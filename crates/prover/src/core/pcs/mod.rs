@@ -19,6 +19,7 @@ pub use self::prover::{
 };
 pub use self::utils::TreeVec;
 pub use self::verifier::CommitmentSchemeVerifier;
+use super::channel::Channel;
 use super::fri::FriConfig;
 
 #[derive(Copy, Debug, Clone, PartialEq, Eq)]
@@ -36,6 +37,15 @@ pub struct PcsConfig {
 impl PcsConfig {
     pub const fn security_bits(&self) -> u32 {
         self.pow_bits + self.fri_config.security_bits()
+    }
+
+    pub fn mix_into(&self, channel: &mut impl Channel) {
+        let Self {
+            pow_bits,
+            fri_config,
+        } = self;
+        channel.mix_u64(*pow_bits as u64);
+        fri_config.mix_into(channel);
     }
 }
 

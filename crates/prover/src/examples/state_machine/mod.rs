@@ -50,6 +50,7 @@ pub fn prove_state_machine(
     );
 
     // Setup protocol.
+    config.mix_into(channel);
     let mut commitment_scheme =
         CommitmentSchemeProver::<_, Blake2sMerkleChannel>::new(config, &twiddles);
 
@@ -140,8 +141,9 @@ pub fn verify_state_machine(
     components: StateMachineComponents,
     proof: StateMachineProof<Blake2sMerkleHasher>,
 ) -> Result<(), VerificationError> {
-    let commitment_scheme =
-        &mut CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(proof.stark_proof.config);
+    let pcs_config = proof.stark_proof.config;
+    pcs_config.mix_into(channel);
+    let commitment_scheme = &mut CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(pcs_config);
     // Decommit.
     // Retrieve the expected column sizes in each commitment interaction, from the AIR.
     let sizes = proof.stmt0.log_sizes();

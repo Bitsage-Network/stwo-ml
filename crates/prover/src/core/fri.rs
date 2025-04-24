@@ -76,6 +76,17 @@ impl FriConfig {
     pub const fn security_bits(&self) -> u32 {
         self.log_blowup_factor * self.n_queries as u32
     }
+
+    pub fn mix_into(&self, channel: &mut impl Channel) {
+        let Self {
+            log_blowup_factor,
+            n_queries,
+            log_last_layer_degree_bound,
+        } = self;
+        channel.mix_u64(*log_blowup_factor as u64);
+        channel.mix_u64(*n_queries as u64);
+        channel.mix_u64(*log_last_layer_degree_bound as u64);
+    }
 }
 
 pub trait FriOps: ColumnOps<BaseField> + PolyOps + Sized + ColumnOps<SecureField> {
