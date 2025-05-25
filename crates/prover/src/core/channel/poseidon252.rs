@@ -60,7 +60,8 @@ impl Channel for Poseidon252Channel {
 
     fn trailing_zeros(&self) -> u32 {
         let bytes = self.digest.to_bytes_be();
-        u128::from_le_bytes(std::array::from_fn(|i| bytes[i])).trailing_zeros()
+        // Returns maximum of 128.
+        u128::from_be_bytes(bytes[16..].try_into().unwrap()).trailing_zeros()
     }
 
     fn mix_felts(&mut self, felts: &[SecureField]) {
