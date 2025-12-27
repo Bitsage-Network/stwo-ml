@@ -50,20 +50,21 @@ impl MerkleOps<Blake2sMerkleHasher> for GpuBackend {
             return commit_on_layer_simd_blake2s(log_size, prev_layer, columns);
         }
         
-        // Large trees: require GPU
+        // Large trees: prefer GPU, fallback to SIMD if unavailable
         if !is_cuda_available() {
-            panic!(
-                "GpuBackend::commit_on_layer called with log_size={} but CUDA is not available. \
-                 Use SimdBackend for CPU-only execution.",
+            tracing::warn!(
+                "GpuBackend::commit_on_layer: CUDA unavailable for log_size={}, falling back to SIMD. \
+                 Performance will be degraded. For optimal performance, ensure CUDA is available.",
                 log_size
             );
+            return commit_on_layer_simd_blake2s(log_size, prev_layer, columns);
         }
-        
+
         tracing::info!(
             "GPU Merkle: using CUDA for {} leaves (log_size={})",
             1u64 << log_size, log_size
         );
-        
+
         gpu_commit_on_layer_blake2s(log_size, prev_layer, columns)
     }
 }
@@ -81,19 +82,21 @@ impl MerkleOps<Blake2sM31MerkleHasher> for GpuBackend {
             return commit_on_layer_simd_blake2s_m31(log_size, prev_layer, columns);
         }
         
-        // Large trees: require GPU
+        // Large trees: prefer GPU, fallback to SIMD if unavailable
         if !is_cuda_available() {
-            panic!(
-                "GpuBackend::commit_on_layer (M31) called with log_size={} but CUDA is not available.",
+            tracing::warn!(
+                "GpuBackend::commit_on_layer (M31): CUDA unavailable for log_size={}, falling back to SIMD. \
+                 Performance will be degraded. For optimal performance, ensure CUDA is available.",
                 log_size
             );
+            return commit_on_layer_simd_blake2s_m31(log_size, prev_layer, columns);
         }
-        
+
         tracing::info!(
             "GPU Merkle (M31): using CUDA for {} leaves (log_size={})",
             1u64 << log_size, log_size
         );
-        
+
         gpu_commit_on_layer_blake2s_m31(log_size, prev_layer, columns)
     }
 }
@@ -190,7 +193,12 @@ fn gpu_commit_on_layer_blake2s(
                 .collect()
         }
         Err(e) => {
-            panic!("GPU Merkle hashing failed: {}. GPU backend requires working CUDA.", e);
+            tracing::error!(
+                "GPU Merkle hashing CUDA execution failed: {}. Falling back to SIMD.",
+                e
+            );
+            // Fallback to SIMD on CUDA execution failure
+            commit_on_layer_simd_blake2s(log_size, prev_layer, columns)
         }
     }
 }

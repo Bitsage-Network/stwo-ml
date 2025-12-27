@@ -63,15 +63,16 @@ impl FriOps for GpuBackend {
             return fold_line_simd_fallback(eval, alpha, twiddles);
         }
         
-        // Large evaluations: require GPU
+        // Large evaluations: prefer GPU, fallback to SIMD if unavailable
         if !is_cuda_available() {
-            panic!(
-                "GpuBackend::fold_line called with log_size={} but CUDA is not available. \
-                 Use SimdBackend for CPU-only execution.",
+            tracing::warn!(
+                "GpuBackend::fold_line: CUDA unavailable for log_size={}, falling back to SIMD. \
+                 Performance will be degraded. For optimal performance, ensure CUDA is available.",
                 log_size
             );
+            return fold_line_simd_fallback(eval, alpha, twiddles);
         }
-        
+
         tracing::info!(
             "GPU fold_line: using CUDA for {} elements (log_size={})",
             eval.len(), log_size
@@ -95,15 +96,17 @@ impl FriOps for GpuBackend {
             return;
         }
         
-        // Large evaluations: require GPU
+        // Large evaluations: prefer GPU, fallback to SIMD if unavailable
         if !is_cuda_available() {
-            panic!(
-                "GpuBackend::fold_circle_into_line called with log_size={} but CUDA is not available. \
-                 Use SimdBackend for CPU-only execution.",
+            tracing::warn!(
+                "GpuBackend::fold_circle_into_line: CUDA unavailable for log_size={}, falling back to SIMD. \
+                 Performance will be degraded. For optimal performance, ensure CUDA is available.",
                 log_size
             );
+            fold_circle_into_line_simd_fallback(dst, src, alpha, twiddles);
+            return;
         }
-        
+
         tracing::info!(
             "GPU fold_circle_into_line: using CUDA for {} elements (log_size={})",
             src.len(), log_size
@@ -197,7 +200,12 @@ fn gpu_fold_line(
             LineEvaluation::new(domain.double(), folded_values)
         }
         Err(e) => {
-            panic!("GPU fold_line failed: {}. GPU backend requires working CUDA.", e);
+            tracing::error!(
+                "GPU fold_line CUDA execution failed: {}. Falling back to SIMD.",
+                e
+            );
+            // Fallback to SIMD on CUDA execution failure
+            fold_line_simd_fallback(eval, alpha, _twiddles)
         }
     }
 }
@@ -265,7 +273,12 @@ fn gpu_fold_circle_into_line(
             }
         }
         Err(e) => {
-            panic!("GPU fold_circle_into_line failed: {}. GPU backend requires working CUDA.", e);
+            tracing::error!(
+                "GPU fold_circle_into_line CUDA execution failed: {}. Falling back to SIMD.",
+                e
+            );
+            // Fallback to SIMD on CUDA execution failure
+            fold_circle_into_line_simd_fallback(dst, src, alpha, _twiddles);
         }
     }
 }

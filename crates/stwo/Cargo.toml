@@ -25,7 +25,7 @@ slow-tests = []
 tracing = []
 # GPU Acceleration Features
 gpu = []  # GPU acceleration (kernel source only, no runtime dependency)
-cuda-runtime = ["gpu", "cudarc"]  # Actual CUDA execution (requires CUDA toolkit)
+cuda-runtime = ["gpu", "cudarc", "aes-gcm", "getrandom"]  # Actual CUDA execution (requires CUDA toolkit)
 multi-gpu = ["cuda-runtime"]  # Multi-GPU support for distributed proving
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -57,6 +57,10 @@ hashbrown.workspace = true
 std-shims.workspace = true
 dashmap = "6.1.0"
 lazy_static = "1.4"
+
+# Cryptography for TEE secure sessions
+aes-gcm = { version = "0.10", optional = true }
+getrandom = { version = "0.2", optional = true }
 
 # GPU acceleration (optional)
 # Note: When building on a system with CUDA, use: --features gpu,cuda-runtime

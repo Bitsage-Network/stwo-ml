@@ -60,20 +60,23 @@ impl QuotientOps for GpuBackend {
             );
         }
         
-        // Large domains: require GPU
+        // Large domains: prefer GPU, fallback to SIMD if unavailable
         if !is_cuda_available() {
-            panic!(
-                "GpuBackend::accumulate_quotients called with log_size={} but CUDA is not available. \
-                 Use SimdBackend for CPU-only execution.",
+            tracing::warn!(
+                "GpuBackend::accumulate_quotients: CUDA unavailable for log_size={}, falling back to SIMD. \
+                 Performance will be degraded. For optimal performance, ensure CUDA is available.",
                 log_size
             );
+            return accumulate_quotients_simd_fallback(
+                domain, columns, random_coeff, sample_batches, log_blowup_factor
+            );
         }
-        
+
         tracing::info!(
             "GPU accumulate_quotients: using CUDA for {} elements (log_size={})",
             domain.size(), log_size
         );
-        
+
         gpu_accumulate_quotients(domain, columns, random_coeff, sample_batches, log_blowup_factor)
     }
 }
@@ -231,7 +234,14 @@ fn gpu_accumulate_quotients(
             SecureEvaluation::new(domain, extended_eval)
         }
         Err(e) => {
-            panic!("GPU accumulate_quotients failed: {}. GPU backend requires working CUDA.", e);
+            tracing::error!(
+                "GPU accumulate_quotients CUDA execution failed: {}. Falling back to SIMD.",
+                e
+            );
+            // Fallback to SIMD on CUDA execution failure
+            accumulate_quotients_simd_fallback(
+                domain, columns, random_coeff, sample_batches, log_blowup_factor
+            )
         }
     }
 }

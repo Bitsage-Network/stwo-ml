@@ -212,33 +212,99 @@ impl TeeContext {
         }
     }
     
-    /// Decrypt data using the session key
-    /// 
-    /// In production: This would use AES-GCM with the TEE-sealed key
-    /// For now: We XOR with the key (placeholder for real crypto)
+    /// Decrypt data using the session key with AES-256-GCM
+    ///
+    /// This uses authenticated encryption (AEAD) which provides:
+    /// - Confidentiality: Data is encrypted
+    /// - Integrity: Any tampering is detected
+    /// - Authenticity: Data came from the key holder
+    ///
+    /// # Format
+    /// Input: [12-byte nonce][ciphertext][16-byte auth tag]
+    /// Output: plaintext
+    #[cfg(feature = "cuda-runtime")]
     pub fn decrypt(&self, encrypted_data: &[u8]) -> Result<Vec<u8>, SecureSessionError> {
-        // Simple XOR decryption (placeholder)
-        // In production: Use AES-GCM or ChaCha20-Poly1305
-        let decrypted: Vec<u8> = encrypted_data
-            .iter()
-            .enumerate()
-            .map(|(i, &byte)| byte ^ self.session_key[i % 32])
-            .collect();
-        
-        Ok(decrypted)
+        use aes_gcm::{
+            aead::{Aead, KeyInit},
+            Aes256Gcm, Nonce,
+        };
+
+        // Minimum size: 12 (nonce) + 16 (auth tag) = 28 bytes
+        if encrypted_data.len() < 28 {
+            return Err(SecureSessionError::CryptoError(
+                "Encrypted data too short (minimum 28 bytes for nonce + tag)".into()
+            ));
+        }
+
+        // Extract nonce (first 12 bytes)
+        let nonce = Nonce::from_slice(&encrypted_data[..12]);
+
+        // Extract ciphertext + auth tag (remaining bytes)
+        let ciphertext_with_tag = &encrypted_data[12..];
+
+        // Create cipher instance
+        let cipher = Aes256Gcm::new_from_slice(&self.session_key)
+            .map_err(|e| SecureSessionError::CryptoError(format!("Invalid key: {}", e)))?;
+
+        // Decrypt and verify authentication tag
+        let plaintext = cipher.decrypt(nonce, ciphertext_with_tag)
+            .map_err(|_| SecureSessionError::CryptoError(
+                "Decryption failed: invalid ciphertext or authentication tag".into()
+            ))?;
+
+        Ok(plaintext)
     }
-    
-    /// Encrypt data using the session key
+
+    #[cfg(not(feature = "cuda-runtime"))]
+    pub fn decrypt(&self, _encrypted_data: &[u8]) -> Result<Vec<u8>, SecureSessionError> {
+        Err(SecureSessionError::CryptoError(
+            "AES-GCM encryption requires cuda-runtime feature".into()
+        ))
+    }
+
+    /// Encrypt data using the session key with AES-256-GCM
+    ///
+    /// This uses authenticated encryption (AEAD) which provides:
+    /// - Confidentiality: Data is encrypted
+    /// - Integrity: Any tampering is detected
+    /// - Authenticity: Data came from the key holder
+    ///
+    /// # Format
+    /// Output: [12-byte nonce][ciphertext][16-byte auth tag]
+    #[cfg(feature = "cuda-runtime")]
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, SecureSessionError> {
-        // Simple XOR encryption (placeholder)
-        // In production: Use AES-GCM or ChaCha20-Poly1305
-        let encrypted: Vec<u8> = plaintext
-            .iter()
-            .enumerate()
-            .map(|(i, &byte)| byte ^ self.session_key[i % 32])
-            .collect();
-        
-        Ok(encrypted)
+        use aes_gcm::{
+            aead::{Aead, KeyInit},
+            Aes256Gcm, Nonce,
+        };
+
+        // Generate random 12-byte nonce using secure randomness
+        let mut nonce_bytes = [0u8; 12];
+        getrandom::getrandom(&mut nonce_bytes)
+            .map_err(|e| SecureSessionError::CryptoError(format!("Failed to generate nonce: {}", e)))?;
+        let nonce = Nonce::from_slice(&nonce_bytes);
+
+        // Create cipher instance
+        let cipher = Aes256Gcm::new_from_slice(&self.session_key)
+            .map_err(|e| SecureSessionError::CryptoError(format!("Invalid key: {}", e)))?;
+
+        // Encrypt with authentication tag appended
+        let ciphertext_with_tag = cipher.encrypt(nonce, plaintext)
+            .map_err(|e| SecureSessionError::CryptoError(format!("Encryption failed: {}", e)))?;
+
+        // Prepend nonce to ciphertext
+        let mut result = Vec::with_capacity(12 + ciphertext_with_tag.len());
+        result.extend_from_slice(&nonce_bytes);
+        result.extend_from_slice(&ciphertext_with_tag);
+
+        Ok(result)
+    }
+
+    #[cfg(not(feature = "cuda-runtime"))]
+    pub fn encrypt(&self, _plaintext: &[u8]) -> Result<Vec<u8>, SecureSessionError> {
+        Err(SecureSessionError::CryptoError(
+            "AES-GCM encryption requires cuda-runtime feature".into()
+        ))
     }
     
     /// Get the attestation quote
@@ -1028,15 +1094,48 @@ mod tests {
     }
     
     #[test]
-    fn test_tee_encrypt_decrypt() {
+    #[cfg(feature = "cuda-runtime")]
+    fn test_tee_encrypt_decrypt_aes_gcm() {
         let ctx = TeeContext::new(12345);
         let plaintext = b"Hello, World!";
-        
+
         let encrypted = ctx.encrypt(plaintext).unwrap();
-        assert_ne!(&encrypted, plaintext);
-        
+
+        // Encrypted should be: 12 (nonce) + 13 (plaintext) + 16 (auth tag) = 41 bytes
+        assert_eq!(encrypted.len(), 12 + plaintext.len() + 16);
+        assert_ne!(&encrypted[12..], plaintext); // Ciphertext should differ from plaintext
+
         let decrypted = ctx.decrypt(&encrypted).unwrap();
         assert_eq!(&decrypted, plaintext);
+    }
+
+    #[test]
+    #[cfg(feature = "cuda-runtime")]
+    fn test_tee_decrypt_detects_tampering() {
+        let ctx = TeeContext::new(12345);
+        let plaintext = b"Sensitive data";
+
+        let mut encrypted = ctx.encrypt(plaintext).unwrap();
+
+        // Tamper with the ciphertext
+        if encrypted.len() > 15 {
+            encrypted[15] ^= 0xFF;
+        }
+
+        // Decryption should fail due to authentication tag mismatch
+        let result = ctx.decrypt(&encrypted);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "cuda-runtime")]
+    fn test_tee_decrypt_rejects_short_input() {
+        let ctx = TeeContext::new(12345);
+
+        // Too short to contain nonce + auth tag
+        let short_data = vec![0u8; 20];
+        let result = ctx.decrypt(&short_data);
+        assert!(result.is_err());
     }
     
     #[test]

@@ -106,15 +106,16 @@ impl PolyOps for GpuBackend {
             return interpolate_simd_fallback(eval, twiddles);
         }
         
-        // Large polynomials: require GPU
+        // Large polynomials: prefer GPU, fallback to SIMD if unavailable
         if !is_cuda_available() {
-            panic!(
-                "GpuBackend::interpolate called with log_size={} but CUDA is not available. \
-                 Use SimdBackend for CPU-only execution.",
+            tracing::warn!(
+                "GpuBackend::interpolate: CUDA unavailable for log_size={}, falling back to SIMD. \
+                 Performance will be degraded. For optimal performance, ensure CUDA is available.",
                 log_size
             );
+            return interpolate_simd_fallback(eval, twiddles);
         }
-        
+
         tracing::info!(
             "GPU interpolate: using CUDA for {} elements (log_size={})",
             1u64 << log_size, log_size
@@ -148,16 +149,21 @@ impl PolyOps for GpuBackend {
                 .collect();
         }
         
-        // Large polynomials with multiple columns: use GPU pipeline for batch processing
+        // Large polynomials with multiple columns: prefer GPU, fallback to SIMD
         if !is_cuda_available() {
-            panic!(
-                "GpuBackend::interpolate_columns called with log_size={} but CUDA is not available.",
+            tracing::warn!(
+                "GpuBackend::interpolate_columns: CUDA unavailable for log_size={}, falling back to SIMD. \
+                 Performance will be degraded.",
                 log_size
             );
+            return columns
+                .into_iter()
+                .map(|eval| eval.interpolate_with_twiddles(twiddles))
+                .collect();
         }
-        
+
         tracing::info!("GPU interpolate_columns: batch (log_size={}, num_columns={})", log_size, num_columns);
-        
+
         gpu_batch_interpolate(columns, log_size)
     }
     
@@ -206,19 +212,30 @@ impl PolyOps for GpuBackend {
                 .collect();
         }
         
-        // Large polynomials: use GPU batch evaluation
+        // Large polynomials: prefer GPU, fallback to SIMD
         if !is_cuda_available() {
-            panic!(
-                "GpuBackend::evaluate_polynomials called with log_size={} but CUDA is not available.",
+            tracing::warn!(
+                "GpuBackend::evaluate_polynomials: CUDA unavailable for log_size={}, falling back to SIMD. \
+                 Performance will be degraded.",
                 log_size
             );
+            return polynomials
+                .into_iter()
+                .map(|poly_coeffs| {
+                    let evals = poly_coeffs.evaluate_with_twiddles(
+                        CanonicCoset::new(poly_coeffs.log_size() + log_blowup_factor).circle_domain(),
+                        twiddles,
+                    );
+                    Poly::new(store_polynomials_coefficients.then_some(poly_coeffs), evals)
+                })
+                .collect();
         }
-        
+
         tracing::info!(
             "GPU batch evaluate: {} polynomials × {} elements (log_size={}, blowup={})",
             num_polys, 1u64 << log_size, log_size, log_blowup_factor
         );
-        
+
         gpu_batch_evaluate(polynomials, log_blowup_factor, twiddles, store_polynomials_coefficients)
     }
     
@@ -282,15 +299,16 @@ impl PolyOps for GpuBackend {
             return evaluate_simd_fallback(poly, domain, twiddles);
         }
         
-        // Large polynomials: require GPU
+        // Large polynomials: prefer GPU, fallback to SIMD if unavailable
         if !is_cuda_available() {
-            panic!(
-                "GpuBackend::evaluate called with log_size={} but CUDA is not available. \
-                 Use SimdBackend for CPU-only execution.",
+            tracing::warn!(
+                "GpuBackend::evaluate: CUDA unavailable for log_size={}, falling back to SIMD. \
+                 Performance will be degraded. For optimal performance, ensure CUDA is available.",
                 log_size
             );
+            return evaluate_simd_fallback(poly, domain, twiddles);
         }
-        
+
         tracing::info!(
             "GPU evaluate: using CUDA for {} elements (log_size={})",
             1u64 << log_size, log_size
@@ -429,8 +447,12 @@ fn gpu_interpolate(
             CircleCoefficients::new(coeffs)
         }
         Err(e) => {
-            // GPU execution failed - this is a hard error, not a fallback
-            panic!("GPU IFFT execution failed: {}. GPU backend requires working CUDA.", e);
+            tracing::error!(
+                "GPU IFFT execution failed: {}. Falling back to SIMD.",
+                e
+            );
+            // Fallback to SIMD on GPU execution failure
+            return interpolate_simd_fallback(eval, _twiddles);
         }
     }
 }
@@ -465,7 +487,19 @@ fn gpu_batch_interpolate(
     
     // Ensure pipeline is cached for this log_size (twiddles stay on GPU)
     if let Err(e) = get_or_create_pipeline(log_size) {
-        panic!("Failed to create/get GPU pipeline: {}", e);
+        tracing::error!("Failed to create GPU pipeline: {}. Falling back to sequential SIMD.", e);
+        return columns
+            .into_iter()
+            .map(|eval| {
+                let simd_eval = CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(
+                    eval.domain,
+                    eval.values,
+                );
+                let simd_twiddles = SimdBackend::precompute_twiddles(eval.domain.half_coset);
+                let result = SimdBackend::interpolate(simd_eval, &simd_twiddles);
+                CircleCoefficients::new(result.coeffs)
+            })
+            .collect();
     }
     
     // Use the cached pipeline
@@ -758,8 +792,12 @@ fn gpu_evaluate(
             CircleEvaluation::new(domain, values)
         }
         Err(e) => {
-            // GPU execution failed - this is a hard error, not a fallback
-            panic!("GPU FFT execution failed: {}. GPU backend requires working CUDA.", e);
+            tracing::error!(
+                "GPU FFT execution failed: {}. Falling back to SIMD.",
+                e
+            );
+            // Fallback to SIMD on GPU execution failure
+            evaluate_simd_fallback(poly, domain, _twiddles)
         }
     }
 }
