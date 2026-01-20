@@ -1,0 +1,314 @@
+name: GPU CI
+
+env:
+  NIGHTLY_VERSION: "nightly-2025-07-14"
+  CUDA_VERSION: "12.4"
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+    paths:
+      - 'crates/stwo/src/prover/backend/gpu/**'
+      - 'crates/constraint-framework/src/prover/gpu_*'
+      - '.github/workflows/gpu-ci.yaml'
+
+  pull_request:
+    paths:
+      - 'crates/stwo/src/prover/backend/gpu/**'
+      - 'crates/constraint-framework/src/prover/gpu_*'
+
+  workflow_dispatch:
+    inputs:
+      run_benchmarks:
+        description: 'Run GPU benchmarks'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  # ============================================================================
+  # GPU Build Check (runs on standard runner, no GPU needed)
+  # ============================================================================
+  gpu-build-check:
+    name: GPU Build Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.NIGHTLY_VERSION }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Check GPU feature compiles (no CUDA runtime)
+        run: |
+          cargo check --features="gpu,prover" --package stwo
+          cargo check --features="gpu" --package stwo-constraint-framework
+
+      - name: Check cuda-runtime feature compiles (stub mode)
+        run: |
+          cargo check --features="cuda-runtime,prover" --package stwo
+
+  # ============================================================================
+  # GPU Unit Tests (requires GPU runner)
+  # ============================================================================
+  gpu-unit-tests:
+    name: GPU Unit Tests
+    runs-on: [self-hosted, gpu, cuda]
+    needs: gpu-build-check
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup CUDA
+        uses: ./.github/actions/setup_cuda
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.NIGHTLY_VERSION }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify CUDA availability
+        run: |
+          nvidia-smi
+          nvcc --version
+
+      - name: Run GPU backend unit tests
+        run: |
+          cargo test --features="cuda-runtime,prover" \
+            --package stwo \
+            -- prover::backend::gpu \
+            --nocapture
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Run constraint framework GPU tests
+        run: |
+          cargo test --features="cuda-runtime" \
+            --package stwo-constraint-framework \
+            -- gpu \
+            --nocapture
+
+  # ============================================================================
+  # GPU Integration Tests (requires GPU runner)
+  # ============================================================================
+  gpu-integration-tests:
+    name: GPU Integration Tests
+    runs-on: [self-hosted, gpu, cuda]
+    needs: gpu-unit-tests
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup CUDA
+        uses: ./.github/actions/setup_cuda
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.NIGHTLY_VERSION }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run GPU integration tests
+        run: |
+          cargo test --features="cuda-runtime,prover" \
+            --package stwo \
+            --test '*gpu*' \
+            --nocapture
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Run GPU vs SIMD equivalence tests
+        run: |
+          cargo test --features="cuda-runtime,prover" \
+            --package stwo \
+            -- gpu_simd_equivalence \
+            --nocapture
+
+  # ============================================================================
+  # GPU Feature Parity Tests
+  # ============================================================================
+  gpu-feature-parity:
+    name: GPU/SIMD Feature Parity
+    runs-on: [self-hosted, gpu, cuda]
+    needs: gpu-unit-tests
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup CUDA
+        uses: ./.github/actions/setup_cuda
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.NIGHTLY_VERSION }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run FFT parity test
+        run: |
+          cargo test --features="cuda-runtime,prover" \
+            --package stwo \
+            -- fft_gpu_simd_parity \
+            --nocapture
+
+      - name: Run FRI parity test
+        run: |
+          cargo test --features="cuda-runtime,prover" \
+            --package stwo \
+            -- fri_gpu_simd_parity \
+            --nocapture
+
+      - name: Run Merkle parity test
+        run: |
+          cargo test --features="cuda-runtime,prover" \
+            --package stwo \
+            -- merkle_gpu_simd_parity \
+            --nocapture
+
+  # ============================================================================
+  # GPU Benchmarks (optional, triggered manually or on main)
+  # ============================================================================
+  gpu-benchmarks:
+    name: GPU Benchmarks
+    runs-on: [self-hosted, gpu, cuda]
+    needs: gpu-integration-tests
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.run_benchmarks == 'true' || github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup CUDA
+        uses: ./.github/actions/setup_cuda
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.NIGHTLY_VERSION }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install criterion
+        run: cargo install cargo-criterion
+
+      - name: Run GPU benchmarks
+        run: |
+          cargo criterion --features="cuda-runtime,prover" \
+            --package stwo \
+            -- gpu \
+            --output-format bencher \
+            | tee gpu-benchmark-results.txt
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-benchmark-results
+          path: gpu-benchmark-results.txt
+
+      - name: Compare with baseline
+        run: |
+          echo "GPU Benchmark Results:"
+          cat gpu-benchmark-results.txt
+
+  # ============================================================================
+  # Multi-GPU Tests (requires multi-GPU runner)
+  # ============================================================================
+  multi-gpu-tests:
+    name: Multi-GPU Tests
+    runs-on: [self-hosted, gpu, multi-gpu]
+    needs: gpu-unit-tests
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup CUDA
+        uses: ./.github/actions/setup_cuda
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.NIGHTLY_VERSION }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Detect GPU count
+        run: |
+          GPU_COUNT=$(nvidia-smi -L | wc -l)
+          echo "Detected $GPU_COUNT GPUs"
+          nvidia-smi -L
+
+      - name: Run multi-GPU tests
+        run: |
+          cargo test --features="multi-gpu,prover" \
+            --package stwo \
+            -- multi_gpu \
+            --nocapture
+        env:
+          RUST_BACKTRACE: 1
+
+  # ============================================================================
+  # GPU Memory Leak Detection
+  # ============================================================================
+  gpu-memory-check:
+    name: GPU Memory Check
+    runs-on: [self-hosted, gpu, cuda]
+    needs: gpu-unit-tests
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup CUDA
+        uses: ./.github/actions/setup_cuda
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.NIGHTLY_VERSION }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build test binary
+        run: |
+          cargo build --features="cuda-runtime,prover" \
+            --package stwo \
+            --tests
+
+      - name: Run with cuda-memcheck (if available)
+        run: |
+          if command -v compute-sanitizer &> /dev/null; then
+            compute-sanitizer --tool memcheck \
+              cargo test --features="cuda-runtime,prover" \
+                --package stwo \
+                -- gpu_memory_test \
+                --nocapture
+          else
+            echo "compute-sanitizer not available, skipping memory check"
+            cargo test --features="cuda-runtime,prover" \
+              --package stwo \
+              -- gpu_memory_test \
+              --nocapture
+          fi
+
+  # ============================================================================
+  # Summary Job
+  # ============================================================================
+  gpu-tests-summary:
+    name: GPU Tests Summary
+    runs-on: ubuntu-latest
+    needs:
+      - gpu-build-check
+      - gpu-unit-tests
+      - gpu-integration-tests
+      - gpu-feature-parity
+      - gpu-memory-check
+    if: always()
+    steps:
+      - name: Check GPU test results
+        uses: re-actors/alls-green@v1.2.2
+        with:
+          jobs: ${{ toJSON(needs) }}
