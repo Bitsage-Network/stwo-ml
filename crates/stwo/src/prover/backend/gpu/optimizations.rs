@@ -730,7 +730,7 @@ impl<T: Copy + Default + Send> PooledPinnedBuffer<T> {
 }
 
 #[cfg(feature = "cuda-runtime")]
-impl<T: Copy + Default + Send> Drop for PooledPinnedBuffer<T> {
+impl<T: Copy + Default + Send + 'static> Drop for PooledPinnedBuffer<T> {
     fn drop(&mut self) {
         if let Some(buffer) = self.buffer.take() {
             self.pool.release_internal(buffer, self.size_class);
@@ -941,7 +941,7 @@ impl<T: Copy + Default + Send + 'static> PinnedMemoryPool<T> {
 }
 
 #[cfg(feature = "cuda-runtime")]
-impl<T: Copy + Default + Send> Default for PinnedMemoryPool<T> {
+impl<T: Copy + Default + Send + 'static> Default for PinnedMemoryPool<T> {
     fn default() -> Self {
         Self::new()
     }

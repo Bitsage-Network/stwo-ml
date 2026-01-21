@@ -230,12 +230,10 @@ impl MultiGpuExecutorPool {
 impl GpuExecutorContext {
     /// Get or create twiddles for a specific log_size.
     pub fn get_or_create_twiddles(&mut self, log_size: u32) -> Result<&TwiddleCache, CudaFftError> {
-        // Use entry API to avoid double lookup and eliminate unwrap
-        use std::collections::hash_map::Entry;
-
-        if let Entry::Vacant(e) = self.twiddle_cache.entry(log_size) {
+        // Check if we need to create the cache first
+        if !self.twiddle_cache.contains_key(&log_size) {
             let cache = self.create_twiddle_cache(log_size)?;
-            e.insert(cache);
+            self.twiddle_cache.insert(log_size, cache);
         }
 
         // Safe: we just ensured the entry exists above
