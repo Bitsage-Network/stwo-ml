@@ -719,15 +719,19 @@ impl GpuProofPipeline {
                 format!("Invalid polynomial index: {}", poly_idx)
             ));
         }
-        
-        let executor = self.get_executor();
+
         let n = 1u32 << self.log_size;
-        
-        executor.execute_denormalize_on_device(
-            &mut self.poly_data[poly_idx],
+
+        // Take the data out to avoid borrow conflicts
+        let mut data = std::mem::take(&mut self.poly_data[poly_idx]);
+        let result = self.get_executor().execute_denormalize_on_device(
+            &mut data,
             denorm_factor,
             n,
-        )
+        );
+        // Put the data back
+        self.poly_data[poly_idx] = data;
+        result
     }
     
     /// Execute IFFT with fused denormalization on GPU.
@@ -891,27 +895,30 @@ impl GpuProofPipeline {
             ));
         }
         
-        let executor = self.get_executor();
         let n = 1usize << self.log_size;
         let n_dst = n / 2;
-        
-        // Upload twiddles and alpha
-        let d_itwiddles = executor.device.htod_sync_copy(itwiddles)
-            .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
-        let d_alpha = executor.device.htod_sync_copy(alpha)
-            .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
-        
+
+        // Upload twiddles and alpha (scope the borrow)
+        let (d_itwiddles, d_alpha) = {
+            let executor = self.get_executor();
+            let d_itwiddles = executor.device.htod_sync_copy(itwiddles)
+                .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+            let d_alpha = executor.device.htod_sync_copy(alpha)
+                .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+            (d_itwiddles, d_alpha)
+        };
+
         // Launch kernel with shared memory for alpha
         let block_size = 256u32;
         let grid_size = ((n_dst as u32) + block_size - 1) / block_size;
         let log_n = n.ilog2();
-        
+
         let cfg = LaunchConfig {
             grid_dim: (grid_size, 1, 1),
             block_dim: (block_size, 1, 1),
             shared_mem_bytes: 32,
         };
-        
+
         // Use split_at_mut to get non-overlapping mutable references
         // We need to handle the case where dst_idx < src_idx and dst_idx > src_idx
         let (dst_slice, src_slice) = if dst_idx < src_idx {
@@ -921,16 +928,20 @@ impl GpuProofPipeline {
             let (left, right) = self.poly_data.split_at_mut(dst_idx);
             (&mut right[0], &left[src_idx])
         };
-        
-        unsafe {
-            executor.kernels.fold_circle_into_line.clone().launch(
-                cfg,
-                (dst_slice, src_slice, &d_itwiddles, &d_alpha, n as u32, log_n),
-            ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
+
+        // Launch and sync (re-borrow executor)
+        {
+            let executor = self.get_executor();
+            unsafe {
+                executor.kernels.fold_circle_into_line.clone().launch(
+                    cfg,
+                    (dst_slice, src_slice, &d_itwiddles, &d_alpha, n as u32, log_n),
+                ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
+            }
+
+            executor.device.synchronize()
+                .map_err(|e| CudaFftError::KernelExecution(format!("Sync failed: {:?}", e)))?;
         }
-        
-        executor.device.synchronize()
-            .map_err(|e| CudaFftError::KernelExecution(format!("Sync failed: {:?}", e)))?;
         
         Ok(())
     }

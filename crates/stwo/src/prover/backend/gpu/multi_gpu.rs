@@ -438,7 +438,7 @@ pub struct P2PTransfer {
 #[cfg(feature = "cuda-runtime")]
 impl P2PTransfer {
     /// Create a new P2P transfer handler.
-    pub fn new(src_device: usize, dst_device: usize, topology: &GpuTopology) -> Result<Self, CudaFftError> {
+    pub fn new(src_device: usize, dst_device: usize, _topology: &GpuTopology) -> Result<Self, CudaFftError> {
         let p2p_enabled = if src_device != dst_device {
             // Try to enable P2P
             enable_p2p_access(src_device, dst_device)?
@@ -783,7 +783,7 @@ impl DistributedFft {
     /// Exchange butterfly data between two GPUs.
     fn exchange_butterfly_data(
         &self,
-        pipelines: &mut [GpuProofPipeline],
+        _pipelines: &mut [GpuProofPipeline],
         src_gpu: usize,
         dst_gpu: usize,
     ) -> Result<(), CudaFftError> {
