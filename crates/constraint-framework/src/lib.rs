@@ -28,6 +28,13 @@ pub use prover::{
     CpuDomainEvaluator, FractionWriter, LogupColGenerator, LogupTraceGenerator,
     SimdDomainEvaluator,
 };
+
+// GPU constraint kernel configuration - allows users to enable/disable direct GPU kernels
+#[cfg(all(feature = "prover", feature = "std", feature = "gpu"))]
+pub use prover::{
+    is_gpu_constraint_kernels_enabled, set_gpu_constraint_kernels_enabled, will_use_gpu_kernels,
+    GpuDomainEvaluator,
+};
 use std_shims::Vec;
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::{SecureField, SECURE_EXTENSION_DEGREE};

@@ -69,6 +69,8 @@ pub mod multi_gpu_executor;
 pub mod cuda_streams;
 pub mod large_proofs;
 pub mod tee;
+pub mod optimizations;
+pub mod constraints;
 
 /// GPU Backend for hardware-accelerated proof generation.
 ///

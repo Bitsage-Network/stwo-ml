@@ -19,3 +19,9 @@ pub use simd_domain::SimdDomainEvaluator;
 // GPU exports
 #[cfg(feature = "gpu")]
 pub use gpu_domain::GpuDomainEvaluator;
+#[cfg(feature = "gpu")]
+pub use gpu_component_prover::{
+    is_gpu_constraint_kernels_enabled,
+    set_gpu_constraint_kernels_enabled,
+    will_use_gpu_kernels,
+};
