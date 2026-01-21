@@ -958,28 +958,35 @@ impl GpuProofPipeline {
             ));
         }
         
-        let executor = self.get_executor();
-        
         // Upload alpha once
-        let d_alpha = executor.device.htod_sync_copy(alpha)
-            .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
-        
+        let d_alpha = {
+            let executor = self.get_executor();
+            executor.device.htod_sync_copy(alpha)
+                .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?
+        };
+
         let mut current_idx = input_idx;
         let mut current_n = 1usize << self.log_size;
-        
+
         for layer in 0..num_layers {
             // Upload twiddles for this layer
-            let d_itwiddles = executor.device.htod_sync_copy(&all_itwiddles[layer])
-                .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
-            
+            let d_itwiddles = {
+                let executor = self.get_executor();
+                executor.device.htod_sync_copy(&all_itwiddles[layer])
+                    .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?
+            };
+
             // Fold
             current_idx = self.fri_fold_line_gpu(current_idx, &d_itwiddles, &d_alpha, current_n)?;
             current_n /= 2;
         }
-        
+
         // Single sync at the end
-        executor.device.synchronize()
-            .map_err(|e| CudaFftError::KernelExecution(format!("Sync failed: {:?}", e)))?;
+        {
+            let executor = self.get_executor();
+            executor.device.synchronize()
+                .map_err(|e| CudaFftError::KernelExecution(format!("Sync failed: {:?}", e)))?;
+        }
         
         Ok(current_idx)
     }

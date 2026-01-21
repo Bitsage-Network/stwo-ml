@@ -955,15 +955,14 @@ impl WorkDistributor {
         match self.strategy {
             WorkDistributionStrategy::RoundRobin => {
                 // Find GPU with lowest current assignment count
-                self.loads
+                let best_idx = self.loads
                     .iter()
                     .enumerate()
                     .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                    .map(|(idx, _)| {
-                        self.loads[idx] += 1.0;
-                        idx
-                    })
-                    .unwrap_or(0)
+                    .map(|(idx, _)| idx)
+                    .unwrap_or(0);
+                self.loads[best_idx] += 1.0;
+                best_idx
             }
             WorkDistributionStrategy::CapabilityWeighted => {
                 // Assign to GPU with most available relative capacity
