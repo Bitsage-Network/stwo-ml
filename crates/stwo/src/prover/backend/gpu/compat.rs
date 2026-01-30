@@ -18,6 +18,7 @@ use cudarc::driver::sys::{CUdevice, CUdevice_attribute};
 // =============================================================================
 
 #[cfg(feature = "cuda-runtime")]
+#[link(name = "cuda")]
 extern "C" {
     fn cuDeviceCanAccessPeer(canAccessPeer: *mut i32, dev: i32, peerDev: i32) -> i32;
     fn cuDeviceGetP2PAttribute(value: *mut i32, attrib: i32, srcDevice: i32, dstDevice: i32) -> i32;
