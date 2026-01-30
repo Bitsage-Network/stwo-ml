@@ -56,6 +56,8 @@ extern "C" {
     ) -> i32;
     fn cuGraphDestroy(hGraph: cudarc::driver::sys::CUgraph) -> i32;
     fn cuGraphExecDestroy(hGraphExec: cudarc::driver::sys::CUgraphExec) -> i32;
+    fn cuMemcpyHtoDAsync_v2(dstDevice: u64, srcHost: *const std::ffi::c_void, ByteCount: usize, hStream: *mut std::ffi::c_void) -> i32;
+    fn cuMemcpyDtoHAsync_v2(dstHost: *mut std::ffi::c_void, srcDevice: u64, ByteCount: usize, hStream: *mut std::ffi::c_void) -> i32;
     fn cuMemAllocHost_v2(pp: *mut *mut std::ffi::c_void, bytesize: usize) -> i32;
     fn cuMemFreeHost(p: *mut std::ffi::c_void) -> i32;
     fn cuGraphExecUpdate(
@@ -93,7 +95,7 @@ pub fn mem_get_info() -> Result<(usize, usize), String> {
 /// Query a device attribute.
 #[cfg(feature = "cuda-runtime")]
 pub fn device_get_attribute(device: CUdevice, attrib: CUdevice_attribute) -> Result<i32, String> {
-    result::device::get_attribute(device, attrib)
+    unsafe { result::device::get_attribute(device, attrib) }
         .map_err(|e| format!("Failed to query device attribute: {:?}", e))
 }
 
@@ -107,7 +109,7 @@ pub fn device_get_name(device: CUdevice) -> Result<String, String> {
 /// Query total device memory.
 #[cfg(feature = "cuda-runtime")]
 pub fn device_total_mem(device: CUdevice) -> Result<usize, String> {
-    result::device::total_mem(device)
+    unsafe { result::device::total_mem(device) }
         .map_err(|e| format!("Failed to query total memory: {:?}", e))
 }
 
@@ -165,8 +167,14 @@ pub fn memcpy_htod_async(
     size_bytes: usize,
     stream: cudarc::driver::sys::CUstream,
 ) -> Result<(), String> {
-    result::memcpy_htod_async(dst, src, size_bytes, stream)
-        .map_err(|e| format!("Async H2D copy failed: {:?}", e))
+    let result = unsafe {
+        cuMemcpyHtoDAsync_v2(dst, src, size_bytes, stream as *mut std::ffi::c_void)
+    };
+    if result == CUDA_SUCCESS {
+        Ok(())
+    } else {
+        Err(format!("Async H2D copy failed: CUDA error {}", result))
+    }
 }
 
 /// Async device-to-host memory copy.
@@ -177,8 +185,14 @@ pub fn memcpy_dtoh_async(
     size_bytes: usize,
     stream: cudarc::driver::sys::CUstream,
 ) -> Result<(), String> {
-    result::memcpy_dtoh_async(dst, src, size_bytes, stream)
-        .map_err(|e| format!("Async D2H copy failed: {:?}", e))
+    let result = unsafe {
+        cuMemcpyDtoHAsync_v2(dst, src as u64, size_bytes, stream as *mut std::ffi::c_void)
+    };
+    if result == CUDA_SUCCESS {
+        Ok(())
+    } else {
+        Err(format!("Async D2H copy failed: CUDA error {}", result))
+    }
 }
 
 // =============================================================================
@@ -478,6 +492,7 @@ pub use cudarc::driver::sys::{
 #[cfg(feature = "cuda-runtime")]
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
 pub enum CUgraphExecUpdateResult {
     CU_GRAPH_EXEC_UPDATE_SUCCESS = 0,
     CU_GRAPH_EXEC_UPDATE_ERROR = 1,

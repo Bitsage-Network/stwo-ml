@@ -28,7 +28,7 @@
 //! - Data must be in pinned (page-locked) memory for true async transfers
 
 #[cfg(feature = "cuda-runtime")]
-use cudarc::driver::{CudaDevice, CudaSlice, CudaStream, LaunchConfig, LaunchAsync};
+use cudarc::driver::{CudaDevice, CudaSlice, CudaStream, LaunchConfig, LaunchAsync, DevicePtr};
 
 #[cfg(feature = "cuda-runtime")]
 use std::sync::Arc;

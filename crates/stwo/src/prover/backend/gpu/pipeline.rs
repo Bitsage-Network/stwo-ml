@@ -103,6 +103,11 @@ pub struct GpuProofPipeline {
 }
 
 #[cfg(feature = "cuda-runtime")]
+unsafe impl Send for GpuProofPipeline {}
+#[cfg(feature = "cuda-runtime")]
+unsafe impl Sync for GpuProofPipeline {}
+
+#[cfg(feature = "cuda-runtime")]
 impl GpuProofPipeline {
     /// Create a new GPU proof pipeline for polynomials of the given size.
     /// Uses the global executor (GPU 0).
@@ -273,7 +278,7 @@ impl GpuProofPipeline {
             unsafe {
                 self.executor.kernels.fft_layer.clone().launch(
                     cfg,
-                    (data, &twiddle_view, layer as u32, self.log_size, n_twiddles),
+                    (&mut *data, &twiddle_view, layer as u32, self.log_size, n_twiddles),
                 ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
             }
         }
@@ -317,7 +322,7 @@ impl GpuProofPipeline {
             unsafe {
                 self.executor.kernels.ifft_layer.clone().launch(
                     cfg,
-                    (data, &twiddle_view, layer as u32, self.log_size, n_twiddles),
+                    (&mut *data, &twiddle_view, layer as u32, self.log_size, n_twiddles),
                 ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
             }
         }
@@ -722,15 +727,21 @@ impl GpuProofPipeline {
 
         let n = 1u32 << self.log_size;
 
-        // Take the data out to avoid borrow conflicts
-        let mut data = std::mem::take(&mut self.poly_data[poly_idx]);
+        // Swap the data out to avoid borrow conflicts
+        let mut data = self.poly_data.swap_remove(poly_idx);
         let result = self.executor.clone().execute_denormalize_on_device(
             &mut data,
             denorm_factor,
             n,
         );
-        // Put the data back
-        self.poly_data[poly_idx] = data;
+        // Put the data back at the correct position
+        if poly_idx < self.poly_data.len() {
+            self.poly_data.push(data);
+            let last = self.poly_data.len() - 1;
+            self.poly_data.swap(poly_idx, last);
+        } else {
+            self.poly_data.push(data);
+        }
         result
     }
     

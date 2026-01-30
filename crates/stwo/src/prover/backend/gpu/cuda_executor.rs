@@ -166,6 +166,8 @@ pub enum CudaFftError {
     KernelExecution(String),
     /// Invalid input size
     InvalidSize(String),
+    /// Kernel launch failed
+    KernelLaunch(String),
 }
 
 impl std::fmt::Display for CudaFftError {
@@ -178,6 +180,7 @@ impl std::fmt::Display for CudaFftError {
             CudaFftError::MemoryTransfer(s) => write!(f, "Memory transfer failed: {}", s),
             CudaFftError::KernelExecution(s) => write!(f, "Kernel execution failed: {}", s),
             CudaFftError::InvalidSize(s) => write!(f, "Invalid size: {}", s),
+            CudaFftError::KernelLaunch(s) => write!(f, "Kernel launch failed: {}", s),
         }
     }
 }
@@ -286,11 +289,11 @@ pub fn estimate_proof_memory(log_size: u32, num_polynomials: usize) -> usize {
 pub fn with_memory_fallback<T, GpuFn, CpuFn>(
     strategy: MemoryPressureStrategy,
     required_bytes: usize,
-    gpu_fn: GpuFn,
+    mut gpu_fn: GpuFn,
     cpu_fn: CpuFn,
 ) -> Result<T, CudaFftError>
 where
-    GpuFn: FnOnce() -> Result<T, CudaFftError>,
+    GpuFn: FnMut() -> Result<T, CudaFftError>,
     CpuFn: FnOnce() -> T,
 {
     match strategy {
@@ -561,32 +564,32 @@ impl CudaFftExecutor {
 
         // Query compute capability
         let major = compat::device_get_attribute(
-            cu_device,
+            *cu_device,
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR
         ).map_err(|e| CudaFftError::DriverInit(e))? as u32;
 
         let minor = compat::device_get_attribute(
-            cu_device,
+            *cu_device,
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR
         ).map_err(|e| CudaFftError::DriverInit(e))? as u32;
 
         // Query device name
-        let name = compat::device_get_name(cu_device)
+        let name = compat::device_get_name(*cu_device)
             .unwrap_or_else(|_| "NVIDIA GPU".to_string());
 
         // Query total memory
-        let total_memory_bytes = compat::device_total_mem(cu_device)
+        let total_memory_bytes = compat::device_total_mem(*cu_device)
             .unwrap_or(8 * 1024 * 1024 * 1024);
 
         // Query SM count
         let multiprocessor_count = compat::device_get_attribute(
-            cu_device,
+            *cu_device,
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT
         ).map_err(|e| CudaFftError::DriverInit(e))? as u32;
 
         // Query max threads per block
         let max_threads_per_block = compat::device_get_attribute(
-            cu_device,
+            *cu_device,
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK
         ).map_err(|e| CudaFftError::DriverInit(e))? as u32;
 

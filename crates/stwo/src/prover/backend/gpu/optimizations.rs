@@ -99,6 +99,21 @@ impl Drop for GraphExec {
 }
 
 #[cfg(feature = "cuda-runtime")]
+unsafe impl Send for CudaGraph {}
+#[cfg(feature = "cuda-runtime")]
+unsafe impl Sync for CudaGraph {}
+
+#[cfg(feature = "cuda-runtime")]
+unsafe impl Send for GraphExec {}
+#[cfg(feature = "cuda-runtime")]
+unsafe impl Sync for GraphExec {}
+
+#[cfg(feature = "cuda-runtime")]
+unsafe impl Send for GraphAcceleratedFft {}
+#[cfg(feature = "cuda-runtime")]
+unsafe impl Sync for GraphAcceleratedFft {}
+
+#[cfg(feature = "cuda-runtime")]
 impl CudaGraph {
     /// Create a new CUDA graph on the specified device.
     pub fn new(device: Arc<CudaDevice>) -> Result<Self, CudaFftError> {
@@ -601,7 +616,7 @@ impl PinnedPoolStats {
 /// This wrapper holds a `PinnedBuffer` and ensures it's returned to the pool
 /// when dropped, rather than being deallocated.
 #[cfg(feature = "cuda-runtime")]
-pub struct PooledPinnedBuffer<T: Copy + Default + Send> {
+pub struct PooledPinnedBuffer<T: Copy + Default + Send + 'static> {
     /// The underlying pinned buffer (wrapped in Option for take-on-drop)
     buffer: Option<PinnedBuffer<T>>,
     /// Size class for this buffer
@@ -611,7 +626,7 @@ pub struct PooledPinnedBuffer<T: Copy + Default + Send> {
 }
 
 #[cfg(feature = "cuda-runtime")]
-impl<T: Copy + Default + Send> PooledPinnedBuffer<T> {
+impl<T: Copy + Default + Send + 'static> PooledPinnedBuffer<T> {
     /// Get the underlying buffer's slice.
     pub fn as_slice(&self) -> &[T] {
         self.buffer.as_ref().unwrap().as_slice()
@@ -897,7 +912,7 @@ pub fn get_pinned_pool_u64() -> &'static PinnedMemoryPool<u64> {
 
 /// Async transfer handle for overlapped execution.
 #[cfg(feature = "cuda-runtime")]
-pub struct AsyncTransfer<T: Copy> {
+pub struct AsyncTransfer<T: Copy + Default> {
     /// Pinned host buffer
     pinned: PinnedBuffer<T>,
     /// GPU buffer
@@ -946,7 +961,7 @@ impl<T: Copy + Default + cudarc::driver::DeviceRepr> AsyncTransfer<T> {
 
     /// Wait for transfer to complete.
     pub fn wait(self) -> Result<CudaSlice<T>, CudaFftError> {
-        self.stream.synchronize()
+        self.stream.device.synchronize()
             .map_err(|e| CudaFftError::MemoryTransfer(format!("Sync: {:?}", e)))?;
         Ok(self.gpu_slice)
     }
@@ -983,12 +998,12 @@ impl HopperCapabilities {
 
         // Get compute capability using compat module
         let major = compat::device_get_attribute(
-            cu_device,
+            *cu_device,
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR
         ).unwrap_or(0);
 
         let minor = compat::device_get_attribute(
-            cu_device,
+            *cu_device,
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR
         ).unwrap_or(0);
 
@@ -999,13 +1014,13 @@ impl HopperCapabilities {
 
         // Get SM count
         let sm_count = compat::device_get_attribute(
-            cu_device,
+            *cu_device,
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT
         ).unwrap_or(0);
 
         // Get L2 cache size
         let l2_cache = compat::device_get_attribute(
-            cu_device,
+            *cu_device,
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE
         ).unwrap_or(0);
 

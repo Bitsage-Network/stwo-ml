@@ -25,6 +25,7 @@ use crate::prover::lookups::gkr_prover::{
 use crate::prover::lookups::utils::UnivariatePoly;
 use crate::prover::lookups::mle::{Mle, MleOps};
 
+use crate::prover::backend::Column;
 use super::GpuBackend;
 
 /// Minimum MLE size (log2) for GPU acceleration.
@@ -242,7 +243,7 @@ mod gpu_impl {
         mle: Mle<GpuBackend, BaseField>,
         assignment: SecureField,
     ) -> Result<Mle<GpuBackend, SecureField>, CudaFftError> {
-        let executor = get_cuda_executor()?;
+        let executor = get_cuda_executor().map_err(|e| e.clone())?;
         let n = mle.len();
         let half_n = n / 2;
 
@@ -275,7 +276,7 @@ mod gpu_impl {
         mle: Mle<GpuBackend, SecureField>,
         assignment: SecureField,
     ) -> Result<Mle<GpuBackend, SecureField>, CudaFftError> {
-        let executor = get_cuda_executor()?;
+        let executor = get_cuda_executor().map_err(|e| e.clone())?;
         let n = mle.len();
         let half_n = n / 2;
 
@@ -314,7 +315,7 @@ mod gpu_impl {
         y: &[SecureField],
         v: SecureField,
     ) -> Result<Mle<GpuBackend, SecureField>, CudaFftError> {
-        let executor = get_cuda_executor()?;
+        let executor = get_cuda_executor().map_err(|e| e.clone())?;
         let n_variables = y.len();
         let output_size = 1usize << n_variables;
 
