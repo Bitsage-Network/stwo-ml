@@ -186,11 +186,11 @@ pub struct PinnedBuffer<T: Copy + Default> {
 #[cfg(feature = "cuda-runtime")]
 impl<T: Copy + Default> PinnedBuffer<T> {
     /// Allocate a new pinned buffer with the given capacity.
-    /// 
+    ///
     /// Uses `cuMemAllocHost` for page-locked allocation.
     pub fn new(capacity: usize) -> Result<Self, CudaFftError> {
-        use cudarc::driver::sys;
-        
+        use super::compat;
+
         if capacity == 0 {
             return Ok(Self {
                 ptr: std::ptr::null_mut(),
@@ -198,22 +198,15 @@ impl<T: Copy + Default> PinnedBuffer<T> {
                 capacity: 0,
             });
         }
-        
+
         let size_bytes = capacity * std::mem::size_of::<T>();
-        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        
-        let result = unsafe {
-            sys::cuMemAllocHost_v2(&mut ptr, size_bytes)
-        };
-        
-        if result != sys::cudaError_enum::CUDA_SUCCESS {
-            return Err(CudaFftError::MemoryAllocation(
-                format!("Failed to allocate pinned memory ({} bytes): {:?}", size_bytes, result)
-            ));
-        }
-        
+        let ptr = compat::mem_alloc_host(size_bytes)
+            .map_err(|e| CudaFftError::MemoryAllocation(
+                format!("Failed to allocate pinned memory ({} bytes): {}", size_bytes, e)
+            ))?;
+
         tracing::debug!("Allocated {} bytes of pinned memory", size_bytes);
-        
+
         Ok(Self {
             ptr: ptr as *mut T,
             len: 0,
@@ -305,14 +298,10 @@ impl<T: Copy + Default> PinnedBuffer<T> {
 impl<T: Copy + Default> Drop for PinnedBuffer<T> {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            use cudarc::driver::sys;
-            
-            let result = unsafe {
-                sys::cuMemFreeHost(self.ptr as *mut std::ffi::c_void)
-            };
-            
-            if result != sys::cudaError_enum::CUDA_SUCCESS {
-                tracing::warn!("Failed to free pinned memory: {:?}", result);
+            use super::compat;
+
+            if let Err(e) = compat::mem_free_host(self.ptr as *mut std::ffi::c_void) {
+                tracing::warn!("Failed to free pinned memory: {}", e);
             }
         }
     }
@@ -368,69 +357,55 @@ impl AsyncTransferManager {
     }
     
     /// Asynchronously upload data to a GPU buffer.
-    /// 
+    ///
     /// This is a true async operation - the function returns immediately
     /// and the transfer happens in the background on the H2D stream.
     pub fn upload_async(&mut self, data: &[u32], gpu_dest: &mut CudaSlice<u32>) -> Result<(), CudaFftError> {
-        use cudarc::driver::sys;
-        
+        use super::compat;
+
         // Copy to pinned buffer
         self.upload_buffer.copy_from_slice(data)?;
-        
+
         // Get raw pointers
         let src_ptr = self.upload_buffer.as_ptr() as *const std::ffi::c_void;
-        let dst_ptr = gpu_dest.device_ptr() as u64;
+        let dst_ptr = *gpu_dest.device_ptr();
         let size_bytes = data.len() * std::mem::size_of::<u32>();
-        
-        // Async copy using CUDA driver API
-        let stream_handle = self.h2d_stream.stream as sys::CUstream;
-        
-        let result = unsafe {
-            sys::cuMemcpyHtoDAsync_v2(dst_ptr, src_ptr, size_bytes, stream_handle)
-        };
-        
-        if result != sys::cudaError_enum::CUDA_SUCCESS {
-            return Err(CudaFftError::MemoryTransfer(
-                format!("Async H2D failed: {:?}", result)
-            ));
-        }
-        
+
+        // Async copy using CUDA driver API via compat layer
+        let stream_handle = self.h2d_stream.stream;
+
+        compat::memcpy_htod_async(dst_ptr, src_ptr, size_bytes, stream_handle)
+            .map_err(|e| CudaFftError::MemoryTransfer(e))?;
+
         Ok(())
     }
     
     /// Asynchronously download data from a GPU buffer.
-    /// 
+    ///
     /// The data is available in `get_download_buffer()` after `sync_d2h()`.
     pub fn download_async(&mut self, gpu_src: &CudaSlice<u32>, len: usize) -> Result<(), CudaFftError> {
-        use cudarc::driver::sys;
-        
+        use super::compat;
+
         if len > self.download_buffer.capacity() {
             return Err(CudaFftError::InvalidSize(
                 format!("Download size ({}) exceeds buffer capacity ({})", len, self.download_buffer.capacity())
             ));
         }
-        
+
         // Set the length for later retrieval
         self.download_buffer.len = len;
-        
+
         // Get raw pointers
-        let src_ptr = gpu_src.device_ptr() as u64;
+        let src_ptr = *gpu_src.device_ptr();
         let dst_ptr = self.download_buffer.as_mut_ptr() as *mut std::ffi::c_void;
         let size_bytes = len * std::mem::size_of::<u32>();
-        
-        // Async copy using CUDA driver API
-        let stream_handle = self.d2h_stream.stream as sys::CUstream;
-        
-        let result = unsafe {
-            sys::cuMemcpyDtoHAsync_v2(dst_ptr, src_ptr, size_bytes, stream_handle)
-        };
-        
-        if result != sys::cudaError_enum::CUDA_SUCCESS {
-            return Err(CudaFftError::MemoryTransfer(
-                format!("Async D2H failed: {:?}", result)
-            ));
-        }
-        
+
+        // Async copy using CUDA driver API via compat layer
+        let stream_handle = self.d2h_stream.stream;
+
+        compat::memcpy_dtoh_async(dst_ptr, src_ptr, size_bytes, stream_handle)
+            .map_err(|e| CudaFftError::MemoryTransfer(e))?;
+
         Ok(())
     }
     

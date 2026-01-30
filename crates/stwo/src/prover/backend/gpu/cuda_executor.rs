@@ -222,28 +222,18 @@ impl Default for MemoryPressureStrategy {
 /// Query current GPU memory usage.
 #[cfg(feature = "cuda-runtime")]
 pub fn get_memory_stats() -> Result<GpuMemoryStats, CudaFftError> {
-    use cudarc::driver::sys;
-    
-    let mut free: usize = 0;
-    let mut total: usize = 0;
-    
-    let result = unsafe {
-        sys::cuMemGetInfo_v2(&mut free, &mut total)
-    };
-    
-    if result != sys::cudaError_enum::CUDA_SUCCESS {
-        return Err(CudaFftError::DriverInit(
-            format!("Failed to query memory info: {:?}", result)
-        ));
-    }
-    
+    use super::compat;
+
+    let (free, total) = compat::mem_get_info()
+        .map_err(|e| CudaFftError::DriverInit(e))?;
+
     let used = total - free;
     let utilization = if total > 0 {
         (used as f32 / total as f32) * 100.0
     } else {
         0.0
     };
-    
+
     Ok(GpuMemoryStats {
         total_bytes: total,
         free_bytes: free,
@@ -413,6 +403,17 @@ pub struct CudaFftExecutor {
     transfer_stream: Option<cudarc::driver::CudaStream>,
 }
 
+// SAFETY: CudaFftExecutor is Send+Sync because:
+// - CudaDevice is already Send+Sync (Arc-wrapped)
+// - CudaStream contains a raw CUDA stream handle that is safe to send between threads
+//   as long as we don't use it concurrently (we don't - access is serialized)
+// - CompiledKernels contains CudaFunction handles that are thread-safe
+// This is required for OnceLock<Result<CudaFftExecutor, _>> and the executor pool statics.
+#[cfg(feature = "cuda-runtime")]
+unsafe impl Send for CudaFftExecutor {}
+#[cfg(feature = "cuda-runtime")]
+unsafe impl Sync for CudaFftExecutor {}
+
 /// Compiled CUDA kernels for proof operations.
 #[cfg(feature = "cuda-runtime")]
 pub struct CompiledKernels {
@@ -553,33 +554,42 @@ impl CudaFftExecutor {
     }
     
     fn get_device_info(device: &Arc<CudaDevice>) -> Result<DeviceInfo, CudaFftError> {
-        // Query actual device attributes via cudarc's CuDevice API
-        // cudarc exposes the raw CUDA driver API through device.cu_device()
-        use cudarc::driver::sys;
-        
+        use super::compat;
+        use cudarc::driver::sys::CUdevice_attribute;
+
         let cu_device = device.cu_device();
-        
+
         // Query compute capability
-        let (major, minor) = Self::query_compute_capability(cu_device)?;
-        
-        // Query device name
-        let name = Self::query_device_name(cu_device)?;
-        
-        // Query total memory
-        let total_memory_bytes = Self::query_total_memory(cu_device)?;
-        
-        // Query SM count  
-        let multiprocessor_count = Self::query_attribute(
-            cu_device, 
-            sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT
-        )? as u32;
-        
-        // Query max threads per block
-        let max_threads_per_block = Self::query_attribute(
+        let major = compat::device_get_attribute(
             cu_device,
-            sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK
-        )? as u32;
-        
+            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR
+        ).map_err(|e| CudaFftError::DriverInit(e))? as u32;
+
+        let minor = compat::device_get_attribute(
+            cu_device,
+            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR
+        ).map_err(|e| CudaFftError::DriverInit(e))? as u32;
+
+        // Query device name
+        let name = compat::device_get_name(cu_device)
+            .unwrap_or_else(|_| "NVIDIA GPU".to_string());
+
+        // Query total memory
+        let total_memory_bytes = compat::device_total_mem(cu_device)
+            .unwrap_or(8 * 1024 * 1024 * 1024);
+
+        // Query SM count
+        let multiprocessor_count = compat::device_get_attribute(
+            cu_device,
+            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT
+        ).map_err(|e| CudaFftError::DriverInit(e))? as u32;
+
+        // Query max threads per block
+        let max_threads_per_block = compat::device_get_attribute(
+            cu_device,
+            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK
+        ).map_err(|e| CudaFftError::DriverInit(e))? as u32;
+
         Ok(DeviceInfo {
             name,
             compute_capability: (major, minor),
@@ -587,85 +597,6 @@ impl CudaFftExecutor {
             multiprocessor_count,
             max_threads_per_block,
         })
-    }
-    
-    /// Query the compute capability (SM version) of the device.
-    fn query_compute_capability(cu_device: cudarc::driver::sys::CUdevice) -> Result<(u32, u32), CudaFftError> {
-        use cudarc::driver::sys;
-        
-        let major = Self::query_attribute(
-            cu_device,
-            sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR
-        )? as u32;
-        
-        let minor = Self::query_attribute(
-            cu_device,
-            sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR
-        )? as u32;
-        
-        Ok((major, minor))
-    }
-    
-    /// Query a single integer device attribute.
-    fn query_attribute(
-        cu_device: cudarc::driver::sys::CUdevice,
-        attrib: cudarc::driver::sys::CUdevice_attribute
-    ) -> Result<i32, CudaFftError> {
-        use cudarc::driver::sys;
-        
-        let mut value: i32 = 0;
-        let result = unsafe { 
-            sys::cuDeviceGetAttribute(&mut value, attrib, cu_device) 
-        };
-        
-        if result != sys::cudaError_enum::CUDA_SUCCESS {
-            return Err(CudaFftError::DriverInit(
-                format!("Failed to query device attribute {:?}: {:?}", attrib, result)
-            ));
-        }
-        
-        Ok(value)
-    }
-    
-    /// Query the device name.
-    fn query_device_name(cu_device: cudarc::driver::sys::CUdevice) -> Result<String, CudaFftError> {
-        use cudarc::driver::sys;
-        
-        let mut name_buffer = [0i8; 256];
-        let result = unsafe {
-            sys::cuDeviceGetName(name_buffer.as_mut_ptr(), 256, cu_device)
-        };
-        
-        if result != sys::cudaError_enum::CUDA_SUCCESS {
-            // Fall back to generic name if query fails
-            return Ok("NVIDIA GPU".to_string());
-        }
-        
-        // Convert C string to Rust String
-        let name = unsafe {
-            std::ffi::CStr::from_ptr(name_buffer.as_ptr())
-                .to_string_lossy()
-                .into_owned()
-        };
-        
-        Ok(name)
-    }
-    
-    /// Query total device memory.
-    fn query_total_memory(cu_device: cudarc::driver::sys::CUdevice) -> Result<usize, CudaFftError> {
-        use cudarc::driver::sys;
-        
-        let mut total_bytes: usize = 0;
-        let result = unsafe {
-            sys::cuDeviceTotalMem_v2(&mut total_bytes, cu_device)
-        };
-        
-        if result != sys::cudaError_enum::CUDA_SUCCESS {
-            // Fall back to 8GB if query fails
-            return Ok(8 * 1024 * 1024 * 1024);
-        }
-        
-        Ok(total_bytes)
     }
     
     // =========================================================================

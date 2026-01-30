@@ -358,7 +358,7 @@ impl GpuProofPipeline {
             ));
         }
         
-        let executor = self.get_executor();
+        let executor = self.executor.clone();
         let d_data = executor.device.htod_sync_copy(data)
             .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
         
@@ -382,7 +382,7 @@ impl GpuProofPipeline {
         polynomials: impl Iterator<Item = &'a [u32]>,
     ) -> Result<usize, CudaFftError> {
         let n = 1usize << self.log_size;
-        let executor = self.get_executor();
+        let executor = self.executor.clone();
         
         // Collect all polynomial data
         let polys: Vec<&[u32]> = polynomials.collect();
@@ -436,7 +436,7 @@ impl GpuProofPipeline {
         let pool = get_pinned_pool_u32();
         let pinned = pool.acquire_with_data(data)?;
 
-        let executor = self.get_executor();
+        let executor = self.executor.clone();
 
         // Allocate GPU buffer
         let mut d_data = unsafe {
@@ -469,7 +469,7 @@ impl GpuProofPipeline {
         polynomials: impl Iterator<Item = &'a [u32]>,
     ) -> Result<usize, CudaFftError> {
         let n = 1usize << self.log_size;
-        let executor = self.get_executor();
+        let executor = self.executor.clone();
         let pool = get_pinned_pool_u32();
 
         // Collect all polynomial data
@@ -519,7 +519,7 @@ impl GpuProofPipeline {
         }
 
         let n = 1usize << self.log_size;
-        let executor = self.get_executor();
+        let executor = self.executor.clone();
         let pool = get_pinned_pool_u32();
 
         // Get pinned buffer from pool
@@ -547,7 +547,7 @@ impl GpuProofPipeline {
             return Ok(Vec::new());
         }
         
-        let executor = self.get_executor();
+        let executor = self.executor.clone();
         
         // Download each polynomial separately
         let mut results = Vec::with_capacity(num_polys);
@@ -569,8 +569,8 @@ impl GpuProofPipeline {
             ));
         }
         
-        let executor = self.get_executor();
-        
+        let executor = self.executor.clone();
+
         executor.execute_ifft_on_device(
             &mut self.poly_data[poly_idx],
             &self.itwiddles,
@@ -620,7 +620,7 @@ impl GpuProofPipeline {
             ));
         }
 
-        let executor = self.get_executor();
+        let executor = self.executor.clone();
         let block_size = 256u32;
         let num_layers = self.twiddles_cpu.len();
 
@@ -631,24 +631,24 @@ impl GpuProofPipeline {
             twiddle_offsets.push(offset);
             offset += tw.len();
         }
-        
+
         // Execute layers in reverse order for forward FFT
         for layer in (0..num_layers).rev() {
             let n_twiddles = self.twiddles_cpu[layer].len() as u32;
             let butterflies_per_twiddle = 1u32 << layer;
             let total_butterflies = n_twiddles * butterflies_per_twiddle;
             let grid_size = (total_butterflies + block_size - 1) / block_size;
-            
+
             let twiddle_offset = twiddle_offsets[layer];
-            
+
             let cfg = LaunchConfig {
                 grid_dim: (grid_size, 1, 1),
                 block_dim: (block_size, 1, 1),
                 shared_mem_bytes: 0,
             };
-            
+
             let twiddle_view = self.twiddles.slice(twiddle_offset..);
-            
+
             unsafe {
                 executor.kernels.fft_layer.clone().launch(
                     cfg,
@@ -656,7 +656,7 @@ impl GpuProofPipeline {
                 ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
             }
         }
-        
+
         executor.device.synchronize()
             .map_err(|e| CudaFftError::KernelExecution(format!("Sync failed: {:?}", e)))?;
         
@@ -671,7 +671,7 @@ impl GpuProofPipeline {
             ));
         }
         
-        let executor = self.get_executor();
+        let executor = self.executor.clone();
         let n = 1usize << self.log_size;
         let mut result = vec![0u32; n];
         executor.device.dtoh_sync_copy_into(&self.poly_data[poly_idx], &mut result)
@@ -700,7 +700,7 @@ impl GpuProofPipeline {
     
     /// Synchronize GPU operations.
     pub fn sync(&self) -> Result<(), CudaFftError> {
-        let executor = self.get_executor();
+        let executor = self.executor.clone();
         executor.device.synchronize()
             .map_err(|e| CudaFftError::KernelExecution(format!("Sync failed: {:?}", e)))
     }
@@ -724,7 +724,7 @@ impl GpuProofPipeline {
 
         // Take the data out to avoid borrow conflicts
         let mut data = std::mem::take(&mut self.poly_data[poly_idx]);
-        let result = self.get_executor().execute_denormalize_on_device(
+        let result = self.executor.clone().execute_denormalize_on_device(
             &mut data,
             denorm_factor,
             n,
@@ -778,7 +778,7 @@ impl GpuProofPipeline {
             ));
         }
         
-        let executor = self.get_executor();
+        let executor = self.executor.clone();
         let n = 1usize << self.log_size;
         let n_output = n / 2;
         
@@ -837,7 +837,7 @@ impl GpuProofPipeline {
             ));
         }
         
-        let executor = self.get_executor();
+        let executor = self.executor.clone();
         let n_output = current_n / 2;
         
         // Allocate output on GPU
@@ -900,7 +900,7 @@ impl GpuProofPipeline {
 
         // Upload twiddles and alpha (scope the borrow)
         let (d_itwiddles, d_alpha) = {
-            let executor = self.get_executor();
+            let executor = self.executor.clone();
             let d_itwiddles = executor.device.htod_sync_copy(itwiddles)
                 .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
             let d_alpha = executor.device.htod_sync_copy(alpha)
@@ -929,9 +929,9 @@ impl GpuProofPipeline {
             (&mut right[0], &left[src_idx])
         };
 
-        // Launch and sync (re-borrow executor)
+        // Launch and sync
         {
-            let executor = self.get_executor();
+            let executor = self.executor.clone();
             unsafe {
                 executor.kernels.fold_circle_into_line.clone().launch(
                     cfg,
@@ -971,7 +971,7 @@ impl GpuProofPipeline {
         
         // Upload alpha once
         let d_alpha = {
-            let executor = self.get_executor();
+            let executor = self.executor.clone();
             executor.device.htod_sync_copy(alpha)
                 .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?
         };
@@ -982,7 +982,7 @@ impl GpuProofPipeline {
         for layer in 0..num_layers {
             // Upload twiddles for this layer
             let d_itwiddles = {
-                let executor = self.get_executor();
+                let executor = self.executor.clone();
                 executor.device.htod_sync_copy(&all_itwiddles[layer])
                     .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?
             };
@@ -994,7 +994,7 @@ impl GpuProofPipeline {
 
         // Single sync at the end
         {
-            let executor = self.get_executor();
+            let executor = self.executor.clone();
             executor.device.synchronize()
                 .map_err(|e| CudaFftError::KernelExecution(format!("Sync failed: {:?}", e)))?;
         }
@@ -1021,7 +1021,7 @@ impl GpuProofPipeline {
         col_indices: &[usize],
         n_points: usize,
     ) -> Result<usize, CudaFftError> {
-        let executor = self.get_executor();
+        let executor = self.executor.clone();
         
         // Gather column data from GPU polynomials
         let n_columns = column_indices.len();
@@ -1152,7 +1152,7 @@ impl GpuProofPipeline {
         column_indices: &[usize],
         n_hashes: usize,
     ) -> Result<Vec<u8>, CudaFftError> {
-        let executor = self.get_executor();
+        let executor = self.executor.clone();
         
         let n_columns = column_indices.len();
         let n = 1usize << self.log_size;
@@ -1241,7 +1241,7 @@ impl GpuProofPipeline {
         column_indices: &[usize],
         n_leaves: usize,
     ) -> Result<[u8; 32], CudaFftError> {
-        let executor = self.get_executor();
+        let executor = self.executor.clone();
         
         let n_columns = column_indices.len();
         let n = 1usize << self.log_size;
@@ -1381,7 +1381,7 @@ impl GpuProofPipeline {
     /// # Returns
     /// New layer hashes (half the count of prev_layer)
     pub fn merkle_tree_layer(&self, prev_layer: &[u8]) -> Result<Vec<u8>, CudaFftError> {
-        let executor = self.get_executor();
+        let executor = self.executor.clone();
         
         let n_prev = prev_layer.len() / 32;
         let n_output = n_prev / 2;

@@ -50,6 +50,7 @@ use serde::{Deserialize, Serialize};
 use super::{Backend, BackendForChannel};
 use crate::core::vcs::blake2_merkle::{Blake2sM31MerkleChannel, Blake2sMerkleChannel};
 
+pub mod compat;  // cudarc 0.11+ compatibility layer
 pub mod column;
 pub mod conversion;
 pub mod fft;

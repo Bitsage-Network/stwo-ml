@@ -72,58 +72,48 @@ pub struct GpuCapabilities {
 impl GpuCapabilities {
     /// Query capabilities for a device.
     pub fn query(device_id: usize) -> Result<Self, CudaFftError> {
-        use cudarc::driver::sys;
-        
+        use super::compat;
+        use cudarc::driver::sys::CUdevice_attribute;
+
         let device = CudaDevice::new(device_id)
             .map_err(|e| CudaFftError::DriverInit(format!("{:?}", e)))?;
-        
+
         let cu_device = device.cu_device();
-        
+
         // Query compute capability
-        let mut major = 0i32;
-        let mut minor = 0i32;
-        unsafe {
-            sys::cuDeviceGetAttribute(
-                &mut major,
-                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
-                cu_device,
-            );
-            sys::cuDeviceGetAttribute(
-                &mut minor,
-                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
-                cu_device,
-            );
-        }
-        
+        let major = compat::device_get_attribute(
+            cu_device,
+            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR
+        ).map_err(|e| CudaFftError::DriverInit(e))? as u32;
+
+        let minor = compat::device_get_attribute(
+            cu_device,
+            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR
+        ).map_err(|e| CudaFftError::DriverInit(e))? as u32;
+
         // Query SM count
-        let mut sm_count = 0i32;
-        unsafe {
-            sys::cuDeviceGetAttribute(
-                &mut sm_count,
-                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
-                cu_device,
-            );
-        }
-        
+        let sm_count = compat::device_get_attribute(
+            cu_device,
+            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT
+        ).map_err(|e| CudaFftError::DriverInit(e))? as u32;
+
         // Query memory
-        let mut total_memory = 0usize;
-        unsafe {
-            sys::cuDeviceTotalMem_v2(&mut total_memory, cu_device);
-        }
-        
+        let total_memory = compat::device_total_mem(cu_device)
+            .unwrap_or(8 * 1024 * 1024 * 1024);
+
         // Estimate memory bandwidth based on architecture
-        let memory_bandwidth_gbps = Self::estimate_bandwidth(major as u32, sm_count as u32);
-        
+        let memory_bandwidth_gbps = Self::estimate_bandwidth(major, sm_count);
+
         // Tensor Cores available on Volta (SM 7.0) and later
         let has_tensor_cores = major >= 7;
-        
+
         // Calculate relative power (normalized to A100 = 1.0)
-        let relative_power = Self::calculate_relative_power(major as u32, sm_count as u32);
-        
+        let relative_power = Self::calculate_relative_power(major, sm_count);
+
         Ok(GpuCapabilities {
             device_id,
-            compute_capability: (major as u32, minor as u32),
-            sm_count: sm_count as u32,
+            compute_capability: (major, minor),
+            sm_count,
             total_memory,
             memory_bandwidth_gbps,
             has_tensor_cores,
@@ -186,16 +176,12 @@ impl GpuTopology {
     ///
     /// Queries CUDA driver for P2P capabilities and NVLink connections.
     pub fn detect() -> Result<Self, CudaFftError> {
-        use cudarc::driver::sys;
+        use super::compat;
+        use cudarc::driver::sys::CUdevice_P2PAttribute;
 
-        // Get device count
-        let mut device_count = 0i32;
-        let result = unsafe { sys::cuDeviceGetCount(&mut device_count) };
-        if result != sys::cudaError_enum::CUDA_SUCCESS {
-            return Err(CudaFftError::DriverInit(format!(
-                "Failed to get device count: {:?}", result
-            )));
-        }
+        // Get device count using compat module
+        let device_count = compat::device_get_count()
+            .map_err(|e| CudaFftError::DriverInit(e))?;
 
         let n = device_count as usize;
         if n == 0 {
@@ -215,32 +201,21 @@ impl GpuTopology {
                     continue;
                 }
 
-                // Query P2P access capability
-                let mut can_access = 0i32;
-                unsafe {
-                    sys::cuDeviceCanAccessPeer(
-                        &mut can_access,
-                        src as i32,
-                        dst as i32,
-                    );
-                }
-                p2p_access[src][dst] = can_access != 0;
+                // Query P2P access capability using compat module
+                let can_access = compat::device_can_access_peer(src as i32, dst as i32)
+                    .unwrap_or(false);
+                p2p_access[src][dst] = can_access;
 
                 // Query P2P performance attribute to detect NVLink
-                // Attribute 0 = CU_DEVICE_P2P_ATTRIBUTE_PERFORMANCE_RANK
-                let mut perf_rank = 0i32;
-                unsafe {
-                    sys::cuDeviceGetP2PAttribute(
-                        &mut perf_rank,
-                        sys::CUdevice_P2P_attribute::CU_DEVICE_P2P_ATTRIBUTE_PERFORMANCE_RANK,
-                        src as i32,
-                        dst as i32,
-                    );
-                }
+                let perf_rank = compat::device_get_p2p_attribute(
+                    CUdevice_P2PAttribute::CU_DEVICE_P2P_ATTRIBUTE_PERFORMANCE_RANK,
+                    src as i32,
+                    dst as i32,
+                ).unwrap_or(0);
 
                 // High performance rank indicates NVLink
                 // (exact threshold depends on system, but >0 typically means NVLink)
-                nvlink_connected[src][dst] = perf_rank > 0 && can_access != 0;
+                nvlink_connected[src][dst] = perf_rank > 0 && can_access;
 
                 // Estimate bandwidth based on connection type
                 bandwidth_matrix[src][dst] = if nvlink_connected[src][dst] {
@@ -353,19 +328,17 @@ impl GpuTopology {
 /// Should be called once at initialization for all GPU pairs that will communicate.
 #[cfg(feature = "cuda-runtime")]
 pub fn enable_p2p_access(src_device: usize, dst_device: usize) -> Result<bool, CudaFftError> {
-    use cudarc::driver::sys;
+    use super::compat;
 
     if src_device == dst_device {
         return Ok(true); // Same device, no P2P needed
     }
 
-    // Check if P2P is possible
-    let mut can_access = 0i32;
-    unsafe {
-        sys::cuDeviceCanAccessPeer(&mut can_access, src_device as i32, dst_device as i32);
-    }
+    // Check if P2P is possible using compat module
+    let can_access = compat::device_can_access_peer(src_device as i32, dst_device as i32)
+        .unwrap_or(false);
 
-    if can_access == 0 {
+    if !can_access {
         tracing::debug!("P2P access not possible between GPU {} and GPU {}", src_device, dst_device);
         return Ok(false);
     }
@@ -374,29 +347,21 @@ pub fn enable_p2p_access(src_device: usize, dst_device: usize) -> Result<bool, C
     let src_ctx = CudaDevice::new(src_device)
         .map_err(|e| CudaFftError::DriverInit(format!("Failed to get device {}: {:?}", src_device, e)))?;
 
-    // Enable P2P access
-    let result = unsafe {
-        // Set context to source device
-        sys::cuCtxSetCurrent(src_ctx.cu_primary_ctx());
-        sys::cuCtxEnablePeerAccess(
-            CudaDevice::new(dst_device)
-                .map_err(|e| CudaFftError::DriverInit(format!("{:?}", e)))?
-                .cu_primary_ctx(),
-            0, // flags (reserved, must be 0)
-        )
-    };
+    // Get destination device context
+    let dst_ctx = CudaDevice::new(dst_device)
+        .map_err(|e| CudaFftError::DriverInit(format!("Failed to get device {}: {:?}", dst_device, e)))?;
 
-    match result {
-        sys::cudaError_enum::CUDA_SUCCESS => {
+    // Set context to source device and enable P2P access
+    compat::ctx_set_current(src_ctx.cu_primary_ctx())
+        .map_err(|e| CudaFftError::DriverInit(e))?;
+
+    match compat::ctx_enable_peer_access(dst_ctx.cu_primary_ctx(), 0) {
+        Ok(()) => {
             tracing::info!("Enabled P2P access: GPU {} -> GPU {}", src_device, dst_device);
             Ok(true)
         }
-        sys::cudaError_enum::CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED => {
-            tracing::debug!("P2P access already enabled: GPU {} -> GPU {}", src_device, dst_device);
-            Ok(true)
-        }
-        _ => {
-            tracing::warn!("Failed to enable P2P access GPU {} -> GPU {}: {:?}", src_device, dst_device, result);
+        Err(e) => {
+            tracing::warn!("Failed to enable P2P access GPU {} -> GPU {}: {}", src_device, dst_device, e);
             Ok(false)
         }
     }
@@ -463,46 +428,30 @@ impl P2PTransfer {
         src_device: &Arc<CudaDevice>,
         dst_device: &Arc<CudaDevice>,
     ) -> Result<(), CudaFftError> {
-        use cudarc::driver::sys;
+        use super::compat;
 
         if self.p2p_enabled && self.src_device != self.dst_device {
-            // Direct P2P copy
+            // Direct P2P copy using compat module
             let size_bytes = src.len() * std::mem::size_of::<T>();
 
-            let result = unsafe {
-                sys::cuMemcpyPeer(
-                    dst.device_ptr().0 as sys::CUdeviceptr,
-                    dst_device.cu_primary_ctx(),
-                    src.device_ptr().0 as sys::CUdeviceptr,
-                    src_device.cu_primary_ctx(),
-                    size_bytes,
-                )
-            };
-
-            if result != sys::cudaError_enum::CUDA_SUCCESS {
-                return Err(CudaFftError::MemoryTransfer(format!(
-                    "P2P copy failed: {:?}", result
-                )));
-            }
+            compat::memcpy_peer(
+                dst.device_ptr().0 as compat::CUdeviceptr,
+                dst_device.cu_primary_ctx(),
+                src.device_ptr().0 as compat::CUdeviceptr,
+                src_device.cu_primary_ctx(),
+                size_bytes,
+            ).map_err(|e| CudaFftError::MemoryTransfer(e))?;
 
             Ok(())
         } else if self.src_device == self.dst_device {
             // Same device, use device-to-device copy
             let size_bytes = src.len() * std::mem::size_of::<T>();
 
-            let result = unsafe {
-                sys::cuMemcpy(
-                    dst.device_ptr().0 as sys::CUdeviceptr,
-                    src.device_ptr().0 as sys::CUdeviceptr,
-                    size_bytes,
-                )
-            };
-
-            if result != sys::cudaError_enum::CUDA_SUCCESS {
-                return Err(CudaFftError::MemoryTransfer(format!(
-                    "D2D copy failed: {:?}", result
-                )));
-            }
+            compat::memcpy_dtod(
+                dst.device_ptr().0 as compat::CUdeviceptr,
+                src.device_ptr().0 as compat::CUdeviceptr,
+                size_bytes,
+            ).map_err(|e| CudaFftError::MemoryTransfer(e))?;
 
             Ok(())
         } else {
@@ -568,29 +517,21 @@ impl AsyncP2PTransfer {
         src: &cudarc::driver::CudaSlice<T>,
         dst: &mut cudarc::driver::CudaSlice<T>,
         src_device: &Arc<CudaDevice>,
-        _dst_device: &Arc<CudaDevice>,
+        dst_device: &Arc<CudaDevice>,
     ) -> Result<(), CudaFftError> {
-        use cudarc::driver::sys;
+        use super::compat;
 
         if self.transfer.p2p_enabled {
             let size_bytes = src.len() * std::mem::size_of::<T>();
 
-            let result = unsafe {
-                sys::cuMemcpyPeerAsync(
-                    dst.device_ptr().0 as sys::CUdeviceptr,
-                    src_device.cu_primary_ctx(), // Using src context for simplicity
-                    src.device_ptr().0 as sys::CUdeviceptr,
-                    src_device.cu_primary_ctx(),
-                    size_bytes,
-                    self.stream.stream,
-                )
-            };
-
-            if result != sys::cudaError_enum::CUDA_SUCCESS {
-                return Err(CudaFftError::MemoryTransfer(format!(
-                    "Async P2P copy failed: {:?}", result
-                )));
-            }
+            compat::memcpy_peer_async(
+                dst.device_ptr().0 as compat::CUdeviceptr,
+                dst_device.cu_primary_ctx(),
+                src.device_ptr().0 as compat::CUdeviceptr,
+                src_device.cu_primary_ctx(),
+                size_bytes,
+                self.stream.stream,
+            ).map_err(|e| CudaFftError::MemoryTransfer(e))?;
         }
 
         Ok(())

@@ -80,25 +80,19 @@ struct GraphExec {
 #[cfg(feature = "cuda-runtime")]
 impl Drop for GraphExec {
     fn drop(&mut self) {
-        use cudarc::driver::sys;
+        use super::compat;
 
         // Destroy the graph exec first (depends on graph)
         if !self.raw_exec.is_null() {
-            unsafe {
-                let result = sys::cuGraphExecDestroy(self.raw_exec);
-                if result != sys::cudaError_enum::CUDA_SUCCESS {
-                    tracing::warn!("Failed to destroy CUDA graph exec: {:?}", result);
-                }
+            if let Err(e) = compat::graph_exec_destroy(self.raw_exec) {
+                tracing::warn!("Failed to destroy CUDA graph exec: {}", e);
             }
         }
 
         // Then destroy the graph
         if !self.raw_graph.is_null() {
-            unsafe {
-                let result = sys::cuGraphDestroy(self.raw_graph);
-                if result != sys::cudaError_enum::CUDA_SUCCESS {
-                    tracing::warn!("Failed to destroy CUDA graph: {:?}", result);
-                }
+            if let Err(e) = compat::graph_destroy(self.raw_graph) {
+                tracing::warn!("Failed to destroy CUDA graph: {}", e);
             }
         }
     }
@@ -127,29 +121,20 @@ impl CudaGraph {
     /// # CUDA API
     /// Uses `cuStreamBeginCapture` with `CU_STREAM_CAPTURE_MODE_GLOBAL` mode.
     pub fn begin_capture(&mut self) -> Result<(), CudaFftError> {
-        use cudarc::driver::sys;
+        use super::compat;
 
         if self.is_capturing {
             return Err(CudaFftError::KernelExecution("Already capturing".into()));
         }
 
         // Get raw stream handle from cudarc's CudaStream
-        // CudaStream exposes the raw handle via cu_stream() method
         let raw_stream = self.capture_stream.stream;
 
         // Begin stream capture with global mode (captures all work from any thread)
-        let result = unsafe {
-            sys::cuStreamBeginCapture_v2(
-                raw_stream,
-                sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL,
-            )
-        };
-
-        if result != sys::cudaError_enum::CUDA_SUCCESS {
-            return Err(CudaFftError::KernelExecution(
-                format!("cuStreamBeginCapture failed: {:?}", result)
-            ));
-        }
+        compat::stream_begin_capture(
+            raw_stream,
+            compat::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL,
+        ).map_err(|e| CudaFftError::KernelExecution(e))?;
 
         self.is_capturing = true;
         tracing::debug!("CUDA graph capture started on stream");
@@ -166,56 +151,33 @@ impl CudaGraph {
     /// Uses `cuStreamEndCapture` to get the graph, then `cuGraphInstantiate` to
     /// create an executable version.
     pub fn end_capture(&mut self) -> Result<(), CudaFftError> {
-        use cudarc::driver::sys;
+        use super::compat;
 
         if !self.is_capturing {
             return Err(CudaFftError::KernelExecution("Not capturing".into()));
         }
 
         let raw_stream = self.capture_stream.stream;
-        let mut graph: sys::CUgraph = std::ptr::null_mut();
 
         // End capture and get the graph
-        let result = unsafe {
-            sys::cuStreamEndCapture(raw_stream, &mut graph)
+        let graph = match compat::stream_end_capture(raw_stream) {
+            Ok(g) => g,
+            Err(e) => {
+                self.is_capturing = false;
+                return Err(CudaFftError::KernelExecution(e));
+            }
         };
-
-        if result != sys::cudaError_enum::CUDA_SUCCESS {
-            self.is_capturing = false;
-            return Err(CudaFftError::KernelExecution(
-                format!("cuStreamEndCapture failed: {:?}", result)
-            ));
-        }
-
-        if graph.is_null() {
-            self.is_capturing = false;
-            return Err(CudaFftError::KernelExecution(
-                "cuStreamEndCapture returned null graph".into()
-            ));
-        }
 
         // Instantiate the graph for execution
-        let mut graph_exec: sys::CUgraphExec = std::ptr::null_mut();
-
-        // cuGraphInstantiate_v2 provides better error reporting
-        let result = unsafe {
-            sys::cuGraphInstantiate_v2(
-                &mut graph_exec,
-                graph,
-                std::ptr::null_mut(),  // error node (optional)
-                std::ptr::null_mut(),  // log buffer (optional)
-                0,                      // log buffer size
-            )
+        let graph_exec = match compat::graph_instantiate(graph) {
+            Ok(ge) => ge,
+            Err(e) => {
+                // Cleanup the graph on failure
+                let _ = compat::graph_destroy(graph);
+                self.is_capturing = false;
+                return Err(CudaFftError::KernelExecution(e));
+            }
         };
-
-        if result != sys::cudaError_enum::CUDA_SUCCESS {
-            // Cleanup the graph on failure
-            unsafe { sys::cuGraphDestroy(graph); }
-            self.is_capturing = false;
-            return Err(CudaFftError::KernelExecution(
-                format!("cuGraphInstantiate failed: {:?}", result)
-            ));
-        }
 
         self.is_capturing = false;
         self.graph_exec = Some(GraphExec {
@@ -240,7 +202,7 @@ impl CudaGraph {
     /// # CUDA API
     /// Uses `cuGraphLaunch` to execute the instantiated graph.
     pub fn launch(&self) -> Result<(), CudaFftError> {
-        use cudarc::driver::sys;
+        use super::compat;
 
         let graph_exec = self.graph_exec.as_ref()
             .ok_or_else(|| CudaFftError::KernelExecution("Graph not instantiated".into()))?;
@@ -248,15 +210,8 @@ impl CudaGraph {
         let raw_stream = self.capture_stream.stream;
 
         // Launch the graph on the stream
-        let result = unsafe {
-            sys::cuGraphLaunch(graph_exec.raw_exec, raw_stream)
-        };
-
-        if result != sys::cudaError_enum::CUDA_SUCCESS {
-            return Err(CudaFftError::KernelExecution(
-                format!("cuGraphLaunch failed: {:?}", result)
-            ));
-        }
+        compat::graph_launch(graph_exec.raw_exec, raw_stream)
+            .map_err(|e| CudaFftError::KernelExecution(e))?;
 
         Ok(())
     }
@@ -273,18 +228,11 @@ impl CudaGraph {
     ///
     /// Waits for all operations on the stream (including graph launches) to complete.
     pub fn synchronize(&self) -> Result<(), CudaFftError> {
-        use cudarc::driver::sys;
+        use super::compat;
 
         let raw_stream = self.capture_stream.stream;
-        let result = unsafe {
-            sys::cuStreamSynchronize(raw_stream)
-        };
-
-        if result != sys::cudaError_enum::CUDA_SUCCESS {
-            return Err(CudaFftError::KernelExecution(
-                format!("cuStreamSynchronize failed: {:?}", result)
-            ));
-        }
+        compat::stream_synchronize(raw_stream)
+            .map_err(|e| CudaFftError::KernelExecution(e))?;
 
         Ok(())
     }
@@ -311,35 +259,26 @@ impl CudaGraph {
     ///
     /// Returns true if update was successful, false if re-capture is needed.
     pub fn try_update(&mut self) -> Result<bool, CudaFftError> {
-        use cudarc::driver::sys;
+        use super::compat;
 
         let graph_exec = match &self.graph_exec {
             Some(ge) => ge,
             None => return Ok(false),
         };
 
-        // Check if the graph can be updated in place
-        let mut update_result: sys::CUgraphExecUpdateResult =
-            sys::CUgraphExecUpdateResult::CU_GRAPH_EXEC_UPDATE_SUCCESS;
-
-        let result = unsafe {
-            sys::cuGraphExecUpdate_v2(
-                graph_exec.raw_exec,
-                graph_exec.raw_graph,
-                std::ptr::null_mut(),  // error info (optional)
-                &mut update_result,
-            )
-        };
-
-        if result != sys::cudaError_enum::CUDA_SUCCESS {
-            tracing::debug!("Graph update failed: {:?}", result);
-            return Ok(false);
-        }
-
-        match update_result {
-            sys::CUgraphExecUpdateResult::CU_GRAPH_EXEC_UPDATE_SUCCESS => Ok(true),
-            _ => {
-                tracing::debug!("Graph update result: {:?}, re-capture needed", update_result);
+        // Check if the graph can be updated in place using the compat wrapper
+        match compat::graph_exec_update(graph_exec.raw_exec, graph_exec.raw_graph) {
+            Ok(update_result) => {
+                match update_result {
+                    compat::CUgraphExecUpdateResult::CU_GRAPH_EXEC_UPDATE_SUCCESS => Ok(true),
+                    _ => {
+                        tracing::debug!("Graph update result: {:?}, re-capture needed", update_result);
+                        Ok(false)
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!("Graph update failed: {}", e);
                 Ok(false)
             }
         }
@@ -383,24 +322,13 @@ pub struct PinnedBuffer<T: Copy + Default> {
 impl<T: Copy + Default> PinnedBuffer<T> {
     /// Allocate pinned host memory for `len` elements.
     pub fn new(len: usize) -> Result<Self, CudaFftError> {
-        use cudarc::driver::sys;
+        use super::compat;
 
         let size_bytes = len * std::mem::size_of::<T>();
-        let mut ptr: *mut T = std::ptr::null_mut();
 
-        // Allocate pinned memory using CUDA runtime
-        let result = unsafe {
-            sys::cuMemAllocHost_v2(
-                &mut ptr as *mut *mut T as *mut *mut std::ffi::c_void,
-                size_bytes,
-            )
-        };
-
-        if result != sys::cudaError_enum::CUDA_SUCCESS {
-            return Err(CudaFftError::MemoryAllocation(
-                format!("Failed to allocate pinned memory: {:?}", result)
-            ));
-        }
+        // Allocate pinned memory using compat module
+        let ptr = compat::mem_alloc_host(size_bytes)
+            .map_err(|e| CudaFftError::MemoryAllocation(e))? as *mut T;
 
         // Zero-initialize
         unsafe {
@@ -456,14 +384,11 @@ impl<T: Copy + Default> PinnedBuffer<T> {
 #[cfg(feature = "cuda-runtime")]
 impl<T: Copy + Default> Drop for PinnedBuffer<T> {
     fn drop(&mut self) {
-        use cudarc::driver::sys;
+        use super::compat;
 
         if !self.ptr.is_null() {
-            unsafe {
-                let result = sys::cuMemFreeHost(self.ptr as *mut std::ffi::c_void);
-                if result != sys::cudaError_enum::CUDA_SUCCESS {
-                    tracing::warn!("Failed to free pinned memory: {:?}", result);
-                }
+            if let Err(e) = compat::mem_free_host(self.ptr as *mut std::ffi::c_void) {
+                tracing::warn!("Failed to free pinned memory: {}", e);
             }
         }
     }
@@ -1051,25 +976,21 @@ pub struct HopperCapabilities {
 impl HopperCapabilities {
     /// Detect H100 capabilities.
     pub fn detect(device: &CudaDevice) -> Result<Option<Self>, CudaFftError> {
-        use cudarc::driver::sys;
+        use super::compat;
+        use cudarc::driver::sys::CUdevice_attribute;
 
         let cu_device = device.cu_device();
 
-        // Get compute capability
-        let mut major = 0i32;
-        let mut minor = 0i32;
-        unsafe {
-            sys::cuDeviceGetAttribute(
-                &mut major,
-                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
-                cu_device,
-            );
-            sys::cuDeviceGetAttribute(
-                &mut minor,
-                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
-                cu_device,
-            );
-        }
+        // Get compute capability using compat module
+        let major = compat::device_get_attribute(
+            cu_device,
+            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR
+        ).unwrap_or(0);
+
+        let minor = compat::device_get_attribute(
+            cu_device,
+            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR
+        ).unwrap_or(0);
 
         // Hopper is SM 9.0
         if major < 9 {
@@ -1077,24 +998,16 @@ impl HopperCapabilities {
         }
 
         // Get SM count
-        let mut sm_count = 0i32;
-        unsafe {
-            sys::cuDeviceGetAttribute(
-                &mut sm_count,
-                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
-                cu_device,
-            );
-        }
+        let sm_count = compat::device_get_attribute(
+            cu_device,
+            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT
+        ).unwrap_or(0);
 
         // Get L2 cache size
-        let mut l2_cache = 0i32;
-        unsafe {
-            sys::cuDeviceGetAttribute(
-                &mut l2_cache,
-                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE,
-                cu_device,
-            );
-        }
+        let l2_cache = compat::device_get_attribute(
+            cu_device,
+            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE
+        ).unwrap_or(0);
 
         Ok(Some(Self {
             thread_block_clusters: true, // SM 9.0+ supports clusters
