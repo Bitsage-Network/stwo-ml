@@ -1217,6 +1217,11 @@ __device__ __forceinline__ QM31 qm31_zero() {
     return result;
 }
 
+__device__ __forceinline__ QM31 qm31_one() {
+    QM31 result = {1, 0, 0, 0};
+    return result;
+}
+
 __device__ __forceinline__ QM31 qm31_add(QM31 x, QM31 y) {
     QM31 result;
     result.a0 = m31_add(x.a0, y.a0);
