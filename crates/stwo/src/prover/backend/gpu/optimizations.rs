@@ -961,7 +961,7 @@ impl<T: Copy + Default + cudarc::driver::DeviceRepr> AsyncTransfer<T> {
 
     /// Wait for transfer to complete.
     pub fn wait(self) -> Result<CudaSlice<T>, CudaFftError> {
-        self.stream.device.synchronize()
+        self.gpu_slice.device().synchronize()
             .map_err(|e| CudaFftError::MemoryTransfer(format!("Sync: {:?}", e)))?;
         Ok(self.gpu_slice)
     }
