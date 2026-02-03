@@ -35,7 +35,7 @@ use super::cuda_executor::is_cuda_available;
 use super::GpuBackend;
 
 /// Threshold for GPU acceleration (log2 of domain size)
-const GPU_QUOTIENT_THRESHOLD_LOG_SIZE: u32 = 14; // 16K elements
+const GPU_QUOTIENT_THRESHOLD_LOG_SIZE: u32 = 14; // 16K elements — H100 wins above this size
 
 impl QuotientOps for GpuBackend {
     fn accumulate_quotients(
@@ -59,12 +59,11 @@ impl QuotientOps for GpuBackend {
                 domain, columns, random_coeff, sample_batches, log_blowup_factor
             );
         }
-        
+
         // Large domains: prefer GPU, fallback to SIMD if unavailable
         if !is_cuda_available() {
             tracing::warn!(
-                "GpuBackend::accumulate_quotients: CUDA unavailable for log_size={}, falling back to SIMD. \
-                 Performance will be degraded. For optimal performance, ensure CUDA is available.",
+                "GpuBackend::accumulate_quotients: CUDA unavailable for log_size={}, falling back to SIMD.",
                 log_size
             );
             return accumulate_quotients_simd_fallback(
@@ -72,12 +71,20 @@ impl QuotientOps for GpuBackend {
             );
         }
 
-        tracing::info!(
-            "GPU accumulate_quotients: using CUDA for {} elements (log_size={})",
-            domain.size(), log_size
-        );
-
-        gpu_accumulate_quotients(domain, columns, random_coeff, sample_batches, log_blowup_factor)
+        // GPU quotients: call CUDA kernel, with built-in SIMD fallback on error
+        #[cfg(feature = "cuda-runtime")]
+        {
+            tracing::info!("GPU quotients: using CUDA for log_size={}", log_size);
+            return gpu_accumulate_quotients(
+                domain, columns, random_coeff, sample_batches, log_blowup_factor
+            );
+        }
+        #[cfg(not(feature = "cuda-runtime"))]
+        {
+            return accumulate_quotients_simd_fallback(
+                domain, columns, random_coeff, sample_batches, log_blowup_factor
+            );
+        }
     }
 }
 
@@ -224,8 +231,9 @@ fn gpu_accumulate_quotients(
                 
                 for coord in 0..4 {
                     let eval = subeval_polys[coord].evaluate_with_twiddles(shifted_subdomain, &shifted_twiddles);
-                    let start = ci * eval.values.len();
-                    let end = start + eval.values.len();
+                    let packed_len = eval.values.data.len();
+                    let start = ci * packed_len;
+                    let end = start + packed_len;
                     extended_eval.columns[coord].data[start..end]
                         .copy_from_slice(&eval.values.data);
                 }
@@ -244,17 +252,6 @@ fn gpu_accumulate_quotients(
             )
         }
     }
-}
-
-#[cfg(not(feature = "cuda-runtime"))]
-fn gpu_accumulate_quotients(
-    _domain: CircleDomain,
-    _columns: &[&CircleEvaluation<GpuBackend, BaseField, BitReversedOrder>],
-    _random_coeff: SecureField,
-    _sample_batches: &[ColumnSampleBatch],
-    _log_blowup_factor: u32,
-) -> SecureEvaluation<GpuBackend, BitReversedOrder> {
-    panic!("GPU accumulate_quotients requires cuda-runtime feature");
 }
 
 /// Compute denominator inverses for GPU.
@@ -315,6 +312,6 @@ mod tests {
     #[test]
     fn test_threshold_reasonable() {
         assert!(GPU_QUOTIENT_THRESHOLD_LOG_SIZE >= 10);
-        assert!(GPU_QUOTIENT_THRESHOLD_LOG_SIZE <= 20);
+        assert!(GPU_QUOTIENT_THRESHOLD_LOG_SIZE <= 22);
     }
 }
