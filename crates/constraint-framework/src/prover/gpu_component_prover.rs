@@ -55,7 +55,7 @@ use crate::{FrameworkComponent, FrameworkEval, PREPROCESSED_TRACE_IDX};
 
 // Import GPU constraint kernel types when cuda-runtime is available
 #[cfg(feature = "cuda-runtime")]
-use stwo::prover::backend::gpu::constraints::{ConstraintKernel, ConstraintKernelConfig};
+use stwo::prover::backend::gpu::constraints::ConstraintKernel;
 
 /// Global flag to enable direct GPU constraint kernels.
 /// When disabled (default), uses SIMD-style vectorization.

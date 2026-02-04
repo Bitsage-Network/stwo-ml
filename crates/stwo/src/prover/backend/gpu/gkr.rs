@@ -24,8 +24,9 @@ use crate::prover::lookups::gkr_prover::{
 };
 use crate::prover::lookups::utils::UnivariatePoly;
 use crate::prover::lookups::mle::{Mle, MleOps};
-
+#[cfg(feature = "cuda-runtime")]
 use crate::prover::backend::Column;
+
 use super::GpuBackend;
 
 /// Minimum MLE size (log2) for GPU acceleration.

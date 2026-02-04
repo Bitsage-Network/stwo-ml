@@ -785,6 +785,7 @@ impl DistributedFft {
 ///
 /// Similar to DistributedFft, this splits FRI folding across GPUs
 /// for large polynomials.
+#[allow(dead_code)]
 #[cfg(feature = "cuda-runtime")]
 pub struct DistributedFri {
     /// Number of GPUs

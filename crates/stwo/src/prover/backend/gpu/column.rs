@@ -32,6 +32,8 @@
 //! - Minimum size for GPU benefit: 16K elements (2^14)
 //! - PCIe bandwidth: ~12 GB/s (Gen3 x16)
 
+use starknet_ff::FieldElement as FieldElement252;
+
 use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SecureField;
 use crate::core::vcs::blake2_hash::Blake2sHash;
@@ -101,6 +103,14 @@ impl ColumnOps<SecureField> for GpuBackend {
         
         use crate::prover::backend::simd::SimdBackend;
         <SimdBackend as ColumnOps<SecureField>>::bit_reverse_column(column);
+    }
+}
+
+impl ColumnOps<FieldElement252> for GpuBackend {
+    type Column = Vec<FieldElement252>;
+
+    fn bit_reverse_column(_column: &mut Self::Column) {
+        unimplemented!("GPU bit_reverse for FieldElement252 not needed for Merkle")
     }
 }
 

@@ -232,16 +232,113 @@ pub fn hash_col_to_gpu(
     col // Same type
 }
 
+// =============================================================================
+// SoA ↔ AoS Conversions for CUDA FRI Kernels
+// =============================================================================
+
+/// Convert a `SecureColumnByCoords` (SoA: 4 separate BaseColumns) to AoS
+/// layout (interleaved `[c0_i, c1_i, c2_i, c3_i, ...]`) as flat `u32`.
+///
+/// The CUDA FRI kernels expect QM31 elements packed as 4 consecutive `u32`.
+/// This uses `bytemuck`-style reinterpretation (M31 is repr(transparent)
+/// over `u32`) instead of element-by-element extraction.
+pub fn secure_column_to_aos(col: &SecureColumnByCoords<SimdBackend>, n: usize) -> Vec<u32> {
+    // Each BaseColumn stores Vec<PackedBaseField> where PackedBaseField
+    // is repr(transparent) over u32x16. We need the raw u32 values.
+    let c0 = col_data_as_u32(&col.columns[0], n);
+    let c1 = col_data_as_u32(&col.columns[1], n);
+    let c2 = col_data_as_u32(&col.columns[2], n);
+    let c3 = col_data_as_u32(&col.columns[3], n);
+
+    let mut aos = Vec::with_capacity(n * 4);
+    for i in 0..n {
+        aos.push(c0[i]);
+        aos.push(c1[i]);
+        aos.push(c2[i]);
+        aos.push(c3[i]);
+    }
+    aos
+}
+
+/// Convert AoS layout (`[c0_0, c1_0, c2_0, c3_0, c0_1, ...]`) back to
+/// `SecureColumnByCoords<SimdBackend>`.
+pub fn aos_to_secure_column(aos: &[u32], n: usize) -> SecureColumnByCoords<SimdBackend> {
+    use crate::core::fields::m31::M31;
+
+    assert_eq!(aos.len(), n * 4);
+
+    let mut c0 = Vec::with_capacity(n);
+    let mut c1 = Vec::with_capacity(n);
+    let mut c2 = Vec::with_capacity(n);
+    let mut c3 = Vec::with_capacity(n);
+
+    for i in 0..n {
+        c0.push(M31(aos[i * 4]));
+        c1.push(M31(aos[i * 4 + 1]));
+        c2.push(M31(aos[i * 4 + 2]));
+        c3.push(M31(aos[i * 4 + 3]));
+    }
+
+    SecureColumnByCoords {
+        columns: [
+            BaseColumn::from_iter(c0),
+            BaseColumn::from_iter(c1),
+            BaseColumn::from_iter(c2),
+            BaseColumn::from_iter(c3),
+        ],
+    }
+}
+
+/// Reinterpret a `BaseColumn`'s packed data as a `&[u32]` slice of length `n`.
+///
+/// `BaseColumn.data` is `Vec<PackedBaseField>` where `PackedBaseField` is
+/// `repr(transparent)` over `u32x16`. Each `u32x16` holds 16 consecutive
+/// M31 values stored as `u32`.
+fn col_data_as_u32(col: &BaseColumn, n: usize) -> &[u32] {
+    // Safety: PackedBaseField is repr(transparent) over u32x16,
+    // and M31 is repr(transparent) over u32.
+    let ptr = col.data.as_ptr() as *const u32;
+    let total = col.data.len() * 16; // 16 u32s per PackedBaseField
+    let slice = unsafe { std::slice::from_raw_parts(ptr, total) };
+    &slice[..n]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::prover::backend::Column;
-    
+
     #[test]
     fn test_base_column_identity() {
         let col = BaseColumn::zeros(100);
         let converted = base_col_ref_to_simd(&col);
         assert_eq!(col.len(), converted.len());
+    }
+
+    #[test]
+    fn test_aos_roundtrip() {
+        use crate::core::fields::m31::M31;
+
+        let n = 32; // Must be multiple of 16 for PackedBaseField alignment
+        let mut col = SecureColumnByCoords::<SimdBackend>::zeros(n);
+        // Write some test values
+        for i in 0..n {
+            let val = crate::core::fields::qm31::SecureField::from_m31(
+                M31(i as u32),
+                M31(i as u32 + 100),
+                M31(i as u32 + 200),
+                M31(i as u32 + 300),
+            );
+            col.set(i, val);
+        }
+
+        let aos = secure_column_to_aos(&col, n);
+        assert_eq!(aos.len(), n * 4);
+
+        let recovered = aos_to_secure_column(&aos, n);
+        for i in 0..n {
+            assert_eq!(col.at(i), recovered.at(i), "mismatch at index {}", i);
+        }
     }
 }
 

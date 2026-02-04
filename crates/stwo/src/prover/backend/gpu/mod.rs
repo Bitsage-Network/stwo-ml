@@ -49,6 +49,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{Backend, BackendForChannel};
 use crate::core::vcs::blake2_merkle::{Blake2sM31MerkleChannel, Blake2sMerkleChannel};
+use crate::core::vcs::poseidon252_merkle::Poseidon252MerkleChannel;
 
 pub mod compat;  // cudarc 0.11+ compatibility layer
 pub mod column;
@@ -175,6 +176,7 @@ impl Backend for GpuBackend {}
 // Implement BackendForChannel for supported Merkle channels
 impl BackendForChannel<Blake2sMerkleChannel> for GpuBackend {}
 impl BackendForChannel<Blake2sM31MerkleChannel> for GpuBackend {}
+impl BackendForChannel<Poseidon252MerkleChannel> for GpuBackend {}
 
 /// Global GPU context management.
 ///

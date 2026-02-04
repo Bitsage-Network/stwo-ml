@@ -1002,7 +1002,7 @@ impl HopperCapabilities {
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR
         ).unwrap_or(0);
 
-        let minor = compat::device_get_attribute(
+        let _minor = compat::device_get_attribute(
             *cu_device,
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR
         ).unwrap_or(0);

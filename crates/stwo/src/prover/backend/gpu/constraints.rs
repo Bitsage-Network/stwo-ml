@@ -335,6 +335,7 @@ impl Default for ConstraintKernelConfig {
 ///
 /// This struct manages CUDA kernels for constraint evaluation and provides
 /// a high-level interface for the constraint framework.
+#[allow(dead_code)]
 #[cfg(feature = "cuda-runtime")]
 pub struct ConstraintKernel {
     device: Arc<CudaDevice>,

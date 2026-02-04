@@ -348,6 +348,7 @@ impl GpuProofPipeline {
     /// 
     /// This is the primary method for accessing the executor for operations.
     /// The executor is bound to this pipeline's GPU device.
+    #[allow(dead_code)]
     #[inline]
     fn get_executor(&self) -> &CudaFftExecutor {
         &self.executor
@@ -609,9 +610,9 @@ impl GpuProofPipeline {
             }
         }
 
-        // Fall back to direct kernel execution
-        self.execute_fft_kernels(&mut self.poly_data[poly_idx].clone(), true)?;
-        Ok(())
+        // Fall back to direct kernel execution using fft_direct
+        // (fft_direct avoids the borrow conflict by using the executor clone)
+        self.fft_direct(poly_idx)
     }
 
     /// Execute FFT on a polynomial using the old direct execution path.
@@ -696,11 +697,22 @@ impl GpuProofPipeline {
     }
     
     /// Clear all polynomial data from GPU memory.
-    /// 
+    ///
     /// This allows reusing the pipeline for a new batch of polynomials
     /// while keeping the twiddles cached on GPU.
     pub fn clear_polynomials(&mut self) {
         self.poly_data.clear();
+    }
+
+    /// Take all polynomial CudaSlice data out of the pipeline.
+    /// Returns the GPU-resident data, leaving the pipeline empty.
+    pub fn take_all_poly_data(&mut self) -> Vec<CudaSlice<u32>> {
+        std::mem::take(&mut self.poly_data)
+    }
+
+    /// Get a reference to the pipeline's CUDA device.
+    pub fn device(&self) -> &Arc<cudarc::driver::CudaDevice> {
+        &self.executor.device
     }
     
     /// Synchronize GPU operations.
@@ -761,6 +773,198 @@ impl GpuProofPipeline {
         self.denormalize(poly_idx, denorm.0)
     }
     
+    // =========================================================================
+    // Batch FFT/IFFT Operations (minimizes GPU syncs)
+    // =========================================================================
+
+    /// Execute IFFT + denormalize on ALL polynomials with a single GPU sync.
+    ///
+    /// Instead of syncing after each column's IFFT (26 syncs for 26 columns),
+    /// this launches all IFFT kernels across all columns per layer, then syncs
+    /// once at the end. This eliminates ~50 unnecessary GPU synchronizations.
+    pub fn ifft_with_denormalize_batch(&mut self, poly_indices: &[usize]) -> Result<(), CudaFftError> {
+        if poly_indices.is_empty() {
+            return Ok(());
+        }
+        for &idx in poly_indices {
+            if idx >= self.poly_data.len() {
+                return Err(CudaFftError::InvalidSize(
+                    format!("Invalid polynomial index: {}", idx)
+                ));
+            }
+        }
+
+        let executor = self.executor.clone();
+        let block_size = 256u32;
+        let num_layers = self.itwiddles_cpu.len();
+        let n = 1u32 << self.log_size;
+
+        // Calculate twiddle offsets
+        let mut twiddle_offsets_cpu: Vec<u32> = Vec::new();
+        let mut offset = 0u32;
+        for tw in &self.itwiddles_cpu {
+            twiddle_offsets_cpu.push(offset);
+            offset += tw.len() as u32;
+        }
+
+        // Shared memory configuration
+        const SHMEM_ELEMENTS: u32 = 1024;
+        const SHMEM_LOG_ELEMENTS: u32 = 10;
+        const SHMEM_BLOCK_SIZE: u32 = 256;
+        let shared_mem_layers = std::cmp::min(self.log_size, SHMEM_LOG_ELEMENTS);
+        let use_shmem = shared_mem_layers > 0 && n >= SHMEM_ELEMENTS;
+
+        // Phase 1: Launch shared-memory IFFT kernel for all columns (no sync between columns)
+        if use_shmem {
+            let num_blocks = n / SHMEM_ELEMENTS;
+            let cfg = LaunchConfig {
+                grid_dim: (num_blocks, 1, 1),
+                block_dim: (SHMEM_BLOCK_SIZE, 1, 1),
+                shared_mem_bytes: SHMEM_ELEMENTS * 4,
+            };
+            for &idx in poly_indices {
+                unsafe {
+                    executor.kernels.ifft_shared_mem.clone().launch(
+                        cfg,
+                        (
+                            &mut self.poly_data[idx],
+                            &self.itwiddles,
+                            &self.twiddle_offsets,
+                            shared_mem_layers,
+                            self.log_size,
+                        ),
+                    ).map_err(|e| CudaFftError::KernelExecution(format!("Batch IFFT shmem: {:?}", e)))?;
+                }
+            }
+        }
+
+        // Phase 2: Per-layer IFFT kernels for remaining layers, all columns per layer
+        let start_layer = if use_shmem { shared_mem_layers as usize } else { 0 };
+        for layer in start_layer..num_layers {
+            let n_twiddles = self.itwiddles_cpu[layer].len() as u32;
+            let butterflies_per_twiddle = 1u32 << layer;
+            let total_butterflies = n_twiddles * butterflies_per_twiddle;
+            let grid_size = (total_butterflies + block_size - 1) / block_size;
+            let twiddle_offset = twiddle_offsets_cpu[layer] as usize;
+
+            let cfg = LaunchConfig {
+                grid_dim: (grid_size, 1, 1),
+                block_dim: (block_size, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let twiddle_view = self.itwiddles.slice(twiddle_offset..);
+
+            for &idx in poly_indices {
+                unsafe {
+                    executor.kernels.ifft_layer.clone().launch(
+                        cfg,
+                        (&mut self.poly_data[idx], &twiddle_view, layer as u32, self.log_size, n_twiddles),
+                    ).map_err(|e| CudaFftError::KernelExecution(format!("Batch IFFT layer {}: {:?}", layer, e)))?;
+                }
+            }
+        }
+
+        // Phase 3: Denormalize all columns (no sync between)
+        use crate::core::fields::m31::BaseField;
+        let denorm = BaseField::from(1u32 << self.log_size).inverse();
+        let denorm_factor = denorm.0;
+
+        if n >= 1024 && n % 4 == 0 {
+            let grid_size = (n / 4 + block_size - 1) / block_size;
+            let cfg = LaunchConfig {
+                grid_dim: (grid_size, 1, 1),
+                block_dim: (block_size, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            for &idx in poly_indices {
+                unsafe {
+                    executor.kernels.denormalize_vec4.clone().launch(
+                        cfg,
+                        (&mut self.poly_data[idx], denorm_factor, n),
+                    ).map_err(|e| CudaFftError::KernelExecution(format!("Batch denorm: {:?}", e)))?;
+                }
+            }
+        } else {
+            let grid_size = (n + block_size - 1) / block_size;
+            let cfg = LaunchConfig {
+                grid_dim: (grid_size, 1, 1),
+                block_dim: (block_size, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            for &idx in poly_indices {
+                unsafe {
+                    executor.kernels.denormalize.clone().launch(
+                        cfg,
+                        (&mut self.poly_data[idx], denorm_factor, n),
+                    ).map_err(|e| CudaFftError::KernelExecution(format!("Batch denorm: {:?}", e)))?;
+                }
+            }
+        }
+
+        // Single sync at the end — all IFFT + denormalize for all columns
+        executor.device.synchronize()
+            .map_err(|e| CudaFftError::KernelExecution(format!("Batch IFFT sync: {:?}", e)))?;
+
+        Ok(())
+    }
+
+    /// Execute FFT on ALL polynomials with a single GPU sync.
+    pub fn fft_batch(&mut self, poly_indices: &[usize]) -> Result<(), CudaFftError> {
+        if poly_indices.is_empty() {
+            return Ok(());
+        }
+        for &idx in poly_indices {
+            if idx >= self.poly_data.len() {
+                return Err(CudaFftError::InvalidSize(
+                    format!("Invalid polynomial index: {}", idx)
+                ));
+            }
+        }
+
+        let executor = self.executor.clone();
+        let block_size = 256u32;
+        let num_layers = self.twiddles_cpu.len();
+
+        // Calculate twiddle offsets
+        let mut twiddle_offsets: Vec<usize> = Vec::new();
+        let mut offset = 0usize;
+        for tw in &self.twiddles_cpu {
+            twiddle_offsets.push(offset);
+            offset += tw.len();
+        }
+
+        // Execute layers in reverse order for forward FFT, all columns per layer
+        for layer in (0..num_layers).rev() {
+            let n_twiddles = self.twiddles_cpu[layer].len() as u32;
+            let butterflies_per_twiddle = 1u32 << layer;
+            let total_butterflies = n_twiddles * butterflies_per_twiddle;
+            let grid_size = (total_butterflies + block_size - 1) / block_size;
+            let twiddle_offset = twiddle_offsets[layer];
+
+            let cfg = LaunchConfig {
+                grid_dim: (grid_size, 1, 1),
+                block_dim: (block_size, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let twiddle_view = self.twiddles.slice(twiddle_offset..);
+
+            for &idx in poly_indices {
+                unsafe {
+                    executor.kernels.fft_layer.clone().launch(
+                        cfg,
+                        (&mut self.poly_data[idx], &twiddle_view, layer as u32, self.log_size, n_twiddles),
+                    ).map_err(|e| CudaFftError::KernelExecution(format!("Batch FFT layer {}: {:?}", layer, e)))?;
+                }
+            }
+        }
+
+        // Single sync at the end
+        executor.device.synchronize()
+            .map_err(|e| CudaFftError::KernelExecution(format!("Batch FFT sync: {:?}", e)))?;
+
+        Ok(())
+    }
+
     // =========================================================================
     // FRI Folding Operations (on persistent GPU memory)
     // =========================================================================
@@ -1450,6 +1654,19 @@ impl GpuProofPipeline {
             .map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
         
         Ok(output)
+    }
+
+    /// Get a reference to a polynomial's GPU data by index.
+    pub fn poly_slice(&self, idx: usize) -> &CudaSlice<u32> {
+        &self.poly_data[idx]
+    }
+
+    /// Push an externally-allocated GPU buffer as a new polynomial.
+    /// Returns the index of the new polynomial.
+    pub fn push_external_poly(&mut self, data: CudaSlice<u32>) -> usize {
+        let idx = self.poly_data.len();
+        self.poly_data.push(data);
+        idx
     }
 }
 

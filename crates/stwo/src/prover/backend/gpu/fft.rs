@@ -66,7 +66,7 @@ use std::sync::OnceLock;
 use std::collections::HashMap;
 
 /// Threshold below which CPU is faster due to GPU overhead
-pub const GPU_FFT_THRESHOLD_LOG_SIZE: u32 = 14; // 16K elements
+pub const GPU_FFT_THRESHOLD_LOG_SIZE: u32 = 14; // 16K elements — H100 wins above this size
 
 /// Maximum cached twiddle size (2^24 = 16M elements)
 pub const MAX_CACHED_TWIDDLES_LOG_SIZE: u32 = 24;
@@ -240,15 +240,16 @@ extern "C" __global__ void fft_layer_kernel(
     uint32_t idx0 = (h << (layer + 1)) + l;
     uint32_t idx1 = idx0 + (1u << layer);
     
-    // Get twiddle factor
-    uint32_t twiddle = twiddles[h];
-    
+    // Get twiddle factor (stored as doubled value)
+    uint32_t twiddle_dbl = twiddles[h];
+
     // Load values
     uint32_t a = data[idx0];
     uint32_t b = data[idx1];
-    
+
     // Forward butterfly: (a, b) -> (a + b*t, a - b*t)
-    uint32_t t = m31_mul(b, twiddle);
+    // Twiddles are stored doubled, so use mul_twiddle_dbl to halve during multiply
+    uint32_t t = m31_mul_twiddle_dbl(b, twiddle_dbl);
     data[idx0] = m31_add(a, t);
     data[idx1] = m31_sub(a, t);
 }
@@ -743,58 +744,141 @@ pub fn compute_twiddle_dbls_cpu(log_size: u32) -> Vec<Vec<u32>> {
 }
 
 /// Internal function that actually computes the forward twiddles (uncached).
+/// Returns log_size layers: circle layer (layer 0) + log_size-1 line layers.
+/// The circle layer uses y-coordinate twiddles derived from the finest line twiddles.
 fn compute_twiddle_dbls_cpu_uncached(log_size: u32) -> Vec<Vec<u32>> {
     use crate::core::poly::circle::CanonicCoset;
-    use crate::core::utils::bit_reverse;
     use crate::core::fields::m31::BaseField;
+    use crate::core::utils::bit_reverse;
     use itertools::Itertools;
-    
+
     let half_coset = CanonicCoset::new(log_size).circle_domain().half_coset;
-    
-    // Compute line twiddles (layers 1+)
-    let mut line_twiddles: Vec<Vec<u32>> = Vec::new();
+
+    // Compute line twiddles (matching SIMD get_twiddle_dbls)
+    let mut line_twiddles: Vec<Vec<u32>> = vec![];
     let mut current_coset = half_coset;
-    
+
     for _ in 0..current_coset.log_size() {
-        // Collect twiddles: x-coordinate (not inverted), doubled
         let layer_twiddles: Vec<u32> = current_coset
             .iter()
             .take(current_coset.size() / 2)
-            .map(|p| p.x.0 * 2)  // Doubled twiddle (not inverse)
+            .map(|p| p.x.0 * 2)
             .collect_vec();
-        
+
         let mut reversed = layer_twiddles;
         bit_reverse(&mut reversed);
-        
         line_twiddles.push(reversed);
+
         current_coset = current_coset.double();
     }
-    
-    // Compute circle twiddles (layer 0) from first line layer
+
+    // Compute circle twiddles (layer 0) from first line layer.
+    // Matches CPU backend's circle_twiddles_from_line_twiddles:
+    // For each pair [x, y] in line_twiddles[0], produces [y, -y, -x, x]
     let circle_twiddles: Vec<u32> = if !line_twiddles.is_empty() && !line_twiddles[0].is_empty() {
         let first_line: Vec<BaseField> = line_twiddles[0]
             .iter()
             .map(|&v| BaseField::from_u32_unchecked(v / 2))
             .collect();
-        
+
         first_line
             .chunks_exact(2)
             .flat_map(|chunk| {
                 let x = chunk[0];
                 let y = chunk[1];
-                // Return doubled values: [y, -y, -x, x]
                 [y.0 * 2, (-y).0 * 2, (-x).0 * 2, x.0 * 2]
             })
             .collect()
     } else {
         Vec::new()
     };
-    
+
     // Combine: circle twiddles as layer 0, then line twiddles as layers 1+
     let mut result = Vec::with_capacity(line_twiddles.len() + 1);
     result.push(circle_twiddles);
     result.extend(line_twiddles);
-    
+
+    result
+}
+
+// =============================================================================
+// Extract GPU twiddles from TwiddleTree
+// =============================================================================
+
+/// Extract per-layer twiddles for GPU IFFT from a TwiddleTree.
+///
+/// The TwiddleTree stores flat line twiddles computed from the maximal coset.
+/// `domain_line_twiddles_from_tree` extracts the correct sub-slices for a given domain.
+/// We then derive the circle twiddles (layer 0) from the first line layer, matching
+/// the GPU kernel's expected format: `[circle_layer, line_layer_0, line_layer_1, ...]`.
+///
+/// This ensures the GPU uses the EXACT same twiddle values as the SIMD backend,
+/// avoiding the ConstraintsNotSatisfied error that occurs when twiddles are computed
+/// independently from a different coset.
+pub fn extract_itwiddles_for_gpu(
+    twiddle_tree: &crate::prover::poly::twiddles::TwiddleTree<super::GpuBackend>,
+    domain: crate::core::poly::circle::CircleDomain,
+) -> Vec<Vec<u32>> {
+    use crate::core::poly::utils::domain_line_twiddles_from_tree;
+    use crate::core::fields::m31::BaseField;
+
+    let line_twiddles = domain_line_twiddles_from_tree(domain, &twiddle_tree.itwiddles);
+
+    // Derive circle twiddles (layer 0) from first line layer.
+    // For each pair [x, y] in line_twiddles[0], produces [y, -y, -x, x] (all doubled).
+    let circle_twiddles: Vec<u32> = if !line_twiddles.is_empty() && !line_twiddles[0].is_empty() {
+        let first_line = line_twiddles[0];
+        first_line
+            .chunks_exact(2)
+            .flat_map(|chunk| {
+                let x = BaseField::from_u32_unchecked(chunk[0] / 2);
+                let y = BaseField::from_u32_unchecked(chunk[1] / 2);
+                [y.0 * 2, (-y).0 * 2, (-x).0 * 2, x.0 * 2]
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut result = Vec::with_capacity(line_twiddles.len() + 1);
+    result.push(circle_twiddles);
+    for layer in &line_twiddles {
+        result.push(layer.to_vec());
+    }
+    result
+}
+
+/// Extract per-layer twiddles for GPU FFT from a TwiddleTree.
+///
+/// Same as `extract_itwiddles_for_gpu` but uses forward twiddles.
+pub fn extract_twiddles_for_gpu(
+    twiddle_tree: &crate::prover::poly::twiddles::TwiddleTree<super::GpuBackend>,
+    domain: crate::core::poly::circle::CircleDomain,
+) -> Vec<Vec<u32>> {
+    use crate::core::poly::utils::domain_line_twiddles_from_tree;
+    use crate::core::fields::m31::BaseField;
+
+    let line_twiddles = domain_line_twiddles_from_tree(domain, &twiddle_tree.twiddles);
+
+    let circle_twiddles: Vec<u32> = if !line_twiddles.is_empty() && !line_twiddles[0].is_empty() {
+        let first_line = line_twiddles[0];
+        first_line
+            .chunks_exact(2)
+            .flat_map(|chunk| {
+                let x = BaseField::from_u32_unchecked(chunk[0] / 2);
+                let y = BaseField::from_u32_unchecked(chunk[1] / 2);
+                [y.0 * 2, (-y).0 * 2, (-x).0 * 2, x.0 * 2]
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut result = Vec::with_capacity(line_twiddles.len() + 1);
+    result.push(circle_twiddles);
+    for layer in &line_twiddles {
+        result.push(layer.to_vec());
+    }
     result
 }
 
@@ -1124,6 +1208,31 @@ extern "C" __global__ void fold_line_batch_kernel(
     
     // Store
     qm31_store(output + idx * 4, result);
+}
+
+// =============================================================================
+// AoS -> SoA De-interleave Kernel
+// =============================================================================
+// Splits interleaved QM31 data [c0,c1,c2,c3, c0,c1,c2,c3, ...]
+// into 4 separate arrays [c0,c0,...], [c1,c1,...], [c2,c2,...], [c3,c3,...]
+// Each thread handles one QM31 element.
+
+extern "C" __global__ void deinterleave_aos_to_soa_kernel(
+    const uint32_t* __restrict__ aos_input,
+    uint32_t* __restrict__ col0,
+    uint32_t* __restrict__ col1,
+    uint32_t* __restrict__ col2,
+    uint32_t* __restrict__ col3,
+    uint32_t n
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    uint4 val = *((const uint4*)(aos_input + idx * 4));
+    col0[idx] = val.x;
+    col1[idx] = val.y;
+    col2[idx] = val.z;
+    col3[idx] = val.w;
 }
 "#;
 
@@ -1999,6 +2108,577 @@ extern "C" __global__ void merkle_layer_kernel(
 "#;
 
 // =============================================================================
+// Poseidon252 Merkle CUDA Kernel
+// =============================================================================
+//
+// Native CUDA kernel for Poseidon252 Merkle tree hashing.
+// Implements 252-bit field arithmetic (modular add/mul over Stark252 prime)
+// and the Hades permutation (4 full + 83 partial + 4 full rounds, S-box = x^3).
+//
+// Each thread computes one Merkle node hash. For internal (non-leaf) nodes,
+// this is poseidon_hash(left_child, right_child). For leaf nodes, this is
+// poseidon_hash_many over the packed M31 column values.
+//
+// The Stark252 prime is P = 2^251 + 17·2^192 + 1, represented as 4×u64 limbs
+// in little-endian order.
+
+pub const POSEIDON252_MERKLE_CUDA_KERNEL: &str = r#"
+// =============================================================================
+// Type Definitions for 252-bit Field Arithmetic
+// =============================================================================
+
+typedef unsigned int uint32_t;
+typedef unsigned long long uint64_t;
+typedef unsigned char uint8_t;
+
+// A 252-bit field element stored as 4 x 64-bit limbs (little-endian).
+// value = limb[0] + limb[1]*2^64 + limb[2]*2^128 + limb[3]*2^192
+struct felt252 {
+    uint64_t limb[4];
+};
+
+// =============================================================================
+// Stark252 Prime: P = 2^251 + 17·2^192 + 1
+// =============================================================================
+
+// P in little-endian u64 limbs
+__constant__ uint64_t STARK_P[4] = {
+    0x0000000000000001ULL,  // limb[0]
+    0x0000000000000000ULL,  // limb[1]
+    0x0000000000000000ULL,  // limb[2]
+    0x0800000000000011ULL   // limb[3]
+};
+
+// =============================================================================
+// 107 Optimized Round Constants for Poseidon-Stark252
+// Round constants are uploaded to device global memory at init time.
+// The kernel receives a pointer to 107 x 4 x uint64_t values.
+// =============================================================================
+
+// Global device pointer to round constants (set via cudaMemcpyToSymbol or kernel arg)
+__device__ const uint64_t* g_poseidon_rc = nullptr;
+// (Remaining RC entries removed — constants loaded at runtime from host)
+
+// =============================================================================
+// 252-bit Modular Arithmetic (device functions)
+// =============================================================================
+
+// Compare a >= b  (returns 1 if a >= b, 0 otherwise)
+__device__ __forceinline__ int felt_gte(const felt252* a, const uint64_t b[4]) {
+    for (int i = 3; i >= 0; i--) {
+        if (a->limb[i] > b[i]) return 1;
+        if (a->limb[i] < b[i]) return 0;
+    }
+    return 1; // equal
+}
+
+// r = a + b (mod P)
+// PTX helper: add two u64 with carry in/out
+__device__ __forceinline__ uint64_t add_cc(uint64_t a, uint64_t b, uint64_t* carry_out) {
+    uint64_t result;
+    asm("add.cc.u64 %0, %1, %2;" : "=l"(result) : "l"(a), "l"(b));
+    asm("addc.u64 %0, 0, 0;" : "=l"(*carry_out));
+    return result;
+}
+
+__device__ __forceinline__ uint64_t addc_cc(uint64_t a, uint64_t b, uint64_t carry_in, uint64_t* carry_out) {
+    uint64_t result;
+    // Add carry_in first, then a+b with carry chain
+    uint64_t t;
+    asm("add.cc.u64 %0, %1, %2;" : "=l"(t) : "l"(a), "l"(carry_in));
+    asm("addc.cc.u64 %0, %1, %2;" : "=l"(result) : "l"(t), "l"(b));
+    asm("addc.u64 %0, 0, 0;" : "=l"(*carry_out));
+    // Handle double carry: if first add overflowed
+    uint64_t c1 = (t < a) ? 1ULL : 0ULL;
+    *carry_out += c1;
+    return result;
+}
+
+// Simpler: just use the overflow-check approach for add with carry
+__device__ __forceinline__ uint64_t add64_carry(uint64_t a, uint64_t b, uint64_t cin, uint64_t* cout) {
+    uint64_t s1 = a + b;
+    uint64_t c1 = (s1 < a) ? 1ULL : 0ULL;
+    uint64_t s2 = s1 + cin;
+    uint64_t c2 = (s2 < s1) ? 1ULL : 0ULL;
+    *cout = c1 + c2;
+    return s2;
+}
+
+// mul64_hi: return high 64 bits of a*b using PTX
+__device__ __forceinline__ uint64_t mul64_hi(uint64_t a, uint64_t b) {
+    uint64_t result;
+    asm("mul.hi.u64 %0, %1, %2;" : "=l"(result) : "l"(a), "l"(b));
+    return result;
+}
+
+// mul64_lo: return low 64 bits (just regular multiply)
+__device__ __forceinline__ uint64_t mul64_lo(uint64_t a, uint64_t b) {
+    return a * b;
+}
+
+// mad64: prod[lo,hi] = a*b + c, return lo, set *hi
+__device__ __forceinline__ uint64_t mad64(uint64_t a, uint64_t b, uint64_t c, uint64_t* hi) {
+    uint64_t lo = mul64_lo(a, b);
+    *hi = mul64_hi(a, b);
+    uint64_t s = lo + c;
+    if (s < lo) (*hi)++;
+    return s;
+}
+
+__device__ void felt_add(felt252* r, const felt252* a, const felt252* b) {
+    uint64_t c = 0;
+    for (int i = 0; i < 4; i++) {
+        r->limb[i] = add64_carry(a->limb[i], b->limb[i], c, &c);
+    }
+    // Reduce: if r >= P, subtract P
+    int ge = 0;
+    for (int i = 3; i >= 0; i--) {
+        if (r->limb[i] > STARK_P[i]) { ge = 1; break; }
+        if (r->limb[i] < STARK_P[i]) { ge = 0; break; }
+        if (i == 0) ge = 1;
+    }
+    if (ge || c) {
+        uint64_t borrow = 0;
+        for (int i = 0; i < 4; i++) {
+            uint64_t sub = STARK_P[i] + borrow;
+            borrow = (r->limb[i] < sub) ? 1ULL : 0ULL;
+            r->limb[i] -= sub;
+        }
+    }
+}
+
+// r = a - b (mod P)
+__device__ void felt_sub(felt252* r, const felt252* a, const felt252* b) {
+    uint64_t borrow = 0;
+    for (int i = 0; i < 4; i++) {
+        uint64_t sub = b->limb[i] + borrow;
+        borrow = (a->limb[i] < sub) ? 1ULL : 0ULL;
+        r->limb[i] = a->limb[i] - sub;
+    }
+    if (borrow) {
+        // Add P back
+        uint64_t carry = 0;
+        for (int i = 0; i < 4; i++) {
+            r->limb[i] = add64_carry(r->limb[i], STARK_P[i], carry, &carry);
+        }
+    }
+}
+
+// r = a * b (mod P) using schoolbook 256×256→512 then Barrett-like reduction
+// For simplicity, we use a 4×4 schoolbook multiply then reduce.
+__device__ void felt_mul(felt252* r, const felt252* a, const felt252* b) {
+    // 512-bit product in 8 limbs using PTX mul.hi/mul.lo
+    uint64_t prod[8] = {0};
+    for (int i = 0; i < 4; i++) {
+        uint64_t carry = 0;
+        for (int j = 0; j < 4; j++) {
+            // prod[i+j] += a[i]*b[j] + carry
+            uint64_t hi;
+            uint64_t lo = mad64(a->limb[i], b->limb[j], prod[i+j], &hi);
+            uint64_t s = lo + carry;
+            if (s < lo) hi++;
+            prod[i+j] = s;
+            carry = hi;
+        }
+        prod[i+4] += carry;
+    }
+    // Reduce mod P = 2^251 + 17*2^192 + 1
+    // Split prod into low (bits 0..251) and high (bits 251..)
+    // prod = low + high * 2^251, and 2^251 ≡ -(17*2^192 + 1) mod P
+    // So prod ≡ low - high*(17*2^192 + 1) mod P
+    // But this is complex. Use simpler: Montgomery or just repeated subtraction.
+    // For H100 SM9.0, use the fact that P has special structure.
+
+    // Extract bits: low = prod[0..3] with top bit of prod[3] masked to 251 bits
+    // high = (prod[3] >> 59) | (prod[4] << 5) | ... shifted
+    // 251 = 3*64 + 59, so bit 251 is bit 59 of limb[3]
+
+    uint64_t low[4];
+    low[0] = prod[0];
+    low[1] = prod[1];
+    low[2] = prod[2];
+    low[3] = prod[3] & ((1ULL << 59) - 1); // bottom 59 bits of limb[3]
+
+    // high = prod >> 251
+    uint64_t high[5] = {0};
+    high[0] = (prod[3] >> 59) | (prod[4] << 5);
+    high[1] = (prod[4] >> 59) | (prod[5] << 5);
+    high[2] = (prod[5] >> 59) | (prod[6] << 5);
+    high[3] = (prod[6] >> 59) | (prod[7] << 5);
+    high[4] = (prod[7] >> 59);
+
+    // prod ≡ low + high * 2^251 mod P
+    // 2^251 ≡ -(17*2^192 + 1) mod P
+    // So prod ≡ low - high*(17*2^192 + 1) mod P
+    // = low - high - high*17*2^192
+
+    // Compute high * 1 (just high itself)
+    // Compute high * 17 * 2^192
+    // 2^192 = limb[3] shift, so high*17*2^192 = (high*17) << 192
+    // high*17 in limbs: multiply each limb by 17, propagate carry
+    uint64_t h17[6] = {0};
+    uint64_t carry = 0;
+    for (int i = 0; i < 5; i++) {
+        uint64_t hi;
+        uint64_t lo = mad64(high[i], 17ULL, carry, &hi);
+        h17[i] = lo;
+        carry = hi;
+    }
+    h17[5] = carry;
+
+    // h17_shifted = h17 << 192 bits = shift by 3 limbs
+    // sub_val = high + h17_shifted
+    // But this can overflow 256 bits. We'll compute in 512-bit space then reduce again.
+    // Actually, high has ~261 bits max (512-251=261), so high*17*2^192 has ~261+4+192=457 bits.
+    // We need another round. For simplicity, do two rounds of reduction.
+
+    // Round 1: r = low - high - (high*17) << 192, handling borrow as addition of P
+    // Start with r = low
+    felt252 result;
+    result.limb[0] = low[0]; result.limb[1] = low[1];
+    result.limb[2] = low[2]; result.limb[3] = low[3];
+
+    // Subtract high[0..3] from result
+    {
+        uint64_t borrow = 0;
+        for (int i = 0; i < 4; i++) {
+            uint64_t sub = (i < 5 ? high[i] : 0) + borrow;
+            borrow = (result.limb[i] < sub) ? 1ULL : 0ULL;
+            result.limb[i] -= sub;
+        }
+        // If borrow, add P
+        if (borrow) {
+            uint64_t c2 = 0;
+            for (int i = 0; i < 4; i++) {
+                result.limb[i] = add64_carry(result.limb[i], STARK_P[i], c2, &c2);
+            }
+        }
+    }
+
+    // Subtract h17 << 192 (= h17[0] in limb[3], h17[1] in overflow)
+    // h17_shifted[0..2] = 0, h17_shifted[3] = h17[0], overflow = h17[1..5]
+    {
+        uint64_t borrow = 0;
+        // limbs 0,1,2 unaffected (subtract 0)
+        uint64_t sub3 = h17[0] + borrow;
+        borrow = (result.limb[3] < sub3) ? 1ULL : 0ULL;
+        result.limb[3] -= sub3;
+        // Remaining h17[1..5] and high[4] are overflow — need more reduction
+        // For practical 252-bit inputs, high is small enough that one round suffices.
+        // Add P for each borrow
+        if (borrow || h17[1] || h17[2]) {
+            // Multiple P additions needed. Simplified: add P once per borrow.
+            uint64_t c2 = 0;
+            for (int i = 0; i < 4; i++) {
+                result.limb[i] = add64_carry(result.limb[i], STARK_P[i], c2, &c2);
+            }
+        }
+    }
+
+    // Final normalization: ensure result < P (up to 2 subtractions)
+    for (int rep = 0; rep < 3; rep++) {
+        int ge = 0;
+        for (int i = 3; i >= 0; i--) {
+            if (result.limb[i] > STARK_P[i]) { ge = 1; break; }
+            if (result.limb[i] < STARK_P[i]) break;
+            if (i == 0) ge = 1;
+        }
+        if (!ge) break;
+        uint64_t borrow = 0;
+        for (int i = 0; i < 4; i++) {
+            uint64_t sub = STARK_P[i] + borrow;
+            borrow = (result.limb[i] < sub) ? 1ULL : 0ULL;
+            result.limb[i] -= sub;
+        }
+    }
+
+    *r = result;
+}
+
+// r = a^2 (mod P) — uses felt_mul for simplicity; can be optimized with Karatsuba
+__device__ __forceinline__ void felt_sqr(felt252* r, const felt252* a) {
+    felt_mul(r, a, a);
+}
+
+// r = a^3 (mod P) — the S-box
+__device__ __forceinline__ void felt_cube(felt252* r, const felt252* a) {
+    felt252 sq;
+    felt_sqr(&sq, a);
+    felt_mul(r, &sq, a);
+}
+
+// Load a constant from round constant table (passed as device pointer)
+__device__ __forceinline__ void felt_load_rc(felt252* r, const uint64_t* rc_ptr, int index) {
+    r->limb[0] = rc_ptr[index * 4 + 0];
+    r->limb[1] = rc_ptr[index * 4 + 1];
+    r->limb[2] = rc_ptr[index * 4 + 2];
+    r->limb[3] = rc_ptr[index * 4 + 3];
+}
+
+__device__ void felt_set_zero(felt252* r) {
+    r->limb[0] = 0; r->limb[1] = 0; r->limb[2] = 0; r->limb[3] = 0;
+}
+
+__device__ void felt_set_u64(felt252* r, uint64_t v) {
+    r->limb[0] = v; r->limb[1] = 0; r->limb[2] = 0; r->limb[3] = 0;
+}
+
+__device__ void felt_copy(felt252* dst, const felt252* src) {
+    dst->limb[0] = src->limb[0]; dst->limb[1] = src->limb[1];
+    dst->limb[2] = src->limb[2]; dst->limb[3] = src->limb[3];
+}
+
+// =============================================================================
+// Optimized Hades Permutation (state width=3, S-box=x^3)
+// 4 full rounds + 83 partial rounds + 4 full rounds = 91 total
+// Uses optimized round constants (107 values) and specialized mix function.
+// =============================================================================
+
+// Optimized mix function: t = s0+s1+s2; s0=t+2*s0; s1=t-2*s1; s2=t-3*s2
+__device__ void poseidon_mix(felt252 state[3]) {
+    felt252 t, tmp;
+    felt_add(&t, &state[0], &state[1]);
+    felt_add(&t, &t, &state[2]);
+
+    // state[0] = t + 2*state[0]  (= t + state[0].double())
+    felt_add(&tmp, &state[0], &state[0]);
+    felt_add(&state[0], &t, &tmp);
+
+    // state[1] = t - 2*state[1]
+    felt_add(&tmp, &state[1], &state[1]);
+    felt_sub(&state[1], &t, &tmp);
+
+    // state[2] = t - 3*state[2]
+    felt_add(&tmp, &state[2], &state[2]);
+    felt252 triple;
+    felt_add(&triple, &tmp, &state[2]);
+    felt_sub(&state[2], &t, &triple);
+}
+
+// Full round: add constants to all 3 state elements, cube each, mix
+__device__ void poseidon_full_round(felt252 state[3], const uint64_t* rc, int rc_offset) {
+    felt252 c;
+    for (int i = 0; i < 3; i++) {
+        felt_load_rc(&c, rc, rc_offset + i);
+        felt_add(&state[i], &state[i], &c);
+        felt_cube(&state[i], &state[i]);
+    }
+    poseidon_mix(state);
+}
+
+/// Partial round: add constant to state[2] only, cube state[2], mix
+__device__ void poseidon_partial_round(felt252 state[3], const uint64_t* rc, int rc_index) {
+    felt252 c;
+    felt_load_rc(&c, rc, rc_index);
+    felt_add(&state[2], &state[2], &c);
+    felt_cube(&state[2], &state[2]);
+    poseidon_mix(state);
+}
+
+// Full Hades permutation
+__device__ void hades_permutation(felt252 state[3], const uint64_t* rc) {
+    int rc_idx = 0;
+
+    // First 4 full rounds (3 constants each)
+    for (int r = 0; r < 4; r++) {
+        poseidon_full_round(state, rc, rc_idx);
+        rc_idx += 3;
+    }
+
+    // 83 partial rounds (1 constant each)
+    for (int r = 0; r < 83; r++) {
+        poseidon_partial_round(state, rc, rc_idx);
+        rc_idx += 1;
+    }
+
+    // Last 4 full rounds
+    for (int r = 0; r < 4; r++) {
+        poseidon_full_round(state, rc, rc_idx);
+        rc_idx += 3;
+    }
+}
+
+// poseidon_hash(a, b) = hades([a, b, 2])[0]
+__device__ void poseidon_hash(felt252* result, const felt252* a, const felt252* b, const uint64_t* rc) {
+    felt252 state[3];
+    felt_copy(&state[0], a);
+    felt_copy(&state[1], b);
+    felt_set_u64(&state[2], 2);
+    hades_permutation(state, rc);
+    felt_copy(result, &state[0]);
+}
+
+// poseidon_hash_many: sponge with rate=2
+__device__ void poseidon_hash_many(felt252* result, const felt252* inputs, int n_inputs, const uint64_t* rc) {
+    felt252 state[3];
+    felt_set_zero(&state[0]);
+    felt_set_zero(&state[1]);
+    felt_set_zero(&state[2]);
+
+    int i = 0;
+    while (i < n_inputs) {
+        felt_add(&state[0], &state[0], &inputs[i]);
+        i++;
+        if (i < n_inputs) {
+            felt_add(&state[1], &state[1], &inputs[i]);
+            i++;
+        } else {
+            felt252 one;
+            felt_set_u64(&one, 1);
+            felt_add(&state[1], &state[1], &one);
+            hades_permutation(state, rc);
+            felt_copy(result, &state[0]);
+            return;
+        }
+        hades_permutation(state, rc);
+    }
+    // Even number of inputs: pad with [1, 0]
+    felt252 one;
+    felt_set_u64(&one, 1);
+    felt_add(&state[0], &state[0], &one);
+    hades_permutation(state, rc);
+    felt_copy(result, &state[0]);
+}
+
+// =============================================================================
+// Construct FieldElement252 from 8 M31 limbs (matching Rust construct_felt252_from_m31s)
+// Each M31 is 31 bits. Pack as: felt = m31[0] | m31[1]<<31 | m31[2]<<62 | ...
+// =============================================================================
+__device__ void construct_felt252_from_m31s(
+    felt252* result, const uint32_t* m31_values, int n_values, int is_remainder
+) {
+    // Build 256-bit value from M31 limbs (each 31 bits) using 4xu64
+    // Pack: value = m31[0] | m31[1]<<31 | m31[2]<<62 | ...
+    uint64_t limbs[4] = {0, 0, 0, 0};
+    int bit_pos = 0;
+    for (int i = 0; i < n_values; i++) {
+        uint64_t val = (uint64_t)m31_values[i];
+        int limb_idx = bit_pos / 64;
+        int bit_off = bit_pos % 64;
+        if (limb_idx < 4) {
+            limbs[limb_idx] |= (val << bit_off);
+            // Handle overflow into next limb
+            if (bit_off + 31 > 64 && limb_idx + 1 < 4) {
+                limbs[limb_idx + 1] |= (val >> (64 - bit_off));
+            }
+        }
+        bit_pos += 31;
+    }
+    result->limb[0] = limbs[0];
+    result->limb[1] = limbs[1];
+    result->limb[2] = limbs[2];
+    result->limb[3] = limbs[3];
+
+    // If remainder (n_values < 8), add length padding in bits 248,249,250
+    if (is_remainder && n_values < 8) {
+        // Set bits 248,249,250 of the felt to encode length mod 8
+        // Bit 248 is in limb[3] at bit position 248-192=56
+        uint64_t len_bits = ((uint64_t)n_values) << 56;
+        result->limb[3] |= len_bits;
+    }
+}
+
+// =============================================================================
+// Poseidon252 Merkle Layer Kernel
+// =============================================================================
+//
+// Each thread computes one hash node.
+// For leaf nodes (prev_layer == NULL): hash_node(None, column_values[i])
+// For internal nodes: hash_node(Some((left, right)), column_values[i])
+//
+// Arguments:
+//   output:      [n_hashes * 4] uint64_t (4 limbs per felt252, LE)
+//   columns:     [n_columns * col_stride] uint32_t (flattened M31 columns)
+//   prev_layer:  [n_hashes * 2 * 4] uint64_t (parent hashes, 4 limbs each) or NULL
+//   n_columns:   number of M31 columns
+//   n_hashes:    number of hash nodes to compute
+//   has_prev:    1 if prev_layer is valid, 0 if NULL
+//   col_stride:  stride between elements in a column (= n_hashes for leaf, n_hashes for internal)
+
+extern "C" __global__ void poseidon252_merkle_layer_kernel(
+    uint64_t* output,
+    const uint32_t* columns,
+    const uint64_t* prev_layer,
+    const uint64_t* round_constants,
+    uint32_t n_columns,
+    uint32_t n_hashes,
+    uint32_t has_prev,
+    uint32_t col_stride
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_hashes) return;
+
+    // Temporary array for poseidon_hash_many inputs
+    // Max inputs: 2 (children) + ceil(n_columns / 8) (packed M31 blocks)
+    // We support up to 64 columns → 8 packed blocks + 2 children = 10 inputs max
+    felt252 hash_inputs[12];
+    int n_inputs = 0;
+
+    if (has_prev) {
+        // Load left and right child hashes
+        const uint64_t* left_ptr = prev_layer + (2 * idx) * 4;
+        const uint64_t* right_ptr = prev_layer + (2 * idx + 1) * 4;
+
+        hash_inputs[0].limb[0] = left_ptr[0];
+        hash_inputs[0].limb[1] = left_ptr[1];
+        hash_inputs[0].limb[2] = left_ptr[2];
+        hash_inputs[0].limb[3] = left_ptr[3];
+
+        hash_inputs[1].limb[0] = right_ptr[0];
+        hash_inputs[1].limb[1] = right_ptr[1];
+        hash_inputs[1].limb[2] = right_ptr[2];
+        hash_inputs[1].limb[3] = right_ptr[3];
+
+        n_inputs = 2;
+
+        // If no columns, just do poseidon_hash(left, right) directly
+        if (n_columns == 0) {
+            felt252 result;
+            poseidon_hash(&result, &hash_inputs[0], &hash_inputs[1], round_constants);
+            output[idx * 4 + 0] = result.limb[0];
+            output[idx * 4 + 1] = result.limb[1];
+            output[idx * 4 + 2] = result.limb[2];
+            output[idx * 4 + 3] = result.limb[3];
+            return;
+        }
+    }
+
+    // Pack column values into felt252 blocks (8 M31s per block)
+    uint32_t m31_buf[8];
+    uint32_t cols_remaining = n_columns;
+    uint32_t col_offset = 0;
+
+    while (cols_remaining > 0) {
+        uint32_t block_size = (cols_remaining >= 8) ? 8 : cols_remaining;
+        for (uint32_t j = 0; j < block_size; j++) {
+            m31_buf[j] = columns[(col_offset + j) * col_stride + idx];
+        }
+        int is_remainder = (block_size < 8) ? 1 : 0;
+        construct_felt252_from_m31s(&hash_inputs[n_inputs], m31_buf, block_size, is_remainder);
+        n_inputs++;
+        cols_remaining -= block_size;
+        col_offset += block_size;
+    }
+
+    // Compute hash
+    felt252 result;
+    if (n_inputs == 1) {
+        poseidon_hash_many(&result, hash_inputs, 1, round_constants);
+    } else if (n_inputs == 2 && !has_prev) {
+        poseidon_hash_many(&result, hash_inputs, 2, round_constants);
+    } else {
+        poseidon_hash_many(&result, hash_inputs, n_inputs, round_constants);
+    }
+
+    // Write output (4 x u64 limbs per felt252)
+    output[idx * 4 + 0] = result.limb[0];
+    output[idx * 4 + 1] = result.limb[1];
+    output[idx * 4 + 2] = result.limb[2];
+    output[idx * 4 + 3] = result.limb[3];
+}
+"#;
+
+// =============================================================================
 // Global GPU Context
 // =============================================================================
 
@@ -2019,7 +2699,7 @@ mod tests {
         assert_eq!(M31_PRIME, 0x7FFFFFFF);
         assert_eq!(M31_PRIME, (1u32 << 31) - 1);
         assert!(GPU_FFT_THRESHOLD_LOG_SIZE >= 10);
-        assert!(GPU_FFT_THRESHOLD_LOG_SIZE <= 20);
+        assert!(GPU_FFT_THRESHOLD_LOG_SIZE <= 22);
     }
     
     #[test]

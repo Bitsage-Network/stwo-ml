@@ -64,6 +64,15 @@ pub trait FriOps: ColumnOps<BaseField> + PolyOps + Sized + ColumnOps<SecureField
         twiddles: &TwiddleTree<Self>,
     );
 
+    /// Resolves any pending GPU→CPU transfers for a line evaluation.
+    ///
+    /// In the GPU-resident FRI pipeline, fold outputs stay on GPU during the commit phase.
+    /// This method batch-downloads the data to CPU when it's actually needed (before decommit
+    /// or last-layer interpolation). Default implementation is a no-op for CPU backends.
+    fn resolve_pending_line_evaluation(_eval: &mut LineEvaluation<Self>) {
+        // No-op for non-GPU backends
+    }
+
     /// Decomposes a FRI-space polynomial into a polynomial inside the fft-space and the
     /// remainder term.
     /// FRI-space: polynomials of total degree n/2.
@@ -123,8 +132,17 @@ impl<'a, B: FriOps + MerkleOps<MC::H>, MC: MerkleChannel> FriProver<'a, B, MC> {
         );
 
         let first_layer = Self::commit_first_layer(channel, columns);
-        let (inner_layers, last_layer_evaluation) =
+        let (mut inner_layers, mut last_layer_evaluation) =
             Self::commit_inner_layers(channel, config, columns, twiddles);
+
+        // GPU-resident FRI pipeline: batch-resolve deferred GPU→CPU transfers.
+        // During the fold loop, outputs stayed on GPU (only Merkle roots downloaded).
+        // Now download all evaluation data needed for decommitment and interpolation.
+        for layer in &mut inner_layers {
+            B::resolve_pending_line_evaluation(&mut layer.evaluation);
+        }
+        B::resolve_pending_line_evaluation(&mut last_layer_evaluation);
+
         let last_layer_poly = Self::commit_last_layer(channel, config, last_layer_evaluation);
 
         Self {
@@ -225,6 +243,17 @@ impl<'a, B: FriOps + MerkleOps<MC::H>, MC: MerkleChannel> FriProver<'a, B, MC> {
 
         let last_layer_degree_bound = 1 << config.log_last_layer_degree_bound;
         let zeros = coeffs.split_off(last_layer_degree_bound);
+        let non_zero_count = zeros.iter().filter(|x| !x.is_zero()).count();
+        if non_zero_count > 0 {
+            tracing::error!(
+                "FRI invalid degree: {} non-zero coefficients above degree bound {} (total coeffs: {})",
+                non_zero_count, last_layer_degree_bound, coeffs.len() + zeros.len()
+            );
+            // Log first few non-zero values
+            for (i, z) in zeros.iter().enumerate().filter(|(_, z)| !z.is_zero()).take(5) {
+                tracing::error!("  coeff[{}+{}] = {:?}", last_layer_degree_bound, i, z);
+            }
+        }
         assert!(zeros.iter().all(SecureField::is_zero), "invalid degree");
 
         let last_layer_poly = LinePoly::from_ordered_coefficients(coeffs);
