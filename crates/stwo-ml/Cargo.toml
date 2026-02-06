@@ -1,0 +1,32 @@
+[package]
+name = "stwo-ml"
+version = "0.1.0"
+edition = "2021"
+description = "ML inference proving circuits built on STWO Circle STARKs"
+license = "Apache-2.0"
+repository = "https://github.com/Bitsage-Network/stwo-ml"
+
+[features]
+default = ["std"]
+std = ["stwo/std"]
+gpu = ["stwo/gpu"]
+cuda-runtime = ["gpu", "stwo/cuda-runtime"]
+
+[dependencies]
+stwo = { path = "../stwo", features = ["std"] }
+stwo-constraint-framework = { path = "../constraint-framework" }
+tracing = "0.1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"], optional = true }
+
+[dev-dependencies]
+rand = "0.8"
+criterion = "0.5"
+
+[[bench]]
+name = "matmul"
+harness = false
+
+[[bench]]
+name = "attention"
+harness = false
