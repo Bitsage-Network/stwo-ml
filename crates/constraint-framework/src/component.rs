@@ -4,6 +4,7 @@ use core::ops::Deref;
 
 use hashbrown::HashMap;
 use itertools::Itertools;
+use num_traits::Zero;
 use std_shims::{vec, String, Vec};
 use stwo::core::air::accumulation::PointEvaluationAccumulator;
 use stwo::core::air::Component;
@@ -12,7 +13,7 @@ use stwo::core::constraints::coset_vanishing;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::fields::FieldExpOps;
 use stwo::core::pcs::{TreeSubspan, TreeVec};
-use stwo::core::poly::circle::CanonicCoset;
+use stwo::core::poly::circle::{CanonicCoset, MIN_CIRCLE_DOMAIN_LOG_SIZE};
 use stwo::core::utils::all_unique;
 use stwo::core::ColumnVec;
 
@@ -116,6 +117,7 @@ pub struct FrameworkComponent<C: FrameworkEval> {
     pub(super) preprocessed_column_indices: Vec<usize>,
     pub(super) claimed_sum: SecureField,
     info: InfoEvaluator,
+    is_disabled: bool,
 }
 
 impl<E: FrameworkEval> FrameworkComponent<E> {
@@ -123,6 +125,22 @@ impl<E: FrameworkEval> FrameworkComponent<E> {
         location_allocator: &mut TraceLocationAllocator,
         eval: E,
         claimed_sum: SecureField,
+    ) -> Self {
+        let is_disabled = false;
+        Self::new_ex(location_allocator, eval, claimed_sum, is_disabled)
+    }
+
+    pub fn disabled(location_allocator: &mut TraceLocationAllocator, eval: E) -> Self {
+        let claimed_sum = SecureField::zero();
+        let is_disabled = true;
+        Self::new_ex(location_allocator, eval, claimed_sum, is_disabled)
+    }
+
+    pub fn new_ex(
+        location_allocator: &mut TraceLocationAllocator,
+        eval: E,
+        claimed_sum: SecureField,
+        is_disabled: bool,
     ) -> Self {
         let info = eval.evaluate(InfoEvaluator::new(eval.log_size(), vec![], claimed_sum));
         let trace_locations = location_allocator.next_for_structure(&info.mask_offsets);
@@ -156,6 +174,7 @@ impl<E: FrameworkEval> FrameworkComponent<E> {
             info,
             preprocessed_column_indices,
             claimed_sum,
+            is_disabled,
         }
     }
 
@@ -181,6 +200,10 @@ impl<E: FrameworkEval> FrameworkComponent<E> {
                 .collect(),
         )
     }
+
+    pub fn is_disabled(&self) -> bool {
+        self.is_disabled
+    }
 }
 
 pub struct RelationCounts(HashMap<String, usize>);
@@ -198,20 +221,30 @@ impl<E: FrameworkEval> Component for FrameworkComponent<E> {
     }
 
     fn max_constraint_log_degree_bound(&self) -> u32 {
-        self.eval.max_constraint_log_degree_bound()
+        if self.is_disabled() {
+            MIN_CIRCLE_DOMAIN_LOG_SIZE
+        } else {
+            self.eval.max_constraint_log_degree_bound()
+        }
     }
 
     fn trace_log_degree_bounds(&self) -> TreeVec<ColumnVec<u32>> {
+        let log_size = if self.is_disabled() {
+            MIN_CIRCLE_DOMAIN_LOG_SIZE
+        } else {
+            self.eval.log_size()
+        };
+
         let mut log_degree_bounds = self
             .info
             .mask_offsets
             .as_ref()
-            .map(|tree_offsets| vec![self.eval.log_size(); tree_offsets.len()]);
+            .map(|tree_offsets| vec![log_size; tree_offsets.len()]);
 
         log_degree_bounds[0] = self
             .preprocessed_column_indices
             .iter()
-            .map(|_| self.eval.log_size())
+            .map(|_| log_size)
             .collect();
 
         log_degree_bounds
@@ -220,8 +253,9 @@ impl<E: FrameworkEval> Component for FrameworkComponent<E> {
     fn mask_points(
         &self,
         point: CirclePoint<SecureField>,
+        max_log_degree_bound: u32,
     ) -> TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>> {
-        let trace_step = CanonicCoset::new(self.eval.log_size()).step();
+        let trace_step = CanonicCoset::new(max_log_degree_bound).step();
         self.info.mask_offsets.as_ref().map_cols(|col_offsets| {
             col_offsets
                 .iter()
@@ -239,7 +273,14 @@ impl<E: FrameworkEval> Component for FrameworkComponent<E> {
         point: CirclePoint<SecureField>,
         mask: &TreeVec<ColumnVec<Vec<SecureField>>>,
         evaluation_accumulator: &mut PointEvaluationAccumulator,
+        max_log_degree_bound: u32,
     ) {
+        if self.is_disabled {
+            for _ in 0..self.n_constraints() {
+                evaluation_accumulator.accumulate(SecureField::zero());
+            }
+            return;
+        }
         let preprocessed_mask = self
             .preprocessed_column_indices
             .iter()
@@ -252,7 +293,7 @@ impl<E: FrameworkEval> Component for FrameworkComponent<E> {
         self.eval.evaluate(PointEvaluator::new(
             mask_points,
             evaluation_accumulator,
-            coset_vanishing(CanonicCoset::new(self.eval.log_size()).coset, point).inverse(),
+            coset_vanishing(CanonicCoset::new(max_log_degree_bound).coset, point).inverse(),
             self.eval.log_size(),
             self.claimed_sum,
         ));

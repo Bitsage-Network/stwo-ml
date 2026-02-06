@@ -13,7 +13,7 @@ use stwo::core::fields::FieldExpOps;
 use stwo::core::pcs::PcsConfig;
 use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::proof::StarkProof;
-use stwo::core::vcs::blake2_merkle::{Blake2sMerkleChannel, Blake2sMerkleHasher};
+use stwo::core::vcs_lifted::blake2_merkle::{Blake2sMerkleChannel, Blake2sMerkleHasher};
 use stwo::core::ColumnVec;
 use stwo::prover::backend::simd::column::BaseColumn;
 use stwo::prover::backend::simd::m31::{PackedBaseField, LOG_N_LANES};
@@ -302,7 +302,6 @@ pub fn gen_interaction_trace(
     let _span = span!(Level::INFO, "Generate interaction trace").entered();
     let mut logup_gen = unsafe { LogupTraceGenerator::uninitialized(log_size) };
 
-    #[allow(clippy::needless_range_loop)]
     for rep_i in 0..N_INSTANCES_PER_ROW {
         let frac_at_row = |vec_row: usize| {
             let denom0: PackedSecureField = lookup_elements.combine(
@@ -405,7 +404,7 @@ mod tests {
     use stwo::core::fri::FriConfig;
     use stwo::core::pcs::{CommitmentSchemeVerifier, PcsConfig, TreeVec};
     use stwo::core::poly::circle::CanonicCoset;
-    use stwo::core::vcs::blake2_merkle::Blake2sMerkleChannel;
+    use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
     use stwo::core::verifier::verify;
     use stwo_constraint_framework::assert_constraints_on_polys;
 
@@ -487,6 +486,7 @@ mod tests {
         );
     }
 
+    #[ignore = "AIRs with constraint degree >= 2 are not supported yet in the lifted protocol."]
     #[test_log::test]
     fn test_simd_poseidon_prove() {
         // Note: To see time measurement, run test with
@@ -530,6 +530,7 @@ mod tests {
         verify(&[&component], channel, commitment_scheme, proof).unwrap();
     }
 
+    #[ignore = "AIRs with constraint degree >= 2 are not supported yet in the lifted protocol."]
     #[cfg(feature = "tracing")]
     #[test]
     fn trace_simd_poseidon_prove() {

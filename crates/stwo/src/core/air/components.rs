@@ -27,19 +27,24 @@ impl Components<'_> {
     pub fn mask_points(
         &self,
         point: CirclePoint<SecureField>,
+        max_log_degree_bound: u32,
+        include_all_preprocessed_columns: bool,
     ) -> TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>> {
         let mut mask_points = TreeVec::concat_cols(
             self.components
                 .iter()
-                .map(|component| component.mask_points(point)),
+                .map(|component| component.mask_points(point, max_log_degree_bound)),
         );
 
         let preprocessed_mask_points = &mut mask_points[PREPROCESSED_TRACE_IDX];
-        *preprocessed_mask_points = vec![vec![]; self.n_preprocessed_columns];
-
-        for component in &self.components {
-            for idx in component.preprocessed_column_indices() {
-                preprocessed_mask_points[idx] = vec![point];
+        if include_all_preprocessed_columns {
+            *preprocessed_mask_points = vec![vec![point]; self.n_preprocessed_columns];
+        } else {
+            *preprocessed_mask_points = vec![vec![]; self.n_preprocessed_columns];
+            for component in &self.components {
+                for idx in component.preprocessed_column_indices() {
+                    preprocessed_mask_points[idx] = vec![point];
+                }
             }
         }
 
@@ -51,6 +56,7 @@ impl Components<'_> {
         point: CirclePoint<SecureField>,
         mask_values: &TreeVec<Vec<Vec<SecureField>>>,
         random_coeff: SecureField,
+        max_log_degree_bound: u32,
     ) -> SecureField {
         let mut evaluation_accumulator = PointEvaluationAccumulator::new(random_coeff);
         for component in &self.components {
@@ -58,6 +64,7 @@ impl Components<'_> {
                 point,
                 mask_values,
                 &mut evaluation_accumulator,
+                max_log_degree_bound,
             )
         }
         evaluation_accumulator.finalize()

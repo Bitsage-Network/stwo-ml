@@ -594,13 +594,16 @@ fn slow_eval_at_point(
     poly: &CircleCoefficients<SimdBackend>,
     point: CirclePoint<SecureField>,
 ) -> SecureField {
-    let mut mappings = vec![point.y, point.x];
-    let mut x = point.x;
-    for _ in 2..poly.log_size() {
-        x = CirclePoint::double_x(x);
-        mappings.push(x);
+    let mut mappings = vec![point.y];
+    if poly.log_size() > 1 {
+        mappings.push(point.x);
+        let mut x = point.x;
+        for _ in 2..poly.log_size() {
+            x = CirclePoint::double_x(x);
+            mappings.push(x);
+        }
+        mappings.reverse();
     }
-    mappings.reverse();
 
     // If the polynomial is large, the fft does a transpose in the middle.
     if poly.log_size() > CACHED_FFT_LOG_SIZE {
@@ -695,9 +698,7 @@ mod tests {
     #[test]
     fn test_simd_eval_at_point_by_folding() {
         let poly = CircleCoefficients::<SimdBackend>::new(BaseColumn::from_cpu(
-            [691, 805673, 5, 435684, 4832, 23876431, 197, 897346068]
-                .map(BaseField::from)
-                .to_vec(),
+            &[691, 805673, 5, 435684, 4832, 23876431, 197, 897346068].map(BaseField::from),
         ));
         let s = CanonicCoset::new(10);
         let domain = s.circle_domain();
@@ -828,9 +829,7 @@ mod tests {
     #[test]
     fn test_simd_barycentric_evaluation() {
         let poly = CircleCoefficients::<SimdBackend>::new(BaseColumn::from_cpu(
-            [691, 805673, 5, 435684, 4832, 23876431, 197, 897346068]
-                .map(BaseField::from)
-                .to_vec(),
+            &[691, 805673, 5, 435684, 4832, 23876431, 197, 897346068].map(BaseField::from),
         ));
         let s = CanonicCoset::new(10);
         let domain = s.circle_domain();

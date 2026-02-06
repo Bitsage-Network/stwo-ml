@@ -77,6 +77,22 @@ impl<T> TreeVec<ColumnVec<T>> {
         )
     }
 
+    #[cfg(feature = "parallel")]
+    pub fn par_map_cols<U, F>(self, f: F) -> TreeVec<ColumnVec<U>>
+    where
+        T: Send,
+        U: Send,
+        F: Fn(T) -> U + Sync + Send,
+    {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        TreeVec(
+            self.0
+                .into_par_iter()
+                .map(|column| column.into_par_iter().map(&f).collect::<Vec<_>>())
+                .collect(),
+        )
+    }
+
     /// Zips two [`TreeVec<ColumnVec<T>>`] with the same structure (number of columns in each tree).
     /// The resulting [`TreeVec<ColumnVec<T>>`] has the same structure, with each value being a
     /// tuple of the corresponding values from the input [`TreeVec<ColumnVec<T>>`].
@@ -173,4 +189,24 @@ impl<T> TreeVec<ColumnVec<Vec<T>>> {
     pub fn flatten_cols(self) -> Vec<T> {
         self.0.into_iter().flatten().flatten().collect()
     }
+}
+
+pub fn prepare_preprocessed_query_positions(
+    query_positions: &[usize],
+    max_log_size: u32,
+    pp_max_log_size: u32,
+) -> Vec<usize> {
+    if pp_max_log_size == 0 {
+        return vec![];
+    };
+    if max_log_size < pp_max_log_size {
+        return query_positions
+            .iter()
+            .map(|pos| (pos >> 1 << (pp_max_log_size - max_log_size + 1)) + (pos & 1))
+            .collect();
+    }
+    query_positions
+        .iter()
+        .map(|pos| (pos >> (max_log_size - pp_max_log_size + 1) << 1) + (pos & 1))
+        .collect()
 }
