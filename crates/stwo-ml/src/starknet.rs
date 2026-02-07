@@ -646,6 +646,154 @@ pub fn prove_attention_for_starknet(
 }
 
 // ============================================================================
+// Starknet Model Proof (full computation graph)
+// ============================================================================
+
+/// Per-node proof data serializable as Starknet calldata.
+///
+/// Each node proof is either a matmul proof (sumcheck + MLE commitments)
+/// or a component proof (type tag only — LogUp proofs verified off-chain,
+/// only matmul proofs go on-chain due to gas costs).
+#[derive(Debug, Clone)]
+pub enum StarknetNodeProof {
+    /// Input node — no proof.
+    Input,
+    /// MatMul proof with full on-chain calldata.
+    MatMul(Box<StarknetMatMulProof>),
+    /// Activation/LayerNorm/Quantize — type tag for off-chain proof reference.
+    OffChain {
+        /// Node type identifier: 1=Activation, 2=LayerNorm, 3=Quantize.
+        node_type: u32,
+    },
+}
+
+/// Complete model proof for Starknet on-chain verification.
+///
+/// The on-chain verifier checks all matmul sumcheck proofs. Activation,
+/// LayerNorm, and Quantize proofs are verified off-chain (their LogUp STARK
+/// proofs are too large for on-chain gas budgets). The model proof
+/// commits to the graph structure so the verifier knows the computation
+/// being proven.
+#[derive(Debug, Clone)]
+pub struct StarknetModelProof {
+    /// Number of nodes in the graph.
+    pub num_nodes: u32,
+    /// Per-node proofs in topological order.
+    pub node_proofs: Vec<StarknetNodeProof>,
+}
+
+impl StarknetModelProof {
+    /// Serialize the model proof to felt252 calldata.
+    ///
+    /// Layout:
+    ///   [num_nodes,
+    ///    for each node:
+    ///      node_type (0=Input, 1=MatMul, 2=Activation, 3=LayerNorm, 4=Quantize),
+    ///      if MatMul: matmul_proof_calldata...
+    ///   ]
+    pub fn to_calldata(&self) -> Vec<Felt> {
+        let mut data = vec![FieldElement252::from(self.num_nodes as u64)];
+
+        for node_proof in &self.node_proofs {
+            match node_proof {
+                StarknetNodeProof::Input => {
+                    data.push(FieldElement252::from(0u64)); // type = Input
+                }
+                StarknetNodeProof::MatMul(ref proof) => {
+                    data.push(FieldElement252::from(1u64)); // type = MatMul
+                    let matmul_calldata = proof.to_calldata();
+                    data.push(FieldElement252::from(matmul_calldata.len() as u64));
+                    data.extend_from_slice(&matmul_calldata);
+                }
+                StarknetNodeProof::OffChain { node_type } => {
+                    data.push(FieldElement252::from(*node_type as u64));
+                }
+            }
+        }
+
+        data
+    }
+
+    /// Count of on-chain verifiable proofs (matmul nodes only).
+    pub fn num_onchain_proofs(&self) -> usize {
+        self.node_proofs
+            .iter()
+            .filter(|p| matches!(p, StarknetNodeProof::MatMul(_)))
+            .count()
+    }
+}
+
+/// Generate a Starknet model proof from a computation graph.
+///
+/// Pipeline:
+/// 1. Execute graph to generate all intermediate values
+/// 2. For each MatMul node: generate full StarknetMatMulProof with Poseidon commitments
+/// 3. For other nodes: record type tag (proofs verified off-chain)
+///
+/// All MatMul proofs run with production config (no redundant local verify).
+#[instrument(skip_all, fields(num_nodes = graph.nodes().len()))]
+pub fn prove_model_for_starknet(
+    graph: &crate::compiler::graph::ComputationGraph,
+    input: &M31Matrix,
+    weights: &crate::compiler::graph::GraphWeights,
+) -> Result<StarknetModelProof, StarknetModelError> {
+    use crate::compiler::graph::{execute_graph, GraphOp};
+
+    let execution = execute_graph(graph, input, weights)
+        .map_err(StarknetModelError::Execution)?;
+    let order = execution.order.clone();
+    let config = ProverConfig::production();
+
+    let mut node_proofs = Vec::with_capacity(order.len());
+
+    for &node_id in &order {
+        let node = graph.node(node_id).unwrap();
+        let proof = match &node.op {
+            GraphOp::Input { .. } => StarknetNodeProof::Input,
+
+            GraphOp::MatMul { .. } => {
+                let pred_id = node.inputs[0];
+                let input_matrix = execution.output(pred_id)
+                    .ok_or(StarknetModelError::MissingOutput(node_id))?;
+                let weight_matrix = weights.matmul_weights.get(&node_id)
+                    .ok_or(StarknetModelError::MissingWeight(node_id))?;
+                let output_matrix = execution.output(node_id)
+                    .ok_or(StarknetModelError::MissingOutput(node_id))?;
+
+                let matmul_proof = prove_matmul_for_starknet_with_config(
+                    input_matrix, weight_matrix, output_matrix, &config,
+                )?;
+                StarknetNodeProof::MatMul(Box::new(matmul_proof))
+            }
+
+            GraphOp::Activation { .. } => StarknetNodeProof::OffChain { node_type: 2 },
+            GraphOp::LayerNorm { .. } => StarknetNodeProof::OffChain { node_type: 3 },
+            GraphOp::Quantize { .. } => StarknetNodeProof::OffChain { node_type: 4 },
+        };
+
+        node_proofs.push(proof);
+    }
+
+    Ok(StarknetModelProof {
+        num_nodes: order.len() as u32,
+        node_proofs,
+    })
+}
+
+/// Error type for Starknet model proof generation.
+#[derive(Debug, thiserror::Error)]
+pub enum StarknetModelError {
+    #[error("execution error: {0}")]
+    Execution(#[from] crate::compiler::graph::ExecutionError),
+    #[error("matmul proof error: {0}")]
+    MatMul(#[from] MatMulError),
+    #[error("missing output for node {0}")]
+    MissingOutput(usize),
+    #[error("missing weight for node {0}")]
+    MissingWeight(usize),
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1156,5 +1304,132 @@ mod tests {
         let a_padded = pad_matrix_for_mle(&a);
         let a_tree = PoseidonMerkleTree::from_m31_values(&a_padded);
         assert_eq!(proof.a_commitment, a_tree.root());
+    }
+
+    // -----------------------------------------------------------------------
+    // Starknet model proof tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_starknet_model_proof_matmul_relu() {
+        use crate::compiler::graph::{ComputationGraph, GraphOp, GraphWeights};
+
+        let graph = ComputationGraph::sequential(vec![
+            GraphOp::Input { rows: 4, cols: 4 },
+            GraphOp::MatMul {
+                weight_rows: 4,
+                weight_cols: 4,
+            },
+            GraphOp::Activation {
+                activation: ActivationType::ReLU,
+                log_table_size: 8,
+            },
+        ])
+        .unwrap();
+
+        let input = M31Matrix::from_data(
+            4, 4,
+            (0..16u32).map(|i| M31::from(i % 4)).collect(),
+        ).unwrap();
+
+        let weight = M31Matrix::from_data(
+            4, 4,
+            (0..16u32).map(|i| M31::from((i + 1) % 3)).collect(),
+        ).unwrap();
+
+        let mut weights = GraphWeights::new();
+        weights.matmul_weights.insert(1, weight);
+
+        let proof = prove_model_for_starknet(&graph, &input, &weights).unwrap();
+
+        assert_eq!(proof.num_nodes, 3);
+        assert_eq!(proof.num_onchain_proofs(), 1); // Only matmul is on-chain
+
+        // Verify calldata structure
+        let calldata = proof.to_calldata();
+        assert_eq!(calldata[0], FieldElement252::from(3u64)); // num_nodes
+        assert_eq!(calldata[1], FieldElement252::from(0u64)); // Input type
+        assert_eq!(calldata[2], FieldElement252::from(1u64)); // MatMul type
+    }
+
+    #[test]
+    fn test_starknet_model_proof_two_layer_mlp() {
+        use crate::compiler::graph::{ComputationGraph, GraphOp, GraphWeights};
+
+        let graph = ComputationGraph::sequential(vec![
+            GraphOp::Input { rows: 4, cols: 4 },
+            GraphOp::MatMul {
+                weight_rows: 4,
+                weight_cols: 4,
+            },
+            GraphOp::Activation {
+                activation: ActivationType::ReLU,
+                log_table_size: 8,
+            },
+            GraphOp::MatMul {
+                weight_rows: 4,
+                weight_cols: 4,
+            },
+        ])
+        .unwrap();
+
+        let input = M31Matrix::from_data(
+            4, 4,
+            (0..16u32).map(|i| M31::from(i % 3)).collect(),
+        ).unwrap();
+
+        let w1 = M31Matrix::from_data(
+            4, 4,
+            (0..16u32).map(|i| M31::from((i + 1) % 2)).collect(),
+        ).unwrap();
+
+        let w2 = M31Matrix::from_data(
+            4, 4,
+            (0..16u32).map(|i| M31::from(i % 2)).collect(),
+        ).unwrap();
+
+        let mut weights = GraphWeights::new();
+        weights.matmul_weights.insert(1, w1);
+        weights.matmul_weights.insert(3, w2);
+
+        let proof = prove_model_for_starknet(&graph, &input, &weights).unwrap();
+
+        assert_eq!(proof.num_nodes, 4);
+        assert_eq!(proof.num_onchain_proofs(), 2); // Two matmul proofs
+
+        let calldata = proof.to_calldata();
+        assert!(calldata.len() > 10);
+    }
+
+    #[test]
+    fn test_starknet_model_calldata_deterministic() {
+        use crate::compiler::graph::{ComputationGraph, GraphOp, GraphWeights};
+
+        let graph = ComputationGraph::sequential(vec![
+            GraphOp::Input { rows: 4, cols: 4 },
+            GraphOp::MatMul {
+                weight_rows: 4,
+                weight_cols: 4,
+            },
+        ])
+        .unwrap();
+
+        let input = M31Matrix::from_data(
+            4, 4,
+            (1..=16).map(M31::from).collect(),
+        ).unwrap();
+
+        let weight = M31Matrix::from_data(
+            4, 4,
+            (17..=32).map(M31::from).collect(),
+        ).unwrap();
+
+        let mut weights = GraphWeights::new();
+        weights.matmul_weights.insert(1, weight);
+
+        let proof1 = prove_model_for_starknet(&graph, &input, &weights).unwrap();
+        let proof2 = prove_model_for_starknet(&graph, &input, &weights).unwrap();
+
+        assert_eq!(proof1.to_calldata(), proof2.to_calldata());
     }
 }

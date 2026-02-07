@@ -42,3 +42,15 @@ harness = false
 [[bench]]
 name = "activation"
 harness = false
+
+[[bench]]
+name = "layernorm"
+harness = false
+
+[[bench]]
+name = "range_check"
+harness = false
+
+[[bench]]
+name = "model_prove"
+harness = false

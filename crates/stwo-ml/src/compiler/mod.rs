@@ -22,5 +22,6 @@
 //! Proof Generation (via stwo-gpu backend)
 //! ```
 
-pub mod onnx;
 pub mod graph;
+pub mod onnx;
+pub mod prove;
