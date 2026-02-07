@@ -22,12 +22,14 @@
 //!   Final value = claimed MLE(r)
 //! ```
 
+use rayon::prelude::*;
 use starknet_crypto::{poseidon_hash, poseidon_hash_many};
 use starknet_ff::FieldElement as FieldElement252;
 
 use stwo::core::fields::m31::M31;
 use stwo::core::fields::qm31::SecureField;
 
+use crate::backend::{batch_merkle_layer, batch_poseidon_hash_with_domain, PAR_THRESHOLD};
 use crate::components::matmul::M31Matrix;
 
 // ============================================================================
@@ -106,9 +108,7 @@ impl PoseidonMerkleTree {
 
         for i in 0..depth {
             let prev = &layers[i];
-            let next: Vec<FieldElement252> = (0..prev.len() / 2)
-                .map(|j| hash_node(prev[2 * j], prev[2 * j + 1]))
-                .collect();
+            let next = batch_merkle_layer(prev);
             layers.push(next);
         }
 
@@ -117,14 +117,23 @@ impl PoseidonMerkleTree {
 
     /// Build from M31 values (hashes each value as a leaf).
     pub fn from_m31_values(values: &[M31]) -> Self {
-        let leaf_hashes: Vec<FieldElement252> = values.iter().map(|v| hash_m31_leaf(*v)).collect();
+        let felt_values: Vec<FieldElement252> = if values.len() >= PAR_THRESHOLD {
+            values.par_iter().map(|v| m31_to_felt(*v)).collect()
+        } else {
+            values.iter().map(|v| m31_to_felt(*v)).collect()
+        };
+        let leaf_hashes = batch_poseidon_hash_with_domain(&felt_values, LEAF_DOMAIN);
         Self::from_leaf_hashes(leaf_hashes)
     }
 
     /// Build from QM31 values (hashes each value as a leaf).
     pub fn from_qm31_values(values: &[SecureField]) -> Self {
-        let leaf_hashes: Vec<FieldElement252> =
-            values.iter().map(|v| hash_qm31_leaf(*v)).collect();
+        let felt_values: Vec<FieldElement252> = if values.len() >= PAR_THRESHOLD {
+            values.par_iter().map(|v| qm31_to_felt(*v)).collect()
+        } else {
+            values.iter().map(|v| qm31_to_felt(*v)).collect()
+        };
+        let leaf_hashes = batch_poseidon_hash_with_domain(&felt_values, LEAF_DOMAIN);
         Self::from_leaf_hashes(leaf_hashes)
     }
 
@@ -242,13 +251,25 @@ pub fn commit_matrix(matrix: &M31Matrix) -> (MatrixCommitment, PoseidonMerkleTre
 /// When opening MLE at `point = [x_0, ..., x_{n-1}]`, fold with variables in **reverse** order:
 /// first fold with `x_{n-1}`, then `x_{n-2}`, ..., finally `x_0`.
 fn fold_layer(layer: &[SecureField], challenge: SecureField) -> Vec<SecureField> {
-    (0..layer.len() / 2)
-        .map(|j| {
-            let lo = layer[2 * j];
-            let hi = layer[2 * j + 1];
-            challenge * (hi - lo) + lo
-        })
-        .collect()
+    let pairs = layer.len() / 2;
+    if pairs >= PAR_THRESHOLD {
+        (0..pairs)
+            .into_par_iter()
+            .map(|j| {
+                let lo = layer[2 * j];
+                let hi = layer[2 * j + 1];
+                challenge * (hi - lo) + lo
+            })
+            .collect()
+    } else {
+        (0..pairs)
+            .map(|j| {
+                let lo = layer[2 * j];
+                let hi = layer[2 * j + 1];
+                challenge * (hi - lo) + lo
+            })
+            .collect()
+    }
 }
 
 /// Data for a single query at a single folding round.
@@ -355,9 +376,9 @@ pub fn open_mle(
     let layer0_pairs = entries.len() / 2;
     let query_indices = derive_query_indices(seed, num_queries, layer0_pairs);
 
-    // Generate query proofs
+    // Generate query proofs (parallel — each query is independent)
     let queries: Vec<QueryProof> = query_indices
-        .iter()
+        .par_iter()
         .map(|&q| generate_query_proof(q, &layers, tree, &trees, n))
         .collect();
 
