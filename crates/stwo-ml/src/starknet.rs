@@ -71,30 +71,41 @@ pub struct StarknetMatMulProof {
     pub b_opening: MleOpeningProof,
 }
 
-/// A single M31 value serialized as a 64-bit unsigned integer for Starknet calldata.
-type Felt = u64;
+/// Starknet calldata element — a native felt252.
+///
+/// Cairo `Serde` deserializes each field from `Span<felt252>`, so every element
+/// in calldata is a single felt252. Small values (u32, u64, M31) are embedded
+/// directly; Poseidon hashes use the full 252-bit range.
+type Felt = FieldElement252;
 
 impl StarknetMatMulProof {
-    /// Serialize the sumcheck portion to felt252 calldata.
+    /// Serialize the complete proof to felt252 calldata.
     ///
-    /// Layout (matching Cairo `MatMulSumcheckProof` Serde):
+    /// Each element is a native `felt252`. Layout matches Cairo `MatMulSumcheckProof`
+    /// Serde deserialization exactly:
     ///   [m, k, n, num_rounds,
-    ///    claimed_sum.a.a, claimed_sum.a.b, claimed_sum.b.a, claimed_sum.b.b,
-    ///    round_polys_len,
-    ///    round_0.c0.a.a, ..., round_0.c2.b.b,
-    ///    ...,
-    ///    final_a_eval.a.a, ..., final_b_eval.b.b]
+    ///    claimed_sum(4 QM31 components),
+    ///    round_polys_len, round_0.c0(4), round_0.c1(4), round_0.c2(4), ...,
+    ///    final_a_eval(4), final_b_eval(4),
+    ///    a_commitment(1 felt252), b_commitment(1 felt252),
+    ///    a_opening: { intermediate_roots_len, [root(1 felt252 each)...],
+    ///                 queries_len, [query: { pair_index,
+    ///                   rounds_len, [round: { left(4), right(4),
+    ///                     left_siblings_len, [sibling(1 felt252)...],
+    ///                     right_siblings_len, [sibling(1 felt252)...] }] }] ,
+    ///                 final_value(4) },
+    ///    b_opening: { ... } ]
     pub fn to_calldata(&self) -> Vec<Felt> {
         let mut data = vec![
-            self.m as Felt,
-            self.k as Felt,
-            self.n as Felt,
-            self.num_rounds as Felt,
+            FieldElement252::from(self.m as u64),
+            FieldElement252::from(self.k as u64),
+            FieldElement252::from(self.n as u64),
+            FieldElement252::from(self.num_rounds as u64),
         ];
 
         push_qm31(&mut data, self.claimed_sum);
 
-        data.push(self.round_polys.len() as Felt);
+        data.push(FieldElement252::from(self.round_polys.len() as u64));
         for round in &self.round_polys {
             push_qm31(&mut data, round[0]);
             push_qm31(&mut data, round[1]);
@@ -103,6 +114,18 @@ impl StarknetMatMulProof {
 
         push_qm31(&mut data, self.final_a_eval);
         push_qm31(&mut data, self.final_b_eval);
+
+        // a_commitment as felt252 (single felt for Cairo)
+        push_felt252(&mut data, self.a_commitment);
+
+        // b_commitment as felt252
+        push_felt252(&mut data, self.b_commitment);
+
+        // a_opening
+        push_mle_opening(&mut data, &self.a_opening);
+
+        // b_opening
+        push_mle_opening(&mut data, &self.b_opening);
 
         data
     }
@@ -170,13 +193,68 @@ impl StarknetMatMulProof {
 // Helpers
 // ============================================================================
 
-/// Push QM31 components as 4 M31 felt values.
+/// Push QM31 as 4 felt252 values (one per M31 component).
+///
+/// Cairo layout: `QM31 { a: CM31 { a: u64, b: u64 }, b: CM31 { a: u64, b: u64 } }`
+/// Serde order: a.a, a.b, b.a, b.b → 4 felt252 elements.
 fn push_qm31(data: &mut Vec<Felt>, v: SecureField) {
     let [m0, m1, m2, m3] = v.to_m31_array();
-    data.push(m0.0 as Felt);
-    data.push(m1.0 as Felt);
-    data.push(m2.0 as Felt);
-    data.push(m3.0 as Felt);
+    data.push(FieldElement252::from(m0.0 as u64));
+    data.push(FieldElement252::from(m1.0 as u64));
+    data.push(FieldElement252::from(m2.0 as u64));
+    data.push(FieldElement252::from(m3.0 as u64));
+}
+
+/// Push a felt252 as a single calldata element.
+///
+/// Cairo's `Serde` for `felt252` reads one element from `Span<felt252>`.
+fn push_felt252(data: &mut Vec<Felt>, v: FieldElement252) {
+    data.push(v);
+}
+
+/// Serialize an MLE opening proof to calldata.
+///
+/// Layout (matching Cairo `MleOpeningProof` Serde):
+///   intermediate_roots_len, [root_0(4 limbs), root_1(4 limbs), ...],
+///   queries_len, [query_0, query_1, ...],
+///   final_value(4 QM31 components)
+fn push_mle_opening(data: &mut Vec<Felt>, proof: &MleOpeningProof) {
+    // intermediate_roots: Array<felt252>
+    data.push(FieldElement252::from(proof.intermediate_roots.len() as u64));
+    for root in &proof.intermediate_roots {
+        push_felt252(data, *root);
+    }
+
+    // queries: Array<MleQueryProof>
+    data.push(FieldElement252::from(proof.queries.len() as u64));
+    for query in &proof.queries {
+        // initial_pair_index: u32
+        data.push(FieldElement252::from(query.initial_pair_index as u64));
+
+        // rounds: Array<MleQueryRoundData>
+        data.push(FieldElement252::from(query.rounds.len() as u64));
+        for round in &query.rounds {
+            // left_value: QM31
+            push_qm31(data, round.left_value);
+            // right_value: QM31
+            push_qm31(data, round.right_value);
+
+            // left_siblings: Array<felt252>
+            data.push(FieldElement252::from(round.left_proof.siblings.len() as u64));
+            for sibling in &round.left_proof.siblings {
+                push_felt252(data, *sibling);
+            }
+
+            // right_siblings: Array<felt252>
+            data.push(FieldElement252::from(round.right_proof.siblings.len() as u64));
+            for sibling in &round.right_proof.siblings {
+                push_felt252(data, *sibling);
+            }
+        }
+    }
+
+    // final_value: QM31
+    push_qm31(data, proof.final_value);
 }
 
 /// Pad a matrix to power-of-two dimensions for proper MLE layout.
@@ -493,14 +571,21 @@ mod tests {
         let proof = prove_matmul_for_starknet(&a, &b, &c).unwrap();
         let calldata = proof.to_calldata();
 
-        // 4 (m,k,n,rounds) + 4 (claimed_sum) + 1 (array_len) + rounds*12 (polys) + 8 (final evals)
-        let expected_len = 4 + 4 + 1 + (proof.num_rounds as usize) * 12 + 8;
-        assert_eq!(calldata.len(), expected_len);
+        // Now each felt252 is one element (not 4 limbs), so calldata is more compact.
+        // Base: 4 dims + 4 claimed_sum + 1 round_polys_len + rounds*12 + 8 evals
+        // + 1 a_commitment + 1 b_commitment + MLE openings
+        let sumcheck_base = 4 + 4 + 1 + (proof.num_rounds as usize) * 12 + 8;
+        assert!(calldata.len() > sumcheck_base + 2, "should include MLE openings");
 
-        assert_eq!(calldata[0], 2); // m
-        assert_eq!(calldata[1], 2); // k
-        assert_eq!(calldata[2], 2); // n
-        assert_eq!(calldata[3], 1); // num_rounds
+        let f = |v: u64| FieldElement252::from(v);
+        assert_eq!(calldata[0], f(2)); // m
+        assert_eq!(calldata[1], f(2)); // k
+        assert_eq!(calldata[2], f(2)); // n
+        assert_eq!(calldata[3], f(1)); // num_rounds
+
+        // Calldata is deterministic
+        let calldata2 = prove_matmul_for_starknet(&a, &b, &c).unwrap().to_calldata();
+        assert_eq!(calldata, calldata2);
     }
 
     #[test]
@@ -515,6 +600,159 @@ mod tests {
         // Same matrices → same commitment roots
         assert_eq!(proof1.a_commitment, proof2.a_commitment);
         assert_eq!(proof1.b_commitment, proof2.b_commitment);
+    }
+
+    #[test]
+    fn test_starknet_proof_16x16() {
+        let a = M31Matrix::from_data(16, 16, (1..=256).map(M31::from).collect()).unwrap();
+        let b = M31Matrix::from_data(16, 16, (257..=512).map(M31::from).collect()).unwrap();
+        let c = M31Matrix::multiply(&a, &b).unwrap();
+
+        let proof = prove_matmul_for_starknet(&a, &b, &c).unwrap();
+
+        assert_eq!(proof.m, 16);
+        assert_eq!(proof.k, 16);
+        assert_eq!(proof.n, 16);
+        assert_eq!(proof.num_rounds, 4); // log2(16) = 4
+        assert_eq!(proof.round_polys.len(), 4);
+        assert_ne!(proof.a_commitment, proof.b_commitment);
+
+        // Verify MLE openings locally
+        let a_padded = pad_matrix_for_mle(&a);
+        let a_tree = PoseidonMerkleTree::from_m31_values(&a_padded);
+        assert_eq!(proof.a_commitment, a_tree.root());
+    }
+
+    #[test]
+    fn test_starknet_proof_32x32() {
+        let a = M31Matrix::from_data(
+            32, 32,
+            (0..1024).map(|i| M31::from((i * 7 + 3) % 1000)).collect(),
+        ).unwrap();
+        let b = M31Matrix::from_data(
+            32, 32,
+            (0..1024).map(|i| M31::from((i * 13 + 11) % 1000)).collect(),
+        ).unwrap();
+        let c = M31Matrix::multiply(&a, &b).unwrap();
+
+        let proof = prove_matmul_for_starknet(&a, &b, &c).unwrap();
+
+        assert_eq!(proof.num_rounds, 5); // log2(32) = 5
+        assert_eq!(proof.a_opening.queries.len(), DEFAULT_NUM_QUERIES);
+        assert_eq!(proof.b_opening.queries.len(), DEFAULT_NUM_QUERIES);
+        // Each query should have 10 rounds for A (5 row + 5 col = 10 vars)
+        assert_eq!(
+            proof.a_opening.queries[0].rounds.len(),
+            10 // log2(32) + log2(32) = 10 variables
+        );
+    }
+
+    #[test]
+    fn test_starknet_proof_64x64() {
+        let a = M31Matrix::from_data(
+            64, 64,
+            (0..4096).map(|i| M31::from((i * 7 + 3) % 2147483647)).collect(),
+        ).unwrap();
+        let b = M31Matrix::from_data(
+            64, 64,
+            (0..4096).map(|i| M31::from((i * 13 + 11) % 2147483647)).collect(),
+        ).unwrap();
+        let c = M31Matrix::multiply(&a, &b).unwrap();
+
+        let proof = prove_matmul_for_starknet(&a, &b, &c).unwrap();
+
+        assert_eq!(proof.num_rounds, 6); // log2(64) = 6
+        assert_eq!(proof.a_opening.intermediate_roots.len(), 11); // 12 vars - 1
+    }
+
+    #[test]
+    fn test_starknet_proof_128x128() {
+        let a = M31Matrix::from_data(
+            128, 128,
+            (0..16384).map(|i| M31::from((i * 7 + 3) % 2147483647)).collect(),
+        ).unwrap();
+        let b = M31Matrix::from_data(
+            128, 128,
+            (0..16384).map(|i| M31::from((i * 13 + 11) % 2147483647)).collect(),
+        ).unwrap();
+        let c = M31Matrix::multiply(&a, &b).unwrap();
+
+        let proof = prove_matmul_for_starknet(&a, &b, &c).unwrap();
+
+        assert_eq!(proof.num_rounds, 7); // log2(128) = 7
+        assert_eq!(proof.round_polys.len(), 7);
+        assert_eq!(proof.a_opening.queries.len(), DEFAULT_NUM_QUERIES);
+        assert_eq!(proof.b_opening.queries.len(), DEFAULT_NUM_QUERIES);
+        // A has 14 variables (7 row + 7 col), so 13 intermediate roots
+        assert_eq!(proof.a_opening.intermediate_roots.len(), 13);
+        // Each query should have 14 rounds
+        assert_eq!(proof.a_opening.queries[0].rounds.len(), 14);
+
+        // Verify commitment roots are consistent
+        let a_padded = pad_matrix_for_mle(&a);
+        let a_tree = PoseidonMerkleTree::from_m31_values(&a_padded);
+        assert_eq!(proof.a_commitment, a_tree.root());
+
+        // Calldata should serialize
+        let calldata = proof.to_calldata();
+        assert!(calldata.len() > 100);
+    }
+
+    #[test]
+    fn test_starknet_proof_256x256() {
+        let a = M31Matrix::from_data(
+            256, 256,
+            (0..65536).map(|i| M31::from((i * 7 + 3) % 2147483647)).collect(),
+        ).unwrap();
+        let b = M31Matrix::from_data(
+            256, 256,
+            (0..65536).map(|i| M31::from((i * 13 + 11) % 2147483647)).collect(),
+        ).unwrap();
+        let c = M31Matrix::multiply(&a, &b).unwrap();
+
+        let proof = prove_matmul_for_starknet(&a, &b, &c).unwrap();
+
+        assert_eq!(proof.num_rounds, 8); // log2(256) = 8
+        assert_eq!(proof.round_polys.len(), 8);
+        assert_eq!(proof.a_opening.queries.len(), DEFAULT_NUM_QUERIES);
+        assert_eq!(proof.b_opening.queries.len(), DEFAULT_NUM_QUERIES);
+        // A has 16 variables (8 row + 8 col), so 15 intermediate roots
+        assert_eq!(proof.a_opening.intermediate_roots.len(), 15);
+
+        // Verify calldata size is reasonable
+        let calldata = proof.to_calldata();
+        assert!(calldata.len() > 200);
+    }
+
+    #[test]
+    fn test_calldata_full_serialization() {
+        // Verify calldata includes MLE opening proofs
+        let a = M31Matrix::from_data(
+            2, 2,
+            vec![M31::from(1), M31::from(2), M31::from(3), M31::from(4)],
+        ).unwrap();
+        let b = M31Matrix::from_data(
+            2, 2,
+            vec![M31::from(5), M31::from(6), M31::from(7), M31::from(8)],
+        ).unwrap();
+        let c = M31Matrix::multiply(&a, &b).unwrap();
+
+        let proof = prove_matmul_for_starknet(&a, &b, &c).unwrap();
+        let calldata = proof.to_calldata();
+
+        // Base: 4 dims + 4 claimed_sum + 1 len + rounds*12 + 8 evals + 2 commitments + openings
+        assert!(calldata.len() > 29, "calldata should include MLE openings, got len={}", calldata.len());
+
+        // First elements are still m, k, n, num_rounds
+        let f = |v: u64| FieldElement252::from(v);
+        assert_eq!(calldata[0], f(2)); // m
+        assert_eq!(calldata[1], f(2)); // k
+        assert_eq!(calldata[2], f(2)); // n
+        assert_eq!(calldata[3], f(1)); // num_rounds
+
+        // Calldata should be deterministic
+        let calldata2 = proof.to_calldata();
+        assert_eq!(calldata, calldata2);
     }
 
     #[test]
