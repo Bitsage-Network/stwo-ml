@@ -47,8 +47,28 @@ pub mod components;
 pub mod compiler;
 pub mod gadgets;
 
+/// Poseidon Merkle commitment and multilinear folding for MLE opening proofs.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod commitment;
+
+/// On-chain proof generation for Starknet's SumcheckVerifier contract.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod starknet;
+
 /// Re-export core STWO types used throughout stwo-ml.
 pub mod prelude {
-    pub use stwo::core::fields::m31::M31;
-    pub use stwo::core::fields::qm31::QM31;
+    pub use stwo::core::channel::{Blake2sChannel, Channel};
+    #[cfg(not(target_arch = "wasm32"))]
+    pub use stwo::core::channel::Poseidon252Channel;
+    pub use stwo::core::fields::m31::{BaseField, M31};
+    pub use stwo::core::fields::qm31::{QM31, SecureField};
+    pub use stwo::core::fields::Field;
+    pub use stwo::prover::backend::cpu::CpuBackend;
+    pub use stwo::prover::backend::simd::SimdBackend;
+    pub use stwo::prover::backend::{Col, Column, ColumnOps};
+    pub use stwo::prover::lookups::mle::Mle;
+    pub use stwo::prover::lookups::sumcheck::{
+        partially_verify, prove_batch, MultivariatePolyOracle, SumcheckProof,
+    };
+    pub use stwo::prover::lookups::utils::UnivariatePoly;
 }

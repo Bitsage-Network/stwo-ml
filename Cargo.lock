@@ -1428,8 +1428,12 @@ name = "stwo-ml"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "itertools 0.12.1",
+ "num-traits",
  "rand",
  "serde",
+ "starknet-crypto",
+ "starknet-ff",
  "stwo",
  "stwo-constraint-framework",
  "thiserror",
