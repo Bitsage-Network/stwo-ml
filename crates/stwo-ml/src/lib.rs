@@ -47,6 +47,10 @@ pub mod components;
 pub mod compiler;
 pub mod gadgets;
 
+/// Backend abstraction for CPU/GPU-accelerated Poseidon Merkle operations.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod backend;
+
 /// Poseidon Merkle commitment and multilinear folding for MLE opening proofs.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod commitment;

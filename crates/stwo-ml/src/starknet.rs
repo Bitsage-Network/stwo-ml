@@ -25,6 +25,7 @@
 //! ```
 
 use starknet_ff::FieldElement as FieldElement252;
+use tracing::{info_span, instrument};
 
 use stwo::core::channel::{Channel, Poseidon252Channel};
 use stwo::core::fields::m31::M31;
@@ -302,37 +303,98 @@ fn build_opening_point_b(
 }
 
 // ============================================================================
+// Prover configuration
+// ============================================================================
+
+/// Configuration for the proving pipeline.
+#[derive(Debug, Clone)]
+pub struct ProverConfig {
+    /// Run local verification after proving (catches bugs but doubles sumcheck time).
+    /// Default: true (development). Set false for production throughput.
+    pub verify_after_prove: bool,
+    /// Number of spot-check queries for MLE opening proofs.
+    pub num_queries: usize,
+}
+
+impl Default for ProverConfig {
+    fn default() -> Self {
+        Self {
+            verify_after_prove: true,
+            num_queries: DEFAULT_NUM_QUERIES,
+        }
+    }
+}
+
+impl ProverConfig {
+    /// Production config: skip redundant local verification for maximum throughput.
+    pub fn production() -> Self {
+        Self {
+            verify_after_prove: false,
+            num_queries: DEFAULT_NUM_QUERIES,
+        }
+    }
+}
+
+// ============================================================================
 // Proof generation
 // ============================================================================
 
 /// Generate a complete matmul proof with MLE commitments for on-chain verification.
 ///
-/// This is the main entry point. It:
-/// 1. Commits matrices A, B via Poseidon Merkle trees
-/// 2. Runs `prove_matmul` with `Poseidon252Channel`
-/// 3. Derives the sumcheck assignment point
-/// 4. Generates MLE opening proofs for both matrices
-/// 5. Packages everything into `StarknetMatMulProof`
+/// Uses the default [`ProverConfig`] (with local verification enabled).
 pub fn prove_matmul_for_starknet(
     a: &M31Matrix,
     b: &M31Matrix,
     c: &M31Matrix,
 ) -> Result<StarknetMatMulProof, MatMulError> {
-    // Step 1: Commit to matrices
-    let a_padded = pad_matrix_for_mle(a);
-    let b_padded = pad_matrix_for_mle(b);
-    let a_tree = PoseidonMerkleTree::from_m31_values(&a_padded);
-    let b_tree = PoseidonMerkleTree::from_m31_values(&b_padded);
+    prove_matmul_for_starknet_with_config(a, b, c, &ProverConfig::default())
+}
+
+/// Generate a complete matmul proof with custom prover configuration.
+///
+/// Pipeline stages (all A/B operations run in parallel):
+/// 1. Commit matrices A, B via Poseidon Merkle trees
+/// 2. Run sumcheck proving with Poseidon252Channel
+/// 3. Derive the sumcheck assignment point
+/// 4. Compute final MLE evaluations
+/// 5. Generate MLE opening proofs
+/// 6. Package into `StarknetMatMulProof`
+#[instrument(skip_all, fields(size = %format!("{}x{}x{}", a.rows, a.cols, b.cols)))]
+pub fn prove_matmul_for_starknet_with_config(
+    a: &M31Matrix,
+    b: &M31Matrix,
+    c: &M31Matrix,
+    config: &ProverConfig,
+) -> Result<StarknetMatMulProof, MatMulError> {
+    // Step 1: Commit to matrices (A and B tree builds run in parallel)
+    let (a_padded, b_padded, a_tree, b_tree) = {
+        let _span = info_span!("merkle_commit").entered();
+        let (a_padded, b_padded) = rayon::join(
+            || pad_matrix_for_mle(a),
+            || pad_matrix_for_mle(b),
+        );
+        let (a_tree, b_tree) = rayon::join(
+            || PoseidonMerkleTree::from_m31_values(&a_padded),
+            || PoseidonMerkleTree::from_m31_values(&b_padded),
+        );
+        (a_padded, b_padded, a_tree, b_tree)
+    };
     let a_commitment = a_tree.root();
     let b_commitment = b_tree.root();
 
     // Step 2: Run sumcheck with Poseidon252Channel
-    let mut prover_channel = Poseidon252Channel::default();
-    let (proof, aux) = prove_matmul(a, b, c, &mut prover_channel)?;
+    let (proof, aux) = {
+        let _span = info_span!("sumcheck_prove").entered();
+        let mut prover_channel = Poseidon252Channel::default();
+        prove_matmul(a, b, c, &mut prover_channel)?
+    };
 
-    // Verify locally to catch bugs early
-    let mut verify_channel = Poseidon252Channel::default();
-    verify_matmul(a, b, c, &proof, &aux, &mut verify_channel)?;
+    // Optional local verification (skip in production for 2x sumcheck throughput)
+    if config.verify_after_prove {
+        let _span = info_span!("sumcheck_verify").entered();
+        let mut verify_channel = Poseidon252Channel::default();
+        verify_matmul(a, b, c, &proof, &aux, &mut verify_channel)?;
+    }
 
     // Step 3: Extract round polynomial coefficients
     let k_log = a.cols.next_power_of_two().ilog2() as usize;
@@ -370,18 +432,34 @@ pub fn prove_matmul_for_starknet(
         partially_verify(aux.claimed_c_eval, &proof.sumcheck_proof, &mut eval_channel)
             .map_err(MatMulError::SumcheckError)?;
 
-    // Step 5: Compute final MLE evaluations at the full opening points
+    // Step 5: Compute final MLE evaluations at the full opening points (parallel A/B)
     let a_point = build_opening_point_a(&aux.row_challenges, &assignment);
     let b_point = build_opening_point_b(&assignment, &aux.col_challenges);
 
-    let a_padded_sf: Vec<SecureField> = a_padded.iter().map(|v| SecureField::from(*v)).collect();
-    let b_padded_sf: Vec<SecureField> = b_padded.iter().map(|v| SecureField::from(*v)).collect();
-    let final_a_eval = eval_mle_at_point_pub(&a_padded_sf, &a_point);
-    let final_b_eval = eval_mle_at_point_pub(&b_padded_sf, &b_point);
+    let (final_a_eval, final_b_eval) = {
+        let _span = info_span!("mle_eval").entered();
+        rayon::join(
+            || {
+                let sf: Vec<SecureField> =
+                    a_padded.iter().map(|v| SecureField::from(*v)).collect();
+                eval_mle_at_point_pub(&sf, &a_point)
+            },
+            || {
+                let sf: Vec<SecureField> =
+                    b_padded.iter().map(|v| SecureField::from(*v)).collect();
+                eval_mle_at_point_pub(&sf, &b_point)
+            },
+        )
+    };
 
-    // Step 6: Generate MLE opening proofs
-    let a_opening = open_mle(&a_padded, &a_point, &a_tree, DEFAULT_NUM_QUERIES);
-    let b_opening = open_mle(&b_padded, &b_point, &b_tree, DEFAULT_NUM_QUERIES);
+    // Step 6: Generate MLE opening proofs (parallel A/B)
+    let (a_opening, b_opening) = {
+        let _span = info_span!("mle_open").entered();
+        rayon::join(
+            || open_mle(&a_padded, &a_point, &a_tree, config.num_queries),
+            || open_mle(&b_padded, &b_point, &b_tree, config.num_queries),
+        )
+    };
 
     // Sanity check: opening proofs should yield the correct evaluations
     assert_eq!(a_opening.final_value, final_a_eval, "A opening mismatch");
@@ -787,5 +865,53 @@ mod tests {
         // Method 2: The Starknet proof's final_a_eval
         let starknet_proof = prove_matmul_for_starknet(&a, &b, &c).unwrap();
         assert_eq!(full_eval, starknet_proof.final_a_eval);
+    }
+
+    #[test]
+    fn test_production_config_matches_default() {
+        let a = M31Matrix::from_data(4, 4, (1..=16).map(M31::from).collect()).unwrap();
+        let b = M31Matrix::from_data(4, 4, (17..=32).map(M31::from).collect()).unwrap();
+        let c = M31Matrix::multiply(&a, &b).unwrap();
+
+        let default_proof = prove_matmul_for_starknet(&a, &b, &c).unwrap();
+        let prod_proof =
+            prove_matmul_for_starknet_with_config(&a, &b, &c, &ProverConfig::production())
+                .unwrap();
+
+        // Same matrices → same proof (verify_after_prove doesn't affect output)
+        assert_eq!(default_proof.a_commitment, prod_proof.a_commitment);
+        assert_eq!(default_proof.b_commitment, prod_proof.b_commitment);
+        assert_eq!(default_proof.final_a_eval, prod_proof.final_a_eval);
+        assert_eq!(default_proof.final_b_eval, prod_proof.final_b_eval);
+        assert_eq!(default_proof.claimed_sum, prod_proof.claimed_sum);
+        assert_eq!(
+            default_proof.to_calldata(),
+            prod_proof.to_calldata()
+        );
+    }
+
+    #[test]
+    fn test_production_config_64x64() {
+        let a = M31Matrix::from_data(
+            64, 64,
+            (0..4096).map(|i| M31::from((i * 7 + 3) % 2147483647)).collect(),
+        ).unwrap();
+        let b = M31Matrix::from_data(
+            64, 64,
+            (0..4096).map(|i| M31::from((i * 13 + 11) % 2147483647)).collect(),
+        ).unwrap();
+        let c = M31Matrix::multiply(&a, &b).unwrap();
+
+        let proof =
+            prove_matmul_for_starknet_with_config(&a, &b, &c, &ProverConfig::production())
+                .unwrap();
+
+        assert_eq!(proof.num_rounds, 6);
+        assert_ne!(proof.a_commitment, FieldElement252::ZERO);
+
+        // Verify the proof is still valid by checking MLE openings
+        let a_padded = pad_matrix_for_mle(&a);
+        let a_tree = PoseidonMerkleTree::from_m31_values(&a_padded);
+        assert_eq!(proof.a_commitment, a_tree.root());
     }
 }

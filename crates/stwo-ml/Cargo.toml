@@ -20,6 +20,7 @@ thiserror = "2"
 itertools = "0.12"
 num-traits = "0.2"
 serde = { version = "1", features = ["derive"], optional = true }
+rayon = "1.10"
 starknet-crypto = { version = "0.6.2", default-features = false, features = ["alloc"] }
 starknet-ff = { version = "0.3.7", default-features = false, features = ["alloc"] }
 
