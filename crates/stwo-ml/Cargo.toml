@@ -8,16 +8,20 @@ repository = "https://github.com/Bitsage-Network/stwo-ml"
 
 [features]
 default = ["std"]
-std = ["stwo/std"]
+std = ["stwo/prover"]
 gpu = ["stwo/gpu"]
 cuda-runtime = ["gpu", "stwo/cuda-runtime"]
 
 [dependencies]
 stwo = { path = "../stwo", features = ["std"] }
-stwo-constraint-framework = { path = "../constraint-framework" }
+stwo-constraint-framework = { path = "../constraint-framework", features = ["prover"] }
 tracing = "0.1"
 thiserror = "2"
+itertools = "0.12"
+num-traits = "0.2"
 serde = { version = "1", features = ["derive"], optional = true }
+starknet-crypto = { version = "0.6.2", default-features = false, features = ["alloc"] }
+starknet-ff = { version = "0.3.7", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 rand = "0.8"
@@ -29,4 +33,8 @@ harness = false
 
 [[bench]]
 name = "attention"
+harness = false
+
+[[bench]]
+name = "activation"
 harness = false
