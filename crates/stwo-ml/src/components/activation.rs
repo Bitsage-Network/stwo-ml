@@ -87,11 +87,10 @@ impl ActivationType {
     pub fn build_table(&self, log_size: u32) -> PrecomputedTable {
         match self {
             ActivationType::ReLU => PrecomputedTable::relu(log_size),
-            _ => {
-                // For non-ReLU activations, use identity as placeholder.
-                // Real implementations would use fixed-point approximations.
-                PrecomputedTable::identity(log_size)
-            }
+            ActivationType::GELU => PrecomputedTable::gelu(log_size),
+            ActivationType::Sigmoid => PrecomputedTable::sigmoid(log_size),
+            ActivationType::Softmax => PrecomputedTable::softmax_exp(log_size),
+            ActivationType::LayerNorm => PrecomputedTable::identity(log_size),
         }
     }
 }
@@ -509,5 +508,94 @@ mod tests {
         let inputs = vec![M31::from(0), M31::from(20)]; // 20 >= 16
         let result = count_activation_multiplicities(&inputs, &table);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_prove_verify_gelu() {
+        let log_size = 4u32;
+        let table = PrecomputedTable::gelu(log_size);
+
+        let inputs: Vec<M31> = vec![
+            M31::from(0),
+            M31::from(3),
+            M31::from(7),
+            M31::from(5),
+            M31::from(1),
+            M31::from(10),
+            M31::from(12),  // "negative" (>= 8)
+            M31::from(0),
+        ];
+
+        let config = PcsConfig::default();
+        let mut prover_channel = Blake2sChannel::default();
+        let (component, proof) =
+            prove_activation(&inputs, &table, config, &mut prover_channel).unwrap();
+
+        let mut verifier_channel = Blake2sChannel::default();
+        verify_activation(&component, &proof, &mut verifier_channel).unwrap();
+    }
+
+    #[test]
+    fn test_prove_verify_sigmoid() {
+        let log_size = 4u32;
+        let table = PrecomputedTable::sigmoid(log_size);
+
+        let inputs: Vec<M31> = (0..16).map(M31::from).collect();
+
+        let config = PcsConfig::default();
+        let mut prover_channel = Blake2sChannel::default();
+        let (component, proof) =
+            prove_activation(&inputs, &table, config, &mut prover_channel).unwrap();
+
+        let mut verifier_channel = Blake2sChannel::default();
+        verify_activation(&component, &proof, &mut verifier_channel).unwrap();
+    }
+
+    #[test]
+    fn test_prove_verify_softmax_exp() {
+        let log_size = 4u32;
+        let table = PrecomputedTable::softmax_exp(log_size);
+
+        let inputs: Vec<M31> = vec![
+            M31::from(0),
+            M31::from(2),
+            M31::from(5),
+            M31::from(0),
+            M31::from(10),  // "negative"
+            M31::from(14),
+            M31::from(7),
+            M31::from(1),
+        ];
+
+        let config = PcsConfig::default();
+        let mut prover_channel = Blake2sChannel::default();
+        let (component, proof) =
+            prove_activation(&inputs, &table, config, &mut prover_channel).unwrap();
+
+        let mut verifier_channel = Blake2sChannel::default();
+        verify_activation(&component, &proof, &mut verifier_channel).unwrap();
+    }
+
+    #[test]
+    fn test_build_table_dispatches_correctly() {
+        let relu = ActivationType::ReLU.build_table(4);
+        let gelu = ActivationType::GELU.build_table(4);
+        let sigmoid = ActivationType::Sigmoid.build_table(4);
+        let softmax = ActivationType::Softmax.build_table(4);
+
+        // ReLU(0) = 0
+        assert_eq!(relu.get(0).1, M31::from(0));
+        // GELU(0) = 0
+        assert_eq!(gelu.get(0).1, M31::from(0));
+        // Sigmoid(0) = 0.5 * half
+        let sig_zero = sigmoid.get(0).1.0;
+        assert!(sig_zero > 0, "sigmoid(0) should be positive");
+        // Softmax exp(0) = 1.0 * scale
+        let exp_zero = softmax.get(0).1.0;
+        assert!(exp_zero > 0, "exp(0) should be positive");
+
+        // GELU and Sigmoid tables should differ from each other at some index
+        assert_ne!(gelu.get(6).1, sigmoid.get(6).1,
+            "GELU and Sigmoid should produce different outputs");
     }
 }

@@ -34,6 +34,10 @@ use stwo::core::fields::qm31::SecureField;
 use crate::commitment::{
     open_mle, verify_mle_opening, MleOpeningProof, PoseidonMerkleTree, DEFAULT_NUM_QUERIES,
 };
+use crate::components::attention::{
+    apply_activation_table, flatten_matrix, AttentionError,
+};
+use crate::components::activation::ActivationType;
 use crate::components::matmul::{prove_matmul, verify_matmul, M31Matrix, MatMulError};
 
 // ============================================================================
@@ -501,6 +505,147 @@ fn eval_mle_at_point_pub(evals: &[SecureField], point: &[SecureField]) -> Secure
 }
 
 // ============================================================================
+// Starknet Attention Proof
+// ============================================================================
+
+/// Error type for Starknet attention proof generation.
+#[derive(Debug, thiserror::Error)]
+pub enum StarknetAttentionError {
+    #[error("matmul error: {0}")]
+    MatMul(#[from] MatMulError),
+    #[error("attention error: {0}")]
+    Attention(#[from] AttentionError),
+}
+
+/// Complete attention proof with MLE commitments for on-chain verification.
+///
+/// Contains two matmul proofs (QK^T and weights×V) with Poseidon Merkle
+/// commitments to all matrices (Q, K^T, V, scores, weights, output).
+///
+/// The activation step (scores → weights) is verified on-chain by checking
+/// the committed scores against the committed weights using the activation
+/// table. The prover commits to both, and the verifier checks consistency.
+#[derive(Debug, Clone)]
+pub struct StarknetAttentionProof {
+    /// QK^T matmul proof (Stage 1).
+    pub qkt_proof: StarknetMatMulProof,
+    /// Weights×V matmul proof (Stage 3).
+    pub attn_v_proof: StarknetMatMulProof,
+    /// Activation type used for scores → weights.
+    pub activation_type: u32,
+    /// Log2 of the activation table size.
+    pub activation_log_size: u32,
+    /// Poseidon Merkle root of the scores matrix.
+    pub scores_commitment: FieldElement252,
+    /// Poseidon Merkle root of the weights matrix.
+    pub weights_commitment: FieldElement252,
+}
+
+impl StarknetAttentionProof {
+    /// Serialize the complete attention proof to felt252 calldata.
+    ///
+    /// Layout:
+    ///   [activation_type, activation_log_size,
+    ///    scores_commitment, weights_commitment,
+    ///    qkt_proof_calldata..., attn_v_proof_calldata...]
+    pub fn to_calldata(&self) -> Vec<Felt> {
+        let mut data = vec![
+            FieldElement252::from(self.activation_type as u64),
+            FieldElement252::from(self.activation_log_size as u64),
+        ];
+
+        push_felt252(&mut data, self.scores_commitment);
+        push_felt252(&mut data, self.weights_commitment);
+
+        // Inline both matmul proofs
+        let qkt_calldata = self.qkt_proof.to_calldata();
+        data.push(FieldElement252::from(qkt_calldata.len() as u64));
+        data.extend_from_slice(&qkt_calldata);
+
+        let attn_v_calldata = self.attn_v_proof.to_calldata();
+        data.push(FieldElement252::from(attn_v_calldata.len() as u64));
+        data.extend_from_slice(&attn_v_calldata);
+
+        data
+    }
+}
+
+/// Generate a complete attention proof for Starknet on-chain verification.
+///
+/// Pipeline:
+/// 1. Compute scores = Q × K^T
+/// 2. Apply activation table: weights = activation(scores)
+/// 3. Compute output = weights × V
+/// 4. Generate two StarknetMatMulProofs (QK^T and weights×V)
+/// 5. Commit scores and weights for on-chain activation verification
+///
+/// All matrices must have scores in `[0, 2^log_table_size)` after QK^T.
+#[instrument(skip_all, fields(
+    seq_len = q.rows,
+    d_k = q.cols,
+    d_v = v.cols,
+    activation = ?activation_type,
+))]
+pub fn prove_attention_for_starknet(
+    q: &M31Matrix,
+    k: &M31Matrix,
+    v: &M31Matrix,
+    activation_type: ActivationType,
+    log_table_size: u32,
+) -> Result<StarknetAttentionProof, StarknetAttentionError> {
+    // Stage 1: Compute scores = Q × K^T
+    let kt = k.transpose();
+    let scores = M31Matrix::multiply(q, &kt)?;
+
+    // Stage 2: Apply activation table
+    let table = activation_type.build_table(log_table_size);
+    let weights = apply_activation_table(&scores, &table)?;
+
+    // Stage 3: Compute output = weights × V
+    let output = M31Matrix::multiply(&weights, v)?;
+
+    // Generate QK^T matmul proof (parallel with V proof)
+    let config = ProverConfig::production();
+    let (qkt_proof, attn_v_proof) = {
+        let _span = info_span!("attention_proofs").entered();
+        rayon::join(
+            || prove_matmul_for_starknet_with_config(q, &kt, &scores, &config),
+            || prove_matmul_for_starknet_with_config(&weights, v, &output, &config),
+        )
+    };
+    let qkt_proof = qkt_proof?;
+    let attn_v_proof = attn_v_proof?;
+
+    // Commit scores and weights for on-chain activation verification
+    let score_values = flatten_matrix(&scores);
+    let weight_values = flatten_matrix(&weights);
+    let (scores_tree, weights_tree) = {
+        let _span = info_span!("activation_commit").entered();
+        rayon::join(
+            || PoseidonMerkleTree::from_m31_values(&score_values),
+            || PoseidonMerkleTree::from_m31_values(&weight_values),
+        )
+    };
+
+    let activation_type_id = match activation_type {
+        ActivationType::ReLU => 0,
+        ActivationType::GELU => 1,
+        ActivationType::Sigmoid => 2,
+        ActivationType::Softmax => 3,
+        ActivationType::LayerNorm => 4,
+    };
+
+    Ok(StarknetAttentionProof {
+        qkt_proof,
+        attn_v_proof,
+        activation_type: activation_type_id,
+        activation_log_size: log_table_size,
+        scores_commitment: scores_tree.root(),
+        weights_commitment: weights_tree.root(),
+    })
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -888,6 +1033,104 @@ mod tests {
             default_proof.to_calldata(),
             prod_proof.to_calldata()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Starknet attention proof tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_starknet_attention_relu_4x4() {
+        // Small attention: seq_len=4, d_k=4, d_v=4 with ReLU activation.
+        // Values kept small to fit in log_size=4 table ([0, 16)).
+        let q = M31Matrix::from_data(4, 4, vec![
+            M31::from(0), M31::from(1), M31::from(0), M31::from(1),
+            M31::from(1), M31::from(0), M31::from(1), M31::from(0),
+            M31::from(0), M31::from(0), M31::from(1), M31::from(1),
+            M31::from(1), M31::from(1), M31::from(0), M31::from(0),
+        ]).unwrap();
+        let k = q.clone();
+        let v = M31Matrix::from_data(4, 4, vec![
+            M31::from(1), M31::from(0), M31::from(1), M31::from(0),
+            M31::from(0), M31::from(1), M31::from(0), M31::from(1),
+            M31::from(1), M31::from(1), M31::from(0), M31::from(0),
+            M31::from(0), M31::from(0), M31::from(1), M31::from(1),
+        ]).unwrap();
+
+        let proof = prove_attention_for_starknet(
+            &q, &k, &v,
+            ActivationType::ReLU,
+            4,
+        ).unwrap();
+
+        // Verify structure
+        assert_eq!(proof.qkt_proof.m, 4);
+        assert_eq!(proof.qkt_proof.k, 4);
+        assert_eq!(proof.attn_v_proof.m, 4);
+        assert_eq!(proof.activation_type, 0); // ReLU
+        assert_eq!(proof.activation_log_size, 4);
+        assert_ne!(proof.scores_commitment, FieldElement252::ZERO);
+        assert_ne!(proof.weights_commitment, FieldElement252::ZERO);
+
+        // Calldata should serialize
+        let calldata = proof.to_calldata();
+        assert!(calldata.len() > 50, "calldata too short: {}", calldata.len());
+
+        // First two elements: activation_type, activation_log_size
+        assert_eq!(calldata[0], FieldElement252::from(0u64)); // ReLU
+        assert_eq!(calldata[1], FieldElement252::from(4u64)); // log_size
+    }
+
+    #[test]
+    fn test_starknet_attention_sigmoid_4x4() {
+        let q = M31Matrix::from_data(4, 4, vec![
+            M31::from(0), M31::from(1), M31::from(0), M31::from(1),
+            M31::from(1), M31::from(0), M31::from(1), M31::from(0),
+            M31::from(0), M31::from(0), M31::from(1), M31::from(1),
+            M31::from(1), M31::from(1), M31::from(0), M31::from(0),
+        ]).unwrap();
+        let k = q.clone();
+        let v = M31Matrix::from_data(4, 4, vec![
+            M31::from(1), M31::from(0), M31::from(1), M31::from(0),
+            M31::from(0), M31::from(1), M31::from(0), M31::from(1),
+            M31::from(1), M31::from(1), M31::from(0), M31::from(0),
+            M31::from(0), M31::from(0), M31::from(1), M31::from(1),
+        ]).unwrap();
+
+        let proof = prove_attention_for_starknet(
+            &q, &k, &v,
+            ActivationType::Sigmoid,
+            4,
+        ).unwrap();
+
+        assert_eq!(proof.activation_type, 2); // Sigmoid
+        assert_ne!(proof.scores_commitment, proof.weights_commitment,
+            "sigmoid should transform scores differently from identity");
+
+        let calldata = proof.to_calldata();
+        assert!(calldata.len() > 50);
+    }
+
+    #[test]
+    fn test_starknet_attention_calldata_deterministic() {
+        let q = M31Matrix::from_data(4, 4, vec![
+            M31::from(0), M31::from(1), M31::from(0), M31::from(1),
+            M31::from(1), M31::from(0), M31::from(1), M31::from(0),
+            M31::from(0), M31::from(0), M31::from(1), M31::from(1),
+            M31::from(1), M31::from(1), M31::from(0), M31::from(0),
+        ]).unwrap();
+        let k = q.clone();
+        let v = M31Matrix::from_data(4, 4, vec![
+            M31::from(1), M31::from(0), M31::from(1), M31::from(0),
+            M31::from(0), M31::from(1), M31::from(0), M31::from(1),
+            M31::from(1), M31::from(1), M31::from(0), M31::from(0),
+            M31::from(0), M31::from(0), M31::from(1), M31::from(1),
+        ]).unwrap();
+
+        let proof1 = prove_attention_for_starknet(&q, &k, &v, ActivationType::ReLU, 4).unwrap();
+        let proof2 = prove_attention_for_starknet(&q, &k, &v, ActivationType::ReLU, 4).unwrap();
+
+        assert_eq!(proof1.to_calldata(), proof2.to_calldata());
     }
 
     #[test]

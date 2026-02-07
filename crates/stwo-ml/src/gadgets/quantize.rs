@@ -18,7 +18,14 @@
 //! The quantization gadget ensures all quantized values are within
 //! the expected range using the range check gadget.
 
+use stwo::core::channel::Blake2sChannel;
 use stwo::core::fields::m31::M31;
+use stwo::core::pcs::PcsConfig;
+use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasher;
+
+use super::range_check::{
+    prove_range_check, verify_range_check, RangeCheckComponent, RangeCheckError,
+};
 
 /// Quantization parameters for mapping float values to field elements.
 #[derive(Debug, Clone, Copy)]
@@ -85,6 +92,71 @@ impl QuantizeParams {
 pub fn validate_quantized_range(values: &[M31], bits: u32) -> bool {
     let max = 1u32 << bits;
     values.iter().all(|v| v.0 < max)
+}
+
+// ---------------------------------------------------------------------------
+// Quantize + Range Check integration
+// ---------------------------------------------------------------------------
+
+/// Error type for quantized range check operations.
+#[derive(Debug, thiserror::Error)]
+pub enum QuantizeError {
+    #[error("range check error: {0}")]
+    RangeCheck(#[from] RangeCheckError),
+    #[error("quantized value {value} out of range [0, {max})")]
+    ValueOutOfRange { value: u32, max: u32 },
+}
+
+/// Quantize a vector of floats and prove all quantized values are in range.
+///
+/// Combines `QuantizeParams::quantize_vec` with `prove_range_check` to produce
+/// a STWO STARK proof that all quantized values are in `[0, 2^bits)`.
+///
+/// Returns the quantized values and the range check proof.
+pub fn prove_quantized_range(
+    values: &[f32],
+    params: &QuantizeParams,
+    config: PcsConfig,
+    channel: &mut Blake2sChannel,
+) -> Result<
+    (
+        Vec<M31>,
+        RangeCheckComponent,
+        stwo::core::proof::StarkProof<Blake2sMerkleHasher>,
+    ),
+    QuantizeError,
+> {
+    let quantized = params.quantize_vec(values);
+
+    // Verify all values are in range before proving.
+    let max = 1u32 << params.bits;
+    for &v in &quantized {
+        if v.0 >= max {
+            return Err(QuantizeError::ValueOutOfRange {
+                value: v.0,
+                max,
+            });
+        }
+    }
+
+    // Use the range check STARK to prove all values are in [0, 2^bits).
+    // The range check table needs log_size >= bits. We use the bits value
+    // directly, clamped to minimum SIMD lane size.
+    let log_range = params.bits.max(stwo::prover::backend::simd::m31::LOG_N_LANES);
+
+    let (component, proof) = prove_range_check(&quantized, log_range, config, channel)?;
+
+    Ok((quantized, component, proof))
+}
+
+/// Verify a quantized range check proof.
+pub fn verify_quantized_range(
+    component: &RangeCheckComponent,
+    proof: &stwo::core::proof::StarkProof<Blake2sMerkleHasher>,
+    channel: &mut Blake2sChannel,
+) -> Result<(), QuantizeError> {
+    verify_range_check(component, proof, channel)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -165,5 +237,70 @@ mod tests {
         assert!(QuantizeParams::int8_asymmetric(0.1, 256).is_none());
         assert!(QuantizeParams::int8_asymmetric(0.1, 1000).is_none());
         assert!(QuantizeParams::int8_asymmetric(0.1, 255).is_some());
+    }
+
+    // -------------------------------------------------------------------
+    // Quantize + Range Check STARK integration tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_prove_verify_quantized_range() {
+        use stwo::core::channel::Blake2sChannel;
+        use stwo::core::pcs::PcsConfig;
+
+        let params = QuantizeParams::int8_symmetric(0.1);
+        let values = vec![0.0, 0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 0.3];
+
+        let config = PcsConfig::default();
+        let mut prover_channel = Blake2sChannel::default();
+        let (quantized, component, proof) =
+            prove_quantized_range(&values, &params, config, &mut prover_channel).unwrap();
+
+        // Verify all quantized values are in [0, 256)
+        for &v in &quantized {
+            assert!(v.0 < 256, "quantized value {} out of INT8 range", v.0);
+        }
+
+        let mut verifier_channel = Blake2sChannel::default();
+        verify_quantized_range(&component, &proof, &mut verifier_channel).unwrap();
+    }
+
+    #[test]
+    fn test_prove_quantized_range_batch() {
+        use stwo::core::channel::Blake2sChannel;
+        use stwo::core::pcs::PcsConfig;
+
+        let params = QuantizeParams::int8_symmetric(0.05);
+        // Generate a batch of 64 values in [-5, 5]
+        let values: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) * 0.15).collect();
+
+        let config = PcsConfig::default();
+        let mut prover_channel = Blake2sChannel::default();
+        let (quantized, component, proof) =
+            prove_quantized_range(&values, &params, config, &mut prover_channel).unwrap();
+
+        assert_eq!(quantized.len(), 64);
+
+        let mut verifier_channel = Blake2sChannel::default();
+        verify_quantized_range(&component, &proof, &mut verifier_channel).unwrap();
+    }
+
+    #[test]
+    fn test_quantized_range_preserves_values() {
+        use stwo::core::channel::Blake2sChannel;
+        use stwo::core::pcs::PcsConfig;
+
+        let params = QuantizeParams::int8_symmetric(0.1);
+        let values = vec![0.0, 0.5];
+
+        let config = PcsConfig::default();
+        let mut channel = Blake2sChannel::default();
+        let (quantized, _, _) =
+            prove_quantized_range(&values, &params, config, &mut channel).unwrap();
+
+        // 0.0 → 128 (zero_point)
+        assert_eq!(quantized[0], M31::from(128));
+        // 0.5 → 133 (128 + round(0.5/0.1))
+        assert_eq!(quantized[1], M31::from(133));
     }
 }

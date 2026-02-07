@@ -20,8 +20,36 @@
 //!
 //! This reduces to element-wise constraint verification where `mean` and
 //! `inv_std` are public inputs computed and committed by the prover.
+//!
+//! # STWO Integration
+//!
+//! The STWO proof uses LogUp to verify each (input, output) pair is in a
+//! precomputed table of valid layernorm mappings for the given parameters.
+//! This follows the same pattern as the activation component.
 
+use num_traits::Zero;
+use stwo::core::air::Component;
+use stwo::core::channel::{Blake2sChannel, Channel};
 use stwo::core::fields::m31::M31;
+use stwo::core::fields::qm31::SecureField;
+use stwo::core::pcs::{CommitmentSchemeVerifier, PcsConfig};
+use stwo::core::poly::circle::CanonicCoset;
+use stwo::core::utils::{bit_reverse_index, coset_index_to_circle_domain_index};
+use stwo::core::vcs_lifted::blake2_merkle::{Blake2sMerkleChannel, Blake2sMerkleHasher};
+use stwo::core::verifier::verify;
+use stwo::core::ColumnVec;
+use stwo::prover::backend::simd::column::BaseColumn;
+use stwo::prover::backend::simd::m31::{PackedM31, LOG_N_LANES};
+use stwo::prover::backend::simd::qm31::PackedQM31;
+use stwo::prover::backend::simd::SimdBackend;
+use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
+use stwo::prover::poly::BitReversedOrder;
+use stwo::prover::{prove, CommitmentSchemeProver};
+use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
+use stwo_constraint_framework::{
+    relation, FrameworkComponent, FrameworkEval, LogupTraceGenerator, Relation, RelationEntry,
+    TraceLocationAllocator,
+};
 use thiserror::Error;
 
 use super::matmul::M31Matrix;
@@ -251,6 +279,307 @@ impl M31Inverse for M31 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// LogUp relation for LayerNorm
+// ---------------------------------------------------------------------------
+
+// LogUp relation with 2 elements: (input, output)
+relation!(LayerNormRelation, 2);
+
+// ---------------------------------------------------------------------------
+// LayerNorm FrameworkEval
+// ---------------------------------------------------------------------------
+
+/// Constraint evaluator for layernorm via LogUp.
+///
+/// Preprocessed columns: valid (input, output) pairs for the given parameters.
+/// Trace column: multiplicity of each table entry.
+/// LogUp constraint: entries with non-zero multiplicity must be in the table.
+#[derive(Clone)]
+pub struct LayerNormEval {
+    /// Log2 of the table size.
+    pub log_size: u32,
+    /// Lookup elements drawn from the channel.
+    pub lookup_elements: LayerNormRelation,
+}
+
+const LOG_CONSTRAINT_DEGREE: u32 = 1;
+
+impl FrameworkEval for LayerNormEval {
+    fn log_size(&self) -> u32 {
+        self.log_size
+    }
+
+    fn max_constraint_log_degree_bound(&self) -> u32 {
+        self.log_size + LOG_CONSTRAINT_DEGREE
+    }
+
+    fn evaluate<E: stwo_constraint_framework::EvalAtRow>(&self, mut eval: E) -> E {
+        let multiplicity = eval.next_trace_mask();
+
+        let table_input = eval.get_preprocessed_column(PreProcessedColumnId {
+            id: String::from("layernorm_input"),
+        });
+        let table_output = eval.get_preprocessed_column(PreProcessedColumnId {
+            id: String::from("layernorm_output"),
+        });
+
+        eval.add_to_relation(RelationEntry::new(
+            &self.lookup_elements,
+            E::EF::from(multiplicity),
+            &[table_input, table_output],
+        ));
+
+        eval.finalize_logup();
+        eval
+    }
+}
+
+pub type LayerNormComponent = FrameworkComponent<LayerNormEval>;
+
+// ---------------------------------------------------------------------------
+// Trace generation for STWO LayerNorm
+// ---------------------------------------------------------------------------
+
+/// Generate the preprocessed layernorm table: valid (input, output) pairs.
+///
+/// For each input `i` in `[0, 2^log_size)`, the output is:
+///   `output = (i - mean) * inv_std * gamma[i % feature_dim] + beta[i % feature_dim]`
+///
+/// This table is specific to the given (mean, inv_std, gamma, beta) parameters.
+pub fn generate_layernorm_table(
+    log_size: u32,
+    mean: M31,
+    inv_std: M31,
+    params: &LayerNormParams,
+) -> Vec<CircleEvaluation<SimdBackend, M31, BitReversedOrder>> {
+    let domain = CanonicCoset::new(log_size).circle_domain();
+    let size = 1usize << log_size;
+
+    let mut input_col = vec![M31::zero(); size];
+    let mut output_col = vec![M31::zero(); size];
+
+    for i in 0..size {
+        let bit_rev =
+            bit_reverse_index(coset_index_to_circle_domain_index(i, log_size), log_size);
+        let input_val = M31::from(i as u32);
+        let feat_idx = i % params.feature_dim;
+        let centered = input_val - mean;
+        let output_val = centered * inv_std * params.gamma[feat_idx] + params.beta[feat_idx];
+        input_col[bit_rev] = input_val;
+        output_col[bit_rev] = output_val;
+    }
+
+    vec![
+        CircleEvaluation::<SimdBackend, _, BitReversedOrder>::new(
+            domain,
+            BaseColumn::from_iter(input_col),
+        ),
+        CircleEvaluation::<SimdBackend, _, BitReversedOrder>::new(
+            domain,
+            BaseColumn::from_iter(output_col),
+        ),
+    ]
+}
+
+/// Count multiplicities of input values against the layernorm table.
+pub fn count_layernorm_multiplicities(
+    inputs: &[M31],
+    log_size: u32,
+) -> Result<Vec<u32>, LayerNormError> {
+    let size = 1usize << log_size;
+    let mut counts = vec![0u32; size];
+    for &input in inputs {
+        let idx = input.0 as usize;
+        if idx >= size {
+            return Err(LayerNormError::DimensionMismatch {
+                input_len: idx,
+                param_len: size,
+            });
+        }
+        counts[idx] += 1;
+    }
+    Ok(counts)
+}
+
+/// Generate the trace column (multiplicities) in bit-reversed circle domain order.
+pub fn generate_layernorm_trace(
+    inputs: &[M31],
+    log_size: u32,
+) -> ColumnVec<CircleEvaluation<SimdBackend, M31, BitReversedOrder>> {
+    let domain = CanonicCoset::new(log_size).circle_domain();
+    let size = 1usize << log_size;
+    let multiplicities = count_layernorm_multiplicities(inputs, log_size)
+        .expect("inputs already validated");
+
+    let mut col = vec![M31::zero(); size];
+    for (i, &count) in multiplicities.iter().enumerate() {
+        let bit_rev =
+            bit_reverse_index(coset_index_to_circle_domain_index(i, log_size), log_size);
+        col[bit_rev] = M31::from(count);
+    }
+
+    vec![CircleEvaluation::<SimdBackend, _, BitReversedOrder>::new(
+        domain,
+        BaseColumn::from_iter(col),
+    )]
+}
+
+/// Generate the LogUp interaction trace for the layernorm component.
+pub fn generate_layernorm_interaction_trace(
+    trace: &ColumnVec<CircleEvaluation<SimdBackend, M31, BitReversedOrder>>,
+    preprocessed: &[CircleEvaluation<SimdBackend, M31, BitReversedOrder>],
+    lookup_elements: &LayerNormRelation,
+) -> (
+    ColumnVec<CircleEvaluation<SimdBackend, M31, BitReversedOrder>>,
+    SecureField,
+) {
+    let log_size = trace[0].domain.log_size();
+    let mut logup_gen = LogupTraceGenerator::new(log_size);
+    let mut col_gen = logup_gen.new_col();
+
+    for vec_row in 0..(1 << (log_size - LOG_N_LANES)) {
+        let multiplicity: PackedM31 = trace[0].data[vec_row];
+        let table_input: PackedM31 = preprocessed[0].data[vec_row];
+        let table_output: PackedM31 = preprocessed[1].data[vec_row];
+
+        let denom: PackedQM31 = lookup_elements.combine(&[table_input, table_output]);
+        col_gen.write_frac(vec_row, multiplicity.into(), denom);
+    }
+    col_gen.finalize_col();
+
+    logup_gen.finalize_last()
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end prove / verify (STWO)
+// ---------------------------------------------------------------------------
+
+/// Prove a layernorm computation using STWO.
+///
+/// Inputs must be in `[0, 2^log_size)`. The table is constructed from the
+/// given parameters (mean, inv_std, gamma, beta).
+pub fn prove_layernorm_stark(
+    inputs: &[M31],
+    log_size: u32,
+    mean: M31,
+    inv_std: M31,
+    params: &LayerNormParams,
+    config: PcsConfig,
+    channel: &mut Blake2sChannel,
+) -> Result<
+    (
+        LayerNormComponent,
+        stwo::core::proof::StarkProof<Blake2sMerkleHasher>,
+    ),
+    LayerNormError,
+> {
+    if log_size < LOG_N_LANES {
+        return Err(LayerNormError::EmptyInput);
+    }
+
+    // Validate inputs are in table range.
+    let size = 1u32 << log_size;
+    for &v in inputs {
+        if v.0 >= size {
+            return Err(LayerNormError::DimensionMismatch {
+                input_len: v.0 as usize,
+                param_len: size as usize,
+            });
+        }
+    }
+
+    // Precompute twiddles.
+    let twiddles = SimdBackend::precompute_twiddles(
+        CanonicCoset::new(log_size + config.fri_config.log_blowup_factor + 1)
+            .circle_domain()
+            .half_coset,
+    );
+
+    config.mix_into(channel);
+    let mut commitment_scheme =
+        CommitmentSchemeProver::<_, Blake2sMerkleChannel>::new(config, &twiddles);
+
+    // Phase 1: Preprocessed columns (layernorm table).
+    let preprocessed = generate_layernorm_table(log_size, mean, inv_std, params);
+    let mut tree_builder = commitment_scheme.tree_builder();
+    tree_builder.extend_evals(preprocessed.clone());
+    tree_builder.commit(channel);
+
+    // Phase 2: Trace columns (multiplicities).
+    let trace = generate_layernorm_trace(inputs, log_size);
+    let mut tree_builder = commitment_scheme.tree_builder();
+    tree_builder.extend_evals(trace.clone());
+    tree_builder.commit(channel);
+
+    // Draw lookup elements.
+    let lookup_elements = LayerNormRelation::draw(channel);
+
+    // Phase 3: Interaction trace (LogUp).
+    let (interaction_trace, claimed_sum) =
+        generate_layernorm_interaction_trace(&trace, &preprocessed, &lookup_elements);
+
+    channel.mix_felts(&[claimed_sum]);
+
+    let mut tree_builder = commitment_scheme.tree_builder();
+    tree_builder.extend_evals(interaction_trace);
+    tree_builder.commit(channel);
+
+    // Create component.
+    let mut allocator = TraceLocationAllocator::new_with_preprocessed_columns(&[
+        PreProcessedColumnId {
+            id: String::from("layernorm_input"),
+        },
+        PreProcessedColumnId {
+            id: String::from("layernorm_output"),
+        },
+    ]);
+    let component = LayerNormComponent::new(
+        &mut allocator,
+        LayerNormEval {
+            log_size,
+            lookup_elements,
+        },
+        claimed_sum,
+    );
+
+    // Prove.
+    let proof = prove(&[&component], channel, commitment_scheme)
+        .map_err(|_| LayerNormError::EmptyInput)?; // Re-using error for simplicity
+
+    Ok((component, proof))
+}
+
+/// Verify a layernorm STWO proof.
+pub fn verify_layernorm_stark(
+    component: &LayerNormComponent,
+    proof: &stwo::core::proof::StarkProof<Blake2sMerkleHasher>,
+    channel: &mut Blake2sChannel,
+) -> Result<(), LayerNormError> {
+    let pcs_config = proof.config;
+    pcs_config.mix_into(channel);
+    let commitment_scheme = &mut CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(pcs_config);
+
+    let sizes = component.trace_log_degree_bounds();
+
+    // Preprocessed (2 columns: input and output).
+    commitment_scheme.commit(proof.commitments[0], &sizes[0], channel);
+    // Trace (1 column: multiplicities).
+    commitment_scheme.commit(proof.commitments[1], &sizes[1], channel);
+
+    // Draw lookup elements.
+    let _lookup_elements = LayerNormRelation::draw(channel);
+
+    // Mix claimed sum.
+    channel.mix_felts(&[component.claimed_sum()]);
+
+    // Interaction.
+    commitment_scheme.commit(proof.commitments[2], &sizes[2], channel);
+
+    verify(&[component], channel, commitment_scheme, proof.clone())
+        .map_err(|_| LayerNormError::MeanMismatch)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,5 +696,75 @@ mod tests {
     fn test_empty_input_error() {
         assert!(compute_mean(&[]).is_err());
         assert!(compute_variance(&[]).is_err());
+    }
+
+    // -------------------------------------------------------------------
+    // STWO STARK proof tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_prove_verify_layernorm_stark() {
+        let log_size = 4u32; // table size 16
+        let feature_dim = 4;
+        let params = LayerNormParams::identity(feature_dim);
+
+        // Mean=5, inv_std=1 (identity scaling)
+        let mean = M31::from(5);
+        let inv_std = M31::from(1);
+
+        // Input values in [0, 16)
+        let inputs: Vec<M31> = vec![
+            M31::from(3), M31::from(5), M31::from(7), M31::from(9),
+            M31::from(0), M31::from(1), M31::from(10), M31::from(4),
+        ];
+
+        let config = PcsConfig::default();
+        let mut prover_channel = Blake2sChannel::default();
+        let (component, proof) = prove_layernorm_stark(
+            &inputs, log_size, mean, inv_std, &params,
+            config, &mut prover_channel,
+        ).unwrap();
+
+        let mut verifier_channel = Blake2sChannel::default();
+        verify_layernorm_stark(&component, &proof, &mut verifier_channel).unwrap();
+    }
+
+    #[test]
+    fn test_prove_verify_layernorm_stark_with_scale() {
+        let log_size = 4u32;
+        let params = LayerNormParams::new(
+            vec![M31::from(2), M31::from(3), M31::from(1), M31::from(1)],
+            vec![M31::from(10), M31::from(20), M31::from(0), M31::from(5)],
+        ).unwrap();
+
+        let mean = M31::from(8);
+        let inv_std = M31::from(1);
+
+        let inputs: Vec<M31> = (0..16).map(M31::from).collect();
+
+        let config = PcsConfig::default();
+        let mut prover_channel = Blake2sChannel::default();
+        let (component, proof) = prove_layernorm_stark(
+            &inputs, log_size, mean, inv_std, &params,
+            config, &mut prover_channel,
+        ).unwrap();
+
+        let mut verifier_channel = Blake2sChannel::default();
+        verify_layernorm_stark(&component, &proof, &mut verifier_channel).unwrap();
+    }
+
+    #[test]
+    fn test_layernorm_stark_rejects_out_of_range() {
+        let log_size = 4u32;
+        let params = LayerNormParams::identity(4);
+        let inputs = vec![M31::from(20)]; // out of [0, 16)
+
+        let config = PcsConfig::default();
+        let mut channel = Blake2sChannel::default();
+        let result = prove_layernorm_stark(
+            &inputs, log_size, M31::from(0), M31::from(1), &params,
+            config, &mut channel,
+        );
+        assert!(result.is_err());
     }
 }
