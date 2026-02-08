@@ -2,59 +2,49 @@
 //!
 //! # The Core Innovation
 //!
-//! Traditional zkML decomposes matrix multiplication into individual multiply-add
-//! trace rows: O(m × k × n) rows for (m×k) × (k×n).
+//! Traditional zkML (including ObelyskVM today) decomposes matrix multiplication
+//! into individual multiply-add trace rows: O(m × k × n) rows for (m×k) × (k×n).
 //!
 //! This component uses the **sumcheck protocol over multilinear extensions** to
 //! verify the same computation in O(m + k + n) verifier work:
 //!
 //! ```text
-//! Traditional approach:
+//! Traditional (ObelyskVM):
 //!   C[i][j] = Σ_k A[i][k] × B[k][j]
 //!   → Each multiply-add = 1 trace row
-//!   → 128×128 MatMul = 2,097,152 rows
+//!   → 128×128 MatMul = 2,097,152 rows (burns half the 4M cycle budget)
 //!
 //! Sumcheck approach (stwo-ml):
 //!   Represent A, B, C as MLEs on boolean hypercube
 //!   Prover claims: Σ_{x∈{0,1}^n} MLE_A(r_i, x) × MLE_B(x, r_j) = MLE_C(r_i, r_j)
 //!   Verifier checks via n rounds of sumcheck
 //!   → 128×128 MatMul ≈ 49,152 rows (42× reduction)
+//!   → Bounded by O(m×n + m×k + k×n) for witness, O(log(m×k×n)) for verifier
 //! ```
 //!
 //! # Usage
 //!
 //! ```rust,ignore
-//! use stwo_ml::components::matmul::{prove_matmul, verify_matmul, M31Matrix};
-//! use stwo::core::channel::Blake2sChannel;
+//! use stwo_ml::components::matmul::MatMulComponent;
 //!
-//! let a = M31Matrix::random(4, 4);
-//! let b = M31Matrix::random(4, 4);
-//! let c = M31Matrix::multiply(&a, &b);
+//! // Define matrix dimensions
+//! let component = MatMulComponent::new(128, 64, 32); // A(128×64) × B(64×32) = C(128×32)
 //!
-//! let mut prover_channel = Blake2sChannel::default();
-//! let (proof, challenges) = prove_matmul(&a, &b, &c, &mut prover_channel).unwrap();
-//!
-//! let mut verifier_channel = Blake2sChannel::default();
-//! verify_matmul(&a, &b, &c, &proof, &challenges, &mut verifier_channel).unwrap();
+//! // Prove with witness
+//! let proof = component.prove(&a_matrix, &b_matrix, &c_matrix, &mut prover)?;
 //! ```
 
 use num_traits::{One, Zero};
-use thiserror::Error;
-
-use stwo::core::channel::Channel;
-use stwo::core::fields::m31::{BaseField, M31};
+use stwo::core::fields::m31::M31;
 use stwo::core::fields::qm31::SecureField;
-use stwo::prover::backend::cpu::CpuBackend;
-use stwo::prover::backend::Column;
-use stwo::prover::lookups::mle::Mle;
+use stwo::core::channel::{Blake2sChannel, Channel};
 use stwo::prover::lookups::sumcheck::{
-    partially_verify, prove_batch, MultivariatePolyOracle, SumcheckProof,
+    self, MultivariatePolyOracle, SumcheckProof,
 };
 use stwo::prover::lookups::utils::UnivariatePoly;
 
 /// Matrix dimensions for a matmul operation.
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MatMulDims {
     /// Rows in A / rows in C.
     pub m: usize,
@@ -87,7 +77,6 @@ impl MatMulDims {
 
 /// Flat matrix stored in row-major order over M31.
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct M31Matrix {
     pub rows: usize,
     pub cols: usize,
@@ -103,19 +92,6 @@ impl M31Matrix {
         }
     }
 
-    /// Create a matrix from a flat vector of M31 values (row-major).
-    ///
-    /// Returns `Err` if `data.len() != rows * cols`.
-    pub fn from_data(rows: usize, cols: usize, data: Vec<M31>) -> Result<Self, MatMulError> {
-        if data.len() != rows * cols {
-            return Err(MatMulError::InvalidMatrixData {
-                expected: rows * cols,
-                got: data.len(),
-            });
-        }
-        Ok(Self { rows, cols, data })
-    }
-
     pub fn get(&self, i: usize, j: usize) -> M31 {
         self.data[i * self.cols + j]
     }
@@ -123,453 +99,370 @@ impl M31Matrix {
     pub fn set(&mut self, i: usize, j: usize, val: M31) {
         self.data[i * self.cols + j] = val;
     }
-
-    /// Transpose this matrix.
-    pub fn transpose(&self) -> M31Matrix {
-        let mut t = M31Matrix::new(self.cols, self.rows);
-        for i in 0..self.rows {
-            for j in 0..self.cols {
-                t.set(j, i, self.get(i, j));
-            }
-        }
-        t
-    }
-
-    /// Multiply two matrices: C = A × B.
-    ///
-    /// Returns `Err` if inner dimensions don't match.
-    pub fn multiply(a: &M31Matrix, b: &M31Matrix) -> Result<M31Matrix, MatMulError> {
-        if a.cols != b.rows {
-            return Err(MatMulError::DimensionMismatch {
-                a_rows: a.rows,
-                a_cols: a.cols,
-                b_rows: b.rows,
-                b_cols: b.cols,
-            });
-        }
-        let mut c = M31Matrix::new(a.rows, b.cols);
-        for i in 0..a.rows {
-            for j in 0..b.cols {
-                let mut sum = M31::from(0);
-                for k in 0..a.cols {
-                    sum += a.get(i, k) * b.get(k, j);
-                }
-                c.set(i, j, sum);
-            }
-        }
-        Ok(c)
-    }
 }
 
-// ---------------------------------------------------------------------------
-// Multilinear Extension helpers
-// ---------------------------------------------------------------------------
+// ===== MLE Helpers =====
 
-/// Pad a vector to the next power of two length with zeros.
-fn pad_to_pow2(v: &[SecureField]) -> Vec<SecureField> {
-    let n = v.len().next_power_of_two();
-    let mut padded = v.to_vec();
-    padded.resize(n, SecureField::zero());
-    padded
-}
-
-/// Evaluate an MLE at a point (recursive implementation for verification).
-fn eval_mle_at_point(evals: &[SecureField], point: &[SecureField]) -> SecureField {
-    match point {
-        [] => evals[0],
-        [p_i, rest @ ..] => {
-            let mid = evals.len() / 2;
-            let (lhs, rhs) = evals.split_at(mid);
-            let lhs_eval = eval_mle_at_point(lhs, rest);
-            let rhs_eval = eval_mle_at_point(rhs, rest);
-            // eq(0, p_i) * lhs + eq(1, p_i) * rhs = (1 - p_i) * lhs + p_i * rhs
-            *p_i * (rhs_eval - lhs_eval) + lhs_eval
-        }
-    }
-}
-
-/// Extract a row from matrix A as an MLE over the inner dimension k.
+/// Evaluate a multilinear extension at a given point.
 ///
-/// Given A\[i\]\[k\] for fixed i (selected by random challenges r_i),
-/// produces the MLE f_A(k) = Σ_i eq(r_i, i) * A\[i\]\[k\].
-fn extract_row_mle(
-    matrix: &M31Matrix,
-    row_challenges: &[SecureField],
-) -> Vec<SecureField> {
-    let num_rows = matrix.rows.next_power_of_two();
-    let num_cols = matrix.cols.next_power_of_two();
-
-    // Build eq(r_i, i) for each row index i
-    let eq_evals = eq_evals_at_point(row_challenges, num_rows);
-
-    // f_A(k) = Σ_i eq(r_i, i) * A[i][k]
-    let mut result = vec![SecureField::zero(); num_cols];
-    for (i, &eq_i) in eq_evals.iter().enumerate().take(matrix.rows) {
-        for (k, res_k) in result.iter_mut().enumerate().take(matrix.cols) {
-            *res_k += eq_i * SecureField::from(matrix.get(i, k));
+/// `evals` contains function values on the boolean hypercube {0,1}^n
+/// (standard bit ordering: evals[b_{n-1}...b_1 b_0]).
+/// `point` is the evaluation point in F^n.
+fn evaluate_mle(evals: &[SecureField], point: &[SecureField]) -> SecureField {
+    assert_eq!(evals.len(), 1 << point.len(), "evals length must be 2^n_vars");
+    let mut current: Vec<SecureField> = evals.to_vec();
+    for &r in point.iter() {
+        let mid = current.len() / 2;
+        let mut next = Vec::with_capacity(mid);
+        for i in 0..mid {
+            // Fold: f(r, x_rest) = (1-r)*f(0, x_rest) + r*f(1, x_rest)
+            next.push(current[i] + r * (current[mid + i] - current[i]));
         }
+        current = next;
     }
-    result
+    assert_eq!(current.len(), 1);
+    current[0]
 }
 
-/// Extract a column from matrix B as an MLE over the inner dimension k.
-///
-/// Given B\[k\]\[j\] for fixed j (selected by random challenges r_j),
-/// produces the MLE f_B(k) = Σ_j eq(r_j, j) * B\[k\]\[j\].
-fn extract_col_mle(
-    matrix: &M31Matrix,
-    col_challenges: &[SecureField],
-) -> Vec<SecureField> {
-    let num_rows = matrix.rows.next_power_of_two();
-    let num_cols = matrix.cols.next_power_of_two();
-
-    // Build eq(r_j, j) for each column index j
-    let eq_evals = eq_evals_at_point(col_challenges, num_cols);
-
-    // f_B(k) = Σ_j eq(r_j, j) * B[k][j]
-    let mut result = vec![SecureField::zero(); num_rows];
-    for (k, res_k) in result.iter_mut().enumerate().take(matrix.rows) {
-        for (j, &eq_j) in eq_evals.iter().enumerate().take(matrix.cols) {
-            *res_k += eq_j * SecureField::from(matrix.get(k, j));
+/// Fix the first `assignments.len()` variables of an MLE, returning
+/// the reduced evaluations over the remaining variables.
+fn restrict_mle(evals: &[SecureField], assignments: &[SecureField]) -> Vec<SecureField> {
+    let mut current: Vec<SecureField> = evals.to_vec();
+    for &r in assignments.iter() {
+        let mid = current.len() / 2;
+        let mut next = Vec::with_capacity(mid);
+        for i in 0..mid {
+            next.push(current[i] + r * (current[mid + i] - current[i]));
         }
+        current = next;
     }
-    result
+    current
 }
 
-/// Compute eq(point, i) for all i in {0,1}^n where n = ceil_log2(size).
-///
-/// eq(x, y) = Π_j (x_j * y_j + (1 - x_j) * (1 - y_j))
-fn eq_evals_at_point(point: &[SecureField], size: usize) -> Vec<SecureField> {
-    let n = point.len();
-    assert!(size <= (1 << n));
-    let mut evals = vec![SecureField::zero(); 1 << n];
-    evals[0] = SecureField::one();
+/// Convert a row-major M31Matrix into MLE evaluations (SecureField).
+/// Layout: A[i][j] at index i*cols + j.
+/// Requires rows*cols to be a power of 2.
+fn matrix_to_mle(matrix: &M31Matrix) -> Vec<SecureField> {
+    let n = matrix.rows * matrix.cols;
+    assert!(n.is_power_of_two(), "matrix size must be power of 2");
+    matrix.data.iter().map(|&v| SecureField::from(v)).collect()
+}
 
-    for (j, &p_j) in point.iter().enumerate() {
-        let half = 1 << j;
-        // Process in reverse to avoid overwriting values we still need
-        for i in (0..half).rev() {
-            evals[2 * i + 1] = evals[i] * p_j;
-            evals[2 * i] = evals[i] * (SecureField::one() - p_j);
+/// Convert an M31Matrix into an MLE with transposed variable ordering.
+/// B[i][j] is stored at index j*rows + i (column-major).
+/// This allows fixing the column variables (j) first via restrict_mle.
+fn matrix_to_mle_col_major(matrix: &M31Matrix) -> Vec<SecureField> {
+    let n = matrix.rows * matrix.cols;
+    assert!(n.is_power_of_two(), "matrix size must be power of 2");
+    let mut evals = vec![SecureField::zero(); n];
+    for i in 0..matrix.rows {
+        for j in 0..matrix.cols {
+            evals[j * matrix.rows + i] = SecureField::from(matrix.get(i, j));
         }
     }
-
     evals
 }
 
-// ---------------------------------------------------------------------------
-// Inner-product oracle: f_A(k) * f_B(k) summed over boolean hypercube
-// ---------------------------------------------------------------------------
-
-/// Oracle for the inner product Σ_k f_A(k) * f_B(k).
-///
-/// This represents a degree-2 multivariate polynomial (product of two MLEs)
-/// that the sumcheck protocol operates on. The degree bound of 2 per variable
-/// is within STWO's MAX_DEGREE = 3.
-#[derive(Debug, Clone)]
-pub struct InnerProductOracle {
-    /// MLE for the row slice f_A(k).
-    mle_a: Mle<CpuBackend, SecureField>,
-    /// MLE for the column slice f_B(k).
-    mle_b: Mle<CpuBackend, SecureField>,
-}
-
-impl InnerProductOracle {
-    pub fn new(
-        a_evals: Vec<SecureField>,
-        b_evals: Vec<SecureField>,
-    ) -> Result<Self, MatMulError> {
-        if a_evals.len() != b_evals.len() || !a_evals.len().is_power_of_two() {
-            return Err(MatMulError::OracleDimensionMismatch {
-                a_len: a_evals.len(),
-                b_len: b_evals.len(),
-            });
+/// Compute C = A × B in M31 arithmetic.
+pub fn matmul_m31(a: &M31Matrix, b: &M31Matrix) -> M31Matrix {
+    assert_eq!(a.cols, b.rows, "A.cols must equal B.rows");
+    let m = a.rows;
+    let k = a.cols;
+    let n = b.cols;
+    let mut c = M31Matrix::new(m, n);
+    for i in 0..m {
+        for j in 0..n {
+            let mut sum = M31::from(0);
+            for l in 0..k {
+                sum += a.get(i, l) * b.get(l, j);
+            }
+            c.set(i, j, sum);
         }
-        Ok(Self {
-            mle_a: Mle::new(a_evals),
-            mle_b: Mle::new(b_evals),
-        })
     }
+    c
 }
 
-impl MultivariatePolyOracle for InnerProductOracle {
+// ===== Sumcheck Oracle =====
+
+/// Oracle for the matmul inner product sumcheck:
+///   g(x) = f_a(x) × f_b(x)
+/// where f_a = MLE_A restricted to random row point,
+///       f_b = MLE_B restricted to random col point.
+/// Degree per variable = 2 (product of two multilinear), within MAX_DEGREE=3.
+pub struct MatMulOracle {
+    /// MLE_A(r_i, x) evaluations on {0,1}^{log k}
+    pub f_a: Vec<SecureField>,
+    /// MLE_B(x, r_j) evaluations on {0,1}^{log k}
+    pub f_b: Vec<SecureField>,
+}
+
+impl MultivariatePolyOracle for MatMulOracle {
     fn n_variables(&self) -> usize {
-        self.mle_a.n_variables()
+        assert_eq!(self.f_a.len(), self.f_b.len());
+        self.f_a.len().ilog2() as usize
     }
 
-    /// Computes the univariate polynomial h(x_0) = Σ_{x_1,...,x_{n-1}} f_A(x_0,...) * f_B(x_0,...).
-    ///
-    /// Since f_A and f_B are each multilinear, h(x_0) is degree 2 in x_0.
-    /// We evaluate at 3 points {0, 1, 2} and interpolate.
+    /// Compute S(t) = Σ_{x_1,...} f_a(t, x_1,...) × f_b(t, x_1,...)
+    /// This is a degree-2 univariate polynomial in t.
     fn sum_as_poly_in_first_variable(&self, _claim: SecureField) -> UnivariatePoly<SecureField> {
-        let half = self.mle_a.len() / 2;
+        let n = self.f_a.len();
+        let mid = n / 2;
 
-        // f_A(x_0, rest) = (1 - x_0) * a_lo + x_0 * a_hi
-        // f_B(x_0, rest) = (1 - x_0) * b_lo + x_0 * b_hi
-        // Product at x_0 for fixed (rest): f_A * f_B
-        //   = [(1-x_0)*a_lo + x_0*a_hi] * [(1-x_0)*b_lo + x_0*b_hi]
+        // Evaluate at t=0, t=1, t=2 for degree-2 Lagrange interpolation
+        let mut s0 = SecureField::zero(); // S(0) = Σ a_lo × b_lo
+        let mut s1 = SecureField::zero(); // S(1) = Σ a_hi × b_hi
+        let mut s2 = SecureField::zero(); // S(2) = Σ (2a_hi - a_lo)(2b_hi - b_lo)
 
-        // Evaluate h at x_0 = 0: Σ_rest a_lo[rest] * b_lo[rest]
-        let y0: SecureField = (0..half)
-            .map(|i| self.mle_a.at(i) * self.mle_b.at(i))
-            .sum();
+        for i in 0..mid {
+            let a0 = self.f_a[i];
+            let a1 = self.f_a[mid + i];
+            let b0 = self.f_b[i];
+            let b1 = self.f_b[mid + i];
 
-        // Evaluate h at x_0 = 1: Σ_rest a_hi[rest] * b_hi[rest]
-        let y1: SecureField = (0..half)
-            .map(|i| self.mle_a.at(half + i) * self.mle_b.at(half + i))
-            .sum();
-
-        // Note: y0 + y1 may differ from claim if the claim is invalid.
-        // The sumcheck verifier will catch this via round polynomial checks.
-
-        // Evaluate h at x_0 = 2 for the degree-2 interpolation
-        let two = SecureField::from(BaseField::from(2));
-        let y2: SecureField = (0..half)
-            .map(|i| {
-                let a_val = two * self.mle_a.at(half + i) - self.mle_a.at(i);
-                let b_val = two * self.mle_b.at(half + i) - self.mle_b.at(i);
-                a_val * b_val
-            })
-            .sum();
-
-        let x0 = SecureField::zero();
-        let x1 = SecureField::one();
-        let x2 = two;
-
-        UnivariatePoly::interpolate_lagrange(&[x0, x1, x2], &[y0, y1, y2])
-    }
-
-    /// Fix the first variable to `challenge`, reducing both MLEs.
-    fn fix_first_variable(self, challenge: SecureField) -> Self {
-        let half_a = self.mle_a.len() / 2;
-        let half_b = self.mle_b.len() / 2;
-
-        // f_A(challenge, rest) = (1 - challenge) * a_lo[rest] + challenge * a_hi[rest]
-        let new_a: Vec<SecureField> = (0..half_a)
-            .map(|i| {
-                let lo = self.mle_a.at(i);
-                let hi = self.mle_a.at(half_a + i);
-                challenge * (hi - lo) + lo
-            })
-            .collect();
-
-        let new_b: Vec<SecureField> = (0..half_b)
-            .map(|i| {
-                let lo = self.mle_b.at(i);
-                let hi = self.mle_b.at(half_b + i);
-                challenge * (hi - lo) + lo
-            })
-            .collect();
-
-        Self {
-            mle_a: Mle::new(new_a),
-            mle_b: Mle::new(new_b),
+            s0 += a0 * b0;
+            s1 += a1 * b1;
+            // At t=2: f(2,...) = (1-2)*f(0,...) + 2*f(1,...) = 2*f_hi - f_lo
+            let a2 = a1 + a1 - a0;
+            let b2 = b1 + b1 - b0;
+            s2 += a2 * b2;
         }
+
+        // Lagrange interpolation through (0, s0), (1, s1), (2, s2)
+        let two = SecureField::from(M31::from(2));
+        UnivariatePoly::interpolate_lagrange(
+            &[SecureField::zero(), SecureField::one(), two],
+            &[s0, s1, s2],
+        )
+    }
+
+    /// Fix the first variable to `challenge`, folding both MLEs.
+    fn fix_first_variable(self, challenge: SecureField) -> Self {
+        let n = self.f_a.len();
+        let mid = n / 2;
+
+        let mut new_a = Vec::with_capacity(mid);
+        let mut new_b = Vec::with_capacity(mid);
+
+        for i in 0..mid {
+            new_a.push(self.f_a[i] + challenge * (self.f_a[mid + i] - self.f_a[i]));
+            new_b.push(self.f_b[i] + challenge * (self.f_b[mid + i] - self.f_b[i]));
+        }
+
+        MatMulOracle { f_a: new_a, f_b: new_b }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Error types
-// ---------------------------------------------------------------------------
+// ===== Sumcheck Proof =====
 
-#[derive(Error, Debug)]
-pub enum MatMulError {
-    #[error("dimension mismatch: A is {a_rows}×{a_cols}, B is {b_rows}×{b_cols}")]
-    DimensionMismatch {
-        a_rows: usize,
-        a_cols: usize,
-        b_rows: usize,
-        b_cols: usize,
-    },
-    #[error("product matrix C has wrong dimensions: expected {expected_rows}×{expected_cols}, got {got_rows}×{got_cols}")]
-    OutputDimensionMismatch {
-        expected_rows: usize,
-        expected_cols: usize,
-        got_rows: usize,
-        got_cols: usize,
-    },
-    #[error("invalid matrix data: expected {expected} elements, got {got}")]
-    InvalidMatrixData { expected: usize, got: usize },
-    #[error("MLE claim mismatch: C evaluation does not match auxiliary data")]
-    ClaimMismatch,
-    #[error("final evaluation mismatch: sumcheck output does not match MLE evaluations of A and B")]
-    FinalEvalMismatch,
-    #[error("Fiat-Shamir challenge mismatch: verifier derived different challenges than prover")]
-    ChallengeMismatch,
-    #[error("oracle construction error: MLE dimensions must match and be power of two (got a={a_len}, b={b_len})")]
-    OracleDimensionMismatch { a_len: usize, b_len: usize },
-    #[error("sumcheck verification failed: {0}")]
-    SumcheckError(#[from] stwo::prover::lookups::sumcheck::SumcheckError),
-}
-
-// ---------------------------------------------------------------------------
-// Proof type
-// ---------------------------------------------------------------------------
-
-/// Proof that C = A × B using the sumcheck protocol.
+/// Proof that C = A × B, generated via the sumcheck protocol.
 #[derive(Debug, Clone)]
-pub struct MatMulProof {
-    /// The sumcheck proof for the batched inner product claims.
+pub struct MatMulSumcheckProof {
+    /// The inner sumcheck proof (round polynomials).
     pub sumcheck_proof: SumcheckProof,
+    /// Random row evaluation point r_i ∈ F^{log m}.
+    pub r_i: Vec<SecureField>,
+    /// Random column evaluation point r_j ∈ F^{log n}.
+    pub r_j: Vec<SecureField>,
+    /// Claimed value: MLE_C(r_i, r_j).
+    pub claimed_sum: SecureField,
+    /// Final MLE_A evaluation at (r_i, r_k) where r_k = sumcheck assignment.
+    pub final_a_eval: SecureField,
+    /// Final MLE_B evaluation at (r_k, r_j).
+    pub final_b_eval: SecureField,
+    /// Sumcheck variable assignment (challenges from each round).
+    pub assignment: Vec<SecureField>,
 }
 
-/// Auxiliary data produced by the prover, needed for verification.
-#[derive(Debug, Clone)]
-pub struct MatMulAux {
-    /// Random challenges for the row dimension of C (selects a "random row").
-    pub row_challenges: Vec<SecureField>,
-    /// Random challenges for the column dimension of C (selects a "random column").
-    pub col_challenges: Vec<SecureField>,
-    /// The claimed value of MLE_C at (row_challenges, col_challenges).
-    pub claimed_c_eval: SecureField,
-    /// Lambda used for batching (set to 1 for single claim).
-    pub lambda: SecureField,
+/// Error type for matmul proving/verification.
+#[derive(Debug, thiserror::Error)]
+pub enum MatMulError {
+    #[error("Dimension mismatch: {0}")]
+    DimensionMismatch(String),
+    #[error("Dimensions must be powers of 2: {0}")]
+    NonPowerOfTwo(String),
+    #[error("Sumcheck verification failed: {0}")]
+    SumcheckFailed(String),
+    #[error("Evaluation mismatch at final check: expected {expected}, got {actual}")]
+    EvaluationMismatch { expected: SecureField, actual: SecureField },
+    #[error("Claimed sum mismatch: expected {expected}, got {actual}")]
+    ClaimedSumMismatch { expected: SecureField, actual: SecureField },
 }
 
-// ---------------------------------------------------------------------------
-// Prove
-// ---------------------------------------------------------------------------
-
-/// Prove that C = A × B using the sumcheck protocol.
+/// Prove that C = A × B using the sumcheck protocol over multilinear extensions.
 ///
-/// The protocol:
-/// 1. Draw random challenges r_i, r_j to select a "random entry" of C.
-/// 2. Evaluate MLE_C(r_i, r_j) = claimed value.
-/// 3. Reduce to: prove Σ_k f_A(k) * f_B(k) = claimed value
-///    where f_A(k) = MLE_A(r_i, k) and f_B(k) = MLE_B(k, r_j).
-/// 4. Run sumcheck on the inner product oracle.
-/// 5. Verifier checks the final evaluation against MLE evaluations of A and B.
-pub fn prove_matmul(
+/// Protocol:
+/// 1. Build MLEs for A (row-major), B (col-major for restriction), C (row-major)
+/// 2. Draw random evaluation points r_i, r_j via Fiat-Shamir
+/// 3. Claim: Σ_{x ∈ {0,1}^{log k}} MLE_A(r_i, x) × MLE_B(x, r_j) = MLE_C(r_i, r_j)
+/// 4. Run sumcheck on g(x) = MLE_A(r_i, x) × MLE_B(x, r_j)
+/// 5. Return proof with final oracle evaluations
+pub fn prove_matmul_sumcheck(
     a: &M31Matrix,
     b: &M31Matrix,
     c: &M31Matrix,
-    channel: &mut impl Channel,
-) -> Result<(MatMulProof, MatMulAux), MatMulError> {
+) -> Result<MatMulSumcheckProof, MatMulError> {
     // Validate dimensions
     if a.cols != b.rows {
-        return Err(MatMulError::DimensionMismatch {
-            a_rows: a.rows,
-            a_cols: a.cols,
-            b_rows: b.rows,
-            b_cols: b.cols,
-        });
+        return Err(MatMulError::DimensionMismatch(
+            format!("A.cols={} != B.rows={}", a.cols, b.rows),
+        ));
     }
     if c.rows != a.rows || c.cols != b.cols {
-        return Err(MatMulError::OutputDimensionMismatch {
-            expected_rows: a.rows,
-            expected_cols: b.cols,
-            got_rows: c.rows,
-            got_cols: c.cols,
-        });
+        return Err(MatMulError::DimensionMismatch(
+            format!("C({},{}) != expected ({},{})", c.rows, c.cols, a.rows, b.cols),
+        ));
     }
 
-    let m_log = a.rows.next_power_of_two().ilog2() as usize;
-    let n_log = b.cols.next_power_of_two().ilog2() as usize;
+    let m = a.rows;
+    let k = a.cols;
+    let n = b.cols;
 
-    // Mix matrix dimensions into the channel for Fiat-Shamir binding
-    channel.mix_u64(a.rows as u64);
-    channel.mix_u64(a.cols as u64);
-    channel.mix_u64(b.cols as u64);
+    for (name, val) in [("m", m), ("k", k), ("n", n)] {
+        if !val.is_power_of_two() {
+            return Err(MatMulError::NonPowerOfTwo(format!("{name}={val}")));
+        }
+    }
 
-    // Step 1: Draw random challenges for row and column selection
-    let row_challenges = channel.draw_secure_felts(m_log);
-    let col_challenges = channel.draw_secure_felts(n_log);
+    let log_m = m.ilog2() as usize;
+    let _log_k = k.ilog2() as usize;
+    let log_n = n.ilog2() as usize;
 
-    // Step 2: Evaluate MLE_C at (r_i, r_j) — this is the claimed inner product value
-    let c_mle_evals: Vec<SecureField> = c.data.iter().map(|&v| SecureField::from(v)).collect();
-    let c_padded = pad_to_pow2(&c_mle_evals);
+    // Build MLEs
+    let mle_a = matrix_to_mle(a);           // row-major: (row_bits, col_bits)
+    let mle_b_t = matrix_to_mle_col_major(b); // col-major: (col_bits, row_bits)
+    let mle_c = matrix_to_mle(c);           // row-major: (row_bits, col_bits)
 
-    // MLE_C has variables (row_bits, col_bits), evaluate at (row_challenges, col_challenges)
-    let mut point = Vec::with_capacity(m_log + n_log);
-    point.extend_from_slice(&row_challenges);
-    point.extend_from_slice(&col_challenges);
-    let claimed_c_eval = eval_mle_at_point(&c_padded, &point);
+    // Fiat-Shamir: seed channel with dimensions
+    let mut channel = Blake2sChannel::default();
+    channel.mix_felts(&[
+        SecureField::from(M31::from(m as u32)),
+        SecureField::from(M31::from(k as u32)),
+        SecureField::from(M31::from(n as u32)),
+    ]);
 
-    // Step 3: Extract row/column slices as MLEs over inner dimension k
-    let a_row = extract_row_mle(a, &row_challenges);
-    let b_col = extract_col_mle(b, &col_challenges);
+    // Draw random evaluation points
+    let r_i = channel.draw_secure_felts(log_m);
+    let r_j = channel.draw_secure_felts(log_n);
 
-    // Step 4: Create the inner product oracle and run sumcheck
-    let oracle = InnerProductOracle::new(a_row, b_col)?;
-    let lambda = SecureField::one(); // single claim, no batching needed
+    // Compute claimed sum: MLE_C(r_i, r_j)
+    let mut r_ij = Vec::with_capacity(log_m + log_n);
+    r_ij.extend_from_slice(&r_i);
+    r_ij.extend_from_slice(&r_j);
+    let claimed_sum = evaluate_mle(&mle_c, &r_ij);
 
-    let (sumcheck_proof, _assignment, _constant_oracles, _claimed_evals) =
-        prove_batch(vec![claimed_c_eval], vec![oracle], lambda, channel);
+    // Mix claimed sum into channel for binding
+    channel.mix_felts(&[claimed_sum]);
 
-    Ok((
-        MatMulProof { sumcheck_proof },
-        MatMulAux {
-            row_challenges,
-            col_challenges,
-            claimed_c_eval,
-            lambda,
-        },
-    ))
+    // Restrict MLEs to random points
+    // f_a(x) = MLE_A(r_i, x) for x ∈ {0,1}^{log k} — fix first log_m vars
+    let f_a = restrict_mle(&mle_a, &r_i);
+    // f_b(x) = MLE_B(x, r_j) — using transposed layout, fix first log_n vars
+    let f_b = restrict_mle(&mle_b_t, &r_j);
+
+    assert_eq!(f_a.len(), k, "f_a should have k={k} elements");
+    assert_eq!(f_b.len(), k, "f_b should have k={k} elements");
+
+    // Build oracle and run sumcheck
+    let oracle = MatMulOracle { f_a, f_b };
+    let lambda = SecureField::one();
+    let (sumcheck_proof, assignment, final_oracles, _claimed_evals) =
+        sumcheck::prove_batch(vec![claimed_sum], vec![oracle], lambda, &mut channel);
+
+    // Extract final single-point evaluations
+    let final_oracle = &final_oracles[0];
+    assert_eq!(final_oracle.f_a.len(), 1);
+    assert_eq!(final_oracle.f_b.len(), 1);
+    let final_a_eval = final_oracle.f_a[0];
+    let final_b_eval = final_oracle.f_b[0];
+
+    Ok(MatMulSumcheckProof {
+        sumcheck_proof,
+        r_i,
+        r_j,
+        claimed_sum,
+        final_a_eval,
+        final_b_eval,
+        assignment,
+    })
 }
 
-// ---------------------------------------------------------------------------
-// Verify
-// ---------------------------------------------------------------------------
-
-/// Verify that C = A × B using a sumcheck proof.
+/// Verify a matmul sumcheck proof against the original matrices.
 ///
-/// The verifier:
-/// 1. Recomputes the random challenges (from the channel).
-/// 2. Evaluates MLE_C at those challenges to get the claimed inner product.
-/// 3. Runs sumcheck partial verification to get the variable assignment.
-/// 4. Evaluates MLE_A and MLE_B at the assigned points and checks consistency.
-pub fn verify_matmul(
+/// Checks:
+/// 1. MLE_C(r_i, r_j) matches the claimed sum
+/// 2. Sumcheck round polynomials are valid (via STWO's partially_verify)
+/// 3. Final evaluation matches MLE_A(r_i, r_k) × MLE_B(r_k, r_j)
+pub fn verify_matmul_sumcheck(
+    proof: &MatMulSumcheckProof,
     a: &M31Matrix,
     b: &M31Matrix,
     c: &M31Matrix,
-    proof: &MatMulProof,
-    aux: &MatMulAux,
-    channel: &mut impl Channel,
 ) -> Result<(), MatMulError> {
-    let m_log = a.rows.next_power_of_two().ilog2() as usize;
-    let n_log = b.cols.next_power_of_two().ilog2() as usize;
+    let m = a.rows;
+    let k = a.cols;
+    let n = b.cols;
+    let log_m = m.ilog2() as usize;
+    let log_n = n.ilog2() as usize;
 
-    // Reproduce the Fiat-Shamir transcript
-    channel.mix_u64(a.rows as u64);
-    channel.mix_u64(a.cols as u64);
-    channel.mix_u64(b.cols as u64);
+    // Recreate channel with identical Fiat-Shamir transcript
+    let mut channel = Blake2sChannel::default();
+    channel.mix_felts(&[
+        SecureField::from(M31::from(m as u32)),
+        SecureField::from(M31::from(k as u32)),
+        SecureField::from(M31::from(n as u32)),
+    ]);
 
-    let row_challenges = channel.draw_secure_felts(m_log);
-    let col_challenges = channel.draw_secure_felts(n_log);
+    // Draw same r_i, r_j
+    let r_i = channel.draw_secure_felts(log_m);
+    let r_j = channel.draw_secure_felts(log_n);
+    assert_eq!(r_i, proof.r_i, "r_i mismatch — channel desync");
+    assert_eq!(r_j, proof.r_j, "r_j mismatch — channel desync");
 
-    // Verify challenges match
-    if row_challenges != aux.row_challenges || col_challenges != aux.col_challenges {
-        return Err(MatMulError::ChallengeMismatch);
+    // Verify claimed sum = MLE_C(r_i, r_j)
+    let mle_c = matrix_to_mle(c);
+    let mut r_ij = Vec::with_capacity(log_m + log_n);
+    r_ij.extend_from_slice(&r_i);
+    r_ij.extend_from_slice(&r_j);
+    let expected_sum = evaluate_mle(&mle_c, &r_ij);
+
+    if expected_sum != proof.claimed_sum {
+        return Err(MatMulError::ClaimedSumMismatch {
+            expected: expected_sum,
+            actual: proof.claimed_sum,
+        });
     }
 
-    // Step 1: Evaluate MLE_C at (r_i, r_j)
-    let c_mle_evals: Vec<SecureField> = c.data.iter().map(|&v| SecureField::from(v)).collect();
-    let c_padded = pad_to_pow2(&c_mle_evals);
-    let mut point = Vec::with_capacity(m_log + n_log);
-    point.extend_from_slice(&row_challenges);
-    point.extend_from_slice(&col_challenges);
-    let claimed_c_eval = eval_mle_at_point(&c_padded, &point);
+    // Mix claimed sum (same as prover)
+    channel.mix_felts(&[proof.claimed_sum]);
 
-    if claimed_c_eval != aux.claimed_c_eval {
-        return Err(MatMulError::ClaimMismatch);
-    }
-
-    // Step 2: Run sumcheck partial verification
+    // Run sumcheck partial verification
     let (assignment, claimed_eval) =
-        partially_verify(claimed_c_eval, &proof.sumcheck_proof, channel)?;
+        sumcheck::partially_verify(proof.claimed_sum, &proof.sumcheck_proof, &mut channel)
+            .map_err(|e| MatMulError::SumcheckFailed(format!("{e}")))?;
 
-    // Step 3: Verify the final evaluation
-    // After sumcheck, the verifier needs to check:
-    //   claimed_eval == f_A(assignment) * f_B(assignment)
-    // where f_A and f_B are the row/col slices at the random challenges.
-    let a_row = extract_row_mle(a, &row_challenges);
-    let b_col = extract_col_mle(b, &col_challenges);
+    // Verify final evaluations against MLEs
+    let mle_a = matrix_to_mle(a);
+    let mle_b_t = matrix_to_mle_col_major(b);
 
-    let a_eval = eval_mle_at_point(&a_row, &assignment);
-    let b_eval = eval_mle_at_point(&b_col, &assignment);
+    // MLE_A(r_i, assignment) — full point is (r_i ++ assignment)
+    let mut r_full_a = Vec::with_capacity(r_i.len() + assignment.len());
+    r_full_a.extend_from_slice(&r_i);
+    r_full_a.extend_from_slice(&assignment);
+    let expected_a = evaluate_mle(&mle_a, &r_full_a);
 
-    if claimed_eval != a_eval * b_eval {
-        return Err(MatMulError::FinalEvalMismatch);
+    // MLE_B_T(r_j, assignment) — transposed, so (r_j ++ assignment)
+    let mut r_full_b = Vec::with_capacity(r_j.len() + assignment.len());
+    r_full_b.extend_from_slice(&r_j);
+    r_full_b.extend_from_slice(&assignment);
+    let expected_b = evaluate_mle(&mle_b_t, &r_full_b);
+
+    // The claimed eval from sumcheck should equal f_a(assignment) * f_b(assignment)
+    let expected_product = expected_a * expected_b;
+    if claimed_eval != expected_product {
+        return Err(MatMulError::EvaluationMismatch {
+            expected: expected_product,
+            actual: claimed_eval,
+        });
     }
 
     Ok(())
@@ -578,7 +471,6 @@ pub fn verify_matmul(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stwo::core::channel::Blake2sChannel;
 
     #[test]
     fn test_dims_speedup() {
@@ -605,22 +497,18 @@ mod tests {
     }
 
     #[test]
-    fn test_matrix_multiply() {
-        // 2×2 identity multiplication
+    fn test_matmul_m31() {
+        // A = [[1, 2], [3, 4]], B = [[5, 6], [7, 8]]
+        // C = [[1*5+2*7, 1*6+2*8], [3*5+4*7, 3*6+4*8]] = [[19, 22], [43, 50]]
         let mut a = M31Matrix::new(2, 2);
-        a.set(0, 0, M31::from(1));
-        a.set(0, 1, M31::from(2));
-        a.set(1, 0, M31::from(3));
-        a.set(1, 1, M31::from(4));
+        a.set(0, 0, M31::from(1)); a.set(0, 1, M31::from(2));
+        a.set(1, 0, M31::from(3)); a.set(1, 1, M31::from(4));
 
         let mut b = M31Matrix::new(2, 2);
-        b.set(0, 0, M31::from(5));
-        b.set(0, 1, M31::from(6));
-        b.set(1, 0, M31::from(7));
-        b.set(1, 1, M31::from(8));
+        b.set(0, 0, M31::from(5)); b.set(0, 1, M31::from(6));
+        b.set(1, 0, M31::from(7)); b.set(1, 1, M31::from(8));
 
-        let c = M31Matrix::multiply(&a, &b).unwrap();
-        // C = [[1*5+2*7, 1*6+2*8], [3*5+4*7, 3*6+4*8]] = [[19, 22], [43, 50]]
+        let c = matmul_m31(&a, &b);
         assert_eq!(c.get(0, 0), M31::from(19));
         assert_eq!(c.get(0, 1), M31::from(22));
         assert_eq!(c.get(1, 0), M31::from(43));
@@ -628,179 +516,97 @@ mod tests {
     }
 
     #[test]
-    fn test_eq_evals() {
-        let one = SecureField::one();
-        let zero = SecureField::zero();
+    fn test_mle_evaluate() {
+        // MLE of f(0)=1, f(1)=3 → f(x) = 1 + 2x
+        let evals = vec![SecureField::from(M31::from(1)), SecureField::from(M31::from(3))];
+        let point = vec![SecureField::zero()];
+        assert_eq!(evaluate_mle(&evals, &point), SecureField::from(M31::from(1)));
 
-        // eq((0), i) for i in {0, 1} should be [1, 0]
-        let evals = eq_evals_at_point(&[zero], 2);
-        assert_eq!(evals[0], one);
-        assert_eq!(evals[1], zero);
-
-        // eq((1), i) for i in {0, 1} should be [0, 1]
-        let evals = eq_evals_at_point(&[one], 2);
-        assert_eq!(evals[0], zero);
-        assert_eq!(evals[1], one);
+        let point = vec![SecureField::one()];
+        assert_eq!(evaluate_mle(&evals, &point), SecureField::from(M31::from(3)));
     }
 
     #[test]
-    fn test_inner_product_oracle() {
-        // Simple test: f_A = [1, 2], f_B = [3, 4]
-        // Inner product = 1*3 + 2*4 = 11
-        let a_evals = vec![
-            SecureField::from(M31::from(1)),
-            SecureField::from(M31::from(2)),
-        ];
-        let b_evals = vec![
-            SecureField::from(M31::from(3)),
-            SecureField::from(M31::from(4)),
-        ];
-        let claim = SecureField::from(M31::from(11));
-
-        let oracle = InnerProductOracle::new(a_evals, b_evals).unwrap();
-        assert_eq!(oracle.n_variables(), 1);
-
-        let poly = oracle.sum_as_poly_in_first_variable(claim);
-        // h(0) = a[0]*b[0] = 3, h(1) = a[1]*b[1] = 8
-        assert_eq!(poly.eval_at_point(SecureField::zero()), SecureField::from(M31::from(3)));
-        assert_eq!(poly.eval_at_point(SecureField::one()), SecureField::from(M31::from(8)));
-    }
-
-    #[test]
-    fn test_prove_verify_2x2() {
+    fn test_sumcheck_matmul_2x2() {
+        // Smallest meaningful test: 2×2 × 2×2
         let mut a = M31Matrix::new(2, 2);
-        a.set(0, 0, M31::from(1));
-        a.set(0, 1, M31::from(2));
-        a.set(1, 0, M31::from(3));
-        a.set(1, 1, M31::from(4));
+        a.set(0, 0, M31::from(1)); a.set(0, 1, M31::from(2));
+        a.set(1, 0, M31::from(3)); a.set(1, 1, M31::from(4));
 
         let mut b = M31Matrix::new(2, 2);
-        b.set(0, 0, M31::from(5));
-        b.set(0, 1, M31::from(6));
-        b.set(1, 0, M31::from(7));
-        b.set(1, 1, M31::from(8));
+        b.set(0, 0, M31::from(5)); b.set(0, 1, M31::from(6));
+        b.set(1, 0, M31::from(7)); b.set(1, 1, M31::from(8));
 
-        let c = M31Matrix::multiply(&a, &b).unwrap();
+        let c = matmul_m31(&a, &b);
 
-        let mut prover_channel = Blake2sChannel::default();
-        let (proof, aux) = prove_matmul(&a, &b, &c, &mut prover_channel).unwrap();
+        // Prove
+        let proof = prove_matmul_sumcheck(&a, &b, &c).expect("proving should succeed");
 
-        let mut verifier_channel = Blake2sChannel::default();
-        verify_matmul(&a, &b, &c, &proof, &aux, &mut verifier_channel).unwrap();
+        // Verify
+        verify_matmul_sumcheck(&proof, &a, &b, &c).expect("verification should succeed");
     }
 
     #[test]
-    fn test_prove_verify_4x4() {
-        // Build a 4×4 matmul with known values
-        let a = M31Matrix::from_data(
-            4, 4,
-            (1..=16).map(M31::from).collect(),
-        ).unwrap();
-        let b = M31Matrix::from_data(
-            4, 4,
-            (17..=32).map(M31::from).collect(),
-        ).unwrap();
-        let c = M31Matrix::multiply(&a, &b).unwrap();
+    fn test_sumcheck_matmul_4x4() {
+        // 4×4 × 4×4 — 2 sumcheck rounds over inner dimension
+        let mut a = M31Matrix::new(4, 4);
+        let mut b = M31Matrix::new(4, 4);
+        for i in 0..4 {
+            for j in 0..4 {
+                a.set(i, j, M31::from((i * 4 + j + 1) as u32));
+                b.set(i, j, M31::from((i * 4 + j + 17) as u32));
+            }
+        }
 
-        let mut prover_channel = Blake2sChannel::default();
-        let (proof, aux) = prove_matmul(&a, &b, &c, &mut prover_channel).unwrap();
+        let c = matmul_m31(&a, &b);
 
-        let mut verifier_channel = Blake2sChannel::default();
-        verify_matmul(&a, &b, &c, &proof, &aux, &mut verifier_channel).unwrap();
+        let proof = prove_matmul_sumcheck(&a, &b, &c).expect("4x4 proving should succeed");
+        assert_eq!(proof.assignment.len(), 2, "log2(4) = 2 sumcheck rounds");
+
+        verify_matmul_sumcheck(&proof, &a, &b, &c).expect("4x4 verification should succeed");
     }
 
     #[test]
-    fn test_prove_verify_8x8() {
-        let a = M31Matrix::from_data(
-            8, 8,
-            (1..=64).map(M31::from).collect(),
-        ).unwrap();
-        let b = M31Matrix::from_data(
-            8, 8,
-            (65..=128).map(M31::from).collect(),
-        ).unwrap();
-        let c = M31Matrix::multiply(&a, &b).unwrap();
+    fn test_sumcheck_matmul_tampered_c_fails_verification() {
+        // Prove with correct matrices
+        let mut a = M31Matrix::new(2, 2);
+        a.set(0, 0, M31::from(1)); a.set(0, 1, M31::from(2));
+        a.set(1, 0, M31::from(3)); a.set(1, 1, M31::from(4));
 
-        let mut prover_channel = Blake2sChannel::default();
-        let (proof, aux) = prove_matmul(&a, &b, &c, &mut prover_channel).unwrap();
+        let mut b = M31Matrix::new(2, 2);
+        b.set(0, 0, M31::from(5)); b.set(0, 1, M31::from(6));
+        b.set(1, 0, M31::from(7)); b.set(1, 1, M31::from(8));
 
-        let mut verifier_channel = Blake2sChannel::default();
-        verify_matmul(&a, &b, &c, &proof, &aux, &mut verifier_channel).unwrap();
+        let c = matmul_m31(&a, &b);
+        let proof = prove_matmul_sumcheck(&a, &b, &c).expect("proving should succeed");
+
+        // Tamper with C and try to verify — should fail at claimed sum check
+        let mut c_wrong = c.clone();
+        c_wrong.set(0, 0, M31::from(999));
+
+        let result = verify_matmul_sumcheck(&proof, &a, &b, &c_wrong);
+        assert!(result.is_err(), "verification with tampered C should fail");
     }
 
     #[test]
-    fn test_prove_verify_non_square() {
-        // A is 4×2, B is 2×4, C is 4×4
-        let a = M31Matrix::from_data(
-            4, 2,
-            (1..=8).map(M31::from).collect(),
-        ).unwrap();
-        let b = M31Matrix::from_data(
-            2, 4,
-            (1..=8).map(M31::from).collect(),
-        ).unwrap();
-        let c = M31Matrix::multiply(&a, &b).unwrap();
+    fn test_sumcheck_matmul_rectangular() {
+        // 2×4 × 4×2 = 2×2 — non-square matrices
+        let mut a = M31Matrix::new(2, 4);
+        let mut b = M31Matrix::new(4, 2);
+        for i in 0..2 {
+            for j in 0..4 {
+                a.set(i, j, M31::from((i * 4 + j + 1) as u32));
+            }
+        }
+        for i in 0..4 {
+            for j in 0..2 {
+                b.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
 
-        let mut prover_channel = Blake2sChannel::default();
-        let (proof, aux) = prove_matmul(&a, &b, &c, &mut prover_channel).unwrap();
+        let c = matmul_m31(&a, &b);
 
-        let mut verifier_channel = Blake2sChannel::default();
-        verify_matmul(&a, &b, &c, &proof, &aux, &mut verifier_channel).unwrap();
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_invalid_product_panics_prover() {
-        // A correct prover cannot prove a false claim — prove_batch will panic
-        // when the round polynomial sum doesn't match the claim.
-        let a = M31Matrix::from_data(
-            2, 2,
-            vec![M31::from(1), M31::from(0), M31::from(0), M31::from(1)],
-        ).unwrap();
-        let b = M31Matrix::from_data(
-            2, 2,
-            vec![M31::from(5), M31::from(6), M31::from(7), M31::from(8)],
-        ).unwrap();
-        let mut c = M31Matrix::multiply(&a, &b).unwrap();
-        c.set(0, 0, M31::from(999)); // corrupt the result
-
-        let mut prover_channel = Blake2sChannel::default();
-        let _ = prove_matmul(&a, &b, &c, &mut prover_channel);
-    }
-
-    #[test]
-    fn test_verify_rejects_tampered_proof() {
-        let a = M31Matrix::from_data(4, 4, (1..=16).map(M31::from).collect()).unwrap();
-        let b = M31Matrix::from_data(4, 4, (17..=32).map(M31::from).collect()).unwrap();
-        let c = M31Matrix::multiply(&a, &b).unwrap();
-
-        let mut prover_channel = Blake2sChannel::default();
-        let (proof, aux) = prove_matmul(&a, &b, &c, &mut prover_channel).unwrap();
-
-        // Tamper with aux: use wrong row challenges
-        let mut bad_aux = aux.clone();
-        bad_aux.claimed_c_eval = SecureField::from(M31::from(999));
-
-        let mut verifier_channel = Blake2sChannel::default();
-        let result = verify_matmul(&a, &b, &c, &proof, &bad_aux, &mut verifier_channel);
-        assert!(result.is_err(), "tampered proof should be rejected");
-    }
-
-    #[test]
-    fn test_verify_rejects_wrong_matrix() {
-        let a = M31Matrix::from_data(4, 4, (1..=16).map(M31::from).collect()).unwrap();
-        let b = M31Matrix::from_data(4, 4, (17..=32).map(M31::from).collect()).unwrap();
-        let c = M31Matrix::multiply(&a, &b).unwrap();
-
-        let mut prover_channel = Blake2sChannel::default();
-        let (proof, aux) = prove_matmul(&a, &b, &c, &mut prover_channel).unwrap();
-
-        // Try to verify with different matrix C
-        let mut c_bad = c.clone();
-        c_bad.set(0, 0, M31::from(0));
-
-        let mut verifier_channel = Blake2sChannel::default();
-        let result = verify_matmul(&a, &b, &c_bad, &proof, &aux, &mut verifier_channel);
-        assert!(result.is_err(), "wrong matrix should be rejected");
+        let proof = prove_matmul_sumcheck(&a, &b, &c).expect("rectangular proving should succeed");
+        verify_matmul_sumcheck(&proof, &a, &b, &c).expect("rectangular verification should succeed");
     }
 }

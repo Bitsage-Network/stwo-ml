@@ -19,9 +19,12 @@
 //! STWO Circuit
 //!     │  Components: MatMul + Activation + Attention + LayerNorm
 //!     ▼
-//! Proof Generation (via stwo-gpu backend)
+//! Proof Generation (prove.rs)
 //! ```
 
-pub mod graph;
 pub mod onnx;
+pub mod graph;
 pub mod prove;
+#[cfg(feature = "safetensors")]
+pub mod safetensors;
+pub mod quantize_weights;
