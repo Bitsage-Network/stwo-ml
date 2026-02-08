@@ -8,155 +8,115 @@
 //! ```text
 //! FP32 weight → scale + zero_point → INT8 → M31
 //!
-//! q = clamp(round(w / scale) + zero_point, 0, 255)
+//! q = round(w / scale) + zero_point
 //! M31_val = q mod (2^31 - 1)
 //!
-//! For INT8: q ∈ [0, 255] → direct M31 embedding
+//! For INT8: q ∈ [-128, 127] → M31 range is [0, 255] (shifted)
 //! For FP16: mantissa ∈ [0, 1023] → direct M31 embedding
 //! ```
-//!
-//! The quantization gadget ensures all quantized values are within
-//! the expected range using the range check gadget.
 
-use stwo::core::channel::Blake2sChannel;
 use stwo::core::fields::m31::M31;
-use stwo::core::pcs::PcsConfig;
-use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasher;
 
-use super::range_check::{
-    prove_range_check, verify_range_check, RangeCheckComponent, RangeCheckError,
-};
+/// Quantization strategy for converting floating-point to M31.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantStrategy {
+    /// Direct clamping: clamp to [0, P-1] and convert.
+    Direct,
+    /// INT8 symmetric: scale to [-127, 127], shift to [0, 254].
+    Symmetric8,
+    /// INT8 asymmetric: scale with zero-point to [0, 255].
+    Asymmetric8,
+}
 
-/// Quantization parameters for mapping float values to field elements.
-#[derive(Debug, Clone, Copy)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct QuantizeParams {
-    /// Scale factor: real_value ≈ (quantized - zero_point) * scale.
-    pub scale: f32,
-    /// Zero point offset (maps 0.0 in real space to this quantized value).
-    pub zero_point: u32,
-    /// Number of bits for the quantized representation.
+/// Quantization parameters for a tensor.
+#[derive(Debug, Clone)]
+pub struct QuantParams {
+    pub strategy: QuantStrategy,
+    /// Scale factor: real_value = (quantized - zero_point) * scale.
+    pub scale: f64,
+    /// Zero point offset.
+    pub zero_point: i32,
+    /// Number of bits.
     pub bits: u32,
 }
 
-impl QuantizeParams {
-    /// Standard INT8 symmetric quantization.
-    pub fn int8_symmetric(scale: f32) -> Self {
-        Self {
-            scale,
-            zero_point: 128, // Symmetric around 128
-            bits: 8,
+impl QuantParams {
+    /// Compute quantization parameters from a tensor's min/max values.
+    pub fn from_range(min_val: f64, max_val: f64, strategy: QuantStrategy) -> Self {
+        match strategy {
+            QuantStrategy::Direct => {
+                let p = (1u64 << 31) - 1;
+                Self {
+                    strategy,
+                    scale: (max_val - min_val) / p as f64,
+                    zero_point: 0,
+                    bits: 31,
+                }
+            }
+            QuantStrategy::Symmetric8 => {
+                let abs_max = max_val.abs().max(min_val.abs());
+                let scale = abs_max / 127.0;
+                Self {
+                    strategy,
+                    scale,
+                    zero_point: 127, // shift so that 0 maps to 127
+                    bits: 8,
+                }
+            }
+            QuantStrategy::Asymmetric8 => {
+                let scale = (max_val - min_val) / 255.0;
+                let zero_point = (-min_val / scale).round() as i32;
+                Self {
+                    strategy,
+                    scale,
+                    zero_point: zero_point.clamp(0, 255),
+                    bits: 8,
+                }
+            }
         }
     }
-
-    /// Standard INT8 asymmetric quantization.
-    ///
-    /// Returns `None` if `zero_point >= 256`.
-    pub fn int8_asymmetric(scale: f32, zero_point: u32) -> Option<Self> {
-        if zero_point >= 256 {
-            return None;
-        }
-        Some(Self {
-            scale,
-            zero_point,
-            bits: 8,
-        })
-    }
-
-    /// Maximum quantized value.
-    pub fn max_value(&self) -> u32 {
-        (1u32 << self.bits) - 1
-    }
-
-    /// Quantize a single float value to M31.
-    pub fn quantize(&self, value: f32) -> M31 {
-        let q = (value / self.scale).round() as i64 + self.zero_point as i64;
-        let clamped = q.clamp(0, self.max_value() as i64) as u32;
-        M31::from(clamped)
-    }
-
-    /// Dequantize an M31 value back to float (approximate).
-    pub fn dequantize(&self, value: M31) -> f32 {
-        (value.0 as f32 - self.zero_point as f32) * self.scale
-    }
-
-    /// Quantize a vector of floats to M31 values.
-    pub fn quantize_vec(&self, values: &[f32]) -> Vec<M31> {
-        values.iter().map(|&v| self.quantize(v)).collect()
-    }
 }
 
-/// Verify that all quantized values are within the valid range.
-///
-/// Returns true if all values are in `[0, 2^bits)`.
-pub fn validate_quantized_range(values: &[M31], bits: u32) -> bool {
-    let max = 1u32 << bits;
-    values.iter().all(|v| v.0 < max)
+/// Quantize a single f32 value to M31 using the given parameters.
+pub fn quantize_value(value: f32, params: &QuantParams) -> M31 {
+    let q = (value as f64 / params.scale).round() as i64 + params.zero_point as i64;
+    let p = (1u32 << 31) - 1;
+    let clamped = q.rem_euclid(p as i64) as u32;
+    M31::from(clamped)
 }
 
-// ---------------------------------------------------------------------------
-// Quantize + Range Check integration
-// ---------------------------------------------------------------------------
-
-/// Error type for quantized range check operations.
-#[derive(Debug, thiserror::Error)]
-pub enum QuantizeError {
-    #[error("range check error: {0}")]
-    RangeCheck(#[from] RangeCheckError),
-    #[error("quantized value {value} out of range [0, {max})")]
-    ValueOutOfRange { value: u32, max: u32 },
+/// Dequantize an M31 value back to f32.
+pub fn dequantize_value(m31_val: M31, params: &QuantParams) -> f32 {
+    let q = m31_val.0 as i64 - params.zero_point as i64;
+    (q as f64 * params.scale) as f32
 }
 
-/// Quantize a vector of floats and prove all quantized values are in range.
-///
-/// Combines `QuantizeParams::quantize_vec` with `prove_range_check` to produce
-/// a STWO STARK proof that all quantized values are in `[0, 2^bits)`.
-///
-/// Returns the quantized values and the range check proof.
-pub fn prove_quantized_range(
-    values: &[f32],
-    params: &QuantizeParams,
-    config: PcsConfig,
-    channel: &mut Blake2sChannel,
-) -> Result<
-    (
-        Vec<M31>,
-        RangeCheckComponent,
-        stwo::core::proof::StarkProof<Blake2sMerkleHasher>,
-    ),
-    QuantizeError,
-> {
-    let quantized = params.quantize_vec(values);
-
-    // Verify all values are in range before proving.
-    let max = 1u32 << params.bits;
-    for &v in &quantized {
-        if v.0 >= max {
-            return Err(QuantizeError::ValueOutOfRange {
-                value: v.0,
-                max,
-            });
-        }
+/// Quantize an entire tensor (flat f32 array) to Vec<M31>.
+pub fn quantize_tensor(data: &[f32], strategy: QuantStrategy) -> (Vec<M31>, QuantParams) {
+    if data.is_empty() {
+        return (
+            vec![],
+            QuantParams {
+                strategy,
+                scale: 1.0,
+                zero_point: 0,
+                bits: 8,
+            },
+        );
     }
 
-    // Use the range check STARK to prove all values are in [0, 2^bits).
-    // The range check table needs log_size >= bits. We use the bits value
-    // directly, clamped to minimum SIMD lane size.
-    let log_range = params.bits.max(stwo::prover::backend::simd::m31::LOG_N_LANES);
+    let min_val = data.iter().cloned().fold(f32::INFINITY, f32::min) as f64;
+    let max_val = data.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
 
-    let (component, proof) = prove_range_check(&quantized, log_range, config, channel)?;
+    let params = QuantParams::from_range(min_val, max_val, strategy);
+    let quantized: Vec<M31> = data.iter().map(|&v| quantize_value(v, &params)).collect();
 
-    Ok((quantized, component, proof))
+    (quantized, params)
 }
 
-/// Verify a quantized range check proof.
-pub fn verify_quantized_range(
-    component: &RangeCheckComponent,
-    proof: &stwo::core::proof::StarkProof<Blake2sMerkleHasher>,
-    channel: &mut Blake2sChannel,
-) -> Result<(), QuantizeError> {
-    verify_range_check(component, proof, channel)?;
-    Ok(())
+/// Dequantize an entire tensor back to Vec<f32>.
+pub fn dequantize_tensor(data: &[M31], params: &QuantParams) -> Vec<f32> {
+    data.iter().map(|&v| dequantize_value(v, params)).collect()
 }
 
 #[cfg(test)]
@@ -164,143 +124,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_int8_symmetric_quantize() {
-        let params = QuantizeParams::int8_symmetric(0.1);
-        assert_eq!(params.zero_point, 128);
-        assert_eq!(params.bits, 8);
-        assert_eq!(params.max_value(), 255);
+    fn test_symmetric8_roundtrip() {
+        let values = vec![1.0f32, -1.0, 0.5, -0.5, 0.0];
+        let (quantized, params) = quantize_tensor(&values, QuantStrategy::Symmetric8);
+        let recovered = dequantize_tensor(&quantized, &params);
 
-        // Value 0.0 maps to zero_point (128)
-        assert_eq!(params.quantize(0.0), M31::from(128));
-
-        // Positive values shift above zero_point
-        // 1.0 / 0.1 = 10, + 128 = 138
-        assert_eq!(params.quantize(1.0), M31::from(138));
-
-        // Negative values shift below zero_point
-        // -1.0 / 0.1 = -10, + 128 = 118
-        assert_eq!(params.quantize(-1.0), M31::from(118));
-    }
-
-    #[test]
-    fn test_quantize_clamp() {
-        let params = QuantizeParams::int8_symmetric(0.01);
-
-        // Very large value clamps to 255
-        assert_eq!(params.quantize(100.0), M31::from(255));
-
-        // Very negative value clamps to 0
-        assert_eq!(params.quantize(-100.0), M31::from(0));
-    }
-
-    #[test]
-    fn test_quantize_dequantize_roundtrip() {
-        let params = QuantizeParams::int8_symmetric(0.1);
-        let original = 0.5f32;
-        let quantized = params.quantize(original);
-        let recovered = params.dequantize(quantized);
-
-        // Should be approximately equal (within quantization error)
-        assert!((original - recovered).abs() < params.scale);
-    }
-
-    #[test]
-    fn test_quantize_vec() {
-        let params = QuantizeParams::int8_symmetric(0.1);
-        let values = vec![0.0, 0.5, -0.5, 1.0];
-        let quantized = params.quantize_vec(&values);
-
-        assert_eq!(quantized.len(), 4);
-        assert_eq!(quantized[0], M31::from(128)); // 0.0 → 128
-        assert!(quantized[1].0 > 128); // 0.5 → 133
-        assert!(quantized[2].0 < 128); // -0.5 → 123
-    }
-
-    #[test]
-    fn test_validate_range() {
-        let values = vec![M31::from(0), M31::from(100), M31::from(255)];
-        assert!(validate_quantized_range(&values, 8)); // all < 256
-
-        let bad = vec![M31::from(0), M31::from(256)];
-        assert!(!validate_quantized_range(&bad, 8)); // 256 >= 256
-    }
-
-    #[test]
-    fn test_asymmetric_quantize() {
-        let params = QuantizeParams::int8_asymmetric(0.05, 50).unwrap();
-        assert_eq!(params.zero_point, 50);
-        assert_eq!(params.quantize(0.0), M31::from(50));
-    }
-
-    #[test]
-    fn test_asymmetric_rejects_bad_zero_point() {
-        assert!(QuantizeParams::int8_asymmetric(0.1, 256).is_none());
-        assert!(QuantizeParams::int8_asymmetric(0.1, 1000).is_none());
-        assert!(QuantizeParams::int8_asymmetric(0.1, 255).is_some());
-    }
-
-    // -------------------------------------------------------------------
-    // Quantize + Range Check STARK integration tests
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn test_prove_verify_quantized_range() {
-        use stwo::core::channel::Blake2sChannel;
-        use stwo::core::pcs::PcsConfig;
-
-        let params = QuantizeParams::int8_symmetric(0.1);
-        let values = vec![0.0, 0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 0.3];
-
-        let config = PcsConfig::default();
-        let mut prover_channel = Blake2sChannel::default();
-        let (quantized, component, proof) =
-            prove_quantized_range(&values, &params, config, &mut prover_channel).unwrap();
-
-        // Verify all quantized values are in [0, 256)
-        for &v in &quantized {
-            assert!(v.0 < 256, "quantized value {} out of INT8 range", v.0);
+        for (orig, recov) in values.iter().zip(recovered.iter()) {
+            let error = (orig - recov).abs();
+            assert!(
+                error < 0.02,
+                "Roundtrip error too large: {orig} -> {recov} (error: {error})"
+            );
         }
-
-        let mut verifier_channel = Blake2sChannel::default();
-        verify_quantized_range(&component, &proof, &mut verifier_channel).unwrap();
     }
 
     #[test]
-    fn test_prove_quantized_range_batch() {
-        use stwo::core::channel::Blake2sChannel;
-        use stwo::core::pcs::PcsConfig;
+    fn test_asymmetric8_roundtrip() {
+        let values = vec![0.0f32, 1.0, 2.0, 3.0];
+        let (quantized, params) = quantize_tensor(&values, QuantStrategy::Asymmetric8);
+        let recovered = dequantize_tensor(&quantized, &params);
 
-        let params = QuantizeParams::int8_symmetric(0.05);
-        // Generate a batch of 64 values in [-5, 5]
-        let values: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) * 0.15).collect();
-
-        let config = PcsConfig::default();
-        let mut prover_channel = Blake2sChannel::default();
-        let (quantized, component, proof) =
-            prove_quantized_range(&values, &params, config, &mut prover_channel).unwrap();
-
-        assert_eq!(quantized.len(), 64);
-
-        let mut verifier_channel = Blake2sChannel::default();
-        verify_quantized_range(&component, &proof, &mut verifier_channel).unwrap();
+        for (orig, recov) in values.iter().zip(recovered.iter()) {
+            let error = (orig - recov).abs();
+            assert!(
+                error < 0.05,
+                "Roundtrip error too large: {orig} -> {recov} (error: {error})"
+            );
+        }
     }
 
     #[test]
-    fn test_quantized_range_preserves_values() {
-        use stwo::core::channel::Blake2sChannel;
-        use stwo::core::pcs::PcsConfig;
+    fn test_direct_quantization() {
+        let val = quantize_value(42.0, &QuantParams {
+            strategy: QuantStrategy::Direct,
+            scale: 1.0,
+            zero_point: 0,
+            bits: 31,
+        });
+        assert_eq!(val, M31::from(42));
+    }
 
-        let params = QuantizeParams::int8_symmetric(0.1);
-        let values = vec![0.0, 0.5];
-
-        let config = PcsConfig::default();
-        let mut channel = Blake2sChannel::default();
-        let (quantized, _, _) =
-            prove_quantized_range(&values, &params, config, &mut channel).unwrap();
-
-        // 0.0 → 128 (zero_point)
-        assert_eq!(quantized[0], M31::from(128));
-        // 0.5 → 133 (128 + round(0.5/0.1))
-        assert_eq!(quantized[1], M31::from(133));
+    #[test]
+    fn test_empty_tensor() {
+        let (q, _) = quantize_tensor(&[], QuantStrategy::Symmetric8);
+        assert!(q.is_empty());
     }
 }
