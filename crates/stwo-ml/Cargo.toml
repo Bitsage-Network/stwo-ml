@@ -33,11 +33,11 @@ safetensors = { version = "0.4", optional = true }
 memmap2 = { version = "0.9", optional = true }
 
 hex = "0.4"
+serde_json = "1"
 
 [dev-dependencies]
 rand = "0.8"
 criterion = "0.5"
-serde_json = "1"
 
 [[bin]]
 name = "prove-qwen"

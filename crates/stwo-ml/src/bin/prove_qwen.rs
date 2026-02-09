@@ -20,7 +20,8 @@ use stwo_ml::components::activation::ActivationType;
 use stwo_ml::gadgets::quantize::QuantStrategy;
 #[allow(unused_imports)]
 use stwo_ml::backend::{gpu_is_available, gpu_device_name, gpu_available_memory};
-use stwo_ml::pipeline::types::PipelineConfig;
+use stwo_ml::cairo_serde::serialize_matmul_sumcheck_proof;
+use stwo_ml::pipeline::types::{PipelineConfig, LayerProofKindOnChain};
 use stwo_ml::pipeline::prover::prove_model_pipeline;
 use stwo_ml::pipeline::verifier::verify_pipeline_proof;
 
@@ -505,16 +506,105 @@ fn main() {
             println!("  Receipt valid: {:?}", vr.receipt_valid);
             println!("  Time: {:.2}ms", verify_time.as_secs_f64() * 1000.0);
 
-            // === Phase 9: ON-CHAIN SERIALIZATION ===
+            // === Phase 9: ON-CHAIN CALLDATA SERIALIZATION ===
             println!();
-            println!("[On-Chain Serialization]");
+            println!("[On-Chain Calldata Serialization]");
+
+            // Build the calldata for verify_ml_inference(
+            //   model_id, model_commitment, io_commitment,
+            //   matmul_proofs: Array<MatMulSumcheckProof>,
+            //   layer_headers: Array<LayerProofHeader>,
+            //   tee_report_hash
+            // )
+            let model_id = FieldElement::from(1u64); // Qwen3-14B = model_id 1
+            let tee_report_hash = proof.tee_report_hash.unwrap_or(FieldElement::ZERO);
+
+            let mut calldata: Vec<FieldElement> = Vec::new();
+
+            // 1. model_id
+            calldata.push(model_id);
+            // 2. model_commitment
+            calldata.push(proof.model_commitment);
+            // 3. io_commitment
+            calldata.push(proof.io_commitment);
+
+            // 4. matmul_proofs: Array<MatMulSumcheckProof>
+            //    Collect only the matmul sumcheck proofs from layer_proofs
+            let matmul_proofs: Vec<_> = proof.layer_proofs.iter()
+                .filter_map(|lp| {
+                    if let LayerProofKindOnChain::MatMulSumcheck(ref p) = lp.kind {
+                        Some(p)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            // Array length prefix
+            calldata.push(FieldElement::from(matmul_proofs.len() as u64));
+            // Serialize each matmul proof
+            for mp in &matmul_proofs {
+                serialize_matmul_sumcheck_proof(mp, &mut calldata);
+            }
+
+            // 5. layer_headers: Array<LayerProofHeader>
+            //    LayerProofHeader { layer_index: u32, input_commitment: felt252, output_commitment: felt252 }
+            calldata.push(FieldElement::from(proof.layer_proofs.len() as u64));
+            for lp in &proof.layer_proofs {
+                calldata.push(FieldElement::from(lp.layer_index as u64));
+                calldata.push(lp.input_commitment);
+                calldata.push(lp.output_commitment);
+            }
+
+            // 6. tee_report_hash
+            calldata.push(tee_report_hash);
+
+            println!("  Model ID:         {}", model_id);
             println!("  Model commitment: 0x{}", hex_short(&proof.model_commitment));
             println!("  IO commitment:    0x{}", hex_short(&proof.io_commitment));
-            println!("  Layer proofs:     {}", proof.layer_proofs.len());
-            println!("  Proven layers:    {}", proof.num_proven_layers());
-            println!("  MatMul proofs:    {}", proof.num_matmul_proofs());
-            println!("  Ready for StweMlVerifier.verify_ml_inference()");
+            println!("  MatMul proofs:    {}", matmul_proofs.len());
+            println!("  Layer headers:    {}", proof.layer_proofs.len());
+            println!("  TEE report hash:  0x{}", hex_short(&tee_report_hash));
+            println!("  Total calldata:   {} felt252 elements", calldata.len());
+
+            // Write calldata to JSON file
+            let calldata_hex: Vec<String> = calldata.iter()
+                .map(|f| format!("0x{}", hex::encode(f.to_bytes_be()).trim_start_matches('0').to_string()))
+                .map(|s| if s == "0x" { "0x0".to_string() } else { s })
+                .collect();
+
+            let calldata_json = serde_json::json!({
+                "contract": "0x0490d3ad13c551cc074f10ad261ed6a80cce4fb3e7549888b112aeede108a851",
+                "function": "verify_ml_inference",
+                "model_id": format!("0x{}", hex_short(&model_id)),
+                "model_commitment": format!("0x{}", hex_short(&proof.model_commitment)),
+                "io_commitment": format!("0x{}", hex_short(&proof.io_commitment)),
+                "num_matmul_proofs": matmul_proofs.len(),
+                "num_layer_headers": proof.layer_proofs.len(),
+                "total_felts": calldata.len(),
+                "calldata": calldata_hex,
+                "register_model_calldata": [
+                    format!("0x{}", hex_short(&model_id)),
+                    format!("0x{}", hex_short(&proof.model_commitment)),
+                ],
+            });
+
+            let output_path = "qwen3_calldata.json";
+            std::fs::write(output_path, serde_json::to_string_pretty(&calldata_json).unwrap())
+                .expect("Failed to write calldata JSON");
+            println!("  Written to: {}", output_path);
+
+            // Also write a flat starkli-compatible calldata file (space-separated hex)
+            let starkli_calldata: String = calldata_hex.join(" ");
+            let starkli_path = "qwen3_calldata.txt";
+            std::fs::write(starkli_path, &starkli_calldata)
+                .expect("Failed to write starkli calldata");
+            println!("  Starkli calldata: {}", starkli_path);
+
+            println!();
             println!("  Contract: 0x0490d3ad13c551cc074f10ad261ed6a80cce4fb3e7549888b112aeede108a851");
+            println!("  Step 1: starkli invoke <contract> register_model 0x1 0x{}", hex_short(&proof.model_commitment));
+            println!("  Step 2: starkli invoke <contract> verify_ml_inference $(cat {})", starkli_path);
 
             println!();
             println!("═══════════════════════════════════════════════════════");
@@ -523,6 +613,7 @@ fn main() {
                      prove_time.as_secs_f64(),
                      verify_time.as_secs_f64() * 1000.0,
                      proof.layer_proofs.len());
+            println!("  Calldata: {} felts → {}", calldata.len(), output_path);
             println!("═══════════════════════════════════════════════════════");
         }
         Err(e) => {
