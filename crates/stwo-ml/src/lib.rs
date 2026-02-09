@@ -27,6 +27,7 @@ pub mod cairo_serde;
 pub mod receipt;
 pub mod crypto;
 pub mod pipeline;
+pub mod recursive;
 
 /// Re-export core STWO types used throughout stwo-ml.
 pub mod prelude {
