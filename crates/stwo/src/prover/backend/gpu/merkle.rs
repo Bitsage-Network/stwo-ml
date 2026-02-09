@@ -34,6 +34,7 @@ use crate::prover::vcs_lifted::ops::MerkleOpsLifted;
 use super::GpuBackend;
 
 /// Threshold for GPU acceleration (log2 of tree size)
+#[allow(dead_code)]
 const GPU_MERKLE_THRESHOLD_LOG_SIZE: u32 = 16;
 
 impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M31_OUTPUT>>
