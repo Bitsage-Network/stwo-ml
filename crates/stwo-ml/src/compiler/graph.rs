@@ -6,6 +6,7 @@
 use stwo::core::fields::m31::M31;
 
 use crate::components::activation::ActivationType;
+use crate::components::attention::MultiHeadAttentionConfig;
 use crate::components::matmul::M31Matrix;
 use crate::gadgets::quantize::QuantParams;
 
@@ -36,6 +37,10 @@ pub enum GraphOp {
     Identity {
         size: usize,
     },
+    /// Multi-head attention: decomposes into matmul sumcheck + LogUp softmax.
+    Attention {
+        config: MultiHeadAttentionConfig,
+    },
 }
 
 impl GraphOp {
@@ -59,6 +64,7 @@ impl GraphOp {
                 *size
             }
             GraphOp::Identity { .. } => 0,
+            GraphOp::Attention { config } => config.sumcheck_trace_rows(),
         }
     }
 }
@@ -79,8 +85,9 @@ pub struct GraphNode {
 /// Weights for the entire graph.
 #[derive(Debug, Clone)]
 pub struct GraphWeights {
-    /// Per-node weight matrices (node_id → weight data).
-    pub weights: Vec<(usize, M31Matrix)>,
+    /// Per-node weight matrices (node_id, name, weight data).
+    /// Unnamed weights use `""` as the name (backward compatible).
+    pub weights: Vec<(usize, String, M31Matrix)>,
     /// Per-node bias vectors.
     pub biases: Vec<(usize, Vec<M31>)>,
 }
@@ -93,19 +100,34 @@ impl GraphWeights {
         }
     }
 
+    /// Add an unnamed weight (backward compatible).
     pub fn add_weight(&mut self, node_id: usize, weight: M31Matrix) {
-        self.weights.push((node_id, weight));
+        self.weights.push((node_id, String::new(), weight));
+    }
+
+    /// Add a named weight (e.g. "w_q", "w_k", "w_v", "w_o" for attention).
+    pub fn add_named_weight(&mut self, node_id: usize, name: &str, weight: M31Matrix) {
+        self.weights.push((node_id, name.to_string(), weight));
     }
 
     pub fn add_bias(&mut self, node_id: usize, bias: Vec<M31>) {
         self.biases.push((node_id, bias));
     }
 
+    /// Get the first unnamed weight for a node.
     pub fn get_weight(&self, node_id: usize) -> Option<&M31Matrix> {
         self.weights
             .iter()
-            .find(|(id, _)| *id == node_id)
-            .map(|(_, w)| w)
+            .find(|(id, name, _)| *id == node_id && name.is_empty())
+            .map(|(_, _, w)| w)
+    }
+
+    /// Get a named weight for a node.
+    pub fn get_named_weight(&self, node_id: usize, name: &str) -> Option<&M31Matrix> {
+        self.weights
+            .iter()
+            .find(|(id, n, _)| *id == node_id && n == name)
+            .map(|(_, _, w)| w)
     }
 
     pub fn get_bias(&self, node_id: usize) -> Option<&Vec<M31>> {
@@ -234,6 +256,57 @@ impl GraphBuilder {
         self.last_node.expect("no nodes added yet")
     }
 
+    /// Add an identity (passthrough) layer.
+    pub fn identity(&mut self) -> &mut Self {
+        let shape = self.current_output_shape();
+        let size = shape.0 * shape.1;
+        let inputs = self.last_node.map(|n| vec![n]).unwrap_or_default();
+
+        let id = self.graph.add_node(
+            GraphOp::Identity { size },
+            inputs,
+            shape,
+        );
+        self.last_node = Some(id);
+        self
+    }
+
+    /// Add a quantization layer.
+    pub fn quantize(&mut self, params: QuantParams) -> &mut Self {
+        let shape = self.current_output_shape();
+        let size = shape.0 * shape.1;
+        let inputs = self.last_node.map(|n| vec![n]).unwrap_or_default();
+
+        let id = self.graph.add_node(
+            GraphOp::Quantize { params, size },
+            inputs,
+            shape,
+        );
+        self.last_node = Some(id);
+        self
+    }
+
+    /// Add a multi-head attention layer.
+    ///
+    /// Input shape must have `cols == config.d_model`. Output shape is preserved.
+    pub fn attention(&mut self, config: MultiHeadAttentionConfig) -> &mut Self {
+        let shape = self.current_output_shape();
+        assert_eq!(
+            shape.1, config.d_model,
+            "attention input cols ({}) must equal d_model ({})",
+            shape.1, config.d_model,
+        );
+        let inputs = self.last_node.map(|n| vec![n]).unwrap_or_default();
+
+        let id = self.graph.add_node(
+            GraphOp::Attention { config },
+            inputs,
+            shape, // attention preserves shape
+        );
+        self.last_node = Some(id);
+        self
+    }
+
     /// Build the final computation graph.
     pub fn build(self) -> ComputationGraph {
         self.graph
@@ -299,6 +372,33 @@ mod tests {
         // Transformer block should have manageable trace
         println!("Transformer block trace rows: {total}");
         assert!(total < 10_000_000, "trace budget exceeded");
+    }
+
+    #[test]
+    fn test_builder_identity_and_quantize() {
+        let mut builder = GraphBuilder::new((1, 8));
+        builder
+            .linear(8)
+            .identity()
+            .quantize(QuantParams {
+                strategy: crate::gadgets::quantize::QuantStrategy::Direct,
+                scale: 1.0,
+                zero_point: 0,
+                bits: 8,
+            })
+            .linear(4);
+
+        let graph = builder.build();
+
+        assert_eq!(graph.num_layers(), 4);
+        // Identity and Quantize preserve shape
+        assert_eq!(graph.nodes[1].output_shape, (1, 8));
+        assert_eq!(graph.nodes[2].output_shape, (1, 8));
+        assert_eq!(graph.output_shape, (1, 4));
+
+        // Identity has 0 trace rows, Quantize has size trace rows
+        assert_eq!(graph.nodes[1].op.trace_rows(), 0);
+        assert_eq!(graph.nodes[2].op.trace_rows(), 8); // 1*8
     }
 
     #[test]

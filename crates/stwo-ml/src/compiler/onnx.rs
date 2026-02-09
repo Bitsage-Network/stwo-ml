@@ -62,7 +62,7 @@ pub enum OnnxError {
 #[cfg(feature = "onnx")]
 pub fn load_onnx(path: &Path) -> Result<OnnxModel, OnnxError> {
     use tract_onnx::prelude::*;
-    use crate::compiler::quantize_weights::quantize_weight_matrix;
+    use crate::compiler::quantize_weights::{quantize_weight_matrix, quantize_bias_vector};
     use crate::gadgets::quantize::QuantStrategy;
 
     let model = tract_onnx::onnx()
@@ -108,6 +108,18 @@ pub fn load_onnx(path: &Path) -> Result<OnnxModel, OnnxError> {
                     num_parameters += weight_data.len();
                     weights.add_weight(graph_node_id, matrix);
                 }
+
+                // Extract bias for Gemm ops (third input)
+                if op_name.as_ref() == "Gemm" {
+                    if let Some(bias_data) = extract_const_input(model.model(), node_idx, 2) {
+                        let (bias_vec, _) = quantize_bias_vector(
+                            &bias_data,
+                            QuantStrategy::Direct,
+                        );
+                        num_parameters += bias_data.len();
+                        weights.add_bias(graph_node_id, bias_vec);
+                    }
+                }
             }
             "Relu" => {
                 builder.activation(ActivationType::ReLU);
@@ -124,10 +136,24 @@ pub fn load_onnx(path: &Path) -> Result<OnnxModel, OnnxError> {
             "LayerNormalization" | "RmsNormalization" => {
                 builder.layer_norm();
             }
+            // Element-wise ops: map to identity (computation folded into surrounding layers)
+            "Add" | "Mul" => {
+                builder.identity();
+            }
+            // Dequantization: map to quantize node
+            "DequantizeLinear" => {
+                use crate::gadgets::quantize::{QuantStrategy, QuantParams};
+                builder.quantize(QuantParams {
+                    strategy: QuantStrategy::Direct,
+                    scale: 1.0,
+                    zero_point: 0,
+                    bits: 8,
+                });
+            }
             // Skip infrastructure ops that don't map to computation
             "Source" | "Const" | "Reshape" | "Transpose" | "Flatten"
             | "Squeeze" | "Unsqueeze" | "Cast" | "Gather" | "Concat"
-            | "Shape" | "Slice" | "Identity" | "Dropout" | "Add" | "Mul" => {
+            | "Shape" | "Slice" | "Identity" | "Dropout" => {
                 // These are structural ops, not computation ops
             }
             _ => {
@@ -249,6 +275,259 @@ pub fn build_mlp(
     }
 }
 
+/// Configuration for building a transformer block.
+#[derive(Debug, Clone)]
+pub struct TransformerConfig {
+    /// Model/embedding dimension.
+    pub d_model: usize,
+    /// Number of attention heads.
+    pub num_heads: usize,
+    /// Sequence length (number of tokens).
+    pub seq_len: usize,
+    /// Feed-forward inner dimension (typically 4 * d_model).
+    pub d_ff: usize,
+    /// Activation function for FFN.
+    pub activation: ActivationType,
+}
+
+impl TransformerConfig {
+    /// Create a new config with defaults: d_ff = 4 * d_model, activation = GELU, seq_len = 1.
+    pub fn new(d_model: usize, num_heads: usize) -> Self {
+        Self {
+            d_model,
+            num_heads,
+            seq_len: 1,
+            d_ff: 4 * d_model,
+            activation: ActivationType::GELU,
+        }
+    }
+
+    /// Create a new config with explicit sequence length.
+    pub fn with_seq_len(d_model: usize, num_heads: usize, seq_len: usize) -> Self {
+        Self {
+            d_model,
+            num_heads,
+            seq_len,
+            d_ff: 4 * d_model,
+            activation: ActivationType::GELU,
+        }
+    }
+}
+
+/// Build a single transformer block with auto-generated weights.
+///
+/// Structure: LayerNorm → Attention → LayerNorm → FFN up → Activation → FFN down.
+/// 6 layers total.
+pub fn build_transformer_block(config: &TransformerConfig, seed: u64) -> OnnxModel {
+    use crate::components::attention::MultiHeadAttentionConfig;
+
+    let d = config.d_model;
+    let d_ff = config.d_ff;
+    let seq_len = config.seq_len;
+
+    let mut builder = GraphBuilder::new((seq_len, d));
+
+    // Pre-attention LayerNorm
+    builder.layer_norm();
+    // Multi-head attention
+    let attn_config = MultiHeadAttentionConfig::new(config.num_heads, d, seq_len);
+    builder.attention(attn_config);
+    // Post-attention LayerNorm
+    builder.layer_norm();
+    // FFN up projection (d_model → d_ff)
+    builder.linear(d_ff);
+    // FFN activation
+    builder.activation(config.activation);
+    // FFN down projection (d_ff → d_model)
+    builder.linear(d);
+
+    let graph = builder.build();
+    let weights = generate_weights_for_graph(&graph, seed);
+    let num_parameters = count_attention_and_matmul_params(&graph);
+
+    let metadata = ModelMetadata {
+        name: "transformer_block".to_string(),
+        num_parameters,
+        input_shape: (seq_len, d),
+        output_shape: graph.output_shape,
+        num_layers: graph.num_layers(),
+    };
+
+    OnnxModel {
+        graph,
+        weights,
+        input_shape: (seq_len, d),
+        metadata,
+    }
+}
+
+/// Build a multi-layer transformer with auto-generated weights.
+///
+/// Stacks `num_layers` transformer blocks + final LayerNorm + LM head linear.
+pub fn build_transformer(
+    config: &TransformerConfig,
+    num_layers: usize,
+    vocab_size: usize,
+    seed: u64,
+) -> OnnxModel {
+    use crate::components::attention::MultiHeadAttentionConfig;
+
+    let d = config.d_model;
+    let d_ff = config.d_ff;
+    let seq_len = config.seq_len;
+
+    let mut builder = GraphBuilder::new((seq_len, d));
+
+    let attn_config = MultiHeadAttentionConfig::new(config.num_heads, d, seq_len);
+
+    for _ in 0..num_layers {
+        // Each block: LN → Attention → LN → FFN up → act → FFN down
+        builder.layer_norm();
+        builder.attention(attn_config);
+        builder.layer_norm();
+        builder.linear(d_ff);
+        builder.activation(config.activation);
+        builder.linear(d);
+    }
+
+    // Final LayerNorm + LM head
+    builder.layer_norm();
+    builder.linear(vocab_size);
+
+    let graph = builder.build();
+    let weights = generate_weights_for_graph(&graph, seed);
+    let num_parameters = count_attention_and_matmul_params(&graph);
+
+    let metadata = ModelMetadata {
+        name: format!("transformer_{num_layers}L"),
+        num_parameters,
+        input_shape: (seq_len, d),
+        output_shape: graph.output_shape,
+        num_layers: graph.num_layers(),
+    };
+
+    OnnxModel {
+        graph,
+        weights,
+        input_shape: (seq_len, d),
+        metadata,
+    }
+}
+
+/// Count the total number of MatMul parameters (k*n) across all MatMul nodes.
+pub fn count_matmul_params(graph: &ComputationGraph) -> usize {
+    use crate::compiler::graph::GraphOp;
+    graph.nodes.iter().map(|node| {
+        if let GraphOp::MatMul { dims: (_m, k, n) } = &node.op {
+            k * n
+        } else {
+            0
+        }
+    }).sum()
+}
+
+/// Count parameters in both MatMul and Attention nodes.
+pub fn count_attention_and_matmul_params(graph: &ComputationGraph) -> usize {
+    use crate::compiler::graph::GraphOp;
+    graph.nodes.iter().map(|node| {
+        match &node.op {
+            GraphOp::MatMul { dims: (_m, k, n) } => k * n,
+            GraphOp::Attention { config } => {
+                // 4 projection matrices: W_Q, W_K, W_V, W_O, each d_model × d_model
+                4 * config.d_model * config.d_model
+            }
+            _ => 0,
+        }
+    }).sum()
+}
+
+/// Generate deterministic M31 weights for all MatMul and Attention nodes in a graph.
+///
+/// Uses an LCG PRNG: `state = state * 6364136223846793005 + 1442695040888963407`.
+/// Values are `(state >> 33) % 9 + 1`, giving M31 values in [1, 9].
+pub fn generate_weights_for_graph(
+    graph: &ComputationGraph,
+    seed: u64,
+) -> GraphWeights {
+    use stwo::core::fields::m31::M31;
+    use crate::compiler::graph::GraphOp;
+    use crate::components::matmul::M31Matrix;
+
+    let mut weights = GraphWeights::new();
+    let mut state = seed;
+
+    let mut fill_matrix = |rows: usize, cols: usize| -> M31Matrix {
+        let mut matrix = M31Matrix::new(rows, cols);
+        for i in 0..rows {
+            for j in 0..cols {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let val = ((state >> 33) % 9 + 1) as u32;
+                matrix.set(i, j, M31::from(val));
+            }
+        }
+        matrix
+    };
+
+    for node in &graph.nodes {
+        match &node.op {
+            GraphOp::MatMul { dims: (_m, k, n) } => {
+                let matrix = fill_matrix(*k, *n);
+                weights.add_weight(node.id, matrix);
+            }
+            GraphOp::Attention { config } => {
+                let d = config.d_model;
+                // 4 named weight matrices: W_Q, W_K, W_V, W_O
+                for name in &["w_q", "w_k", "w_v", "w_o"] {
+                    let matrix = fill_matrix(d, d);
+                    weights.add_named_weight(node.id, name, matrix);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    weights
+}
+
+/// Build a simple MLP model with auto-generated deterministic weights.
+///
+/// Same structure as `build_mlp`, but populates `GraphWeights` with
+/// LCG-seeded M31 values in [1, 9]. Immediately provable.
+pub fn build_mlp_with_weights(
+    input_dim: usize,
+    hidden_dims: &[usize],
+    output_dim: usize,
+    activation: ActivationType,
+    seed: u64,
+) -> OnnxModel {
+    let mut builder = GraphBuilder::new((1, input_dim));
+
+    for &dim in hidden_dims {
+        builder.linear(dim);
+        builder.activation(activation);
+    }
+    builder.linear(output_dim);
+
+    let graph = builder.build();
+    let weights = generate_weights_for_graph(&graph, seed);
+    let num_parameters = count_matmul_params(&graph);
+
+    let metadata = ModelMetadata {
+        name: "mlp".to_string(),
+        num_parameters,
+        input_shape: (1, input_dim),
+        output_shape: graph.output_shape,
+        num_layers: graph.num_layers(),
+    };
+
+    OnnxModel {
+        graph,
+        weights,
+        input_shape: (1, input_dim),
+        metadata,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,6 +548,134 @@ mod tests {
             let result = load_onnx(Path::new("nonexistent.onnx"));
             assert!(result.is_err());
         }
+    }
+
+    #[test]
+    fn test_build_transformer_block() {
+        let config = TransformerConfig::new(8, 2);
+        let model = build_transformer_block(&config, 42);
+
+        // 6 layers: LN + Attention + LN + FFN_up + act + FFN_down
+        assert_eq!(model.graph.num_layers(), 6);
+        assert_eq!(model.input_shape, (1, 8));
+        assert_eq!(model.graph.output_shape, (1, 8));
+
+        // Attention: 4 × (8×8) = 256 params
+        // FFN_up(8→32) + FFN_down(32→8) = 256 + 256 = 512 params
+        // Total: 768
+        assert_eq!(model.metadata.num_parameters, 768);
+        // 4 named weights (attention) + 2 unnamed weights (FFN)
+        assert_eq!(model.weights.weights.len(), 6);
+    }
+
+    #[test]
+    fn test_build_transformer_block_provable() {
+        use crate::compiler::prove::prove_model;
+
+        // Use tiny dims so proving is fast: 1 head, d_model=4, seq_len=4
+        let config = TransformerConfig {
+            d_model: 4,
+            num_heads: 1,
+            seq_len: 4,
+            d_ff: 8,
+            activation: ActivationType::GELU,
+        };
+        let model = build_transformer_block(&config, 77);
+
+        let mut input = crate::components::matmul::M31Matrix::new(4, 4);
+        for i in 0..4 {
+            for j in 0..4 {
+                input.set(i, j, stwo::core::fields::m31::M31::from((i * 4 + j + 1) as u32));
+            }
+        }
+
+        let result = prove_model(&model.graph, &input, &model.weights);
+        assert!(result.is_ok(), "Transformer block should prove: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_build_multi_layer_transformer() {
+        let config = TransformerConfig::new(8, 2);
+        let model = build_transformer(
+            &config,
+            2,     // 2 layers
+            16,    // vocab_size
+            42,
+        );
+
+        // Each block = 6 layers (LN + Attn + LN + FFN_up + act + FFN_down),
+        // + final LN + LM head = 2*6 + 2 = 14
+        assert_eq!(model.graph.num_layers(), 14);
+        assert_eq!(model.graph.output_shape, (1, 16));
+        assert_eq!(model.metadata.name, "transformer_2L");
+    }
+
+    #[test]
+    fn test_build_mlp_with_weights_autogenerated() {
+        let model = build_mlp_with_weights(4, &[8, 4], 2, ActivationType::ReLU, 42);
+
+        assert_eq!(model.input_shape, (1, 4));
+        assert_eq!(model.graph.output_shape, (1, 2));
+        assert_eq!(model.graph.num_layers(), 5); // linear + relu + linear + relu + linear
+
+        // Weights should be populated
+        assert!(!model.weights.weights.is_empty());
+        assert_eq!(model.weights.weights.len(), 3); // 3 MatMul layers
+
+        // Verify parameter count: 4*8 + 8*4 + 4*2 = 32+32+8 = 72
+        assert_eq!(model.metadata.num_parameters, 72);
+        assert_eq!(count_matmul_params(&model.graph), 72);
+
+        // Verify weight shapes
+        let w0 = model.weights.get_weight(0).unwrap();
+        assert_eq!((w0.rows, w0.cols), (4, 8));
+        let w2 = model.weights.get_weight(2).unwrap();
+        assert_eq!((w2.rows, w2.cols), (8, 4));
+        let w4 = model.weights.get_weight(4).unwrap();
+        assert_eq!((w4.rows, w4.cols), (4, 2));
+    }
+
+    #[test]
+    fn test_build_mlp_with_weights_and_prove_auto() {
+        use crate::compiler::prove::prove_model;
+
+        let model = build_mlp_with_weights(4, &[4], 2, ActivationType::ReLU, 123);
+
+        let mut input = crate::components::matmul::M31Matrix::new(1, 4);
+        for j in 0..4 {
+            input.set(0, j, stwo::core::fields::m31::M31::from((j + 1) as u32));
+        }
+
+        let result = prove_model(&model.graph, &input, &model.weights);
+        assert!(result.is_ok(), "Auto-weighted MLP should prove: {:?}", result.err());
+
+        let (proofs, execution) = result.unwrap();
+        assert_eq!(proofs.len(), 3); // linear + relu + linear
+        assert_eq!(execution.output.cols, 2);
+    }
+
+    #[test]
+    fn test_generate_weights_deterministic() {
+        use crate::compiler::graph::GraphBuilder;
+
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(4).activation(ActivationType::ReLU).linear(2);
+        let graph = builder.build();
+
+        // Same seed = same weights
+        let w1 = generate_weights_for_graph(&graph, 42);
+        let w2 = generate_weights_for_graph(&graph, 42);
+        assert_eq!(w1.weights.len(), w2.weights.len());
+        for ((id1, _name1, m1), (id2, _name2, m2)) in w1.weights.iter().zip(w2.weights.iter()) {
+            assert_eq!(id1, id2);
+            assert_eq!(m1.data, m2.data);
+        }
+
+        // Different seed = different weights
+        let w3 = generate_weights_for_graph(&graph, 99);
+        let (_, _, m1) = &w1.weights[0];
+        let (_, _, m3) = &w3.weights[0];
+        assert_ne!(m1.data, m3.data, "Different seeds should produce different weights");
     }
 
     #[test]
@@ -294,5 +701,68 @@ mod tests {
 
         let result = prove_model(&model.graph, &input, &weights);
         assert!(result.is_ok(), "MLP from build_mlp should prove: {:?}", result.err());
+    }
+
+    /// Test that build_mlp_with_weights produces a model that goes through
+    /// the full prove → verify pipeline (simulates what load_onnx → prove would do).
+    #[test]
+    fn test_load_onnx_programmatic_via_builder() {
+        use crate::compiler::prove::{prove_model, verify_model_matmuls};
+
+        // Simulate what load_onnx produces: a graph with weights
+        let model = build_mlp_with_weights(4, &[4, 4], 2, ActivationType::ReLU, 55);
+
+        // Verify structure matches what ONNX loading would produce
+        assert_eq!(model.graph.num_layers(), 5); // 3 linear + 2 relu
+        assert_eq!(model.weights.weights.len(), 3);
+        assert!(model.metadata.num_parameters > 0);
+
+        let mut input = crate::components::matmul::M31Matrix::new(1, 4);
+        for j in 0..4 {
+            input.set(0, j, stwo::core::fields::m31::M31::from((j + 1) as u32));
+        }
+
+        let (proofs, _exec) = prove_model(&model.graph, &input, &model.weights)
+            .expect("programmatic ONNX model should prove");
+
+        verify_model_matmuls(&proofs, &model.graph, &input, &model.weights)
+            .expect("programmatic ONNX model should verify");
+    }
+
+    /// End-to-end: build model with identity/quantize ops → prove.
+    #[test]
+    fn test_load_onnx_and_prove_with_all_ops() {
+        use crate::compiler::prove::prove_model;
+        use crate::compiler::graph::GraphBuilder;
+
+        // Build a graph that mimics what load_onnx would produce with
+        // DequantizeLinear, Add, Mul ops
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.quantize(crate::gadgets::quantize::QuantParams {
+            strategy: crate::gadgets::quantize::QuantStrategy::Direct,
+            scale: 1.0,
+            zero_point: 0,
+            bits: 8,
+        });
+        builder.linear(4);
+        builder.identity(); // simulates Add
+        builder.activation(ActivationType::ReLU);
+        builder.identity(); // simulates Mul
+        builder.linear(2);
+
+        let graph = builder.build();
+        let weights = generate_weights_for_graph(&graph, 88);
+
+        let mut input = crate::components::matmul::M31Matrix::new(1, 4);
+        for j in 0..4 {
+            input.set(0, j, stwo::core::fields::m31::M31::from((j + 1) as u32));
+        }
+
+        let result = prove_model(&graph, &input, &weights);
+        assert!(result.is_ok(), "Model with all op types should prove: {:?}", result.err());
+
+        let (proofs, execution) = result.unwrap();
+        assert_eq!(proofs.len(), 6); // quantize + linear + identity + relu + identity + linear
+        assert_eq!(execution.output.cols, 2);
     }
 }
