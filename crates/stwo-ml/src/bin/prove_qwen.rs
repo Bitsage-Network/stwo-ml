@@ -160,33 +160,27 @@ fn load_qwen3_block_weights(
                     let shape = tensor.shape();
                     let (st_rows, st_cols) = (shape[0], shape[1]);
 
-                    // Transpose if needed: SafeTensors (out_dim, in_dim) → (in_dim, out_dim) = (k_orig, n_orig)
-                    let (orig_k, orig_n) = if st_rows != st_cols && st_rows == *n {
-                        // Need transpose: (n_orig, k_orig) → (k_orig, n_orig)
-                        let mut transposed = vec![0.0f32; raw.len()];
+                    // SafeTensors stores PyTorch Linear weight as (out_features, in_features).
+                    // Our matmul needs weight as (k=in_features, n=out_features).
+                    // Always transpose: (out, in) → (in, out) = (k_orig, n_orig).
+                    let (k_orig, n_orig) = (st_cols, st_rows);
+                    let transposed = if st_rows != st_cols {
+                        let mut t = vec![0.0f32; raw.len()];
                         for i in 0..st_rows {
                             for j in 0..st_cols {
-                                transposed[j * st_rows + i] = raw[i * st_cols + j];
+                                t[j * st_rows + i] = raw[i * st_cols + j];
                             }
                         }
-                        println!("    Loaded {} shape=({},{}) → transposed to ({},{}) → padded to ({}x{})",
-                                 target_name, st_rows, st_cols, st_cols, st_rows, k, n);
-                        let (matrix, _) = quantize_weight_matrix(
-                            &transposed, st_cols, st_rows, QuantStrategy::Direct,
-                        );
-                        let padded = pad_matrix(&matrix, *k, *n);
-                        weights.add_weight(*node_idx, padded);
-                        found = true;
-                        break;
+                        t
                     } else {
-                        (st_rows.min(st_cols), st_rows.max(st_cols))
+                        raw // Square: transpose is identical for weight matrices
                     };
 
-                    println!("    Loaded {} shape=({},{}) → padded to ({}x{})",
-                             target_name, orig_k, orig_n, k, n);
+                    println!("    Loaded {} safetensors=({},{}) → (k={},n={}) → padded to ({}x{})",
+                             target_name, st_rows, st_cols, k_orig, n_orig, k, n);
 
                     let (matrix, _) = quantize_weight_matrix(
-                        &raw, orig_k, orig_n, QuantStrategy::Direct,
+                        &transposed, k_orig, n_orig, QuantStrategy::Direct,
                     );
                     let padded = pad_matrix(&matrix, *k, *n);
                     weights.add_weight(*node_idx, padded);
