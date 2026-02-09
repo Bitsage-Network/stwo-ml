@@ -210,6 +210,7 @@ mod tests {
             onchain_matmul: true,
             prove_activations: false,
             generate_receipt: false,
+            precomputed_model_commitment: None,
         };
 
         let proof = prove_model_pipeline(&graph, &make_input_4x4(), &weights, &config).unwrap();
@@ -252,6 +253,7 @@ mod tests {
             onchain_matmul: true,
             prove_activations: false,
             generate_receipt: true,
+            precomputed_model_commitment: None,
         };
 
         let proof = prove_model_pipeline(&graph, &make_input_4x4(), &weights, &config).unwrap();

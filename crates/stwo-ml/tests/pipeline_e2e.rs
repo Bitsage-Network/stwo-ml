@@ -52,6 +52,7 @@ fn pipeline_e2e_two_layer_mlp() {
         onchain_matmul: true,
         prove_activations: true,
         generate_receipt: true,
+        precomputed_model_commitment: None,
     };
 
     let proof = prove_model_pipeline(&graph, &input, &weights, &config)
@@ -110,6 +111,7 @@ fn pipeline_e2e_single_matmul_verify() {
         onchain_matmul: true,
         prove_activations: false,
         generate_receipt: true,
+        precomputed_model_commitment: None,
     };
 
     let proof = prove_model_pipeline(&graph, &input, &weights, &config).unwrap();
@@ -132,6 +134,7 @@ fn pipeline_e2e_commitment_determinism() {
         onchain_matmul: true,
         prove_activations: true,
         generate_receipt: false,
+        precomputed_model_commitment: None,
     };
 
     // Prove twice, commitments must match
@@ -161,6 +164,7 @@ fn pipeline_e2e_io_commitment_matches_starknet() {
         onchain_matmul: true,
         prove_activations: false,
         generate_receipt: false,
+        precomputed_model_commitment: None,
     };
 
     let proof = prove_model_pipeline(&graph, &input, &weights, &config).unwrap();
@@ -183,6 +187,7 @@ fn pipeline_e2e_with_layernorm() {
         onchain_matmul: true,
         prove_activations: false,
         generate_receipt: true,
+        precomputed_model_commitment: None,
     };
 
     let proof = prove_model_pipeline(&graph, &input, &weights, &config).unwrap();
@@ -208,6 +213,7 @@ fn pipeline_e2e_receipt_chain() {
         onchain_matmul: true,
         prove_activations: false,
         generate_receipt: true,
+        precomputed_model_commitment: None,
     };
 
     // First inference

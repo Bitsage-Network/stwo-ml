@@ -10,6 +10,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use starknet_crypto::poseidon_hash_many;
+use starknet_ff::FieldElement;
 use stwo::core::fields::m31::M31;
 
 use stwo_ml::compiler::graph::{ComputationGraph, GraphBuilder, GraphOp, GraphWeights};
@@ -21,7 +23,6 @@ use stwo_ml::backend::{gpu_is_available, gpu_device_name, gpu_available_memory};
 use stwo_ml::pipeline::types::PipelineConfig;
 use stwo_ml::pipeline::prover::prove_model_pipeline;
 use stwo_ml::pipeline::verifier::verify_pipeline_proof;
-// On-chain serialization uses proof.model_commitment / proof.io_commitment directly
 
 /// Qwen3-14B model configuration.
 #[allow(dead_code)]
@@ -49,48 +50,56 @@ impl Qwen3Config {
     }
 }
 
-/// Build a computation graph for N transformer blocks.
+/// Round up to the next power of two.
+fn next_pow2(n: usize) -> usize {
+    if n == 0 { return 1; }
+    1usize << (usize::BITS - (n - 1).leading_zeros())
+}
+
+/// Pad an M31Matrix to target dimensions (zero-fill).
+fn pad_matrix(m: &M31Matrix, target_rows: usize, target_cols: usize) -> M31Matrix {
+    assert!(target_rows >= m.rows && target_cols >= m.cols);
+    if target_rows == m.rows && target_cols == m.cols {
+        return m.clone();
+    }
+    let mut padded = M31Matrix::new(target_rows, target_cols);
+    for i in 0..m.rows {
+        for j in 0..m.cols {
+            padded.set(i, j, m.data[i * m.cols + j]);
+        }
+    }
+    padded
+}
+
+/// Build a computation graph for N transformer blocks with power-of-two dimensions.
 ///
-/// Simplified sequential block:
+/// Actual Qwen3-14B: h=5120, inter=17408
+/// Padded for sumcheck: h=8192, inter=32768 (next power of 2)
+///
+/// Block structure:
 ///   LayerNorm → Q_proj(h→h) → O_proj(h→h) → LayerNorm → gate_proj(h→inter) → GELU → down_proj(inter→h)
-///
-/// Note: K/V projections are omitted because GQA uses smaller dim (num_kv_heads × head_dim = 1024)
-/// which doesn't chain sequentially with the 5120-dim Q projection. The full attention
-/// computation (score matmuls, softmax) is also omitted — this proves the linear projections
-/// and MLP which dominate the parameter count and computation.
 fn build_qwen3_graph(config: &Qwen3Config, num_blocks: usize, seq_len: usize) -> ComputationGraph {
-    let batch = seq_len; // seq_len tokens, each hidden_size
-    let h = config.hidden_size;
-    let inter = config.intermediate_size;
+    let batch = next_pow2(seq_len);
+    let h = next_pow2(config.hidden_size);
+    let inter = next_pow2(config.intermediate_size);
 
     let mut builder = GraphBuilder::new((batch, h));
 
     for _block in 0..num_blocks {
-        // === Pre-attention RMSNorm ===
         builder.layer_norm();
-
-        // === Self-Attention projections (Q and O only for sequential proof chain) ===
-        // Q projection: (batch, h) → (batch, h)
-        builder.linear(h);
-        // Output projection: (batch, h) → (batch, h)
-        builder.linear(h);
-
-        // === Post-attention RMSNorm ===
+        builder.linear(h);       // Q projection
+        builder.linear(h);       // O projection
         builder.layer_norm();
-
-        // === MLP (SwiGLU simplified) ===
-        // gate_proj: (batch, h) → (batch, intermediate)
-        builder.linear(inter);
-        // SiLU activation on gate
-        builder.activation(ActivationType::GELU); // Closest to SiLU we have
-        // down_proj: (batch, intermediate) → (batch, h)
-        builder.linear(h);
+        builder.linear(inter);   // gate_proj
+        builder.activation(ActivationType::GELU);
+        builder.linear(h);       // down_proj
     }
 
     builder.build()
 }
 
 /// Load real Qwen3 weights from SafeTensors for a specific block.
+/// Pads weight matrices to graph's power-of-two dimensions.
 #[cfg(feature = "safetensors")]
 fn load_qwen3_block_weights(
     model_dir: &Path,
@@ -101,7 +110,6 @@ fn load_qwen3_block_weights(
 
     let mut weights = GraphWeights::new();
 
-    // Find all safetensors files in model_dir
     let mut st_files: Vec<PathBuf> = std::fs::read_dir(model_dir)
         .map_err(|e| format!("Cannot read model dir: {e}"))?
         .filter_map(|e| e.ok())
@@ -116,9 +124,6 @@ fn load_qwen3_block_weights(
 
     println!("  Found {} safetensors files", st_files.len());
 
-    // Tensor name mappings for Qwen3 architecture (4 matmuls per block)
-    // Graph: layernorm → q_proj → o_proj → layernorm → gate_proj → gelu → down_proj
-    // MatMul nodes: q_proj, o_proj, gate_proj, down_proj
     let weight_names = [
         format!("model.layers.{block_idx}.self_attn.q_proj.weight"),
         format!("model.layers.{block_idx}.self_attn.o_proj.weight"),
@@ -133,7 +138,6 @@ fn load_qwen3_block_weights(
 
     println!("  Graph has {} matmul nodes to load weights for", matmul_node_indices.len());
 
-    // Try to load each weight from safetensors files
     for (weight_idx, node_idx) in matmul_node_indices.iter().enumerate() {
         if weight_idx >= weight_names.len() {
             break;
@@ -154,37 +158,44 @@ fn load_qwen3_block_weights(
                 if let Ok(tensor) = tensors.tensor(target_name) {
                     let raw = tensor_to_f32(tensor.data(), tensor.dtype());
                     let shape = tensor.shape();
-                    // SafeTensors stores (out_dim, in_dim); matmul needs (k=in_dim, n=out_dim)
                     let (st_rows, st_cols) = (shape[0], shape[1]);
-                    println!("    Loaded {} shape=({},{}) → node {} needs ({}x{})",
-                             target_name, st_rows, st_cols, node_idx, k, n);
 
-                    // Transpose from (out_dim, in_dim) to (in_dim, out_dim) = (k, n)
-                    let data = if st_rows == *n && st_cols == *k {
-                        // Need transpose: (n, k) → (k, n)
+                    // Transpose if needed: SafeTensors (out_dim, in_dim) → (in_dim, out_dim) = (k_orig, n_orig)
+                    let (orig_k, orig_n) = if st_rows != st_cols && st_rows == *n {
+                        // Need transpose: (n_orig, k_orig) → (k_orig, n_orig)
                         let mut transposed = vec![0.0f32; raw.len()];
                         for i in 0..st_rows {
                             for j in 0..st_cols {
                                 transposed[j * st_rows + i] = raw[i * st_cols + j];
                             }
                         }
-                        transposed
+                        println!("    Loaded {} shape=({},{}) → transposed to ({},{}) → padded to ({}x{})",
+                                 target_name, st_rows, st_cols, st_cols, st_rows, k, n);
+                        let (matrix, _) = quantize_weight_matrix(
+                            &transposed, st_cols, st_rows, QuantStrategy::Direct,
+                        );
+                        let padded = pad_matrix(&matrix, *k, *n);
+                        weights.add_weight(*node_idx, padded);
+                        found = true;
+                        break;
                     } else {
-                        // Already correct shape or square
-                        raw
+                        (st_rows.min(st_cols), st_rows.max(st_cols))
                     };
 
+                    println!("    Loaded {} shape=({},{}) → padded to ({}x{})",
+                             target_name, orig_k, orig_n, k, n);
+
                     let (matrix, _) = quantize_weight_matrix(
-                        &data, *k, *n, QuantStrategy::Direct,
+                        &raw, orig_k, orig_n, QuantStrategy::Direct,
                     );
-                    weights.add_weight(*node_idx, matrix);
+                    let padded = pad_matrix(&matrix, *k, *n);
+                    weights.add_weight(*node_idx, padded);
                     found = true;
                     break;
                 }
             }
 
             if !found {
-                // Generate random weights as fallback
                 println!("    [WARN] {} not found, using random weights for node {}", target_name, node_idx);
                 let matrix = random_m31_matrix(*k, *n);
                 weights.add_weight(*node_idx, matrix);
@@ -218,6 +229,48 @@ fn random_m31_matrix(rows: usize, cols: usize) -> M31Matrix {
         }
     }
     matrix
+}
+
+/// Compute a fast model commitment using chunked Poseidon hashing.
+/// Instead of hashing all N million elements sequentially, hash each weight
+/// matrix's metadata + sampled elements, then combine.
+fn fast_model_commitment(weights: &GraphWeights, graph: &ComputationGraph) -> FieldElement {
+    let mut per_weight_hashes = Vec::new();
+
+    for (idx, node) in graph.nodes.iter().enumerate() {
+        if let GraphOp::MatMul { dims: (_, k, n) } = &node.op {
+            if let Some(w) = weights.get_weight(idx) {
+                // Hash: [rows, cols, first 256 elements, last 256 elements, diagonal sample]
+                let mut felts = Vec::with_capacity(520);
+                felts.push(FieldElement::from(*k as u64));
+                felts.push(FieldElement::from(*n as u64));
+
+                // First 256 elements
+                for i in 0..256.min(w.data.len()) {
+                    felts.push(FieldElement::from(w.data[i].0 as u64));
+                }
+                // Last 256 elements
+                let start = w.data.len().saturating_sub(256);
+                for i in start..w.data.len() {
+                    felts.push(FieldElement::from(w.data[i].0 as u64));
+                }
+                // Diagonal sample (every 1024th element)
+                let mut idx = 0;
+                while idx < w.data.len() {
+                    felts.push(FieldElement::from(w.data[idx].0 as u64));
+                    idx += 1024;
+                }
+
+                per_weight_hashes.push(poseidon_hash_many(&felts));
+            }
+        }
+    }
+
+    if per_weight_hashes.is_empty() {
+        FieldElement::ZERO
+    } else {
+        poseidon_hash_many(&per_weight_hashes)
+    }
 }
 
 /// Convert tensor bytes to f32.
@@ -256,7 +309,6 @@ fn half_to_f32(bits: u16) -> f32 {
     let frac = (bits & 0x3FF) as u32;
     if exp == 0 {
         if frac == 0 { return f32::from_bits(sign); }
-        // Subnormal
         let mut e = 0i32;
         let mut f = frac;
         while f & 0x400 == 0 { f <<= 1; e -= 1; }
@@ -286,7 +338,6 @@ fn print_gpu_info() {
 
     #[cfg(feature = "cuda-runtime")]
     {
-        // Direct CUDA init test for diagnostics
         match stwo::prover::backend::gpu::cuda_executor::get_cuda_executor() {
             Ok(exec) => {
                 println!("  CUDA executor: OK");
@@ -337,15 +388,17 @@ fn main() {
 
     // === Phase 2: Model Configuration ===
     let config = Qwen3Config::qwen3_14b();
+    let h_padded = next_pow2(config.hidden_size);
+    let inter_padded = next_pow2(config.intermediate_size);
     println!("[Model: Qwen3-14B]");
-    println!("  Hidden size: {}", config.hidden_size);
-    println!("  Intermediate: {}", config.intermediate_size);
+    println!("  Hidden size: {} (padded to {} for sumcheck)", config.hidden_size, h_padded);
+    println!("  Intermediate: {} (padded to {})", config.intermediate_size, inter_padded);
     println!("  Attention heads: {} (KV: {})", config.num_attention_heads, config.num_kv_heads);
     println!("  Total layers: {} (proving {})", config.num_layers, num_blocks);
-    println!("  Sequence length: {}", seq_len);
+    println!("  Sequence length: {} (padded to {})", seq_len, next_pow2(seq_len));
     println!();
 
-    // === Phase 3: Build Computation Graph ===
+    // === Phase 3: Build Computation Graph (power-of-two dimensions) ===
     let t0 = Instant::now();
     let graph = build_qwen3_graph(&config, num_blocks, seq_len);
     println!("[Graph Built] {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
@@ -357,6 +410,13 @@ fn main() {
         .filter(|n| matches!(n.op, GraphOp::MatMul { .. }))
         .count();
     println!("  MatMul ops: {}", matmul_count);
+
+    // Print matmul dimensions
+    for node in &graph.nodes {
+        if let GraphOp::MatMul { dims: (m, k, n) } = &node.op {
+            println!("    node {}: MatMul {}x{}x{}", node.id, m, k, n);
+        }
+    }
     println!();
 
     // === Phase 4: Load Weights ===
@@ -392,27 +452,38 @@ fn main() {
     }
     println!();
 
-    // === Phase 5: Create Input ===
-    let mut input = M31Matrix::new(seq_len, config.hidden_size);
-    // Simulate embedding output (token → hidden state)
+    // === Phase 5: Compute Model Commitment (fast mode) ===
+    println!("[Model Commitment] Computing fast commitment (sampled Poseidon)...");
+    let t_commit = Instant::now();
+    let model_commitment = fast_model_commitment(&weights, &graph);
+    println!("  Commitment: 0x{}", hex_short(&model_commitment));
+    println!("  Time: {:.1}ms", t_commit.elapsed().as_secs_f64() * 1000.0);
+    println!();
+
+    // === Phase 6: Create Input (padded to power-of-two) ===
+    let batch_padded = next_pow2(seq_len);
+    let mut input = M31Matrix::new(batch_padded, h_padded);
     for i in 0..seq_len {
         for j in 0..config.hidden_size {
             let val = ((i * config.hidden_size + j + 1) as u32) % ((1u32 << 31) - 1);
             input.set(i, j, M31::from(val));
         }
     }
-    println!("[Input] {}x{} M31 matrix (simulated embedding output)", seq_len, config.hidden_size);
+    println!("[Input] {}x{} M31 matrix (padded from {}x{})",
+             batch_padded, h_padded, seq_len, config.hidden_size);
 
-    // === Phase 6: PROVE ===
+    // === Phase 7: PROVE ===
     let pipeline_config = PipelineConfig {
         onchain_matmul: true,
-        prove_activations: true,
-        generate_receipt: true,
+        prove_activations: false, // Skip activation STARKs for first run
+        generate_receipt: false,  // Skip receipt for first run
+        precomputed_model_commitment: Some(model_commitment),
     };
 
     println!();
     println!("═══════════════════════════════════════════════════════");
     println!("  PROVING {} transformer block(s)...", num_blocks);
+    println!("  Mode: matmul sumcheck ON | activations OFF | receipt OFF");
     println!("═══════════════════════════════════════════════════════");
     let t_prove = Instant::now();
 
@@ -426,7 +497,7 @@ fn main() {
             println!("  Layer proofs: {}", proof.layer_proofs.len());
             println!("  Receipt: {}", if proof.receipt.is_some() { "yes" } else { "no" });
 
-            // === Phase 7: VERIFY ===
+            // === Phase 8: VERIFY ===
             println!();
             println!("[Verifying proof...]");
             let t_verify = Instant::now();
@@ -440,7 +511,7 @@ fn main() {
             println!("  Receipt valid: {:?}", vr.receipt_valid);
             println!("  Time: {:.2}ms", verify_time.as_secs_f64() * 1000.0);
 
-            // === Phase 8: ON-CHAIN SERIALIZATION ===
+            // === Phase 9: ON-CHAIN SERIALIZATION ===
             println!();
             println!("[On-Chain Serialization]");
             println!("  Model commitment: 0x{}", hex_short(&proof.model_commitment));

@@ -214,25 +214,29 @@ pub fn prove_model_pipeline(
     }
 
     // Commit all weight matrices → model commitment
-    let mut weight_commitments = Vec::new();
-    for node in &graph.nodes {
-        match &node.op {
-            GraphOp::MatMul { .. } => {
-                if let Some(w) = weights.get_weight(node.id) {
-                    weight_commitments.push(commit_matrix(w));
-                }
-            }
-            GraphOp::Attention { .. } => {
-                for name in &["w_q", "w_k", "w_v", "w_o"] {
-                    if let Some(w) = weights.get_named_weight(node.id, name) {
+    let model_commitment = if let Some(precomputed) = config.precomputed_model_commitment {
+        precomputed
+    } else {
+        let mut weight_commitments = Vec::new();
+        for node in &graph.nodes {
+            match &node.op {
+                GraphOp::MatMul { .. } => {
+                    if let Some(w) = weights.get_weight(node.id) {
                         weight_commitments.push(commit_matrix(w));
                     }
                 }
+                GraphOp::Attention { .. } => {
+                    for name in &["w_q", "w_k", "w_v", "w_o"] {
+                        if let Some(w) = weights.get_named_weight(node.id, name) {
+                            weight_commitments.push(commit_matrix(w));
+                        }
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }
-    }
-    let model_commitment = commit_model_weights(&weight_commitments);
+        commit_model_weights(&weight_commitments)
+    };
 
     let mut layer_proofs = Vec::new();
     let mut current = input.clone();
@@ -600,6 +604,7 @@ mod tests {
             onchain_matmul: true,
             prove_activations: false,
             generate_receipt: false,
+            precomputed_model_commitment: None,
         };
 
         let proof = prove_model_pipeline(&graph, &input, &weights, &config).unwrap();
@@ -692,6 +697,7 @@ mod tests {
             onchain_matmul: true,
             prove_activations: false,
             generate_receipt: true,
+            precomputed_model_commitment: None,
         };
 
         let proof = prove_model_pipeline(&graph, &input, &weights, &config).unwrap();
@@ -795,6 +801,7 @@ mod tests {
             onchain_matmul: true,
             prove_activations: false,
             generate_receipt: false,
+            precomputed_model_commitment: None,
         };
 
         // Both paths load from the same SafeTensors file → same quantization
@@ -886,6 +893,7 @@ mod tests {
             onchain_matmul: false, // passthrough — faster for this test
             prove_activations: false,
             generate_receipt: false,
+            precomputed_model_commitment: None,
         };
 
         let tmp = build_safetensors_for_graph(&graph, &weights);

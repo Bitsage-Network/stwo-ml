@@ -49,6 +49,10 @@ pub struct PipelineConfig {
     pub prove_activations: bool,
     /// Whether to generate a compute receipt.
     pub generate_receipt: bool,
+    /// Optional precomputed model commitment (skips expensive weight hashing).
+    /// When `Some`, the pipeline uses this value directly instead of hashing
+    /// all weight matrices with Poseidon (which can take minutes for large models).
+    pub precomputed_model_commitment: Option<FieldElement>,
 }
 
 impl Default for PipelineConfig {
@@ -57,6 +61,7 @@ impl Default for PipelineConfig {
             onchain_matmul: true,
             prove_activations: true,
             generate_receipt: true,
+            precomputed_model_commitment: None,
         }
     }
 }
