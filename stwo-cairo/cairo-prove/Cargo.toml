@@ -1,0 +1,53 @@
+[package]
+name = "cairo-prove"
+version = "0.1.0"
+edition = "2021"
+
+# =============================================================================
+# TOOLCHAIN REQUIREMENTS
+# =============================================================================
+# This crate requires Rust 1.89+ due to cairo-lang dependencies using genco-macros
+# which requires unstable proc_macro_span features stabilized in 1.89.
+#
+# If using an older Rust version, either:
+# 1. Update rustup: rustup update nightly
+# 2. Or use the git-based dependencies with a compatible commit
+# =============================================================================
+
+[dependencies]
+# Local workspace dependencies (use our custom implementations)
+stwo-cairo-adapter = { path = "../stwo_cairo_prover/crates/adapter" }
+stwo_cairo_prover = { path = "../stwo_cairo_prover/crates/prover" }
+stwo-cairo-serialize = { path = "../stwo_cairo_prover/crates/cairo-serialize" }
+cairo-air = { path = "../stwo_cairo_prover/crates/cairo-air" }
+
+# Cairo language dependencies
+# NOTE: crates.io versions require Rust 1.89+ due to genco-macros dependency
+# For Rust 1.88 nightly, use git refs instead (uncomment below and comment crates.io versions)
+cairo-lang-compiler = "2.14.1-dev.0"
+cairo-lang-executable = "2.14.1-dev.0"
+cairo-lang-runner = "2.14.1-dev.0"
+cairo-lang-casm = "2.14.1-dev.0"
+cairo-lang-utils = "2.14.1-dev.0"
+
+# Alternative: Git refs for Rust < 1.89 (uncomment if needed)
+# cairo-lang-compiler = { git = "https://github.com/starkware-libs/cairo.git", rev = "5cc466a" }
+# cairo-lang-executable = { git = "https://github.com/starkware-libs/cairo.git", rev = "5cc466a" }
+# cairo-lang-runner = { git = "https://github.com/starkware-libs/cairo.git", rev = "5cc466a" }
+# cairo-lang-casm = { git = "https://github.com/starkware-libs/cairo.git", rev = "5cc466a" }
+# cairo-lang-utils = { git = "https://github.com/starkware-libs/cairo.git", rev = "5cc466a" }
+
+# Cairo VM - must match workspace version for type compatibility
+cairo-vm = { version = "3.0.1", features = [
+    "extensive_hints",
+    "mod_builtin",
+    "clap",
+], default-features = false }
+
+serde_json = "1.0.138"
+clap = { version = "4.5.38", features = ["derive"] }
+num-bigint = "0.4.6"
+camino = "1.1.9"
+log = "0.4.20"
+env_logger = "0.11.3"
+thiserror = "2.0"

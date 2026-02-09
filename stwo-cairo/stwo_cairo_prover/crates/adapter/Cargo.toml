@@ -1,0 +1,37 @@
+[package]
+name = "stwo-cairo-adapter"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+slow-tests = []
+extract-mem-trace = []
+
+[dependencies]
+bytemuck.workspace = true
+cairo-lang-casm.workspace = true
+cairo-vm.workspace = true
+indoc.workspace = true
+itertools.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+stwo-cairo-common.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+stwo.workspace = true
+memmap2 = "0.9.5"
+bincode = { version = "2.0.1", features = ["serde"] }
+dashmap.workspace = true
+rayon.workspace = true
+clap.workspace = true
+crypto-bigint = "0.5.1"
+anyhow.workspace = true
+
+[dev-dependencies]
+stwo_cairo_utils.workspace = true
+cairo-lang-casm.workspace = true
+rand.workspace = true
+test-case.workspace = true
+dev-utils.workspace = true

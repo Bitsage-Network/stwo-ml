@@ -1,4 +1,0 @@
-[default]
-url = "https://api.cartridge.gg/x/starknet/sepolia"
-account = "deployer"
-accounts-file = "../../BitSage-Cairo-Smart-Contracts/deployment/sncast_accounts.json"
