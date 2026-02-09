@@ -32,10 +32,17 @@ tract-onnx = { version = "0.21", optional = true, default-features = false }
 safetensors = { version = "0.4", optional = true }
 memmap2 = { version = "0.9", optional = true }
 
+hex = "0.4"
+
 [dev-dependencies]
 rand = "0.8"
 criterion = "0.5"
 serde_json = "1"
+
+[[bin]]
+name = "prove-qwen"
+path = "src/bin/prove_qwen.rs"
+required-features = ["safetensors"]
 
 [[bench]]
 name = "matmul"

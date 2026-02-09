@@ -193,8 +193,8 @@ pub fn prove_layernorm_onchain(
     outputs: &[M31],
 ) -> Result<LayerNormProofOnChain, LayerNormError> {
     let n = inputs.len();
-    for (name, data) in [("means", means), ("variances", variances),
-                          ("rsqrt_vals", rsqrt_vals), ("outputs", outputs)] {
+    for (_name, data) in [("means", means), ("variances", variances),
+                           ("rsqrt_vals", rsqrt_vals), ("outputs", outputs)] {
         if data.len() != n {
             return Err(LayerNormError::DimensionMismatch {
                 expected: n,

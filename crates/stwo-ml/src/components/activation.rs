@@ -11,6 +11,7 @@ use stwo::prover::poly::circle::CircleEvaluation;
 use stwo::prover::poly::BitReversedOrder;
 use stwo::core::poly::circle::CanonicCoset;
 use stwo::prover::backend::{Col, Column, ColumnOps};
+use stwo::prover::backend::simd::SimdBackend;
 use stwo_constraint_framework::{
     FrameworkEval, FrameworkComponent,
     EvalAtRow, RelationEntry,
@@ -138,11 +139,12 @@ pub type ActivationComponent = FrameworkComponent<ActivationEval>;
 
 /// Generate the preprocessed activation table as trace columns.
 ///
-/// Generic over backend `B` — works with `SimdBackend`, `CpuBackend`, or `GpuBackend`.
-pub fn generate_activation_table<B: ColumnOps<BaseField>>(
+/// Trace generation always uses `SimdBackend`. Use `convert_evaluations`
+/// to convert to other backends if needed.
+pub fn generate_activation_table(
     table: &PrecomputedTable,
-) -> Vec<CircleEvaluation<B, BaseField, BitReversedOrder>> {
-    table.generate_trace_columns::<B>()
+) -> Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>> {
+    table.generate_trace_columns()
 }
 
 /// Generate the main execution trace for activation lookups.
@@ -204,7 +206,6 @@ pub enum ActivationError {
 // ===== On-Chain Proof Structures =====
 
 use starknet_ff::FieldElement;
-use crate::crypto::poseidon_channel::PoseidonChannel;
 use crate::crypto::poseidon_merkle::PoseidonMerkleTree;
 
 /// On-chain activation proof with Poseidon Merkle commitments.
@@ -331,12 +332,11 @@ mod tests {
 
     #[test]
     fn test_generate_activation_table() {
-        use stwo::prover::backend::simd::SimdBackend;
         let table = PrecomputedTable::build(
             crate::gadgets::lookup_table::activations::relu,
             4,
         );
-        let cols = generate_activation_table::<SimdBackend>(&table);
+        let cols = generate_activation_table(&table);
         assert_eq!(cols.len(), 2);
     }
 

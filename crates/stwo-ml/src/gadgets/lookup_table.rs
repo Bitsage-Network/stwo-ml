@@ -172,6 +172,27 @@ pub mod activations {
             M31::from(scale)
         }
     }
+
+    /// Approximate exp(x) for softmax computation.
+    ///
+    /// Maps M31 values to a scaled exponential approximation:
+    /// - "Negative" region (val > P/2): returns 1 (near-zero after normalization)
+    /// - Zero: returns 2^16 (exp(0) = 1, scaled)
+    /// - Positive: linear scale as approximation
+    pub fn softmax_exp(x: M31) -> M31 {
+        let val = x.0;
+        let half_p = (1u32 << 30) - 1;
+        if val > half_p {
+            // "Negative" region — exp of large negative ≈ 0
+            M31::from(1)
+        } else if val == 0 {
+            // exp(0) = 1, scaled by 2^16
+            M31::from(1u32 << 16)
+        } else {
+            // Positive region — capped linear approximation
+            M31::from(val.min((1u32 << 31) - 2))
+        }
+    }
 }
 
 #[cfg(test)]
