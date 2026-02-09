@@ -16,6 +16,7 @@ use stwo_ml::compiler::graph::{ComputationGraph, GraphBuilder, GraphOp, GraphWei
 use stwo_ml::components::matmul::M31Matrix;
 use stwo_ml::components::activation::ActivationType;
 use stwo_ml::gadgets::quantize::QuantStrategy;
+#[allow(unused_imports)]
 use stwo_ml::backend::{gpu_is_available, gpu_device_name, gpu_available_memory};
 use stwo_ml::pipeline::types::PipelineConfig;
 use stwo_ml::pipeline::prover::prove_model_pipeline;
