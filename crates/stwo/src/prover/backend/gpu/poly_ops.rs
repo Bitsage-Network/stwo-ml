@@ -46,15 +46,16 @@ impl PolyOps for GpuBackend {
     }
 
     fn interpolate_columns(
-        columns: impl IntoIterator<Item = CircleEvaluation<Self, BaseField, BitReversedOrder>>,
+        columns: Vec<CircleEvaluation<Self, BaseField, BitReversedOrder>>,
         twiddles: &TwiddleTree<Self>,
     ) -> Vec<CircleCoefficients<Self>> {
         let simd_twiddles = twiddle_ref_to_simd(twiddles);
-        let simd_columns = columns.into_iter().map(|eval| {
-            CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(
-                eval.domain, eval.values,
-            )
-        });
+        let simd_columns: Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>> =
+            columns.into_iter().map(|eval| {
+                CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(
+                    eval.domain, eval.values,
+                )
+            }).collect();
         let results = SimdBackend::interpolate_columns(simd_columns, simd_twiddles);
         results.into_iter().map(|r| CircleCoefficients::new(r.coeffs)).collect()
     }
