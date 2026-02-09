@@ -601,10 +601,33 @@ fn main() {
                 .expect("Failed to write starkli calldata");
             println!("  Starkli calldata: {}", starkli_path);
 
+            // Write per-proof calldata files for verify_matmul (single-proof submission)
+            // verify_matmul(model_id: felt252, proof: MatMulSumcheckProof)
+            println!();
+            println!("[Per-Proof Calldata] (for verify_matmul single-proof submission)");
+            for (proof_idx, mp) in matmul_proofs.iter().enumerate() {
+                let mut single_calldata: Vec<FieldElement> = Vec::new();
+                single_calldata.push(model_id);
+                serialize_matmul_sumcheck_proof(mp, &mut single_calldata);
+
+                let single_hex: Vec<String> = single_calldata.iter()
+                    .map(|f| {
+                        let h = hex::encode(f.to_bytes_be());
+                        let t = h.trim_start_matches('0');
+                        if t.is_empty() { "0x0".to_string() } else { format!("0x{}", t) }
+                    })
+                    .collect();
+
+                let single_path = format!("qwen3_matmul_proof_{}.txt", proof_idx);
+                std::fs::write(&single_path, single_hex.join(" "))
+                    .expect("Failed to write per-proof calldata");
+                println!("  Proof {}: {} felts → {}", proof_idx, single_calldata.len(), single_path);
+            }
+
             println!();
             println!("  Contract: 0x0490d3ad13c551cc074f10ad261ed6a80cce4fb3e7549888b112aeede108a851");
             println!("  Step 1: starkli invoke <contract> register_model 0x1 0x{}", hex_short(&proof.model_commitment));
-            println!("  Step 2: starkli invoke <contract> verify_ml_inference $(cat {})", starkli_path);
+            println!("  Step 2: starkli invoke <contract> verify_matmul 0x1 $(cat qwen3_matmul_proof_0.txt)");
 
             println!();
             println!("═══════════════════════════════════════════════════════");
