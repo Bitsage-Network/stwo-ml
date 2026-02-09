@@ -281,13 +281,28 @@ fn print_banner() {
 
 fn print_gpu_info() {
     println!("[GPU Status]");
-    if gpu_is_available() {
-        let name = gpu_device_name().unwrap_or("Unknown".into());
-        let mem = gpu_available_memory().unwrap_or(0);
-        println!("  Device: {}", name);
-        println!("  Memory: {:.1} GB available", mem as f64 / 1e9);
-        println!("  Backend: GpuBackend (CUDA)");
-    } else {
+    println!("  cuda-runtime feature: {}", cfg!(feature = "cuda-runtime"));
+
+    #[cfg(feature = "cuda-runtime")]
+    {
+        // Direct CUDA init test for diagnostics
+        match stwo::prover::backend::gpu::cuda_executor::get_cuda_executor() {
+            Ok(exec) => {
+                println!("  CUDA executor: OK");
+                println!("  Device: {}", exec.device_info.name);
+                println!("  Memory: {:.1} GB", exec.device_info.total_memory_bytes as f64 / 1e9);
+                println!("  Compute: SM {}.{}", exec.device_info.compute_capability.0, exec.device_info.compute_capability.1);
+                println!("  Backend: GpuBackend (CUDA)");
+            }
+            Err(e) => {
+                println!("  CUDA executor FAILED: {:?}", e);
+                println!("  Falling back to SimdBackend");
+            }
+        }
+    }
+
+    #[cfg(not(feature = "cuda-runtime"))]
+    {
         println!("  Device: CPU only (SimdBackend)");
         println!("  Tip: Build with --features cuda-runtime for GPU acceleration");
     }
