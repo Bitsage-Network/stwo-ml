@@ -8,3 +8,4 @@ pub mod matmul;
 pub mod activation;
 pub mod attention;
 pub mod layernorm;
+pub mod f32_ops;
