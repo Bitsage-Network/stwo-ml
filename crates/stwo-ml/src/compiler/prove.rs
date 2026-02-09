@@ -8,13 +8,14 @@ use stwo::core::fields::qm31::SecureField;
 use stwo::core::pcs::PcsConfig;
 use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
-use stwo::core::channel::{Blake2sChannel, MerkleChannel};
+use stwo::core::channel::MerkleChannel;
 use stwo::core::proof::StarkProof;
 use stwo::core::vcs_lifted::MerkleHasherLifted;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::simd::qm31::PackedSecureField;
-use stwo::prover::backend::{Col, Column};
+use stwo::prover::backend::{Col, Column, BackendForChannel};
 use stwo::prover::poly::circle::CircleEvaluation;
+use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::CommitmentSchemeProver;
 use stwo::prover::poly::circle::PolyOps;
 use stwo::prover::prove;
@@ -24,10 +25,16 @@ use stwo_constraint_framework::{
     LogupTraceGenerator,
 };
 
+use crate::backend::convert_evaluations;
+
 use crate::compiler::graph::{ComputationGraph, GraphOp, GraphWeights};
 use crate::components::activation::{
     ActivationEval, ActivationRelation,
     compute_multiplicities,
+};
+use crate::components::attention::{
+    AttentionWeights, AttentionProof,
+    attention_forward, prove_attention_with,
 };
 use crate::components::matmul::{
     M31Matrix, matmul_m31,
@@ -42,6 +49,8 @@ pub enum LayerProofKind<H: MerkleHasherLifted> {
     Stark(StarkProof<H>),
     /// MatMul: Sumcheck proof over multilinear extensions.
     Sumcheck(MatMulSumcheckProof),
+    /// Multi-head attention: composed matmul sumcheck + softmax LogUp STARK.
+    Attention(Box<AttentionProof<H>>),
     /// Identity/Quantize: no proof needed.
     Passthrough,
 }
@@ -68,8 +77,29 @@ pub struct GraphExecution {
 
 type Blake2sHash = <Blake2sMerkleChannel as MerkleChannel>::H;
 
-/// Model proof result: per-layer proofs + execution trace.
-pub type ModelProofResult = (Vec<LayerProof<Blake2sHash>>, GraphExecution);
+/// Raw SIMD columns built for activation layer proving.
+///
+/// Contains both the `CircleEvaluation`s (for commitment) and the raw
+/// packed column data (for LogUp computation after lookup elements are drawn).
+struct ActivationColumns {
+    /// Tree 0: preprocessed lookup table columns.
+    preprocessed: Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
+    /// Tree 1: execution trace columns.
+    execution: Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
+    /// Raw packed columns — kept for LogUp computation.
+    table_input_col: Col<SimdBackend, BaseField>,
+    table_output_col: Col<SimdBackend, BaseField>,
+    trace_input_col: Col<SimdBackend, BaseField>,
+    trace_output_col: Col<SimdBackend, BaseField>,
+    multiplicities: Vec<M31>,
+    log_size: u32,
+}
+
+/// Generic model proof result: per-layer proofs + execution trace.
+pub type ModelProofResultFor<H> = (Vec<LayerProof<H>>, GraphExecution);
+
+/// Model proof result using Blake2s (default).
+pub type ModelProofResult = ModelProofResultFor<Blake2sHash>;
 
 /// Error type for model proving.
 #[derive(Debug, thiserror::Error)]
@@ -84,25 +114,113 @@ pub enum ModelError {
     MissingWeight(usize),
 }
 
-/// Prove a single activation layer using SimdBackend + Blake2s.
+/// Prove a single activation layer, generic over backend and Merkle channel.
 ///
 /// Uses LogUp to verify every (input, output) pair exists in the precomputed table.
 /// Tree layout: [preprocessed table | execution trace | LogUp interaction].
-pub fn prove_activation_layer(
+///
+/// Trace generation uses `SimdBackend` (fast column building). Commitment and
+/// proving use backend `B`, so GPU acceleration applies to the cryptographic
+/// operations (Merkle trees, FRI, quotient evaluation). LogUp computation uses
+/// `SimdBackend` packed operations but draws lookup elements from the real
+/// `MC::C` channel, making this fully generic over any `MerkleChannel`.
+pub fn prove_activation_layer<B, MC>(
     inputs: &[M31],
     outputs: &[M31],
     table: &PrecomputedTable,
     config: PcsConfig,
-) -> Result<(FrameworkComponent<ActivationEval>, StarkProof<<Blake2sMerkleChannel as MerkleChannel>::H>), ModelError> {
-    use stwo::prover::backend::simd::m31::LOG_N_LANES;
+) -> Result<(FrameworkComponent<ActivationEval>, StarkProof<<MC as MerkleChannel>::H>), ModelError>
+where
+    B: BackendForChannel<MC> + PolyOps,
+    MC: MerkleChannel,
+    FrameworkComponent<ActivationEval>: stwo::prover::ComponentProver<B>,
+{
+    // --- Phase A: Build raw SIMD columns (no commitment yet) ---
+    let cols = build_activation_columns_simd(inputs, outputs, table);
+    let log_size = cols.log_size;
 
+    // --- Phase B: Commit with real B+MC scheme ---
+    let twiddles = B::precompute_twiddles(
+        CanonicCoset::new(log_size + 1 + config.fri_config.log_blowup_factor)
+            .circle_domain()
+            .half_coset,
+    );
+
+    let channel = &mut MC::C::default();
+    let mut commitment_scheme = CommitmentSchemeProver::<B, MC>::new(config, &twiddles);
+
+    // Tree 0: Preprocessed columns
+    let mut tree_builder = commitment_scheme.tree_builder();
+    tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(cols.preprocessed));
+    tree_builder.commit(channel);
+
+    // Tree 1: Execution trace
+    let mut tree_builder = commitment_scheme.tree_builder();
+    tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(cols.execution));
+    tree_builder.commit(channel);
+
+    // --- Phase C: Draw lookup elements from REAL MC::C channel ---
+    // The channel state is now deterministic based on the Merkle roots committed
+    // above with backend B and hash MC::H. This works with any MerkleChannel.
+    let lookup_elements: ActivationRelation = ActivationRelation::draw(channel);
+
+    // --- Phase D: Compute LogUp interaction trace on SimdBackend ---
+    // LogupTraceGenerator is SimdBackend-only. The lookup elements are just
+    // SecureField scalars — they work identically regardless of which channel drew them.
+    let (interaction_simd, claimed_sum) = compute_activation_logup_simd(
+        &cols.table_input_col,
+        &cols.table_output_col,
+        &cols.trace_input_col,
+        &cols.trace_output_col,
+        &cols.multiplicities,
+        log_size,
+        &lookup_elements,
+    );
+
+    // Tree 2: LogUp interaction trace
+    let mut tree_builder = commitment_scheme.tree_builder();
+    tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(interaction_simd));
+    tree_builder.commit(channel);
+
+    // --- Phase E: Build component and prove ---
+    let component = FrameworkComponent::new(
+        &mut TraceLocationAllocator::default(),
+        ActivationEval {
+            log_n_rows: log_size,
+            lookup_elements,
+            claimed_sum,
+            total_sum: claimed_sum,
+        },
+        claimed_sum,
+    );
+
+    let proof = prove::<B, MC>(
+        &[&component],
+        channel,
+        commitment_scheme,
+    ).map_err(|e| ModelError::ProvingError {
+        layer: 0,
+        message: format!("{e:?}"),
+    })?;
+
+    Ok((component, proof))
+}
+
+/// Build raw SIMD columns for activation layer proving (no commitment).
+///
+/// Returns the packed columns and CircleEvaluations needed for:
+/// - Commitment (preprocessed + execution evals)
+/// - LogUp computation (raw packed column data)
+fn build_activation_columns_simd(
+    inputs: &[M31],
+    outputs: &[M31],
+    table: &PrecomputedTable,
+) -> ActivationColumns {
     let log_size = table.log_size.max(4);
     let size = 1usize << log_size;
-    let vec_size = size >> LOG_N_LANES;
     let domain = CanonicCoset::new(log_size).circle_domain();
 
     // Pad trace with the first table entry for rows beyond real data.
-    // This ensures padding rows reference a valid table entry.
     let pad_input = table.inputs[0];
     let pad_output = table.outputs[0];
     let padding_count = size.saturating_sub(inputs.len());
@@ -110,7 +228,6 @@ pub fn prove_activation_layer(
     // Build multiplicities: count real uses + padding uses
     let mut multiplicities = compute_multiplicities(inputs, table);
     if padding_count > 0 {
-        // Padding rows all "use" the first table entry
         multiplicities[0] += M31::from(padding_count as u32);
     }
 
@@ -123,7 +240,6 @@ pub fn prove_activation_layer(
         trace_input_col.set(i, inp);
         trace_output_col.set(i, out);
     }
-    // Padding rows use valid table entry
     for i in inputs.len()..size {
         trace_input_col.set(i, pad_input);
         trace_output_col.set(i, pad_output);
@@ -140,47 +256,47 @@ pub fn prove_activation_layer(
         table_output_col.set(i, out);
     }
 
-    // --- Commitment scheme setup ---
-    let twiddles = SimdBackend::precompute_twiddles(
-        CanonicCoset::new(log_size + 1 + config.fri_config.log_blowup_factor)
-            .circle_domain()
-            .half_coset,
-    );
-
-    let channel = &mut Blake2sChannel::default();
-    let mut commitment_scheme =
-        CommitmentSchemeProver::<SimdBackend, Blake2sMerkleChannel>::new(config, &twiddles);
-
-    // Tree 0: Preprocessed columns (activation table: input + output)
-    let preprocessed_trace = vec![
+    // Build CircleEvaluations for commitment (clone columns since LogUp needs originals)
+    let preprocessed = vec![
         CircleEvaluation::new(domain, table_input_col.clone()),
         CircleEvaluation::new(domain, table_output_col.clone()),
     ];
-    let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(preprocessed_trace);
-    tree_builder.commit(channel);
-
-    // Tree 1: Execution trace (trace_input, trace_output, multiplicity)
-    let execution_trace = vec![
+    let execution = vec![
         CircleEvaluation::new(domain, trace_input_col.clone()),
         CircleEvaluation::new(domain, trace_output_col.clone()),
         CircleEvaluation::new(domain, mult_col),
     ];
-    let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(execution_trace);
-    tree_builder.commit(channel);
 
-    // Draw lookup elements (Fiat-Shamir after committing trees 0 + 1)
-    let lookup_elements = ActivationRelation::draw(channel);
+    ActivationColumns {
+        preprocessed,
+        execution,
+        table_input_col,
+        table_output_col,
+        trace_input_col,
+        trace_output_col,
+        multiplicities,
+        log_size,
+    }
+}
 
-    // Tree 2: Interaction trace — 1 LogUp column with combined fractions.
-    //
-    // Each row combines table-yield + trace-use into one fraction:
-    //   frac = -mult/q_table + 1/q_trace
-    //        = (q_table - mult * q_trace) / (q_table * q_trace)
-    //
-    // where q_table = combine([table_in, table_out])
-    //       q_trace = combine([trace_in, trace_out])
+/// Compute LogUp interaction trace on SimdBackend given lookup elements.
+///
+/// The lookup elements can come from any `Channel` implementation — they're
+/// just `SecureField` scalars used for random linear combinations.
+fn compute_activation_logup_simd(
+    table_input_col: &Col<SimdBackend, BaseField>,
+    table_output_col: &Col<SimdBackend, BaseField>,
+    trace_input_col: &Col<SimdBackend, BaseField>,
+    trace_output_col: &Col<SimdBackend, BaseField>,
+    multiplicities: &[M31],
+    log_size: u32,
+    lookup_elements: &ActivationRelation,
+) -> (Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>, SecureField) {
+    use stwo::prover::backend::simd::m31::LOG_N_LANES;
+
+    let size = 1usize << log_size;
+    let vec_size = size >> LOG_N_LANES;
+
     let mut logup_gen = LogupTraceGenerator::new(log_size);
     let mut col_gen = logup_gen.new_col();
 
@@ -193,7 +309,7 @@ pub fn prove_activation_layer(
         );
 
         let mult_packed: PackedSecureField = mult_col_data_at(
-            &multiplicities, vec_row, log_size,
+            multiplicities, vec_row, log_size,
         );
 
         let numerator = q_table - mult_packed * q_trace;
@@ -203,34 +319,7 @@ pub fn prove_activation_layer(
     }
     col_gen.finalize_col();
 
-    let (interaction_trace, claimed_sum) = logup_gen.finalize_last();
-    let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(interaction_trace);
-    tree_builder.commit(channel);
-
-    // Build component
-    let component = FrameworkComponent::new(
-        &mut TraceLocationAllocator::default(),
-        ActivationEval {
-            log_n_rows: log_size,
-            lookup_elements,
-            claimed_sum,
-            total_sum: claimed_sum,
-        },
-        claimed_sum,
-    );
-
-    // Prove
-    let proof = prove::<SimdBackend, Blake2sMerkleChannel>(
-        &[&component],
-        channel,
-        commitment_scheme,
-    ).map_err(|e| ModelError::ProvingError {
-        layer: 0,
-        message: format!("{e:?}"),
-    })?;
-
-    Ok((component, proof))
+    logup_gen.finalize_last()
 }
 
 /// Helper: get packed multiplicity values at a given vec_row.
@@ -268,15 +357,90 @@ fn apply_activation(input: &M31Matrix, f: &dyn Fn(M31) -> M31) -> M31Matrix {
     output
 }
 
-/// Prove an entire computation graph: execute forward pass and generate
-/// real STARK proofs (activations) and sumcheck proofs (matmuls).
+/// Compute LayerNorm forward pass in M31 field arithmetic.
 ///
-/// Returns per-layer proofs and the final output matrix.
-pub fn prove_model(
+/// y = (x - mean) * rsqrt(variance)
+///
+/// Division by n uses modular inverse (Fermat's little theorem).
+/// Reciprocal sqrt looked up in precomputed table.
+fn apply_layernorm(input: &M31Matrix, dim: usize) -> M31Matrix {
+    use crate::components::layernorm::build_rsqrt_table;
+
+    let rsqrt_table = build_rsqrt_table(16);
+    let mut output = M31Matrix::new(input.rows, input.cols);
+    let n = dim.min(input.cols);
+    let inv_n = m31_mod_inverse(n as u32);
+
+    for row in 0..input.rows {
+        // Mean: sum(x) / n
+        let mut sum = M31::from(0);
+        for col in 0..n {
+            sum += input.data[row * input.cols + col];
+        }
+        let mean = sum * inv_n;
+
+        // Variance: sum((x - mean)^2) / n
+        let mut var_sum = M31::from(0);
+        for col in 0..n {
+            let diff = input.data[row * input.cols + col] - mean;
+            var_sum += diff * diff;
+        }
+        let variance = var_sum * inv_n;
+
+        // rsqrt(variance) from lookup table. Fallback to scale=1.0 (2^16).
+        let rsqrt = rsqrt_table
+            .lookup(variance)
+            .unwrap_or(M31::from(1u32 << 16));
+
+        // Output: (x - mean) * rsqrt
+        for col in 0..n {
+            let centered = input.data[row * input.cols + col] - mean;
+            output.data[row * input.cols + col] = centered * rsqrt;
+        }
+        // Pass through any columns beyond the normalization dimension
+        for col in n..input.cols {
+            output.data[row * input.cols + col] = input.data[row * input.cols + col];
+        }
+    }
+
+    output
+}
+
+/// Modular inverse of n in M31 via Fermat's little theorem: n^(P-2) mod P.
+fn m31_mod_inverse(n: u32) -> M31 {
+    if n == 0 {
+        return M31::from(0);
+    }
+    let p: u64 = (1u64 << 31) - 1;
+    let mut result: u64 = 1;
+    let mut base = n as u64 % p;
+    let mut exp = p - 2;
+    while exp > 0 {
+        if exp & 1 == 1 {
+            result = result * base % p;
+        }
+        base = base * base % p;
+        exp >>= 1;
+    }
+    M31::from(result as u32)
+}
+
+/// Prove an entire computation graph, generic over backend and Merkle channel.
+///
+/// Executes the forward pass and generates real STARK proofs (activations)
+/// and sumcheck proofs (matmuls). Trace generation uses `SimdBackend`
+/// internally; commitment and proving use backend `B`, enabling GPU
+/// acceleration of Merkle hashing, FRI, and quotient evaluation.
+pub fn prove_model_with<B, MC>(
     graph: &ComputationGraph,
     input: &M31Matrix,
     weights: &GraphWeights,
-) -> Result<ModelProofResult, ModelError> {
+) -> Result<ModelProofResultFor<<MC as MerkleChannel>::H>, ModelError>
+where
+    B: BackendForChannel<MC> + PolyOps,
+    MC: MerkleChannel,
+    FrameworkComponent<ActivationEval>: stwo::prover::ComponentProver<B>,
+{
     let mut layer_proofs = Vec::new();
     let mut intermediates: Vec<(usize, M31Matrix)> = Vec::new();
 
@@ -318,10 +482,10 @@ pub fn prove_model(
                 let f = activation_type.as_fn();
                 let output = apply_activation(&current, &*f);
 
-                // Build lookup table for this activation type
-                let table = PrecomputedTable::build(
-                    |x| (*f)(x),
-                    4, // log_size=4 (16 entries) for small models
+                // Build production-sized lookup table for this activation type
+                let table = PrecomputedTable::build_parallel(
+                    move |x| (*f)(x),
+                    activation_type.production_log_size(),
                 );
                 let config = PcsConfig::default();
 
@@ -330,7 +494,7 @@ pub fn prove_model(
                 let flat_outputs: Vec<M31> = output.data.clone();
 
                 // Generate real STARK proof via LogUp
-                let (_component, proof) = prove_activation_layer(
+                let (_component, proof) = prove_activation_layer::<B, MC>(
                     &flat_inputs,
                     &flat_outputs,
                     &table,
@@ -351,10 +515,53 @@ pub fn prove_model(
                 });
             }
 
-            GraphOp::LayerNorm { .. }
-            | GraphOp::Quantize { .. }
+            GraphOp::LayerNorm { dim } => {
+                // Real LayerNorm forward pass in M31 arithmetic.
+                // STARK proof for rsqrt lookup is generated at the aggregation layer.
+                let output = apply_layernorm(&current, *dim);
+                intermediates.push((node.id, current.clone()));
+                current = output;
+
+                layer_proofs.push(LayerProof {
+                    kind: LayerProofKind::Passthrough,
+                    claimed_sum: SecureField::from(M31::from(0)),
+                    layer_index: node.id,
+                });
+            }
+
+            GraphOp::Attention { config } => {
+                let attn_weights = AttentionWeights {
+                    w_q: weights.get_named_weight(node.id, "w_q")
+                        .ok_or(ModelError::MissingWeight(node.id))?.clone(),
+                    w_k: weights.get_named_weight(node.id, "w_k")
+                        .ok_or(ModelError::MissingWeight(node.id))?.clone(),
+                    w_v: weights.get_named_weight(node.id, "w_v")
+                        .ok_or(ModelError::MissingWeight(node.id))?.clone(),
+                    w_o: weights.get_named_weight(node.id, "w_o")
+                        .ok_or(ModelError::MissingWeight(node.id))?.clone(),
+                };
+
+                let proof = prove_attention_with::<B, MC>(
+                    &current, &attn_weights, config, false,
+                ).map_err(|e| ModelError::ProvingError {
+                    layer: node.id,
+                    message: format!("Attention: {e}"),
+                })?;
+
+                intermediates.push((node.id, current.clone()));
+                current = proof.intermediates.final_output.clone();
+
+                layer_proofs.push(LayerProof {
+                    kind: LayerProofKind::Attention(Box::new(proof)),
+                    claimed_sum: SecureField::from(M31::from(0)),
+                    layer_index: node.id,
+                });
+            }
+
+            GraphOp::Quantize { .. }
             | GraphOp::Identity { .. } => {
-                // Passthrough for now — LayerNorm proving can be added
+                // Quantize: applied to weights at load time, identity in forward pass.
+                // Identity: no-op by definition.
                 intermediates.push((node.id, current.clone()));
                 layer_proofs.push(LayerProof {
                     kind: LayerProofKind::Passthrough,
@@ -373,12 +580,25 @@ pub fn prove_model(
     Ok((layer_proofs, execution))
 }
 
+/// Prove an entire computation graph using `SimdBackend` + `Blake2sMerkleChannel`.
+///
+/// Convenience wrapper around [`prove_model_with`]. Use `prove_model_with::<GpuBackend, Blake2sMerkleChannel>`
+/// for GPU-accelerated proving (requires `cuda-runtime` feature).
+pub fn prove_model(
+    graph: &ComputationGraph,
+    input: &M31Matrix,
+    weights: &GraphWeights,
+) -> Result<ModelProofResult, ModelError> {
+    prove_model_with::<SimdBackend, Blake2sMerkleChannel>(graph, input, weights)
+}
+
 /// Verify all matmul sumcheck proofs in a model's layer proofs.
 ///
 /// For each Sumcheck proof, replays the Fiat-Shamir transcript
 /// and checks the final MLE evaluations against the original matrices.
-pub fn verify_model_matmuls(
-    layer_proofs: &[LayerProof<<Blake2sMerkleChannel as MerkleChannel>::H>],
+/// Generic over the Merkle hash type `H`.
+pub fn verify_model_matmuls<H: MerkleHasherLifted>(
+    layer_proofs: &[LayerProof<H>],
     graph: &ComputationGraph,
     input: &M31Matrix,
     weights: &GraphWeights,
@@ -406,15 +626,71 @@ pub fn verify_model_matmuls(
             }
             (LayerProofKind::Stark(_), GraphOp::Activation { activation_type, .. })
             | (LayerProofKind::Passthrough, GraphOp::Activation { activation_type, .. }) => {
-                // STARK proof verified separately; here just replay the forward pass
                 let f = activation_type.as_fn();
                 current = apply_activation(&current, &*f);
+            }
+            (LayerProofKind::Passthrough, GraphOp::LayerNorm { dim }) => {
+                current = apply_layernorm(&current, *dim);
+            }
+            (LayerProofKind::Attention(_), GraphOp::Attention { config }) => {
+                // Replay the forward pass to advance `current`
+                let attn_weights = AttentionWeights {
+                    w_q: weights.get_named_weight(node.id, "w_q")
+                        .ok_or(ModelError::MissingWeight(node.id))?.clone(),
+                    w_k: weights.get_named_weight(node.id, "w_k")
+                        .ok_or(ModelError::MissingWeight(node.id))?.clone(),
+                    w_v: weights.get_named_weight(node.id, "w_v")
+                        .ok_or(ModelError::MissingWeight(node.id))?.clone(),
+                    w_o: weights.get_named_weight(node.id, "w_o")
+                        .ok_or(ModelError::MissingWeight(node.id))?.clone(),
+                };
+                let inter = attention_forward(&current, &attn_weights, config, false);
+                current = inter.final_output;
             }
             _ => {}
         }
     }
 
     Ok(())
+}
+
+/// Prove a model using the best available backend.
+///
+/// If `cuda-runtime` feature is enabled and a GPU is detected, uses `GpuBackend`
+/// for commitment and proving (Merkle trees, FRI, quotient evaluation on GPU).
+/// Otherwise falls back to `SimdBackend`.
+///
+/// `GpuBackend` is a drop-in replacement — same column types, same twiddles.
+/// Trace generation stays on SIMD; the GPU accelerates cryptographic operations.
+pub fn prove_model_auto(
+    graph: &ComputationGraph,
+    input: &M31Matrix,
+    weights: &GraphWeights,
+) -> Result<ModelProofResult, ModelError> {
+    crate::backend::with_best_backend(
+        || prove_model_with::<SimdBackend, Blake2sMerkleChannel>(graph, input, weights),
+        || prove_model_gpu(graph, input, weights),
+    )
+}
+
+/// GPU proving path — dispatches to `GpuBackend` when `cuda-runtime` is enabled.
+fn prove_model_gpu(
+    graph: &ComputationGraph,
+    input: &M31Matrix,
+    weights: &GraphWeights,
+) -> Result<ModelProofResult, ModelError> {
+    #[cfg(feature = "cuda-runtime")]
+    {
+        use stwo::prover::backend::gpu::GpuBackend;
+        return prove_model_with::<GpuBackend, Blake2sMerkleChannel>(graph, input, weights);
+    }
+
+    // Fallback — unreachable when with_best_backend routes here,
+    // but needed for compilation without cuda-runtime.
+    #[cfg(not(feature = "cuda-runtime"))]
+    {
+        prove_model_with::<SimdBackend, Blake2sMerkleChannel>(graph, input, weights)
+    }
 }
 
 #[cfg(test)]
@@ -600,7 +876,121 @@ mod tests {
         }).collect();
 
         let config = PcsConfig::default();
-        let result = prove_activation_layer(&inputs, &outputs, &table, config);
+        let result = prove_activation_layer::<SimdBackend, Blake2sMerkleChannel>(&inputs, &outputs, &table, config);
         assert!(result.is_ok(), "Standalone activation proving failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_prove_model_auto() {
+        // prove_model_auto should produce identical results to prove_model
+        let mut builder = GraphBuilder::new((1, 4));
+        builder
+            .linear(4)
+            .activation(ActivationType::ReLU)
+            .linear(2);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+
+        let mut weights = GraphWeights::new();
+        let mut w0 = M31Matrix::new(4, 4);
+        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        weights.add_weight(0, w0);
+        let mut w2 = M31Matrix::new(4, 2);
+        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        weights.add_weight(2, w2);
+
+        let (proofs, execution) = prove_model_auto(&graph, &input, &weights)
+            .expect("prove_model_auto should succeed");
+
+        assert_eq!(proofs.len(), 3);
+        assert_eq!(execution.output.rows, 1);
+        assert_eq!(execution.output.cols, 2);
+    }
+
+    /// GPU proving test — only runs with cuda-runtime feature.
+    #[cfg(feature = "cuda-runtime")]
+    #[test]
+    fn test_prove_model_gpu_backend() {
+        use stwo::prover::backend::gpu::GpuBackend;
+
+        let mut builder = GraphBuilder::new((1, 4));
+        builder
+            .linear(4)
+            .activation(ActivationType::ReLU)
+            .linear(2);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+
+        let mut weights = GraphWeights::new();
+        let mut w0 = M31Matrix::new(4, 4);
+        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        weights.add_weight(0, w0);
+        let mut w2 = M31Matrix::new(4, 2);
+        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        weights.add_weight(2, w2);
+
+        // Use GpuBackend explicitly
+        let (proofs, execution) = prove_model_with::<GpuBackend, Blake2sMerkleChannel>(
+            &graph, &input, &weights,
+        ).expect("GPU proving should succeed");
+
+        assert_eq!(proofs.len(), 3);
+        assert_eq!(execution.output.cols, 2);
+
+        // Verify the proofs
+        verify_model_matmuls(&proofs, &graph, &input, &weights)
+            .expect("GPU proof verification should succeed");
+    }
+
+    /// Test proving a model that contains an Attention layer.
+    #[test]
+    fn test_prove_model_with_attention() {
+        use crate::components::attention::MultiHeadAttentionConfig;
+
+        // Build: attention(2 heads, d=4, seq=4) → linear(4→2)
+        let attn_config = MultiHeadAttentionConfig::new(2, 4, 4);
+        let mut builder = GraphBuilder::new((4, 4));
+        builder.attention(attn_config);
+        builder.linear(2);
+        let graph = builder.build();
+
+        // Input
+        let mut input = M31Matrix::new(4, 4);
+        for i in 0..4 { for j in 0..4 { input.set(i, j, M31::from((i * 4 + j + 1) as u32)); } }
+
+        // Weights: named for attention, unnamed for linear
+        let mut weights = GraphWeights::new();
+        let mut state = 42u64;
+        let fill = |rows: usize, cols: usize, s: &mut u64| -> M31Matrix {
+            let mut m = M31Matrix::new(rows, cols);
+            for i in 0..rows { for j in 0..cols {
+                *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                m.set(i, j, M31::from(((*s >> 33) % 9 + 1) as u32));
+            }}
+            m
+        };
+        weights.add_named_weight(0, "w_q", fill(4, 4, &mut state));
+        weights.add_named_weight(0, "w_k", fill(4, 4, &mut state));
+        weights.add_named_weight(0, "w_v", fill(4, 4, &mut state));
+        weights.add_named_weight(0, "w_o", fill(4, 4, &mut state));
+        weights.add_weight(1, fill(4, 2, &mut state)); // linear layer
+
+        let (proofs, execution) = prove_model(&graph, &input, &weights)
+            .expect("Model with attention should prove");
+
+        // 2 layers: attention + linear
+        assert_eq!(proofs.len(), 2);
+        assert!(matches!(proofs[0].kind, LayerProofKind::Attention(_)), "layer 0 = attention");
+        assert!(matches!(proofs[1].kind, LayerProofKind::Sumcheck(_)), "layer 1 = matmul");
+        assert_eq!(execution.output.rows, 4);
+        assert_eq!(execution.output.cols, 2);
+
+        // Verify
+        verify_model_matmuls(&proofs, &graph, &input, &weights)
+            .expect("Model with attention should verify");
     }
 }
