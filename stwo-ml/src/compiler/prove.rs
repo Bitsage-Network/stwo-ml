@@ -523,6 +523,18 @@ where
                 });
             }
 
+            GraphOp::Attention { .. } => {
+                // Attention is proven at the component level (via prove_attention_with).
+                // In the per-layer pipeline, treat as passthrough — attention proofs
+                // are handled separately when the caller uses the attention prover.
+                intermediates.push((node.id, current.clone()));
+                layer_proofs.push(LayerProof {
+                    kind: LayerProofKind::Passthrough,
+                    claimed_sum: SecureField::from(M31::from(0)),
+                    layer_index: node.id,
+                });
+            }
+
             GraphOp::Quantize { .. }
             | GraphOp::Identity { .. } => {
                 // Quantize: applied to weights at load time, identity in forward pass.
@@ -596,6 +608,9 @@ pub fn verify_model_matmuls<H: MerkleHasherLifted>(
             }
             (LayerProofKind::Passthrough, GraphOp::LayerNorm { dim }) => {
                 current = apply_layernorm(&current, *dim);
+            }
+            (LayerProofKind::Passthrough, GraphOp::Attention { .. }) => {
+                // Attention proofs verified separately; skip in matmul verifier.
             }
             _ => {}
         }

@@ -1,0 +1,11 @@
+# Rust build artifacts
+target/
+Cargo.lock
+
+# Cairo/Scarb build artifacts
+**/target/dev/
+**/target/release/
+**/target/CACHEDIR.TAG
+
+# OS
+.DS_Store

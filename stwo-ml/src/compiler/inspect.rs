@@ -119,6 +119,12 @@ pub fn summarize_graph(graph: &ComputationGraph, weights: &GraphWeights) -> Mode
                 num_other += 1;
                 ("Quantize".to_string(), 0)
             }
+            GraphOp::Attention { config } => {
+                num_other += 1;
+                let d = config.d_model;
+                // 4 weight matrices: W_Q, W_K, W_V, W_O each (d_model, d_model)
+                (format!("Attention({}h)", config.num_heads), 4 * d * d)
+            }
             GraphOp::Identity { .. } => {
                 num_other += 1;
                 ("Identity".to_string(), 0)

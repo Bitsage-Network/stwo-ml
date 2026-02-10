@@ -7,6 +7,8 @@ members = [
     "crates/constraint_framework",
     "crates/verifier_core",
     "crates/verifier_utils",
+    "crates/ml_air",
+    "crates/ml_verifier",
 ]
 
 [workspace.tool.cairo-lint]

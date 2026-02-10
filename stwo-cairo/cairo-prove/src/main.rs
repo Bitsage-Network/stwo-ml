@@ -97,6 +97,68 @@ fn handle_verify(proof: &Path, with_pedersen: bool) -> Result<()> {
     Ok(())
 }
 
+fn handle_prove_ml(
+    verifier_executable: &Path,
+    ml_proof: &Path,
+    output: &Path,
+    proof_format: ProofFormat,
+    _gpu: bool,
+) -> Result<()> {
+    info!("Generating recursive proof for ML STARK proof: {:?}", ml_proof);
+    info!("Using ML verifier executable: {:?}", verifier_executable);
+    info!(
+        "GPU backend: {}",
+        if _gpu { "requested (requires cuda-runtime feature)" } else { "disabled" }
+    );
+    let start = Instant::now();
+
+    // Step 1: Load the ML verifier executable (compiled Cairo Sierra JSON)
+    let exec_str = verifier_executable
+        .to_str()
+        .ok_or_else(|| CairoProveError::InvalidPath {
+            path: verifier_executable.to_path_buf(),
+        })?;
+    let exec_file = std::fs::File::open(exec_str)?;
+    let executable: cairo_lang_executable::executable::Executable =
+        serde_json::from_reader(exec_file)
+            .map_err(|e| CairoProveError::ProofSerialization(
+                format!("Failed to parse ML verifier executable: {e}")
+            ))?;
+    info!("ML verifier executable loaded.");
+
+    // Step 2: Load ML proof arguments (felt252 hex array)
+    let args_file = std::fs::File::open(ml_proof)?;
+    let as_vec: Vec<cairo_lang_utils::bigint::BigUintAsHex> =
+        serde_json::from_reader(args_file)
+            .map_err(|e| CairoProveError::ProofSerialization(
+                format!("Failed to parse ML proof arguments: {e}")
+            ))?;
+    let args: Vec<Arg> = as_vec
+        .into_iter()
+        .map(|v| Arg::Value(v.value.into()))
+        .collect();
+    info!("ML proof arguments loaded: {} felt252 values.", args.len());
+
+    // Step 3: Execute the ML verifier in Cairo VM
+    let exec_start = Instant::now();
+    let runner = execute(executable, args)?;
+    info!("ML verifier executed in {:.2?}.", exec_start.elapsed());
+
+    // Step 4: Generate recursive STARK proof
+    let prove_start = Instant::now();
+    let prover_input = prover_input_from_runner(&runner)?;
+    let cairo_proof = prove(prover_input, secure_pcs_config())?;
+    info!("Recursive STARK proof generated in {:.2?}.", prove_start.elapsed());
+
+    // Step 5: Save the proof
+    serialize_proof_to_file::<Blake2sMerkleChannel>(&cairo_proof, output.into(), proof_format)
+        .map_err(|e| CairoProveError::ProofSerialization(format!("{:?}", e)))?;
+
+    let elapsed = start.elapsed();
+    info!("Recursive proof saved to: {:?} ({:.2?} total)", output, elapsed);
+    Ok(())
+}
+
 fn run() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -116,6 +178,15 @@ fn run() -> Result<()> {
             with_pedersen,
         } => {
             handle_verify(&proof, with_pedersen)?;
+        }
+        Commands::ProveMl {
+            verifier_executable,
+            ml_proof,
+            output,
+            proof_format,
+            gpu,
+        } => {
+            handle_prove_ml(&verifier_executable, &ml_proof, &output, proof_format, gpu)?;
         }
     }
     Ok(())

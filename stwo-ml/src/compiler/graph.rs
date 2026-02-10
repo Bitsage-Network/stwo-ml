@@ -6,6 +6,7 @@
 use stwo::core::fields::m31::M31;
 
 use crate::components::activation::ActivationType;
+use crate::components::attention::MultiHeadAttentionConfig;
 use crate::components::matmul::M31Matrix;
 use crate::gadgets::quantize::QuantParams;
 
@@ -31,6 +32,10 @@ pub enum GraphOp {
     Quantize {
         params: QuantParams,
         size: usize,
+    },
+    /// Multi-head attention block.
+    Attention {
+        config: MultiHeadAttentionConfig,
     },
     /// Identity / passthrough (for graph structure).
     Identity {
@@ -58,6 +63,9 @@ impl GraphOp {
                 // Range check per element
                 *size
             }
+            GraphOp::Attention { config } => {
+                config.sumcheck_trace_rows()
+            }
             GraphOp::Identity { .. } => 0,
         }
     }
@@ -83,6 +91,8 @@ pub struct GraphWeights {
     pub weights: Vec<(usize, M31Matrix)>,
     /// Per-node bias vectors.
     pub biases: Vec<(usize, Vec<M31>)>,
+    /// Named weight matrices: (node_id, name, weight).
+    pub named_weights: Vec<(usize, String, M31Matrix)>,
 }
 
 impl GraphWeights {
@@ -90,11 +100,17 @@ impl GraphWeights {
         Self {
             weights: Vec::new(),
             biases: Vec::new(),
+            named_weights: Vec::new(),
         }
     }
 
     pub fn add_weight(&mut self, node_id: usize, weight: M31Matrix) {
         self.weights.push((node_id, weight));
+    }
+
+    /// Add a named weight for a node (e.g. "w_q", "w_k" for attention).
+    pub fn add_named_weight(&mut self, node_id: usize, name: &str, weight: M31Matrix) {
+        self.named_weights.push((node_id, name.to_string(), weight));
     }
 
     pub fn add_bias(&mut self, node_id: usize, bias: Vec<M31>) {
@@ -106,6 +122,14 @@ impl GraphWeights {
             .iter()
             .find(|(id, _)| *id == node_id)
             .map(|(_, w)| w)
+    }
+
+    /// Get a named weight for a node.
+    pub fn get_named_weight(&self, node_id: usize, name: &str) -> Option<&M31Matrix> {
+        self.named_weights
+            .iter()
+            .find(|(id, n, _)| *id == node_id && n == name)
+            .map(|(_, _, w)| w)
     }
 
     pub fn get_bias(&self, node_id: usize) -> Option<&Vec<M31>> {
@@ -121,6 +145,7 @@ impl Default for GraphWeights {
         Self::new()
     }
 }
+
 
 /// A computation graph representing a neural network.
 #[derive(Debug, Clone)]
@@ -208,6 +233,20 @@ impl GraphBuilder {
 
         let id = self.graph.add_node(
             GraphOp::Activation { activation_type: act_type, size },
+            inputs,
+            shape,
+        );
+        self.last_node = Some(id);
+        self
+    }
+
+    /// Add a multi-head attention block.
+    pub fn attention(&mut self, config: MultiHeadAttentionConfig) -> &mut Self {
+        let shape = self.current_output_shape();
+        let inputs = self.last_node.map(|n| vec![n]).unwrap_or_default();
+
+        let id = self.graph.add_node(
+            GraphOp::Attention { config },
             inputs,
             shape,
         );

@@ -354,6 +354,101 @@ pub fn serialize_matmul_sumcheck_proof(
     serialize_mle_opening_proof(&proof.b_opening, output);
 }
 
+// === MLProof serialization for recursive verification ===
+//
+// Serializes an AggregatedModelProofOnChain into the felt252[] layout
+// matching the Cairo `MLProof` struct's Serde deserialization.
+
+use crate::aggregation::AggregatedModelProofOnChain;
+
+/// Metadata about the ML model, needed to construct the Cairo MLClaim.
+pub struct MLClaimMetadata {
+    pub model_id: FieldElement,
+    pub num_layers: u32,
+    pub activation_type: u8,
+    pub io_commitment: FieldElement,
+    pub weight_commitment: FieldElement,
+}
+
+/// Serialize an ML proof for the recursive Cairo verifier.
+///
+/// Output format matches Cairo's `MLProof { claim, matmul_proofs, channel_salt }`:
+///
+/// 1. MLClaim: model_id, num_layers, activation_type, io_commitment, weight_commitment
+/// 2. matmul_proofs: Array<MatMulSumcheckProofOnChain> (10-field version, no MLE openings)
+/// 3. channel_salt: Option<u64> (0 for None, 1 + value for Some)
+pub fn serialize_ml_proof_for_recursive(
+    proof: &AggregatedModelProofOnChain,
+    metadata: &MLClaimMetadata,
+    channel_salt: Option<u64>,
+) -> Vec<FieldElement> {
+    let mut output = Vec::new();
+
+    // 1. MLClaim
+    output.push(metadata.model_id);
+    serialize_u32(metadata.num_layers, &mut output);
+    // activation_type is u8, serialize as felt252
+    output.push(FieldElement::from(metadata.activation_type as u64));
+    output.push(metadata.io_commitment);
+    output.push(metadata.weight_commitment);
+
+    // 2. matmul_proofs: Array<MatMulSumcheckProofOnChain> (10-field Cairo layout)
+    serialize_u32(proof.matmul_proofs.len() as u32, &mut output);
+    for (_layer_idx, matmul) in &proof.matmul_proofs {
+        serialize_matmul_for_recursive(matmul, &mut output);
+    }
+
+    // 3. channel_salt: Option<u64>
+    match channel_salt {
+        None => {
+            serialize_u32(0, &mut output); // Cairo Option::None variant index
+        }
+        Some(salt) => {
+            serialize_u32(1, &mut output); // Cairo Option::Some variant index
+            serialize_u64(salt, &mut output);
+        }
+    }
+
+    output
+}
+
+/// Serialize a matmul proof in the 10-field Cairo layout (no MLE openings).
+///
+/// This matches the Cairo `MatMulSumcheckProofOnChain` struct which has:
+/// m, k, n, num_rounds, claimed_sum, round_polys, final_a_eval, final_b_eval,
+/// a_commitment, b_commitment
+fn serialize_matmul_for_recursive(
+    proof: &MatMulSumcheckProofOnChain,
+    output: &mut Vec<FieldElement>,
+) {
+    serialize_u32(proof.m, output);
+    serialize_u32(proof.k, output);
+    serialize_u32(proof.n, output);
+    serialize_u32(proof.num_rounds, output);
+    serialize_qm31(proof.claimed_sum, output);
+    // round_polys: Array<RoundPoly>
+    serialize_u32(proof.round_polys.len() as u32, output);
+    for rp in &proof.round_polys {
+        serialize_round_poly(rp, output);
+    }
+    serialize_qm31(proof.final_a_eval, output);
+    serialize_qm31(proof.final_b_eval, output);
+    output.push(proof.a_commitment);
+    output.push(proof.b_commitment);
+}
+
+/// Convert the serialized felt252[] to a JSON array of hex strings,
+/// suitable for cairo-prove's `--arguments-file`.
+pub fn serialize_ml_proof_to_arguments_file(
+    felts: &[FieldElement],
+) -> String {
+    let hex_strings: Vec<String> = felts
+        .iter()
+        .map(|f| format!("\"0x{:x}\"", f))
+        .collect();
+    format!("[{}]", hex_strings.join(","))
+}
+
 // === Deserialization (Cairo felt252[] → Rust types) ===
 
 /// Deserialize a receipt hash from a felt252 value.
@@ -572,5 +667,110 @@ mod tests {
         let final_a = out[fv_start];
         // Should be non-zero since we used non-zero inputs
         assert_ne!(final_a, FieldElement::ZERO);
+    }
+
+    #[test]
+    fn test_serialize_ml_proof_for_recursive_structure() {
+        use crate::components::matmul::{M31Matrix, matmul_m31, prove_matmul_sumcheck_onchain};
+
+        let mut a = M31Matrix::new(2, 2);
+        a.set(0, 0, M31::from(1)); a.set(0, 1, M31::from(2));
+        a.set(1, 0, M31::from(3)); a.set(1, 1, M31::from(4));
+
+        let mut b = M31Matrix::new(2, 2);
+        b.set(0, 0, M31::from(5)); b.set(0, 1, M31::from(6));
+        b.set(1, 0, M31::from(7)); b.set(1, 1, M31::from(8));
+
+        let c = matmul_m31(&a, &b);
+        let matmul_proof = prove_matmul_sumcheck_onchain(&a, &b, &c).unwrap();
+
+        let aggregated = AggregatedModelProofOnChain {
+            activation_stark: None,
+            matmul_proofs: vec![(0, matmul_proof)],
+            execution: crate::compiler::prove::GraphExecution {
+                intermediates: vec![],
+                output: M31Matrix::new(1, 1),
+            },
+            activation_claims: vec![],
+        };
+
+        let metadata = MLClaimMetadata {
+            model_id: FieldElement::from(0x42u64),
+            num_layers: 1,
+            activation_type: 0, // ReLU
+            io_commitment: FieldElement::from(0xdeadbeefu64),
+            weight_commitment: FieldElement::from(0xcafeu64),
+        };
+
+        let felts = serialize_ml_proof_for_recursive(&aggregated, &metadata, None);
+
+        // Verify structure:
+        // MLClaim: model_id(1) + num_layers(1) + activation_type(1) + io_commitment(1) + weight_commitment(1) = 5
+        assert_eq!(felts[0], FieldElement::from(0x42u64), "model_id");
+        assert_eq!(felts[1], FieldElement::from(1u64), "num_layers");
+        assert_eq!(felts[2], FieldElement::from(0u64), "activation_type (ReLU=0)");
+        assert_eq!(felts[3], FieldElement::from(0xdeadbeefu64), "io_commitment");
+        assert_eq!(felts[4], FieldElement::from(0xcafeu64), "weight_commitment");
+
+        // matmul_proofs: length = 1
+        assert_eq!(felts[5], FieldElement::from(1u64), "matmul_proofs length");
+
+        // First matmul proof starts at index 6: m=2, k=2, n=2, num_rounds=1
+        assert_eq!(felts[6], FieldElement::from(2u64), "m");
+        assert_eq!(felts[7], FieldElement::from(2u64), "k");
+        assert_eq!(felts[8], FieldElement::from(2u64), "n");
+        assert_eq!(felts[9], FieldElement::from(1u64), "num_rounds");
+
+        // Total should be reasonable
+        assert!(felts.len() > 20, "serialized too small: {} felts", felts.len());
+
+        // Test arguments file generation
+        let json = serialize_ml_proof_to_arguments_file(&felts);
+        assert!(json.starts_with("[\"0x"));
+        assert!(json.ends_with("\"]"));
+    }
+
+    #[test]
+    fn test_serialize_ml_proof_with_salt() {
+        use crate::components::matmul::{M31Matrix, matmul_m31, prove_matmul_sumcheck_onchain};
+
+        let mut a = M31Matrix::new(2, 2);
+        a.set(0, 0, M31::from(1)); a.set(0, 1, M31::from(0));
+        a.set(1, 0, M31::from(0)); a.set(1, 1, M31::from(1));
+        let c = matmul_m31(&a, &a);
+        let matmul_proof = prove_matmul_sumcheck_onchain(&a, &a, &c).unwrap();
+
+        let aggregated = AggregatedModelProofOnChain {
+            activation_stark: None,
+            matmul_proofs: vec![(0, matmul_proof)],
+            execution: crate::compiler::prove::GraphExecution {
+                intermediates: vec![],
+                output: M31Matrix::new(1, 1),
+            },
+            activation_claims: vec![],
+        };
+
+        let metadata = MLClaimMetadata {
+            model_id: FieldElement::ONE,
+            num_layers: 1,
+            activation_type: 0,
+            io_commitment: FieldElement::ZERO,
+            weight_commitment: FieldElement::ZERO,
+        };
+
+        // With salt
+        let with_salt = serialize_ml_proof_for_recursive(&aggregated, &metadata, Some(12345));
+        // Without salt
+        let no_salt = serialize_ml_proof_for_recursive(&aggregated, &metadata, None);
+
+        // Salt adds 1 extra felt (variant index 1 + value) vs (variant index 0)
+        assert_eq!(with_salt.len(), no_salt.len() + 1);
+
+        // Last felt of no_salt is variant=0 (None)
+        assert_eq!(no_salt[no_salt.len() - 1], FieldElement::ZERO);
+
+        // Last 2 felts of with_salt are variant=1, value=12345
+        assert_eq!(with_salt[with_salt.len() - 2], FieldElement::from(1u64));
+        assert_eq!(with_salt[with_salt.len() - 1], FieldElement::from(12345u64));
     }
 }

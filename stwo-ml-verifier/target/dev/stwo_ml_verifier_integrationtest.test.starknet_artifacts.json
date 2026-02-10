@@ -1,1 +1,0 @@
-{"version":1,"contracts":[{"id":"mk1abgapu3goo","package_name":"stwo_ml_verifier","contract_name":"StweMlVerifierContract","module_path":"stwo_ml_verifier::contract::StweMlVerifierContract","artifacts":{"sierra":"stwo_ml_verifier_integrationtest_StweMlVerifierContract.test.contract_class.json","casm":null}}]}

@@ -44,9 +44,33 @@ where
 }
 
 /// Minimum problem sizes (log2) where GPU acceleration is beneficial.
+///
+/// Override with env var `OBELYSK_GPU_THRESHOLD` to set all thresholds to the same value.
+/// Set to `0` on H200/A100 to always use GPU. Default values are conservative for consumer GPUs.
 pub struct GpuThresholds;
 
 impl GpuThresholds {
+    const DEFAULT_FFT_FRI: u32 = 12;
+    const DEFAULT_QUOTIENT: u32 = 14;
+    const DEFAULT_COLUMN_OPS: u32 = 14;
+    const DEFAULT_MERKLE: u32 = 14;
+    const DEFAULT_MLE: u32 = 14;
+
+    /// Read override from `OBELYSK_GPU_THRESHOLD` env var, or return the default.
+    fn env_override(default: u32) -> u32 {
+        std::env::var("OBELYSK_GPU_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+
+    pub fn fft_fri() -> u32 { Self::env_override(Self::DEFAULT_FFT_FRI) }
+    pub fn quotient() -> u32 { Self::env_override(Self::DEFAULT_QUOTIENT) }
+    pub fn column_ops() -> u32 { Self::env_override(Self::DEFAULT_COLUMN_OPS) }
+    pub fn merkle() -> u32 { Self::env_override(Self::DEFAULT_MERKLE) }
+    pub fn mle() -> u32 { Self::env_override(Self::DEFAULT_MLE) }
+
+    // Keep const values for backwards compatibility in tests
     pub const FFT_FRI: u32 = 12;
     pub const QUOTIENT: u32 = 14;
     pub const COLUMN_OPS: u32 = 14;
@@ -150,8 +174,10 @@ pub fn fits_in_gpu(log_size: u32, num_columns: usize) -> bool {
 }
 
 /// Whether the given log_size is large enough for GPU to be beneficial.
+///
+/// Set `OBELYSK_GPU_THRESHOLD=0` to always use GPU on datacenter GPUs (H200, A100).
 pub fn should_use_gpu(log_size: u32) -> bool {
-    gpu_is_available() && log_size >= GpuThresholds::FFT_FRI
+    gpu_is_available() && log_size >= GpuThresholds::fft_fri()
 }
 
 /// Execute a closure with the best available backend.

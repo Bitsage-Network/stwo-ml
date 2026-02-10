@@ -1,0 +1,13 @@
+[package]
+name = "obelysk_ml_verifier"
+version = "0.1.0"
+edition = "2024_07"
+
+[[target.executable]]
+
+[dependencies]
+obelysk_ml_air = { path = "../ml_air" }
+cairo_execute = "2.12.2"
+
+[features]
+default = []
