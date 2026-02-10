@@ -47,7 +47,7 @@ use crate::compiler::prove::{
     apply_layernorm_detailed,
 };
 use crate::components::elementwise::{ElementwiseAddEval, ElementwiseMulEval};
-use crate::components::layernorm::{LayerNormEval, LayerNormRelation, build_rsqrt_table};
+use crate::components::layernorm::{LayerNormConfig, LayerNormEval, LayerNormRelation, build_rsqrt_table};
 use crate::components::activation::{
     ActivationEval, ActivationRelation,
     compute_multiplicities,
@@ -66,6 +66,12 @@ use crate::backend::convert_evaluations;
 use tracing::info;
 
 type Blake2sHash = <Blake2sMerkleChannel as MerkleChannel>::H;
+
+/// Compute the minimum log_size for a data vector: next power of two, at least SIMD width.
+fn data_log_size(data_len: usize) -> u32 {
+    let min_size = data_len.next_power_of_two().max(1 << LOG_N_LANES);
+    min_size.ilog2()
+}
 
 /// A claim about a single layer's computation.
 #[derive(Debug, Clone)]
@@ -140,6 +146,7 @@ struct ActivationLayerData {
     inputs: Vec<M31>,
     outputs: Vec<M31>,
     table: PrecomputedTable,
+    log_size: u32,
 }
 
 /// Collected Add layer data for unified STARK aggregation.
@@ -148,6 +155,7 @@ struct AddLayerData {
     lhs: Vec<M31>,
     rhs: Vec<M31>,
     output: Vec<M31>,
+    log_size: u32,
 }
 
 /// Collected Mul layer data for unified STARK aggregation.
@@ -156,6 +164,7 @@ struct MulLayerData {
     lhs: Vec<M31>,
     rhs: Vec<M31>,
     output: Vec<M31>,
+    log_size: u32,
 }
 
 /// Collected LayerNorm layer data for unified STARK aggregation.
@@ -167,6 +176,7 @@ struct LayerNormLayerData {
     rsqrt_vals: Vec<M31>,
     outputs: Vec<M31>,
     rsqrt_table: PrecomputedTable,
+    log_size: u32,
 }
 
 /// Prove an entire computation graph with aggregated STARK proof,
@@ -241,7 +251,8 @@ where
                 let f = activation_type.as_fn();
                 let output = crate::compiler::prove::apply_activation_pub(&current, &*f);
 
-                let table = PrecomputedTable::build(|x| (*f)(x), 4);
+                let act_log_size = activation_type.recommended_table_log_size();
+                let table = PrecomputedTable::build(|x| (*f)(x), act_log_size);
                 let flat_inputs = current.data.clone();
                 let flat_outputs = output.data.clone();
 
@@ -250,6 +261,7 @@ where
                     inputs: flat_inputs,
                     outputs: flat_outputs,
                     table,
+                    log_size: act_log_size,
                 });
 
                 intermediates.push((node.id, current.clone()));
@@ -268,11 +280,13 @@ where
                     .unwrap_or_else(|| current.clone());
                 let output = elementwise_add(&lhs, &rhs);
 
+                let add_log_size = data_log_size(output.data.len());
                 add_layers.push(AddLayerData {
                     node_id: node.id,
                     lhs: lhs.data.clone(),
                     rhs: rhs.data.clone(),
                     output: output.data.clone(),
+                    log_size: add_log_size,
                 });
 
                 intermediates.push((node.id, current.clone()));
@@ -291,11 +305,13 @@ where
                     .unwrap_or_else(|| current.clone());
                 let output = elementwise_mul(&lhs, &rhs);
 
+                let mul_log_size = data_log_size(output.data.len());
                 mul_layers.push(MulLayerData {
                     node_id: node.id,
                     lhs: lhs.data.clone(),
                     rhs: rhs.data.clone(),
                     output: output.data.clone(),
+                    log_size: mul_log_size,
                 });
 
                 intermediates.push((node.id, current.clone()));
@@ -304,8 +320,9 @@ where
             }
 
             GraphOp::LayerNorm { dim } => {
+                let ln_log_size = LayerNormConfig::new(*dim).rsqrt_table_log_size;
                 let ln = apply_layernorm_detailed(&current, *dim);
-                let rsqrt_table = build_rsqrt_table(4);
+                let rsqrt_table = build_rsqrt_table(ln_log_size);
 
                 layernorm_layers.push(LayerNormLayerData {
                     node_id: node.id,
@@ -315,6 +332,7 @@ where
                     rsqrt_vals: ln.rsqrt_vals.clone(),
                     outputs: ln.outputs.clone(),
                     rsqrt_table,
+                    log_size: ln_log_size,
                 });
 
                 intermediates.push((node.id, current.clone()));
@@ -351,12 +369,16 @@ where
     }
 
     // === Build unified STARK for all non-matmul components ===
-    let log_size = 4u32; // All tables use log_size=4 for now
-    let size = 1usize << log_size;
-    let vec_size = size >> LOG_N_LANES;
-    let domain = CanonicCoset::new(log_size).circle_domain();
+    // Per-component log_sizes: each component uses its own size derived from
+    // its table or data length. The max_log_size drives twiddle precomputation.
+    let all_log_sizes: Vec<u32> = activation_layers.iter().map(|l| l.log_size)
+        .chain(add_layers.iter().map(|l| l.log_size))
+        .chain(mul_layers.iter().map(|l| l.log_size))
+        .chain(layernorm_layers.iter().map(|l| l.log_size))
+        .collect();
+    let max_log_size = *all_log_sizes.iter().max().unwrap();
 
-    let max_degree_bound = log_size + 1;
+    let max_degree_bound = max_log_size + 1;
     let twiddles = B::precompute_twiddles(
         CanonicCoset::new(max_degree_bound + config.fri_config.log_blowup_factor)
             .circle_domain()
@@ -375,18 +397,22 @@ where
     {
         let mut tree_builder = commitment_scheme.tree_builder();
         for layer in &activation_layers {
-            let (table_input_col, table_output_col) = build_table_columns(&layer.table, size);
+            let layer_size = 1usize << layer.log_size;
+            let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
+            let (table_input_col, table_output_col) = build_table_columns(&layer.table, layer_size);
             let simd_evals = vec![
-                CircleEvaluation::new(domain, table_input_col),
-                CircleEvaluation::new(domain, table_output_col),
+                CircleEvaluation::new(layer_domain, table_input_col),
+                CircleEvaluation::new(layer_domain, table_output_col),
             ];
             tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
         }
         for layer in &layernorm_layers {
-            let (table_var_col, table_rsqrt_col) = build_table_columns(&layer.rsqrt_table, size);
+            let layer_size = 1usize << layer.log_size;
+            let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
+            let (table_var_col, table_rsqrt_col) = build_table_columns(&layer.rsqrt_table, layer_size);
             let simd_evals = vec![
-                CircleEvaluation::new(domain, table_var_col),
-                CircleEvaluation::new(domain, table_rsqrt_col),
+                CircleEvaluation::new(layer_domain, table_var_col),
+                CircleEvaluation::new(layer_domain, table_rsqrt_col),
             ];
             tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
         }
@@ -401,9 +427,11 @@ where
     let mut tree_builder = commitment_scheme.tree_builder();
     let mut activation_mults: Vec<Vec<M31>> = Vec::new();
     for layer in &activation_layers {
+        let layer_size = 1usize << layer.log_size;
+        let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
         let pad_input = layer.table.inputs[0];
         let pad_output = layer.table.outputs[0];
-        let padding_count = size.saturating_sub(layer.inputs.len());
+        let padding_count = layer_size.saturating_sub(layer.inputs.len());
 
         let mut mults = compute_multiplicities(&layer.inputs, &layer.table);
         if padding_count > 0 {
@@ -412,45 +440,50 @@ where
 
         let (trace_in, trace_out, mult_col) = build_trace_columns(
             &layer.inputs, &layer.outputs, &mults,
-            pad_input, pad_output, size,
+            pad_input, pad_output, layer_size,
         );
         let simd_evals = vec![
-            CircleEvaluation::new(domain, trace_in),
-            CircleEvaluation::new(domain, trace_out),
-            CircleEvaluation::new(domain, mult_col),
+            CircleEvaluation::new(layer_domain, trace_in),
+            CircleEvaluation::new(layer_domain, trace_out),
+            CircleEvaluation::new(layer_domain, mult_col),
         ];
         tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
         activation_mults.push(mults);
     }
     for layer in &add_layers {
+        let layer_size = 1usize << layer.log_size;
+        let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
         let (lhs_col, rhs_col, out_col) = build_elementwise_trace_columns(
-            &layer.lhs, &layer.rhs, &layer.output, size,
+            &layer.lhs, &layer.rhs, &layer.output, layer_size,
         );
         let simd_evals = vec![
-            CircleEvaluation::new(domain, lhs_col),
-            CircleEvaluation::new(domain, rhs_col),
-            CircleEvaluation::new(domain, out_col),
+            CircleEvaluation::new(layer_domain, lhs_col),
+            CircleEvaluation::new(layer_domain, rhs_col),
+            CircleEvaluation::new(layer_domain, out_col),
         ];
         tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
     }
     for layer in &mul_layers {
+        let layer_size = 1usize << layer.log_size;
+        let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
         let (lhs_col, rhs_col, out_col) = build_elementwise_trace_columns(
-            &layer.lhs, &layer.rhs, &layer.output, size,
+            &layer.lhs, &layer.rhs, &layer.output, layer_size,
         );
         let simd_evals = vec![
-            CircleEvaluation::new(domain, lhs_col),
-            CircleEvaluation::new(domain, rhs_col),
-            CircleEvaluation::new(domain, out_col),
+            CircleEvaluation::new(layer_domain, lhs_col),
+            CircleEvaluation::new(layer_domain, rhs_col),
+            CircleEvaluation::new(layer_domain, out_col),
         ];
         tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
     }
     let mut layernorm_mults: Vec<Vec<M31>> = Vec::new();
     for layer in &layernorm_layers {
+        let layer_size = 1usize << layer.log_size;
         let mults = compute_multiplicities(&layer.variances, &layer.rsqrt_table);
         let cols = build_layernorm_trace_columns(
             &layer.inputs, &layer.means, &layer.variances,
             &layer.rsqrt_vals, &layer.outputs, &mults,
-            &layer.rsqrt_table, size,
+            &layer.rsqrt_table, layer_size,
         );
         tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(cols));
         layernorm_mults.push(mults);
@@ -478,19 +511,21 @@ where
 
         if let Some(ref lookup) = activation_lookup {
         for (idx, layer) in activation_layers.iter().enumerate() {
+            let layer_size = 1usize << layer.log_size;
+            let layer_vec_size = layer_size >> LOG_N_LANES;
             let pad_input = layer.table.inputs[0];
             let pad_output = layer.table.outputs[0];
 
-            let (table_in_col, table_out_col) = build_table_columns(&layer.table, size);
+            let (table_in_col, table_out_col) = build_table_columns(&layer.table, layer_size);
             let (trace_in_col, trace_out_col, _) = build_trace_columns(
                 &layer.inputs, &layer.outputs, &activation_mults[idx],
-                pad_input, pad_output, size,
+                pad_input, pad_output, layer_size,
             );
 
-            let mut logup_gen = LogupTraceGenerator::new(log_size);
+            let mut logup_gen = LogupTraceGenerator::new(layer.log_size);
             let mut col_gen = logup_gen.new_col();
 
-            for vec_row in 0..vec_size {
+            for vec_row in 0..layer_vec_size {
                 let q_table: PackedSecureField = lookup.lookup_elements().combine(
                     &[table_in_col.data[vec_row], table_out_col.data[vec_row]],
                 );
@@ -514,12 +549,14 @@ where
 
         if let Some(ref lookup) = layernorm_lookup {
             for (idx, layer) in layernorm_layers.iter().enumerate() {
-                let (table_var_col, table_rsqrt_col) = build_table_columns(&layer.rsqrt_table, size);
+                let layer_size = 1usize << layer.log_size;
+                let layer_vec_size = layer_size >> LOG_N_LANES;
+                let (table_var_col, table_rsqrt_col) = build_table_columns(&layer.rsqrt_table, layer_size);
 
                 // Build variance and rsqrt trace columns for LogUp
-                let mut var_col = Col::<SimdBackend, BaseField>::zeros(size);
-                let mut rsqrt_col = Col::<SimdBackend, BaseField>::zeros(size);
-                let n = layer.variances.len().min(size);
+                let mut var_col = Col::<SimdBackend, BaseField>::zeros(layer_size);
+                let mut rsqrt_col = Col::<SimdBackend, BaseField>::zeros(layer_size);
+                let n = layer.variances.len().min(layer_size);
                 for i in 0..n {
                     var_col.set(i, layer.variances[i]);
                     rsqrt_col.set(i, layer.rsqrt_vals[i]);
@@ -527,15 +564,15 @@ where
                 // Pad with table[0] values
                 let pad_var = layer.rsqrt_table.inputs.first().copied().unwrap_or(M31::from(0));
                 let pad_rsqrt = layer.rsqrt_table.outputs.first().copied().unwrap_or(M31::from(0));
-                for i in n..size {
+                for i in n..layer_size {
                     var_col.set(i, pad_var);
                     rsqrt_col.set(i, pad_rsqrt);
                 }
 
-                let mut logup_gen = LogupTraceGenerator::new(log_size);
+                let mut logup_gen = LogupTraceGenerator::new(layer.log_size);
                 let mut col_gen = logup_gen.new_col();
 
-                for vec_row in 0..vec_size {
+                for vec_row in 0..layer_vec_size {
                     let q_table: PackedSecureField = lookup.lookup_elements().combine(
                         &[table_var_col.data[vec_row], table_rsqrt_col.data[vec_row]],
                     );
@@ -574,7 +611,7 @@ where
             let component = FrameworkComponent::new(
                 &mut allocator,
                 ActivationEval {
-                    log_n_rows: log_size,
+                    log_n_rows: layer.log_size,
                     lookup_elements: lookup.clone(),
                     claimed_sum,
                     total_sum: claimed_sum,
@@ -585,7 +622,7 @@ where
             activation_claims.push(LayerClaim {
                 layer_index: layer.node_id,
                 claimed_sum,
-                trace_rows: size,
+                trace_rows: 1 << layer.log_size,
             });
         }
     }
@@ -594,14 +631,14 @@ where
     for layer in &add_layers {
         let component = FrameworkComponent::new(
             &mut allocator,
-            ElementwiseAddEval { log_n_rows: log_size },
+            ElementwiseAddEval { log_n_rows: layer.log_size },
             SecureField::default(),
         );
         component_refs_storage.push(Box::new(component));
         add_claims.push(LayerClaim {
             layer_index: layer.node_id,
             claimed_sum: SecureField::default(),
-            trace_rows: size,
+            trace_rows: 1 << layer.log_size,
         });
     }
 
@@ -609,14 +646,14 @@ where
     for layer in &mul_layers {
         let component = FrameworkComponent::new(
             &mut allocator,
-            ElementwiseMulEval { log_n_rows: log_size },
+            ElementwiseMulEval { log_n_rows: layer.log_size },
             SecureField::default(),
         );
         component_refs_storage.push(Box::new(component));
         mul_claims.push(LayerClaim {
             layer_index: layer.node_id,
             claimed_sum: SecureField::default(),
-            trace_rows: size,
+            trace_rows: 1 << layer.log_size,
         });
     }
 
@@ -627,7 +664,7 @@ where
             let component = FrameworkComponent::new(
                 &mut allocator,
                 LayerNormEval {
-                    log_n_rows: log_size,
+                    log_n_rows: layer.log_size,
                     dim: layer.inputs.len(),
                     lookup_elements: lookup.clone(),
                     claimed_sum,
@@ -638,7 +675,7 @@ where
             layernorm_claims.push(LayerClaim {
                 layer_index: layer.node_id,
                 claimed_sum,
-                trace_rows: size,
+                trace_rows: 1 << layer.log_size,
             });
         }
     }
@@ -862,7 +899,8 @@ where
                 let f = activation_type.as_fn();
                 let output = crate::compiler::prove::apply_activation_pub(&current, &*f);
 
-                let table = PrecomputedTable::build(|x| (*f)(x), 4);
+                let act_log_size = activation_type.recommended_table_log_size();
+                let table = PrecomputedTable::build(|x| (*f)(x), act_log_size);
                 let flat_inputs = current.data.clone();
                 let flat_outputs = output.data.clone();
 
@@ -871,6 +909,7 @@ where
                     inputs: flat_inputs,
                     outputs: flat_outputs,
                     table,
+                    log_size: act_log_size,
                 });
 
                 intermediates.push((node.id, current.clone()));
@@ -889,11 +928,13 @@ where
                     .unwrap_or_else(|| current.clone());
                 let output = elementwise_add(&lhs, &rhs);
 
+                let add_log_size = data_log_size(output.data.len());
                 add_layers.push(AddLayerData {
                     node_id: node.id,
                     lhs: lhs.data.clone(),
                     rhs: rhs.data.clone(),
                     output: output.data.clone(),
+                    log_size: add_log_size,
                 });
 
                 intermediates.push((node.id, current.clone()));
@@ -912,11 +953,13 @@ where
                     .unwrap_or_else(|| current.clone());
                 let output = elementwise_mul(&lhs, &rhs);
 
+                let mul_log_size = data_log_size(output.data.len());
                 mul_layers.push(MulLayerData {
                     node_id: node.id,
                     lhs: lhs.data.clone(),
                     rhs: rhs.data.clone(),
                     output: output.data.clone(),
+                    log_size: mul_log_size,
                 });
 
                 intermediates.push((node.id, current.clone()));
@@ -925,8 +968,9 @@ where
             }
 
             GraphOp::LayerNorm { dim } => {
+                let ln_log_size = LayerNormConfig::new(*dim).rsqrt_table_log_size;
                 let ln = apply_layernorm_detailed(&current, *dim);
-                let rsqrt_table = build_rsqrt_table(4);
+                let rsqrt_table = build_rsqrt_table(ln_log_size);
 
                 layernorm_layers.push(LayerNormLayerData {
                     node_id: node.id,
@@ -936,6 +980,7 @@ where
                     rsqrt_vals: ln.rsqrt_vals.clone(),
                     outputs: ln.outputs.clone(),
                     rsqrt_table,
+                    log_size: ln_log_size,
                 });
 
                 intermediates.push((node.id, current.clone()));
@@ -972,12 +1017,16 @@ where
     }
 
     // Build unified STARK using backend B + Blake2sMerkleChannel
-    let log_size = 4u32;
-    let size = 1usize << log_size;
-    let vec_size = size >> LOG_N_LANES;
-    let domain = CanonicCoset::new(log_size).circle_domain();
+    // Per-component log_sizes: each component uses its own size derived from
+    // its table or data length. The max_log_size drives twiddle precomputation.
+    let all_log_sizes: Vec<u32> = activation_layers.iter().map(|l| l.log_size)
+        .chain(add_layers.iter().map(|l| l.log_size))
+        .chain(mul_layers.iter().map(|l| l.log_size))
+        .chain(layernorm_layers.iter().map(|l| l.log_size))
+        .collect();
+    let max_log_size = *all_log_sizes.iter().max().unwrap();
 
-    let max_degree_bound = log_size + 1;
+    let max_degree_bound = max_log_size + 1;
     let twiddles = B::precompute_twiddles(
         CanonicCoset::new(max_degree_bound + config.fri_config.log_blowup_factor)
             .circle_domain()
@@ -994,18 +1043,22 @@ where
     {
         let mut tree_builder = commitment_scheme.tree_builder();
         for layer in &activation_layers {
-            let (table_input_col, table_output_col) = build_table_columns(&layer.table, size);
+            let layer_size = 1usize << layer.log_size;
+            let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
+            let (table_input_col, table_output_col) = build_table_columns(&layer.table, layer_size);
             let simd_evals = vec![
-                CircleEvaluation::new(domain, table_input_col),
-                CircleEvaluation::new(domain, table_output_col),
+                CircleEvaluation::new(layer_domain, table_input_col),
+                CircleEvaluation::new(layer_domain, table_output_col),
             ];
             tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
         }
         for layer in &layernorm_layers {
-            let (table_var_col, table_rsqrt_col) = build_table_columns(&layer.rsqrt_table, size);
+            let layer_size = 1usize << layer.log_size;
+            let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
+            let (table_var_col, table_rsqrt_col) = build_table_columns(&layer.rsqrt_table, layer_size);
             let simd_evals = vec![
-                CircleEvaluation::new(domain, table_var_col),
-                CircleEvaluation::new(domain, table_rsqrt_col),
+                CircleEvaluation::new(layer_domain, table_var_col),
+                CircleEvaluation::new(layer_domain, table_rsqrt_col),
             ];
             tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
         }
@@ -1016,9 +1069,11 @@ where
     let mut tree_builder = commitment_scheme.tree_builder();
     let mut activation_mults: Vec<Vec<M31>> = Vec::new();
     for layer in &activation_layers {
+        let layer_size = 1usize << layer.log_size;
+        let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
         let pad_input = layer.table.inputs[0];
         let pad_output = layer.table.outputs[0];
-        let padding_count = size.saturating_sub(layer.inputs.len());
+        let padding_count = layer_size.saturating_sub(layer.inputs.len());
 
         let mut mults = compute_multiplicities(&layer.inputs, &layer.table);
         if padding_count > 0 {
@@ -1027,45 +1082,50 @@ where
 
         let (trace_in, trace_out, mult_col) = build_trace_columns(
             &layer.inputs, &layer.outputs, &mults,
-            pad_input, pad_output, size,
+            pad_input, pad_output, layer_size,
         );
         let simd_evals = vec![
-            CircleEvaluation::new(domain, trace_in),
-            CircleEvaluation::new(domain, trace_out),
-            CircleEvaluation::new(domain, mult_col),
+            CircleEvaluation::new(layer_domain, trace_in),
+            CircleEvaluation::new(layer_domain, trace_out),
+            CircleEvaluation::new(layer_domain, mult_col),
         ];
         tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
         activation_mults.push(mults);
     }
     for layer in &add_layers {
+        let layer_size = 1usize << layer.log_size;
+        let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
         let (lhs_col, rhs_col, out_col) = build_elementwise_trace_columns(
-            &layer.lhs, &layer.rhs, &layer.output, size,
+            &layer.lhs, &layer.rhs, &layer.output, layer_size,
         );
         let simd_evals = vec![
-            CircleEvaluation::new(domain, lhs_col),
-            CircleEvaluation::new(domain, rhs_col),
-            CircleEvaluation::new(domain, out_col),
+            CircleEvaluation::new(layer_domain, lhs_col),
+            CircleEvaluation::new(layer_domain, rhs_col),
+            CircleEvaluation::new(layer_domain, out_col),
         ];
         tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
     }
     for layer in &mul_layers {
+        let layer_size = 1usize << layer.log_size;
+        let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
         let (lhs_col, rhs_col, out_col) = build_elementwise_trace_columns(
-            &layer.lhs, &layer.rhs, &layer.output, size,
+            &layer.lhs, &layer.rhs, &layer.output, layer_size,
         );
         let simd_evals = vec![
-            CircleEvaluation::new(domain, lhs_col),
-            CircleEvaluation::new(domain, rhs_col),
-            CircleEvaluation::new(domain, out_col),
+            CircleEvaluation::new(layer_domain, lhs_col),
+            CircleEvaluation::new(layer_domain, rhs_col),
+            CircleEvaluation::new(layer_domain, out_col),
         ];
         tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
     }
     let mut layernorm_mults: Vec<Vec<M31>> = Vec::new();
     for layer in &layernorm_layers {
+        let layer_size = 1usize << layer.log_size;
         let mults = compute_multiplicities(&layer.variances, &layer.rsqrt_table);
         let cols = build_layernorm_trace_columns(
             &layer.inputs, &layer.means, &layer.variances,
             &layer.rsqrt_vals, &layer.outputs, &mults,
-            &layer.rsqrt_table, size,
+            &layer.rsqrt_table, layer_size,
         );
         tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(cols));
         layernorm_mults.push(mults);
@@ -1091,19 +1151,21 @@ where
 
         if let Some(ref lookup) = activation_lookup {
             for (idx, layer) in activation_layers.iter().enumerate() {
+                let layer_size = 1usize << layer.log_size;
+                let layer_vec_size = layer_size >> LOG_N_LANES;
                 let pad_input = layer.table.inputs[0];
                 let pad_output = layer.table.outputs[0];
 
-                let (table_in_col, table_out_col) = build_table_columns(&layer.table, size);
+                let (table_in_col, table_out_col) = build_table_columns(&layer.table, layer_size);
                 let (trace_in_col, trace_out_col, _) = build_trace_columns(
                     &layer.inputs, &layer.outputs, &activation_mults[idx],
-                    pad_input, pad_output, size,
+                    pad_input, pad_output, layer_size,
                 );
 
-                let mut logup_gen = LogupTraceGenerator::new(log_size);
+                let mut logup_gen = LogupTraceGenerator::new(layer.log_size);
                 let mut col_gen = logup_gen.new_col();
 
-                for vec_row in 0..vec_size {
+                for vec_row in 0..layer_vec_size {
                     let q_table: PackedSecureField = lookup.lookup_elements().combine(
                         &[table_in_col.data[vec_row], table_out_col.data[vec_row]],
                     );
@@ -1127,26 +1189,28 @@ where
 
         if let Some(ref lookup) = layernorm_lookup {
             for (idx, layer) in layernorm_layers.iter().enumerate() {
-                let (table_var_col, table_rsqrt_col) = build_table_columns(&layer.rsqrt_table, size);
+                let layer_size = 1usize << layer.log_size;
+                let layer_vec_size = layer_size >> LOG_N_LANES;
+                let (table_var_col, table_rsqrt_col) = build_table_columns(&layer.rsqrt_table, layer_size);
 
-                let mut var_col = Col::<SimdBackend, BaseField>::zeros(size);
-                let mut rsqrt_col = Col::<SimdBackend, BaseField>::zeros(size);
-                let n = layer.variances.len().min(size);
+                let mut var_col = Col::<SimdBackend, BaseField>::zeros(layer_size);
+                let mut rsqrt_col = Col::<SimdBackend, BaseField>::zeros(layer_size);
+                let n = layer.variances.len().min(layer_size);
                 for i in 0..n {
                     var_col.set(i, layer.variances[i]);
                     rsqrt_col.set(i, layer.rsqrt_vals[i]);
                 }
                 let pad_var = layer.rsqrt_table.inputs.first().copied().unwrap_or(M31::from(0));
                 let pad_rsqrt = layer.rsqrt_table.outputs.first().copied().unwrap_or(M31::from(0));
-                for i in n..size {
+                for i in n..layer_size {
                     var_col.set(i, pad_var);
                     rsqrt_col.set(i, pad_rsqrt);
                 }
 
-                let mut logup_gen = LogupTraceGenerator::new(log_size);
+                let mut logup_gen = LogupTraceGenerator::new(layer.log_size);
                 let mut col_gen = logup_gen.new_col();
 
-                for vec_row in 0..vec_size {
+                for vec_row in 0..layer_vec_size {
                     let q_table: PackedSecureField = lookup.lookup_elements().combine(
                         &[table_var_col.data[vec_row], table_rsqrt_col.data[vec_row]],
                     );
@@ -1185,7 +1249,7 @@ where
             let component = FrameworkComponent::new(
                 &mut allocator,
                 ActivationEval {
-                    log_n_rows: log_size,
+                    log_n_rows: layer.log_size,
                     lookup_elements: lookup.clone(),
                     claimed_sum,
                     total_sum: claimed_sum,
@@ -1196,7 +1260,7 @@ where
             activation_claims.push(LayerClaim {
                 layer_index: layer.node_id,
                 claimed_sum,
-                trace_rows: size,
+                trace_rows: 1 << layer.log_size,
             });
         }
     }
@@ -1205,14 +1269,14 @@ where
     for layer in &add_layers {
         let component = FrameworkComponent::new(
             &mut allocator,
-            ElementwiseAddEval { log_n_rows: log_size },
+            ElementwiseAddEval { log_n_rows: layer.log_size },
             SecureField::default(),
         );
         component_refs_storage.push(Box::new(component));
         add_claims.push(LayerClaim {
             layer_index: layer.node_id,
             claimed_sum: SecureField::default(),
-            trace_rows: size,
+            trace_rows: 1 << layer.log_size,
         });
     }
 
@@ -1220,14 +1284,14 @@ where
     for layer in &mul_layers {
         let component = FrameworkComponent::new(
             &mut allocator,
-            ElementwiseMulEval { log_n_rows: log_size },
+            ElementwiseMulEval { log_n_rows: layer.log_size },
             SecureField::default(),
         );
         component_refs_storage.push(Box::new(component));
         mul_claims.push(LayerClaim {
             layer_index: layer.node_id,
             claimed_sum: SecureField::default(),
-            trace_rows: size,
+            trace_rows: 1 << layer.log_size,
         });
     }
 
@@ -1238,7 +1302,7 @@ where
             let component = FrameworkComponent::new(
                 &mut allocator,
                 LayerNormEval {
-                    log_n_rows: log_size,
+                    log_n_rows: layer.log_size,
                     dim: layer.inputs.len(),
                     lookup_elements: lookup.clone(),
                     claimed_sum,
@@ -1249,7 +1313,7 @@ where
             layernorm_claims.push(LayerClaim {
                 layer_index: layer.node_id,
                 claimed_sum,
-                trace_rows: size,
+                trace_rows: 1 << layer.log_size,
             });
         }
     }

@@ -36,7 +36,7 @@ use crate::components::activation::{
     compute_multiplicities,
 };
 use crate::components::elementwise::{ElementwiseAddEval, ElementwiseMulEval};
-use crate::components::layernorm::{LayerNormEval, LayerNormRelation, build_rsqrt_table};
+use crate::components::layernorm::{LayerNormConfig, LayerNormEval, LayerNormRelation, build_rsqrt_table};
 use crate::components::matmul::{
     M31Matrix, matmul_m31,
     MatMulSumcheckProof, prove_matmul_sumcheck,
@@ -724,7 +724,7 @@ pub(crate) struct LayerNormIntermediates {
 /// Division by n uses modular inverse (Fermat's little theorem).
 /// Reciprocal sqrt looked up in precomputed table.
 pub(crate) fn apply_layernorm_detailed(input: &M31Matrix, dim: usize) -> LayerNormIntermediates {
-    let rsqrt_table = build_rsqrt_table(4);
+    let rsqrt_table = build_rsqrt_table(LayerNormConfig::new(dim).rsqrt_table_log_size);
     let mut output = M31Matrix::new(input.rows, input.cols);
     let n = dim.min(input.cols);
     let inv_n = m31_mod_inverse(n as u32);
@@ -895,9 +895,8 @@ where
                 let f = activation_type.as_fn();
                 let output = apply_activation(&current, &*f);
 
-                // Build lookup table — use production size for real models
-                let log_size = activation_type.recommended_table_log_size()
-                    .min(4); // cap at 4 for small test models to avoid OOM
+                // Build lookup table — use production size
+                let log_size = activation_type.recommended_table_log_size();
                 let table = PrecomputedTable::build(
                     |x| (*f)(x),
                     log_size,
@@ -933,7 +932,7 @@ where
 
             GraphOp::LayerNorm { dim } => {
                 let ln = apply_layernorm_detailed(&current, *dim);
-                let rsqrt_table = build_rsqrt_table(4);
+                let rsqrt_table = build_rsqrt_table(LayerNormConfig::new(*dim).rsqrt_table_log_size);
                 let config = PcsConfig::default();
 
                 let (_component, proof) = prove_layernorm_layer::<B, MC>(
@@ -1194,7 +1193,7 @@ where
             GraphOp::Activation { activation_type, size: _ } => {
                 let f = activation_type.as_fn();
                 let output = apply_activation(&current, &*f);
-                let log_size = activation_type.recommended_table_log_size().min(4);
+                let log_size = activation_type.recommended_table_log_size();
                 let table = PrecomputedTable::build(|x| (*f)(x), log_size);
                 let config = PcsConfig::default();
                 let flat_inputs: Vec<M31> = current.data.clone();
@@ -1265,7 +1264,7 @@ where
             }
             GraphOp::LayerNorm { dim } => {
                 let ln = apply_layernorm_detailed(&current, *dim);
-                let rsqrt_table = build_rsqrt_table(4);
+                let rsqrt_table = build_rsqrt_table(LayerNormConfig::new(*dim).rsqrt_table_log_size);
                 let config = PcsConfig::default();
                 let (_component, proof) = prove_layernorm_layer::<B, MC>(
                     &ln.inputs, &ln.means, &ln.variances, &ln.rsqrt_vals,
