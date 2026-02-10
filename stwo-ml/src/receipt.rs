@@ -49,6 +49,7 @@ use stwo_constraint_framework::{
     FrameworkEval, FrameworkComponent, EvalAtRow, TraceLocationAllocator,
 };
 
+use tracing::info;
 use crate::backend::convert_evaluations;
 
 /// The lifted Merkle hasher type for Blake2s channel.
@@ -295,9 +296,21 @@ pub fn prove_receipt_batch(receipts: &[ComputeReceipt]) -> Result<ReceiptProof, 
 pub fn prove_receipt_batch_auto(
     receipts: &[ComputeReceipt],
 ) -> Result<ReceiptProof, ReceiptError> {
+    let gpu_available = crate::backend::gpu_is_available();
+    info!(
+        gpu_available,
+        batch_size = receipts.len(),
+        "Auto-selecting backend for receipt batch proving"
+    );
     crate::backend::with_best_backend(
-        || prove_receipt_batch_with::<SimdBackend, Blake2sMerkleChannel>(receipts),
-        || prove_receipt_batch_gpu(receipts),
+        || {
+            info!("Using SimdBackend for receipt batch proving");
+            prove_receipt_batch_with::<SimdBackend, Blake2sMerkleChannel>(receipts)
+        },
+        || {
+            info!("Using GpuBackend for receipt batch proving");
+            prove_receipt_batch_gpu(receipts)
+        },
     )
 }
 
@@ -331,6 +344,11 @@ where
     MC: MerkleChannel,
     FrameworkComponent<ReceiptEval>: stwo::prover::ComponentProver<B>,
 {
+    info!(
+        backend = std::any::type_name::<B>(),
+        batch_size = receipts.len(),
+        "Proving receipt batch"
+    );
     if receipts.is_empty() {
         return Err(ReceiptError::EmptyBatch);
     }
@@ -628,5 +646,17 @@ mod tests {
     fn test_empty_batch_rejected() {
         let result = prove_receipt_batch(&[]);
         assert!(matches!(result.unwrap_err(), ReceiptError::EmptyBatch));
+    }
+
+    #[test]
+    fn test_prove_receipt_batch_auto() {
+        let r0 = test_receipt(1000, 100, 100, 10, 0, FieldElement::ZERO);
+        let r1 = test_receipt(2000, 200, 200, 20, 1, r0.receipt_hash());
+
+        let proof = prove_receipt_batch_auto(&[r0, r1])
+            .expect("auto batch proving should succeed");
+
+        assert_eq!(proof.batch_size, 2);
+        assert_eq!(proof.receipt_hashes.len(), 2);
     }
 }

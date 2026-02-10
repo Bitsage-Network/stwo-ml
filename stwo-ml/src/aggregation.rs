@@ -50,6 +50,7 @@ use crate::components::matmul::{
 };
 use crate::gadgets::lookup_table::PrecomputedTable;
 use crate::backend::convert_evaluations;
+use tracing::info;
 
 type Blake2sHash = <Blake2sMerkleChannel as MerkleChannel>::H;
 
@@ -132,6 +133,11 @@ where
     MC: MerkleChannel,
     FrameworkComponent<ActivationEval>: ComponentProver<B>,
 {
+    info!(
+        backend = std::any::type_name::<B>(),
+        channel = std::any::type_name::<MC>(),
+        "Proving activation STARK (off-chain aggregation)"
+    );
     let config = PcsConfig::default();
     let mut intermediates: Vec<(usize, M31Matrix)> = Vec::new();
     let mut current = input.clone();
@@ -361,9 +367,20 @@ pub fn prove_model_aggregated_auto(
     input: &M31Matrix,
     weights: &GraphWeights,
 ) -> Result<AggregatedModelProof, AggregationError> {
+    let gpu_available = crate::backend::gpu_is_available();
+    info!(
+        gpu_available,
+        "Auto-selecting backend for off-chain aggregation"
+    );
     crate::backend::with_best_backend(
-        || prove_model_aggregated_with::<SimdBackend, Blake2sMerkleChannel>(graph, input, weights),
-        || prove_model_aggregated_gpu(graph, input, weights),
+        || {
+            info!("Using SimdBackend for off-chain aggregation");
+            prove_model_aggregated_with::<SimdBackend, Blake2sMerkleChannel>(graph, input, weights)
+        },
+        || {
+            info!("Using GpuBackend for off-chain aggregation");
+            prove_model_aggregated_gpu(graph, input, weights)
+        },
     )
 }
 
@@ -416,16 +433,28 @@ pub fn prove_model_aggregated_onchain(
     input: &M31Matrix,
     weights: &GraphWeights,
 ) -> Result<AggregatedModelProofOnChain, AggregationError> {
-    prove_model_aggregated_onchain_impl(graph, input, weights)
+    prove_model_aggregated_onchain_with::<SimdBackend>(graph, input, weights)
 }
 
-/// On-chain aggregated proving (uses SimdBackend + Blake2sMerkleChannel for
-/// activation STARK, Poseidon for matmul sumchecks).
-fn prove_model_aggregated_onchain_impl(
+/// On-chain aggregated proving, generic over backend `B`.
+///
+/// Activation STARK always uses `Blake2sMerkleChannel` (matching the on-chain
+/// verifier). Matmul sumcheck proofs use Poseidon (independent of `B`).
+/// Genericizing `B` allows GPU acceleration of Merkle hashing, FRI, and
+/// quotient evaluation for the activation STARK portion.
+pub(crate) fn prove_model_aggregated_onchain_with<B>(
     graph: &ComputationGraph,
     input: &M31Matrix,
     weights: &GraphWeights,
-) -> Result<AggregatedModelProofOnChain, AggregationError> {
+) -> Result<AggregatedModelProofOnChain, AggregationError>
+where
+    B: BackendForChannel<Blake2sMerkleChannel> + PolyOps,
+    FrameworkComponent<ActivationEval>: ComponentProver<B>,
+{
+    info!(
+        backend = std::any::type_name::<B>(),
+        "Proving activation STARK (on-chain aggregation, Blake2sMerkleChannel)"
+    );
     let config = PcsConfig::default();
     let mut intermediates: Vec<(usize, M31Matrix)> = Vec::new();
     let mut current = input.clone();
@@ -494,10 +523,7 @@ fn prove_model_aggregated_onchain_impl(
         });
     }
 
-    // Build aggregated activation STARK using SimdBackend + Blake2sMerkleChannel
-    type B = SimdBackend;
-    type MC = Blake2sMerkleChannel;
-
+    // Build aggregated activation STARK using backend B + Blake2sMerkleChannel
     let log_size = 4u32;
     let size = 1usize << log_size;
     let vec_size = size >> LOG_N_LANES;
@@ -510,8 +536,8 @@ fn prove_model_aggregated_onchain_impl(
             .half_coset,
     );
 
-    let channel = &mut <MC as MerkleChannel>::C::default();
-    let mut commitment_scheme = CommitmentSchemeProver::<B, MC>::new(config, &twiddles);
+    let channel = &mut <Blake2sMerkleChannel as MerkleChannel>::C::default();
+    let mut commitment_scheme = CommitmentSchemeProver::<B, Blake2sMerkleChannel>::new(config, &twiddles);
 
     // Tree 0: Preprocessed
     let mut tree_builder = commitment_scheme.tree_builder();
@@ -620,7 +646,7 @@ fn prove_model_aggregated_onchain_impl(
     let component_refs: Vec<&dyn ComponentProver<B>> =
         components.iter().map(|c| c as &dyn ComponentProver<B>).collect();
 
-    let stark_proof = prove::<B, MC>(
+    let stark_proof = prove::<B, Blake2sMerkleChannel>(
         &component_refs,
         channel,
         commitment_scheme,
@@ -637,14 +663,27 @@ fn prove_model_aggregated_onchain_impl(
 /// Prove with auto GPU dispatch for on-chain format.
 ///
 /// Uses `GpuBackend` when CUDA is available, otherwise `SimdBackend`.
+/// GPU accelerates the activation STARK (Merkle hashing, FRI, quotient eval).
+/// Matmul sumcheck proofs use Poseidon and are unaffected by the backend choice.
 pub fn prove_model_aggregated_onchain_auto(
     graph: &ComputationGraph,
     input: &M31Matrix,
     weights: &GraphWeights,
 ) -> Result<AggregatedModelProofOnChain, AggregationError> {
+    let gpu_available = crate::backend::gpu_is_available();
+    info!(
+        gpu_available,
+        "Auto-selecting backend for on-chain aggregation"
+    );
     crate::backend::with_best_backend(
-        || prove_model_aggregated_onchain_impl(graph, input, weights),
-        || prove_model_aggregated_onchain_gpu(graph, input, weights),
+        || {
+            info!("Using SimdBackend for on-chain aggregation");
+            prove_model_aggregated_onchain_with::<SimdBackend>(graph, input, weights)
+        },
+        || {
+            info!("Using GpuBackend for on-chain aggregation");
+            prove_model_aggregated_onchain_gpu(graph, input, weights)
+        },
     )
 }
 
@@ -656,19 +695,15 @@ fn prove_model_aggregated_onchain_gpu(
 ) -> Result<AggregatedModelProofOnChain, AggregationError> {
     #[cfg(feature = "cuda-runtime")]
     {
-        // GPU backend still uses SimdBackend for trace generation + LogUp,
-        // but routes commitment and STARK proving through GPU kernels.
-        // For on-chain proofs, the activation STARK uses Blake2s which benefits
-        // from GPU Merkle tree hashing and FRI.
-        // However, the matmul on-chain proofs use Poseidon (CPU-only for now).
-        // So we use SimdBackend for the activation STARK portion.
-        // TODO: Once Poseidon GPU support lands in stwo, route through GpuBackend.
-        return prove_model_aggregated_onchain_impl(graph, input, weights);
+        use stwo::prover::backend::gpu::GpuBackend;
+        return prove_model_aggregated_onchain_with::<GpuBackend>(
+            graph, input, weights,
+        );
     }
 
     #[cfg(not(feature = "cuda-runtime"))]
     {
-        prove_model_aggregated_onchain_impl(graph, input, weights)
+        prove_model_aggregated_onchain_with::<SimdBackend>(graph, input, weights)
     }
 }
 
@@ -912,5 +947,56 @@ mod tests {
         assert_eq!(mp.m, 1);
         assert_eq!(mp.k, 4);
         assert_eq!(mp.n, 2);
+    }
+
+    #[test]
+    fn test_aggregated_onchain_auto_mlp() {
+        // prove_model_aggregated_onchain_auto should produce correct results
+        // (on macOS without CUDA, falls back to SimdBackend)
+        let mut builder = GraphBuilder::new((1, 4));
+        builder
+            .linear(4)
+            .activation(ActivationType::ReLU)
+            .linear(2);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+
+        let mut weights = GraphWeights::new();
+        let mut w0 = M31Matrix::new(4, 4);
+        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        weights.add_weight(0, w0);
+        let mut w2 = M31Matrix::new(4, 2);
+        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        weights.add_weight(2, w2);
+
+        let proof = prove_model_aggregated_onchain_auto(&graph, &input, &weights)
+            .expect("on-chain auto aggregated proving should succeed");
+
+        assert!(proof.activation_stark.is_some());
+        assert_eq!(proof.matmul_proofs.len(), 2);
+        assert_eq!(proof.activation_claims.len(), 1);
+    }
+
+    #[test]
+    fn test_aggregated_onchain_auto_matmul_only() {
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(2);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+
+        let mut weights = GraphWeights::new();
+        let mut w = M31Matrix::new(4, 2);
+        for i in 0..4 { for j in 0..2 { w.set(i, j, M31::from((i * 2 + j + 1) as u32)); } }
+        weights.add_weight(0, w);
+
+        let proof = prove_model_aggregated_onchain_auto(&graph, &input, &weights)
+            .expect("on-chain auto matmul-only proving should succeed");
+
+        assert!(proof.activation_stark.is_none());
+        assert_eq!(proof.matmul_proofs.len(), 1);
     }
 }

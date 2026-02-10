@@ -41,6 +41,15 @@ pub fn prove(input: ProverInput, pcs_config: PcsConfig) -> Result<CairoProof<Bla
     prove_inner(input, preprocessed_trace, pcs_config)
 }
 
+/// Prove with GPU backend when cuda-runtime feature is enabled.
+/// Currently identical to `prove()` because `prove_cairo` is hardcoded to SimdBackend.
+/// This will become the GPU path when `prove_cairo` is genericized upstream.
+#[cfg(feature = "cuda-runtime")]
+pub fn prove_gpu(input: ProverInput, pcs_config: PcsConfig) -> Result<CairoProof<Blake2sMerkleHasher>> {
+    // TODO: When prove_cairo supports generic backend, use GpuBackend here
+    prove(input, pcs_config)
+}
+
 fn prove_inner(
     input: ProverInput,
     preprocessed_trace: PreProcessedTraceVariant,

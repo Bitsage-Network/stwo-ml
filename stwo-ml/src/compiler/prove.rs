@@ -25,6 +25,7 @@ use stwo_constraint_framework::{
     LogupTraceGenerator,
 };
 
+use tracing::info;
 use crate::backend::convert_evaluations;
 
 use crate::compiler::graph::{ComputationGraph, GraphOp, GraphWeights};
@@ -435,6 +436,12 @@ where
     MC: MerkleChannel,
     FrameworkComponent<ActivationEval>: stwo::prover::ComponentProver<B>,
 {
+    info!(
+        backend = std::any::type_name::<B>(),
+        channel = std::any::type_name::<MC>(),
+        num_nodes = graph.nodes.len(),
+        "Proving model per-layer"
+    );
     let mut layer_proofs = Vec::new();
     let mut intermediates: Vec<(usize, M31Matrix)> = Vec::new();
 
@@ -632,9 +639,20 @@ pub fn prove_model_auto(
     input: &M31Matrix,
     weights: &GraphWeights,
 ) -> Result<ModelProofResult, ModelError> {
+    let gpu_available = crate::backend::gpu_is_available();
+    info!(
+        gpu_available,
+        "Auto-selecting backend for per-layer proving"
+    );
     crate::backend::with_best_backend(
-        || prove_model_with::<SimdBackend, Blake2sMerkleChannel>(graph, input, weights),
-        || prove_model_gpu(graph, input, weights),
+        || {
+            info!("Using SimdBackend for per-layer proving");
+            prove_model_with::<SimdBackend, Blake2sMerkleChannel>(graph, input, weights)
+        },
+        || {
+            info!("Using GpuBackend for per-layer proving");
+            prove_model_gpu(graph, input, weights)
+        },
     )
 }
 

@@ -22,7 +22,7 @@ use starknet_ff::FieldElement;
 use crate::aggregation::{
     AggregatedModelProof, AggregatedModelProofOnChain,
     AggregationError, LayerClaim,
-    prove_model_aggregated_auto,
+    prove_model_aggregated_auto, prove_model_aggregated_onchain_auto,
 };
 use crate::cairo_serde::{serialize_proof, serialize_matmul_sumcheck_proof};
 use crate::compiler::graph::{ComputationGraph, GraphWeights};
@@ -83,6 +83,23 @@ pub fn prove_for_starknet(
 ) -> Result<StarknetModelProof, StarknetModelError> {
     let proof = prove_model_aggregated_auto(graph, input, weights)?;
     Ok(build_starknet_proof(&proof))
+}
+
+/// Prove a computation graph and produce Starknet-ready on-chain calldata.
+///
+/// Runs the full on-chain pipeline:
+/// 1. Forward pass + per-layer proving (Blake2s activation STARK + Poseidon matmul sumchecks)
+/// 2. Assembles combined calldata with IO commitment at index [4]
+/// 3. Estimates gas cost for on-chain verification
+///
+/// Uses GPU acceleration when available via `prove_model_aggregated_onchain_auto`.
+pub fn prove_for_starknet_onchain(
+    graph: &ComputationGraph,
+    input: &M31Matrix,
+    weights: &GraphWeights,
+) -> Result<StarknetModelProof, StarknetModelError> {
+    let proof = prove_model_aggregated_onchain_auto(graph, input, weights)?;
+    Ok(build_starknet_proof_onchain(&proof))
 }
 
 /// Convert an already-computed `AggregatedModelProof` into Starknet calldata.
@@ -413,5 +430,61 @@ mod tests {
             "combined_calldata[4] must equal io_commitment"
         );
         assert_ne!(starknet_proof.io_commitment, FieldElement::ZERO);
+    }
+
+    #[test]
+    fn test_prove_for_starknet_onchain_mlp() {
+        let mut builder = GraphBuilder::new((1, 4));
+        builder
+            .linear(4)
+            .activation(ActivationType::ReLU)
+            .linear(2);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+
+        let mut weights = GraphWeights::new();
+        let mut w0 = M31Matrix::new(4, 4);
+        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        weights.add_weight(0, w0);
+        let mut w2 = M31Matrix::new(4, 2);
+        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        weights.add_weight(2, w2);
+
+        let result = prove_for_starknet_onchain(&graph, &input, &weights);
+        assert!(result.is_ok());
+        let proof = result.unwrap();
+
+        // Has activation STARK + matmul on-chain proofs
+        assert!(!proof.activation_calldata.is_empty());
+        assert_eq!(proof.num_matmul_proofs, 2);
+        assert_eq!(proof.layer_claims.len(), 1);
+        assert_ne!(proof.io_commitment, FieldElement::ZERO);
+        assert!(proof.combined_calldata.len() > 5);
+        assert_eq!(proof.combined_calldata[4], proof.io_commitment);
+    }
+
+    #[test]
+    fn test_prove_for_starknet_onchain_matmul_only() {
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(2);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+
+        let mut weights = GraphWeights::new();
+        let mut w = M31Matrix::new(4, 2);
+        for i in 0..4 { for j in 0..2 { w.set(i, j, M31::from((i * 2 + j + 1) as u32)); } }
+        weights.add_weight(0, w);
+
+        let result = prove_for_starknet_onchain(&graph, &input, &weights);
+        assert!(result.is_ok());
+        let proof = result.unwrap();
+
+        assert!(proof.activation_calldata.is_empty());
+        assert_eq!(proof.num_matmul_proofs, 1);
+        assert!(proof.estimated_gas > 0);
     }
 }

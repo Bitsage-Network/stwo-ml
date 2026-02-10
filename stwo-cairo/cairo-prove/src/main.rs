@@ -102,14 +102,20 @@ fn handle_prove_ml(
     ml_proof: &Path,
     output: &Path,
     proof_format: ProofFormat,
-    _gpu: bool,
+    gpu: bool,
 ) -> Result<()> {
     info!("Generating recursive proof for ML STARK proof: {:?}", ml_proof);
     info!("Using ML verifier executable: {:?}", verifier_executable);
-    info!(
-        "GPU backend: {}",
-        if _gpu { "requested (requires cuda-runtime feature)" } else { "disabled" }
-    );
+    if gpu {
+        info!("GPU requested for recursive proving.");
+        #[cfg(feature = "cuda-runtime")]
+        info!("cuda-runtime feature enabled — GPU will be used for STARK proving.");
+        #[cfg(not(feature = "cuda-runtime"))]
+        info!("cuda-runtime feature NOT enabled — falling back to SimdBackend. \
+               Build with --features cuda-runtime to enable GPU.");
+    } else {
+        info!("GPU backend: disabled");
+    }
     let start = Instant::now();
 
     // Step 1: Load the ML verifier executable (compiled Cairo Sierra JSON)

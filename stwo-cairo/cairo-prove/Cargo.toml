@@ -14,6 +14,11 @@ edition = "2021"
 # 2. Or use the git-based dependencies with a compatible commit
 # =============================================================================
 
+[features]
+default = []
+gpu = ["stwo_cairo_prover/gpu"]
+cuda-runtime = ["gpu", "stwo_cairo_prover/cuda-runtime"]
+
 [dependencies]
 # Local workspace dependencies (use our custom implementations)
 stwo-cairo-adapter = { path = "../stwo_cairo_prover/crates/adapter" }

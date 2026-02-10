@@ -28,7 +28,7 @@ use crate::backend::{
 use crate::compiler::graph::{ComputationGraph, GraphWeights};
 use crate::compiler::prove::{ModelError, ModelProofResult};
 use crate::components::matmul::M31Matrix;
-use crate::aggregation::{AggregatedModelProof, AggregationError};
+use crate::aggregation::{AggregatedModelProof, AggregatedModelProofOnChain, AggregationError};
 use crate::receipt::{ComputeReceipt, ReceiptProof, ReceiptError};
 
 /// GPU-accelerated model prover.
@@ -144,6 +144,24 @@ impl GpuModelProver {
         }
     }
 
+    /// Prove a model with on-chain aggregation using the best available backend.
+    ///
+    /// Same as `prove_model_aggregated` but produces on-chain format proofs
+    /// (Poseidon matmul sumchecks + Blake2s activation STARK).
+    /// Uses GPU when the graph exceeds size thresholds and fits in GPU memory.
+    pub fn prove_model_aggregated_onchain(
+        &self,
+        graph: &ComputationGraph,
+        input: &M31Matrix,
+        weights: &GraphWeights,
+    ) -> Result<AggregatedModelProofOnChain, AggregationError> {
+        if self.should_use_gpu(graph) {
+            self.prove_model_aggregated_onchain_gpu(graph, input, weights)
+        } else {
+            crate::aggregation::prove_model_aggregated_onchain(graph, input, weights)
+        }
+    }
+
     /// Prove a batch of compute receipts using the best available backend.
     ///
     /// Uses GPU for large batches that exceed size thresholds.
@@ -200,6 +218,27 @@ impl GpuModelProver {
         #[cfg(not(feature = "cuda-runtime"))]
         {
             crate::aggregation::prove_model_aggregated(graph, input, weights)
+        }
+    }
+
+    /// Internal: on-chain aggregated prove using GPU backend.
+    fn prove_model_aggregated_onchain_gpu(
+        &self,
+        graph: &ComputationGraph,
+        input: &M31Matrix,
+        weights: &GraphWeights,
+    ) -> Result<AggregatedModelProofOnChain, AggregationError> {
+        #[cfg(feature = "cuda-runtime")]
+        {
+            use stwo::prover::backend::gpu::GpuBackend;
+            return crate::aggregation::prove_model_aggregated_onchain_with::<GpuBackend>(
+                graph, input, weights,
+            );
+        }
+
+        #[cfg(not(feature = "cuda-runtime"))]
+        {
+            crate::aggregation::prove_model_aggregated_onchain(graph, input, weights)
         }
     }
 
@@ -357,6 +396,36 @@ mod tests {
         let proof = result.unwrap();
         assert!(proof.activation_stark.is_some());
         assert_eq!(proof.matmul_proofs.len(), 2);
+    }
+
+    #[test]
+    fn test_prove_model_aggregated_onchain_cpu_fallback() {
+        use stwo::core::fields::m31::M31;
+        let mut builder = GraphBuilder::new((1, 4));
+        builder
+            .linear(4)
+            .activation(ActivationType::ReLU)
+            .linear(2);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+
+        let mut weights = GraphWeights::new();
+        let mut w0 = M31Matrix::new(4, 4);
+        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        weights.add_weight(0, w0);
+        let mut w2 = M31Matrix::new(4, 2);
+        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        weights.add_weight(2, w2);
+
+        let prover = GpuModelProver::default();
+        let result = prover.prove_model_aggregated_onchain(&graph, &input, &weights);
+        assert!(result.is_ok());
+        let proof = result.unwrap();
+        assert!(proof.activation_stark.is_some());
+        assert_eq!(proof.matmul_proofs.len(), 2);
+        assert_eq!(proof.activation_claims.len(), 1);
     }
 
     #[test]
