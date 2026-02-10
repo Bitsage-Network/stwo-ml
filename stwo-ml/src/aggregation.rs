@@ -25,6 +25,9 @@ use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
 use stwo::core::channel::MerkleChannel;
 use stwo::core::proof::StarkProof;
 use stwo::core::vcs_lifted::MerkleHasherLifted;
+use stwo::core::pcs::CommitmentSchemeVerifier;
+use stwo::core::air::Component;
+use stwo::core::verifier::verify as stwo_verify;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::simd::m31::LOG_N_LANES;
 use stwo::prover::backend::simd::qm31::PackedSecureField;
@@ -39,6 +42,7 @@ use stwo_constraint_framework::{
     LogupTraceGenerator,
 };
 
+use num_traits::One;
 use std::collections::HashMap;
 
 use crate::compiler::graph::{ComputationGraph, GraphOp, GraphWeights};
@@ -61,6 +65,17 @@ use crate::components::matmul::{
 use crate::components::tiled_matmul::{
     TiledMatMulConfig, prove_tiled_matmul, compose_tiled_proof,
 };
+use crate::components::attention::{
+    AttentionWeights, AttentionProof, AttentionProofOnChain,
+    MultiHeadAttentionConfig,
+    prove_attention_with, prove_attention_onchain,
+    attention_forward,
+};
+use crate::components::embedding::{
+    EmbeddingEval, EmbeddingRelation,
+    embedding_lookup, build_embedding_table_columns,
+};
+use crate::components::conv2d::{Im2ColConfig, conv2d_forward};
 use crate::gadgets::lookup_table::PrecomputedTable;
 use crate::backend::convert_evaluations;
 use tracing::info;
@@ -85,7 +100,7 @@ pub struct LayerClaim {
 /// Generic over the Merkle hash type `H`.
 pub struct AggregatedModelProofFor<H: MerkleHasherLifted> {
     /// Single STARK proof covering all non-matmul components
-    /// (activations, Add, Mul, LayerNorm).
+    /// (activations, Add, Mul, LayerNorm, Embedding).
     /// `None` if the model has no non-matmul layers.
     pub unified_stark: Option<StarkProof<H>>,
     /// Per-matmul sumcheck proofs, in layer order.
@@ -100,16 +115,21 @@ pub struct AggregatedModelProofFor<H: MerkleHasherLifted> {
     pub execution: GraphExecution,
     /// Per-activation-layer claims (for verification).
     pub activation_claims: Vec<LayerClaim>,
+    /// Per-attention proofs (separate from unified STARK).
+    pub attention_proofs: Vec<(usize, AttentionProof<H>)>,
+    /// Per-embedding layer claims (verified inside unified STARK).
+    pub embedding_claims: Vec<LayerClaim>,
 }
 
 /// Aggregated model proof using Blake2s (default).
 pub type AggregatedModelProof = AggregatedModelProofFor<Blake2sHash>;
 
 impl<H: MerkleHasherLifted> AggregatedModelProofFor<H> {
-    /// Total number of proven layers (matmul + activation + add + mul + layernorm).
+    /// Total number of proven layers (matmul + activation + add + mul + layernorm + attention + embedding).
     pub fn num_proven_layers(&self) -> usize {
         self.matmul_proofs.len() + self.activation_claims.len()
             + self.add_claims.len() + self.mul_claims.len() + self.layernorm_claims.len()
+            + self.attention_proofs.len() + self.embedding_claims.len()
     }
 
     /// Estimated calldata size in bytes for on-chain submission.
@@ -118,14 +138,17 @@ impl<H: MerkleHasherLifted> AggregatedModelProofFor<H> {
         let commitment_size = 3 * 32;
         // FRI proof: ~1KB per component (rough estimate)
         let num_components = self.activation_claims.len()
-            + self.add_claims.len() + self.mul_claims.len() + self.layernorm_claims.len();
+            + self.add_claims.len() + self.mul_claims.len() + self.layernorm_claims.len()
+            + self.embedding_claims.len();
         let fri_size = 1024 * num_components.max(1);
         // Sumcheck proofs: ~256 bytes each
         let sumcheck_size = self.matmul_proofs.len() * 256;
         // Claims are lightweight (no separate STARK proofs)
         let claim_size = (self.add_claims.len() + self.mul_claims.len()
-            + self.layernorm_claims.len()) * 32;
-        commitment_size + fri_size + sumcheck_size + claim_size
+            + self.layernorm_claims.len() + self.embedding_claims.len()) * 32;
+        // Attention proofs: ~2KB each (multiple matmul sumchecks + softmax STARK)
+        let attention_size = self.attention_proofs.len() * 2048;
+        commitment_size + fri_size + sumcheck_size + claim_size + attention_size
     }
 }
 
@@ -138,6 +161,8 @@ pub enum AggregationError {
     ProvingError(String),
     #[error("Model error: {0}")]
     ModelError(#[from] ModelError),
+    #[error("Verification failed: {0}")]
+    VerificationFailed(String),
 }
 
 /// Collected activation layer data for aggregation.
@@ -179,6 +204,27 @@ struct LayerNormLayerData {
     log_size: u32,
 }
 
+/// Collected Attention layer data for aggregation.
+struct AttentionLayerData {
+    node_id: usize,
+    config: MultiHeadAttentionConfig,
+    weights: AttentionWeights,
+    input: M31Matrix,
+}
+
+/// Collected Embedding layer data for unified STARK aggregation.
+struct EmbeddingLayerData {
+    node_id: usize,
+    token_ids: Vec<M31>,
+    col_indices: Vec<M31>,
+    values: Vec<M31>,
+    multiplicities: Vec<M31>,
+    table_tokens: Vec<M31>,
+    table_cols: Vec<M31>,
+    table_values: Vec<M31>,
+    log_size: u32,
+}
+
 /// Prove an entire computation graph with aggregated STARK proof,
 /// generic over backend and Merkle channel.
 ///
@@ -198,6 +244,7 @@ where
     FrameworkComponent<ElementwiseAddEval>: ComponentProver<B>,
     FrameworkComponent<ElementwiseMulEval>: ComponentProver<B>,
     FrameworkComponent<LayerNormEval>: ComponentProver<B>,
+    FrameworkComponent<EmbeddingEval>: ComponentProver<B>,
 {
     info!(
         backend = std::any::type_name::<B>(),
@@ -215,6 +262,8 @@ where
     let mut add_layers: Vec<AddLayerData> = Vec::new();
     let mut mul_layers: Vec<MulLayerData> = Vec::new();
     let mut layernorm_layers: Vec<LayerNormLayerData> = Vec::new();
+    let mut attention_layers: Vec<AttentionLayerData> = Vec::new();
+    let mut embedding_layers: Vec<EmbeddingLayerData> = Vec::new();
 
     let topo = graph.topological_order();
     for &node_id in &topo {
@@ -340,11 +389,104 @@ where
                 current = ln.output_matrix;
             }
 
+            GraphOp::Attention { config: attn_config } => {
+                let w_q = weights.get_named_weight(node.id, "w_q");
+                let w_k = weights.get_named_weight(node.id, "w_k");
+                let w_v = weights.get_named_weight(node.id, "w_v");
+                let w_o = weights.get_named_weight(node.id, "w_o");
+
+                if let (Some(wq), Some(wk), Some(wv), Some(wo)) = (w_q, w_k, w_v, w_o) {
+                    let attn_weights = AttentionWeights {
+                        w_q: wq.clone(), w_k: wk.clone(),
+                        w_v: wv.clone(), w_o: wo.clone(),
+                    };
+                    // Run forward pass to get correct output for downstream nodes
+                    let inter = attention_forward(&current, &attn_weights, attn_config, false);
+                    attention_layers.push(AttentionLayerData {
+                        node_id: node.id,
+                        config: *attn_config,
+                        weights: attn_weights,
+                        input: current.clone(),
+                    });
+                    intermediates.push((node.id, current.clone()));
+                    node_outputs.insert(node.id, inter.final_output.clone());
+                    current = inter.final_output;
+                } else {
+                    // No weights found — passthrough (log warning)
+                    info!(node_id = node.id, "Attention node missing weights, passthrough");
+                    intermediates.push((node.id, current.clone()));
+                    node_outputs.insert(node.id, current.clone());
+                }
+            }
+
+            GraphOp::Embedding { vocab_size: _, embed_dim: _ } => {
+                let embed_table = weights.get_weight(node.id).ok_or(
+                    ModelError::MissingWeight(node.id)
+                )?;
+                let token_u32s: Vec<u32> = current.data.iter().map(|m| m.0).collect();
+                let (output, token_ids, col_indices, values, multiplicities) =
+                    embedding_lookup(&token_u32s, embed_table);
+                let (table_tokens, table_cols, table_values) = build_embedding_table_columns(embed_table);
+                let log_size = data_log_size(values.len());
+                embedding_layers.push(EmbeddingLayerData {
+                    node_id: node.id,
+                    token_ids,
+                    col_indices,
+                    values,
+                    multiplicities,
+                    table_tokens,
+                    table_cols,
+                    table_values,
+                    log_size,
+                });
+                intermediates.push((node.id, current.clone()));
+                node_outputs.insert(node.id, output.clone());
+                current = output;
+            }
+
+            GraphOp::Conv2D { in_channels, out_channels, kernel_size, stride, padding } => {
+                let kernel = weights.get_weight(node.id).ok_or(
+                    ModelError::MissingWeight(node.id)
+                )?;
+                let im2col_config = Im2ColConfig {
+                    in_channels: *in_channels,
+                    kernel_size: *kernel_size,
+                    stride: *stride,
+                    padding: *padding,
+                    input_h: current.rows,
+                    input_w: current.cols / in_channels,
+                };
+                let (_im2col_mat, _kernel_mat, output) =
+                    conv2d_forward(&current.data, &kernel.data, &im2col_config, *out_channels);
+                // Prove the im2col×kernel matmul
+                let proof = prove_matmul_sumcheck(&_im2col_mat, &_kernel_mat, &output)
+                    .map_err(|e| ModelError::ProvingError {
+                        layer: node.id,
+                        message: format!("Conv2D matmul: {e}"),
+                    })?;
+                intermediates.push((node.id, current.clone()));
+                matmul_proofs.push((node.id, proof));
+                node_outputs.insert(node.id, output.clone());
+                current = output;
+            }
+
             _ => {
+                // Identity, Quantize, etc. — passthrough
                 intermediates.push((node.id, current.clone()));
                 node_outputs.insert(node.id, current.clone());
             }
         }
+    }
+
+    // Prove attention layers (separate from unified STARK)
+    let mut attention_proofs = Vec::new();
+    for layer in &attention_layers {
+        let proof = prove_attention_with::<B, MC>(
+            &layer.input, &layer.weights, &layer.config, false,
+        ).map_err(|e| AggregationError::ProvingError(
+            format!("Attention node {}: {e}", layer.node_id),
+        ))?;
+        attention_proofs.push((layer.node_id, proof));
     }
 
     let execution = GraphExecution {
@@ -354,7 +496,8 @@ where
 
     // Check if there are any non-matmul components to aggregate
     let has_components = !activation_layers.is_empty()
-        || !add_layers.is_empty() || !mul_layers.is_empty() || !layernorm_layers.is_empty();
+        || !add_layers.is_empty() || !mul_layers.is_empty() || !layernorm_layers.is_empty()
+        || !embedding_layers.is_empty();
 
     if !has_components {
         return Ok(AggregatedModelProofFor {
@@ -365,6 +508,8 @@ where
             layernorm_claims: Vec::new(),
             execution,
             activation_claims: Vec::new(),
+            attention_proofs,
+            embedding_claims: Vec::new(),
         });
     }
 
@@ -375,6 +520,7 @@ where
         .chain(add_layers.iter().map(|l| l.log_size))
         .chain(mul_layers.iter().map(|l| l.log_size))
         .chain(layernorm_layers.iter().map(|l| l.log_size))
+        .chain(embedding_layers.iter().map(|l| l.log_size))
         .collect();
     let max_log_size = *all_log_sizes.iter().max().unwrap();
 
@@ -388,11 +534,13 @@ where
     let channel = &mut MC::C::default();
     let mut commitment_scheme = CommitmentSchemeProver::<B, MC>::new(config, &twiddles);
 
-    let has_logup = !activation_layers.is_empty() || !layernorm_layers.is_empty();
+    let has_logup = !activation_layers.is_empty() || !layernorm_layers.is_empty()
+        || !embedding_layers.is_empty();
 
     // Tree 0: Preprocessed columns (always committed, may be empty)
     // - Activation tables: 2 cols per layer (table_input, table_output)
     // - LayerNorm rsqrt tables: 2 cols per layer (table_var, table_rsqrt)
+    // - Embedding tables: 3 cols per layer (table_token, table_col, table_value)
     // - Add/Mul: 0 preprocessed cols
     {
         let mut tree_builder = commitment_scheme.tree_builder();
@@ -416,6 +564,14 @@ where
             ];
             tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
         }
+        for layer in &embedding_layers {
+            let layer_size = 1usize << layer.log_size;
+            let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
+            let simd_evals = build_embedding_preprocessed_columns(
+                &layer.table_tokens, &layer.table_cols, &layer.table_values, layer_size, layer_domain,
+            );
+            tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
+        }
         tree_builder.commit(channel);
     }
 
@@ -424,6 +580,7 @@ where
     // 2. Add traces: 3 cols per layer (lhs, rhs, output)
     // 3. Mul traces: 3 cols per layer (lhs, rhs, output)
     // 4. LayerNorm traces: 6 cols per layer (input, mean, var, rsqrt, output, multiplicity)
+    // 5. Embedding traces: 4 cols per layer (token_id, col_idx, value, multiplicity)
     let mut tree_builder = commitment_scheme.tree_builder();
     let mut activation_mults: Vec<Vec<M31>> = Vec::new();
     for layer in &activation_layers {
@@ -488,24 +645,38 @@ where
         tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(cols));
         layernorm_mults.push(mults);
     }
+    for layer in &embedding_layers {
+        let layer_size = 1usize << layer.log_size;
+        let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
+        let simd_evals = build_embedding_trace_columns(
+            &layer.token_ids, &layer.col_indices, &layer.values, &layer.multiplicities,
+            layer_size, layer_domain,
+        );
+        tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
+    }
     tree_builder.commit(channel);
 
     // Draw relation elements and build Tree 2 — only if LogUp components exist
     let mut activation_lookup: Option<ActivationRelation> = None;
     let mut layernorm_lookup: Option<LayerNormRelation> = None;
+    let mut embedding_lookup_rel: Option<EmbeddingRelation> = None;
     let mut activation_claimed_sums: Vec<SecureField> = Vec::new();
     let mut layernorm_claimed_sums: Vec<SecureField> = Vec::new();
+    let mut embedding_claimed_sums: Vec<SecureField> = Vec::new();
 
     if has_logup {
-        // Draw relation elements — activation first, then layernorm
+        // Draw relation elements — activation first, then layernorm, then embedding
         if !activation_layers.is_empty() {
             activation_lookup = Some(ActivationRelation::draw(channel));
         }
         if !layernorm_layers.is_empty() {
             layernorm_lookup = Some(LayerNormRelation::draw(channel));
         }
+        if !embedding_layers.is_empty() {
+            embedding_lookup_rel = Some(EmbeddingRelation::draw(channel));
+        }
 
-        // Tree 2: Interaction traces (LogUp) — only for activation and layernorm
+        // Tree 2: Interaction traces (LogUp) — for activation, layernorm, and embedding
         // Add/Mul are pure AIR (no interaction columns)
         let mut tree_builder = commitment_scheme.tree_builder();
 
@@ -593,6 +764,63 @@ where
                 layernorm_claimed_sums.push(claimed_sum);
             }
         }
+
+        // Embedding LogUp interaction traces
+        if let Some(ref lookup) = embedding_lookup_rel {
+            for layer in &embedding_layers {
+                let layer_size = 1usize << layer.log_size;
+                let layer_vec_size = layer_size >> LOG_N_LANES;
+
+                // Build SIMD columns for preprocessed table and trace
+                let mut tbl_tok = Col::<SimdBackend, BaseField>::zeros(layer_size);
+                let mut tbl_col = Col::<SimdBackend, BaseField>::zeros(layer_size);
+                let mut tbl_val = Col::<SimdBackend, BaseField>::zeros(layer_size);
+                let n_table = layer.table_tokens.len().min(layer_size);
+                for i in 0..n_table {
+                    tbl_tok.set(i, layer.table_tokens[i]);
+                    tbl_col.set(i, layer.table_cols[i]);
+                    tbl_val.set(i, layer.table_values[i]);
+                }
+
+                let mut tr_tok = Col::<SimdBackend, BaseField>::zeros(layer_size);
+                let mut tr_col = Col::<SimdBackend, BaseField>::zeros(layer_size);
+                let mut tr_val = Col::<SimdBackend, BaseField>::zeros(layer_size);
+                let n_trace = layer.token_ids.len().min(layer_size);
+                for i in 0..n_trace {
+                    tr_tok.set(i, layer.token_ids[i]);
+                    tr_col.set(i, layer.col_indices[i]);
+                    tr_val.set(i, layer.values[i]);
+                }
+
+                let mut logup_gen = LogupTraceGenerator::new(layer.log_size);
+
+                // Table side (yield with -multiplicity)
+                let mut col_gen = logup_gen.new_col();
+                for vec_row in 0..layer_vec_size {
+                    let q_table: PackedSecureField = lookup.lookup_elements().combine(
+                        &[tbl_tok.data[vec_row], tbl_col.data[vec_row], tbl_val.data[vec_row]],
+                    );
+                    let mult_packed = pack_multiplicities(&layer.multiplicities, vec_row);
+                    col_gen.write_frac(vec_row, -mult_packed, q_table);
+                }
+                col_gen.finalize_col();
+
+                // Trace side (use with +1)
+                let mut col_gen = logup_gen.new_col();
+                for vec_row in 0..layer_vec_size {
+                    let q_trace: PackedSecureField = lookup.lookup_elements().combine(
+                        &[tr_tok.data[vec_row], tr_col.data[vec_row], tr_val.data[vec_row]],
+                    );
+                    col_gen.write_frac(vec_row, PackedSecureField::one(), q_trace);
+                }
+                col_gen.finalize_col();
+
+                let (interaction_trace, claimed_sum) = logup_gen.finalize_last();
+                tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(interaction_trace));
+                embedding_claimed_sums.push(claimed_sum);
+            }
+        }
+
         tree_builder.commit(channel);
     } // end if has_logup
 
@@ -603,6 +831,7 @@ where
     let mut add_claims: Vec<LayerClaim> = Vec::new();
     let mut mul_claims: Vec<LayerClaim> = Vec::new();
     let mut layernorm_claims: Vec<LayerClaim> = Vec::new();
+    let mut embedding_claims: Vec<LayerClaim> = Vec::new();
 
     // Activation components
     if let Some(ref lookup) = activation_lookup {
@@ -680,6 +909,28 @@ where
         }
     }
 
+    // Embedding components (LogUp)
+    if let Some(ref lookup) = embedding_lookup_rel {
+        for (idx, layer) in embedding_layers.iter().enumerate() {
+            let claimed_sum = embedding_claimed_sums[idx];
+            let component = FrameworkComponent::new(
+                &mut allocator,
+                EmbeddingEval {
+                    log_n_rows: layer.log_size,
+                    lookup_elements: lookup.clone(),
+                    claimed_sum,
+                },
+                claimed_sum,
+            );
+            component_refs_storage.push(Box::new(component));
+            embedding_claims.push(LayerClaim {
+                layer_index: layer.node_id,
+                claimed_sum,
+                trace_rows: 1 << layer.log_size,
+            });
+        }
+    }
+
     // Single prove() call with all component refs
     let component_refs: Vec<&dyn ComponentProver<B>> = component_refs_storage
         .iter()
@@ -700,6 +951,8 @@ where
         layernorm_claims,
         execution,
         activation_claims,
+        attention_proofs,
+        embedding_claims,
     })
 }
 
@@ -780,6 +1033,10 @@ pub struct AggregatedModelProofOnChain {
     pub execution: GraphExecution,
     /// Per-activation-layer claims.
     pub activation_claims: Vec<LayerClaim>,
+    /// Per-attention on-chain proofs.
+    pub attention_proofs: Vec<(usize, AttentionProofOnChain)>,
+    /// Per-embedding layer claims (verified inside unified STARK).
+    pub embedding_claims: Vec<LayerClaim>,
 }
 
 impl AggregatedModelProofOnChain {
@@ -787,6 +1044,7 @@ impl AggregatedModelProofOnChain {
     pub fn num_proven_layers(&self) -> usize {
         self.matmul_proofs.len() + self.activation_claims.len()
             + self.add_claims.len() + self.mul_claims.len() + self.layernorm_claims.len()
+            + self.attention_proofs.len() + self.embedding_claims.len()
     }
 }
 
@@ -822,6 +1080,7 @@ where
     FrameworkComponent<ElementwiseAddEval>: ComponentProver<B>,
     FrameworkComponent<ElementwiseMulEval>: ComponentProver<B>,
     FrameworkComponent<LayerNormEval>: ComponentProver<B>,
+    FrameworkComponent<EmbeddingEval>: ComponentProver<B>,
 {
     info!(
         backend = std::any::type_name::<B>(),
@@ -837,6 +1096,8 @@ where
     let mut add_layers: Vec<AddLayerData> = Vec::new();
     let mut mul_layers: Vec<MulLayerData> = Vec::new();
     let mut layernorm_layers: Vec<LayerNormLayerData> = Vec::new();
+    let mut attention_layers: Vec<AttentionLayerData> = Vec::new();
+    let mut embedding_layers: Vec<EmbeddingLayerData> = Vec::new();
 
     // Memory budget for tiled matmul auto-dispatch (4GB default)
     const TILED_MEMORY_BUDGET: usize = 4 * 1024 * 1024 * 1024;
@@ -988,11 +1249,102 @@ where
                 current = ln.output_matrix;
             }
 
+            GraphOp::Attention { config: attn_config } => {
+                let w_q = weights.get_named_weight(node.id, "w_q");
+                let w_k = weights.get_named_weight(node.id, "w_k");
+                let w_v = weights.get_named_weight(node.id, "w_v");
+                let w_o = weights.get_named_weight(node.id, "w_o");
+
+                if let (Some(wq), Some(wk), Some(wv), Some(wo)) = (w_q, w_k, w_v, w_o) {
+                    let attn_weights = AttentionWeights {
+                        w_q: wq.clone(), w_k: wk.clone(),
+                        w_v: wv.clone(), w_o: wo.clone(),
+                    };
+                    let inter = attention_forward(&current, &attn_weights, attn_config, false);
+                    attention_layers.push(AttentionLayerData {
+                        node_id: node.id,
+                        config: *attn_config,
+                        weights: attn_weights,
+                        input: current.clone(),
+                    });
+                    intermediates.push((node.id, current.clone()));
+                    node_outputs.insert(node.id, inter.final_output.clone());
+                    current = inter.final_output;
+                } else {
+                    info!(node_id = node.id, "Attention node missing weights, passthrough");
+                    intermediates.push((node.id, current.clone()));
+                    node_outputs.insert(node.id, current.clone());
+                }
+            }
+
+            GraphOp::Embedding { vocab_size: _, embed_dim: _ } => {
+                let embed_table = weights.get_weight(node.id).ok_or(
+                    ModelError::MissingWeight(node.id)
+                )?;
+                let token_u32s: Vec<u32> = current.data.iter().map(|m| m.0).collect();
+                let (output, token_ids, col_indices, values, multiplicities) =
+                    embedding_lookup(&token_u32s, embed_table);
+                let (table_tokens, table_cols, table_values) = build_embedding_table_columns(embed_table);
+                let log_size = data_log_size(values.len());
+                embedding_layers.push(EmbeddingLayerData {
+                    node_id: node.id,
+                    token_ids,
+                    col_indices,
+                    values,
+                    multiplicities,
+                    table_tokens,
+                    table_cols,
+                    table_values,
+                    log_size,
+                });
+                intermediates.push((node.id, current.clone()));
+                node_outputs.insert(node.id, output.clone());
+                current = output;
+            }
+
+            GraphOp::Conv2D { in_channels, out_channels, kernel_size, stride, padding } => {
+                let kernel = weights.get_weight(node.id).ok_or(
+                    ModelError::MissingWeight(node.id)
+                )?;
+                let im2col_config = Im2ColConfig {
+                    in_channels: *in_channels,
+                    kernel_size: *kernel_size,
+                    stride: *stride,
+                    padding: *padding,
+                    input_h: current.rows,
+                    input_w: current.cols / in_channels,
+                };
+                let (im2col_mat, kernel_mat, output) =
+                    conv2d_forward(&current.data, &kernel.data, &im2col_config, *out_channels);
+                // Conv2D matmul uses on-chain proving
+                let proof = prove_matmul_sumcheck_onchain(&im2col_mat, &kernel_mat, &output)
+                    .map_err(|e| ModelError::ProvingError {
+                        layer: node.id,
+                        message: format!("Conv2D matmul (on-chain): {e}"),
+                    })?;
+                intermediates.push((node.id, current.clone()));
+                matmul_proofs.push((node.id, proof));
+                node_outputs.insert(node.id, output.clone());
+                current = output;
+            }
+
             _ => {
+                // Identity, Quantize, etc. — passthrough
                 intermediates.push((node.id, current.clone()));
                 node_outputs.insert(node.id, current.clone());
             }
         }
+    }
+
+    // Prove attention layers (on-chain format)
+    let mut attention_proofs = Vec::new();
+    for layer in &attention_layers {
+        let proof = prove_attention_onchain(
+            &layer.input, &layer.weights, &layer.config, false,
+        ).map_err(|e| AggregationError::ProvingError(
+            format!("Attention node {} (on-chain): {e}", layer.node_id),
+        ))?;
+        attention_proofs.push((layer.node_id, proof));
     }
 
     let execution = GraphExecution {
@@ -1002,7 +1354,8 @@ where
 
     // Check if there are any non-matmul components to aggregate
     let has_components = !activation_layers.is_empty()
-        || !add_layers.is_empty() || !mul_layers.is_empty() || !layernorm_layers.is_empty();
+        || !add_layers.is_empty() || !mul_layers.is_empty() || !layernorm_layers.is_empty()
+        || !embedding_layers.is_empty();
 
     if !has_components {
         return Ok(AggregatedModelProofOnChain {
@@ -1013,6 +1366,8 @@ where
             layernorm_claims: Vec::new(),
             execution,
             activation_claims: Vec::new(),
+            attention_proofs,
+            embedding_claims: Vec::new(),
         });
     }
 
@@ -1023,6 +1378,7 @@ where
         .chain(add_layers.iter().map(|l| l.log_size))
         .chain(mul_layers.iter().map(|l| l.log_size))
         .chain(layernorm_layers.iter().map(|l| l.log_size))
+        .chain(embedding_layers.iter().map(|l| l.log_size))
         .collect();
     let max_log_size = *all_log_sizes.iter().max().unwrap();
 
@@ -1036,10 +1392,10 @@ where
     let channel = &mut <Blake2sMerkleChannel as MerkleChannel>::C::default();
     let mut commitment_scheme = CommitmentSchemeProver::<B, Blake2sMerkleChannel>::new(config, &twiddles);
 
-    let has_logup = !activation_layers.is_empty() || !layernorm_layers.is_empty();
+    let has_logup = !activation_layers.is_empty() || !layernorm_layers.is_empty()
+        || !embedding_layers.is_empty();
 
-    // Tree 0: Preprocessed (activation tables + layernorm rsqrt tables)
-    // Always committed (may be empty for pure-AIR models).
+    // Tree 0: Preprocessed (activation tables + layernorm rsqrt tables + embedding tables)
     {
         let mut tree_builder = commitment_scheme.tree_builder();
         for layer in &activation_layers {
@@ -1062,10 +1418,18 @@ where
             ];
             tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
         }
+        for layer in &embedding_layers {
+            let layer_size = 1usize << layer.log_size;
+            let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
+            let simd_evals = build_embedding_preprocessed_columns(
+                &layer.table_tokens, &layer.table_cols, &layer.table_values, layer_size, layer_domain,
+            );
+            tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
+        }
         tree_builder.commit(channel);
     }
 
-    // Tree 1: Execution traces (activation + add + mul + layernorm)
+    // Tree 1: Execution traces (activation + add + mul + layernorm + embedding)
     let mut tree_builder = commitment_scheme.tree_builder();
     let mut activation_mults: Vec<Vec<M31>> = Vec::new();
     for layer in &activation_layers {
@@ -1130,13 +1494,24 @@ where
         tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(cols));
         layernorm_mults.push(mults);
     }
+    for layer in &embedding_layers {
+        let layer_size = 1usize << layer.log_size;
+        let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
+        let simd_evals = build_embedding_trace_columns(
+            &layer.token_ids, &layer.col_indices, &layer.values, &layer.multiplicities,
+            layer_size, layer_domain,
+        );
+        tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
+    }
     tree_builder.commit(channel);
 
     // Draw relation elements and build Tree 2 — only if LogUp components exist
     let mut activation_lookup: Option<ActivationRelation> = None;
     let mut layernorm_lookup: Option<LayerNormRelation> = None;
+    let mut embedding_lookup_rel: Option<EmbeddingRelation> = None;
     let mut activation_claimed_sums: Vec<SecureField> = Vec::new();
     let mut layernorm_claimed_sums: Vec<SecureField> = Vec::new();
+    let mut embedding_claimed_sums: Vec<SecureField> = Vec::new();
 
     if has_logup {
         if !activation_layers.is_empty() {
@@ -1145,8 +1520,11 @@ where
         if !layernorm_layers.is_empty() {
             layernorm_lookup = Some(LayerNormRelation::draw(channel));
         }
+        if !embedding_layers.is_empty() {
+            embedding_lookup_rel = Some(EmbeddingRelation::draw(channel));
+        }
 
-        // Tree 2: Interaction traces (LogUp for activation + layernorm)
+        // Tree 2: Interaction traces (LogUp for activation + layernorm + embedding)
         let mut tree_builder = commitment_scheme.tree_builder();
 
         if let Some(ref lookup) = activation_lookup {
@@ -1231,6 +1609,60 @@ where
                 layernorm_claimed_sums.push(claimed_sum);
             }
         }
+
+        // Embedding LogUp interaction traces
+        if let Some(ref lookup) = embedding_lookup_rel {
+            for layer in &embedding_layers {
+                let layer_size = 1usize << layer.log_size;
+                let layer_vec_size = layer_size >> LOG_N_LANES;
+
+                let mut tbl_tok = Col::<SimdBackend, BaseField>::zeros(layer_size);
+                let mut tbl_col = Col::<SimdBackend, BaseField>::zeros(layer_size);
+                let mut tbl_val = Col::<SimdBackend, BaseField>::zeros(layer_size);
+                let n_table = layer.table_tokens.len().min(layer_size);
+                for i in 0..n_table {
+                    tbl_tok.set(i, layer.table_tokens[i]);
+                    tbl_col.set(i, layer.table_cols[i]);
+                    tbl_val.set(i, layer.table_values[i]);
+                }
+
+                let mut tr_tok = Col::<SimdBackend, BaseField>::zeros(layer_size);
+                let mut tr_col = Col::<SimdBackend, BaseField>::zeros(layer_size);
+                let mut tr_val = Col::<SimdBackend, BaseField>::zeros(layer_size);
+                let n_trace = layer.token_ids.len().min(layer_size);
+                for i in 0..n_trace {
+                    tr_tok.set(i, layer.token_ids[i]);
+                    tr_col.set(i, layer.col_indices[i]);
+                    tr_val.set(i, layer.values[i]);
+                }
+
+                let mut logup_gen = LogupTraceGenerator::new(layer.log_size);
+
+                let mut col_gen = logup_gen.new_col();
+                for vec_row in 0..layer_vec_size {
+                    let q_table: PackedSecureField = lookup.lookup_elements().combine(
+                        &[tbl_tok.data[vec_row], tbl_col.data[vec_row], tbl_val.data[vec_row]],
+                    );
+                    let mult_packed = pack_multiplicities(&layer.multiplicities, vec_row);
+                    col_gen.write_frac(vec_row, -mult_packed, q_table);
+                }
+                col_gen.finalize_col();
+
+                let mut col_gen = logup_gen.new_col();
+                for vec_row in 0..layer_vec_size {
+                    let q_trace: PackedSecureField = lookup.lookup_elements().combine(
+                        &[tr_tok.data[vec_row], tr_col.data[vec_row], tr_val.data[vec_row]],
+                    );
+                    col_gen.write_frac(vec_row, PackedSecureField::one(), q_trace);
+                }
+                col_gen.finalize_col();
+
+                let (interaction_trace, claimed_sum) = logup_gen.finalize_last();
+                tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(interaction_trace));
+                embedding_claimed_sums.push(claimed_sum);
+            }
+        }
+
         tree_builder.commit(channel);
     } // end if has_logup
 
@@ -1241,6 +1673,7 @@ where
     let mut add_claims: Vec<LayerClaim> = Vec::new();
     let mut mul_claims: Vec<LayerClaim> = Vec::new();
     let mut layernorm_claims: Vec<LayerClaim> = Vec::new();
+    let mut embedding_claims: Vec<LayerClaim> = Vec::new();
 
     // Activation components
     if let Some(ref lookup) = activation_lookup {
@@ -1318,6 +1751,28 @@ where
         }
     }
 
+    // Embedding components (LogUp)
+    if let Some(ref lookup) = embedding_lookup_rel {
+        for (idx, layer) in embedding_layers.iter().enumerate() {
+            let claimed_sum = embedding_claimed_sums[idx];
+            let component = FrameworkComponent::new(
+                &mut allocator,
+                EmbeddingEval {
+                    log_n_rows: layer.log_size,
+                    lookup_elements: lookup.clone(),
+                    claimed_sum,
+                },
+                claimed_sum,
+            );
+            component_refs_storage.push(Box::new(component));
+            embedding_claims.push(LayerClaim {
+                layer_index: layer.node_id,
+                claimed_sum,
+                trace_rows: 1 << layer.log_size,
+            });
+        }
+    }
+
     let component_refs: Vec<&dyn ComponentProver<B>> = component_refs_storage
         .iter()
         .map(|c| c.as_component_prover())
@@ -1337,6 +1792,8 @@ where
         layernorm_claims,
         execution,
         activation_claims,
+        attention_proofs,
+        embedding_claims,
     })
 }
 
@@ -1527,6 +1984,64 @@ fn build_layernorm_trace_columns(
     ]
 }
 
+/// Build 3 preprocessed columns for embedding LogUp (table_token, table_col, table_value).
+fn build_embedding_preprocessed_columns(
+    table_tokens: &[M31],
+    table_cols: &[M31],
+    table_values: &[M31],
+    size: usize,
+    domain: stwo::core::poly::circle::CircleDomain,
+) -> Vec<CircleEvaluation<SimdBackend, BaseField, stwo::prover::poly::BitReversedOrder>> {
+    let mut tok_col = Col::<SimdBackend, BaseField>::zeros(size);
+    let mut col_col = Col::<SimdBackend, BaseField>::zeros(size);
+    let mut val_col = Col::<SimdBackend, BaseField>::zeros(size);
+
+    let n = table_tokens.len().min(size);
+    for i in 0..n {
+        tok_col.set(i, table_tokens[i]);
+        col_col.set(i, table_cols[i]);
+        val_col.set(i, table_values[i]);
+    }
+
+    vec![
+        CircleEvaluation::new(domain, tok_col),
+        CircleEvaluation::new(domain, col_col),
+        CircleEvaluation::new(domain, val_col),
+    ]
+}
+
+/// Build 4 execution trace columns for embedding (token_id, col_idx, value, multiplicity).
+fn build_embedding_trace_columns(
+    token_ids: &[M31],
+    col_indices: &[M31],
+    values: &[M31],
+    multiplicities: &[M31],
+    size: usize,
+    domain: stwo::core::poly::circle::CircleDomain,
+) -> Vec<CircleEvaluation<SimdBackend, BaseField, stwo::prover::poly::BitReversedOrder>> {
+    let mut tok_col = Col::<SimdBackend, BaseField>::zeros(size);
+    let mut col_col = Col::<SimdBackend, BaseField>::zeros(size);
+    let mut val_col = Col::<SimdBackend, BaseField>::zeros(size);
+    let mut mult_col = Col::<SimdBackend, BaseField>::zeros(size);
+
+    let n = token_ids.len().min(size);
+    for i in 0..n {
+        tok_col.set(i, token_ids[i]);
+        col_col.set(i, col_indices[i]);
+        val_col.set(i, values[i]);
+    }
+    for (i, &m) in multiplicities.iter().enumerate().take(size) {
+        mult_col.set(i, m);
+    }
+
+    vec![
+        CircleEvaluation::new(domain, tok_col),
+        CircleEvaluation::new(domain, col_col),
+        CircleEvaluation::new(domain, val_col),
+        CircleEvaluation::new(domain, mult_col),
+    ]
+}
+
 fn pack_multiplicities(
     multiplicities: &[M31],
     vec_row: usize,
@@ -1576,6 +2091,447 @@ pub fn collect_chunk_proofs(
 pub fn summarize_claims(claims: &[LayerClaim]) -> (usize, usize) {
     let total_rows: usize = claims.iter().map(|c| c.trace_rows).sum();
     (claims.len(), total_rows)
+}
+
+// === Verification ===
+
+/// Type-erased Component trait for heterogeneous component storage during verification.
+trait ComponentRefErased {
+    fn as_component(&self) -> &dyn Component;
+}
+
+impl<E> ComponentRefErased for FrameworkComponent<E>
+where
+    E: stwo_constraint_framework::FrameworkEval,
+{
+    fn as_component(&self) -> &dyn Component {
+        self
+    }
+}
+
+/// Verify an aggregated model proof (matmul sumchecks + unified STARK).
+///
+/// Re-runs the forward pass to reconstruct expected matrices, then:
+/// 1. Verifies each matmul sumcheck proof against recomputed A × B = C
+/// 2. Verifies the unified STARK proof (activation, add, mul, layernorm, embedding)
+pub fn verify_aggregated_model_proof(
+    proof: AggregatedModelProof,
+    graph: &ComputationGraph,
+    input: &M31Matrix,
+    weights: &GraphWeights,
+) -> Result<(), AggregationError> {
+    use crate::components::matmul::verify_matmul_sumcheck;
+
+    // 1. Re-run forward pass to collect (A, B, C) for matmul verification
+    let mut current = input.clone();
+    let mut node_outputs: HashMap<usize, M31Matrix> = HashMap::new();
+    let mut matmul_matrices: HashMap<usize, (M31Matrix, M31Matrix, M31Matrix)> = HashMap::new();
+
+    let topo = graph.topological_order();
+    for &node_id in &topo {
+        let node = &graph.nodes[node_id];
+        if let Some(&first_input) = node.inputs.first() {
+            if let Some(inp) = node_outputs.get(&first_input) {
+                current = inp.clone();
+            }
+        }
+
+        match &node.op {
+            GraphOp::MatMul { .. } => {
+                let weight = weights.get_weight(node.id).ok_or(
+                    ModelError::MissingWeight(node.id)
+                )?;
+                let output = matmul_m31(&current, weight);
+                matmul_matrices.insert(node.id, (current.clone(), weight.clone(), output.clone()));
+                node_outputs.insert(node.id, output.clone());
+                current = output;
+            }
+            GraphOp::Activation { activation_type, .. } => {
+                let f = activation_type.as_fn();
+                let output = crate::compiler::prove::apply_activation_pub(&current, &*f);
+                node_outputs.insert(node.id, output.clone());
+                current = output;
+            }
+            GraphOp::Add { .. } => {
+                let lhs = node.inputs.get(0)
+                    .and_then(|id| node_outputs.get(id))
+                    .cloned()
+                    .unwrap_or_else(|| current.clone());
+                let rhs = node.inputs.get(1)
+                    .and_then(|id| node_outputs.get(id))
+                    .cloned()
+                    .unwrap_or_else(|| current.clone());
+                let output = elementwise_add(&lhs, &rhs);
+                node_outputs.insert(node.id, output.clone());
+                current = output;
+            }
+            GraphOp::Mul { .. } => {
+                let lhs = node.inputs.get(0)
+                    .and_then(|id| node_outputs.get(id))
+                    .cloned()
+                    .unwrap_or_else(|| current.clone());
+                let rhs = node.inputs.get(1)
+                    .and_then(|id| node_outputs.get(id))
+                    .cloned()
+                    .unwrap_or_else(|| current.clone());
+                let output = elementwise_mul(&lhs, &rhs);
+                node_outputs.insert(node.id, output.clone());
+                current = output;
+            }
+            GraphOp::LayerNorm { dim } => {
+                let ln = apply_layernorm_detailed(&current, *dim);
+                node_outputs.insert(node.id, ln.output_matrix.clone());
+                current = ln.output_matrix;
+            }
+            GraphOp::Attention { config: attn_config } => {
+                let w_q = weights.get_named_weight(node.id, "w_q");
+                let w_k = weights.get_named_weight(node.id, "w_k");
+                let w_v = weights.get_named_weight(node.id, "w_v");
+                let w_o = weights.get_named_weight(node.id, "w_o");
+                if let (Some(wq), Some(wk), Some(wv), Some(wo)) = (w_q, w_k, w_v, w_o) {
+                    let attn_weights = AttentionWeights {
+                        w_q: wq.clone(), w_k: wk.clone(),
+                        w_v: wv.clone(), w_o: wo.clone(),
+                    };
+                    let inter = attention_forward(&current, &attn_weights, attn_config, false);
+                    node_outputs.insert(node.id, inter.final_output.clone());
+                    current = inter.final_output;
+                } else {
+                    node_outputs.insert(node.id, current.clone());
+                }
+            }
+            GraphOp::Embedding { .. } => {
+                let embed_table = weights.get_weight(node.id).ok_or(
+                    ModelError::MissingWeight(node.id)
+                )?;
+                let token_u32s: Vec<u32> = current.data.iter().map(|m| m.0).collect();
+                let (output, _, _, _, _) = embedding_lookup(&token_u32s, embed_table);
+                node_outputs.insert(node.id, output.clone());
+                current = output;
+            }
+            GraphOp::Conv2D { in_channels, out_channels, kernel_size, stride, padding } => {
+                let kernel = weights.get_weight(node.id).ok_or(
+                    ModelError::MissingWeight(node.id)
+                )?;
+                let im2col_config = Im2ColConfig {
+                    in_channels: *in_channels,
+                    kernel_size: *kernel_size,
+                    stride: *stride,
+                    padding: *padding,
+                    input_h: current.rows,
+                    input_w: current.cols / in_channels,
+                };
+                let (im2col_mat, kernel_mat, output) =
+                    conv2d_forward(&current.data, &kernel.data, &im2col_config, *out_channels);
+                matmul_matrices.insert(node.id, (im2col_mat, kernel_mat, output.clone()));
+                node_outputs.insert(node.id, output.clone());
+                current = output;
+            }
+            _ => {
+                node_outputs.insert(node.id, current.clone());
+            }
+        }
+    }
+
+    // 2. Verify matmul sumcheck proofs
+    for (node_id, matmul_proof) in &proof.matmul_proofs {
+        let (a, b, c) = matmul_matrices.get(node_id).ok_or_else(|| {
+            AggregationError::VerificationFailed(
+                format!("No matmul data for node {node_id}")
+            )
+        })?;
+        verify_matmul_sumcheck(matmul_proof, a, b, c).map_err(|e| {
+            AggregationError::VerificationFailed(
+                format!("MatMul sumcheck node {node_id}: {e}")
+            )
+        })?;
+    }
+
+    // 3. Verify unified STARK
+    if let Some(stark_proof) = proof.unified_stark {
+        verify_unified_stark_blake2s(
+            stark_proof, graph,
+            &proof.activation_claims,
+            &proof.add_claims,
+            &proof.mul_claims,
+            &proof.layernorm_claims,
+            &proof.embedding_claims,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Verify the unified STARK proof covering all non-matmul components.
+///
+/// Reconstructs the same component definitions the prover used, sets up the
+/// commitment scheme verifier with the proof's tree commitments, and calls
+/// STWO's verify function to check the DEEP-ALI + FRI proof.
+fn verify_unified_stark_blake2s(
+    proof: StarkProof<Blake2sHash>,
+    graph: &ComputationGraph,
+    activation_claims: &[LayerClaim],
+    add_claims: &[LayerClaim],
+    mul_claims: &[LayerClaim],
+    layernorm_claims: &[LayerClaim],
+    embedding_claims: &[LayerClaim],
+) -> Result<(), AggregationError> {
+    let config = PcsConfig::default();
+
+    // Collect LayerNorm dims from graph nodes
+    let mut layernorm_dims: HashMap<usize, usize> = HashMap::new();
+    for node in &graph.nodes {
+        if let GraphOp::LayerNorm { dim } = &node.op {
+            layernorm_dims.insert(node.id, *dim);
+        }
+    }
+
+    let has_logup = !activation_claims.is_empty()
+        || !layernorm_claims.is_empty()
+        || !embedding_claims.is_empty();
+
+    // Step 1: Build dummy components to get per-tree column sizes.
+    // Column structure depends only on log_n_rows and evaluator type, NOT on lookup elements.
+    let dummy_sizes = build_component_tree_sizes(
+        activation_claims, add_claims, mul_claims,
+        layernorm_claims, embedding_claims, &layernorm_dims,
+    );
+
+    // Step 2: Set up channel and commitment scheme verifier
+    let channel = &mut <Blake2sMerkleChannel as MerkleChannel>::C::default();
+    let mut commitment_scheme = CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(config);
+
+    // Step 3: Commit Tree 0 (preprocessed) and Tree 1 (execution) from proof
+    commitment_scheme.commit(proof.commitments[0], &dummy_sizes.tree0, channel);
+    commitment_scheme.commit(proof.commitments[1], &dummy_sizes.tree1, channel);
+
+    // Step 4: Draw relation elements (same order as prover)
+    let activation_lookup = if !activation_claims.is_empty() {
+        Some(ActivationRelation::draw(channel))
+    } else {
+        None
+    };
+    let layernorm_lookup = if !layernorm_claims.is_empty() {
+        Some(LayerNormRelation::draw(channel))
+    } else {
+        None
+    };
+    let embedding_lookup_rel = if !embedding_claims.is_empty() {
+        Some(EmbeddingRelation::draw(channel))
+    } else {
+        None
+    };
+
+    // Step 5: Commit Tree 2 (interaction) if LogUp components exist
+    if has_logup {
+        commitment_scheme.commit(proof.commitments[2], &dummy_sizes.tree2, channel);
+    }
+
+    // Step 6: Build real components with drawn relation elements
+    let mut allocator = TraceLocationAllocator::default();
+    let mut component_storage: Vec<Box<dyn ComponentRefErased>> = Vec::new();
+
+    // Activation components
+    if let Some(ref lookup) = activation_lookup {
+        for claim in activation_claims {
+            let ls = claim.trace_rows.ilog2();
+            let component = FrameworkComponent::new(
+                &mut allocator,
+                ActivationEval {
+                    log_n_rows: ls,
+                    lookup_elements: lookup.clone(),
+                    claimed_sum: claim.claimed_sum,
+                    total_sum: claim.claimed_sum,
+                },
+                claim.claimed_sum,
+            );
+            component_storage.push(Box::new(component));
+        }
+    }
+
+    // Add components (pure AIR)
+    for claim in add_claims {
+        let ls = claim.trace_rows.ilog2();
+        let component = FrameworkComponent::new(
+            &mut allocator,
+            ElementwiseAddEval { log_n_rows: ls },
+            SecureField::default(),
+        );
+        component_storage.push(Box::new(component));
+    }
+
+    // Mul components (pure AIR)
+    for claim in mul_claims {
+        let ls = claim.trace_rows.ilog2();
+        let component = FrameworkComponent::new(
+            &mut allocator,
+            ElementwiseMulEval { log_n_rows: ls },
+            SecureField::default(),
+        );
+        component_storage.push(Box::new(component));
+    }
+
+    // LayerNorm components
+    if let Some(ref lookup) = layernorm_lookup {
+        for claim in layernorm_claims {
+            let ls = claim.trace_rows.ilog2();
+            let dim = layernorm_dims.get(&claim.layer_index).copied().unwrap_or(1);
+            let component = FrameworkComponent::new(
+                &mut allocator,
+                LayerNormEval {
+                    log_n_rows: ls,
+                    dim,
+                    lookup_elements: lookup.clone(),
+                    claimed_sum: claim.claimed_sum,
+                },
+                claim.claimed_sum,
+            );
+            component_storage.push(Box::new(component));
+        }
+    }
+
+    // Embedding components
+    if let Some(ref lookup) = embedding_lookup_rel {
+        for claim in embedding_claims {
+            let ls = claim.trace_rows.ilog2();
+            let component = FrameworkComponent::new(
+                &mut allocator,
+                EmbeddingEval {
+                    log_n_rows: ls,
+                    lookup_elements: lookup.clone(),
+                    claimed_sum: claim.claimed_sum,
+                },
+                claim.claimed_sum,
+            );
+            component_storage.push(Box::new(component));
+        }
+    }
+
+    // Step 7: Verify
+    let component_refs: Vec<&dyn Component> = component_storage
+        .iter()
+        .map(|c| c.as_component())
+        .collect();
+
+    stwo_verify::<Blake2sMerkleChannel>(
+        &component_refs,
+        channel,
+        &mut commitment_scheme,
+        proof,
+    ).map_err(|e| AggregationError::VerificationFailed(format!("Unified STARK: {e}")))?;
+
+    Ok(())
+}
+
+/// Per-tree column sizes for the unified STARK.
+struct TreeColumnSizes {
+    tree0: Vec<u32>, // preprocessed
+    tree1: Vec<u32>, // execution
+    tree2: Vec<u32>, // interaction (LogUp)
+}
+
+/// Build column sizes for each commitment tree using dummy components.
+///
+/// The column structure depends only on log_n_rows and evaluator type,
+/// NOT on the specific lookup element values, so dummy relations are used.
+fn build_component_tree_sizes(
+    activation_claims: &[LayerClaim],
+    add_claims: &[LayerClaim],
+    mul_claims: &[LayerClaim],
+    layernorm_claims: &[LayerClaim],
+    embedding_claims: &[LayerClaim],
+    layernorm_dims: &HashMap<usize, usize>,
+) -> TreeColumnSizes {
+    let mut allocator = TraceLocationAllocator::default();
+    let mut all_bounds: Vec<Vec<Vec<u32>>> = Vec::new();
+
+    // Activation (dummy)
+    for claim in activation_claims {
+        let ls = claim.trace_rows.ilog2();
+        let component = FrameworkComponent::new(
+            &mut allocator,
+            ActivationEval {
+                log_n_rows: ls,
+                lookup_elements: ActivationRelation::dummy(),
+                claimed_sum: claim.claimed_sum,
+                total_sum: claim.claimed_sum,
+            },
+            claim.claimed_sum,
+        );
+        let bounds = component.trace_log_degree_bounds();
+        all_bounds.push(bounds.iter().map(|v| v.clone()).collect());
+    }
+
+    // Add (dummy)
+    for claim in add_claims {
+        let ls = claim.trace_rows.ilog2();
+        let component = FrameworkComponent::new(
+            &mut allocator,
+            ElementwiseAddEval { log_n_rows: ls },
+            SecureField::default(),
+        );
+        let bounds = component.trace_log_degree_bounds();
+        all_bounds.push(bounds.iter().map(|v| v.clone()).collect());
+    }
+
+    // Mul (dummy)
+    for claim in mul_claims {
+        let ls = claim.trace_rows.ilog2();
+        let component = FrameworkComponent::new(
+            &mut allocator,
+            ElementwiseMulEval { log_n_rows: ls },
+            SecureField::default(),
+        );
+        let bounds = component.trace_log_degree_bounds();
+        all_bounds.push(bounds.iter().map(|v| v.clone()).collect());
+    }
+
+    // LayerNorm (dummy)
+    for claim in layernorm_claims {
+        let ls = claim.trace_rows.ilog2();
+        let dim = layernorm_dims.get(&claim.layer_index).copied().unwrap_or(1);
+        let component = FrameworkComponent::new(
+            &mut allocator,
+            LayerNormEval {
+                log_n_rows: ls,
+                dim,
+                lookup_elements: LayerNormRelation::dummy(),
+                claimed_sum: claim.claimed_sum,
+            },
+            claim.claimed_sum,
+        );
+        let bounds = component.trace_log_degree_bounds();
+        all_bounds.push(bounds.iter().map(|v| v.clone()).collect());
+    }
+
+    // Embedding (dummy)
+    for claim in embedding_claims {
+        let ls = claim.trace_rows.ilog2();
+        let component = FrameworkComponent::new(
+            &mut allocator,
+            EmbeddingEval {
+                log_n_rows: ls,
+                lookup_elements: EmbeddingRelation::dummy(),
+                claimed_sum: claim.claimed_sum,
+            },
+            claim.claimed_sum,
+        );
+        let bounds = component.trace_log_degree_bounds();
+        all_bounds.push(bounds.iter().map(|v| v.clone()).collect());
+    }
+
+    // Merge per-tree
+    let mut tree0 = Vec::new();
+    let mut tree1 = Vec::new();
+    let mut tree2 = Vec::new();
+
+    for bounds in &all_bounds {
+        if bounds.len() > 0 { tree0.extend_from_slice(&bounds[0]); }
+        if bounds.len() > 1 { tree1.extend_from_slice(&bounds[1]); }
+        if bounds.len() > 2 { tree2.extend_from_slice(&bounds[2]); }
+    }
+
+    TreeColumnSizes { tree0, tree1, tree2 }
 }
 
 #[cfg(test)]
@@ -1668,6 +2624,8 @@ mod tests {
                 LayerClaim { layer_index: 0, claimed_sum: SecureField::from(M31::from(0)), trace_rows: 16 },
                 LayerClaim { layer_index: 1, claimed_sum: SecureField::from(M31::from(0)), trace_rows: 16 },
             ],
+            attention_proofs: Vec::new(),
+            embedding_claims: Vec::new(),
         };
         let calldata = proof.estimated_calldata_bytes();
         assert!(calldata > 0);
@@ -1906,5 +2864,65 @@ mod tests {
         assert_eq!(proof.add_claims.len(), 0, "no Add claims");
         // Unified STARK covers mul
         assert!(proof.unified_stark.is_some(), "unified STARK covers mul");
+    }
+
+    // === Verification Tests ===
+
+    #[test]
+    fn test_verify_aggregated_matmul_only() {
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(2);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+
+        let mut weights = GraphWeights::new();
+        let mut w = M31Matrix::new(4, 2);
+        for i in 0..4 { for j in 0..2 { w.set(i, j, M31::from((i * 2 + j + 1) as u32)); } }
+        weights.add_weight(0, w);
+
+        let proof = prove_model_aggregated(&graph, &input, &weights)
+            .expect("proving should succeed");
+        assert!(proof.unified_stark.is_none());
+
+        verify_aggregated_model_proof(proof, &graph, &input, &weights)
+            .expect("verification should succeed");
+    }
+
+    #[test]
+    fn test_verify_aggregated_mlp() {
+        // matmul → relu → matmul → relu → matmul
+        let mut builder = GraphBuilder::new((1, 4));
+        builder
+            .linear(4)
+            .activation(ActivationType::ReLU)
+            .linear(4)
+            .activation(ActivationType::ReLU)
+            .linear(2);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+
+        let mut weights = GraphWeights::new();
+        let mut w0 = M31Matrix::new(4, 4);
+        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        weights.add_weight(0, w0);
+        let mut w2 = M31Matrix::new(4, 4);
+        for i in 0..4 { for j in 0..4 { w2.set(i, j, M31::from(((i * j) % 5 + 1) as u32)); } }
+        weights.add_weight(2, w2);
+        let mut w4 = M31Matrix::new(4, 2);
+        for i in 0..4 { for j in 0..2 { w4.set(i, j, M31::from((i + j + 1) as u32)); } }
+        weights.add_weight(4, w4);
+
+        let proof = prove_model_aggregated(&graph, &input, &weights)
+            .expect("proving should succeed");
+        assert!(proof.unified_stark.is_some());
+        assert_eq!(proof.matmul_proofs.len(), 3);
+        assert_eq!(proof.activation_claims.len(), 2);
+
+        verify_aggregated_model_proof(proof, &graph, &input, &weights)
+            .expect("verification of MLP with activations should succeed");
     }
 }

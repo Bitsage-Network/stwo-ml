@@ -50,6 +50,7 @@ pub mod prelude {
     pub use crate::aggregation::{
         prove_model_aggregated, prove_model_aggregated_with, prove_model_aggregated_auto,
         prove_model_aggregated_onchain, prove_model_aggregated_onchain_auto,
+        verify_aggregated_model_proof,
     };
     pub use crate::receipt::{prove_receipt, prove_receipt_batch, prove_receipt_batch_auto};
     pub use crate::backend::BackendInfo;

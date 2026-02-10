@@ -970,6 +970,8 @@ mod tests {
                 output: M31Matrix::new(1, 1),
             },
             activation_claims: vec![],
+            attention_proofs: Vec::new(),
+            embedding_claims: Vec::new(),
         };
 
         let metadata = MLClaimMetadata {
@@ -1035,6 +1037,8 @@ mod tests {
                 output: M31Matrix::new(1, 1),
             },
             activation_claims: vec![],
+            attention_proofs: Vec::new(),
+            embedding_claims: Vec::new(),
         };
 
         let metadata = MLClaimMetadata {
@@ -1155,6 +1159,8 @@ mod tests {
                 output: M31Matrix::new(1, 1),
             },
             activation_claims: vec![],
+            attention_proofs: Vec::new(),
+            embedding_claims: Vec::new(),
         };
         let felts_none = serialize_ml_proof_for_recursive(&aggregated_none, &metadata, None);
 
@@ -1175,6 +1181,8 @@ mod tests {
                 output: M31Matrix::new(1, 1),
             },
             activation_claims,
+            attention_proofs: Vec::new(),
+            embedding_claims: Vec::new(),
         };
         let felts_some = serialize_ml_proof_for_recursive(&aggregated_some, &metadata, None);
 
@@ -1244,6 +1252,8 @@ mod tests {
                 output: M31Matrix::new(1, 1),
             },
             activation_claims,
+            attention_proofs: Vec::new(),
+            embedding_claims: Vec::new(),
         };
 
         let metadata = MLClaimMetadata {
@@ -1479,6 +1489,8 @@ mod tests {
                 output: M31Matrix::new(1, 1),
             },
             activation_claims: vec![],
+            attention_proofs: Vec::new(),
+            embedding_claims: Vec::new(),
         };
 
         let metadata = MLClaimMetadata {
@@ -1563,6 +1575,8 @@ mod tests {
                 output: M31Matrix::new(1, 1),
             },
             activation_claims: activation_claims.clone(),
+            attention_proofs: Vec::new(),
+            embedding_claims: Vec::new(),
         };
 
         let metadata = MLClaimMetadata {

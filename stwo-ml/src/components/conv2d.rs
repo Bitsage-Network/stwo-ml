@@ -5,7 +5,7 @@
 //! the existing sumcheck infrastructure.
 
 use stwo::core::fields::m31::M31;
-use crate::components::matmul::M31Matrix;
+use crate::components::matmul::{M31Matrix, matmul_m31};
 
 /// im2col configuration.
 #[derive(Debug, Clone, Copy)]
@@ -127,6 +127,22 @@ pub fn reshape_kernel(
     result
 }
 
+/// Run Conv2D forward pass: im2col transform + matmul.
+///
+/// Returns `(im2col_matrix, reshaped_kernel, output_matrix)`.
+/// The output is `im2col_matrix × reshaped_kernel`, shape `(num_patches, out_channels)`.
+pub fn conv2d_forward(
+    input: &[M31],
+    kernel: &[M31],
+    config: &Im2ColConfig,
+    out_channels: usize,
+) -> (M31Matrix, M31Matrix, M31Matrix) {
+    let im2col_mat = im2col(input, config);
+    let kernel_mat = reshape_kernel(kernel, out_channels, config.in_channels, config.kernel_size);
+    let output = matmul_m31(&im2col_mat, &kernel_mat);
+    (im2col_mat, kernel_mat, output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +196,34 @@ mod tests {
         let result = reshape_kernel(&kernel, 2, 1, 2);
         assert_eq!(result.rows, 4); // patch_size = 1*2*2 = 4
         assert_eq!(result.cols, 2); // out_channels
+    }
+
+    #[test]
+    fn test_conv2d_forward() {
+        // 1 input channel, 2 output channels, 2×2 kernel, 3×3 input, stride 1, no padding
+        let config = Im2ColConfig {
+            in_channels: 1,
+            kernel_size: 2,
+            stride: 1,
+            padding: 0,
+            input_h: 3,
+            input_w: 3,
+        };
+        let input: Vec<M31> = (1..=9).map(|i| M31::from(i as u32)).collect();
+        let kernel: Vec<M31> = (1..=8).map(|i| M31::from(i as u32)).collect();
+
+        let (im2col_mat, kernel_mat, output) = conv2d_forward(&input, &kernel, &config, 2);
+
+        // im2col: (4 patches, 4 patch_size), kernel: (4, 2), output: (4, 2)
+        assert_eq!(im2col_mat.rows, 4);
+        assert_eq!(im2col_mat.cols, 4);
+        assert_eq!(kernel_mat.rows, 4);
+        assert_eq!(kernel_mat.cols, 2);
+        assert_eq!(output.rows, 4);
+        assert_eq!(output.cols, 2);
+
+        // Verify output matches manual im2col × kernel
+        let manual_output = matmul_m31(&im2col_mat, &kernel_mat);
+        assert_eq!(output.data, manual_output.data, "conv2d_forward should match manual im2col + matmul");
     }
 }
