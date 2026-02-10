@@ -1,6 +1,12 @@
 /// Claims and proof structures for ML inference verification.
 use stwo_verifier_core::channel::{Channel, ChannelTrait};
 use stwo_verifier_core::fields::qm31::{QM31, QM31Serde};
+use stwo_verifier_core::verifier::StarkProof;
+use stwo_verifier_core::pcs::PcsConfig;
+use super::components::activation::{
+    ActivationClaim, ActivationInteractionClaim, N_ACTIVATION_TRACE_COLUMNS,
+    N_ACTIVATION_PREPROCESSED_COLUMNS,
+};
 
 /// The complete ML inference proof.
 #[derive(Drop, Serde)]
@@ -11,6 +17,29 @@ pub struct MLProof {
     pub matmul_proofs: Array<MatMulSumcheckProofOnChain>,
     /// Optional channel salt for rerandomization.
     pub channel_salt: Option<u64>,
+    /// Optional activation STARK proof data.
+    pub activation_stark_proof: Option<ActivationStarkProof>,
+}
+
+/// STARK proof for activation LogUp verification.
+///
+/// Contains all data needed to run the generic STARK verifier on
+/// activation constraint quotients. When present, `verify_ml()` will
+/// verify both the matmul sumchecks and the activation STARK.
+#[derive(Drop, Serde)]
+pub struct ActivationStarkProof {
+    /// Per-layer activation claims.
+    pub activation_claims: Array<ActivationClaim>,
+    /// Per-layer activation interaction claims.
+    pub activation_interaction_claims: Array<ActivationInteractionClaim>,
+    /// Global interaction claim (LogUp sum).
+    pub interaction_claim: MLInteractionClaim,
+    /// PCS configuration used during proving.
+    pub pcs_config: PcsConfig,
+    /// Proof-of-work nonce for interaction phase.
+    pub interaction_pow: u64,
+    /// The STARK proof itself (commitments, FRI, decommitments).
+    pub stark_proof: StarkProof,
 }
 
 /// Claim about the ML inference computation.
@@ -41,6 +70,53 @@ pub impl MLClaimMixImpl of MLClaimMixTrait {
 pub struct MLInteractionClaim {
     /// Claimed LogUp sum for all activation layers combined.
     pub activation_claimed_sum: QM31,
+}
+
+#[generate_trait]
+pub impl MLInteractionClaimMixImpl of MLInteractionClaimMixTrait {
+    fn mix_into(self: @MLInteractionClaim, ref channel: Channel) {
+        channel.mix_felts([*self.activation_claimed_sum].span());
+    }
+}
+
+/// Compute column log_sizes per commitment tree for the activation STARK.
+///
+/// Returns `[preprocessed_log_sizes, trace_log_sizes, interaction_trace_log_sizes]`
+/// needed by `CommitmentSchemeVerifier::commit()`.
+#[generate_trait]
+pub impl MLClaimLogSizesImpl of MLClaimLogSizesTrait {
+    fn log_sizes(
+        activation_claims: Span<ActivationClaim>,
+    ) -> Array<Array<u32>> {
+        let mut preprocessed_sizes: Array<u32> = array![];
+        let mut trace_sizes: Array<u32> = array![];
+        let mut interaction_sizes: Array<u32> = array![];
+
+        let mut i: u32 = 0;
+        while i < activation_claims.len() {
+            let log_size = *activation_claims.at(i).log_size;
+            // Preprocessed: N_ACTIVATION_PREPROCESSED_COLUMNS columns (table_input, table_output)
+            let mut p: u32 = 0;
+            while p < N_ACTIVATION_PREPROCESSED_COLUMNS {
+                preprocessed_sizes.append(log_size);
+                p += 1;
+            };
+            // Trace: N_ACTIVATION_TRACE_COLUMNS columns (input, output, multiplicity)
+            let mut t: u32 = 0;
+            while t < N_ACTIVATION_TRACE_COLUMNS {
+                trace_sizes.append(log_size);
+                t += 1;
+            };
+            // Interaction: 4 LogUp cumulative sum columns (QM31 partial evals)
+            interaction_sizes.append(log_size);
+            interaction_sizes.append(log_size);
+            interaction_sizes.append(log_size);
+            interaction_sizes.append(log_size);
+            i += 1;
+        };
+
+        array![preprocessed_sizes, trace_sizes, interaction_sizes]
+    }
 }
 
 /// A single round polynomial from the sumcheck protocol.

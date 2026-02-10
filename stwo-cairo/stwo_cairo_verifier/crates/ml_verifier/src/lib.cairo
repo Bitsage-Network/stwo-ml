@@ -18,5 +18,5 @@ use obelysk_ml_air::verify_ml;
 
 #[executable]
 fn main(proof: MLProof) -> MLVerificationOutput {
-    verify_ml(@proof)
+    verify_ml(proof)
 }
