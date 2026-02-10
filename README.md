@@ -1,369 +1,472 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Bitsage-Network/stwo-ml/main/resources/img/stwo-logo.png" alt="STWO ML" width="200"/>
+  <img src="https://raw.githubusercontent.com/Bitsage-Network/Obelysk-Protocol/main/apps/web/public/obelysk-logo.png" alt="Obelysk" width="180"/>
 </p>
 
-<h1 align="center">STWO ML</h1>
+```
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║                                                                               ║
+║    ██████╗ ██████╗ ███████╗██╗  ██╗   ██╗███████╗██╗  ██╗                    ║
+║    ██╔═══██╗██╔══██╗██╔════╝██║  ╚██╗ ██╔╝██╔════╝██║ ██╔╝                    ║
+║    ██║   ██║██████╔╝█████╗  ██║   ╚████╔╝ ███████╗█████╔╝                     ║
+║    ██║   ██║██╔══██╗██╔══╝  ██║    ╚██╔╝  ╚════██║██╔═██╗                     ║
+║    ╚██████╔╝██████╔╝███████╗███████╗██║   ███████║██║  ██╗                    ║
+║     ╚═════╝ ╚═════╝ ╚══════╝╚══════╝╚═╝   ╚══════╝╚═╝  ╚═╝                    ║
+║                                                                               ║
+║        ███████╗████████╗██╗    ██╗ ██████╗     ███╗   ███╗██╗                 ║
+║        ██╔════╝╚══██╔══╝██║    ██║██╔═══██╗    ████╗ ████║██║                 ║
+║        ███████╗   ██║   ██║ █╗ ██║██║   ██║    ██╔████╔██║██║                 ║
+║        ╚════██║   ██║   ██║███╗██║██║   ██║    ██║╚██╔╝██║██║                 ║
+║        ███████║   ██║   ╚███╔███╔╝╚██████╔╝    ██║ ╚═╝ ██║███████╗           ║
+║        ╚══════╝   ╚═╝    ╚══╝╚══╝  ╚═════╝     ╚═╝     ╚═╝╚══════╝           ║
+║                                                                               ║
+║          GPU-Accelerated ZK Proofs for Verifiable AI on Starknet              ║
+║                                                                               ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+```
 
 <p align="center">
-  <strong>GPU-accelerated STARK prover for verifiable ML inference on Starknet</strong>
+  <a href="https://github.com/Bitsage-Network/stwo-ml/stargazers"><img src="https://img.shields.io/github/stars/Bitsage-Network/stwo-ml?style=for-the-badge&color=yellow" alt="Stars"></a>
+  <a href="https://github.com/Bitsage-Network/stwo-ml/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache_2.0-blue?style=for-the-badge" alt="License"></a>
+  <img src="https://img.shields.io/badge/starknet-sepolia-purple?style=for-the-badge" alt="Starknet">
+  <img src="https://img.shields.io/badge/CUDA-12.4+-green?style=for-the-badge&logo=nvidia" alt="CUDA">
+  <img src="https://img.shields.io/badge/rust-nightly-orange?style=for-the-badge&logo=rust" alt="Rust">
 </p>
 
 <p align="center">
-  <a href="https://github.com/Bitsage-Network/stwo-ml/actions"><img src="https://img.shields.io/github/actions/workflow/status/Bitsage-Network/stwo-ml/ci.yml?branch=main&label=CI" alt="CI"></a>
-  <a href="https://github.com/Bitsage-Network/stwo-ml/stargazers"><img src="https://img.shields.io/github/stars/Bitsage-Network/stwo-ml" alt="Stars"></a>
-  <a href="https://github.com/Bitsage-Network/stwo-ml/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License"></a>
+  <strong>Prove Qwen3-14B inference in 40 seconds. Verify on-chain for < $0.01.</strong>
 </p>
 
 ---
 
-STWO ML is a production-grade system for proving ML inference with zero-knowledge proofs and verifying results on Starknet. It extends [StarkWare's STWO prover](https://github.com/starkware-libs/stwo) with ML-specific circuits, 20,000+ lines of CUDA acceleration, and an end-to-end pipeline from model weights to on-chain verification.
+## What is STWO ML?
 
-**Prove a Qwen3-14B inference in 40 seconds. Verify on-chain for < $0.01.**
+STWO ML is the proving engine behind [Obelysk Protocol](https://github.com/Bitsage-Network/Obelysk-Protocol) — a GPU-accelerated system that generates zero-knowledge proofs of ML inference and settles them on Starknet in a single transaction.
 
-## Key Results
-
-| Metric | Value |
-|--------|-------|
-| Qwen3-14B prove time (H200 GPU) | 40.52s |
-| On-chain verification cost | < 0.31 STRK |
-| Recursive proof size | ~1 KB (from 17 MB raw) |
-| MatMul trace reduction | 42-255x (via sumcheck) |
-| GPU FFT speedup | 174x vs CPU |
-| Security | 96-bit (configurable) |
-
-## Architecture
+It extends [StarkWare's STWO](https://github.com/starkware-libs/stwo) (the fastest STARK prover) with **20,000+ lines of CUDA**, ML-specific circuits, and an end-to-end pipeline from model weights to on-chain verification.
 
 ```
-                          STWO ML — End-to-End Pipeline
-
- ┌─────────────────────────────────────────────────────────────────────┐
- │                         1. PROVE (GPU)                              │
- │                                                                     │
- │   Model Weights ──→ stwo-ml ──→ Per-layer STARK proofs             │
- │   (SafeTensors)      │                                              │
- │                      ├── MatMul: Sumcheck protocol (O(m+k+n))       │
- │                      ├── Activations: LogUp lookup tables           │
- │                      ├── Attention: Composed Q/K/V sumchecks        │
- │                      └── LayerNorm: Mean/variance constraints       │
- │                                                                     │
- │   Output: AggregatedModelProof (~17 MB)                             │
- └──────────────────────────────┬──────────────────────────────────────┘
-                                │
- ┌──────────────────────────────▼──────────────────────────────────────┐
- │                      2. RECURSIVE COMPRESS                          │
- │                                                                     │
- │   ML proof ──→ Cairo ML Verifier ──→ cairo-prove ──→ Recursive proof│
- │                (obelysk_ml_air)       (STARK of          (~1 KB)    │
- │                                        the verifier)                │
- └──────────────────────────────┬──────────────────────────────────────┘
-                                │
- ┌──────────────────────────────▼──────────────────────────────────────┐
- │                    3. ON-CHAIN VERIFY                                │
- │                                                                     │
- │   Recursive proof ──→ ObelyskVerifier ──→ 7 events + SAGE payment  │
- │                       (Starknet contract)                           │
- │                                                                     │
- │   Single TX: verify proof + transfer SAGE + emit rich events        │
- └─────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                                                             │
+│   "Did this AI actually run Qwen3-14B on my input?"                         │
+│                                                                             │
+│    stwo-ml proves it did — with math, not trust.                            │
+│                                                                             │
+│    Anyone can verify. Nobody can fake it. Settled on Starknet.              │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## Key Numbers
+
+```
+╔══════════════════════════════╦══════════════════════════════════════════════╗
+║  METRIC                      ║  VALUE                                      ║
+╠══════════════════════════════╬══════════════════════════════════════════════╣
+║  Qwen3-14B Prove Time        ║  40.52 seconds (NVIDIA H200)                ║
+║  On-Chain Verify Cost         ║  < 0.31 STRK (< $0.01)                     ║
+║  Proof Compression            ║  17 MB → ~1 KB (recursive STARK)           ║
+║  MatMul Trace Reduction       ║  42-255x (sumcheck protocol)               ║
+║  GPU FFT Speedup              ║  174x vs CPU SIMD                          ║
+║  Security Level               ║  96-bit (configurable)                     ║
+║  Trusted Setup                ║  NONE (FRI-based, fully transparent)       ║
+║  GPU Backend                  ║  20,000+ lines CUDA (H100/H200/B200)      ║
+╚══════════════════════════════╩══════════════════════════════════════════════╝
+```
+
+---
+
+## Quick Start
+
+### One-Command Install
+
+```bash
+# Clone the repo
+git clone https://github.com/Bitsage-Network/stwo-ml.git && cd stwo-ml
+
+# Build everything (CPU mode — works on any machine)
+cargo build --release -p stwo-ml
+
+# Run tests to verify
+cargo test --lib -p stwo-ml
+```
+
+### GPU Mode (NVIDIA H100/H200/B200)
+
+```bash
+# Requires: CUDA 12.4+, NVIDIA driver 550+
+export LD_LIBRARY_PATH=/usr/local/cuda-12.4/lib64:$LD_LIBRARY_PATH
+
+# Build with GPU acceleration
+cargo build --release -p stwo-ml --features cuda-runtime
+
+# Prove ML inference
+cargo run --release -p prove-qwen --features cuda-runtime -- \
+  --model qwen3-14b \
+  --input "What is zero-knowledge?" \
+  --output proof.json \
+  --gpu
+```
+
+### Full Pipeline (Prove + Verify On-Chain)
+
+```bash
+# Step 1: Prove ML inference on GPU (40s)
+prove-qwen --model qwen3-14b --input "Hello" --output ml_proof.json --gpu
+
+# Step 2: Compress to recursive proof (~1 KB)
+cairo-prove prove-ml \
+  --verifier-executable ml_verifier.executable.json \
+  --ml-proof ml_proof.json \
+  --output recursive.json
+
+# Step 3: Submit to Starknet (1 transaction, 7 events)
+starkli invoke $OBELYSK_VERIFIER verify_and_pay \
+  $MODEL_ID $PROOF_HASH $IO_COMMITMENT $WEIGHT_COMMITMENT \
+  $NUM_LAYERS $JOB_ID $WORKER $SAGE_AMOUNT
+
+# Step 4: Anyone can verify
+starkli call $OBELYSK_VERIFIER is_verified $PROOF_ID
+# → 0x1 (TRUE)
+```
+
+---
+
+## How It Works
+
+```
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║                         STWO ML — PROVING PIPELINE                          ║
+╠═══════════════════════════════════════════════════════════════════════════════╣
+║                                                                             ║
+║   STEP 1: GPU PROVING                                                       ║
+║   ══════════════════                                                        ║
+║                                                                             ║
+║   Model Weights ─────→ stwo-ml (CUDA) ─────→ STARK Proofs                  ║
+║   (SafeTensors)            │                                                ║
+║                            ├─ MatMul ──→ Sumcheck Protocol (O(m+k+n))      ║
+║                            │             42-255x trace reduction             ║
+║                            │                                                ║
+║                            ├─ Activation → LogUp Lookup Tables              ║
+║                            │               ReLU / GELU / Sigmoid            ║
+║                            │                                                ║
+║                            ├─ Attention ─→ Composed Q/K/V Sumchecks        ║
+║                            │               Multi-head with softmax          ║
+║                            │                                                ║
+║                            └─ LayerNorm ─→ Mean/Variance Constraints       ║
+║                                                                             ║
+║   Output: AggregatedModelProof (~17 MB, 4 sumcheck + 1 activation STARK)   ║
+║                                                                             ║
+╠═══════════════════════════════════════════════════════════════════════════════╣
+║                                    │                                        ║
+║                                    ▼                                        ║
+║   STEP 2: RECURSIVE COMPRESSION                                            ║
+║   ══════════════════════════════                                            ║
+║                                                                             ║
+║   ML Proof ──→ Cairo ML Verifier ──→ cairo-prove ──→ Recursive STARK       ║
+║   (17 MB)      (obelysk_ml_air)      (proves the       (~1 KB)             ║
+║                 Sumcheck + MLE         verifier's                           ║
+║                 verification           execution)                           ║
+║                                                                             ║
+╠═══════════════════════════════════════════════════════════════════════════════╣
+║                                    │                                        ║
+║                                    ▼                                        ║
+║   STEP 3: ON-CHAIN SETTLEMENT                                              ║
+║   ════════════════════════════                                              ║
+║                                                                             ║
+║   Recursive Proof ──→ ObelyskVerifier (Starknet) ──→ VERIFIED              ║
+║   (~1 KB)              │                                                    ║
+║                        ├─ Verify proof fact                                 ║
+║                        ├─ Transfer SAGE payment (client → GPU worker)       ║
+║                        ├─ Record on-chain (proof_id → verified)             ║
+║                        └─ Emit 7 events for indexers & frontends            ║
+║                                                                             ║
+║   Single TX. Atomic. Trustless.                                             ║
+║                                                                             ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+```
+
+### Sumcheck MatMul — The Core Innovation
+
+Proving matrix multiplication `C = A @ B` the naive way requires materializing the entire O(m x k x n) computation as constraint rows. STWO ML uses the **sumcheck protocol** to reduce this to O(m + k + n):
+
+```
+                        SUMCHECK PROTOCOL FOR MATMUL
+
+  Traditional:    C[i,j] = A[i,0]*B[0,j] + A[i,1]*B[1,j] + ... + A[i,k]*B[k,j]
+                  → Must prove ALL m×k×n multiplications in trace
+                  → 128×128: 2,097,152 constraint rows
+
+  Sumcheck:       Encode A, B, C as multilinear extensions (MLEs)
+                  → log(k) rounds of interaction
+                  → Each round: prover sends p(X) = c₀ + c₁X + c₂X²
+                  → Verifier checks: p(0) + p(1) = claimed_sum
+                  → Verifier draws random challenge r
+                  → Final: single MLE opening check
+                  → 128×128: 49,152 rows (42x reduction)
+                  → 256×256: ~768 rows (255x reduction)
+```
+
+### LogUp for Activations
+
+Non-linear functions can't be arithmetized efficiently. Instead, STWO ML precomputes lookup tables and uses the **LogUp protocol** to prove every activation output exists in the table:
+
+```
+  ┌──────────────────┐     ┌──────────────────────────────┐
+  │ Activation Input  │────→│ Lookup Table (precomputed)    │
+  │ x = 1.5          │     │ ReLU(0.0) = 0.0              │
+  │                   │     │ ReLU(0.1) = 0.1              │
+  │ Output: 1.5       │     │ ...                          │
+  │ (ReLU(1.5) = 1.5) │←───│ ReLU(1.5) = 1.5  ← MATCH    │
+  └──────────────────┘     │ ...                          │
+                           └──────────────────────────────┘
+
+  LogUp proves the lookup without revealing WHICH entry was used.
+  Supports: ReLU, GELU, Sigmoid, Softmax
+```
+
+### Recursive Compression
+
+The ML verifier is itself a Cairo program. STWO proves its execution, producing a proof-of-the-verifier — a compact recursive STARK:
+
+```
+  17 MB ML Proof ──→ Cairo VM (verifies proof) ──→ Execution Trace ──→ 1 KB STARK
+                     └─ obelysk_ml_air:                                    │
+                        verify_matmul_sumcheck()                           │
+                        verify_mle_opening()                               │
+                        mix_fiat_shamir_channel()                          ▼
+                                                                    Fits in 1 TX
+```
+
+---
 
 ## Repository Structure
 
 ```
 stwo-ml/
-├── stwo/                    # Fork of StarkWare's STWO prover
-│   └── crates/stwo/         #   Circle STARK core + 20K lines GPU/CUDA
 │
-├── stwo-ml/                 # ML inference proving library (Rust)
+├── stwo/                              STWO CORE — StarkWare's Prover + Our GPU Backend
+│   └── crates/stwo/
+│       └── src/prover/backend/
+│           ├── simd/                  StarkWare's CPU backend
+│           ├── cpu/                   StarkWare's baseline
+│           └── gpu/                   ████ OURS ████  20,000+ lines CUDA
+│               ├── fft.rs             Circle FFT kernels (M31 field)
+│               ├── fri.rs             FRI commitment with GPU residency
+│               ├── merkle.rs          Blake2s GPU hashing
+│               ├── quotients.rs       Quotient accumulation
+│               ├── gkr.rs             MLE fold kernels
+│               ├── cuda_executor.rs   NVRTC compilation, multi-GPU
+│               ├── pipeline.rs        H2D → compute → D2H pipeline
+│               └── tee/               NVIDIA Confidential Computing
+│
+├── stwo-ml/                           ML PROVING LIBRARY — 11,000+ lines Rust
 │   └── src/
-│       ├── components/      #   MatMul, Activation, Attention, LayerNorm, F32
-│       ├── compiler/        #   ONNX import, graph builder, proving pipeline
-│       ├── aggregation.rs   #   Compose layer proofs into single STARK
-│       ├── cairo_serde.rs   #   Rust → felt252 serialization for Cairo
-│       ├── starknet.rs      #   On-chain calldata generation
-│       ├── backend.rs       #   GPU/CPU backend selection
-│       ├── gpu.rs           #   GPU-accelerated proof pipeline
-│       ├── tee.rs           #   NVIDIA TEE (confidential GPU) integration
-│       ├── receipt.rs       #   Streaming Verifiable Compute Receipts
-│       ├── crypto/          #   Poseidon channel, MLE commitments, Merkle
-│       └── gadgets/         #   Lookup tables, quantization, range checks
+│       ├── components/
+│       │   ├── matmul.rs              Sumcheck-based matrix multiplication (1,224 loc)
+│       │   ├── activation.rs          LogUp activation tables (255 loc)
+│       │   ├── attention.rs           Multi-head attention proofs (1,120 loc)
+│       │   ├── layernorm.rs           Layer normalization (182 loc)
+│       │   └── f32_ops.rs             Dual-track float verification (338 loc)
+│       │
+│       ├── compiler/
+│       │   ├── onnx.rs                ONNX model import (711 loc)
+│       │   ├── graph.rs               Computation graph builder (411 loc)
+│       │   ├── prove.rs               Proving pipeline (913 loc)
+│       │   ├── safetensors.rs         Weight loading (471 loc)
+│       │   ├── dual.rs                F32 dual-track verification (466 loc)
+│       │   └── inspect.rs             Model introspection (224 loc)
+│       │
+│       ├── aggregation.rs             Proof composition into single STARK (916 loc)
+│       ├── cairo_serde.rs             Rust → felt252 serialization bridge (776 loc)
+│       ├── starknet.rs                On-chain calldata generation (417 loc)
+│       ├── backend.rs                 GPU/CPU auto-dispatch (310 loc)
+│       ├── gpu.rs                     GPU-accelerated pipeline (403 loc)
+│       ├── tee.rs                     TEE attestation integration (274 loc)
+│       ├── receipt.rs                 Verifiable Compute Receipts (632 loc)
+│       └── crypto/
+│           ├── poseidon_channel.rs    Fiat-Shamir channel (249 loc)
+│           ├── mle_opening.rs         MLE commitments & proofs (352 loc)
+│           └── poseidon_merkle.rs     On-chain compatible Merkle (176 loc)
 │
-├── stwo-cairo/              # Cairo proving & verification
-│   ├── cairo-prove/         #   CLI: prove, verify, prove-ml subcommands
-│   ├── stwo_cairo_prover/   #   Rust prover for Cairo VM execution traces
-│   └── stwo_cairo_verifier/ #   Cairo verifier workspace
+├── stwo-cairo/                        CAIRO PROVING & RECURSIVE VERIFICATION
+│   ├── cairo-prove/                   CLI: prove | verify | prove-ml
+│   ├── stwo_cairo_prover/             Rust prover for Cairo VM traces
+│   └── stwo_cairo_verifier/           Cairo verifier workspace
 │       └── crates/
-│           ├── ml_air/      #     ML-specific AIR (sumcheck, MLE, LogUp)
-│           ├── ml_verifier/ #     Cairo executable for recursive proving
-│           ├── verifier_core/     STARK verifier primitives
-│           └── ...          #     constraint_framework, utils, etc.
+│           ├── ml_air/                ML-specific AIR (sumcheck, MLE, LogUp)
+│           ├── ml_verifier/           Cairo #[executable] for recursive proofs
+│           ├── verifier_core/         Generic STARK verifier (FRI, Merkle)
+│           └── constraint_framework/  Constraint evaluation primitives
 │
-├── stwo-ml-verifier/        # On-chain ObelyskVerifier contract (Cairo)
+├── stwo-ml-verifier/                  ON-CHAIN CONTRACT (Cairo/Starknet)
 │   └── src/
-│       ├── contract.cairo   #   verify_and_pay, register_model, 7 events
-│       └── interfaces.cairo #   IObelyskVerifier, IERC20 dispatcher
+│       ├── contract.cairo             ObelyskVerifier: verify_and_pay, 7 events
+│       └── interfaces.cairo           IObelyskVerifier, IERC20 dispatcher
 │
-└── docs/                    # Documentation
+└── docs/                              Documentation & technical specs
 ```
 
-## Components
+---
 
-### STWO (Fork) — Circle STARK Prover
-
-GPU-accelerated fork of [StarkWare's STWO](https://github.com/starkware-libs/stwo) — the fastest STARK prover, using Circle STARKs over the Mersenne-31 field (2^31 - 1).
-
-**What we added:**
-- **20,000+ lines of CUDA code** — FFT, FRI, Merkle, quotient evaluation, GKR on GPU
-- **Multi-GPU support** — distributed proving across multiple H100/H200 GPUs
-- **TEE integration** — NVIDIA Confidential Computing for encrypted proof generation
-- **Configurable GPU thresholds** — automatic CPU/GPU dispatch based on problem size
-
-### stwo-ml — ML Proving Library
-
-The core Rust library that turns neural network inference into STARK proofs.
-
-#### ML Components
-
-| Component | Technique | Trace Reduction | What It Proves |
-|-----------|-----------|-----------------|----------------|
-| **MatMul** | Sumcheck protocol | 42-255x | Matrix multiplication A @ B = C |
-| **Activation** | LogUp lookup tables | N/A (table-based) | ReLU, GELU, Sigmoid, Softmax |
-| **Attention** | Composed sumchecks | Per-head | Q/K/V projections + softmax + context |
-| **LayerNorm** | Mean/variance constraints | ~4x dim | Normalization over last dimension |
-| **F32 Ops** | Dual-track proving | N/A | Float32 with fixed-point verification |
-
-#### Sumcheck MatMul — The Core Innovation
-
-Traditional approach to proving `C = A @ B` requires O(m x k x n) constraint rows. Our sumcheck-based approach reduces this to O(m + k + n):
-
-```
-Given: A (m x k), B (k x n), C (m x n)
-
-1. Encode A, B, C as multilinear extensions (MLEs) over boolean hypercube
-2. Reduce C[i,j] = sum_l A[i,l]*B[l,j] to sumcheck protocol
-3. Prover sends round polynomials p_r(X) = c0 + c1*X + c2*X^2
-4. Verifier checks p_r(0) + p_r(1) = claimed_sum per round
-5. Final: verify MLE openings at challenge point
-
-128x128 MatMul: 2.1M rows → 49K rows (42x reduction)
-256x256 MatMul: 16M rows → 768 rows (255x reduction)
-```
-
-#### Model Compilation Pipeline
-
-```
-ONNX/SafeTensors → ComputationGraph → Per-layer Proofs → Aggregated STARK
-     │                    │                    │                  │
-  load_onnx()      GraphBuilder         prove_model()    prove_model_aggregated()
-                   .matmul()              (parallel)       (single STARK for
-                   .activation()                            all activations)
-                   .attention()
-                   .layernorm()
-```
-
-#### Proof Aggregation
-
-Multiple activation proofs are composed into a single aggregated STARK, while matmul sumcheck proofs remain separate (they're already compact):
-
-```
-Layer 0: MatMul₀ (sumcheck) + ReLU₀ ─┐
-Layer 1: MatMul₁ (sumcheck) + ReLU₁ ─┤──→ Single STARK (all activations)
-Layer 2: MatMul₂ (sumcheck) + GELU₂ ─┘    + N sumcheck proofs (matmuls)
-```
-
-### stwo-cairo — Recursive Proof Compression
-
-#### cairo-prove CLI
-
-```bash
-# Prove a Cairo program execution
-cairo-prove prove <executable.json> <proof.json> --arguments 42,100
-
-# Verify a proof
-cairo-prove verify <proof.json>
-
-# Generate recursive ML proof (compresses 17MB → ~1KB)
-cairo-prove prove-ml \
-  --verifier-executable ml_verifier.executable.json \
-  --ml-proof ml_proof.json \
-  --output recursive_proof.json \
-  --gpu
-```
-
-#### ML Cairo Verifier (obelysk_ml_air)
-
-Cairo implementation of the ML proof verifier, designed to run inside the Cairo VM so its execution can itself be proven:
-
-- **Sumcheck verifier** — validates round polynomials and challenge derivation
-- **MLE opening verifier** — Poseidon Merkle path verification
-- **Fiat-Shamir channel** — deterministic challenge generation matching Rust prover
-- **5 Cairo tests** covering round evaluation, proof validation, and edge cases
-
-### ObelyskVerifier — On-Chain Contract
-
-Starknet contract for single-transaction verification with SAGE token payment:
-
-```
-verify_and_pay(model_id, proof_hash, io_commitment, weight_commitment,
-               num_layers, job_id, worker, sage_amount) → bool
-```
-
-**7 events per verification:**
-1. `JobCreated` — job registered
-2. `ProofSubmitted` — proof fact recorded
-3. `InferenceVerified` — verification passed with full metadata
-4. `PaymentProcessed` — SAGE transferred from client to worker
-5. `WorkerRewarded` — worker payment confirmed
-6. `VerificationComplete` — final summary with proof ID
-
-**Additional functions:** `register_model`, `is_verified`, `get_model_verification_count`
-
-## Getting Started
+## Building & Testing
 
 ### Prerequisites
 
-- **Rust** nightly (1.88+, 1.89+ for cairo-prove)
-- **CUDA Toolkit** 12.4+ (for GPU proving)
-- **Scarb** 2.12+ (for Cairo contracts)
-- **starkli** (for Starknet deployment)
+| Tool | Version | Required For |
+|------|---------|-------------|
+| Rust | nightly 1.88+ | Core library |
+| CUDA Toolkit | 12.4+ | GPU proving |
+| Scarb | 2.12+ | Cairo contracts |
+| starkli | latest | Starknet deployment |
 
-### Build
+### Build Commands
 
 ```bash
-# CPU-only build
-cd stwo-ml && cargo build --release
+# ─── CPU Mode (works everywhere) ──────────────────────────────────
+cargo build --release -p stwo-ml
 
-# GPU build (requires CUDA)
-cd stwo-ml && cargo build --release --features cuda-runtime
+# ─── GPU Mode (NVIDIA H100/H200/B200) ────────────────────────────
+export LD_LIBRARY_PATH=/usr/local/cuda-12.4/lib64:$LD_LIBRARY_PATH
+cargo build --release -p stwo-ml --features cuda-runtime
 
-# Build Cairo ML verifier
+# ─── Cairo ML Verifier ────────────────────────────────────────────
 cd stwo-cairo/stwo_cairo_verifier && scarb build
 
-# Build ObelyskVerifier contract
+# ─── ObelyskVerifier Contract ─────────────────────────────────────
 cd stwo-ml-verifier && scarb build
 ```
 
-### Run Tests
+### Test Suite
 
 ```bash
-# stwo-ml library tests (177 tests)
-cd stwo-ml && cargo test --lib
+# ─── All library tests (177 tests, ~2 min) ────────────────────────
+cargo test --lib -p stwo-ml
 
-# Cairo ML AIR tests (5 tests)
+# ─── Cairo sumcheck verifier (5 tests) ────────────────────────────
 cd stwo-cairo/stwo_cairo_verifier && scarb test -p obelysk_ml_air
 
-# GPU pipeline integration tests (requires H200)
-cd stwo-ml && cargo test --test gpu_pipeline --features cuda-runtime
+# ─── GPU integration tests (requires NVIDIA GPU) ──────────────────
+cargo test --test gpu_pipeline -p stwo-ml --features cuda-runtime
 
-# Scale tests (512x512 → 2048x2048 matmul)
-cd stwo-ml && cargo test --test scale_matmul --release
+# ─── Scale tests (512x512 → 2048x2048 matmul) ────────────────────
+cargo test --test scale_matmul -p stwo-ml --release
 ```
 
-### Prove ML Inference (Full Pipeline)
-
-```bash
-# Step 1: Prove ML inference on GPU
-prove-qwen --model qwen3-14b --input "Hello world" --output ml_proof.json --gpu
-
-# Step 2: Generate recursive proof
-cairo-prove prove-ml \
-  --verifier-executable ml_verifier.executable.json \
-  --ml-proof ml_proof.json \
-  --output recursive_proof.json
-
-# Step 3: Submit to Starknet
-starkli invoke $OBELYSK_VERIFIER verify_and_pay \
-  $MODEL_ID $PROOF_HASH $IO_COMMITMENT $WEIGHT_COMMITMENT \
-  $NUM_LAYERS $JOB_ID $WORKER $SAGE_AMOUNT
-
-# Step 4: Check verification
-starkli call $OBELYSK_VERIFIER is_verified $PROOF_ID
 ```
+╔════════════════════════╦════════╦══════════════════════════════════════════╗
+║  Test Suite             ║ Count  ║ Coverage                                ║
+╠════════════════════════╬════════╬══════════════════════════════════════════╣
+║  stwo-ml (lib)          ║  177   ║ MatMul, activations, attention, ONNX,   ║
+║                         ║        ║ graph, aggregation, crypto, serialization║
+╠════════════════════════╬════════╬══════════════════════════════════════════╣
+║  stwo-ml (integration)  ║   32   ║ GPU pipeline, scale testing (2048x2048) ║
+╠════════════════════════╬════════╬══════════════════════════════════════════╣
+║  obelysk_ml_air (Cairo) ║    5   ║ Sumcheck verifier, round polynomials    ║
+╠════════════════════════╬════════╬══════════════════════════════════════════╣
+║  cairo_serde            ║   14   ║ Rust→felt252 roundtrips                 ║
+╠════════════════════════╬════════╬══════════════════════════════════════════╣
+║  ObelyskVerifier        ║   --   ║ Compiles, produces contract artifacts   ║
+╚════════════════════════╩════════╩══════════════════════════════════════════╝
+```
+
+---
 
 ## Feature Flags
 
-| Flag | Description | Requires |
-|------|-------------|----------|
-| `std` (default) | Standard library + STWO prover | — |
-| `gpu` | GPU kernel sources (no runtime) | — |
-| `cuda-runtime` | Full CUDA GPU execution | CUDA 12.4+ |
-| `multi-gpu` | Distributed multi-GPU proving | `cuda-runtime` |
-| `tee` | NVIDIA Confidential Computing | `cuda-runtime` + H100/H200 |
-| `onnx` | ONNX model import | — |
-| `safetensors` | SafeTensors weight loading | — |
-| `model-loading` | Both ONNX + SafeTensors | — |
+```
+╔══════════════════╦══════════════════════════════════════╦═══════════════════════╗
+║  Flag             ║  What It Does                        ║  Requires             ║
+╠══════════════════╬══════════════════════════════════════╬═══════════════════════╣
+║  std (default)    ║  Standard library + STWO prover      ║  —                    ║
+║  gpu              ║  GPU kernel sources (no runtime)     ║  —                    ║
+║  cuda-runtime     ║  Full CUDA GPU execution             ║  CUDA 12.4+           ║
+║  multi-gpu        ║  Distributed multi-GPU proving       ║  cuda-runtime         ║
+║  tee              ║  NVIDIA Confidential Computing       ║  cuda-runtime + H100+ ║
+║  onnx             ║  ONNX model import via tract-onnx    ║  —                    ║
+║  safetensors      ║  SafeTensors weight loading          ║  —                    ║
+║  model-loading    ║  Both ONNX + SafeTensors             ║  —                    ║
+╚══════════════════╩══════════════════════════════════════╩═══════════════════════╝
+```
 
-## Test Coverage
+---
 
-| Crate | Tests | What's Covered |
-|-------|-------|----------------|
-| stwo-ml (lib) | 177 | MatMul sumcheck, activations, attention, ONNX, graph, aggregation, serialization, crypto |
-| stwo-ml (integration) | 32 | GPU pipeline, scale testing (up to 2048x2048) |
-| obelysk_ml_air (Cairo) | 5 | Sumcheck verifier, round polynomial evaluation |
-| cairo_serde | 14 | Rust→felt252 serialization roundtrips |
-| ObelyskVerifier | Compiles | Contract artifact generation |
+## Performance
+
+```
+╔══════════════════════════════╦════════════╦══════════════════════════════════╗
+║  Operation                    ║  Time      ║  Hardware                        ║
+╠══════════════════════════════╬════════════╬══════════════════════════════════╣
+║  128×128 MatMul prove         ║  11 ms     ║  Apple M3 (release)              ║
+║  512×512 MatMul prove         ║  11 ms     ║  Apple M3 (release)              ║
+║  2048×2048 MatMul prove       ║  189 ms    ║  Apple M3 (496 MB memory)        ║
+║  Qwen3-14B full prove         ║  40.52 s   ║  NVIDIA H200 (GPU)               ║
+║  Qwen3-14B verify             ║  209 ms    ║  CPU                             ║
+║  Recursive compression        ║  ~30 s     ║  NVIDIA H200 (GPU)               ║
+║  On-chain verification        ║  1 TX      ║  Starknet Sepolia                ║
+╠══════════════════════════════╬════════════╬══════════════════════════════════╣
+║  GPU FFT speedup              ║  174x      ║  vs CPU SIMD backend             ║
+║  MatMul trace reduction       ║  42-255x   ║  vs naive constraint approach    ║
+║  Proof compression            ║  17000x    ║  17 MB → ~1 KB (recursive)       ║
+╚══════════════════════════════╩════════════╩══════════════════════════════════╝
+```
+
+---
 
 ## Deployed Contracts (Starknet Sepolia)
 
-| Contract | Address |
-|----------|---------|
-| ObelyskVerifier (v3) | `0x04f8c5377d94baa15291832dc3821c2fc235a95f0823f86add32f828ea965a15` |
-| SAGE Token | `0x072349097c8a802e7f66dc96b95aca84e4d78ddad22014904076c76293a99850` |
+| Contract | Address | Explorer |
+|----------|---------|---------|
+| **ObelyskVerifier v3** | `0x04f8c537...a965a15` | [View on Voyager](https://sepolia.voyager.online/contract/0x04f8c5377d94baa15291832dc3821c2fc235a95f0823f86add32f828ea965a15) |
+| **SAGE Token** | `0x0723490...a99850` | [View on Voyager](https://sepolia.voyager.online/contract/0x072349097c8a802e7f66dc96b95aca84e4d78ddad22014904076c76293a99850) |
+| **StweMlStarkVerifier** | `0x005928a...74fba` | [View on Voyager](https://sepolia.voyager.online/contract/0x005928ac548dc2719ef1b34869db2b61c2a55a4b148012fad742262a8d674fba) |
 
-## How It Works
-
-### 1. Sumcheck Protocol for MatMul
-
-The key insight: matrix multiplication `C = A @ B` can be expressed as a sum over a multilinear extension (MLE), then verified via the sumcheck protocol in logarithmic rounds instead of materializing the full trace.
-
-Each round, the prover sends a degree-2 polynomial. The verifier:
-1. Checks `p(0) + p(1) = claimed_sum`
-2. Draws a random challenge `r`
-3. Updates `claimed_sum = p(r)`
-
-After `log(k)` rounds, the verifier makes a single MLE opening query to confirm the final evaluation.
-
-### 2. LogUp for Activations
-
-Non-linear functions (ReLU, GELU, sigmoid) are proven via precomputed lookup tables using the LogUp protocol. The prover demonstrates that every activation output exists in the table without revealing which entry was used.
-
-### 3. Recursive Compression
-
-The ML verifier itself is a Cairo program. When it verifies an ML proof, its execution trace can be proven by STWO, producing a compact recursive STARK. This compresses a 17 MB ML proof down to ~1 KB that fits in a single Starknet transaction.
-
-### 4. On-Chain Settlement
-
-The ObelyskVerifier contract accepts recursive proofs and atomically:
-- Verifies the proof fact (trusted submitter pattern, upgradeable to Integrity fact registry)
-- Transfers SAGE tokens from client to GPU worker
-- Emits 7 indexable events for frontends and analytics
-
-## Performance Benchmarks
-
-| Operation | Time | Hardware |
-|-----------|------|----------|
-| 128x128 MatMul prove | 11ms | Apple M3 (release) |
-| 512x512 MatMul prove | 11ms | Apple M3 (release) |
-| 2048x2048 MatMul prove | 189ms | Apple M3 (496 MB) |
-| Qwen3-14B full prove | 40.52s | NVIDIA H200 |
-| Qwen3-14B verify | 209ms | CPU |
-| On-chain verification | 1 TX | Starknet Sepolia |
+---
 
 ## Security
 
-- **96-bit security** (configurable via PCS params)
-- **No trusted setup** — FRI-based, fully transparent
-- **Fiat-Shamir** via Poseidon hash (matches Cairo verifier exactly)
-- **TEE option** — model weights never leave encrypted GPU memory (NVIDIA CC-On)
+```
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  96-bit security (configurable)                                 │
+  │  No trusted setup — FRI-based, fully transparent                │
+  │  Fiat-Shamir via Poseidon (matches Cairo verifier exactly)      │
+  │  TEE option — model weights never leave encrypted GPU memory    │
+  │  NVIDIA Confidential Computing (CC-On) on H100/H200/B200       │
+  └─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+```bash
+# Fork → Branch → Code → Test → PR
+git checkout -b feat/your-feature
+cargo test --lib -p stwo-ml
+# Open PR against main
+```
+
+---
 
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE) for details.
 
-Built on [STWO](https://github.com/starkware-libs/stwo) by StarkWare.
+Built on [STWO](https://github.com/starkware-libs/stwo) by [StarkWare](https://starkware.co).
 
 ---
 
 <p align="center">
-  <strong>Bitsage Network</strong> — Verifiable AI on Starknet
+  <img src="https://raw.githubusercontent.com/Bitsage-Network/Obelysk-Protocol/main/apps/web/public/obelysk-logo.png" alt="Obelysk" width="60"/>
+</p>
+
+<p align="center">
+  <strong><a href="https://github.com/Bitsage-Network">Bitsage Network</a></strong> — Verifiable AI on Starknet
+</p>
+
+<p align="center">
+  <a href="https://github.com/Bitsage-Network/Obelysk-Protocol">Obelysk Protocol</a> · <a href="https://github.com/Bitsage-Network/stwo-ml">STWO ML</a> · <a href="https://github.com/Bitsage-Network/stwo-ml/tree/main/docs">Docs</a>
 </p>
