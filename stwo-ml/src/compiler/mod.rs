@@ -30,3 +30,5 @@ pub mod inspect;
 pub mod safetensors;
 pub mod quantize_weights;
 pub mod dual;
+pub mod checkpoint;
+pub mod chunked;

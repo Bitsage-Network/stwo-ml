@@ -26,6 +26,7 @@ pub mod tee;
 pub mod cairo_serde;
 pub mod receipt;
 pub mod crypto;
+pub mod json_serde;
 
 /// Re-export core STWO types used throughout stwo-ml.
 pub mod prelude {

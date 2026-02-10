@@ -125,6 +125,22 @@ pub fn summarize_graph(graph: &ComputationGraph, weights: &GraphWeights) -> Mode
                 // 4 weight matrices: W_Q, W_K, W_V, W_O each (d_model, d_model)
                 (format!("Attention({}h)", config.num_heads), 4 * d * d)
             }
+            GraphOp::Add { .. } => {
+                num_other += 1;
+                ("Add".to_string(), 0)
+            }
+            GraphOp::Mul { .. } => {
+                num_other += 1;
+                ("Mul".to_string(), 0)
+            }
+            GraphOp::Embedding { vocab_size, embed_dim } => {
+                num_other += 1;
+                ("Embedding".to_string(), vocab_size * embed_dim)
+            }
+            GraphOp::Conv2D { in_channels, out_channels, kernel_size, .. } => {
+                num_other += 1;
+                ("Conv2D".to_string(), in_channels * out_channels * kernel_size * kernel_size)
+            }
             GraphOp::Identity { .. } => {
                 num_other += 1;
                 ("Identity".to_string(), 0)

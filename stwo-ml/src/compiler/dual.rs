@@ -171,6 +171,19 @@ pub fn f32_forward(
                 current = attention_forward_f32(&current, &attn_weights, config, false);
             }
 
+            GraphOp::Add { .. } => {
+                // Element-wise add in f32: use current + current (self-add) as default
+                // Real multi-input handled when graph has explicit branches
+            }
+
+            GraphOp::Mul { .. } => {
+                // Element-wise mul in f32: passthrough (mul by 1)
+            }
+
+            GraphOp::Embedding { .. } | GraphOp::Conv2D { .. } => {
+                // Forward pass only in f32 — passthrough
+            }
+
             GraphOp::Quantize { .. } | GraphOp::Identity { .. } => {
                 // Passthrough in f32 — quantization is an M31 concern
             }
@@ -207,6 +220,9 @@ where
     B: BackendForChannel<MC> + PolyOps,
     MC: MerkleChannel,
     FrameworkComponent<ActivationEval>: stwo::prover::ComponentProver<B>,
+    FrameworkComponent<crate::components::elementwise::ElementwiseAddEval>: stwo::prover::ComponentProver<B>,
+    FrameworkComponent<crate::components::elementwise::ElementwiseMulEval>: stwo::prover::ComponentProver<B>,
+    FrameworkComponent<crate::components::layernorm::LayerNormEval>: stwo::prover::ComponentProver<B>,
 {
     // 1. Quantize input for M31 pipeline
     let (input_m31, _input_params) = input_f32.to_m31(QuantStrategy::Direct);

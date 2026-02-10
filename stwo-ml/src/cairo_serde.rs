@@ -370,14 +370,50 @@ pub struct MLClaimMetadata {
     pub weight_commitment: FieldElement,
 }
 
+/// Serialize a lightweight Add or Mul layer claim.
+///
+/// Layout:
+/// - `layer_index` (u32, 1 felt)
+/// - `trace_rows` (u32, 1 felt)
+///
+/// Add/Mul are pure AIR (no LogUp), verified inside the unified STARK.
+fn serialize_elementwise_claim(
+    claim: &LayerClaim,
+    output: &mut Vec<FieldElement>,
+) {
+    serialize_u32(claim.layer_index as u32, output);
+    serialize_u32(claim.trace_rows as u32, output);
+}
+
+/// Serialize a lightweight LayerNorm layer claim.
+///
+/// Layout:
+/// - `layer_index` (u32, 1 felt)
+/// - `trace_rows` (u32, 1 felt)
+/// - `claimed_sum` (QM31, 4 felts — LogUp claimed sum)
+///
+/// LayerNorm uses LogUp for range-checking rsqrt values, so we include
+/// the claimed_sum for the verifier to check the LogUp argument.
+fn serialize_layernorm_claim(
+    claim: &LayerClaim,
+    output: &mut Vec<FieldElement>,
+) {
+    serialize_u32(claim.layer_index as u32, output);
+    serialize_u32(claim.trace_rows as u32, output);
+    serialize_qm31(claim.claimed_sum, output);
+}
+
 /// Serialize an ML proof for the recursive Cairo verifier.
 ///
-/// Output format matches Cairo's `MLProof { claim, matmul_proofs, channel_salt, activation_stark_proof }`:
+/// Output format matches Cairo's `MLProof { claim, matmul_proofs, channel_salt, unified_stark_proof }`:
 ///
 /// 1. MLClaim: model_id, num_layers, activation_type, io_commitment, weight_commitment
 /// 2. matmul_proofs: Array<MatMulSumcheckProofOnChain> (10-field version, no MLE openings)
 /// 3. channel_salt: Option<u64> (0 for None, 1 + value for Some)
-/// 4. activation_stark_proof: Option<ActivationStarkProof> (0 for None, 1 + proof for Some)
+/// 4. unified_stark_proof: Option<UnifiedStarkProof> (0 for None, 1 + proof for Some)
+/// 5. add_claims: Array<ElementwiseClaim> (layer_index + trace_rows)
+/// 6. mul_claims: Array<ElementwiseClaim> (layer_index + trace_rows)
+/// 7. layernorm_claims: Array<LayerNormClaim> (layer_index + trace_rows + claimed_sum)
 pub fn serialize_ml_proof_for_recursive(
     proof: &AggregatedModelProofOnChain,
     metadata: &MLClaimMetadata,
@@ -410,8 +446,8 @@ pub fn serialize_ml_proof_for_recursive(
         }
     }
 
-    // 4. activation_stark_proof: Option<ActivationStarkProof>
-    match &proof.activation_stark {
+    // 4. unified_stark_proof: Option<UnifiedStarkProof>
+    match &proof.unified_stark {
         None => {
             serialize_u32(0, &mut output); // Cairo Option::None variant index
         }
@@ -424,6 +460,24 @@ pub fn serialize_ml_proof_for_recursive(
                 &mut output,
             );
         }
+    }
+
+    // 5. add_claims: Array<ElementwiseClaim>
+    serialize_u32(proof.add_claims.len() as u32, &mut output);
+    for claim in &proof.add_claims {
+        serialize_elementwise_claim(claim, &mut output);
+    }
+
+    // 6. mul_claims: Array<ElementwiseClaim>
+    serialize_u32(proof.mul_claims.len() as u32, &mut output);
+    for claim in &proof.mul_claims {
+        serialize_elementwise_claim(claim, &mut output);
+    }
+
+    // 7. layernorm_claims: Array<LayerNormClaim>
+    serialize_u32(proof.layernorm_claims.len() as u32, &mut output);
+    for claim in &proof.layernorm_claims {
+        serialize_layernorm_claim(claim, &mut output);
     }
 
     output
@@ -549,6 +603,39 @@ pub fn serialize_ml_proof_to_arguments_file(
 }
 
 // === Deserialization (Cairo felt252[] → Rust types) ===
+
+// === Tiled MatMul Proof Serialization ===
+
+use crate::components::tiled_matmul::TiledMatMulProof;
+
+/// Serialize a `TiledMatMulProof` to felt252 array.
+///
+/// Layout: `m, k, n, tile_k, num_tiles, [tile_proofs...], total_claimed_sum`
+///
+/// Each tile proof uses the standard `serialize_matmul_sumcheck_proof` format.
+/// This allows the Cairo verifier to deserialize and verify each tile independently,
+/// then check `sum(tile_claimed_sums) == total_claimed_sum`.
+pub fn serialize_tiled_matmul_proof(
+    proof: &TiledMatMulProof,
+    output: &mut Vec<FieldElement>,
+) {
+    serialize_u32(proof.m as u32, output);
+    serialize_u32(proof.k as u32, output);
+    serialize_u32(proof.n as u32, output);
+    serialize_u32(proof.tile_k as u32, output);
+    serialize_u32(proof.tile_proofs.len() as u32, output);
+
+    for tile in &proof.tile_proofs {
+        // k_start and k_end for this tile
+        serialize_u32(tile.k_start as u32, output);
+        serialize_u32(tile.k_end as u32, output);
+        // The standard matmul proof for this tile
+        serialize_matmul_sumcheck_proof(&tile.proof, output);
+    }
+
+    // Total claimed sum (QM31 = 4 felts)
+    serialize_qm31(proof.total_claimed_sum, output);
+}
 
 /// Deserialize a receipt hash from a felt252 value.
 pub fn felt_to_receipt_hash(felt: &FieldElement) -> [u8; 32] {
@@ -784,8 +871,11 @@ mod tests {
         let matmul_proof = prove_matmul_sumcheck_onchain(&a, &b, &c).unwrap();
 
         let aggregated = AggregatedModelProofOnChain {
-            activation_stark: None,
+            unified_stark: None,
             matmul_proofs: vec![(0, matmul_proof)],
+            add_claims: Vec::new(),
+            mul_claims: Vec::new(),
+            layernorm_claims: Vec::new(),
             execution: crate::compiler::prove::GraphExecution {
                 intermediates: vec![],
                 output: M31Matrix::new(1, 1),
@@ -823,8 +913,11 @@ mod tests {
         // Total should be reasonable
         assert!(felts.len() > 20, "serialized too small: {} felts", felts.len());
 
-        // 4th field: activation_stark_proof = Option::None (trailing 0)
-        assert_eq!(felts[felts.len() - 1], FieldElement::ZERO, "activation_stark_proof = None");
+        // Trailing sections: unified_stark(0), add_claims(0), mul_claims(0), layernorm_claims(0)
+        assert_eq!(felts[felts.len() - 4], FieldElement::ZERO, "unified_stark_proof = None");
+        assert_eq!(felts[felts.len() - 3], FieldElement::ZERO, "add_claims count = 0");
+        assert_eq!(felts[felts.len() - 2], FieldElement::ZERO, "mul_claims count = 0");
+        assert_eq!(felts[felts.len() - 1], FieldElement::ZERO, "layernorm_claims count = 0");
 
         // Test arguments file generation
         let json = serialize_ml_proof_to_arguments_file(&felts);
@@ -843,8 +936,11 @@ mod tests {
         let matmul_proof = prove_matmul_sumcheck_onchain(&a, &a, &c).unwrap();
 
         let aggregated = AggregatedModelProofOnChain {
-            activation_stark: None,
+            unified_stark: None,
             matmul_proofs: vec![(0, matmul_proof)],
+            add_claims: Vec::new(),
+            mul_claims: Vec::new(),
+            layernorm_claims: Vec::new(),
             execution: crate::compiler::prove::GraphExecution {
                 intermediates: vec![],
                 output: M31Matrix::new(1, 1),
@@ -868,16 +964,21 @@ mod tests {
         // Salt adds 1 extra felt (variant index 1 + value) vs (variant index 0)
         assert_eq!(with_salt.len(), no_salt.len() + 1);
 
-        // Both end with activation_stark_proof = Option::None (trailing 0)
-        assert_eq!(no_salt[no_salt.len() - 1], FieldElement::ZERO, "activation_stark = None");
-        assert_eq!(with_salt[with_salt.len() - 1], FieldElement::ZERO, "activation_stark = None");
+        // Both end with: unified_stark(0), add_claims(0), mul_claims(0), layernorm_claims(0)
+        assert_eq!(no_salt[no_salt.len() - 1], FieldElement::ZERO, "layernorm_claims = 0");
+        assert_eq!(no_salt[no_salt.len() - 2], FieldElement::ZERO, "mul_claims = 0");
+        assert_eq!(no_salt[no_salt.len() - 3], FieldElement::ZERO, "add_claims = 0");
+        assert_eq!(no_salt[no_salt.len() - 4], FieldElement::ZERO, "unified_stark = None");
 
-        // no_salt layout ends: ..., channel_salt=None(0), activation_stark=None(0)
-        assert_eq!(no_salt[no_salt.len() - 2], FieldElement::ZERO, "channel_salt = None");
+        assert_eq!(with_salt[with_salt.len() - 1], FieldElement::ZERO, "layernorm_claims = 0");
+        assert_eq!(with_salt[with_salt.len() - 4], FieldElement::ZERO, "unified_stark = None");
 
-        // with_salt layout ends: ..., channel_salt=Some(1), 12345, activation_stark=None(0)
-        assert_eq!(with_salt[with_salt.len() - 3], FieldElement::from(1u64), "channel_salt = Some");
-        assert_eq!(with_salt[with_salt.len() - 2], FieldElement::from(12345u64), "salt value");
+        // no_salt layout ends: ..., channel_salt=None(0), unified_stark=None(0), add(0), mul(0), layernorm(0)
+        assert_eq!(no_salt[no_salt.len() - 5], FieldElement::ZERO, "channel_salt = None");
+
+        // with_salt layout ends: ..., channel_salt=Some(1), 12345, unified_stark=None(0), add(0), mul(0), layernorm(0)
+        assert_eq!(with_salt[with_salt.len() - 6], FieldElement::from(1u64), "channel_salt = Some");
+        assert_eq!(with_salt[with_salt.len() - 5], FieldElement::from(12345u64), "salt value");
     }
 
     #[test]
@@ -955,8 +1056,11 @@ mod tests {
 
         // Without activation STARK
         let aggregated_none = AggregatedModelProofOnChain {
-            activation_stark: None,
+            unified_stark: None,
             matmul_proofs: vec![(0, matmul_proof.clone())],
+            add_claims: Vec::new(),
+            mul_claims: Vec::new(),
+            layernorm_claims: Vec::new(),
             execution: crate::compiler::prove::GraphExecution {
                 intermediates: vec![],
                 output: M31Matrix::new(1, 1),
@@ -972,8 +1076,11 @@ mod tests {
             trace_rows: 4,
         }];
         let aggregated_some = AggregatedModelProofOnChain {
-            activation_stark: Some(activation_proof),
+            unified_stark: Some(activation_proof),
             matmul_proofs: vec![(0, matmul_proof)],
+            add_claims: Vec::new(),
+            mul_claims: Vec::new(),
+            layernorm_claims: Vec::new(),
             execution: crate::compiler::prove::GraphExecution {
                 intermediates: vec![],
                 output: M31Matrix::new(1, 1),
@@ -990,21 +1097,22 @@ mod tests {
             felts_some.len(),
         );
 
-        // None ends with: channel_salt=None(0), activation_stark=None(0)
-        assert_eq!(felts_none[felts_none.len() - 1], FieldElement::ZERO, "activation_stark = None");
-        assert_eq!(felts_none[felts_none.len() - 2], FieldElement::ZERO, "channel_salt = None");
+        // None ends with: channel_salt=None(0), unified_stark=None(0), add(0), mul(0), layernorm(0)
+        assert_eq!(felts_none[felts_none.len() - 1], FieldElement::ZERO, "layernorm_claims = 0");
+        assert_eq!(felts_none[felts_none.len() - 4], FieldElement::ZERO, "unified_stark = None");
+        assert_eq!(felts_none[felts_none.len() - 5], FieldElement::ZERO, "channel_salt = None");
 
         // Some path: both share the same prefix up to channel_salt
-        // The None path is: [MLClaim(5) + matmul_array + channel_salt(1) + activation_none(1)]
-        // The Some path is: [MLClaim(5) + matmul_array + channel_salt(1) + activation_some(1) + data...]
-        // The divergence point is at felts_none.len() - 1 (activation discriminant)
-        let diverge_idx = felts_none.len() - 1;
+        // The None path is: [MLClaim(5) + matmul_array + channel_salt(1) + activation_none(1) + add(0) + mul(0) + layernorm(0)]
+        // The Some path is: [MLClaim(5) + matmul_array + channel_salt(1) + activation_some(1) + data... + add(0) + mul(0) + layernorm(0)]
+        // The divergence point is at felts_none.len() - 4 (activation discriminant)
+        let diverge_idx = felts_none.len() - 4;
         assert_eq!(felts_none[diverge_idx], FieldElement::ZERO, "None discriminant");
         assert_eq!(felts_some[diverge_idx], FieldElement::from(1u64), "Some discriminant");
     }
 
     #[test]
-    fn test_serialize_activation_stark_proof_with_real_proof() {
+    fn test_serialize_unified_stark_proof_with_real_proof() {
         use crate::components::matmul::{M31Matrix, matmul_m31, prove_matmul_sumcheck_onchain};
         use stwo::prover::backend::simd::SimdBackend;
         use crate::compiler::prove::prove_activation_layer;
@@ -1037,8 +1145,11 @@ mod tests {
         }];
 
         let aggregated = AggregatedModelProofOnChain {
-            activation_stark: Some(activation_proof),
+            unified_stark: Some(activation_proof),
             matmul_proofs: vec![(0, matmul_proof)],
+            add_claims: Vec::new(),
+            mul_claims: Vec::new(),
+            layernorm_claims: Vec::new(),
             execution: crate::compiler::prove::GraphExecution {
                 intermediates: vec![],
                 output: M31Matrix::new(1, 1),
@@ -1088,8 +1199,8 @@ mod tests {
         assert_eq!(felts[idx], FieldElement::ZERO, "channel_salt = None");
         idx += 1;
 
-        // Field 4: activation_stark_proof = Option::Some (discriminant = 1)
-        assert_eq!(felts[idx], FieldElement::from(1u64), "activation_stark = Some");
+        // Field 4: unified_stark_proof = Option::Some (discriminant = 1)
+        assert_eq!(felts[idx], FieldElement::from(1u64), "unified_stark = Some");
         idx += 1;
 
         // Inside ActivationStarkProof:
@@ -1145,5 +1256,143 @@ mod tests {
             idx,
             felts.len(),
         );
+    }
+
+    #[test]
+    fn test_serialize_elementwise_claim() {
+        let claim = LayerClaim {
+            layer_index: 3,
+            claimed_sum: SecureField::default(),
+            trace_rows: 16,
+        };
+        let mut output = Vec::new();
+        serialize_elementwise_claim(&claim, &mut output);
+
+        // Layout: layer_index(1) + trace_rows(1)
+        assert_eq!(output.len(), 2, "elementwise claim = 2 felt252s");
+        assert_eq!(output[0], FieldElement::from(3u64), "layer_index");
+        assert_eq!(output[1], FieldElement::from(16u64), "trace_rows");
+    }
+
+    #[test]
+    fn test_serialize_layernorm_claim() {
+        let claim = LayerClaim {
+            layer_index: 7,
+            claimed_sum: SecureField::from(M31::from(42)),
+            trace_rows: 16,
+        };
+        let mut output = Vec::new();
+        serialize_layernorm_claim(&claim, &mut output);
+
+        // Layout: layer_index(1) + trace_rows(1) + claimed_sum(4)
+        assert_eq!(output.len(), 6, "layernorm claim = 6 felt252s");
+        assert_eq!(output[0], FieldElement::from(7u64), "layer_index");
+        assert_eq!(output[1], FieldElement::from(16u64), "trace_rows");
+        // claimed_sum at [2..6] — first component should be 42
+        assert_eq!(output[2], FieldElement::from(42u64), "claimed_sum[0]");
+    }
+
+    #[test]
+    fn test_serialize_ml_proof_with_add() {
+        use crate::components::matmul::M31Matrix;
+        use crate::compiler::graph::GraphBuilder;
+        use crate::components::activation::ActivationType;
+        use crate::aggregation::prove_model_aggregated_onchain;
+
+        // Build a model with a residual Add
+        let mut builder = GraphBuilder::new((1, 8));
+        builder.linear(8);
+        let branch = builder.fork();
+        builder.activation(ActivationType::ReLU);
+        builder.linear(8);
+        builder.add_from(branch);
+        builder.linear(4);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 8);
+        for j in 0..8 { input.set(0, j, M31::from((j + 1) as u32)); }
+
+        let mut weights = crate::compiler::graph::GraphWeights::new();
+        let mut w0 = M31Matrix::new(8, 8);
+        for i in 0..8 { for j in 0..8 { w0.set(i, j, M31::from(((i + j) % 5 + 1) as u32)); } }
+        weights.add_weight(0, w0);
+        let mut w2 = M31Matrix::new(8, 8);
+        for i in 0..8 { for j in 0..8 { w2.set(i, j, M31::from(((i * j) % 7 + 1) as u32)); } }
+        weights.add_weight(2, w2);
+        let mut w4 = M31Matrix::new(8, 4);
+        for i in 0..8 { for j in 0..4 { w4.set(i, j, M31::from((i + j + 1) as u32)); } }
+        weights.add_weight(4, w4);
+
+        let proof = prove_model_aggregated_onchain(&graph, &input, &weights)
+            .expect("on-chain aggregated proving with Add should succeed");
+
+        assert_eq!(proof.add_claims.len(), 1, "should have 1 Add claim");
+
+        let metadata = MLClaimMetadata {
+            model_id: FieldElement::from(0x42u64),
+            num_layers: 5,
+            activation_type: 0,
+            io_commitment: FieldElement::ZERO,
+            weight_commitment: FieldElement::ZERO,
+        };
+
+        let felts = serialize_ml_proof_for_recursive(&proof, &metadata, None);
+
+        // The last 3 sections should be: add_claims(1 claim), mul_claims(empty), layernorm_claims(empty)
+        // Claims are lightweight: add_claim = layer_index(1) + trace_rows(1) = 2 felts per claim
+        let last = felts.len() - 1;
+        assert_eq!(felts[last], FieldElement::ZERO, "layernorm_claims count = 0");
+        assert_eq!(felts[last - 1], FieldElement::ZERO, "mul_claims count = 0");
+        // add_claims section: count(1) + 1 claim * 2 felts = 3 felts before mul_claims
+        // add_claims count should be 1
+        assert_eq!(felts[last - 4], FieldElement::from(1u64), "add_claims count = 1");
+        assert!(felts.len() > 20, "should have data: {} felts", felts.len());
+    }
+
+    #[test]
+    fn test_serialize_empty_add_mul_layernorm_backward_compat() {
+        use crate::components::matmul::{M31Matrix, matmul_m31, prove_matmul_sumcheck_onchain};
+
+        // Build a matmul-only proof (no add/mul/layernorm)
+        let mut a = M31Matrix::new(2, 2);
+        a.set(0, 0, M31::from(1)); a.set(0, 1, M31::from(2));
+        a.set(1, 0, M31::from(3)); a.set(1, 1, M31::from(4));
+        let mut b = M31Matrix::new(2, 2);
+        b.set(0, 0, M31::from(5)); b.set(0, 1, M31::from(6));
+        b.set(1, 0, M31::from(7)); b.set(1, 1, M31::from(8));
+        let c = matmul_m31(&a, &b);
+        let matmul_proof = prove_matmul_sumcheck_onchain(&a, &b, &c).unwrap();
+
+        let aggregated = AggregatedModelProofOnChain {
+            unified_stark: None,
+            matmul_proofs: vec![(0, matmul_proof)],
+            add_claims: Vec::new(),
+            mul_claims: Vec::new(),
+            layernorm_claims: Vec::new(),
+            execution: crate::compiler::prove::GraphExecution {
+                intermediates: vec![],
+                output: M31Matrix::new(1, 1),
+            },
+            activation_claims: vec![],
+        };
+
+        let metadata = MLClaimMetadata {
+            model_id: FieldElement::ONE,
+            num_layers: 1,
+            activation_type: 0,
+            io_commitment: FieldElement::ZERO,
+            weight_commitment: FieldElement::ZERO,
+        };
+
+        let felts = serialize_ml_proof_for_recursive(&aggregated, &metadata, None);
+
+        // Last 3 felts should be [0, 0, 0] (empty add_claims, mul_claims, layernorm_claims)
+        let len = felts.len();
+        assert_eq!(felts[len - 3], FieldElement::ZERO, "add_claims count = 0");
+        assert_eq!(felts[len - 2], FieldElement::ZERO, "mul_claims count = 0");
+        assert_eq!(felts[len - 1], FieldElement::ZERO, "layernorm_claims count = 0");
+
+        // unified_stark=None(0), add(0), mul(0), layernorm(0)
+        assert_eq!(felts[len - 4], FieldElement::ZERO, "unified_stark = None");
     }
 }

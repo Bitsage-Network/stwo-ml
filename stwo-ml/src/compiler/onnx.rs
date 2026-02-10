@@ -136,9 +136,30 @@ pub fn load_onnx(path: &Path) -> Result<OnnxModel, OnnxError> {
             "LayerNormalization" | "RmsNormalization" => {
                 builder.layer_norm();
             }
-            // Element-wise ops: map to identity (computation folded into surrounding layers)
-            "Add" | "Mul" => {
-                builder.identity();
+            // Element-wise ops: real computation with AIR constraints
+            "Add" => {
+                let shape = builder.current_output_shape();
+                let size = shape.0 * shape.1;
+                // For ONNX Add, second input is often from an earlier layer (residual).
+                // In the sequential builder, we treat it as Add with the previous output.
+                let inputs = builder.last_node.map(|n| vec![n]).unwrap_or_default();
+                let id = builder.graph.add_node(
+                    crate::compiler::graph::GraphOp::Add { size },
+                    inputs,
+                    shape,
+                );
+                builder.last_node = Some(id);
+            }
+            "Mul" => {
+                let shape = builder.current_output_shape();
+                let size = shape.0 * shape.1;
+                let inputs = builder.last_node.map(|n| vec![n]).unwrap_or_default();
+                let id = builder.graph.add_node(
+                    crate::compiler::graph::GraphOp::Mul { size },
+                    inputs,
+                    shape,
+                );
+                builder.last_node = Some(id);
             }
             // Dequantization: map to quantize node
             "DequantizeLinear" => {

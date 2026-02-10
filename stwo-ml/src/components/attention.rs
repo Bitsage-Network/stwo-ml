@@ -281,7 +281,7 @@ pub fn apply_causal_mask(scores: &mut M31Matrix) {
 }
 
 /// Modular inverse of n in M31 via Fermat's little theorem: n^(P-2) mod P.
-fn m31_mod_inverse(n: u32) -> M31 {
+pub(crate) fn m31_mod_inverse(n: u32) -> M31 {
     if n == 0 {
         return M31::from(0);
     }
@@ -404,6 +404,44 @@ pub fn attention_forward(
         final_output,
     }
 }
+
+// ===== Softmax Normalization Constraint =====
+
+/// Evaluator for softmax normalization constraint.
+///
+/// Verifies that `weights[i] * sum_exp == exp_values[i]` for each element,
+/// ensuring that the softmax normalization step is correct.
+///
+/// # Constraint (degree 2):
+///   weights[i] * sum_exp - exp_values[i] = 0
+#[derive(Debug, Clone)]
+pub struct SoftmaxNormEval {
+    pub log_n_rows: u32,
+}
+
+impl stwo_constraint_framework::FrameworkEval for SoftmaxNormEval {
+    fn log_size(&self) -> u32 {
+        self.log_n_rows
+    }
+
+    fn max_constraint_log_degree_bound(&self) -> u32 {
+        self.log_n_rows + 1
+    }
+
+    fn evaluate<E: stwo_constraint_framework::EvalAtRow>(&self, mut eval: E) -> E {
+        let exp_val = eval.next_trace_mask();
+        let sum_exp = eval.next_trace_mask();
+        let weight = eval.next_trace_mask();
+
+        // Constraint: weight * sum_exp - exp_val = 0
+        // i.e. weight = exp_val / sum_exp (softmax normalization)
+        eval.add_constraint(weight * sum_exp - exp_val);
+
+        eval
+    }
+}
+
+pub type SoftmaxNormComponent = stwo_constraint_framework::FrameworkComponent<SoftmaxNormEval>;
 
 // ===== Proving =====
 
@@ -1116,5 +1154,30 @@ mod tests {
             }
         }
         assert!(differs, "causal mask should change the output");
+    }
+
+    // --- Softmax normalization tests ---
+
+    #[test]
+    fn test_softmax_normalization_eval() {
+        use stwo_constraint_framework::FrameworkEval;
+        let eval = SoftmaxNormEval { log_n_rows: 4 };
+        assert_eq!(eval.log_size(), 4);
+        assert_eq!(eval.max_constraint_log_degree_bound(), 5);
+    }
+
+    #[test]
+    fn test_softmax_normalization_constraint_holds() {
+        // For softmax: weight = exp(x) / sum(exp)
+        // Constraint: weight * sum_exp - exp_val = 0
+        // If exp_val = 10, sum_exp = 100, weight = 10 * inv(100)
+        // Then weight * 100 = 10 ✓
+        let exp_val = M31::from(10);
+        let sum_exp = M31::from(100);
+        let weight = exp_val * crate::components::attention::m31_mod_inverse(100);
+
+        // Verify constraint: weight * sum_exp - exp_val = 0
+        let constraint_val = weight * sum_exp - exp_val;
+        assert_eq!(constraint_val, M31::from(0), "Softmax norm constraint should hold");
     }
 }

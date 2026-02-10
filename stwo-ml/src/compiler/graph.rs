@@ -37,6 +37,27 @@ pub enum GraphOp {
     Attention {
         config: MultiHeadAttentionConfig,
     },
+    /// Element-wise addition: output[i] = lhs[i] + rhs[i].
+    Add {
+        size: usize,
+    },
+    /// Element-wise multiplication: output[i] = lhs[i] * rhs[i].
+    Mul {
+        size: usize,
+    },
+    /// Embedding table lookup: output = table[token_ids].
+    Embedding {
+        vocab_size: usize,
+        embed_dim: usize,
+    },
+    /// 2D convolution via im2col + MatMul.
+    Conv2D {
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+    },
     /// Identity / passthrough (for graph structure).
     Identity {
         size: usize,
@@ -65,6 +86,18 @@ impl GraphOp {
             }
             GraphOp::Attention { config } => {
                 config.sumcheck_trace_rows()
+            }
+            GraphOp::Add { size } | GraphOp::Mul { size } => {
+                // One constraint per element
+                *size
+            }
+            GraphOp::Embedding { vocab_size, embed_dim } => {
+                // LogUp lookup per token
+                *vocab_size + *embed_dim
+            }
+            GraphOp::Conv2D { in_channels, out_channels, kernel_size, .. } => {
+                // im2col + matmul cost
+                in_channels * kernel_size * kernel_size * out_channels
             }
             GraphOp::Identity { .. } => 0,
         }
@@ -138,6 +171,32 @@ impl GraphWeights {
             .find(|(id, _)| *id == node_id)
             .map(|(_, b)| b)
     }
+
+    /// Extract weights for a node range `[start..end)`, remapping node IDs to `[0..len)`.
+    pub fn subset(&self, range: std::ops::Range<usize>) -> GraphWeights {
+        let start = range.start;
+        let end = range.end;
+        let mut sub = GraphWeights::new();
+
+        for (id, w) in &self.weights {
+            if *id >= start && *id < end {
+                sub.weights.push((*id - start, w.clone()));
+            }
+        }
+        for (id, b) in &self.biases {
+            if *id >= start && *id < end {
+                sub.biases.push((*id - start, b.clone()));
+            }
+        }
+        for (id, name, w) in &self.named_weights {
+            if *id >= start && *id < end {
+                sub.named_weights
+                    .push((*id - start, name.clone(), w.clone()));
+            }
+        }
+
+        sub
+    }
 }
 
 impl Default for GraphWeights {
@@ -189,16 +248,161 @@ impl ComputationGraph {
         self.nodes.len()
     }
 
-    /// Topological order of node IDs (already in order since we add sequentially).
+    /// Topological order of node IDs using Kahn's algorithm.
+    ///
+    /// Handles multi-input nodes (e.g. Add/Mul with residual connections)
+    /// correctly. For purely sequential graphs, produces `[0, 1, 2, ...]`.
     pub fn topological_order(&self) -> Vec<usize> {
-        (0..self.nodes.len()).collect()
+        let n = self.nodes.len();
+        let mut in_degree = vec![0usize; n];
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+
+        for node in &self.nodes {
+            for &inp in &node.inputs {
+                if inp < n {
+                    adj[inp].push(node.id);
+                    in_degree[node.id] += 1;
+                }
+            }
+        }
+
+        let mut queue: std::collections::VecDeque<usize> =
+            (0..n).filter(|&i| in_degree[i] == 0).collect();
+        let mut order = Vec::with_capacity(n);
+
+        while let Some(u) = queue.pop_front() {
+            order.push(u);
+            for &v in &adj[u] {
+                in_degree[v] -= 1;
+                if in_degree[v] == 0 {
+                    queue.push_back(v);
+                }
+            }
+        }
+
+        // If cycle detected (should never happen), fall back to sequential
+        if order.len() != n {
+            (0..n).collect()
+        } else {
+            order
+        }
+    }
+
+    /// Extract a subgraph containing nodes `[start..end)`, remapping node IDs to `[0..len)`.
+    ///
+    /// The subgraph's `input_shape` is derived from the previous node's output shape
+    /// (or the original `input_shape` if `start == 0`).
+    pub fn subgraph(&self, range: std::ops::Range<usize>) -> ComputationGraph {
+        let start = range.start;
+        let end = range.end.min(self.nodes.len());
+
+        let input_shape = if start == 0 {
+            self.input_shape
+        } else {
+            self.nodes[start - 1].output_shape
+        };
+
+        let mut sub = ComputationGraph::new(input_shape);
+
+        for (new_id, old_idx) in (start..end).enumerate() {
+            let node = &self.nodes[old_idx];
+            let remapped_inputs: Vec<usize> = node
+                .inputs
+                .iter()
+                .filter_map(|&old_id| {
+                    if old_id >= start && old_id < end {
+                        Some(old_id - start)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            sub.add_node(node.op.clone(), remapped_inputs, node.output_shape);
+            let _ = new_id; // used implicitly by add_node
+        }
+
+        sub
+    }
+
+    /// Detect transformer block boundaries.
+    ///
+    /// A transformer block is a repeating pattern of LayerNorm → MatMul (attention) →
+    /// Activation → MatMul (FFN). Returns ranges where each range covers one block.
+    /// Falls back to splitting at LayerNorm boundaries, or uniform chunks if no
+    /// LayerNorm is found.
+    pub fn find_block_boundaries(&self) -> Vec<std::ops::Range<usize>> {
+        // Find LayerNorm positions — these typically start transformer blocks
+        let ln_positions: Vec<usize> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, n)| matches!(&n.op, GraphOp::LayerNorm { .. }).then_some(i))
+            .collect();
+
+        if ln_positions.len() >= 2 {
+            // Split at LayerNorm boundaries
+            let mut ranges = Vec::new();
+            for i in 0..ln_positions.len() {
+                let start = ln_positions[i];
+                let end = if i + 1 < ln_positions.len() {
+                    ln_positions[i + 1]
+                } else {
+                    self.nodes.len()
+                };
+                ranges.push(start..end);
+            }
+            // If first LayerNorm is not at position 0, add the prefix
+            if ln_positions[0] > 0 {
+                ranges.insert(0, 0..ln_positions[0]);
+            }
+            ranges
+        } else {
+            // No clear block structure — return single range
+            vec![0..self.nodes.len()]
+        }
+    }
+
+    /// Estimate peak proving memory across all nodes (bytes).
+    ///
+    /// For MatMul nodes, uses `estimate_sumcheck_memory()`. For other ops,
+    /// estimates based on activation size × 16 bytes per SecureField.
+    pub fn estimate_peak_memory(&self) -> usize {
+        use crate::components::matmul::estimate_sumcheck_memory;
+
+        self.nodes
+            .iter()
+            .map(|node| match &node.op {
+                GraphOp::MatMul { dims: (m, k, n) } => {
+                    let (_, total) = estimate_sumcheck_memory(*m, *k, *n);
+                    total
+                }
+                GraphOp::Activation { size, .. } => size * 16, // SecureField per element
+                GraphOp::LayerNorm { dim } => dim * 4 * 16,
+                GraphOp::Attention { config } => {
+                    // Q, K, V projections each d_model × d_model
+                    let d = config.d_model;
+                    let (_, total) = estimate_sumcheck_memory(config.seq_len, d, d);
+                    total * 4 // Q, K, V, output projections
+                }
+                GraphOp::Add { size } | GraphOp::Mul { size } => size * 16,
+                GraphOp::Embedding { vocab_size, embed_dim } => vocab_size * embed_dim * 4,
+                GraphOp::Conv2D { in_channels, out_channels, kernel_size, .. } => {
+                    let k = in_channels * kernel_size * kernel_size;
+                    let (_, total) = estimate_sumcheck_memory(1, k, *out_channels);
+                    total
+                }
+                _ => 0,
+            })
+            .max()
+            .unwrap_or(0)
     }
 }
 
 /// Builder for constructing computation graphs from layer descriptions.
 pub struct GraphBuilder {
-    graph: ComputationGraph,
-    last_node: Option<usize>,
+    pub(crate) graph: ComputationGraph,
+    pub(crate) last_node: Option<usize>,
 }
 
 impl GraphBuilder {
@@ -298,6 +502,81 @@ impl GraphBuilder {
             GraphOp::Quantize { params, size },
             inputs,
             shape,
+        );
+        self.last_node = Some(id);
+        self
+    }
+
+    /// Returns the ID of the most recently added node, for use as a branch point.
+    ///
+    /// Use with `add_from()` / `mul_from()` to create residual connections:
+    /// ```ignore
+    /// let branch = builder.fork();
+    /// builder.linear(64).activation(ActivationType::ReLU);
+    /// builder.add_from(branch); // residual: output = branch + relu(linear(branch))
+    /// ```
+    pub fn fork(&self) -> usize {
+        self.last_node.expect("fork() requires at least one node")
+    }
+
+    /// Add an element-wise addition node combining `lhs` (saved branch) and the current output.
+    pub fn add_from(&mut self, lhs: usize) -> &mut Self {
+        let shape = self.current_output_shape();
+        let size = shape.0 * shape.1;
+        let rhs = self.last_node.expect("add_from requires a current node");
+        let id = self.graph.add_node(
+            GraphOp::Add { size },
+            vec![lhs, rhs],
+            shape,
+        );
+        self.last_node = Some(id);
+        self
+    }
+
+    /// Add an element-wise multiplication node combining `lhs` (saved branch) and the current output.
+    pub fn mul_from(&mut self, lhs: usize) -> &mut Self {
+        let shape = self.current_output_shape();
+        let size = shape.0 * shape.1;
+        let rhs = self.last_node.expect("mul_from requires a current node");
+        let id = self.graph.add_node(
+            GraphOp::Mul { size },
+            vec![lhs, rhs],
+            shape,
+        );
+        self.last_node = Some(id);
+        self
+    }
+
+    /// Add an embedding lookup layer.
+    pub fn embedding(&mut self, vocab_size: usize, embed_dim: usize) -> &mut Self {
+        let inputs = self.last_node.map(|n| vec![n]).unwrap_or_default();
+        let id = self.graph.add_node(
+            GraphOp::Embedding { vocab_size, embed_dim },
+            inputs,
+            (1, embed_dim),
+        );
+        self.last_node = Some(id);
+        self
+    }
+
+    /// Add a 2D convolution layer.
+    pub fn conv2d(
+        &mut self,
+        out_channels: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+    ) -> &mut Self {
+        let shape = self.current_output_shape();
+        let in_channels = shape.1;
+        let inputs = self.last_node.map(|n| vec![n]).unwrap_or_default();
+
+        // Output spatial dim: (input_dim + 2*padding - kernel_size) / stride + 1
+        // Simplified: we track (batch, out_channels) as shape
+        let id = self.graph.add_node(
+            GraphOp::Conv2D { in_channels, out_channels, kernel_size, stride, padding },
+            inputs,
+            (shape.0, out_channels),
         );
         self.last_node = Some(id);
         self
@@ -407,5 +686,211 @@ mod tests {
         assert!(weights.get_weight(0).is_some());
         assert!(weights.get_bias(0).is_some());
         assert!(weights.get_weight(1).is_none());
+    }
+
+    #[test]
+    fn test_subgraph_basic() {
+        // 6-node graph: matmul, relu, matmul, relu, matmul, relu
+        let mut builder = GraphBuilder::new((1, 4));
+        builder
+            .linear(4)
+            .activation(ActivationType::ReLU)
+            .linear(4)
+            .activation(ActivationType::ReLU)
+            .linear(4)
+            .activation(ActivationType::ReLU);
+        let graph = builder.build();
+        assert_eq!(graph.num_layers(), 6);
+
+        // Extract first 3 nodes (matmul, relu, matmul)
+        let sub = graph.subgraph(0..3);
+        assert_eq!(sub.num_layers(), 3);
+        assert_eq!(sub.input_shape, (1, 4));
+        assert_eq!(sub.output_shape, (1, 4));
+
+        // Extract nodes 3..6 (relu, matmul, relu)
+        let sub2 = graph.subgraph(3..6);
+        assert_eq!(sub2.num_layers(), 3);
+        assert_eq!(sub2.input_shape, (1, 4)); // from node 2's output
+    }
+
+    #[test]
+    fn test_subgraph_single_node() {
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(2);
+        let graph = builder.build();
+
+        let sub = graph.subgraph(0..1);
+        assert_eq!(sub.num_layers(), 1);
+        assert_eq!(sub.input_shape, (1, 4));
+        assert_eq!(sub.output_shape, (1, 2));
+    }
+
+    #[test]
+    fn test_weights_subset() {
+        let mut weights = GraphWeights::new();
+        weights.add_weight(0, M31Matrix::new(4, 4));
+        weights.add_weight(2, M31Matrix::new(4, 4));
+        weights.add_weight(4, M31Matrix::new(4, 2));
+        weights.add_bias(0, vec![M31::from(1)]);
+        weights.add_bias(2, vec![M31::from(2)]);
+
+        // Subset for nodes 2..5 → remapped to 0..3
+        let sub = weights.subset(2..5);
+        assert!(sub.get_weight(0).is_some()); // was node 2
+        assert!(sub.get_weight(2).is_some()); // was node 4
+        assert!(sub.get_weight(1).is_none()); // node 3 had no weight
+        assert!(sub.get_bias(0).is_some());   // was node 2
+    }
+
+    #[test]
+    fn test_find_block_boundaries_with_layernorm() {
+        let mut builder = GraphBuilder::new((1, 64));
+        // Block 0: LN → MatMul → ReLU → MatMul
+        builder.layer_norm().linear(64).activation(ActivationType::ReLU).linear(64);
+        // Block 1: LN → MatMul → ReLU → MatMul
+        builder.layer_norm().linear(64).activation(ActivationType::ReLU).linear(64);
+        let graph = builder.build();
+
+        let blocks = graph.find_block_boundaries();
+        assert_eq!(blocks.len(), 2, "should detect 2 transformer blocks");
+        assert_eq!(blocks[0].start, 0);
+        assert_eq!(blocks[1].start, 4);
+    }
+
+    #[test]
+    fn test_find_block_boundaries_no_layernorm() {
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(4).activation(ActivationType::ReLU).linear(2);
+        let graph = builder.build();
+
+        let blocks = graph.find_block_boundaries();
+        assert_eq!(blocks.len(), 1, "no layernorms → single block");
+        assert_eq!(blocks[0], 0..3);
+    }
+
+    #[test]
+    fn test_estimate_peak_memory() {
+        let mut builder = GraphBuilder::new((1, 128));
+        builder.linear(128);
+        let graph = builder.build();
+
+        let peak = graph.estimate_peak_memory();
+        assert!(peak > 0, "peak memory should be positive");
+    }
+
+    #[test]
+    fn test_add_mul_graph_ops() {
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(4);
+        let branch = builder.fork();
+        builder.activation(ActivationType::ReLU);
+        builder.add_from(branch); // residual connection: x + relu(linear(x))
+
+        let graph = builder.build();
+        assert_eq!(graph.num_layers(), 3); // linear, relu, add
+        assert_eq!(graph.output_shape, (1, 4));
+
+        // The Add node should have 2 inputs
+        let add_node = &graph.nodes[2];
+        assert!(matches!(add_node.op, GraphOp::Add { .. }));
+        assert_eq!(add_node.inputs.len(), 2);
+        assert_eq!(add_node.inputs[0], 0); // branch = linear output
+        assert_eq!(add_node.inputs[1], 1); // relu output
+    }
+
+    #[test]
+    fn test_mul_op() {
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(4);
+        let branch = builder.fork();
+        builder.linear(4);
+        builder.mul_from(branch);
+
+        let graph = builder.build();
+        assert_eq!(graph.num_layers(), 3); // linear, linear, mul
+        let mul_node = &graph.nodes[2];
+        assert!(matches!(mul_node.op, GraphOp::Mul { .. }));
+        assert_eq!(mul_node.inputs.len(), 2);
+    }
+
+    #[test]
+    fn test_residual_connection_graph() {
+        // Build a residual block: y = x + matmul(relu(matmul(x)))
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(4);
+        let residual = builder.fork(); // save after first linear
+        builder.activation(ActivationType::ReLU);
+        builder.linear(4);
+        builder.add_from(residual); // residual connection
+
+        let graph = builder.build();
+        assert_eq!(graph.num_layers(), 4); // linear, relu, linear, add
+        assert_eq!(graph.output_shape, (1, 4));
+
+        // Verify topo order handles multi-input
+        let topo = graph.topological_order();
+        assert_eq!(topo.len(), 4);
+        // Add node (3) should come after both linear(0) and linear(2)
+        let add_pos = topo.iter().position(|&x| x == 3).unwrap();
+        let lin0_pos = topo.iter().position(|&x| x == 0).unwrap();
+        let lin2_pos = topo.iter().position(|&x| x == 2).unwrap();
+        assert!(add_pos > lin0_pos);
+        assert!(add_pos > lin2_pos);
+    }
+
+    #[test]
+    fn test_topo_sort_diamond() {
+        // Diamond graph: 0 → 1, 0 → 2, 1+2 → 3(add)
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(4); // node 0
+        let branch = builder.fork(); // save node 0
+        builder.activation(ActivationType::ReLU); // node 1, depends on 0
+        // Now we want node 2 to also depend on 0, then add 1+2
+        // But with current API, 'current' is node 1.
+        // So we use add_from(branch) to combine node 0 + node 1
+        builder.add_from(branch); // node 2 = add(0, 1)
+
+        let graph = builder.build();
+        let topo = graph.topological_order();
+        assert_eq!(topo.len(), 3);
+
+        // Node 2 must come after both 0 and 1
+        let add_pos = topo.iter().position(|&x| x == 2).unwrap();
+        assert!(add_pos > topo.iter().position(|&x| x == 0).unwrap());
+        assert!(add_pos > topo.iter().position(|&x| x == 1).unwrap());
+    }
+
+    #[test]
+    fn test_embedding_op() {
+        let mut builder = GraphBuilder::new((1, 1));
+        builder.embedding(1000, 768);
+        let graph = builder.build();
+
+        assert_eq!(graph.num_layers(), 1);
+        assert_eq!(graph.output_shape, (1, 768));
+        assert!(matches!(graph.nodes[0].op, GraphOp::Embedding { vocab_size: 1000, embed_dim: 768 }));
+    }
+
+    #[test]
+    fn test_conv2d_op() {
+        let mut builder = GraphBuilder::new((1, 3));
+        builder.conv2d(16, 3, 1, 1);
+        let graph = builder.build();
+
+        assert_eq!(graph.num_layers(), 1);
+        assert!(matches!(graph.nodes[0].op, GraphOp::Conv2D { .. }));
+    }
+
+    #[test]
+    fn test_add_trace_rows() {
+        let op = GraphOp::Add { size: 256 };
+        assert_eq!(op.trace_rows(), 256);
+    }
+
+    #[test]
+    fn test_mul_trace_rows() {
+        let op = GraphOp::Mul { size: 512 };
+        assert_eq!(op.trace_rows(), 512);
     }
 }

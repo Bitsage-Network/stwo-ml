@@ -110,18 +110,18 @@ fn test_full_pipeline_aggregated_to_calldata() {
     // 1. Aggregated prove
     let agg_proof = prove_model_aggregated(&graph, &input, &weights)
         .expect("aggregated proving should succeed");
-    assert!(agg_proof.activation_stark.is_some());
+    assert!(agg_proof.unified_stark.is_some());
     assert_eq!(agg_proof.matmul_proofs.len(), 3);
     assert_eq!(agg_proof.activation_claims.len(), 2);
 
     // 2. Serialize to felt252 calldata
-    let calldata = serialize_proof(agg_proof.activation_stark.as_ref().unwrap());
+    let calldata = serialize_proof(agg_proof.unified_stark.as_ref().unwrap());
     assert!(!calldata.is_empty());
     assert!(calldata.len() < 5000, "calldata too large: {} felts", calldata.len());
 
     // 3. Build starknet proof
     let starknet_proof = build_starknet_proof(&agg_proof);
-    assert_eq!(starknet_proof.activation_calldata, calldata);
+    assert_eq!(starknet_proof.unified_calldata, calldata);
     assert!(starknet_proof.estimated_gas > 0);
 
     // 4. DA-aware gas estimate
@@ -136,7 +136,7 @@ fn test_prove_for_starknet_end_to_end() {
     let starknet_proof = prove_for_starknet(&graph, &input, &weights)
         .expect("prove_for_starknet should succeed");
 
-    assert!(!starknet_proof.activation_calldata.is_empty());
+    assert!(!starknet_proof.unified_calldata.is_empty());
     assert_eq!(starknet_proof.num_matmul_proofs, 3);
     assert_eq!(starknet_proof.num_proven_layers, 5);
     assert!(starknet_proof.calldata_size > 0);
@@ -205,7 +205,7 @@ fn test_gpu_prover_full_pipeline() {
     // Aggregated proof
     let agg_proof = prover.prove_model_aggregated(&graph, &input, &weights)
         .expect("GpuModelProver.prove_model_aggregated should succeed");
-    assert!(agg_proof.activation_stark.is_some());
+    assert!(agg_proof.unified_stark.is_some());
     assert_eq!(agg_proof.execution.output.data, execution.output.data);
 
     // Receipt
@@ -310,7 +310,7 @@ fn test_build_mlp_with_weights_full_pipeline() {
     // 3. Aggregated prove
     let agg_proof = prove_model_aggregated(&model.graph, &input, &model.weights)
         .expect("aggregated proving should succeed");
-    assert!(agg_proof.activation_stark.is_some());
+    assert!(agg_proof.unified_stark.is_some());
 
     // 4. Summarize
     let summary = summarize_model(&model);
@@ -429,7 +429,7 @@ fn test_mlp_full_onchain_pipeline() {
     let agg_proof = prove_model_aggregated_onchain(&model.graph, &input, &model.weights)
         .expect("on-chain aggregated proving should succeed");
 
-    assert!(agg_proof.activation_stark.is_some());
+    assert!(agg_proof.unified_stark.is_some());
     assert_eq!(agg_proof.matmul_proofs.len(), 2); // 2 matmul layers in this MLP
 
     // Build complete Starknet calldata
@@ -543,7 +543,7 @@ mod gpu_tests {
             &graph, &input, &weights,
         ).expect("GPU aggregated proving should succeed");
 
-        assert!(proof.activation_stark.is_some());
+        assert!(proof.unified_stark.is_some());
         assert_eq!(proof.matmul_proofs.len(), 3);
     }
 
@@ -576,7 +576,7 @@ mod gpu_tests {
         ).expect("GPU aggregated proving should succeed");
 
         let starknet_proof = build_starknet_proof(&agg_proof);
-        assert!(!starknet_proof.activation_calldata.is_empty());
+        assert!(!starknet_proof.unified_calldata.is_empty());
         assert_eq!(starknet_proof.num_proven_layers, 5);
     }
 }

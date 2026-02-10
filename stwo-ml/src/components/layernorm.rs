@@ -24,6 +24,13 @@ use crate::gadgets::lookup_table::PrecomputedTable;
 // Relation for reciprocal sqrt lookup.
 stwo_constraint_framework::relation!(LayerNormRelation, 2);
 
+impl LayerNormRelation {
+    /// Access the inner LookupElements for computing LogUp fractions in the prover.
+    pub fn lookup_elements(&self) -> &stwo_constraint_framework::logup::LookupElements<2> {
+        &self.0
+    }
+}
+
 /// LayerNorm configuration.
 #[derive(Debug, Clone, Copy)]
 pub struct LayerNormConfig {
@@ -89,7 +96,7 @@ impl FrameworkEval for LayerNormEval {
             &[variance, rsqrt_val],
         ));
 
-        eval.finalize_logup();
+        eval.finalize_logup_in_pairs();
 
         eval
     }

@@ -394,7 +394,7 @@ mod tests {
         let result = prover.prove_model_aggregated(&graph, &input, &weights);
         assert!(result.is_ok());
         let proof = result.unwrap();
-        assert!(proof.activation_stark.is_some());
+        assert!(proof.unified_stark.is_some());
         assert_eq!(proof.matmul_proofs.len(), 2);
     }
 
@@ -423,7 +423,7 @@ mod tests {
         let result = prover.prove_model_aggregated_onchain(&graph, &input, &weights);
         assert!(result.is_ok());
         let proof = result.unwrap();
-        assert!(proof.activation_stark.is_some());
+        assert!(proof.unified_stark.is_some());
         assert_eq!(proof.matmul_proofs.len(), 2);
         assert_eq!(proof.activation_claims.len(), 1);
     }

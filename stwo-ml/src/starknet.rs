@@ -10,7 +10,7 @@
 //!         ↓
 //! prove_model_aggregated_auto()  ← GPU-accelerated when available
 //!         ↓
-//! AggregatedModelProof { activation STARK + matmul sumchecks }
+//! AggregatedModelProof { unified STARK + matmul sumchecks }
 //!         ↓
 //! serialize_proof() (cairo_serde)
 //!         ↓
@@ -35,20 +35,27 @@ use crate::components::matmul::M31Matrix;
 /// Cairo verifier contract, along with metadata for the transaction.
 #[derive(Debug)]
 pub struct StarknetModelProof {
-    /// Serialized activation STARK proof as felt252 calldata.
-    /// Empty if the model has no activation layers.
-    pub activation_calldata: Vec<FieldElement>,
+    /// Serialized unified STARK proof as felt252 calldata.
+    /// Covers all non-matmul components (activations, add, mul, layernorm).
+    /// Empty if the model has no such layers.
+    pub unified_calldata: Vec<FieldElement>,
     /// Serialized matmul sumcheck proofs as felt252 calldata (one per matmul layer).
     pub matmul_calldata: Vec<Vec<FieldElement>>,
     /// IO commitment: Poseidon(inputs || outputs).
     pub io_commitment: FieldElement,
     /// Combined calldata ready for on-chain submission.
-    /// Format: [pcs_config(4), io_commitment(1), activation_proof..., matmul_proofs_count, matmul_proof_0..., ...]
+    /// Format: [pcs_config(4), io_commitment(1), unified_proof..., matmul_proofs_count, matmul_proof_0..., ...]
     pub combined_calldata: Vec<FieldElement>,
     /// Per-activation-layer claims (for the verifier).
     pub layer_claims: Vec<LayerClaim>,
     /// Number of matmul sumcheck proofs.
     pub num_matmul_proofs: usize,
+    /// Number of Add claims in the unified STARK.
+    pub num_add_claims: usize,
+    /// Number of Mul claims in the unified STARK.
+    pub num_mul_claims: usize,
+    /// Number of LayerNorm claims in the unified STARK.
+    pub num_layernorm_claims: usize,
     /// Total number of proven layers.
     pub num_proven_layers: usize,
     /// Estimated gas cost for on-chain verification.
@@ -71,8 +78,8 @@ pub enum StarknetModelError {
 /// Prove a computation graph and produce Starknet-ready calldata.
 ///
 /// Runs the full pipeline:
-/// 1. Forward pass + per-layer proving (aggregated activations, per-matmul sumchecks)
-/// 2. Serializes the activation STARK proof to felt252 calldata
+/// 1. Forward pass + per-layer proving (unified STARK, per-matmul sumchecks)
+/// 2. Serializes the unified STARK proof to felt252 calldata
 /// 3. Estimates gas cost for on-chain verification
 ///
 /// Uses GPU acceleration when available via `prove_model_aggregated_auto`.
@@ -88,7 +95,7 @@ pub fn prove_for_starknet(
 /// Prove a computation graph and produce Starknet-ready on-chain calldata.
 ///
 /// Runs the full on-chain pipeline:
-/// 1. Forward pass + per-layer proving (Blake2s activation STARK + Poseidon matmul sumchecks)
+/// 1. Forward pass + per-layer proving (Blake2s unified STARK + Poseidon matmul sumchecks)
 /// 2. Assembles combined calldata with IO commitment at index [4]
 /// 3. Estimates gas cost for on-chain verification
 ///
@@ -107,7 +114,7 @@ pub fn prove_for_starknet_onchain(
 /// Useful when you've already proven the model (e.g., via `GpuModelProver`)
 /// and just want to serialize for on-chain submission.
 pub fn build_starknet_proof(proof: &AggregatedModelProof) -> StarknetModelProof {
-    let activation_calldata = match &proof.activation_stark {
+    let unified_calldata = match &proof.unified_stark {
         Some(stark_proof) => serialize_proof(stark_proof),
         None => Vec::new(),
     };
@@ -115,15 +122,18 @@ pub fn build_starknet_proof(proof: &AggregatedModelProof) -> StarknetModelProof 
     let total_trace_rows: usize = proof.activation_claims.iter().map(|c| c.trace_rows).sum();
     let num_proven = proof.num_proven_layers();
     let estimated_gas = estimate_verification_gas(num_proven, total_trace_rows.max(1));
-    let calldata_size = activation_calldata.len();
+    let calldata_size = unified_calldata.len();
 
     StarknetModelProof {
-        activation_calldata,
+        unified_calldata,
         matmul_calldata: Vec::new(),
         io_commitment: FieldElement::ZERO,
         combined_calldata: Vec::new(),
         layer_claims: proof.activation_claims.clone(),
         num_matmul_proofs: proof.matmul_proofs.len(),
+        num_add_claims: proof.add_claims.len(),
+        num_mul_claims: proof.mul_claims.len(),
+        num_layernorm_claims: proof.layernorm_claims.len(),
         num_proven_layers: num_proven,
         estimated_gas,
         calldata_size,
@@ -154,7 +164,7 @@ pub fn compute_io_commitment(input: &M31Matrix, output: &M31Matrix) -> FieldElem
 /// - Matmul proof count (1 felt)
 /// - Concatenated matmul calldata
 pub fn build_starknet_proof_onchain(proof: &AggregatedModelProofOnChain) -> StarknetModelProof {
-    let activation_calldata = match &proof.activation_stark {
+    let unified_calldata = match &proof.unified_stark {
         Some(stark_proof) => serialize_proof(stark_proof),
         None => Vec::new(),
     };
@@ -186,8 +196,8 @@ pub fn build_starknet_proof_onchain(proof: &AggregatedModelProofOnChain) -> Star
         io_commitment,
     ];
 
-    // Activation STARK calldata
-    combined.extend_from_slice(&activation_calldata);
+    // Unified STARK calldata (covers activations + add + mul + layernorm)
+    combined.extend_from_slice(&unified_calldata);
 
     // Matmul proofs count
     combined.push(FieldElement::from(matmul_calldata.len() as u64));
@@ -199,17 +209,20 @@ pub fn build_starknet_proof_onchain(proof: &AggregatedModelProofOnChain) -> Star
     }
 
     let total_trace_rows: usize = proof.activation_claims.iter().map(|c| c.trace_rows).sum();
-    let num_proven = proof.matmul_proofs.len() + proof.activation_claims.len();
+    let num_proven = proof.num_proven_layers();
     let estimated_gas = estimate_verification_gas(num_proven, total_trace_rows.max(1));
     let calldata_size = combined.len();
 
     StarknetModelProof {
-        activation_calldata,
+        unified_calldata,
         matmul_calldata,
         io_commitment,
         combined_calldata: combined,
         layer_claims: proof.activation_claims.clone(),
         num_matmul_proofs: proof.matmul_proofs.len(),
+        num_add_claims: proof.add_claims.len(),
+        num_mul_claims: proof.mul_claims.len(),
+        num_layernorm_claims: proof.layernorm_claims.len(),
         num_proven_layers: num_proven,
         estimated_gas,
         calldata_size,
@@ -222,6 +235,7 @@ pub fn build_starknet_proof_onchain(proof: &AggregatedModelProofOnChain) -> Star
 /// - Base cost: 50K gas (contract overhead)
 /// - Per activation layer: 10K gas (STARK verification per component)
 /// - Per matmul: 5K gas (sumcheck verification)
+/// - Per add/mul/layernorm claim: included in unified STARK verification
 /// - Log trace rows: 100 gas per log2(rows) (FRI queries scale logarithmically)
 /// - Per calldata felt: 16 gas (L1 data availability)
 pub fn estimate_verification_gas(num_layers: usize, total_trace_rows: usize) -> u64 {
@@ -287,7 +301,7 @@ mod tests {
         let proof = result.unwrap();
 
         // No activations → empty calldata
-        assert!(proof.activation_calldata.is_empty());
+        assert!(proof.unified_calldata.is_empty());
         assert_eq!(proof.num_matmul_proofs, 1);
         assert_eq!(proof.num_proven_layers, 1);
         assert!(proof.estimated_gas > 0);
@@ -322,8 +336,8 @@ mod tests {
         assert!(result.is_ok());
         let proof = result.unwrap();
 
-        // Has activation STARK calldata
-        assert!(!proof.activation_calldata.is_empty(), "should have activation calldata");
+        // Has unified STARK calldata
+        assert!(!proof.unified_calldata.is_empty(), "should have unified calldata");
         assert_eq!(proof.layer_claims.len(), 2, "2 activation layers");
         assert_eq!(proof.num_matmul_proofs, 3, "3 matmul sumchecks");
         assert_eq!(proof.num_proven_layers, 5, "5 total layers");
@@ -358,7 +372,7 @@ mod tests {
             .expect("aggregated proving should succeed");
         let starknet_proof = build_starknet_proof(&agg_proof);
 
-        assert!(!starknet_proof.activation_calldata.is_empty());
+        assert!(!starknet_proof.unified_calldata.is_empty());
         assert_eq!(starknet_proof.num_matmul_proofs, 2);
         assert_eq!(starknet_proof.layer_claims.len(), 1);
 
@@ -456,8 +470,8 @@ mod tests {
         assert!(result.is_ok());
         let proof = result.unwrap();
 
-        // Has activation STARK + matmul on-chain proofs
-        assert!(!proof.activation_calldata.is_empty());
+        // Has unified STARK + matmul on-chain proofs
+        assert!(!proof.unified_calldata.is_empty());
         assert_eq!(proof.num_matmul_proofs, 2);
         assert_eq!(proof.layer_claims.len(), 1);
         assert_ne!(proof.io_commitment, FieldElement::ZERO);
@@ -483,8 +497,119 @@ mod tests {
         assert!(result.is_ok());
         let proof = result.unwrap();
 
-        assert!(proof.activation_calldata.is_empty());
+        assert!(proof.unified_calldata.is_empty());
         assert_eq!(proof.num_matmul_proofs, 1);
         assert!(proof.estimated_gas > 0);
+    }
+
+    #[test]
+    fn test_build_starknet_proof_with_add() {
+        use crate::aggregation::prove_model_aggregated_onchain;
+
+        // Build a model with a residual Add
+        let mut builder = GraphBuilder::new((1, 8));
+        builder.linear(8);
+        let branch = builder.fork();
+        builder.activation(ActivationType::ReLU);
+        builder.linear(8);
+        builder.add_from(branch);
+        builder.linear(4);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 8);
+        for j in 0..8 { input.set(0, j, M31::from((j + 1) as u32)); }
+
+        let mut weights = GraphWeights::new();
+        let mut w0 = M31Matrix::new(8, 8);
+        for i in 0..8 { for j in 0..8 { w0.set(i, j, M31::from(((i + j) % 5 + 1) as u32)); } }
+        weights.add_weight(0, w0);
+        let mut w2 = M31Matrix::new(8, 8);
+        for i in 0..8 { for j in 0..8 { w2.set(i, j, M31::from(((i * j) % 7 + 1) as u32)); } }
+        weights.add_weight(2, w2);
+        let mut w4 = M31Matrix::new(8, 4);
+        for i in 0..8 { for j in 0..4 { w4.set(i, j, M31::from((i + j + 1) as u32)); } }
+        weights.add_weight(4, w4);
+
+        let agg_proof = prove_model_aggregated_onchain(&graph, &input, &weights)
+            .expect("on-chain proving with Add should succeed");
+        let starknet_proof = build_starknet_proof_onchain(&agg_proof);
+
+        // Add claim should be in the unified STARK
+        assert_eq!(starknet_proof.num_add_claims, 1, "should have 1 Add claim");
+        // Unified calldata covers activation + add together
+        assert!(!starknet_proof.unified_calldata.is_empty(), "unified calldata should be non-empty");
+
+        // mul and layernorm should be empty
+        assert_eq!(starknet_proof.num_mul_claims, 0);
+        assert_eq!(starknet_proof.num_layernorm_claims, 0);
+
+        // num_proven_layers should include the Add claim
+        assert_eq!(
+            starknet_proof.num_proven_layers,
+            3 + 1 + 1, // 3 matmul + 1 activation + 1 add
+            "total proven layers"
+        );
+    }
+
+    #[test]
+    fn test_starknet_combined_calldata_includes_elementwise() {
+        use crate::aggregation::prove_model_aggregated_onchain;
+
+        // Model with Add — combined calldata should be larger than matmul-only
+        let mut builder_add = GraphBuilder::new((1, 8));
+        builder_add.linear(8);
+        let branch = builder_add.fork();
+        builder_add.linear(8);
+        builder_add.add_from(branch);
+        builder_add.linear(4);
+        let graph_add = builder_add.build();
+
+        let mut builder_no_add = GraphBuilder::new((1, 8));
+        builder_no_add.linear(8);
+        builder_no_add.linear(8);
+        builder_no_add.linear(4);
+        let graph_no_add = builder_no_add.build();
+
+        let mut input = M31Matrix::new(1, 8);
+        for j in 0..8 { input.set(0, j, M31::from((j + 1) as u32)); }
+
+        let mut weights = GraphWeights::new();
+        let mut w0 = M31Matrix::new(8, 8);
+        for i in 0..8 { for j in 0..8 { w0.set(i, j, M31::from(((i + j) % 5 + 1) as u32)); } }
+        weights.add_weight(0, w0);
+        let mut w1 = M31Matrix::new(8, 8);
+        for i in 0..8 { for j in 0..8 { w1.set(i, j, M31::from(((i * j) % 7 + 1) as u32)); } }
+        weights.add_weight(1, w1);
+        let mut w2 = M31Matrix::new(8, 4);
+        for i in 0..8 { for j in 0..4 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        weights.add_weight(2, w2);
+
+        // For the add graph, we need weights at different node IDs
+        let mut weights_add = GraphWeights::new();
+        let mut wa0 = M31Matrix::new(8, 8);
+        for i in 0..8 { for j in 0..8 { wa0.set(i, j, M31::from(((i + j) % 5 + 1) as u32)); } }
+        weights_add.add_weight(0, wa0);
+        let mut wa1 = M31Matrix::new(8, 8);
+        for i in 0..8 { for j in 0..8 { wa1.set(i, j, M31::from(((i * j) % 7 + 1) as u32)); } }
+        weights_add.add_weight(1, wa1);
+        let mut wa3 = M31Matrix::new(8, 4);
+        for i in 0..8 { for j in 0..4 { wa3.set(i, j, M31::from((i + j + 1) as u32)); } }
+        weights_add.add_weight(3, wa3);
+
+        let proof_add = prove_model_aggregated_onchain(&graph_add, &input, &weights_add)
+            .expect("proving with Add should succeed");
+        let proof_no_add = prove_model_aggregated_onchain(&graph_no_add, &input, &weights)
+            .expect("proving without Add should succeed");
+
+        let sn_add = build_starknet_proof_onchain(&proof_add);
+        let sn_no_add = build_starknet_proof_onchain(&proof_no_add);
+
+        // Model with Add should have unified STARK (includes Add component)
+        assert!(!sn_add.unified_calldata.is_empty(), "Add model should have unified STARK calldata");
+        assert_eq!(sn_add.num_add_claims, 1, "should have 1 Add claim");
+
+        // Model without Add should have no unified STARK (matmul only)
+        assert!(sn_no_add.unified_calldata.is_empty(), "matmul-only model should have no unified STARK");
+        assert_eq!(sn_no_add.num_add_claims, 0);
     }
 }
