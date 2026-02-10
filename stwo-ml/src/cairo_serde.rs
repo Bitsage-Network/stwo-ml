@@ -410,10 +410,11 @@ fn serialize_layernorm_claim(
 /// 1. MLClaim: model_id, num_layers, activation_type, io_commitment, weight_commitment
 /// 2. matmul_proofs: Array<MatMulSumcheckProofOnChain> (10-field version, no MLE openings)
 /// 3. channel_salt: Option<u64> (0 for None, 1 + value for Some)
-/// 4. unified_stark_proof: Option<UnifiedStarkProof> (0 for None, 1 + proof for Some)
-/// 5. add_claims: Array<ElementwiseClaim> (layer_index + trace_rows)
-/// 6. mul_claims: Array<ElementwiseClaim> (layer_index + trace_rows)
-/// 7. layernorm_claims: Array<LayerNormClaim> (layer_index + trace_rows + claimed_sum)
+/// 4. unified_stark_proof: Option<UnifiedStarkProof> — contains ALL non-matmul component claims
+///    (activations, add, mul, layernorm) plus interaction claims and the STARK proof
+/// 5. add_claims: Array<ElementwiseClaim> (layer_index + trace_rows) — graph-level metadata
+/// 6. mul_claims: Array<ElementwiseClaim> (layer_index + trace_rows) — graph-level metadata
+/// 7. layernorm_claims: Array<LayerNormClaim> (layer_index + trace_rows + claimed_sum) — graph-level metadata
 pub fn serialize_ml_proof_for_recursive(
     proof: &AggregatedModelProofOnChain,
     metadata: &MLClaimMetadata,
@@ -453,9 +454,12 @@ pub fn serialize_ml_proof_for_recursive(
         }
         Some(stark_proof) => {
             serialize_u32(1, &mut output); // Cairo Option::Some variant index
-            serialize_activation_stark_proof(
+            serialize_unified_stark_proof(
                 stark_proof,
                 &proof.activation_claims,
+                &proof.add_claims,
+                &proof.mul_claims,
+                &proof.layernorm_claims,
                 metadata.activation_type,
                 &mut output,
             );
@@ -508,7 +512,7 @@ fn serialize_matmul_for_recursive(
     output.push(proof.b_commitment);
 }
 
-// === Activation STARK Proof Serialization ===
+// === Unified STARK Proof Serialization ===
 
 /// Bridge from Rust `LayerClaim` to Cairo's `ActivationClaim` fields.
 ///
@@ -529,6 +533,42 @@ impl ActivationClaimForSerde {
     }
 }
 
+/// Bridge from Rust `LayerClaim` to Cairo's `ElementwiseComponentClaim` fields.
+///
+/// Cairo layout: `ElementwiseComponentClaim { layer_index: u32, log_size: u32 }`
+/// Used for Add/Mul (pure AIR, no LogUp claimed_sum).
+pub struct ElementwiseClaimForSerde {
+    pub layer_index: u32,
+    pub log_size: u32,
+}
+
+impl ElementwiseClaimForSerde {
+    pub fn from_layer_claim(claim: &LayerClaim) -> Self {
+        Self {
+            layer_index: claim.layer_index as u32,
+            log_size: claim.trace_rows.ilog2(),
+        }
+    }
+}
+
+/// Bridge from Rust `LayerClaim` to Cairo's `LayerNormComponentClaim` fields.
+///
+/// Cairo layout: `LayerNormComponentClaim { layer_index: u32, log_size: u32 }`
+/// The LogUp claimed_sum is serialized separately in the interaction claims.
+pub struct LayerNormClaimForSerde {
+    pub layer_index: u32,
+    pub log_size: u32,
+}
+
+impl LayerNormClaimForSerde {
+    pub fn from_layer_claim(claim: &LayerClaim) -> Self {
+        Self {
+            layer_index: claim.layer_index as u32,
+            log_size: claim.trace_rows.ilog2(),
+        }
+    }
+}
+
 /// Serialize an `ActivationClaim` (3 felt252s: layer_index, log_size, activation_type).
 fn serialize_activation_claim(claim: &ActivationClaimForSerde, output: &mut Vec<FieldElement>) {
     serialize_u32(claim.layer_index, output);
@@ -536,27 +576,48 @@ fn serialize_activation_claim(claim: &ActivationClaimForSerde, output: &mut Vec<
     output.push(FieldElement::from(claim.activation_type as u64));
 }
 
-/// Serialize an `ActivationInteractionClaim` (4 felt252s: claimed_sum as QM31).
-fn serialize_activation_interaction_claim(sum: SecureField, output: &mut Vec<FieldElement>) {
+/// Serialize an `ElementwiseComponentClaim` (2 felt252s: layer_index, log_size).
+fn serialize_elementwise_component_claim(claim: &ElementwiseClaimForSerde, output: &mut Vec<FieldElement>) {
+    serialize_u32(claim.layer_index, output);
+    serialize_u32(claim.log_size, output);
+}
+
+/// Serialize a `LayerNormComponentClaim` (2 felt252s: layer_index, log_size).
+fn serialize_layernorm_component_claim(claim: &LayerNormClaimForSerde, output: &mut Vec<FieldElement>) {
+    serialize_u32(claim.layer_index, output);
+    serialize_u32(claim.log_size, output);
+}
+
+/// Serialize an interaction claim (4 felt252s: claimed_sum as QM31).
+fn serialize_interaction_claim(sum: SecureField, output: &mut Vec<FieldElement>) {
     serialize_qm31(sum, output);
 }
 
-/// Serialize an `MLInteractionClaim` (4 felt252s: activation_claimed_sum as QM31).
+/// Serialize the total `MLInteractionClaim` (4 felt252s: total LogUp sum as QM31).
 fn serialize_ml_interaction_claim(sum: SecureField, output: &mut Vec<FieldElement>) {
     serialize_qm31(sum, output);
 }
 
-/// Serialize a complete `ActivationStarkProof` matching Cairo's `#[derive(Serde)]` field order:
+/// Serialize a complete unified STARK proof covering all non-matmul components.
+///
+/// This matches the Cairo `UnifiedStarkProof` struct's `#[derive(Serde)]` field order:
 ///
 /// 1. `activation_claims: Array<ActivationClaim>` — len + per-claim (3 felts each)
-/// 2. `activation_interaction_claims: Array<ActivationInteractionClaim>` — len + per-claim (4 felts each)
-/// 3. `interaction_claim: MLInteractionClaim` — 4 felts (QM31)
-/// 4. `pcs_config: PcsConfig` — 4 felts (pow_bits + fri_config)
-/// 5. `interaction_pow: u64` — 1 felt (hardcode 0, Rust prover doesn't produce separate PoW)
-/// 6. `stark_proof: StarkProof` — CommitmentSchemeProof (existing serializer)
-fn serialize_activation_stark_proof(
+/// 2. `activation_interaction_claims: Array<QM31>` — len + per-claim (4 felts each)
+/// 3. `add_claims: Array<ElementwiseComponentClaim>` — len + per-claim (2 felts each)
+/// 4. `mul_claims: Array<ElementwiseComponentClaim>` — len + per-claim (2 felts each)
+/// 5. `layernorm_claims: Array<LayerNormComponentClaim>` — len + per-claim (2 felts each)
+/// 6. `layernorm_interaction_claims: Array<QM31>` — len + per-claim (4 felts each)
+/// 7. `interaction_claim: MLInteractionClaim` — 4 felts (total LogUp sum across activations + layernorms)
+/// 8. `pcs_config: PcsConfig` — 4 felts (pow_bits + fri_config)
+/// 9. `interaction_pow: u64` — 1 felt (hardcode 0, Rust prover handles PoW internally)
+/// 10. `stark_proof: StarkProof` — CommitmentSchemeProof (existing serializer)
+fn serialize_unified_stark_proof(
     stark_proof: &Blake2sProof,
     activation_claims: &[LayerClaim],
+    add_claims: &[LayerClaim],
+    mul_claims: &[LayerClaim],
+    layernorm_claims: &[LayerClaim],
     activation_type: u8,
     output: &mut Vec<FieldElement>,
 ) {
@@ -567,26 +628,54 @@ fn serialize_activation_stark_proof(
         .collect();
     serialize_span(&serde_claims, serialize_activation_claim, output);
 
-    // 2. activation_interaction_claims: Array<ActivationInteractionClaim>
+    // 2. activation_interaction_claims: Array<QM31>
     serialize_u32(activation_claims.len() as u32, output);
     for claim in activation_claims {
-        serialize_activation_interaction_claim(claim.claimed_sum, output);
+        serialize_interaction_claim(claim.claimed_sum, output);
     }
 
-    // 3. interaction_claim: MLInteractionClaim (sum of all claimed_sums)
+    // 3. add_claims: Array<ElementwiseComponentClaim>
+    let add_serde: Vec<ElementwiseClaimForSerde> = add_claims
+        .iter()
+        .map(ElementwiseClaimForSerde::from_layer_claim)
+        .collect();
+    serialize_span(&add_serde, serialize_elementwise_component_claim, output);
+
+    // 4. mul_claims: Array<ElementwiseComponentClaim>
+    let mul_serde: Vec<ElementwiseClaimForSerde> = mul_claims
+        .iter()
+        .map(ElementwiseClaimForSerde::from_layer_claim)
+        .collect();
+    serialize_span(&mul_serde, serialize_elementwise_component_claim, output);
+
+    // 5. layernorm_claims: Array<LayerNormComponentClaim>
+    let ln_serde: Vec<LayerNormClaimForSerde> = layernorm_claims
+        .iter()
+        .map(LayerNormClaimForSerde::from_layer_claim)
+        .collect();
+    serialize_span(&ln_serde, serialize_layernorm_component_claim, output);
+
+    // 6. layernorm_interaction_claims: Array<QM31>
+    serialize_u32(layernorm_claims.len() as u32, output);
+    for claim in layernorm_claims {
+        serialize_interaction_claim(claim.claimed_sum, output);
+    }
+
+    // 7. interaction_claim: MLInteractionClaim (sum of ALL LogUp claimed_sums)
     let total_sum: SecureField = activation_claims
         .iter()
+        .chain(layernorm_claims.iter())
         .map(|c| c.claimed_sum)
         .fold(SecureField::default(), |acc, s| acc + s);
     serialize_ml_interaction_claim(total_sum, output);
 
-    // 4. pcs_config: PcsConfig (from the proof itself)
+    // 8. pcs_config: PcsConfig (from the proof itself)
     serialize_pcs_config(&stark_proof.0.config, output);
 
-    // 5. interaction_pow: u64 (hardcode 0 — Rust prover handles PoW internally)
+    // 9. interaction_pow: u64 (hardcode 0 — Rust prover handles PoW internally)
     serialize_u64(0, output);
 
-    // 6. stark_proof: StarkProof → CommitmentSchemeProof
+    // 10. stark_proof: StarkProof → CommitmentSchemeProof
     serialize_commitment_scheme_proof(&stark_proof.0, output);
 }
 
@@ -1203,7 +1292,7 @@ mod tests {
         assert_eq!(felts[idx], FieldElement::from(1u64), "unified_stark = Some");
         idx += 1;
 
-        // Inside ActivationStarkProof:
+        // Inside UnifiedStarkProof:
         // 4.1: activation_claims array (length=1)
         assert_eq!(felts[idx], FieldElement::from(1u64), "activation_claims length");
         idx += 1;
@@ -1216,21 +1305,37 @@ mod tests {
         idx += 1;
 
         // 4.2: activation_interaction_claims array (length=1)
-        assert_eq!(felts[idx], FieldElement::from(1u64), "interaction_claims length");
+        assert_eq!(felts[idx], FieldElement::from(1u64), "activation_interaction_claims length");
         idx += 1;
-        // Each ActivationInteractionClaim = 4 felts (QM31 claimed_sum = default = 0,0,0,0)
+        // Each interaction claim = 4 felts (QM31 claimed_sum = default = 0,0,0,0)
         for i in 0..4 {
-            assert_eq!(felts[idx + i], FieldElement::ZERO, "interaction_claim.claimed_sum[{i}]");
+            assert_eq!(felts[idx + i], FieldElement::ZERO, "activation_interaction_claim[{i}]");
         }
         idx += 4;
 
-        // 4.3: interaction_claim: MLInteractionClaim = 4 felts (sum of claimed_sums = 0)
+        // 4.3: add_claims array (length=0, empty for this proof)
+        assert_eq!(felts[idx], FieldElement::ZERO, "add_claims length = 0");
+        idx += 1;
+
+        // 4.4: mul_claims array (length=0, empty for this proof)
+        assert_eq!(felts[idx], FieldElement::ZERO, "mul_claims length = 0");
+        idx += 1;
+
+        // 4.5: layernorm_claims array (length=0, empty for this proof)
+        assert_eq!(felts[idx], FieldElement::ZERO, "layernorm_claims length = 0");
+        idx += 1;
+
+        // 4.6: layernorm_interaction_claims array (length=0, empty for this proof)
+        assert_eq!(felts[idx], FieldElement::ZERO, "layernorm_interaction_claims length = 0");
+        idx += 1;
+
+        // 4.7: interaction_claim: MLInteractionClaim = 4 felts (sum of all LogUp claimed_sums = 0)
         for i in 0..4 {
             assert_eq!(felts[idx + i], FieldElement::ZERO, "ml_interaction_claim[{i}]");
         }
         idx += 4;
 
-        // 4.4: pcs_config = 4 felts (pow_bits + fri_config)
+        // 4.8: pcs_config = 4 felts (pow_bits + fri_config)
         let default_config = PcsConfig::default();
         assert_eq!(felts[idx], FieldElement::from(default_config.pow_bits as u64), "pcs_config.pow_bits");
         idx += 1;
@@ -1241,11 +1346,11 @@ mod tests {
         assert_eq!(felts[idx], FieldElement::from(default_config.fri_config.n_queries as u64), "fri_config.n_queries");
         idx += 1;
 
-        // 4.5: interaction_pow = 0 (u64)
+        // 4.9: interaction_pow = 0 (u64)
         assert_eq!(felts[idx], FieldElement::ZERO, "interaction_pow = 0");
         idx += 1;
 
-        // 4.6: stark_proof (CommitmentSchemeProof) — starts with PcsConfig again
+        // 4.10: stark_proof (CommitmentSchemeProof) — starts with PcsConfig again
         assert_eq!(felts[idx], FieldElement::from(default_config.pow_bits as u64), "stark_proof config.pow_bits");
         idx += 4; // skip past the 4 PcsConfig felts
 
@@ -1394,5 +1499,213 @@ mod tests {
 
         // unified_stark=None(0), add(0), mul(0), layernorm(0)
         assert_eq!(felts[len - 4], FieldElement::ZERO, "unified_stark = None");
+    }
+
+    #[test]
+    fn test_serialize_unified_stark_with_add_claims() {
+        use stwo::prover::backend::simd::SimdBackend;
+        use crate::compiler::prove::prove_activation_layer;
+        use crate::gadgets::lookup_table::PrecomputedTable;
+        use crate::gadgets::lookup_table::activations;
+        use crate::components::matmul::{M31Matrix, matmul_m31, prove_matmul_sumcheck_onchain};
+
+        // Create matmul proof
+        let mut a = M31Matrix::new(2, 2);
+        a.set(0, 0, M31::from(1)); a.set(0, 1, M31::from(2));
+        a.set(1, 0, M31::from(3)); a.set(1, 1, M31::from(4));
+        let mut b = M31Matrix::new(2, 2);
+        b.set(0, 0, M31::from(5)); b.set(0, 1, M31::from(6));
+        b.set(1, 0, M31::from(7)); b.set(1, 1, M31::from(8));
+        let c_mat = matmul_m31(&a, &b);
+        let matmul_proof = prove_matmul_sumcheck_onchain(&a, &b, &c_mat).unwrap();
+
+        // Create real activation STARK proof
+        let table = PrecomputedTable::build(activations::relu, 4);
+        let inputs = vec![M31::from(0), M31::from(1), M31::from(3), M31::from(5)];
+        let outputs: Vec<M31> = inputs.iter().map(|&x| activations::relu(x)).collect();
+        let config = PcsConfig::default();
+        let (_component, activation_proof) = prove_activation_layer::<SimdBackend, Blake2sMerkleChannel>(
+            &inputs, &outputs, &table, config,
+        ).expect("proving should succeed");
+
+        let activation_claims = vec![LayerClaim {
+            layer_index: 1,
+            claimed_sum: SecureField::from(M31::from(10)),
+            trace_rows: 4,
+        }];
+
+        let add_claims = vec![LayerClaim {
+            layer_index: 3,
+            claimed_sum: SecureField::default(), // pure AIR
+            trace_rows: 8,
+        }];
+
+        let mul_claims = vec![LayerClaim {
+            layer_index: 5,
+            claimed_sum: SecureField::default(), // pure AIR
+            trace_rows: 16,
+        }];
+
+        let layernorm_claims = vec![LayerClaim {
+            layer_index: 7,
+            claimed_sum: SecureField::from(M31::from(20)),
+            trace_rows: 4,
+        }];
+
+        let aggregated = AggregatedModelProofOnChain {
+            unified_stark: Some(activation_proof),
+            matmul_proofs: vec![(0, matmul_proof)],
+            add_claims: add_claims.clone(),
+            mul_claims: mul_claims.clone(),
+            layernorm_claims: layernorm_claims.clone(),
+            execution: crate::compiler::prove::GraphExecution {
+                intermediates: vec![],
+                output: M31Matrix::new(1, 1),
+            },
+            activation_claims: activation_claims.clone(),
+        };
+
+        let metadata = MLClaimMetadata {
+            model_id: FieldElement::from(0x77u64),
+            num_layers: 8,
+            activation_type: 0,
+            io_commitment: FieldElement::ZERO,
+            weight_commitment: FieldElement::ZERO,
+        };
+
+        let felts = serialize_ml_proof_for_recursive(&aggregated, &metadata, None);
+
+        // Find the unified_stark section: skip MLClaim(5) + matmul array + channel_salt + discriminant
+        // After MLClaim(5), matmul_proofs(len+proof), channel_salt(1), discriminant(1)
+        // we enter the unified STARK proof. Walk from the start:
+        let mut idx = 5; // past MLClaim
+        // matmul_proofs: 1 + proof felts
+        idx += 1; // matmul array length
+        let num_rounds = 1u32;
+        let matmul_felts = 4 + 4 + 1 + (num_rounds as usize * 12) + 4 + 4 + 1 + 1;
+        idx += matmul_felts;
+        // channel_salt: None = 1 felt
+        idx += 1;
+        // unified_stark discriminant: Some = 1 felt
+        assert_eq!(felts[idx], FieldElement::from(1u64), "unified_stark = Some");
+        idx += 1;
+
+        // === Inside UnifiedStarkProof ===
+
+        // 1. activation_claims: length=1
+        assert_eq!(felts[idx], FieldElement::from(1u64), "activation_claims len");
+        idx += 1;
+        // ActivationClaim: layer_index(1), log_size(ilog2(4)=2), activation_type(0)
+        assert_eq!(felts[idx], FieldElement::from(1u64), "act claim layer_index");
+        idx += 1;
+        assert_eq!(felts[idx], FieldElement::from(2u64), "act claim log_size");
+        idx += 1;
+        assert_eq!(felts[idx], FieldElement::from(0u64), "act claim activation_type");
+        idx += 1;
+
+        // 2. activation_interaction_claims: length=1, 4 felts
+        assert_eq!(felts[idx], FieldElement::from(1u64), "act interaction len");
+        idx += 1;
+        // claimed_sum = SecureField::from(M31::from(10)) = (10, 0, 0, 0)
+        assert_eq!(felts[idx], FieldElement::from(10u64), "act interaction sum[0]");
+        idx += 4;
+
+        // 3. add_claims: length=1
+        assert_eq!(felts[idx], FieldElement::from(1u64), "add_claims len");
+        idx += 1;
+        // ElementwiseComponentClaim: layer_index(3), log_size(ilog2(8)=3)
+        assert_eq!(felts[idx], FieldElement::from(3u64), "add claim layer_index");
+        idx += 1;
+        assert_eq!(felts[idx], FieldElement::from(3u64), "add claim log_size");
+        idx += 1;
+
+        // 4. mul_claims: length=1
+        assert_eq!(felts[idx], FieldElement::from(1u64), "mul_claims len");
+        idx += 1;
+        // ElementwiseComponentClaim: layer_index(5), log_size(ilog2(16)=4)
+        assert_eq!(felts[idx], FieldElement::from(5u64), "mul claim layer_index");
+        idx += 1;
+        assert_eq!(felts[idx], FieldElement::from(4u64), "mul claim log_size");
+        idx += 1;
+
+        // 5. layernorm_claims: length=1
+        assert_eq!(felts[idx], FieldElement::from(1u64), "layernorm_claims len");
+        idx += 1;
+        // LayerNormComponentClaim: layer_index(7), log_size(ilog2(4)=2)
+        assert_eq!(felts[idx], FieldElement::from(7u64), "ln claim layer_index");
+        idx += 1;
+        assert_eq!(felts[idx], FieldElement::from(2u64), "ln claim log_size");
+        idx += 1;
+
+        // 6. layernorm_interaction_claims: length=1, 4 felts
+        assert_eq!(felts[idx], FieldElement::from(1u64), "ln interaction len");
+        idx += 1;
+        // claimed_sum = SecureField::from(M31::from(20)) = (20, 0, 0, 0)
+        assert_eq!(felts[idx], FieldElement::from(20u64), "ln interaction sum[0]");
+        idx += 4;
+
+        // 7. interaction_claim: total sum = activation(10) + layernorm(20) = 30
+        assert_eq!(felts[idx], FieldElement::from(30u64), "total interaction sum[0]");
+        idx += 4;
+
+        // 8. pcs_config
+        let default_config = PcsConfig::default();
+        assert_eq!(felts[idx], FieldElement::from(default_config.pow_bits as u64), "pcs_config.pow_bits");
+        idx += 4;
+
+        // 9. interaction_pow = 0
+        assert_eq!(felts[idx], FieldElement::ZERO, "interaction_pow");
+        idx += 1;
+
+        // 10. stark_proof data follows
+        assert!(felts.len() > idx + 10, "STARK proof should have data after header");
+
+        // === Outer MLProof sections (graph-level metadata) ===
+        // Last 7 felts: add(count+claim) + mul(count+claim) + layernorm(count+claim+sum)
+        let len = felts.len();
+        // layernorm_claims: count(1) + claim(layer_index + trace_rows + claimed_sum) = 1 + 6 = 7
+        // mul_claims: count(1) + claim(layer_index + trace_rows) = 1 + 2 = 3
+        // add_claims: count(1) + claim(layer_index + trace_rows) = 1 + 2 = 3
+        // Total trailing = 7 + 3 + 3 = 13 felts
+        let ln_end = len;
+        let ln_start = ln_end - 7; // 1 count + 1 claim * (1 + 1 + 4) = 7
+        assert_eq!(felts[ln_start], FieldElement::from(1u64), "outer layernorm count");
+        assert_eq!(felts[ln_start + 1], FieldElement::from(7u64), "outer ln layer_index");
+    }
+
+    #[test]
+    fn test_serialize_elementwise_component_claim_serde() {
+        let claim = LayerClaim {
+            layer_index: 5,
+            claimed_sum: SecureField::default(),
+            trace_rows: 32,
+        };
+        let serde = ElementwiseClaimForSerde::from_layer_claim(&claim);
+        assert_eq!(serde.layer_index, 5);
+        assert_eq!(serde.log_size, 5); // ilog2(32)
+
+        let mut out = Vec::new();
+        serialize_elementwise_component_claim(&serde, &mut out);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], FieldElement::from(5u64));
+        assert_eq!(out[1], FieldElement::from(5u64));
+    }
+
+    #[test]
+    fn test_serialize_layernorm_component_claim_serde() {
+        let claim = LayerClaim {
+            layer_index: 9,
+            claimed_sum: SecureField::from(M31::from(100)),
+            trace_rows: 64,
+        };
+        let serde = LayerNormClaimForSerde::from_layer_claim(&claim);
+        assert_eq!(serde.layer_index, 9);
+        assert_eq!(serde.log_size, 6); // ilog2(64)
+
+        let mut out = Vec::new();
+        serialize_layernorm_component_claim(&serde, &mut out);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], FieldElement::from(9u64));
+        assert_eq!(out[1], FieldElement::from(6u64));
     }
 }
