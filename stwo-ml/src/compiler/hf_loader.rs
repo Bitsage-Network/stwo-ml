@@ -1,13 +1,17 @@
-//! HuggingFace model directory loader.
+//! HuggingFace model directory loader with mandatory validation.
 //!
 //! Loads a transformer model from a HuggingFace-format directory containing:
 //! - `config.json`: Model architecture config
 //! - `*.safetensors`: Weight shard files
+//! - `model.safetensors.index.json`: Shard index (for multi-shard models)
+//!
+//! **All validation checks must pass before the model is returned.**
+//! Proofs over a broken or incomplete model are meaningless.
 //!
 //! Builds a [`ComputationGraph`] from config.json and loads weights from SafeTensors.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::compiler::graph::{ComputationGraph, GraphBuilder, GraphOp, GraphWeights};
 use crate::compiler::onnx::{OnnxModel, OnnxError, ModelMetadata, TransformerConfig};
@@ -15,6 +19,342 @@ use crate::compiler::quantize_weights::quantize_weight_matrix;
 use crate::compiler::safetensors::{discover_shards, list_tensors_sharded, tensor_to_f32};
 use crate::components::activation::ActivationType;
 use crate::gadgets::quantize::QuantStrategy;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Model Validation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Result of a single validation check.
+#[derive(Debug, Clone)]
+pub struct ValidationCheck {
+    pub name: String,
+    pub passed: bool,
+    pub detail: String,
+}
+
+/// Full validation report for a model directory.
+#[derive(Debug, Clone)]
+pub struct ValidationReport {
+    pub model_dir: PathBuf,
+    pub checks: Vec<ValidationCheck>,
+}
+
+impl ValidationReport {
+    pub fn passed(&self) -> bool {
+        self.checks.iter().all(|c| c.passed)
+    }
+
+    pub fn num_passed(&self) -> usize {
+        self.checks.iter().filter(|c| c.passed).count()
+    }
+
+    pub fn num_failed(&self) -> usize {
+        self.checks.iter().filter(|c| !c.passed).count()
+    }
+
+    /// Format as a human-readable report for terminal output.
+    pub fn format_report(&self) -> String {
+        let mut lines = Vec::new();
+        lines.push(format!("  Model directory: {}", self.model_dir.display()));
+        lines.push(String::new());
+
+        for check in &self.checks {
+            let icon = if check.passed { "✓" } else { "✗" };
+            let color = if check.passed { "\x1b[0;32m" } else { "\x1b[0;31m" };
+            let reset = "\x1b[0m";
+            if check.detail.is_empty() {
+                lines.push(format!("  {color}{icon}{reset} {}", check.name));
+            } else {
+                lines.push(format!("  {color}{icon}{reset} {}  ({})", check.name, check.detail));
+            }
+        }
+
+        lines.push(String::new());
+        lines.push(format!("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
+        let total = self.checks.len();
+        let passed = self.num_passed();
+        let failed = self.num_failed();
+        if failed > 0 {
+            lines.push(format!(
+                "  Checks: {passed}/{total} passed, \x1b[0;31m{failed} FAILED\x1b[0m"
+            ));
+            lines.push(String::new());
+            lines.push("  Proofs over an incomplete model are meaningless.".to_string());
+            lines.push("  Fix the issues above before attempting to prove.".to_string());
+        } else {
+            lines.push(format!(
+                "  Checks: {passed}/{total} passed — \x1b[0;32mALL PASSED\x1b[0m"
+            ));
+        }
+        lines.push(format!("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
+
+        lines.join("\n")
+    }
+}
+
+/// Validate a model directory end-to-end.
+///
+/// Checks performed:
+/// 1. Directory exists
+/// 2. config.json exists and is parseable
+/// 3. Architecture parameters are valid (hidden_size > 0, layers > 0)
+/// 4. SafeTensors weight files exist
+/// 5. Shard index exists (for multi-shard models)
+/// 6. Weight files are readable (binary header parses)
+/// 7. Required weight tensors exist for the requested layers
+/// 8. Weight dimensions match expected graph dimensions
+pub fn validate_model_directory(
+    model_dir: &Path,
+    num_layers: Option<usize>,
+) -> ValidationReport {
+    let mut checks = Vec::new();
+
+    // Check 1: Directory exists
+    checks.push(ValidationCheck {
+        name: "Model directory exists".into(),
+        passed: model_dir.is_dir(),
+        detail: model_dir.display().to_string(),
+    });
+
+    if !model_dir.is_dir() {
+        return ValidationReport { model_dir: model_dir.to_path_buf(), checks };
+    }
+
+    // Check 2: config.json exists
+    let config_path = model_dir.join("config.json");
+    checks.push(ValidationCheck {
+        name: "config.json present".into(),
+        passed: config_path.is_file(),
+        detail: if config_path.is_file() { "found".into() } else { "MISSING".into() },
+    });
+
+    if !config_path.is_file() {
+        return ValidationReport { model_dir: model_dir.to_path_buf(), checks };
+    }
+
+    // Check 3: config.json parseable
+    let hf_config = match HfConfig::from_file(&config_path) {
+        Ok(c) => {
+            checks.push(ValidationCheck {
+                name: "config.json parseable".into(),
+                passed: true,
+                detail: format!(
+                    "{}: d={}, heads={}, ff={}, layers={}, vocab={}",
+                    c.model_type, c.hidden_size, c.num_attention_heads,
+                    c.intermediate_size, c.num_hidden_layers, c.vocab_size,
+                ),
+            });
+            Some(c)
+        }
+        Err(e) => {
+            checks.push(ValidationCheck {
+                name: "config.json parseable".into(),
+                passed: false,
+                detail: e.to_string(),
+            });
+            None
+        }
+    };
+
+    // Check 4: Architecture parameters valid
+    if let Some(ref cfg) = hf_config {
+        checks.push(ValidationCheck {
+            name: "Architecture parameters valid".into(),
+            passed: cfg.hidden_size > 0 && cfg.num_hidden_layers > 0 && cfg.num_attention_heads > 0,
+            detail: if cfg.hidden_size == 0 {
+                "hidden_size is 0".into()
+            } else if cfg.num_hidden_layers == 0 {
+                "num_hidden_layers is 0".into()
+            } else {
+                format!("hidden_size={}, layers={}", cfg.hidden_size, cfg.num_hidden_layers)
+            },
+        });
+    }
+
+    // Check 5: SafeTensors weight files exist
+    let shard_paths = discover_shards(model_dir, "model").unwrap_or_default();
+    // Also try without "model" filter (some models use different naming)
+    let shard_paths = if shard_paths.is_empty() {
+        discover_shards(model_dir, "").unwrap_or_default()
+            .into_iter()
+            .filter(|p| p.extension().map_or(false, |e| e == "safetensors"))
+            .collect()
+    } else {
+        shard_paths
+    };
+
+    let total_weight_bytes: u64 = shard_paths.iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum();
+
+    checks.push(ValidationCheck {
+        name: "SafeTensors weight files present".into(),
+        passed: !shard_paths.is_empty(),
+        detail: format!("{} shards, {:.1} GB", shard_paths.len(), total_weight_bytes as f64 / 1e9),
+    });
+
+    // Check 6: Shard index (for multi-shard models)
+    if shard_paths.len() > 1 {
+        let has_index = model_dir.join("model.safetensors.index.json").is_file();
+        checks.push(ValidationCheck {
+            name: "Shard index file present".into(),
+            passed: has_index,
+            detail: if has_index {
+                "model.safetensors.index.json".into()
+            } else {
+                "MISSING — multi-shard model needs index file".into()
+            },
+        });
+    }
+
+    // Check 7: Weight shards are readable
+    if !shard_paths.is_empty() {
+        match validate_shard_headers(&shard_paths) {
+            Ok(total_tensors) => {
+                checks.push(ValidationCheck {
+                    name: "Weight shards readable".into(),
+                    passed: true,
+                    detail: format!("{} tensors across {} shards", total_tensors, shard_paths.len()),
+                });
+            }
+            Err(e) => {
+                checks.push(ValidationCheck {
+                    name: "Weight shards readable".into(),
+                    passed: false,
+                    detail: e,
+                });
+            }
+        }
+    }
+
+    // Check 8: Required weight tensors exist for requested layers
+    if let Some(ref cfg) = hf_config {
+        let layers = num_layers.unwrap_or(cfg.num_hidden_layers);
+        let layers = if layers == 0 { cfg.num_hidden_layers } else { layers };
+
+        if let Ok(all_tensors) = list_tensors_sharded(&shard_paths) {
+            let transformer_config = cfg.to_transformer_config();
+            let graph = build_hf_transformer_graph(&transformer_config, layers);
+            let name_map = build_weight_name_map(&graph, layers, &all_tensors);
+
+            let matmul_count = graph.nodes.iter()
+                .filter(|n| matches!(n.op, GraphOp::MatMul { .. }))
+                .count();
+            let mapped_count = name_map.len();
+
+            checks.push(ValidationCheck {
+                name: "Required weight tensors found".into(),
+                passed: mapped_count == matmul_count,
+                detail: format!("{}/{} MatMul weights mapped", mapped_count, matmul_count),
+            });
+
+            // Check 9: List which specific weights are missing
+            if mapped_count < matmul_count {
+                let missing: Vec<String> = graph.nodes.iter().enumerate()
+                    .filter(|(_, n)| matches!(n.op, GraphOp::MatMul { .. }))
+                    .filter(|(idx, _)| !name_map.contains_key(idx))
+                    .map(|(idx, _)| format!("node {} (MatMul)", idx))
+                    .collect();
+                checks.push(ValidationCheck {
+                    name: "Missing weights".into(),
+                    passed: false,
+                    detail: missing.join(", "),
+                });
+            }
+
+            // Check 10: Verify weight dimensions match
+            if mapped_count > 0 {
+                match validate_weight_dimensions(&shard_paths, &graph, &name_map) {
+                    Ok(()) => {
+                        checks.push(ValidationCheck {
+                            name: "Weight dimensions match graph".into(),
+                            passed: true,
+                            detail: format!("all {} weights have correct shapes", mapped_count),
+                        });
+                    }
+                    Err(mismatches) => {
+                        checks.push(ValidationCheck {
+                            name: "Weight dimensions match graph".into(),
+                            passed: false,
+                            detail: mismatches,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    ValidationReport { model_dir: model_dir.to_path_buf(), checks }
+}
+
+/// Validate that SafeTensors shard files can be opened and headers parsed.
+fn validate_shard_headers(shard_paths: &[PathBuf]) -> Result<usize, String> {
+    let mut total_tensors = 0;
+    for path in shard_paths {
+        let file = std::fs::File::open(path)
+            .map_err(|e| format!("Cannot open {}: {}", path.display(), e))?;
+        let mmap = unsafe { memmap2::Mmap::map(&file) }
+            .map_err(|e| format!("Cannot mmap {}: {}", path.display(), e))?;
+        let tensors = safetensors::SafeTensors::deserialize(&mmap)
+            .map_err(|e| format!("Cannot parse {}: {}", path.display(), e))?;
+        total_tensors += tensors.names().len();
+    }
+    Ok(total_tensors)
+}
+
+/// Validate that weight tensor dimensions match the expected graph dimensions.
+fn validate_weight_dimensions(
+    shard_paths: &[PathBuf],
+    graph: &ComputationGraph,
+    name_map: &HashMap<usize, String>,
+) -> Result<(), String> {
+    let mut shard_data: Vec<memmap2::Mmap> = Vec::new();
+    for path in shard_paths {
+        let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| e.to_string())?;
+        shard_data.push(mmap);
+    }
+
+    let mut mismatches = Vec::new();
+
+    for (idx, node) in graph.nodes.iter().enumerate() {
+        if let GraphOp::MatMul { dims: (_m, k, n) } = &node.op {
+            if let Some(tensor_name) = name_map.get(&idx) {
+                for mmap in &shard_data {
+                    let tensors = safetensors::SafeTensors::deserialize(mmap)
+                        .map_err(|e| e.to_string())?;
+                    if let Ok(tensor) = tensors.tensor(tensor_name) {
+                        let shape = tensor.shape();
+                        if shape.len() == 2 {
+                            let (rows, cols) = (shape[0], shape[1]);
+                            // HF stores (out, in) or (in, out) — either orientation is valid
+                            let ok = (rows == *k && cols == *n)
+                                || (rows == *n && cols == *k);
+                            if !ok {
+                                mismatches.push(format!(
+                                    "{}: shape ({}, {}) does not match expected ({}, {})",
+                                    tensor_name, rows, cols, k, n
+                                ));
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if mismatches.is_empty() {
+        Ok(())
+    } else {
+        Err(mismatches.join("; "))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Config Parsing
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Parsed HuggingFace config.json.
 #[derive(Debug, Clone)]
@@ -98,28 +438,47 @@ impl HfConfig {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Model Loading (with mandatory validation)
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// Load a model from a HuggingFace directory.
 ///
-/// The directory should contain `config.json` and `*.safetensors` files.
+/// **Performs full validation before returning.** If any critical check fails
+/// (missing config, missing weights, dimension mismatch), this returns an error.
+/// Proofs over an incomplete model are refused.
 ///
 /// # Arguments
 /// * `model_dir` - Path to the model directory
-/// * `num_layers` - Number of transformer layers to load (use 0 or config value for all)
+/// * `num_layers` - Number of transformer layers to load (None = all from config)
 ///
 /// Returns an `OnnxModel` with the graph and loaded weights.
 pub fn load_hf_model(
     model_dir: &Path,
     num_layers: Option<usize>,
 ) -> Result<OnnxModel, OnnxError> {
-    let config_path = model_dir.join("config.json");
-    if !config_path.exists() {
-        return Err(OnnxError::IoError(format!(
-            "config.json not found in {}",
-            model_dir.display()
+    // ── Step 1: Run full validation ──
+    let report = validate_model_directory(model_dir, num_layers);
+
+    // Print the validation report
+    eprintln!();
+    eprintln!("  ── Model Validation ──");
+    eprintln!("{}", report.format_report());
+    eprintln!();
+
+    // Refuse to load if validation failed
+    if !report.passed() {
+        return Err(OnnxError::WeightError(format!(
+            "Model validation failed: {}/{} checks passed. \
+             Fix the issues above before proving. \
+             Proofs over an incomplete model are meaningless.",
+            report.num_passed(),
+            report.checks.len(),
         )));
     }
 
-    // Parse config
+    // ── Step 2: Parse config ──
+    let config_path = model_dir.join("config.json");
     let hf_config = HfConfig::from_file(&config_path)?;
     let transformer_config = hf_config.to_transformer_config();
 
@@ -136,46 +495,29 @@ pub fn load_hf_model(
         hf_config.num_hidden_layers,
     );
 
-    // Build computation graph
+    // ── Step 3: Build computation graph ──
     let graph = build_hf_transformer_graph(&transformer_config, layers);
 
-    // Discover and load SafeTensors weights
+    // ── Step 4: Load weights (guaranteed to exist by validation) ──
     let shard_paths = discover_shards(model_dir, "model")
         .map_err(|e| OnnxError::WeightError(format!("Cannot discover shards: {e}")))?;
 
     if shard_paths.is_empty() {
-        eprintln!(
-            "  WARNING: No SafeTensors shard files found in {}. Using auto-generated weights.",
-            model_dir.display()
-        );
-        // Fall back to auto-generated weights for testing
-        let weights = crate::compiler::onnx::generate_weights_for_graph(&graph, 42);
-        let num_parameters = crate::compiler::onnx::count_matmul_params(&graph);
-
-        let metadata = ModelMetadata {
-            name: format!("{}_{}L", hf_config.model_type, layers),
-            num_parameters,
-            input_shape: graph.input_shape,
-            output_shape: graph.output_shape,
-            num_layers: graph.num_layers(),
-        };
-
-        return Ok(OnnxModel {
-            input_shape: graph.input_shape,
-            graph,
-            weights,
-            metadata,
-        });
+        return Err(OnnxError::WeightError(format!(
+            "No SafeTensors weight files found in {}. \
+             Download the model first: \
+             huggingface-cli download <model-id> --local-dir {}",
+            model_dir.display(),
+            model_dir.display(),
+        )));
     }
 
     eprintln!("  Loading weights from {} shards...", shard_paths.len());
 
-    // List tensors for diagnostics
     let all_tensor_names: Vec<(String, usize)> = list_tensors_sharded(&shard_paths)
         .map_err(|e| OnnxError::WeightError(format!("Cannot list tensors: {e}")))?;
     eprintln!("  Total tensors across shards: {}", all_tensor_names.len());
 
-    // Build name mapping: graph node index → HuggingFace tensor name
     let name_map = build_weight_name_map(&graph, layers, &all_tensor_names);
     eprintln!("  Weight name mapping: {} entries", name_map.len());
     for (idx, name) in &name_map {
@@ -186,14 +528,31 @@ pub fn load_hf_model(
         &shard_paths, &graph, &name_map, QuantStrategy::Symmetric8,
     ).map_err(|e| OnnxError::WeightError(format!("Cannot load weights: {e}")))?;
 
-    let loaded_count = graph.nodes.iter().enumerate()
-        .filter(|(idx, _)| weights.get_weight(*idx).is_some())
-        .count();
-    let matmul_count = graph.nodes.iter()
-        .filter(|n| matches!(n.op, GraphOp::MatMul { .. }))
-        .count();
+    // ── Step 5: Verify all MatMul nodes have weights ──
+    let matmul_nodes: Vec<usize> = graph.nodes.iter().enumerate()
+        .filter(|(_, n)| matches!(n.op, GraphOp::MatMul { .. }))
+        .map(|(idx, _)| idx)
+        .collect();
 
-    eprintln!("  Loaded weights for {}/{} MatMul layers", loaded_count, matmul_count);
+    let mut missing_weights = Vec::new();
+    for &idx in &matmul_nodes {
+        if weights.get_weight(idx).is_none() {
+            missing_weights.push(idx);
+        }
+    }
+
+    if !missing_weights.is_empty() {
+        return Err(OnnxError::WeightError(format!(
+            "Weight not found for {} MatMul node(s): {:?}. \
+             All weights must be present before proving. \
+             Check that the model directory has all SafeTensors shards.",
+            missing_weights.len(),
+            missing_weights,
+        )));
+    }
+
+    let loaded_count = matmul_nodes.len() - missing_weights.len();
+    eprintln!("  Loaded weights for {}/{} MatMul layers ✓", loaded_count, matmul_nodes.len());
 
     let num_parameters = crate::compiler::onnx::count_matmul_params(&graph);
 
@@ -212,6 +571,10 @@ pub fn load_hf_model(
         metadata,
     })
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Graph Construction
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Build a transformer computation graph matching a HuggingFace architecture.
 ///
@@ -247,6 +610,10 @@ fn build_hf_transformer_graph(
 
     builder.build()
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Weight Name Mapping
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Build a mapping from graph node indices to HuggingFace tensor names.
 ///
@@ -343,6 +710,10 @@ fn build_weight_name_map(
     map
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Weight Loading
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// Load weights from multiple SafeTensors shards using an explicit name mapping.
 fn load_weights_from_shards(
     shard_paths: &[std::path::PathBuf],
@@ -415,7 +786,7 @@ fn load_weights_from_shards(
                 }
                 if !found {
                     eprintln!(
-                        "    WARNING: tensor '{}' not found in any shard for node {}",
+                        "    ERROR: tensor '{}' not found in any shard for node {}",
                         tensor_name, idx
                     );
                 }
@@ -477,5 +848,23 @@ mod tests {
         assert_eq!(graph.num_layers(), 15);
         assert_eq!(graph.input_shape, (1, 8));
         assert_eq!(graph.output_shape, (1, 8));
+    }
+
+    #[test]
+    fn test_validation_missing_dir() {
+        let report = validate_model_directory(Path::new("/nonexistent/dir"), Some(1));
+        assert!(!report.passed());
+        assert_eq!(report.num_failed(), 1);
+    }
+
+    #[test]
+    fn test_validation_empty_dir() {
+        let tmp = std::env::temp_dir().join("stwo_ml_empty_model");
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let report = validate_model_directory(&tmp, Some(1));
+        assert!(!report.passed());
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

@@ -630,14 +630,19 @@ VALIDATE_SCRIPT
         echo -e "  ${GREEN}Model validation PASSED${NC}"
     fi
 
-    # Also validate prove-model can read the config
+    # Run the Rust prover's own validation (the proof system checks everything)
     PROVE_MODEL_BIN=$(find . -name "prove-model" -path "*/release/*" -type f 2>/dev/null | head -1)
     if [ -n "$PROVE_MODEL_BIN" ]; then
         echo ""
-        echo "  Testing prove-model --inspect..."
-        $PROVE_MODEL_BIN --model-dir "${MODEL_DIR}" --layers 1 --inspect 2>&1 && \
-            echo -e "  ${GREEN}prove-model can read the model${NC}" || \
-            echo -e "  ${YELLOW}prove-model --inspect returned an error${NC}"
+        echo -e "  ${BOLD}Running prover validation (prove-model --validate)...${NC}"
+        echo "  The proof system itself must agree the model is valid."
+        echo ""
+        if $PROVE_MODEL_BIN --model-dir "${MODEL_DIR}" --layers 1 --validate 2>&1; then
+            echo -e "  ${GREEN}Prover validation PASSED${NC}"
+        else
+            echo -e "  ${RED}Prover validation FAILED — the proof system rejected this model${NC}"
+            VALIDATION_FAILED=true
+        fi
     fi
 
     if [ "$VALIDATION_FAILED" = true ]; then

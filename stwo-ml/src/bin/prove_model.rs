@@ -3,6 +3,10 @@
 //! Standalone tool that takes an ONNX model (or HuggingFace model directory)
 //! and JSON input, and produces a serialized proof ready for `cairo-prove prove-ml`.
 //!
+//! **The prover validates the model end-to-end before proving.**
+//! If weights are missing, config is broken, or dimensions don't match,
+//! the proof is refused. Proofs over an incomplete model are meaningless.
+//!
 //! ```text
 //! # ONNX mode:
 //! prove-model \
@@ -18,6 +22,11 @@
 //!   --layers 1 \
 //!   --output proof.json \
 //!   --gpu
+//!
+//! # Validate-only mode (no proving):
+//! prove-model \
+//!   --model-dir /path/to/qwen3-14b \
+//!   --validate
 //! ```
 
 #![feature(portable_simd)]
@@ -62,6 +71,7 @@ impl std::str::FromStr for OutputFormat {
 /// stwo-ml prove-model: generic ZKML prover CLI.
 ///
 /// Takes an ONNX model (or HuggingFace model directory) and produces a proof.
+/// Validates the model before proving — proofs over broken models are refused.
 #[derive(Parser, Debug)]
 #[command(name = "prove-model", version, about)]
 struct Cli {
@@ -105,6 +115,11 @@ struct Cli {
     /// Print model summary and exit (no proving).
     #[arg(long)]
     inspect: bool,
+
+    /// Validate model directory only (check files, weights, dimensions).
+    /// Exits with code 0 if valid, 1 if not.
+    #[arg(long)]
+    validate: bool,
 
     /// Channel salt for Fiat-Shamir (optional).
     #[arg(long)]
@@ -159,7 +174,7 @@ fn generate_random_input(rows: usize, cols: usize) -> M31Matrix {
 
 fn load_model(cli: &Cli) -> OnnxModel {
     if let Some(ref model_dir) = cli.model_dir {
-        // HuggingFace directory mode
+        // HuggingFace directory mode — validation is built into load_hf_model
         eprintln!("Loading HuggingFace model from: {}", model_dir.display());
         stwo_ml::compiler::hf_loader::load_hf_model(model_dir, cli.layers)
             .unwrap_or_else(|e| {
@@ -181,6 +196,31 @@ fn load_model(cli: &Cli) -> OnnxModel {
 
 fn main() {
     let cli = Cli::parse();
+
+    // --validate: run validation only and exit
+    if cli.validate {
+        if let Some(ref model_dir) = cli.model_dir {
+            let report = stwo_ml::compiler::hf_loader::validate_model_directory(
+                model_dir,
+                cli.layers,
+            );
+            eprintln!();
+            eprintln!("  ── Model Validation ──");
+            eprintln!("{}", report.format_report());
+            eprintln!();
+
+            if report.passed() {
+                eprintln!("Model is valid and ready for proving.");
+                process::exit(0);
+            } else {
+                eprintln!("Model validation FAILED. Fix the issues above.");
+                process::exit(1);
+            }
+        } else {
+            eprintln!("--validate requires --model-dir");
+            process::exit(1);
+        }
+    }
 
     let model = load_model(&cli);
 
