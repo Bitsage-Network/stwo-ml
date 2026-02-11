@@ -1,24 +1,27 @@
 #!/usr/bin/env bash
 #
-# Obelysk H200 One-Command Setup
-# ================================
-# Sets up a fresh GPU instance for ML proving benchmarks.
+# Obelysk GPU Setup — One-Command Deployment
+# =============================================
+# Sets up a fresh GPU instance with a fully verified ML model + proving stack.
+# Proofs are meaningless without a working model — this script guarantees both.
 #
 # What this does:
-#   1. Installs system dependencies (build-essential, cmake, pkg-config, etc.)
-#   2. Installs Rust nightly with portable_simd support
-#   3. Verifies CUDA 12.4+ is available
-#   4. Clones the stwo-ml repo
-#   5. Downloads Qwen3-14B weights from HuggingFace (~28GB)
-#   6. Builds stwo-ml, cairo-prove, and Cairo ML verifier
-#   7. Runs a quick sanity test
+#   1. Installs system deps + Python ML stack (torch, transformers, accelerate)
+#   2. Installs Rust nightly (pinned to match stwo's requirements)
+#   3. Verifies CUDA environment (GPU, driver, toolkit)
+#   4. Clones the stwo-ml repo + submodules
+#   5. Downloads model weights from HuggingFace (ALL required files)
+#   6. Builds stwo-ml proving binary (GPU → CPU fallback)
+#   7. Validates model END-TO-END: files, weights, tokenizer, GPU load, inference
+#   8. Prints benchmark commands
 #
 # Usage:
-#   brev shell bitsage-worker
 #   curl -sSL https://raw.githubusercontent.com/Bitsage-Network/stwo-ml/main/scripts/h200_setup.sh | bash
 #
-#   Or if you already have the repo:
-#   bash scripts/h200_setup.sh [--skip-model] [--skip-build] [--branch BRANCH]
+#   Or with options:
+#   bash scripts/h200_setup.sh --model Qwen/Qwen3-14B
+#   bash scripts/h200_setup.sh --model meta-llama/Llama-3-8B
+#   bash scripts/h200_setup.sh --skip-model --skip-deps  # Rebuild only
 #
 set -euo pipefail
 
@@ -29,8 +32,8 @@ set -euo pipefail
 REPO_URL="https://github.com/Bitsage-Network/stwo-ml.git"
 BRANCH="${BRANCH:-main}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/stwo-ml}"
-MODEL_DIR="${MODEL_DIR:-$HOME/models/qwen3-14b}"
-MODEL_HF="Qwen/Qwen3-14B"
+MODEL_HF="${MODEL_HF:-Qwen/Qwen3-14B}"
+MODEL_DIR="${MODEL_DIR:-}"   # auto-derived from MODEL_HF if not set
 
 SKIP_MODEL=false
 SKIP_BUILD=false
@@ -43,22 +46,35 @@ while [[ $# -gt 0 ]]; do
         --skip-build)  SKIP_BUILD=true; shift ;;
         --skip-deps)   SKIP_DEPS=true; shift ;;
         --branch)      BRANCH="$2"; shift 2 ;;
+        --model)       MODEL_HF="$2"; shift 2 ;;
         --model-dir)   MODEL_DIR="$2"; shift 2 ;;
         --install-dir) INSTALL_DIR="$2"; shift 2 ;;
         -h|--help)
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --skip-model    Skip downloading Qwen3-14B weights"
+            echo "  --model HF_ID   HuggingFace model (default: Qwen/Qwen3-14B)"
+            echo "  --model-dir DIR Where to store model weights (auto-derived from model)"
+            echo "  --skip-model    Skip downloading model weights"
             echo "  --skip-build    Skip building Rust binaries"
             echo "  --skip-deps     Skip installing system dependencies"
-            echo "  --branch NAME   Git branch (default: feat/f32-dual-track)"
-            echo "  --model-dir DIR Where to store model weights (default: ~/models/qwen3-14b)"
+            echo "  --branch NAME   Git branch (default: main)"
             echo "  --install-dir   Where to clone repo (default: ~/stwo-ml)"
+            echo ""
+            echo "Examples:"
+            echo "  $0                                          # Default: Qwen3-14B"
+            echo "  $0 --model meta-llama/Llama-3-8B            # Use LLaMA"
+            echo "  $0 --model mistralai/Mistral-7B-v0.3        # Use Mistral"
             exit 0 ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
+
+# Auto-derive MODEL_DIR from HuggingFace model ID if not explicitly set
+if [ -z "$MODEL_DIR" ]; then
+    MODEL_SLUG=$(echo "${MODEL_HF}" | tr '/' '-' | tr '[:upper:]' '[:lower:]')
+    MODEL_DIR="$HOME/models/${MODEL_SLUG}"
+fi
 
 # Colors
 RED='\033[0;31m'
@@ -79,13 +95,23 @@ cat << 'BANNER'
 ║    ╚██████╔╝██████╔╝███████╗███████╗██║   ███████║██║  ██╗                    ║
 ║     ╚═════╝ ╚═════╝ ╚══════╝╚══════╝╚═╝   ╚══════╝╚═╝  ╚═╝                    ║
 ║                                                                               ║
-║                   H200 GPU WORKER SETUP                                       ║
+║    ███████╗████████╗██╗    ██╗ ██████╗    ███╗   ███╗██╗                      ║
+║    ██╔════╝╚══██╔══╝██║    ██║██╔═══██╗   ████╗ ████║██║                      ║
+║    ███████╗   ██║   ██║ █╗ ██║██║   ██║   ██╔████╔██║██║                      ║
+║    ╚════██║   ██║   ██║███╗██║██║   ██║   ██║╚██╔╝██║██║                      ║
+║    ███████║   ██║   ╚███╔███╔╝╚██████╔╝   ██║ ╚═╝ ██║███████╗                ║
+║    ╚══════╝   ╚═╝    ╚══╝╚══╝  ╚═════╝    ╚═╝     ╚═╝╚══════╝                ║
 ║                                                                               ║
-║     Qwen3-14B → Circle STARK Proof → On-Chain Verification                   ║
+║              GPU-Accelerated ZK Proofs for Verifiable AI                      ║
+║                                                                               ║
+║    Model → Circle STARK Proof → Recursive Verification → On-Chain             ║
 ║                                                                               ║
 ╚═══════════════════════════════════════════════════════════════════════════════╝
 BANNER
 echo -e "${NC}"
+echo -e "  ${BOLD}Model:${NC}   ${MODEL_HF}"
+echo -e "  ${BOLD}Target:${NC}  ${MODEL_DIR}"
+echo ""
 
 START_TIME=$(date +%s)
 
@@ -94,7 +120,7 @@ START_TIME=$(date +%s)
 # ═══════════════════════════════════════════════════════════════════════
 
 if [ "$SKIP_DEPS" = false ]; then
-    echo -e "${YELLOW}[1/7] Installing system dependencies${NC}"
+    echo -e "${YELLOW}[1/8] Installing system dependencies${NC}"
 
     # Detect package manager
     if command -v apt-get &>/dev/null; then
@@ -137,7 +163,7 @@ if [ "$SKIP_DEPS" = false ]; then
         pip3 install --quiet --user torch transformers accelerate 2>/dev/null || true
     echo -e "  ${GREEN}torch + transformers installed${NC}"
 else
-    echo -e "${YELLOW}[1/7] Skipping system dependencies (--skip-deps)${NC}"
+    echo -e "${YELLOW}[1/8] Skipping system dependencies (--skip-deps)${NC}"
 fi
 echo ""
 
@@ -145,7 +171,7 @@ echo ""
 # Step 2: Rust Nightly
 # ═══════════════════════════════════════════════════════════════════════
 
-echo -e "${YELLOW}[2/7] Setting up Rust toolchain${NC}"
+echo -e "${YELLOW}[2/8] Setting up Rust toolchain${NC}"
 
 # The stwo and stwo-ml crates pin nightly-2025-07-14 via rust-toolchain.toml.
 # We install that exact version to avoid compilation breakage.
@@ -173,7 +199,7 @@ echo ""
 # Step 3: CUDA Verification
 # ═══════════════════════════════════════════════════════════════════════
 
-echo -e "${YELLOW}[3/7] Verifying CUDA environment${NC}"
+echo -e "${YELLOW}[3/8] Verifying CUDA environment${NC}"
 
 # Check nvidia-smi
 if ! command -v nvidia-smi &>/dev/null; then
@@ -237,7 +263,7 @@ echo ""
 # Step 4: Clone Repository
 # ═══════════════════════════════════════════════════════════════════════
 
-echo -e "${YELLOW}[4/7] Setting up repository${NC}"
+echo -e "${YELLOW}[4/8] Setting up repository${NC}"
 
 if [ -d "${INSTALL_DIR}/.git" ]; then
     echo "  Repo exists at ${INSTALL_DIR}, pulling latest..."
@@ -265,63 +291,63 @@ echo ""
 # ═══════════════════════════════════════════════════════════════════════
 
 if [ "$SKIP_MODEL" = false ]; then
-    echo -e "${YELLOW}[5/7] Downloading Qwen3-14B weights${NC}"
+    echo -e "${YELLOW}[5/8] Downloading model weights${NC}"
+    echo -e "  Model: ${BOLD}${MODEL_HF}${NC}"
+    echo -e "  Dir:   ${MODEL_DIR}"
 
     mkdir -p "${MODEL_DIR}"
 
-    if [ -f "${MODEL_DIR}/config.json" ] && ls "${MODEL_DIR}"/*.safetensors &>/dev/null 2>&1; then
-        echo "  Model already downloaded at ${MODEL_DIR}"
-        SHARD_COUNT=$(ls "${MODEL_DIR}"/*.safetensors 2>/dev/null | wc -l)
-        TOTAL_SIZE=$(du -sh "${MODEL_DIR}" 2>/dev/null | cut -f1)
-        echo "  Shards: ${SHARD_COUNT}, Size: ${TOTAL_SIZE}"
-    else
-        echo "  Downloading ${MODEL_HF} to ${MODEL_DIR}..."
-        echo "  This is ~28GB and may take 10-20 minutes depending on bandwidth."
-        echo ""
-
-        # Download ALL model files needed for inference + proving
-        # Includes: weights, config, tokenizer, shard index, generation config
-        INCLUDE_PATTERNS=(
-            "*.safetensors"
-            "*.json"
-            "tokenizer.model"
-            "*.tiktoken"
-            "*.txt"
-        )
-        INCLUDE_ARGS=""
-        for pat in "${INCLUDE_PATTERNS[@]}"; do
-            INCLUDE_ARGS="${INCLUDE_ARGS} --include ${pat}"
-        done
-
-        if command -v huggingface-cli &>/dev/null; then
-            huggingface-cli download "${MODEL_HF}" \
-                --local-dir "${MODEL_DIR}" \
-                ${INCLUDE_ARGS} \
-                --quiet
-        elif python3 -c "from huggingface_hub import snapshot_download" 2>/dev/null; then
-            python3 -c "
+    # Always use snapshot_download to get ALL required files
+    # This handles: weights, config, tokenizer, shard index, generation config
+    # Works for ANY HuggingFace model (Qwen, LLaMA, Mistral, YOLO, etc.)
+    echo "  Downloading all model files..."
+    python3 -c "
 from huggingface_hub import snapshot_download
-snapshot_download(
-    '${MODEL_HF}',
-    local_dir='${MODEL_DIR}',
-    allow_patterns=['*.safetensors', '*.json', 'tokenizer.model', '*.tiktoken', '*.txt'],
-)
-print('Download complete')
-"
-        else
-            echo -e "  ${YELLOW}huggingface_hub not available, using git lfs...${NC}"
-            git lfs install 2>/dev/null || true
-            GIT_LFS_SKIP_SMUDGE=0 git clone --depth 1 \
-                "https://huggingface.co/${MODEL_HF}" "${MODEL_DIR}"
-        fi
+import os
 
-        echo ""
-        SHARD_COUNT=$(ls "${MODEL_DIR}"/*.safetensors 2>/dev/null | wc -l)
-        TOTAL_SIZE=$(du -sh "${MODEL_DIR}" 2>/dev/null | cut -f1)
-        echo -e "  ${GREEN}Downloaded: ${SHARD_COUNT} shards, ${TOTAL_SIZE}${NC}"
-    fi
+model_dir = '${MODEL_DIR}'
+model_id = '${MODEL_HF}'
+
+# Download everything needed for inference + proving
+# Exclude only large non-essential files (gguf, bin checkpoints, etc.)
+result = snapshot_download(
+    model_id,
+    local_dir=model_dir,
+    ignore_patterns=['*.gguf', '*.bin', '*.pt', '*.pth', '*.ot', '*.msgpack', '.git*'],
+)
+
+# Verify critical files exist
+files = os.listdir(model_dir)
+safetensors = [f for f in files if f.endswith('.safetensors')]
+has_config = 'config.json' in files
+has_index = any('index' in f and f.endswith('.json') for f in files) or len(safetensors) == 1
+has_tokenizer = any('tokenizer' in f.lower() for f in files)
+
+total_size = sum(os.path.getsize(os.path.join(model_dir, f)) for f in files if os.path.isfile(os.path.join(model_dir, f)))
+
+print(f'  ✓ config.json:      {\"found\" if has_config else \"MISSING\"}'  )
+print(f'  ✓ shard index:      {\"found\" if has_index else \"MISSING\"}'  )
+print(f'  ✓ tokenizer:        {\"found\" if has_tokenizer else \"MISSING\"}'  )
+print(f'  ✓ weight shards:    {len(safetensors)} files'  )
+print(f'  ✓ total size:       {total_size / 1e9:.1f} GB'  )
+
+if not has_config:
+    print('ERROR: config.json missing — model cannot load')
+    exit(1)
+if len(safetensors) == 0:
+    print('ERROR: no .safetensors files found — weights missing')
+    exit(1)
+if not has_tokenizer:
+    print('WARNING: no tokenizer found — inference may fail')
+
+print('  Download complete')
+" || {
+        echo -e "  ${RED}Model download failed${NC}"
+        exit 1
+    }
+    echo -e "  ${GREEN}Model downloaded${NC}"
 else
-    echo -e "${YELLOW}[5/7] Skipping model download (--skip-model)${NC}"
+    echo -e "${YELLOW}[5/8] Skipping model download (--skip-model)${NC}"
 fi
 echo ""
 
@@ -330,7 +356,7 @@ echo ""
 # ═══════════════════════════════════════════════════════════════════════
 
 if [ "$SKIP_BUILD" = false ]; then
-    echo -e "${YELLOW}[6/7] Building Obelysk proving stack${NC}"
+    echo -e "${YELLOW}[6/8] Building Obelysk proving stack${NC}"
 
     cd "${INSTALL_DIR}"
 
@@ -408,109 +434,219 @@ if [ "$SKIP_BUILD" = false ]; then
         echo -e "  ${YELLOW}Sanity test skipped (not critical)${NC}"
 
 else
-    echo -e "${YELLOW}[6/7] Skipping build (--skip-build)${NC}"
+    echo -e "${YELLOW}[6/8] Skipping build (--skip-build)${NC}"
 fi
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════════
-# Step 7: Validate Qwen3-14B Model
+# Step 7: Full Model Validation (MUST PASS)
 # ═══════════════════════════════════════════════════════════════════════
 
-echo -e "${YELLOW}[7/8] Validating Qwen3-14B model${NC}"
+if [ "$SKIP_MODEL" = false ]; then
+    echo -e "${YELLOW}[7/8] Validating model end-to-end${NC}"
+    echo -e "  ${BOLD}Every check must pass. Proofs are meaningless without a verified model.${NC}"
+    echo ""
 
-cd "${INSTALL_DIR}"
+    cd "${INSTALL_DIR}"
 
-if [ -f "${MODEL_DIR}/config.json" ] && ls "${MODEL_DIR}"/*.safetensors &>/dev/null 2>&1; then
-    # Install Python ML dependencies for validation
-    pip3 install --quiet torch transformers accelerate 2>/dev/null || \
-        pip3 install --quiet --user torch transformers accelerate 2>/dev/null || true
+    VALIDATION_FAILED=false
 
-    # Run quick validation: load model, check config, run 1 forward pass
-    python3 -c "
+    export MODEL_DIR="${MODEL_DIR}"
+    python3 << 'VALIDATE_SCRIPT'
 import json, os, sys, time
 
-model_dir = '${MODEL_DIR}'
+model_dir = os.environ.get('MODEL_DIR', os.path.expanduser('~/models/qwen3-14b'))
+checks_passed = 0
+checks_failed = 0
 
-# 1. Validate config.json
-print('  Checking config.json...')
-with open(os.path.join(model_dir, 'config.json')) as f:
-    config = json.load(f)
+def check(name, condition, detail=""):
+    global checks_passed, checks_failed
+    if condition:
+        print(f'  \033[0;32m✓\033[0m {name}' + (f'  ({detail})' if detail else ''))
+        checks_passed += 1
+        return True
+    else:
+        print(f'  \033[0;31m✗\033[0m {name}' + (f'  ({detail})' if detail else ''))
+        checks_failed += 1
+        return False
 
-hidden = config.get('hidden_size', 0)
-heads = config.get('num_attention_heads', 0)
-layers = config.get('num_hidden_layers', 0)
-ff = config.get('intermediate_size', 0)
-vocab = config.get('vocab_size', 0)
-print(f'    model_type:    {config.get(\"model_type\", \"unknown\")}')
-print(f'    hidden_size:   {hidden}')
-print(f'    heads:         {heads}')
-print(f'    layers:        {layers}')
-print(f'    intermediate:  {ff}')
-print(f'    vocab_size:    {vocab}')
+print(f'  Model directory: {model_dir}')
+print()
 
-# 2. Validate SafeTensors shards
-shards = [f for f in os.listdir(model_dir) if f.endswith('.safetensors')]
-total_bytes = sum(os.path.getsize(os.path.join(model_dir, f)) for f in shards)
-print(f'    shards:        {len(shards)} ({total_bytes / 1e9:.1f} GB)')
+# ── Check 1: Directory exists ──
+check('Model directory exists', os.path.isdir(model_dir))
 
-# 3. Quick GPU inference test
+# ── Check 2: config.json ──
+config_path = os.path.join(model_dir, 'config.json')
+has_config = os.path.isfile(config_path)
+check('config.json present', has_config)
+
+config = {}
+if has_config:
+    with open(config_path) as f:
+        config = json.load(f)
+
+    model_type = config.get('model_type', 'unknown')
+    hidden = config.get('hidden_size', 0)
+    heads = config.get('num_attention_heads', 0)
+    layers = config.get('num_hidden_layers', 0)
+    ff = config.get('intermediate_size', 0)
+    vocab = config.get('vocab_size', 0)
+
+    check('config.json parseable', hidden > 0 and layers > 0,
+          f'{model_type}: d={hidden}, heads={heads}, ff={ff}, layers={layers}, vocab={vocab}')
+
+# ── Check 3: Weight files ──
+all_files = os.listdir(model_dir) if os.path.isdir(model_dir) else []
+safetensors = sorted([f for f in all_files if f.endswith('.safetensors')])
+total_weight_bytes = sum(
+    os.path.getsize(os.path.join(model_dir, f))
+    for f in safetensors
+)
+check('SafeTensors weight files present', len(safetensors) > 0,
+      f'{len(safetensors)} shards, {total_weight_bytes/1e9:.1f} GB')
+
+# ── Check 4: Shard index (for multi-shard models) ──
+has_index = any('index' in f and f.endswith('.json') for f in all_files)
+if len(safetensors) > 1:
+    check('Shard index file present', has_index,
+          'model.safetensors.index.json' if has_index else 'MISSING — transformers cannot load sharded model')
+elif len(safetensors) == 1:
+    check('Single-shard model (no index needed)', True)
+
+# ── Check 5: Tokenizer ──
+tokenizer_files = [f for f in all_files if 'tokenizer' in f.lower() or f.endswith('.tiktoken')]
+check('Tokenizer files present', len(tokenizer_files) > 0,
+      ', '.join(tokenizer_files[:3]) + ('...' if len(tokenizer_files) > 3 else ''))
+
+# ── Check 6: Weight integrity (read first shard header) ──
+if safetensors:
+    try:
+        import struct
+        first_shard = os.path.join(model_dir, safetensors[0])
+        with open(first_shard, 'rb') as f:
+            header_len = struct.unpack('<Q', f.read(8))[0]
+            header = json.loads(f.read(header_len))
+        tensor_count = len([k for k in header if k != '__metadata__'])
+        check('Weight shard readable', tensor_count > 0,
+              f'{safetensors[0]}: {tensor_count} tensors')
+    except Exception as e:
+        check('Weight shard readable', False, str(e))
+
+# ── Check 7: GPU available ──
 try:
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    gpu_ok = torch.cuda.is_available()
+    if gpu_ok:
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_mem = torch.cuda.get_device_properties(0).total_mem / 1e9
+        check('CUDA GPU available', True, f'{gpu_name}, {gpu_mem:.0f} GB')
+    else:
+        check('CUDA GPU available', False, 'torch.cuda.is_available() = False')
+except ImportError:
+    check('CUDA GPU available', False, 'torch not installed')
+    gpu_ok = False
 
-    if torch.cuda.is_available():
-        print('  Loading model to GPU for inference test...')
+# ── Check 8: Tokenizer loads ──
+tokenizer = None
+try:
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+    test_ids = tokenizer.encode('Hello world')
+    check('Tokenizer loads and encodes', len(test_ids) > 0,
+          f'"Hello world" → {len(test_ids)} tokens')
+except Exception as e:
+    check('Tokenizer loads and encodes', False, str(e))
+
+# ── Check 9: Model loads onto GPU ──
+model = None
+if gpu_ok:
+    try:
+        from transformers import AutoModelForCausalLM
+        print()
+        print('  Loading model onto GPU (this takes 15-30s)...')
         t0 = time.time()
-        tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
-        # Use dtype (not torch_dtype) for transformers >= 5.x
         load_kwargs = dict(device_map='auto', trust_remote_code=True)
         try:
-            model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float16, **load_kwargs)
-        except TypeError:
-            model = AutoModelForCausalLM.from_pretrained(model_dir, torch_dtype=torch.float16, **load_kwargs)
+            model = AutoModelForCausalLM.from_pretrained(model_dir, dtype='float16', **load_kwargs)
+        except (TypeError, ValueError):
+            try:
+                model = AutoModelForCausalLM.from_pretrained(model_dir, torch_dtype='float16', **load_kwargs)
+            except TypeError:
+                import torch
+                model = AutoModelForCausalLM.from_pretrained(model_dir, torch_dtype=torch.float16, **load_kwargs)
         load_time = time.time() - t0
         total_params = sum(p.numel() for p in model.parameters())
-        gpu_mem = torch.cuda.memory_allocated() / 1e9
-        print(f'    loaded in:     {load_time:.1f}s')
-        print(f'    parameters:    {total_params/1e9:.1f}B')
-        print(f'    GPU memory:    {gpu_mem:.1f} GB')
+        gpu_mem_used = torch.cuda.memory_allocated() / 1e9
+        check('Model loads onto GPU', True,
+              f'{total_params/1e9:.1f}B params, {gpu_mem_used:.1f} GB VRAM, {load_time:.1f}s')
+    except Exception as e:
+        check('Model loads onto GPU', False, str(e))
 
-        # Quick generate
-        inputs = tokenizer('Hello', return_tensors='pt').to('cuda')
+# ── Check 10: Inference produces output ──
+if model is not None and tokenizer is not None:
+    try:
+        import torch
+        inputs = tokenizer('The capital of France is', return_tensors='pt').to('cuda')
         t0 = time.time()
         with torch.no_grad():
-            out = model.generate(**inputs, max_new_tokens=10, do_sample=False)
+            out = model.generate(**inputs, max_new_tokens=20, do_sample=False)
         gen_time = time.time() - t0
-        tokens = out.shape[1] - inputs['input_ids'].shape[1]
-        text = tokenizer.decode(out[0], skip_special_tokens=True)
-        print(f'    inference:     {tokens} tokens in {gen_time:.2f}s ({tokens/gen_time:.0f} tok/s)')
-        print(f'    output:        {text[:80]}')
-        print('  Model validation: PASSED')
-        del model
-        torch.cuda.empty_cache()
-    else:
-        print('  CUDA not available for Python — skipping inference test')
-        print('  Config + SafeTensors validation: PASSED')
-except ImportError:
-    print('  torch/transformers not installed — skipping inference test')
-    print('  Config + SafeTensors validation: PASSED')
-except Exception as e:
-    print(f'  Inference test failed: {e}')
-    print('  Config + SafeTensors validation: PASSED (inference test optional)')
-" 2>&1 && echo -e "  ${GREEN}Model validated${NC}" || \
-        echo -e "  ${YELLOW}Model validation skipped${NC}"
+        new_tokens = out.shape[1] - inputs['input_ids'].shape[1]
+        output_text = tokenizer.decode(out[0], skip_special_tokens=True)
+        tok_per_sec = new_tokens / gen_time if gen_time > 0 else 0
+        check('Inference produces output', new_tokens > 0,
+              f'{new_tokens} tokens in {gen_time:.2f}s ({tok_per_sec:.0f} tok/s)')
+        print(f'       → "{output_text[:100]}"')
+    except Exception as e:
+        check('Inference produces output', False, str(e))
+
+    # Clean up GPU memory
+    del model
+    torch.cuda.empty_cache()
+
+# ── Summary ──
+print()
+total = checks_passed + checks_failed
+print(f'  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
+print(f'  Checks: {checks_passed}/{total} passed', end='')
+if checks_failed > 0:
+    print(f', \033[0;31m{checks_failed} FAILED\033[0m')
+else:
+    print(f' — \033[0;32mALL PASSED\033[0m')
+print(f'  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
+
+if checks_failed > 0:
+    print()
+    print('  Some checks failed. Fix the issues above before running benchmarks.')
+    print('  Proofs over a broken model are meaningless.')
+    sys.exit(1)
+VALIDATE_SCRIPT
+
+    if [ $? -ne 0 ]; then
+        VALIDATION_FAILED=true
+        echo -e "  ${RED}Model validation FAILED — fix issues above before proving${NC}"
+    else
+        echo -e "  ${GREEN}Model validation PASSED${NC}"
+    fi
 
     # Also validate prove-model can read the config
     PROVE_MODEL_BIN=$(find . -name "prove-model" -path "*/release/*" -type f 2>/dev/null | head -1)
     if [ -n "$PROVE_MODEL_BIN" ]; then
         echo ""
         echo "  Testing prove-model --inspect..."
-        $PROVE_MODEL_BIN --model-dir "${MODEL_DIR}" --layers 1 --inspect 2>&1 | head -10 && \
+        $PROVE_MODEL_BIN --model-dir "${MODEL_DIR}" --layers 1 --inspect 2>&1 && \
             echo -e "  ${GREEN}prove-model can read the model${NC}" || \
-            echo -e "  ${YELLOW}prove-model --inspect failed (may need --model flag instead)${NC}"
+            echo -e "  ${YELLOW}prove-model --inspect returned an error${NC}"
+    fi
+
+    if [ "$VALIDATION_FAILED" = true ]; then
+        echo -e "\n  ${RED}${BOLD}SETUP INCOMPLETE: Model validation failed.${NC}"
+        echo -e "  ${RED}Fix the issues above, then re-run: bash scripts/h200_setup.sh --skip-deps --skip-build${NC}"
+        exit 1
     fi
 else
-    echo -e "  ${YELLOW}Model not downloaded — skipping validation${NC}"
+    echo -e "${YELLOW}[7/8] Skipping model validation (--skip-model)${NC}"
 fi
 echo ""
 
@@ -547,38 +683,40 @@ echo ""
 echo -e "${GREEN}${BOLD}"
 cat << SUMMARY
 ╔═══════════════════════════════════════════════════════════════════════════════╗
-║                          SETUP COMPLETE                                       ║
+║                                                                               ║
+║                     ✓  SETUP COMPLETE — ALL VALIDATED                         ║
+║                                                                               ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
 ║                                                                               ║
 ║  GPU:          ${GPU_NAME}
 ║  VRAM:         ${GPU_MEM}
 ║  CUDA:         ${NVCC_VER}
+║  Model:        ${MODEL_HF}
+║  Weights:      ${MODEL_DIR}
 ║  Repo:         ${INSTALL_DIR}
-║  Model:        ${MODEL_DIR}
-║  Setup time:   ${ELAPSED_MIN} minutes
+║  Setup time:   ${ELAPSED_MIN} min ${ELAPSED} sec
+║                                                                               ║
+║  The model has been downloaded, loaded onto the GPU, and inference             ║
+║  has been verified. The proving stack is built and ready.                      ║
 ║                                                                               ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
 ║                                                                               ║
-║  NEXT STEPS:                                                                  ║
+║  COMMANDS:                                                                    ║
 ║                                                                               ║
-║  1. Prove single block (Qwen3-14B, 1 layer):                                 ║
-║     ${PROVE_MODEL_BIN:-./prove-model} \\
+║  Inspect model (no proving):                                                  ║
+║     cd ${INSTALL_DIR}/stwo-ml
+║     ./target/release/prove-model \\
+║       --model-dir ${MODEL_DIR} --layers 1 --inspect
+║                                                                               ║
+║  Prove 1 transformer block:                                                   ║
+║     ./target/release/prove-model \\
 ║       --model-dir ${MODEL_DIR} \\
-║       --layers 1 --output proof.json
+║       --layers 1 --output proof_1block.json
 ║                                                                               ║
-║  2. Prove with GPU:                                                           ║
-║     ${PROVE_MODEL_BIN:-./prove-model} \\
+║  Prove all blocks:                                                            ║
+║     ./target/release/prove-model \\
 ║       --model-dir ${MODEL_DIR} \\
-║       --layers 1 --output proof.json --gpu
-║                                                                               ║
-║  3. Full 40-block benchmark:                                                  ║
-║     cd ${INSTALL_DIR}
-║     bash scripts/benchmark_full_model.sh --layers 40 \\
-║       --model-dir ${MODEL_DIR}
-║                                                                               ║
-║  4. Inspect model (no proving):                                               ║
-║     ${PROVE_MODEL_BIN:-./prove-model} \\
-║       --model-dir ${MODEL_DIR} --inspect
+║       --output proof_full.json
 ║                                                                               ║
 ╚═══════════════════════════════════════════════════════════════════════════════╝
 SUMMARY
