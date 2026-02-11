@@ -139,20 +139,25 @@ echo ""
 # Step 2: Rust Nightly
 # ═══════════════════════════════════════════════════════════════════════
 
-echo -e "${YELLOW}[2/7] Setting up Rust nightly${NC}"
+echo -e "${YELLOW}[2/7] Setting up Rust toolchain${NC}"
+
+# The stwo and stwo-ml crates pin nightly-2025-07-14 via rust-toolchain.toml.
+# We install that exact version to avoid compilation breakage.
+PINNED_NIGHTLY="nightly-2025-07-14"
 
 if ! command -v rustup &>/dev/null; then
     echo "  Installing rustup..."
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain "${PINNED_NIGHTLY}"
     source "$HOME/.cargo/env"
 else
     echo "  rustup already installed"
+    source "$HOME/.cargo/env" 2>/dev/null || true
 fi
 
-# Ensure nightly is installed and has the components we need
-rustup install nightly 2>/dev/null || true
-rustup default nightly 2>/dev/null || true
-rustup component add rust-src --toolchain nightly 2>/dev/null || true
+# Install the exact pinned nightly and set as default
+rustup install "${PINNED_NIGHTLY}" 2>/dev/null || true
+rustup default "${PINNED_NIGHTLY}" 2>/dev/null || true
+rustup component add rust-src --toolchain "${PINNED_NIGHTLY}" 2>/dev/null || true
 
 echo "  $(rustc --version)"
 echo "  $(cargo --version)"
@@ -311,24 +316,28 @@ if [ "$SKIP_BUILD" = false ]; then
     cd "${INSTALL_DIR}"
 
     # 6a: Build stwo-ml with GPU + model loading + CLI
+    # rust-toolchain.toml in stwo-ml/ pins the correct nightly automatically
     echo "  [6a] Building stwo-ml (GPU + CLI)..."
     (
         cd stwo-ml
-        RUSTUP_TOOLCHAIN=nightly cargo build --release \
+        cargo build --release \
             --bin prove-model \
             --features "cuda-runtime,cli" \
-            2>&1 | tail -5
+            2>&1 | tail -20
     ) && echo -e "  ${GREEN}stwo-ml built${NC}" || {
-        echo -e "  ${RED}stwo-ml build failed${NC}"
-        echo "  Trying without GPU..."
+        echo -e "  ${RED}stwo-ml GPU build failed${NC}"
+        echo "  Trying without GPU (CPU-only)..."
         (
             cd stwo-ml
-            RUSTUP_TOOLCHAIN=nightly cargo build --release \
+            cargo build --release \
                 --bin prove-model \
                 --features "cli" \
-                2>&1 | tail -5
-        )
-        echo -e "  ${YELLOW}Built in CPU-only mode${NC}"
+                2>&1 | tail -20
+        ) && echo -e "  ${YELLOW}Built in CPU-only mode${NC}" || {
+            echo -e "  ${RED}CPU build also failed. Printing full error:${NC}"
+            cd stwo-ml
+            cargo build --release --bin prove-model --features "cli" 2>&1
+        }
     }
 
     # 6b: Build cairo-prove
@@ -337,7 +346,7 @@ if [ "$SKIP_BUILD" = false ]; then
     if [ -d "stwo-cairo/cairo-prove" ]; then
         (
             cd stwo-cairo/cairo-prove
-            RUSTUP_TOOLCHAIN=nightly cargo build --release 2>&1 | tail -5
+            cargo build --release 2>&1 | tail -10
         ) && echo -e "  ${GREEN}cairo-prove built${NC}" || \
             echo -e "  ${YELLOW}cairo-prove build failed (recursive proving will be unavailable)${NC}"
     else
@@ -374,8 +383,8 @@ if [ "$SKIP_BUILD" = false ]; then
     echo "  [6d] Running quick sanity test..."
     (
         cd stwo-ml
-        RUSTUP_TOOLCHAIN=nightly cargo test --release --lib \
-            -- test_matmul_sumcheck_basic --nocapture 2>&1 | tail -5
+        cargo test --release --lib \
+            -- test_matmul_sumcheck_basic --nocapture 2>&1 | tail -10
     ) && echo -e "  ${GREEN}Sanity test passed${NC}" || \
         echo -e "  ${YELLOW}Sanity test skipped (not critical)${NC}"
 
