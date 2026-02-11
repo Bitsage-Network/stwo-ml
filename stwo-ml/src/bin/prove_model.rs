@@ -30,6 +30,7 @@ use stwo_ml::cairo_serde::{
 use stwo_ml::compiler::inspect::summarize_model;
 use stwo_ml::compiler::onnx::load_onnx;
 use stwo_ml::components::matmul::M31Matrix;
+use stwo_ml::gadgets::quantize::{QuantStrategy, quantize_tensor};
 use stwo_ml::json_serde;
 use stwo_ml::starknet::compute_io_commitment;
 
@@ -119,16 +120,13 @@ fn load_input_json(path: &PathBuf) -> Vec<f32> {
 
 /// Quantize f32 input values to M31 field elements.
 ///
-/// Uses direct truncation to u32 then mod P. For real deployment,
-/// a proper quantization scheme (scale + zero_point) should be used.
+/// Uses symmetric INT8 quantization (scale + zero_point) from the
+/// `gadgets::quantize` module for deterministic, invertible mapping.
 fn quantize_input(values: &[f32], rows: usize, cols: usize) -> M31Matrix {
-    let p = (1u64 << 31) - 1;
+    let (quantized, _params) = quantize_tensor(values, QuantStrategy::Symmetric8);
     let mut matrix = M31Matrix::new(rows, cols);
-    for (i, &v) in values.iter().enumerate().take(rows * cols) {
-        // Map f32 to M31: multiply by 2^16 for fixed-point, then mod P
-        let scaled = (v * 65536.0).round() as i64;
-        let val = ((scaled % p as i64) + p as i64) as u64 % p;
-        matrix.data[i] = M31::from(val as u32);
+    for (i, &v) in quantized.iter().enumerate().take(rows * cols) {
+        matrix.data[i] = v;
     }
     matrix
 }
