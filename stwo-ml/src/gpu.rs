@@ -30,18 +30,37 @@ use crate::compiler::prove::{ModelError, ModelProofResult};
 use crate::components::matmul::M31Matrix;
 use crate::aggregation::{AggregatedModelProof, AggregatedModelProofOnChain, AggregationError};
 use crate::receipt::{ComputeReceipt, ReceiptProof, ReceiptError};
+use crate::tee::{SecurityLevel, TeeAttestation};
 
 /// GPU-accelerated model prover.
 ///
 /// When CUDA is available and the problem size exceeds thresholds,
 /// this uses `GpuBackend` for proving. Otherwise, it transparently
 /// falls back to `SimdBackend`.
+///
+/// The `security_level` field controls TEE attestation behavior:
+/// - `Auto` (default): Use TEE if available, fallback to ZK-only.
+/// - `ZkPlusTee`: Require TEE or fail.
+/// - `ZkOnly`: Skip TEE even if available.
 #[derive(Debug)]
 pub struct GpuModelProver {
     pub device_name: String,
     pub available_memory: usize,
     pub compute_capability: Option<(u32, u32)>,
     pub is_gpu: bool,
+    pub security_level: SecurityLevel,
+}
+
+/// Proof bundled with optional TEE attestation.
+///
+/// When TEE is active, the attestation contains a real hardware attestation
+/// report. When TEE is not used, the attestation is `None`.
+#[derive(Debug)]
+pub struct ProofWithAttestation<P> {
+    /// The proof (any type: ModelProofResult, AggregatedModelProofOnChain, etc.).
+    pub proof: P,
+    /// TEE attestation, present when SecurityLevel resolves to ZkPlusTee.
+    pub attestation: Option<TeeAttestation>,
 }
 
 /// Error type for GPU operations.
@@ -56,16 +75,22 @@ pub enum GpuError {
 }
 
 impl GpuModelProver {
-    /// Create a new GPU model prover.
+    /// Create a new GPU model prover with default security level (Auto).
     ///
     /// Returns `Ok` even if no GPU is available (will use CPU fallback).
     pub fn new() -> Result<Self, GpuError> {
+        Self::new_with_security(SecurityLevel::Auto)
+    }
+
+    /// Create a new GPU model prover with explicit security level.
+    pub fn new_with_security(security_level: SecurityLevel) -> Result<Self, GpuError> {
         if gpu_is_available() {
             Ok(Self {
                 device_name: gpu_device_name().unwrap_or_else(|| "Unknown GPU".to_string()),
                 available_memory: gpu_available_memory().unwrap_or(0),
                 compute_capability: gpu_compute_capability(),
                 is_gpu: true,
+                security_level,
             })
         } else {
             Ok(Self {
@@ -73,6 +98,7 @@ impl GpuModelProver {
                 available_memory: 0,
                 compute_capability: None,
                 is_gpu: false,
+                security_level,
             })
         }
     }
@@ -242,6 +268,62 @@ impl GpuModelProver {
         }
     }
 
+    // ── TEE-aware proving methods ──────────────────────────────────────
+
+    /// Prove a model and return the proof bundled with optional TEE attestation.
+    ///
+    /// When `security_level` resolves to `ZkPlusTee`, generates a fresh
+    /// attestation report binding the proof to the TEE hardware instance.
+    /// When `ZkOnly`, the attestation field is `None`.
+    pub fn prove_model_with_attestation(
+        &self,
+        graph: &ComputationGraph,
+        input: &M31Matrix,
+        weights: &GraphWeights,
+    ) -> Result<ProofWithAttestation<ModelProofResult>, ModelError> {
+        let proof = self.prove_model(graph, input, weights)?;
+        let attestation = self.generate_attestation_if_tee();
+        Ok(ProofWithAttestation { proof, attestation })
+    }
+
+    /// Prove a model with aggregation and return proof + optional TEE attestation.
+    pub fn prove_model_aggregated_with_attestation(
+        &self,
+        graph: &ComputationGraph,
+        input: &M31Matrix,
+        weights: &GraphWeights,
+    ) -> Result<ProofWithAttestation<AggregatedModelProof>, AggregationError> {
+        let proof = self.prove_model_aggregated(graph, input, weights)?;
+        let attestation = self.generate_attestation_if_tee();
+        Ok(ProofWithAttestation { proof, attestation })
+    }
+
+    /// Prove a model with on-chain aggregation and return proof + optional TEE attestation.
+    pub fn prove_model_aggregated_onchain_with_attestation(
+        &self,
+        graph: &ComputationGraph,
+        input: &M31Matrix,
+        weights: &GraphWeights,
+    ) -> Result<ProofWithAttestation<AggregatedModelProofOnChain>, AggregationError> {
+        let proof = self.prove_model_aggregated_onchain(graph, input, weights)?;
+        let attestation = self.generate_attestation_if_tee();
+        Ok(ProofWithAttestation { proof, attestation })
+    }
+
+    /// Generate TEE attestation if security level resolves to ZkPlusTee.
+    fn generate_attestation_if_tee(&self) -> Option<TeeAttestation> {
+        use crate::tee::ResolvedSecurityLevel;
+        match self.security_level.resolve() {
+            ResolvedSecurityLevel::ZkPlusTee => {
+                match crate::tee::TeeModelProver::with_security(self.security_level) {
+                    Ok(tee_prover) if tee_prover.is_tee() => Some(tee_prover.attestation),
+                    _ => None,
+                }
+            }
+            ResolvedSecurityLevel::ZkOnly => None,
+        }
+    }
+
     /// Internal: receipt batch prove using GPU backend.
     fn prove_receipt_batch_gpu(
         &self,
@@ -270,6 +352,7 @@ impl Default for GpuModelProver {
             available_memory: 0,
             compute_capability: None,
             is_gpu: false,
+            security_level: SecurityLevel::Auto,
         })
     }
 }

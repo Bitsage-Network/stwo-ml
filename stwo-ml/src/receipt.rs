@@ -115,6 +115,27 @@ pub struct ComputeReceipt {
 }
 
 impl ComputeReceipt {
+    /// Populate the TEE fields from a real `TeeAttestation`.
+    ///
+    /// Sets `tee_report_hash` to the Poseidon hash of the attestation report
+    /// (matching the on-chain ObelyskVerifier's expected format) and
+    /// `tee_timestamp` to the attestation's timestamp.
+    ///
+    /// This bridges the gap between the attestation pipeline (which produces
+    /// `TeeAttestation`) and the receipt system (which uses felt252 hashes).
+    pub fn set_attestation(&mut self, attestation: &crate::tee::TeeAttestation) {
+        self.tee_report_hash = attestation.report_hash_felt();
+        self.tee_timestamp = attestation.timestamp;
+    }
+
+    /// Create a new receipt with TEE attestation fields populated.
+    ///
+    /// Convenience constructor that calls `set_attestation` on the receipt.
+    pub fn with_attestation(mut self, attestation: &crate::tee::TeeAttestation) -> Self {
+        self.set_attestation(attestation);
+        self
+    }
+
     /// Compute the Poseidon hash of this receipt.
     ///
     /// This hash uniquely identifies the receipt and is used for

@@ -212,9 +212,16 @@ except ImportError:
             .map_err(|e| TeeError::NvTrustError(format!("Attestation command failed: {}", e)))?;
 
         if !output.status.success() {
-            // Fallback: Generate mock evidence for development
-            tracing::warn!("Real attestation not available, using mock evidence");
-            return Ok(generate_mock_evidence(device_id, nonce));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::error!(
+                device_id = device_id,
+                stderr = %stderr,
+                "GPU attestation command failed — real attestation unavailable"
+            );
+            return Err(TeeError::NvTrustError(format!(
+                "nvidia-smi conf-compute attestation failed for device {}: {}",
+                device_id, stderr
+            )));
         }
 
         // Parse attestation report from output
@@ -263,8 +270,15 @@ except Exception as e:
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
         if stdout.starts_with("ERROR:") {
-            tracing::warn!("Python attestation failed: {}", stdout);
-            return Ok(generate_mock_evidence(device_id, nonce));
+            tracing::error!(
+                device_id = device_id,
+                error = %stdout,
+                "Python attestation SDK failed — real attestation unavailable"
+            );
+            return Err(TeeError::NvTrustError(format!(
+                "Python attestation failed for device {}: {}",
+                device_id, stdout
+            )));
         }
 
         base64_decode(&stdout)
@@ -293,8 +307,16 @@ except Exception as e:
             .map_err(|e| TeeError::NvTrustError(format!("Get cert failed: {}", e)))?;
 
         if !output.status.success() {
-            // Return mock cert for development
-            return Ok(generate_mock_cert_chain());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::error!(
+                device_id = device_id,
+                stderr = %stderr,
+                "Failed to retrieve GPU certificate chain"
+            );
+            return Err(TeeError::NvTrustError(format!(
+                "nvidia-smi conf-compute get-cert failed for device {}: {}",
+                device_id, stderr
+            )));
         }
 
         Ok(output.stdout)
@@ -324,7 +346,15 @@ except Exception as e:
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
         if stdout.starts_with("ERROR:") {
-            return Ok(generate_mock_cert_chain());
+            tracing::error!(
+                device_id = device_id,
+                error = %stdout,
+                "Python SDK failed to retrieve certificate chain"
+            );
+            return Err(TeeError::NvTrustError(format!(
+                "Python cert chain retrieval failed for device {}: {}",
+                device_id, stdout
+            )));
         }
 
         base64_decode(&stdout)
@@ -364,9 +394,10 @@ except Exception as e:
             "VERIFIED" => Ok(true),
             "FAILED" => Ok(false),
             _ => {
-                tracing::warn!("Verification result: {}", stdout);
-                // For development, assume verified if not explicitly failed
-                Ok(!stdout.contains("ERROR"))
+                tracing::error!(result = %stdout, "Unexpected verification response from NVIDIA");
+                Err(TeeError::NvTrustError(format!(
+                    "Unexpected verification result: {}", stdout
+                )))
             }
         }
     }
@@ -435,7 +466,8 @@ fn parse_gpu_model(name: &str) -> TeeResult<ConfidentialGpu> {
     }
 }
 
-/// Generate mock evidence for development
+/// Generate mock evidence for testing only.
+#[cfg(test)]
 fn generate_mock_evidence(device_id: u32, nonce: &[u8; 32]) -> Vec<u8> {
     let mut evidence = Vec::new();
     evidence.extend_from_slice(b"NVIDIA_MOCK_EVIDENCE_V1\0");
@@ -452,7 +484,9 @@ fn generate_mock_evidence(device_id: u32, nonce: &[u8; 32]) -> Vec<u8> {
     evidence
 }
 
-/// Generate mock certificate chain
+/// Generate mock certificate chain for testing only.
+#[cfg(test)]
+#[allow(dead_code)]
 fn generate_mock_cert_chain() -> Vec<u8> {
     let mut chain = Vec::new();
     chain.extend_from_slice(b"-----BEGIN CERTIFICATE-----\n");

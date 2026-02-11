@@ -65,7 +65,15 @@ pub mod prelude {
         prove_matmul_sumcheck_onchain,
         prove_matmul_sumcheck_auto,
     };
-    pub use crate::starknet::compute_io_commitment;
+    pub use crate::starknet::{
+        compute_io_commitment,
+        build_starknet_proof_with_tee, build_starknet_proof_onchain_with_tee,
+    };
+    pub use crate::tee::{
+        SecurityLevel, TeeAttestation, TeeCapability, TeeModelProver,
+        detect_tee_capability, verify_attestation,
+    };
+    pub use crate::gpu::ProofWithAttestation;
 }
 
 /// Re-export GPU backend when available.

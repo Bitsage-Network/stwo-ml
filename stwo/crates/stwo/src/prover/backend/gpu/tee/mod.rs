@@ -564,12 +564,11 @@ impl RealTeeContext {
         self.initialized && self.started_at.elapsed() < self.config.session_timeout
     }
 
-    /// Securely destroy the context
+    /// Securely destroy the context using volatile writes to prevent
+    /// compiler optimization from eliding the zeroing.
     pub fn destroy(&mut self) {
-        // Zero out session key
-        for byte in &mut self.session_key {
-            *byte = 0;
-        }
+        // Zero out session key using volatile writes
+        crypto::secure_zero(&mut self.session_key);
 
         self.gpu_attestations.clear();
         self.cpu_attestation = None;
@@ -583,4 +582,102 @@ impl Drop for RealTeeContext {
     fn drop(&mut self) {
         self.destroy();
     }
+}
+
+// ============================================================================
+// Quick TEE Status API (used by stwo-ml SecurityLevel detection)
+// ============================================================================
+
+/// TEE attestation status for quick capability checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeeStatus {
+    /// TEE is available and active (CC-On mode confirmed).
+    Active,
+    /// TEE is not available on this hardware (pre-Hopper GPU or no GPU).
+    Unavailable,
+    /// TEE hardware is available but CC mode is not enabled.
+    Disabled,
+}
+
+/// Check the current GPU TEE status using real CC-mode detection.
+///
+/// Detection order:
+/// 1. Check compute capability via CUDA executor (>= 9 = Hopper+)
+/// 2. Query CC mode via nvidia-smi / sysfs / nvtrust
+/// 3. Return `Active` only when CC is confirmed ON
+pub fn tee_status() -> TeeStatus {
+    #[cfg(feature = "cuda-runtime")]
+    {
+        // Step 1: Check compute capability via CUDA executor
+        if let Ok(executor) = super::cuda_executor::get_cuda_executor() {
+            let (major, _minor) = executor.device_info.compute_capability;
+            if major >= 9 {
+                // Hopper+ architecture — check if CC is actually ON
+                match cc_mode::query_cc_mode(0) {
+                    Ok(CcMode::On) => return TeeStatus::Active,
+                    Ok(CcMode::DevTools) => return TeeStatus::Active,
+                    Ok(CcMode::Off) => return TeeStatus::Disabled,
+                    Err(_) => {
+                        // CC query failed but hardware supports it
+                        return TeeStatus::Disabled;
+                    }
+                }
+            }
+        }
+    }
+    TeeStatus::Unavailable
+}
+
+/// Check if the GPU is running in confidential compute mode.
+pub fn is_confidential_compute_active() -> bool {
+    matches!(tee_status(), TeeStatus::Active)
+}
+
+/// Detect detailed TEE capability information.
+///
+/// Returns compute capability, CC mode, nvattest availability, and GPU model
+/// for use by the SecurityLevel system in stwo-ml.
+pub fn detect_tee_capability() -> TeeCapabilityInfo {
+    let mut info = TeeCapabilityInfo::default();
+
+    #[cfg(feature = "cuda-runtime")]
+    {
+        if let Ok(executor) = super::cuda_executor::get_cuda_executor() {
+            let (major, minor) = executor.device_info.compute_capability;
+            info.compute_capability = Some((major, minor));
+            info.device_name = executor.device_info.name.clone();
+            info.cc_supported = major >= 9;
+
+            if info.cc_supported {
+                info.cc_active = matches!(cc_mode::query_cc_mode(0), Ok(CcMode::On | CcMode::DevTools));
+                info.cc_mode = cc_mode::query_cc_mode(0).ok();
+            }
+        }
+    }
+
+    // Check nvattest CLI availability
+    info.nvattest_available = std::process::Command::new("nvattest")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    info
+}
+
+/// Detailed TEE capability information for SecurityLevel decisions.
+#[derive(Debug, Clone, Default)]
+pub struct TeeCapabilityInfo {
+    /// GPU compute capability (major, minor), e.g. (9, 0) for H100
+    pub compute_capability: Option<(u32, u32)>,
+    /// GPU device name
+    pub device_name: String,
+    /// Whether GPU hardware supports CC (Hopper+ architecture)
+    pub cc_supported: bool,
+    /// Whether CC mode is currently active
+    pub cc_active: bool,
+    /// Current CC mode (if queryable)
+    pub cc_mode: Option<CcMode>,
+    /// Whether the nvattest CLI tool is available
+    pub nvattest_available: bool,
 }

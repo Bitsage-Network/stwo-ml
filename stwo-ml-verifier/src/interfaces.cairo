@@ -23,6 +23,11 @@ pub trait IObelyskVerifier<TContractState> {
     /// 2. Record the verification on-chain
     /// 3. Transfer SAGE payment from caller to worker
     /// 4. Emit rich events for indexing
+    ///
+    /// The `tee_attestation_hash` field is optional (0 = no TEE).
+    /// When non-zero, it records the SHA-256 hash of the NVIDIA CC attestation
+    /// report that accompanied the proof. The full JWT attestation is verified
+    /// off-chain; on-chain we only commit to the hash for auditability.
     fn verify_and_pay(
         ref self: TContractState,
         model_id: felt252,
@@ -33,6 +38,7 @@ pub trait IObelyskVerifier<TContractState> {
         job_id: felt252,
         worker: ContractAddress,
         sage_amount: u256,
+        tee_attestation_hash: felt252,
     ) -> bool;
 
     /// Register a model for verification.
