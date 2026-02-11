@@ -893,6 +893,39 @@ pub fn restrict_mle_pub(evals: &[SecureField], assignments: &[SecureField]) -> V
     restrict_mle(evals, assignments)
 }
 
+/// Public wrapper for `matrix_to_mle` (row-major MLE construction).
+pub fn matrix_to_mle_pub(matrix: &M31Matrix) -> Vec<SecureField> {
+    matrix_to_mle(matrix)
+}
+
+/// Public wrapper for `matrix_to_mle_col_major` (column-major MLE construction).
+pub fn matrix_to_mle_col_major_pub(matrix: &M31Matrix) -> Vec<SecureField> {
+    matrix_to_mle_col_major(matrix)
+}
+
+/// Prove matmul sumcheck with automatic GPU dispatch.
+///
+/// Uses GPU when `k >= 2^MLE_THRESHOLD` and CUDA is available.
+/// Falls back to CPU `prove_matmul_sumcheck` otherwise.
+pub fn prove_matmul_sumcheck_auto(
+    a: &M31Matrix,
+    b: &M31Matrix,
+    c: &M31Matrix,
+) -> Result<MatMulSumcheckProof, MatMulError> {
+    let k = a.cols;
+    #[cfg(feature = "cuda-runtime")]
+    {
+        if crate::backend::gpu_is_available()
+            && k.is_power_of_two()
+            && k.ilog2() >= crate::backend::GpuThresholds::mle()
+        {
+            return crate::gpu_sumcheck::prove_matmul_sumcheck_gpu(a, b, c);
+        }
+    }
+    let _ = k; // suppress unused warning in non-CUDA builds
+    prove_matmul_sumcheck(a, b, c)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -28,6 +28,9 @@ pub mod receipt;
 pub mod crypto;
 pub mod json_serde;
 
+#[cfg(feature = "cuda-runtime")]
+pub mod gpu_sumcheck;
+
 /// Re-export core STWO types used throughout stwo-ml.
 pub mod prelude {
     pub use stwo::core::fields::m31::M31;
@@ -60,6 +63,7 @@ pub mod prelude {
     pub use crate::components::matmul::{
         MatMulSumcheckProofOnChain, RoundPoly,
         prove_matmul_sumcheck_onchain,
+        prove_matmul_sumcheck_auto,
     };
     pub use crate::starknet::compute_io_commitment;
 }

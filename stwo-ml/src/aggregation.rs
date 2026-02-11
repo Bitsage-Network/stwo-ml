@@ -58,7 +58,7 @@ use crate::components::activation::{
 };
 use crate::components::matmul::{
     M31Matrix, matmul_m31,
-    MatMulSumcheckProof, prove_matmul_sumcheck,
+    MatMulSumcheckProof, prove_matmul_sumcheck_auto,
     MatMulSumcheckProofOnChain, prove_matmul_sumcheck_onchain,
     estimate_sumcheck_memory,
 };
@@ -284,7 +284,7 @@ where
 
                 let output = matmul_m31(&current, weight);
 
-                let proof = prove_matmul_sumcheck(&current, weight, &output)
+                let proof = prove_matmul_sumcheck_auto(&current, weight, &output)
                     .map_err(|e| ModelError::ProvingError {
                         layer: node.id,
                         message: format!("MatMul sumcheck: {e}"),
@@ -459,7 +459,7 @@ where
                 let (_im2col_mat, _kernel_mat, output) =
                     conv2d_forward(&current.data, &kernel.data, &im2col_config, *out_channels);
                 // Prove the im2col×kernel matmul
-                let proof = prove_matmul_sumcheck(&_im2col_mat, &_kernel_mat, &output)
+                let proof = prove_matmul_sumcheck_auto(&_im2col_mat, &_kernel_mat, &output)
                     .map_err(|e| ModelError::ProvingError {
                         layer: node.id,
                         message: format!("Conv2D matmul: {e}"),
