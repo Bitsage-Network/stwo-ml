@@ -8,8 +8,9 @@
 
 use std::path::Path;
 
-use crate::compiler::graph::{ComputationGraph, GraphBuilder, GraphWeights, ActivationType};
+use crate::compiler::graph::{ComputationGraph, GraphBuilder};
 use crate::compiler::onnx::{OnnxModel, OnnxError, ModelMetadata, TransformerConfig};
+use crate::components::activation::ActivationType;
 use crate::compiler::safetensors::{discover_shards, load_weights_sharded, list_tensors_sharded};
 use crate::gadgets::quantize::QuantStrategy;
 
