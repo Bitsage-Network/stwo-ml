@@ -88,13 +88,19 @@ pub fn proof_to_json(
 
     let has_unified_stark = proof.unified_stark.is_some();
 
+    let tee_hash_str = match &metadata.tee_attestation_hash {
+        Some(h) if *h != starknet_ff::FieldElement::ZERO => format!("\"{}\"", felt_to_hex(h)),
+        _ => "null".to_string(),
+    };
+
     format!(
-        r#"{{"metadata":{{"model_id":"{}","num_layers":{},"activation_type":{},"io_commitment":"{}","weight_commitment":"{}"}},"matmul_proofs":[{}],"activation_claims":[{}],"has_unified_stark":{},"output_shape":[{},{}]}}"#,
+        r#"{{"metadata":{{"model_id":"{}","num_layers":{},"activation_type":{},"io_commitment":"{}","weight_commitment":"{}","tee_attestation_hash":{}}},"matmul_proofs":[{}],"activation_claims":[{}],"has_unified_stark":{},"output_shape":[{},{}]}}"#,
         felt_to_hex(&metadata.model_id),
         metadata.num_layers,
         metadata.activation_type,
         felt_to_hex(&metadata.io_commitment),
         felt_to_hex(&metadata.weight_commitment),
+        tee_hash_str,
         matmul_proofs.join(","),
         activation_claims.join(","),
         has_unified_stark,

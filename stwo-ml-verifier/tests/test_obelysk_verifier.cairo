@@ -170,7 +170,7 @@ fn test_verify_zero_payment() {
     let (verifier, _sage) = setup();
     start_cheat_caller_address(verifier.contract_address, OWNER());
     let result = verifier
-        .verify_and_pay(MODEL_ID, PROOF_HASH, IO_COMMIT, WEIGHT_COMMIT, NUM_LAYERS, JOB_ID, WORKER(), 0);
+        .verify_and_pay(MODEL_ID, PROOF_HASH, IO_COMMIT, WEIGHT_COMMIT, NUM_LAYERS, JOB_ID, WORKER(), 0, 0);
     stop_cheat_caller_address(verifier.contract_address);
 
     assert!(result, "Should return true");
@@ -182,7 +182,7 @@ fn test_verify_not_owner() {
     let (verifier, _sage) = setup();
     start_cheat_caller_address(verifier.contract_address, ATTACKER());
     verifier
-        .verify_and_pay(MODEL_ID, PROOF_HASH, IO_COMMIT, WEIGHT_COMMIT, NUM_LAYERS, JOB_ID, WORKER(), 0);
+        .verify_and_pay(MODEL_ID, PROOF_HASH, IO_COMMIT, WEIGHT_COMMIT, NUM_LAYERS, JOB_ID, WORKER(), 0, 0);
 }
 
 #[test]
@@ -191,10 +191,10 @@ fn test_verify_double_job() {
     let (verifier, _sage) = setup();
     start_cheat_caller_address(verifier.contract_address, OWNER());
     verifier
-        .verify_and_pay(MODEL_ID, PROOF_HASH, IO_COMMIT, WEIGHT_COMMIT, NUM_LAYERS, JOB_ID, WORKER(), 0);
+        .verify_and_pay(MODEL_ID, PROOF_HASH, IO_COMMIT, WEIGHT_COMMIT, NUM_LAYERS, JOB_ID, WORKER(), 0, 0);
     // Same job_id again should panic
     verifier
-        .verify_and_pay(MODEL_ID, PROOF_HASH, IO_COMMIT, WEIGHT_COMMIT, NUM_LAYERS, JOB_ID, WORKER(), 0);
+        .verify_and_pay(MODEL_ID, PROOF_HASH, IO_COMMIT, WEIGHT_COMMIT, NUM_LAYERS, JOB_ID, WORKER(), 0, 0);
 }
 
 #[test]
@@ -205,7 +205,7 @@ fn test_verify_increments_count() {
     assert!(verifier.get_model_verification_count(MODEL_ID) == 0, "Should start at 0");
 
     verifier
-        .verify_and_pay(MODEL_ID, PROOF_HASH, IO_COMMIT, WEIGHT_COMMIT, NUM_LAYERS, JOB_ID, WORKER(), 0);
+        .verify_and_pay(MODEL_ID, PROOF_HASH, IO_COMMIT, WEIGHT_COMMIT, NUM_LAYERS, JOB_ID, WORKER(), 0, 0);
 
     assert!(verifier.get_model_verification_count(MODEL_ID) == 1, "Should be 1 after verify");
     stop_cheat_caller_address(verifier.contract_address);
@@ -218,7 +218,7 @@ fn test_verify_proof_id_deterministic() {
 
     // Verify job 1 with specific inputs
     verifier
-        .verify_and_pay(MODEL_ID, PROOF_HASH, IO_COMMIT, WEIGHT_COMMIT, NUM_LAYERS, JOB_ID, WORKER(), 0);
+        .verify_and_pay(MODEL_ID, PROOF_HASH, IO_COMMIT, WEIGHT_COMMIT, NUM_LAYERS, JOB_ID, WORKER(), 0, 0);
 
     // Compute expected proof_id = poseidon(model_id, io_commitment, weight_commitment, proof_hash)
     let proof_id = core::poseidon::poseidon_hash_span(
@@ -231,7 +231,7 @@ fn test_verify_proof_id_deterministic() {
     // The proof_id should already be true since same inputs produce same hash
     verifier
         .verify_and_pay(
-            MODEL_ID, PROOF_HASH, IO_COMMIT, WEIGHT_COMMIT, NUM_LAYERS, JOB_ID_2, WORKER(), 0,
+            MODEL_ID, PROOF_HASH, IO_COMMIT, WEIGHT_COMMIT, NUM_LAYERS, JOB_ID_2, WORKER(), 0, 0,
         );
 
     // proof_id is still verified (same hash from same inputs)
@@ -259,7 +259,7 @@ fn test_verify_with_sage_payment() {
     start_cheat_caller_address(verifier.contract_address, OWNER());
     let result = verifier
         .verify_and_pay(
-            MODEL_ID, PROOF_HASH, IO_COMMIT, WEIGHT_COMMIT, NUM_LAYERS, JOB_ID, WORKER(), payment,
+            MODEL_ID, PROOF_HASH, IO_COMMIT, WEIGHT_COMMIT, NUM_LAYERS, JOB_ID, WORKER(), payment, 0,
         );
     stop_cheat_caller_address(verifier.contract_address);
 
@@ -290,12 +290,12 @@ fn test_verify_two_jobs_sage_payment() {
     start_cheat_caller_address(verifier.contract_address, OWNER());
     verifier
         .verify_and_pay(
-            MODEL_ID, PROOF_HASH, IO_COMMIT, WEIGHT_COMMIT, NUM_LAYERS, JOB_ID, WORKER(), payment,
+            MODEL_ID, PROOF_HASH, IO_COMMIT, WEIGHT_COMMIT, NUM_LAYERS, JOB_ID, WORKER(), payment, 0,
         );
     verifier
         .verify_and_pay(
             MODEL_ID, 'proof_hash_002', 'io_002', WEIGHT_COMMIT, NUM_LAYERS, JOB_ID_2, WORKER(),
-            payment,
+            payment, 0,
         );
     stop_cheat_caller_address(verifier.contract_address);
 
@@ -316,7 +316,7 @@ fn test_verify_sage_zero_amount_skips_transfer() {
     // Verify with 0 SAGE — no transfer should happen
     start_cheat_caller_address(verifier.contract_address, OWNER());
     verifier
-        .verify_and_pay(MODEL_ID, PROOF_HASH, IO_COMMIT, WEIGHT_COMMIT, NUM_LAYERS, JOB_ID, WORKER(), 0);
+        .verify_and_pay(MODEL_ID, PROOF_HASH, IO_COMMIT, WEIGHT_COMMIT, NUM_LAYERS, JOB_ID, WORKER(), 0, 0);
     stop_cheat_caller_address(verifier.contract_address);
 
     // Balances unchanged
@@ -337,8 +337,35 @@ fn test_verify_sage_no_allowance_panics() {
     start_cheat_caller_address(verifier.contract_address, OWNER());
     verifier
         .verify_and_pay(
-            MODEL_ID, PROOF_HASH, IO_COMMIT, WEIGHT_COMMIT, NUM_LAYERS, JOB_ID, WORKER(), payment,
+            MODEL_ID, PROOF_HASH, IO_COMMIT, WEIGHT_COMMIT, NUM_LAYERS, JOB_ID, WORKER(), payment, 0,
         );
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// verify_and_pay — With TEE Attestation (1 test)
+// ══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_verify_with_tee_attestation() {
+    let (verifier, _sage) = setup();
+
+    let tee_hash: felt252 = 'tee_attestation_sha256_hash';
+
+    start_cheat_caller_address(verifier.contract_address, OWNER());
+    let result = verifier
+        .verify_and_pay(
+            MODEL_ID, PROOF_HASH, IO_COMMIT, WEIGHT_COMMIT, NUM_LAYERS, JOB_ID, WORKER(), 0,
+            tee_hash,
+        );
+    stop_cheat_caller_address(verifier.contract_address);
+
+    assert!(result, "verify_and_pay with TEE should return true");
+
+    // Verify the proof was recorded
+    let proof_id = core::poseidon::poseidon_hash_span(
+        [MODEL_ID, IO_COMMIT, WEIGHT_COMMIT, PROOF_HASH].span(),
+    );
+    assert!(verifier.is_verified(proof_id), "Proof should be verified");
 }
 
 // ══════════════════════════════════════════════════════════════════════════

@@ -49,6 +49,7 @@ use stwo_ml::components::matmul::M31Matrix;
 use stwo_ml::gadgets::quantize::{QuantStrategy, quantize_tensor};
 use stwo_ml::json_serde;
 use stwo_ml::starknet::compute_io_commitment;
+use stwo_ml::tee::{SecurityLevel, detect_tee_capability};
 
 /// Output format for the proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +112,14 @@ struct Cli {
     /// Use GPU backend if available.
     #[arg(long)]
     gpu: bool,
+
+    /// Security level: 'auto' (default), 'tee' (require TEE), 'zk-only' (pure ZK).
+    ///
+    /// - auto: Detect CC hardware at runtime, use TEE if available.
+    /// - tee: Require NVIDIA CC-On hardware + nvattest. Fails if unavailable.
+    /// - zk-only: Skip TEE even if available. Pure STARK proof only.
+    #[arg(long, default_value = "auto")]
+    security: SecurityLevel,
 
     /// Print model summary and exit (no proving).
     #[arg(long)]
@@ -256,11 +265,26 @@ fn main() {
         generate_random_input(in_rows, in_cols)
     };
 
+    // Detect TEE capability and display status
+    let tee_cap = detect_tee_capability();
+    let resolved = cli.security.resolve();
+    eprintln!("Security: {} (resolved: {:?})", cli.security, resolved);
+    eprintln!("TEE: {}", tee_cap);
+
+    if matches!(cli.security, SecurityLevel::ZkPlusTee) && !tee_cap.cc_active {
+        eprintln!(
+            "Error: --security tee requires NVIDIA H100/H200/B200 with CC-On firmware.\n  {}",
+            tee_cap.status_message
+        );
+        process::exit(1);
+    }
+
     // Prove
     eprintln!(
-        "Proving {} layers (gpu={})",
+        "Proving {} layers (gpu={}, security={})",
         model.graph.num_layers(),
         cli.gpu,
+        cli.security,
     );
 
     let t0 = Instant::now();
@@ -285,6 +309,30 @@ fn main() {
         eprintln!("Error: proving failed: {e}");
         process::exit(1);
     });
+
+    // Generate TEE attestation if applicable
+    let tee_attestation = if matches!(resolved, stwo_ml::tee::ResolvedSecurityLevel::ZkPlusTee) {
+        eprintln!("Generating TEE attestation...");
+        match stwo_ml::tee::TeeModelProver::with_security(cli.security) {
+            Ok(tee_prover) if tee_prover.is_tee() => {
+                eprintln!(
+                    "  TEE: {} (hw={}, secboot={}, dbg={})",
+                    tee_prover.attestation.device_id,
+                    tee_prover.attestation.hw_model,
+                    tee_prover.attestation.secure_boot,
+                    tee_prover.attestation.debug_status,
+                );
+                Some(tee_prover.attestation.clone())
+            }
+            Ok(_) => None,
+            Err(e) => {
+                eprintln!("Warning: TEE attestation failed: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     eprintln!("Proving completed in {:.2}s", prove_elapsed.as_secs_f64());
 
@@ -324,12 +372,19 @@ fn main() {
         }
     };
 
+    // Compute TEE attestation hash for on-chain commitment
+    let tee_hash = tee_attestation
+        .as_ref()
+        .filter(|a| a.has_report())
+        .map(|a| a.report_hash_felt());
+
     let metadata = MLClaimMetadata {
         model_id,
         num_layers: model.graph.num_layers() as u32,
         activation_type,
         io_commitment,
         weight_commitment,
+        tee_attestation_hash: tee_hash,
     };
 
     // Serialize
@@ -363,4 +418,17 @@ fn main() {
         model.metadata.name,
         model.metadata.num_layers,
     );
+
+    // Print TEE attestation summary
+    if let Some(ref att) = tee_attestation {
+        let hash_felt = att.report_hash_felt();
+        eprintln!(
+            "  tee: hw={}, report_hash=0x{:x}, timestamp={}",
+            att.hw_model,
+            hash_felt,
+            att.timestamp,
+        );
+    } else {
+        eprintln!("  tee: none (zk-only)");
+    }
 }

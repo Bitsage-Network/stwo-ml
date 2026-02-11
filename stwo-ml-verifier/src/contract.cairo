@@ -46,6 +46,8 @@ pub mod ObelyskVerifier {
         verification_count: Map<felt252, u32>,
         /// job_id → verified (prevents double-verification).
         completed_jobs: Map<felt252, bool>,
+        /// proof_id → TEE attestation hash (0 if no TEE was used).
+        tee_attestation_hashes: Map<felt252, felt252>,
         /// Total number of verifications.
         total_verifications: u32,
         /// Total SAGE paid out.
@@ -64,6 +66,7 @@ pub mod ObelyskVerifier {
         PaymentProcessed: PaymentProcessed,
         WorkerRewarded: WorkerRewarded,
         VerificationComplete: VerificationComplete,
+        TeeAttested: TeeAttested,
     }
 
     #[derive(Drop, starknet::Event)]
@@ -143,6 +146,25 @@ pub mod ObelyskVerifier {
         pub timestamp: u64,
     }
 
+    /// Emitted when a proof includes a TEE attestation hash.
+    ///
+    /// The attestation_hash is SHA-256 of the NVIDIA CC attestation JWT/report.
+    /// Full attestation verification (cert chain, nonce, freshness) happens
+    /// off-chain. On-chain, we only commit the hash for auditability and
+    /// to enable any relayer/challenger to verify the full attestation.
+    #[derive(Drop, starknet::Event)]
+    pub struct TeeAttested {
+        #[key]
+        pub job_id: felt252,
+        #[key]
+        pub proof_id: felt252,
+        /// SHA-256 hash of the NVIDIA CC attestation report.
+        pub attestation_hash: felt252,
+        /// Timestamp of the attestation (Unix epoch, from the TEE report).
+        pub attestation_timestamp: u64,
+        pub timestamp: u64,
+    }
+
     // ── Constructor ────────────────────────────────────────────────────
 
     #[constructor]
@@ -171,6 +193,7 @@ pub mod ObelyskVerifier {
             job_id: felt252,
             worker: ContractAddress,
             sage_amount: u256,
+            tee_attestation_hash: felt252,
         ) -> bool {
             let caller = get_caller_address();
             let timestamp = get_block_timestamp();
@@ -246,7 +269,25 @@ pub mod ObelyskVerifier {
                 self.total_sage_paid.write(self.total_sage_paid.read() + sage_amount);
             }
 
-            // 8. Record verification
+            // 8. Record TEE attestation (if provided)
+            //    tee_attestation_hash == 0 means no TEE was used (pure ZK proof).
+            //    Non-zero means the proof was generated on CC-On hardware and
+            //    the hash commits to the full NVIDIA attestation JWT/report.
+            if tee_attestation_hash != 0 {
+                self.tee_attestation_hashes.write(proof_id, tee_attestation_hash);
+                self
+                    .emit(
+                        TeeAttested {
+                            job_id,
+                            proof_id,
+                            attestation_hash: tee_attestation_hash,
+                            attestation_timestamp: timestamp, // block timestamp as proxy
+                            timestamp,
+                        },
+                    );
+            }
+
+            // 9. Record verification
             self.verified_proofs.write(proof_id, true);
             self.completed_jobs.write(job_id, true);
             let new_count = self.verification_count.read(model_id) + 1;
@@ -254,7 +295,7 @@ pub mod ObelyskVerifier {
             let total = self.total_verifications.read() + 1;
             self.total_verifications.write(total);
 
-            // 9. Emit VerificationComplete
+            // 10. Emit VerificationComplete
             self
                 .emit(
                     VerificationComplete {
