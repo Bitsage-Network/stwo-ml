@@ -1,0 +1,21 @@
+[package]
+name = "elo_cairo_verifier"
+version = "0.3.0"
+edition = "2024_07"
+
+# Generic on-chain sumcheck verifier for ML matrix multiplication.
+# No token or payment dependencies — pure cryptographic verification.
+# Compatible with any Starknet dapp that needs to verify STWO ML proofs.
+
+[dependencies]
+starknet = "2.12.0"
+
+[dev-dependencies]
+snforge_std = { git = "https://github.com/foundry-rs/starknet-foundry", tag = "v0.54.0" }
+cairo_test = "2.12.2"
+
+[[target.starknet-contract]]
+casm = true
+
+[tool.snforge]
+name = "elo_cairo_verifier"
