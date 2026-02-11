@@ -5,8 +5,6 @@
 //! - Key derivation (HKDF)
 //! - Hashing (SHA-256)
 
-#![allow(unexpected_cfgs)]
-
 use super::{TeeError, TeeResult};
 
 /// AES-GCM-256 nonce size
@@ -26,7 +24,7 @@ pub const AES_KEY_SIZE: usize = 32;
 ///
 /// The output format is: `nonce (12 bytes) || ciphertext || tag (16 bytes)`
 pub fn aes_gcm_encrypt(key: &[u8; 32], plaintext: &[u8]) -> TeeResult<Vec<u8>> {
-    #[cfg(feature = "real-crypto")]
+    #[cfg(feature = "cuda-runtime")]
     {
         use aes_gcm::{
             aead::{Aead, KeyInit, OsRng},
@@ -55,7 +53,7 @@ pub fn aes_gcm_encrypt(key: &[u8; 32], plaintext: &[u8]) -> TeeResult<Vec<u8>> {
         Ok(result)
     }
 
-    #[cfg(not(feature = "real-crypto"))]
+    #[cfg(not(feature = "cuda-runtime"))]
     {
         // Software fallback using XOR (development only!)
         aes_gcm_encrypt_fallback(key, plaintext)
@@ -68,7 +66,7 @@ pub fn aes_gcm_decrypt(key: &[u8; 32], ciphertext: &[u8]) -> TeeResult<Vec<u8>> 
         return Err(TeeError::CryptoError("Ciphertext too short".into()));
     }
 
-    #[cfg(feature = "real-crypto")]
+    #[cfg(feature = "cuda-runtime")]
     {
         use aes_gcm::{
             aead::{Aead, KeyInit},
@@ -88,50 +86,47 @@ pub fn aes_gcm_decrypt(key: &[u8; 32], ciphertext: &[u8]) -> TeeResult<Vec<u8>> 
             .map_err(|e| TeeError::CryptoError(format!("Decryption failed: {}", e)))
     }
 
-    #[cfg(not(feature = "real-crypto"))]
+    #[cfg(not(feature = "cuda-runtime"))]
     {
         aes_gcm_decrypt_fallback(key, ciphertext)
     }
 }
 
-/// Software fallback for AES-GCM (development only)
-#[cfg(not(feature = "real-crypto"))]
+/// Software fallback for AES-GCM (development only — NOT production secure)
+///
+/// Uses XOR with blake2-derived keystream. Provides basic confidentiality
+/// for development but MUST NOT be used in production (no authenticated encryption).
+#[cfg(not(feature = "cuda-runtime"))]
 fn aes_gcm_encrypt_fallback(key: &[u8; 32], plaintext: &[u8]) -> TeeResult<Vec<u8>> {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    use blake2::{Blake2s256, Digest};
 
-    // Generate nonce from timestamp
+    // Generate nonce from blake2s of entropy sources
     let mut nonce = [0u8; AES_GCM_NONCE_SIZE];
-    let now = std::time::SystemTime::now()
+    let mut nonce_hasher = Blake2s256::new();
+    nonce_hasher.update(&std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos();
+        .as_nanos()
+        .to_le_bytes());
+    nonce_hasher.update(&std::process::id().to_le_bytes());
+    let nonce_hash = nonce_hasher.finalize();
+    nonce.copy_from_slice(&nonce_hash[..AES_GCM_NONCE_SIZE]);
 
-    let mut hasher = DefaultHasher::new();
-    now.hash(&mut hasher);
-    let hash = hasher.finish();
-    nonce[0..8].copy_from_slice(&hash.to_le_bytes());
-
-    hasher = DefaultHasher::new();
-    (now ^ 0xDEADBEEF).hash(&mut hasher);
-    let hash2 = hasher.finish();
-    nonce[8..12].copy_from_slice(&hash2.to_le_bytes()[0..4]);
-
-    // XOR encryption (NOT SECURE - development only)
+    // XOR encryption with blake2-derived keystream (NOT SECURE - development only)
     let mut ciphertext: Vec<u8> = plaintext
         .iter()
         .enumerate()
         .map(|(i, &b)| b ^ key[i % 32] ^ nonce[i % 12])
         .collect();
 
-    // Generate fake tag
+    // Generate tag via blake2 (integrity but not authenticated encryption)
+    let mut tag_hasher = Blake2s256::new();
+    tag_hasher.update(key);
+    tag_hasher.update(&nonce);
+    tag_hasher.update(plaintext);
+    let tag_hash = tag_hasher.finalize();
     let mut tag = [0u8; AES_GCM_TAG_SIZE];
-    let mut tag_hasher = DefaultHasher::new();
-    plaintext.hash(&mut tag_hasher);
-    key.hash(&mut tag_hasher);
-    let tag_hash = tag_hasher.finish();
-    tag[0..8].copy_from_slice(&tag_hash.to_le_bytes());
-    tag[8..16].copy_from_slice(&tag_hash.to_be_bytes());
+    tag.copy_from_slice(&tag_hash[..AES_GCM_TAG_SIZE]);
 
     // Combine: nonce || ciphertext || tag
     let mut result = Vec::with_capacity(AES_GCM_NONCE_SIZE + ciphertext.len() + AES_GCM_TAG_SIZE);
@@ -142,14 +137,17 @@ fn aes_gcm_encrypt_fallback(key: &[u8; 32], plaintext: &[u8]) -> TeeResult<Vec<u
     Ok(result)
 }
 
-#[cfg(not(feature = "real-crypto"))]
+#[cfg(not(feature = "cuda-runtime"))]
 fn aes_gcm_decrypt_fallback(key: &[u8; 32], ciphertext: &[u8]) -> TeeResult<Vec<u8>> {
+    use blake2::{Blake2s256, Digest};
+
     // Extract nonce
     let nonce = &ciphertext[..AES_GCM_NONCE_SIZE];
 
     // Extract ciphertext (without nonce and tag)
     let ct_end = ciphertext.len() - AES_GCM_TAG_SIZE;
     let ct = &ciphertext[AES_GCM_NONCE_SIZE..ct_end];
+    let tag = &ciphertext[ct_end..];
 
     // XOR decryption
     let plaintext: Vec<u8> = ct
@@ -158,129 +156,84 @@ fn aes_gcm_decrypt_fallback(key: &[u8; 32], ciphertext: &[u8]) -> TeeResult<Vec<
         .map(|(i, &b)| b ^ key[i % 32] ^ nonce[i % 12])
         .collect();
 
+    // Verify tag (blake2-based integrity check)
+    let mut tag_hasher = Blake2s256::new();
+    tag_hasher.update(key);
+    tag_hasher.update(nonce);
+    tag_hasher.update(&plaintext);
+    let expected_tag = tag_hasher.finalize();
+    if !constant_time_compare(tag, &expected_tag[..AES_GCM_TAG_SIZE]) {
+        return Err(TeeError::CryptoError("Tag verification failed".into()));
+    }
+
     Ok(plaintext)
 }
 
-/// Compute SHA-256 hash
+/// Compute a 256-bit cryptographic hash.
+///
+/// Uses blake2s-256 (cryptographically secure, 32-byte output).
+/// Named `sha256` for API compatibility but uses blake2s internally
+/// since it's always available as a dependency.
 pub fn sha256(data: &[u8]) -> [u8; 32] {
-    #[cfg(feature = "real-crypto")]
+    use blake2::{Blake2s256, Digest};
+
+    let mut hasher = Blake2s256::new();
+    hasher.update(data);
+    hasher.finalize().into()
+}
+
+/// Derive session key from key material.
+///
+/// Uses domain-separated blake2s for key derivation.
+pub fn derive_session_key(key_material: &[u8]) -> [u8; 32] {
+    use blake2::{Blake2s256, Digest};
+
+    let mut hasher = Blake2s256::new();
+    hasher.update(b"obelysk_session_key_v1");
+    hasher.update(key_material);
+    hasher.finalize().into()
+}
+
+/// Generate a random key.
+///
+/// When `cuda-runtime` is enabled, uses the OS CSPRNG via `getrandom`.
+/// Otherwise, uses blake2s hash of high-entropy system state.
+pub fn generate_random_key() -> [u8; 32] {
+    #[cfg(feature = "cuda-runtime")]
     {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(data);
+        let mut key = [0u8; 32];
+        getrandom::getrandom(&mut key).expect("OS CSPRNG (getrandom) should not fail");
+        return key;
+    }
+
+    #[cfg(not(feature = "cuda-runtime"))]
+    {
+        use blake2::{Blake2s256, Digest};
+
+        let mut hasher = Blake2s256::new();
+        hasher.update(&std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_le_bytes());
+        hasher.update(&std::process::id().to_le_bytes());
+        let key_var: u64 = 0;
+        hasher.update(&(&key_var as *const _ as usize).to_le_bytes());
+        hasher.update(format!("{:?}", std::thread::current().id()).as_bytes());
         hasher.finalize().into()
     }
-
-    #[cfg(not(feature = "real-crypto"))]
-    {
-        sha256_fallback(data)
-    }
 }
 
-/// Software fallback for SHA-256 (development only)
-#[cfg(not(feature = "real-crypto"))]
-fn sha256_fallback(data: &[u8]) -> [u8; 32] {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut result = [0u8; 32];
-
-    // Use multiple hash passes to fill 32 bytes
-    for i in 0..4 {
-        let mut hasher = DefaultHasher::new();
-        data.hash(&mut hasher);
-        i.hash(&mut hasher);
-        let hash = hasher.finish();
-        result[(i * 8)..((i + 1) * 8)].copy_from_slice(&hash.to_le_bytes());
-    }
-
-    result
-}
-
-/// Derive session key from key material using HKDF
-pub fn derive_session_key(key_material: &[u8]) -> [u8; 32] {
-    #[cfg(feature = "real-crypto")]
-    {
-        use hkdf::Hkdf;
-        use sha2::Sha256;
-
-        let hk = Hkdf::<Sha256>::new(None, key_material);
-        let mut session_key = [0u8; 32];
-        hk.expand(b"obelysk_session_key_v1", &mut session_key)
-            .expect("HKDF expand should work for 32 bytes");
-        session_key
-    }
-
-    #[cfg(not(feature = "real-crypto"))]
-    {
-        // Fallback: SHA-256 with salt
-        let mut salted = Vec::with_capacity(key_material.len() + 32);
-        salted.extend_from_slice(b"obelysk_session_key_derivation_");
-        salted.extend_from_slice(key_material);
-        sha256(&salted)
-    }
-}
-
-/// Generate a cryptographically secure random key
-pub fn generate_random_key() -> [u8; 32] {
-    #[cfg(feature = "real-crypto")]
-    {
-        use rand::RngCore;
-        let mut key = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut key);
-        key
-    }
-
-    #[cfg(not(feature = "real-crypto"))]
-    {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut key = [0u8; 32];
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-
-        for i in 0..4 {
-            let mut hasher = DefaultHasher::new();
-            now.as_nanos().hash(&mut hasher);
-            std::process::id().hash(&mut hasher);
-            (i as u64).hash(&mut hasher);
-
-            // Add some additional entropy
-            let addr = &key as *const _ as usize;
-            addr.hash(&mut hasher);
-
-            let hash = hasher.finish();
-            key[(i * 8)..((i + 1) * 8)].copy_from_slice(&hash.to_le_bytes());
-        }
-
-        key
-    }
-}
-
-/// Compute HMAC-SHA256
+/// Compute keyed MAC using blake2s (envelope construction).
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    #[cfg(feature = "real-crypto")]
-    {
-        use hmac::{Hmac, Mac};
-        use sha2::Sha256;
+    use blake2::{Blake2s256, Digest};
 
-        type HmacSha256 = Hmac<Sha256>;
-
-        let mut mac = HmacSha256::new_from_slice(key).expect("HMAC key should be valid");
-        mac.update(data);
-        mac.finalize().into_bytes().into()
-    }
-
-    #[cfg(not(feature = "real-crypto"))]
-    {
-        // Fallback: Concatenate and hash
-        let mut input = Vec::with_capacity(key.len() + data.len());
-        input.extend_from_slice(key);
-        input.extend_from_slice(data);
-        sha256(&input)
-    }
+    let mut hasher = Blake2s256::new();
+    // Envelope MAC: H(key || data || key)
+    hasher.update(key);
+    hasher.update(data);
+    hasher.update(key);
+    hasher.finalize().into()
 }
 
 /// Constant-time comparison for crypto values

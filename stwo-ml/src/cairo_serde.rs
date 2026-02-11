@@ -368,6 +368,11 @@ pub struct MLClaimMetadata {
     pub activation_type: u8,
     pub io_commitment: FieldElement,
     pub weight_commitment: FieldElement,
+    /// Optional TEE attestation hash (Poseidon hash of NVIDIA CC attestation report).
+    /// `None` or `Some(FieldElement::ZERO)` means no TEE attestation.
+    /// `Some(hash)` means the proof was generated on CC-On hardware.
+    /// Serialized as: 0 (no TEE) or 1 + hash (with TEE).
+    pub tee_attestation_hash: Option<FieldElement>,
 }
 
 /// Serialize a lightweight Add or Mul layer claim.
@@ -482,6 +487,18 @@ pub fn serialize_ml_proof_for_recursive(
     serialize_u32(proof.layernorm_claims.len() as u32, &mut output);
     for claim in &proof.layernorm_claims {
         serialize_layernorm_claim(claim, &mut output);
+    }
+
+    // 8. tee_attestation_hash: Option<felt252>
+    //    Serialized as Cairo Option: 0 = None, 1 + value = Some.
+    match metadata.tee_attestation_hash {
+        Some(hash) if hash != FieldElement::ZERO => {
+            serialize_u32(1, &mut output); // Some variant
+            output.push(hash);
+        }
+        _ => {
+            serialize_u32(0, &mut output); // None variant
+        }
     }
 
     output
@@ -980,6 +997,7 @@ mod tests {
             activation_type: 0, // ReLU
             io_commitment: FieldElement::from(0xdeadbeefu64),
             weight_commitment: FieldElement::from(0xcafeu64),
+            tee_attestation_hash: None,
         };
 
         let felts = serialize_ml_proof_for_recursive(&aggregated, &metadata, None);
@@ -1004,11 +1022,12 @@ mod tests {
         // Total should be reasonable
         assert!(felts.len() > 20, "serialized too small: {} felts", felts.len());
 
-        // Trailing sections: unified_stark(0), add_claims(0), mul_claims(0), layernorm_claims(0)
-        assert_eq!(felts[felts.len() - 4], FieldElement::ZERO, "unified_stark_proof = None");
-        assert_eq!(felts[felts.len() - 3], FieldElement::ZERO, "add_claims count = 0");
-        assert_eq!(felts[felts.len() - 2], FieldElement::ZERO, "mul_claims count = 0");
-        assert_eq!(felts[felts.len() - 1], FieldElement::ZERO, "layernorm_claims count = 0");
+        // Trailing sections: unified_stark(0), add_claims(0), mul_claims(0), layernorm_claims(0), tee(0)
+        assert_eq!(felts[felts.len() - 5], FieldElement::ZERO, "unified_stark_proof = None");
+        assert_eq!(felts[felts.len() - 4], FieldElement::ZERO, "add_claims count = 0");
+        assert_eq!(felts[felts.len() - 3], FieldElement::ZERO, "mul_claims count = 0");
+        assert_eq!(felts[felts.len() - 2], FieldElement::ZERO, "layernorm_claims count = 0");
+        assert_eq!(felts[felts.len() - 1], FieldElement::ZERO, "tee_attestation_hash = None");
 
         // Test arguments file generation
         let json = serialize_ml_proof_to_arguments_file(&felts);
@@ -1047,6 +1066,7 @@ mod tests {
             activation_type: 0,
             io_commitment: FieldElement::ZERO,
             weight_commitment: FieldElement::ZERO,
+            tee_attestation_hash: None,
         };
 
         // With salt
@@ -1057,21 +1077,23 @@ mod tests {
         // Salt adds 1 extra felt (variant index 1 + value) vs (variant index 0)
         assert_eq!(with_salt.len(), no_salt.len() + 1);
 
-        // Both end with: unified_stark(0), add_claims(0), mul_claims(0), layernorm_claims(0)
-        assert_eq!(no_salt[no_salt.len() - 1], FieldElement::ZERO, "layernorm_claims = 0");
-        assert_eq!(no_salt[no_salt.len() - 2], FieldElement::ZERO, "mul_claims = 0");
-        assert_eq!(no_salt[no_salt.len() - 3], FieldElement::ZERO, "add_claims = 0");
-        assert_eq!(no_salt[no_salt.len() - 4], FieldElement::ZERO, "unified_stark = None");
+        // Both end with: unified_stark(0), add_claims(0), mul_claims(0), layernorm_claims(0), tee(0)
+        assert_eq!(no_salt[no_salt.len() - 1], FieldElement::ZERO, "tee = None");
+        assert_eq!(no_salt[no_salt.len() - 2], FieldElement::ZERO, "layernorm_claims = 0");
+        assert_eq!(no_salt[no_salt.len() - 3], FieldElement::ZERO, "mul_claims = 0");
+        assert_eq!(no_salt[no_salt.len() - 4], FieldElement::ZERO, "add_claims = 0");
+        assert_eq!(no_salt[no_salt.len() - 5], FieldElement::ZERO, "unified_stark = None");
 
-        assert_eq!(with_salt[with_salt.len() - 1], FieldElement::ZERO, "layernorm_claims = 0");
-        assert_eq!(with_salt[with_salt.len() - 4], FieldElement::ZERO, "unified_stark = None");
+        assert_eq!(with_salt[with_salt.len() - 1], FieldElement::ZERO, "tee = None");
+        assert_eq!(with_salt[with_salt.len() - 2], FieldElement::ZERO, "layernorm_claims = 0");
+        assert_eq!(with_salt[with_salt.len() - 5], FieldElement::ZERO, "unified_stark = None");
 
-        // no_salt layout ends: ..., channel_salt=None(0), unified_stark=None(0), add(0), mul(0), layernorm(0)
-        assert_eq!(no_salt[no_salt.len() - 5], FieldElement::ZERO, "channel_salt = None");
+        // no_salt layout ends: ..., channel_salt=None(0), unified_stark=None(0), add(0), mul(0), layernorm(0), tee(0)
+        assert_eq!(no_salt[no_salt.len() - 6], FieldElement::ZERO, "channel_salt = None");
 
-        // with_salt layout ends: ..., channel_salt=Some(1), 12345, unified_stark=None(0), add(0), mul(0), layernorm(0)
-        assert_eq!(with_salt[with_salt.len() - 6], FieldElement::from(1u64), "channel_salt = Some");
-        assert_eq!(with_salt[with_salt.len() - 5], FieldElement::from(12345u64), "salt value");
+        // with_salt layout ends: ..., channel_salt=Some(1), 12345, unified_stark=None(0), add(0), mul(0), layernorm(0), tee(0)
+        assert_eq!(with_salt[with_salt.len() - 7], FieldElement::from(1u64), "channel_salt = Some");
+        assert_eq!(with_salt[with_salt.len() - 6], FieldElement::from(12345u64), "salt value");
     }
 
     #[test]
@@ -1145,6 +1167,7 @@ mod tests {
             activation_type: 0,
             io_commitment: FieldElement::ZERO,
             weight_commitment: FieldElement::ZERO,
+            tee_attestation_hash: None,
         };
 
         // Without activation STARK
@@ -1194,16 +1217,17 @@ mod tests {
             felts_some.len(),
         );
 
-        // None ends with: channel_salt=None(0), unified_stark=None(0), add(0), mul(0), layernorm(0)
-        assert_eq!(felts_none[felts_none.len() - 1], FieldElement::ZERO, "layernorm_claims = 0");
-        assert_eq!(felts_none[felts_none.len() - 4], FieldElement::ZERO, "unified_stark = None");
-        assert_eq!(felts_none[felts_none.len() - 5], FieldElement::ZERO, "channel_salt = None");
+        // None ends with: channel_salt=None(0), unified_stark=None(0), add(0), mul(0), layernorm(0), tee(0)
+        assert_eq!(felts_none[felts_none.len() - 1], FieldElement::ZERO, "tee = None");
+        assert_eq!(felts_none[felts_none.len() - 2], FieldElement::ZERO, "layernorm_claims = 0");
+        assert_eq!(felts_none[felts_none.len() - 5], FieldElement::ZERO, "unified_stark = None");
+        assert_eq!(felts_none[felts_none.len() - 6], FieldElement::ZERO, "channel_salt = None");
 
         // Some path: both share the same prefix up to channel_salt
-        // The None path is: [MLClaim(5) + matmul_array + channel_salt(1) + activation_none(1) + add(0) + mul(0) + layernorm(0)]
-        // The Some path is: [MLClaim(5) + matmul_array + channel_salt(1) + activation_some(1) + data... + add(0) + mul(0) + layernorm(0)]
-        // The divergence point is at felts_none.len() - 4 (activation discriminant)
-        let diverge_idx = felts_none.len() - 4;
+        // The None path is: [MLClaim(5) + matmul_array + channel_salt(1) + activation_none(1) + add(0) + mul(0) + layernorm(0) + tee(0)]
+        // The Some path is: [MLClaim(5) + matmul_array + channel_salt(1) + activation_some(1) + data... + add(0) + mul(0) + layernorm(0) + tee(0)]
+        // The divergence point is at felts_none.len() - 5 (activation discriminant)
+        let diverge_idx = felts_none.len() - 5;
         assert_eq!(felts_none[diverge_idx], FieldElement::ZERO, "None discriminant");
         assert_eq!(felts_some[diverge_idx], FieldElement::from(1u64), "Some discriminant");
     }
@@ -1262,6 +1286,7 @@ mod tests {
             activation_type: 0, // ReLU
             io_commitment: FieldElement::from(0x111u64),
             weight_commitment: FieldElement::from(0x222u64),
+            tee_attestation_hash: None,
         };
 
         let felts = serialize_ml_proof_for_recursive(&aggregated, &metadata, None);
@@ -1449,18 +1474,20 @@ mod tests {
             activation_type: 0,
             io_commitment: FieldElement::ZERO,
             weight_commitment: FieldElement::ZERO,
+            tee_attestation_hash: None,
         };
 
         let felts = serialize_ml_proof_for_recursive(&proof, &metadata, None);
 
-        // The last 3 sections should be: add_claims(1 claim), mul_claims(empty), layernorm_claims(empty)
+        // The last 4 sections: add_claims(1 claim), mul_claims(empty), layernorm_claims(empty), tee(None)
         // Claims are lightweight: add_claim = layer_index(1) + trace_rows(1) = 2 felts per claim
         let last = felts.len() - 1;
-        assert_eq!(felts[last], FieldElement::ZERO, "layernorm_claims count = 0");
-        assert_eq!(felts[last - 1], FieldElement::ZERO, "mul_claims count = 0");
+        assert_eq!(felts[last], FieldElement::ZERO, "tee_attestation_hash = None");
+        assert_eq!(felts[last - 1], FieldElement::ZERO, "layernorm_claims count = 0");
+        assert_eq!(felts[last - 2], FieldElement::ZERO, "mul_claims count = 0");
         // add_claims section: count(1) + 1 claim * 2 felts = 3 felts before mul_claims
         // add_claims count should be 1
-        assert_eq!(felts[last - 4], FieldElement::from(1u64), "add_claims count = 1");
+        assert_eq!(felts[last - 5], FieldElement::from(1u64), "add_claims count = 1");
         assert!(felts.len() > 20, "should have data: {} felts", felts.len());
     }
 
@@ -1499,18 +1526,20 @@ mod tests {
             activation_type: 0,
             io_commitment: FieldElement::ZERO,
             weight_commitment: FieldElement::ZERO,
+            tee_attestation_hash: None,
         };
 
         let felts = serialize_ml_proof_for_recursive(&aggregated, &metadata, None);
 
-        // Last 3 felts should be [0, 0, 0] (empty add_claims, mul_claims, layernorm_claims)
+        // Last 4 felts should be [0, 0, 0, 0] (empty add_claims, mul_claims, layernorm_claims, tee=None)
         let len = felts.len();
-        assert_eq!(felts[len - 3], FieldElement::ZERO, "add_claims count = 0");
-        assert_eq!(felts[len - 2], FieldElement::ZERO, "mul_claims count = 0");
-        assert_eq!(felts[len - 1], FieldElement::ZERO, "layernorm_claims count = 0");
+        assert_eq!(felts[len - 4], FieldElement::ZERO, "add_claims count = 0");
+        assert_eq!(felts[len - 3], FieldElement::ZERO, "mul_claims count = 0");
+        assert_eq!(felts[len - 2], FieldElement::ZERO, "layernorm_claims count = 0");
+        assert_eq!(felts[len - 1], FieldElement::ZERO, "tee_attestation_hash = None");
 
-        // unified_stark=None(0), add(0), mul(0), layernorm(0)
-        assert_eq!(felts[len - 4], FieldElement::ZERO, "unified_stark = None");
+        // unified_stark=None(0), add(0), mul(0), layernorm(0), tee(0)
+        assert_eq!(felts[len - 5], FieldElement::ZERO, "unified_stark = None");
     }
 
     #[test]
@@ -1585,6 +1614,7 @@ mod tests {
             activation_type: 0,
             io_commitment: FieldElement::ZERO,
             weight_commitment: FieldElement::ZERO,
+            tee_attestation_hash: None,
         };
 
         let felts = serialize_ml_proof_for_recursive(&aggregated, &metadata, None);
@@ -1675,13 +1705,15 @@ mod tests {
         assert!(felts.len() > idx + 10, "STARK proof should have data after header");
 
         // === Outer MLProof sections (graph-level metadata) ===
-        // Last 7 felts: add(count+claim) + mul(count+claim) + layernorm(count+claim+sum)
+        // Trailing: add(count+claim) + mul(count+claim) + layernorm(count+claim+sum) + tee(1)
         let len = felts.len();
+        // tee_attestation_hash: None = 1 felt (0)
+        assert_eq!(felts[len - 1], FieldElement::ZERO, "tee_attestation_hash = None");
         // layernorm_claims: count(1) + claim(layer_index + trace_rows + claimed_sum) = 1 + 6 = 7
         // mul_claims: count(1) + claim(layer_index + trace_rows) = 1 + 2 = 3
         // add_claims: count(1) + claim(layer_index + trace_rows) = 1 + 2 = 3
-        // Total trailing = 7 + 3 + 3 = 13 felts
-        let ln_end = len;
+        // Total trailing before tee = 7 + 3 + 3 = 13 felts
+        let ln_end = len - 1; // skip tee
         let ln_start = ln_end - 7; // 1 count + 1 claim * (1 + 1 + 4) = 7
         assert_eq!(felts[ln_start], FieldElement::from(1u64), "outer layernorm count");
         assert_eq!(felts[ln_start + 1], FieldElement::from(7u64), "outer ln layer_index");

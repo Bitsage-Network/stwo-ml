@@ -28,6 +28,7 @@ use crate::cairo_serde::{serialize_proof, serialize_matmul_sumcheck_proof};
 use crate::compiler::graph::{ComputationGraph, GraphWeights};
 use crate::compiler::prove::ModelError;
 use crate::components::matmul::M31Matrix;
+use crate::tee::TeeAttestation;
 
 /// A proof formatted for Starknet on-chain verification.
 ///
@@ -62,6 +63,12 @@ pub struct StarknetModelProof {
     pub estimated_gas: u64,
     /// Total calldata size in felt252 elements.
     pub calldata_size: usize,
+    /// TEE attestation hash (Poseidon hash of the NVIDIA CC attestation report).
+    /// `None` when the proof was generated without TEE (pure ZK-only).
+    /// `Some(hash)` when the proof was generated on CC-On hardware and includes
+    /// a real attestation report. This value is passed to the ObelyskVerifier's
+    /// `tee_attestation_hash` parameter.
+    pub tee_attestation_hash: Option<FieldElement>,
 }
 
 /// Error type for Starknet proof generation.
@@ -137,7 +144,20 @@ pub fn build_starknet_proof(proof: &AggregatedModelProof) -> StarknetModelProof 
         num_proven_layers: num_proven,
         estimated_gas,
         calldata_size,
+        tee_attestation_hash: None,
     }
+}
+
+/// Convert an already-computed `AggregatedModelProof` into Starknet calldata with TEE attestation.
+pub fn build_starknet_proof_with_tee(
+    proof: &AggregatedModelProof,
+    attestation: Option<&TeeAttestation>,
+) -> StarknetModelProof {
+    let mut result = build_starknet_proof(proof);
+    result.tee_attestation_hash = attestation
+        .filter(|a| a.has_report())
+        .map(|a| a.report_hash_felt());
+    result
 }
 
 /// Compute IO commitment: Poseidon hash of flattened input and output M31 values.
@@ -226,7 +246,20 @@ pub fn build_starknet_proof_onchain(proof: &AggregatedModelProofOnChain) -> Star
         num_proven_layers: num_proven,
         estimated_gas,
         calldata_size,
+        tee_attestation_hash: None,
     }
+}
+
+/// Convert an on-chain aggregated proof into Starknet calldata with TEE attestation.
+pub fn build_starknet_proof_onchain_with_tee(
+    proof: &AggregatedModelProofOnChain,
+    attestation: Option<&TeeAttestation>,
+) -> StarknetModelProof {
+    let mut result = build_starknet_proof_onchain(proof);
+    result.tee_attestation_hash = attestation
+        .filter(|a| a.has_report())
+        .map(|a| a.report_hash_felt());
+    result
 }
 
 /// Estimate gas cost for verifying the proof on-chain.

@@ -87,7 +87,12 @@ fn generate_dev_gpu_attestation(
     // Query CC mode
     let cc_mode = super::cc_mode::query_cc_mode(device_id)?;
 
-    // Generate mock evidence (in production, this comes from GPU)
+    // Generate mock evidence (in production, this comes from GPU via nvTrust)
+    tracing::warn!(
+        device_id = device_id,
+        "Using MOCK attestation evidence — nvTrust SDK not available. \
+         Build with --features nvtrust for real GPU attestation."
+    );
     let evidence = generate_mock_evidence(device_id, &nonce, &driver_version);
 
     // Mock certificate chain
@@ -159,35 +164,39 @@ fn parse_gpu_model(name: &str) -> TeeResult<ConfidentialGpu> {
     }
 }
 
-/// Generate a random nonce
+/// Generate a random nonce for attestation freshness.
+///
+/// When `cuda-runtime` is enabled, uses the OS CSPRNG via `getrandom`.
+/// Otherwise, uses blake2s hash of high-entropy system state (not a full CSPRNG
+/// but cryptographically hashed — sufficient for attestation nonces in dev mode).
 fn generate_nonce() -> [u8; 32] {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut nonce = [0u8; 32];
-
-    // Use timestamp and random data
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-
-    let mut hasher = DefaultHasher::new();
-    now.as_nanos().hash(&mut hasher);
-    std::process::id().hash(&mut hasher);
-
-    let hash1 = hasher.finish();
-    nonce[0..8].copy_from_slice(&hash1.to_le_bytes());
-
-    // Add more entropy
-    for i in 1..4 {
-        hasher = DefaultHasher::new();
-        hash1.wrapping_add(i as u64).hash(&mut hasher);
-        now.as_nanos().wrapping_add(i as u128).hash(&mut hasher);
-        let hash = hasher.finish();
-        nonce[(i * 8)..((i + 1) * 8)].copy_from_slice(&hash.to_le_bytes());
+    #[cfg(feature = "cuda-runtime")]
+    {
+        let mut nonce = [0u8; 32];
+        getrandom::getrandom(&mut nonce).expect("OS CSPRNG (getrandom) should not fail");
+        return nonce;
     }
 
-    nonce
+    #[cfg(not(feature = "cuda-runtime"))]
+    {
+        use blake2::{Blake2s256, Digest};
+
+        let mut hasher = Blake2s256::new();
+        // Timestamp entropy
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        hasher.update(&now.as_nanos().to_le_bytes());
+        // Process ID entropy
+        hasher.update(&std::process::id().to_le_bytes());
+        // Stack address entropy (ASLR)
+        let stack_var: u64 = 0;
+        hasher.update(&(&stack_var as *const _ as usize).to_le_bytes());
+        // Thread ID entropy
+        hasher.update(format!("{:?}", std::thread::current().id()).as_bytes());
+
+        hasher.finalize().into()
+    }
 }
 
 /// Generate mock attestation evidence (development only)
@@ -268,6 +277,14 @@ pub fn verify_gpu_attestation(report: &GpuAttestationReport) -> TeeResult<bool> 
         return Err(TeeError::AttestationFailed(
             "Invalid evidence format".into(),
         ));
+    }
+
+    // Warn if using mock evidence (not production-grade)
+    if report.evidence.windows(14).any(|w| w == b"MOCK_SIGNATURE") {
+        tracing::warn!(
+            device_id = report.device_id,
+            "Attestation uses MOCK evidence — not suitable for production"
+        );
     }
 
     tracing::info!(

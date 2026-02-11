@@ -57,6 +57,7 @@ fn test_cross_verify_mlp() {
         activation_type: 0,
         io_commitment,
         weight_commitment: FieldElement::ZERO,
+        tee_attestation_hash: None,
     };
 
     let felts = serialize_ml_proof_for_recursive(&agg_proof, &metadata, None);
@@ -104,6 +105,7 @@ fn test_cross_verify_deep_mlp() {
         activation_type: 0,
         io_commitment,
         weight_commitment: FieldElement::ZERO,
+        tee_attestation_hash: None,
     };
 
     let felts = serialize_ml_proof_for_recursive(&agg_proof, &metadata, None);
@@ -152,6 +154,7 @@ fn test_cross_verify_transformer() {
         activation_type: 1, // GELU
         io_commitment,
         weight_commitment: FieldElement::ZERO,
+        tee_attestation_hash: None,
     };
 
     let felts = serialize_ml_proof_for_recursive(&agg_proof, &metadata, Some(42));

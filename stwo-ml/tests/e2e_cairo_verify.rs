@@ -51,6 +51,7 @@ fn test_e2e_mlp_serialize_for_cairo() {
         activation_type: 0, // ReLU
         io_commitment,
         weight_commitment: FieldElement::from(0xCAFEu64),
+        tee_attestation_hash: None,
     };
 
     // 3. Serialize to felt252[]
@@ -120,6 +121,7 @@ fn test_e2e_serialized_proof_deterministic() {
         activation_type: 0,
         io_commitment: FieldElement::ZERO,
         weight_commitment: FieldElement::ZERO,
+        tee_attestation_hash: None,
     };
 
     // Prove twice
@@ -179,6 +181,7 @@ fn test_e2e_transformer_serialize_for_cairo() {
         activation_type: 1, // GELU
         io_commitment,
         weight_commitment: FieldElement::from(0xBEEFu64),
+        tee_attestation_hash: None,
     };
 
     // Serialize
