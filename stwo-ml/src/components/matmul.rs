@@ -1138,6 +1138,11 @@ pub fn matrix_to_mle_col_major_pub(matrix: &M31Matrix) -> Vec<SecureField> {
     matrix_to_mle_col_major(matrix)
 }
 
+/// Public wrapper for `compute_lagrange_basis`.
+pub fn compute_lagrange_basis_pub(challenges: &[SecureField]) -> Vec<SecureField> {
+    compute_lagrange_basis(challenges)
+}
+
 /// Prove matmul sumcheck with automatic GPU dispatch.
 ///
 /// Uses GPU when the padded inner dimension k >= 2^MLE_THRESHOLD and CUDA

@@ -328,9 +328,9 @@ where
                     ModelError::MissingWeight(node.id)
                 )?;
 
-                // GPU GEMV for single-row inputs (inference), CPU fallback otherwise
+                // GPU GEMM for all matrix sizes, CPU fallback
                 #[cfg(feature = "cuda-runtime")]
-                let output = crate::gpu_sumcheck::gpu_matmul_m31(&current, weight)
+                let output = crate::gpu_sumcheck::gpu_matmul_m31_full(&current, weight)
                     .unwrap_or_else(|_| matmul_m31(&current, weight));
                 #[cfg(not(feature = "cuda-runtime"))]
                 let output = matmul_m31(&current, weight);
@@ -378,6 +378,16 @@ where
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
+
+                #[cfg(feature = "cuda-runtime")]
+                let output = {
+                    let rows = lhs.rows.max(rhs.rows);
+                    let cols = lhs.cols.max(rhs.cols);
+                    crate::gpu_sumcheck::gpu_elementwise_add(&lhs.data, &rhs.data)
+                        .map(|data| M31Matrix { rows, cols, data })
+                        .unwrap_or_else(|_| elementwise_add(&lhs, &rhs))
+                };
+                #[cfg(not(feature = "cuda-runtime"))]
                 let output = elementwise_add(&lhs, &rhs);
 
                 let add_log_size = data_log_size(output.data.len());
@@ -403,6 +413,16 @@ where
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
+
+                #[cfg(feature = "cuda-runtime")]
+                let output = {
+                    let rows = lhs.rows.max(rhs.rows);
+                    let cols = lhs.cols.max(rhs.cols);
+                    crate::gpu_sumcheck::gpu_elementwise_mul(&lhs.data, &rhs.data)
+                        .map(|data| M31Matrix { rows, cols, data })
+                        .unwrap_or_else(|_| elementwise_mul(&lhs, &rhs))
+                };
+                #[cfg(not(feature = "cuda-runtime"))]
                 let output = elementwise_mul(&lhs, &rhs);
 
                 let mul_log_size = data_log_size(output.data.len());
@@ -1215,9 +1235,9 @@ where
                     ModelError::MissingWeight(node.id)
                 )?;
 
-                // GPU GEMV for single-row inputs (inference), CPU fallback otherwise
+                // GPU GEMM for all matrix sizes, CPU fallback
                 #[cfg(feature = "cuda-runtime")]
-                let output = crate::gpu_sumcheck::gpu_matmul_m31(&current, weight)
+                let output = crate::gpu_sumcheck::gpu_matmul_m31_full(&current, weight)
                     .unwrap_or_else(|_| matmul_m31(&current, weight));
                 #[cfg(not(feature = "cuda-runtime"))]
                 let output = matmul_m31(&current, weight);
@@ -1274,6 +1294,16 @@ where
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
+
+                #[cfg(feature = "cuda-runtime")]
+                let output = {
+                    let rows = lhs.rows.max(rhs.rows);
+                    let cols = lhs.cols.max(rhs.cols);
+                    crate::gpu_sumcheck::gpu_elementwise_add(&lhs.data, &rhs.data)
+                        .map(|data| M31Matrix { rows, cols, data })
+                        .unwrap_or_else(|_| elementwise_add(&lhs, &rhs))
+                };
+                #[cfg(not(feature = "cuda-runtime"))]
                 let output = elementwise_add(&lhs, &rhs);
 
                 let add_log_size = data_log_size(output.data.len());
@@ -1303,6 +1333,16 @@ where
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
+
+                #[cfg(feature = "cuda-runtime")]
+                let output = {
+                    let rows = lhs.rows.max(rhs.rows);
+                    let cols = lhs.cols.max(rhs.cols);
+                    crate::gpu_sumcheck::gpu_elementwise_mul(&lhs.data, &rhs.data)
+                        .map(|data| M31Matrix { rows, cols, data })
+                        .unwrap_or_else(|_| elementwise_mul(&lhs, &rhs))
+                };
+                #[cfg(not(feature = "cuda-runtime"))]
                 let output = elementwise_mul(&lhs, &rhs);
 
                 let mul_log_size = data_log_size(output.data.len());
