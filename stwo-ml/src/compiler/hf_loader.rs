@@ -755,56 +755,15 @@ fn load_weights_from_shards(
     let total_weights = name_map.len();
     let mut loaded_count = 0usize;
 
+    // Collect which weights live in which shard: shard_idx → [(node_idx, k, n, tensor_name)]
+    let mut shard_to_weights: HashMap<usize, Vec<(usize, usize, usize, &str)>> = HashMap::new();
     for (idx, node) in graph.nodes.iter().enumerate() {
         if let GraphOp::MatMul { dims: (_m, k, n) } = &node.op {
-            if let Some(tensor_name) = name_map.get(&idx) {
-                loaded_count += 1;
-                if loaded_count <= 3 || loaded_count % 20 == 0 || loaded_count == total_weights {
-                    eprintln!(
-                        "  Loading weight [{}/{}] node {} ({}x{}) — {}",
-                        loaded_count, total_weights, idx, k, n, tensor_name,
-                    );
-                }
-
+            if let Some(tensor_name) = name_map.get(& idx) {
                 if let Some(&shard_idx) = tensor_to_shard.get(tensor_name) {
-                    let tensors = safetensors::SafeTensors::deserialize(&shards[shard_idx].mmap)
-                        .map_err(|e| WeightError::IoError(e.to_string()))?;
-                    let tensor = tensors.tensor(tensor_name)
-                        .map_err(|e| WeightError::IoError(format!("{}: {e}", tensor_name)))?;
-
-                    let data = tensor_to_f32(tensor.data(), tensor.dtype());
-                    // HuggingFace stores weights as (out_features, in_features)
-                    // Our MatMul expects (k, n) = (in_features, out_features)
-                    let shape = tensor.shape();
-                    let (weight_data, wk, wn) = if shape.len() == 2 {
-                        let rows = shape[0]; // out_features
-                        let cols = shape[1]; // in_features
-                        if rows == *n && cols == *k {
-                            // (out, in) → transpose to (in, out) = (k, n)
-                            let mut transposed = vec![0.0f32; data.len()];
-                            for r in 0..rows {
-                                for c in 0..cols {
-                                    transposed[c * rows + r] = data[r * cols + c];
-                                }
-                            }
-                            (transposed, *k, *n)
-                        } else if rows == *k && cols == *n {
-                            (data, *k, *n)
-                        } else {
-                            eprintln!(
-                                "    WARNING: tensor {} shape ({}, {}) doesn't match expected ({}, {}), using as-is",
-                                tensor_name, rows, cols, k, n
-                            );
-                            (data, *k, *n)
-                        }
-                    } else {
-                        (data, *k, *n)
-                    };
-
-                    let (matrix, _params) = quantize_weight_matrix(
-                        &weight_data, wk, wn, strategy,
-                    );
-                    weights.add_weight(idx, matrix);
+                    shard_to_weights.entry(shard_idx)
+                        .or_default()
+                        .push((idx, *k, *n, tensor_name));
                 } else {
                     eprintln!(
                         "    ERROR: tensor '{}' not found in any shard for node {}",
@@ -812,6 +771,68 @@ fn load_weights_from_shards(
                     );
                 }
             }
+        }
+    }
+
+    // Process one shard at a time — deserialize ONCE per shard (8 total, not 160)
+    for shard_idx in 0..shards.len() {
+        let Some(weight_list) = shard_to_weights.get(&shard_idx) else { continue };
+        let tensors = safetensors::SafeTensors::deserialize(&shards[shard_idx].mmap)
+            .map_err(|e| WeightError::IoError(e.to_string()))?;
+
+        for &(idx, k, n, tensor_name) in weight_list {
+            loaded_count += 1;
+            if loaded_count <= 3 || loaded_count % 20 == 0 || loaded_count == total_weights {
+                eprintln!(
+                    "  Loading weight [{}/{}] node {} ({}x{}) — {}",
+                    loaded_count, total_weights, idx, k, n, tensor_name,
+                );
+            }
+
+            let tensor = tensors.tensor(tensor_name)
+                .map_err(|e| WeightError::IoError(format!("{}: {e}", tensor_name)))?;
+
+            let data = tensor_to_f32(tensor.data(), tensor.dtype());
+            // HuggingFace stores weights as (out_features, in_features)
+            // Our MatMul expects (k, n) = (in_features, out_features)
+            let shape = tensor.shape();
+            let (weight_data, wk, wn) = if shape.len() == 2 {
+                let rows = shape[0]; // out_features
+                let cols = shape[1]; // in_features
+                if rows == n && cols == k {
+                    // (out, in) → transpose to (in, out) = (k, n)
+                    // Cache-blocked transpose for better L1/L2 cache utilization
+                    let mut transposed = vec![0.0f32; data.len()];
+                    const BLOCK: usize = 64;
+                    for r_block in (0..rows).step_by(BLOCK) {
+                        for c_block in (0..cols).step_by(BLOCK) {
+                            let r_end = (r_block + BLOCK).min(rows);
+                            let c_end = (c_block + BLOCK).min(cols);
+                            for r in r_block..r_end {
+                                for c in c_block..c_end {
+                                    transposed[c * rows + r] = data[r * cols + c];
+                                }
+                            }
+                        }
+                    }
+                    (transposed, k, n)
+                } else if rows == k && cols == n {
+                    (data, k, n)
+                } else {
+                    eprintln!(
+                        "    WARNING: tensor {} shape ({}, {}) doesn't match expected ({}, {}), using as-is",
+                        tensor_name, rows, cols, k, n
+                    );
+                    (data, k, n)
+                }
+            } else {
+                (data, k, n)
+            };
+
+            let (matrix, _params) = quantize_weight_matrix(
+                &weight_data, wk, wn, strategy,
+            );
+            weights.add_weight(idx, matrix);
         }
     }
 
