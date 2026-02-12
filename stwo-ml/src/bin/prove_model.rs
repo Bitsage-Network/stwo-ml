@@ -431,8 +431,10 @@ fn main() {
         ser_elapsed.as_secs_f64(),
     );
     eprintln!(
-        "  matmul_proofs: {}, activation_claims: {}",
+        "  matmul_proofs: {} individual + {} batched ({} total), activation_claims: {}",
         proof.matmul_proofs.len(),
+        proof.batched_matmul_proofs.len(),
+        proof.total_matmul_count(),
         proof.activation_claims.len(),
     );
     eprintln!(

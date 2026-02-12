@@ -8,7 +8,7 @@ use stwo::core::fields::m31::M31;
 use stwo::core::fields::qm31::SecureField;
 use starknet_ff::FieldElement;
 
-use crate::aggregation::{AggregatedModelProofOnChain, LayerClaim};
+use crate::aggregation::{AggregatedModelProofOnChain, LayerClaim, BatchedMatMulProofOnChain};
 use crate::cairo_serde::MLClaimMetadata;
 use crate::components::matmul::{MatMulSumcheckProofOnChain, RoundPoly};
 
@@ -60,6 +60,30 @@ fn layer_claim_to_json(claim: &LayerClaim) -> String {
     )
 }
 
+/// Serialize a BatchedMatMulProofOnChain to a JSON string.
+fn batched_matmul_to_json(batch: &BatchedMatMulProofOnChain) -> String {
+    let round_polys: Vec<String> = batch.round_polys.iter().map(round_poly_to_json).collect();
+    let entries: Vec<String> = batch.entries.iter().map(|e| {
+        format!(
+            r#"{{"node_id":{},"m":{},"n":{},"claimed_sum":{:?},"final_a_eval":{:?},"final_b_eval":{:?},"a_commitment":"{}","b_commitment":"{}"}}"#,
+            e.node_id, e.m, e.n,
+            qm31_to_array(e.claimed_sum),
+            qm31_to_array(e.final_a_eval),
+            qm31_to_array(e.final_b_eval),
+            felt_to_hex(&e.a_commitment),
+            felt_to_hex(&e.b_commitment),
+        )
+    }).collect();
+    format!(
+        r#"{{"k":{},"num_rounds":{},"lambda":{:?},"combined_claimed_sum":{:?},"round_polys":[{}],"entries":[{}]}}"#,
+        batch.k, batch.num_rounds,
+        qm31_to_array(batch.lambda),
+        qm31_to_array(batch.combined_claimed_sum),
+        round_polys.join(","),
+        entries.join(","),
+    )
+}
+
 /// Serialize an `AggregatedModelProofOnChain` with metadata to a JSON string.
 ///
 /// This produces a human-readable JSON representation of the proof,
@@ -88,13 +112,19 @@ pub fn proof_to_json(
 
     let has_unified_stark = proof.unified_stark.is_some();
 
+    let batched_proofs: Vec<String> = proof
+        .batched_matmul_proofs
+        .iter()
+        .map(batched_matmul_to_json)
+        .collect();
+
     let tee_hash_str = match &metadata.tee_attestation_hash {
         Some(h) if *h != starknet_ff::FieldElement::ZERO => format!("\"{}\"", felt_to_hex(h)),
         _ => "null".to_string(),
     };
 
     format!(
-        r#"{{"metadata":{{"model_id":"{}","num_layers":{},"activation_type":{},"io_commitment":"{}","weight_commitment":"{}","tee_attestation_hash":{}}},"matmul_proofs":[{}],"activation_claims":[{}],"has_unified_stark":{},"output_shape":[{},{}]}}"#,
+        r#"{{"metadata":{{"model_id":"{}","num_layers":{},"activation_type":{},"io_commitment":"{}","weight_commitment":"{}","tee_attestation_hash":{}}},"matmul_proofs":[{}],"batched_matmul_proofs":[{}],"activation_claims":[{}],"has_unified_stark":{},"output_shape":[{},{}]}}"#,
         felt_to_hex(&metadata.model_id),
         metadata.num_layers,
         metadata.activation_type,
@@ -102,6 +132,7 @@ pub fn proof_to_json(
         felt_to_hex(&metadata.weight_commitment),
         tee_hash_str,
         matmul_proofs.join(","),
+        batched_proofs.join(","),
         activation_claims.join(","),
         has_unified_stark,
         proof.execution.output.rows,

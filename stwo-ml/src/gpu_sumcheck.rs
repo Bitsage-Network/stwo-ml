@@ -355,6 +355,113 @@ extern "C" __global__ void sumcheck_reduce_kernel(
 "#;
 
 // =============================================================================
+// M31 GEMV CUDA Kernel (for forward pass acceleration)
+// =============================================================================
+
+/// CUDA kernel for M31 vector-matrix multiply: output[col] = Σ input[i] * weight[i * n + col] mod P.
+/// One thread per output column. Uses u64 accumulation with periodic modular reduction.
+#[cfg(feature = "cuda-runtime")]
+const M31_GEMV_KERNEL: &str = r#"
+#define P 0x7FFFFFFFu
+
+extern "C" __global__ void m31_gemv_kernel(
+    const unsigned int* input,   // k values (M31)
+    const unsigned int* weight,  // k x n matrix (row-major, M31)
+    unsigned int* output,        // n values (M31)
+    unsigned int k,
+    unsigned int n
+) {
+    unsigned int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= n) return;
+
+    unsigned long long acc = 0;
+    for (unsigned int i = 0; i < k; i++) {
+        unsigned long long a = (unsigned long long)input[i];
+        unsigned long long b = (unsigned long long)weight[i * n + col];
+        acc += a * b;
+        // Reduce every 4 iterations to prevent u64 overflow:
+        // max product = (2^31-2)^2 ≈ 4.6e18, sum of 4 ≈ 1.8e19 < 2^64
+        if ((i & 3u) == 3u) {
+            acc %= (unsigned long long)P;
+        }
+    }
+    output[col] = (unsigned int)(acc % (unsigned long long)P);
+}
+"#;
+
+/// GPU-accelerated M31 vector-matrix multiply for the forward pass.
+///
+/// Replaces CPU `matmul_m31` for the common case of m=1 (single-row input).
+/// Falls back to CPU for multi-row inputs.
+#[cfg(feature = "cuda-runtime")]
+pub fn gpu_matmul_m31(
+    input: &M31Matrix,
+    weight: &M31Matrix,
+) -> Result<M31Matrix, MatMulError> {
+    use crate::components::matmul::matmul_m31;
+
+    // Only accelerate single-row inputs (common in inference)
+    if input.rows != 1 {
+        return Ok(matmul_m31(input, weight));
+    }
+
+    let k = input.cols;
+    let n = weight.cols;
+
+    if k != weight.rows {
+        return Err(MatMulError::SumcheckFailed(format!(
+            "GPU GEMV dimension mismatch: input cols={k} != weight rows={}",
+            weight.rows,
+        )));
+    }
+
+    let executor = GpuSumcheckExecutor::cached()
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GPU init: {e}")))?;
+
+    // Compile GEMV kernel (separate from sumcheck kernels, cached in executor)
+    let gemv_fn = executor.get_gemv_fn()
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GEMV kernel: {e}")))?;
+
+    // Upload input and weight as u32 arrays
+    let input_u32: Vec<u32> = input.data.iter().map(|v| v.0).collect();
+    let weight_u32: Vec<u32> = weight.data.iter().map(|v| v.0).collect();
+
+    let d_input = executor.device.htod_sync_copy(&input_u32)
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GPU upload input: {:?}", e)))?;
+    let d_weight = executor.device.htod_sync_copy(&weight_u32)
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GPU upload weight: {:?}", e)))?;
+
+    let d_output: CudaSlice<u32> = executor.device.alloc_zeros(n)
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GPU alloc output: {:?}", e)))?;
+
+    // Launch: one thread per output column
+    let block_size = 256u32;
+    let grid_size = (n as u32 + block_size - 1) / block_size;
+
+    unsafe {
+        gemv_fn.clone().launch(
+            LaunchConfig {
+                grid_dim: (grid_size, 1, 1),
+                block_dim: (block_size, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            (&d_input, &d_weight, &d_output, k as u32, n as u32),
+        ).map_err(|e| MatMulError::SumcheckFailed(format!("GPU GEMV launch: {:?}", e)))?;
+    }
+
+    // Download result
+    let mut output_u32 = vec![0u32; n];
+    executor.device.dtoh_sync_copy_into(&d_output, &mut output_u32)
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GPU download: {:?}", e)))?;
+
+    let mut result = M31Matrix::new(1, n);
+    for (i, &v) in output_u32.iter().enumerate() {
+        result.data[i] = M31::from(v);
+    }
+    Ok(result)
+}
+
+// =============================================================================
 // GPU Sumcheck Executor
 // =============================================================================
 
@@ -365,6 +472,8 @@ pub struct GpuSumcheckExecutor {
     sumcheck_round_fn: CudaFunction,
     sumcheck_reduce_fn: CudaFunction,
     mle_fold_fn: CudaFunction,
+    /// Lazily compiled GEMV kernel function.
+    gemv_fn: std::sync::Mutex<Option<CudaFunction>>,
 }
 
 #[cfg(feature = "cuda-runtime")]
@@ -406,6 +515,7 @@ impl GpuSumcheckExecutor {
             sumcheck_round_fn,
             sumcheck_reduce_fn,
             mle_fold_fn,
+            gemv_fn: std::sync::Mutex::new(None),
         })
     }
 
@@ -422,6 +532,32 @@ impl GpuSumcheckExecutor {
             eprintln!("[GPU] Kernels compiled and cached.");
             Ok(Arc::new(executor))
         }).cloned()
+    }
+
+    /// Get or lazily compile the M31 GEMV kernel function.
+    ///
+    /// The GEMV kernel is compiled separately from the sumcheck kernels since
+    /// not all code paths need it. Compilation happens once on first call.
+    pub fn get_gemv_fn(&self) -> Result<CudaFunction, CudaFftError> {
+        let mut guard = self.gemv_fn.lock().unwrap();
+        if let Some(ref f) = *guard {
+            return Ok(f.clone());
+        }
+
+        // Compile GEMV kernel via NVRTC
+        let ptx = cudarc::nvrtc::compile_ptx(M31_GEMV_KERNEL)
+            .map_err(|e| CudaFftError::KernelCompilation(format!("GEMV kernel: {:?}", e)))?;
+
+        self.device.load_ptx(ptx, "gemv", &["m31_gemv_kernel"])
+            .map_err(|e| CudaFftError::KernelCompilation(format!("load GEMV PTX: {:?}", e)))?;
+
+        let f = self.device.get_func("gemv", "m31_gemv_kernel")
+            .ok_or_else(|| CudaFftError::KernelCompilation(
+                "m31_gemv_kernel not found".into(),
+            ))?;
+
+        *guard = Some(f.clone());
+        Ok(f)
     }
 
     /// Compute the sumcheck round polynomial (s0, s1, s2) on GPU.

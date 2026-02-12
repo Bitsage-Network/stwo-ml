@@ -359,7 +359,10 @@ pub fn serialize_matmul_sumcheck_proof(
 // Serializes an AggregatedModelProofOnChain into the felt252[] layout
 // matching the Cairo `MLProof` struct's Serde deserialization.
 
-use crate::aggregation::{AggregatedModelProofOnChain, LayerClaim};
+use crate::aggregation::{
+    AggregatedModelProofOnChain, LayerClaim,
+    BatchedMatMulProofOnChain,
+};
 
 /// Metadata about the ML model, needed to construct the Cairo MLClaim.
 pub struct MLClaimMetadata {
@@ -439,6 +442,12 @@ pub fn serialize_ml_proof_for_recursive(
     serialize_u32(proof.matmul_proofs.len() as u32, &mut output);
     for (_layer_idx, matmul) in &proof.matmul_proofs {
         serialize_matmul_for_recursive(matmul, &mut output);
+    }
+
+    // 2b. batched_matmul_proofs: Array<BatchedMatMulProofOnChain>
+    serialize_u32(proof.batched_matmul_proofs.len() as u32, &mut output);
+    for batch in &proof.batched_matmul_proofs {
+        serialize_batched_matmul_for_recursive(batch, &mut output);
     }
 
     // 3. channel_salt: Option<u64>
@@ -527,6 +536,41 @@ fn serialize_matmul_for_recursive(
     serialize_qm31(proof.final_b_eval, output);
     output.push(proof.a_commitment);
     output.push(proof.b_commitment);
+}
+
+/// Serialize a batched matmul proof for recursive verification.
+///
+/// Layout:
+/// - k, num_rounds (2 felts)
+/// - lambda (4 felts, QM31)
+/// - combined_claimed_sum (4 felts, QM31)
+/// - round_polys: [len] + len × 12 felts
+/// - entries: [len] + per-entry: node_id, m, n, claimed_sum, final_a, final_b, a_commit, b_commit
+fn serialize_batched_matmul_for_recursive(
+    batch: &BatchedMatMulProofOnChain,
+    output: &mut Vec<FieldElement>,
+) {
+    serialize_u32(batch.k, output);
+    serialize_u32(batch.num_rounds, output);
+    serialize_qm31(batch.lambda, output);
+    serialize_qm31(batch.combined_claimed_sum, output);
+    // round_polys
+    serialize_u32(batch.round_polys.len() as u32, output);
+    for rp in &batch.round_polys {
+        serialize_round_poly(rp, output);
+    }
+    // entries
+    serialize_u32(batch.entries.len() as u32, output);
+    for entry in &batch.entries {
+        serialize_u32(entry.node_id as u32, output);
+        serialize_u32(entry.m, output);
+        serialize_u32(entry.n, output);
+        serialize_qm31(entry.claimed_sum, output);
+        serialize_qm31(entry.final_a_eval, output);
+        serialize_qm31(entry.final_b_eval, output);
+        output.push(entry.a_commitment);
+        output.push(entry.b_commitment);
+    }
 }
 
 // === Unified STARK Proof Serialization ===
@@ -979,6 +1023,7 @@ mod tests {
         let aggregated = AggregatedModelProofOnChain {
             unified_stark: None,
             matmul_proofs: vec![(0, matmul_proof)],
+            batched_matmul_proofs: Vec::new(),
             add_claims: Vec::new(),
             mul_claims: Vec::new(),
             layernorm_claims: Vec::new(),
@@ -1048,6 +1093,7 @@ mod tests {
         let aggregated = AggregatedModelProofOnChain {
             unified_stark: None,
             matmul_proofs: vec![(0, matmul_proof)],
+            batched_matmul_proofs: Vec::new(),
             add_claims: Vec::new(),
             mul_claims: Vec::new(),
             layernorm_claims: Vec::new(),
@@ -1174,6 +1220,7 @@ mod tests {
         let aggregated_none = AggregatedModelProofOnChain {
             unified_stark: None,
             matmul_proofs: vec![(0, matmul_proof.clone())],
+            batched_matmul_proofs: Vec::new(),
             add_claims: Vec::new(),
             mul_claims: Vec::new(),
             layernorm_claims: Vec::new(),
@@ -1196,6 +1243,7 @@ mod tests {
         let aggregated_some = AggregatedModelProofOnChain {
             unified_stark: Some(activation_proof),
             matmul_proofs: vec![(0, matmul_proof)],
+            batched_matmul_proofs: Vec::new(),
             add_claims: Vec::new(),
             mul_claims: Vec::new(),
             layernorm_claims: Vec::new(),
@@ -1268,6 +1316,7 @@ mod tests {
         let aggregated = AggregatedModelProofOnChain {
             unified_stark: Some(activation_proof),
             matmul_proofs: vec![(0, matmul_proof)],
+            batched_matmul_proofs: Vec::new(),
             add_claims: Vec::new(),
             mul_claims: Vec::new(),
             layernorm_claims: Vec::new(),
@@ -1318,6 +1367,10 @@ mod tests {
         let num_rounds = 1u32; // log2(2) = 1
         let matmul_felts = 4 + 4 + 1 + (num_rounds as usize * 12) + 4 + 4 + 1 + 1;
         idx += matmul_felts;
+
+        // Field 2b: batched_matmul_proofs array (length=0)
+        assert_eq!(felts[idx], FieldElement::ZERO, "batched_matmul_proofs length = 0");
+        idx += 1;
 
         // Field 3: channel_salt = Option::None (1 felt = 0)
         assert_eq!(felts[idx], FieldElement::ZERO, "channel_salt = None");
@@ -1508,6 +1561,7 @@ mod tests {
         let aggregated = AggregatedModelProofOnChain {
             unified_stark: None,
             matmul_proofs: vec![(0, matmul_proof)],
+            batched_matmul_proofs: Vec::new(),
             add_claims: Vec::new(),
             mul_claims: Vec::new(),
             layernorm_claims: Vec::new(),
@@ -1596,6 +1650,7 @@ mod tests {
         let aggregated = AggregatedModelProofOnChain {
             unified_stark: Some(activation_proof),
             matmul_proofs: vec![(0, matmul_proof)],
+            batched_matmul_proofs: Vec::new(),
             add_claims: add_claims.clone(),
             mul_claims: mul_claims.clone(),
             layernorm_claims: layernorm_claims.clone(),
@@ -1628,6 +1683,8 @@ mod tests {
         let num_rounds = 1u32;
         let matmul_felts = 4 + 4 + 1 + (num_rounds as usize * 12) + 4 + 4 + 1 + 1;
         idx += matmul_felts;
+        // batched_matmul_proofs: length=0
+        idx += 1;
         // channel_salt: None = 1 felt
         idx += 1;
         // unified_stark discriminant: Some = 1 felt

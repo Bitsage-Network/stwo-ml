@@ -165,6 +165,40 @@ pub enum AggregationError {
     VerificationFailed(String),
 }
 
+/// Batched matmul sumcheck proof — multiple matmuls proved in one combined sumcheck.
+///
+/// Instead of N individual sumcheck proofs (each with its own round polynomials),
+/// a batch combines them with random lambda weighting: h(x) = Σ λ^i · f_a_i(x)·f_b_i(x).
+/// One set of shared round polynomials + per-matmul final evaluations.
+#[derive(Debug, Clone)]
+pub struct BatchedMatMulProofOnChain {
+    /// Padded k dimension (shared by all entries in this batch).
+    pub k: u32,
+    /// Number of sumcheck rounds (log2(k)).
+    pub num_rounds: u32,
+    /// Lambda batching weight drawn from Fiat-Shamir.
+    pub lambda: SecureField,
+    /// Combined claimed sum: Σ λ^i · claimed_sum_i.
+    pub combined_claimed_sum: SecureField,
+    /// Shared round polynomials (one per round).
+    pub round_polys: Vec<crate::components::matmul::RoundPoly>,
+    /// Per-matmul entries with individual evaluations and commitments.
+    pub entries: Vec<BatchedMatMulEntryOnChain>,
+}
+
+/// Per-matmul entry within a batched proof.
+#[derive(Debug, Clone)]
+pub struct BatchedMatMulEntryOnChain {
+    pub node_id: usize,
+    pub m: u32,
+    pub n: u32,
+    pub claimed_sum: SecureField,
+    pub final_a_eval: SecureField,
+    pub final_b_eval: SecureField,
+    pub a_commitment: starknet_ff::FieldElement,
+    pub b_commitment: starknet_ff::FieldElement,
+}
+
 /// Deferred matmul data: forward pass computed, proving deferred to Phase 2.
 struct DeferredMatMul {
     node_id: usize,
@@ -291,6 +325,11 @@ where
                     ModelError::MissingWeight(node.id)
                 )?;
 
+                // GPU GEMV for single-row inputs (inference), CPU fallback otherwise
+                #[cfg(feature = "cuda-runtime")]
+                let output = crate::gpu_sumcheck::gpu_matmul_m31(&current, weight)
+                    .unwrap_or_else(|_| matmul_m31(&current, weight));
+                #[cfg(not(feature = "cuda-runtime"))]
                 let output = matmul_m31(&current, weight);
 
                 let proof = prove_matmul_sumcheck_auto(&current, weight, &output)
@@ -1031,7 +1070,11 @@ pub struct AggregatedModelProofOnChain {
     /// Single STARK proof covering all non-matmul components.
     pub unified_stark: Option<StarkProof<Blake2sHash>>,
     /// Per-matmul on-chain sumcheck proofs, in layer order.
+    /// Empty when `batched_matmul_proofs` is used instead.
     pub matmul_proofs: Vec<(usize, MatMulSumcheckProofOnChain)>,
+    /// Batched matmul proofs — grouped by k dimension.
+    /// When non-empty, these replace `matmul_proofs` (which will be empty).
+    pub batched_matmul_proofs: Vec<BatchedMatMulProofOnChain>,
     /// Per-Add layer claims (verified inside unified STARK).
     pub add_claims: Vec<LayerClaim>,
     /// Per-Mul layer claims (verified inside unified STARK).
@@ -1051,9 +1094,18 @@ pub struct AggregatedModelProofOnChain {
 impl AggregatedModelProofOnChain {
     /// Total number of proven layers across all proof types.
     pub fn num_proven_layers(&self) -> usize {
-        self.matmul_proofs.len() + self.activation_claims.len()
+        let batched_count: usize = self.batched_matmul_proofs.iter()
+            .map(|b| b.entries.len()).sum();
+        self.matmul_proofs.len() + batched_count + self.activation_claims.len()
             + self.add_claims.len() + self.mul_claims.len() + self.layernorm_claims.len()
             + self.attention_proofs.len() + self.embedding_claims.len()
+    }
+
+    /// Total number of matmul proofs (individual + batched entries).
+    pub fn total_matmul_count(&self) -> usize {
+        let batched: usize = self.batched_matmul_proofs.iter()
+            .map(|b| b.entries.len()).sum();
+        self.matmul_proofs.len() + batched
     }
 }
 
@@ -1160,6 +1212,11 @@ where
                     ModelError::MissingWeight(node.id)
                 )?;
 
+                // GPU GEMV for single-row inputs (inference), CPU fallback otherwise
+                #[cfg(feature = "cuda-runtime")]
+                let output = crate::gpu_sumcheck::gpu_matmul_m31(&current, weight)
+                    .unwrap_or_else(|_| matmul_m31(&current, weight));
+                #[cfg(not(feature = "cuda-runtime"))]
                 let output = matmul_m31(&current, weight);
 
                 // Collect for deferred proving (Phase 2)
@@ -1413,60 +1470,161 @@ where
     );
 
     // =====================================================================
-    // Phase 2: Prove all matmul sumchecks (GPU, cached executor)
+    // Phase 2: Prove all matmul sumchecks (GPU batch when available)
     // =====================================================================
     let tag = if gpu_active { "[GPU]" } else { "[CPU]" };
-    eprintln!(
-        "Phase 2/3: {} Proving {} matmul sumchecks...",
-        tag, matmul_data.len(),
-    );
     let t_phase2 = std::time::Instant::now();
+    #[allow(unused_mut)]
+    let mut batched_matmul_proofs: Vec<BatchedMatMulProofOnChain> = Vec::new();
 
-    for (i, dm) in matmul_data.iter().enumerate() {
-        let (m, k, n) = dm.dims;
+    // Try batch proving: group matmuls by k dimension, prove each group in one combined sumcheck.
+    // Falls back to individual proving if GPU batch isn't available.
+    let batch_available = {
+        #[cfg(feature = "cuda-runtime")]
+        { gpu_active }
+        #[cfg(not(feature = "cuda-runtime"))]
+        { false }
+    };
+
+    if batch_available && !matmul_data.is_empty() {
+        // Group matmuls by padded k dimension (all entries in a batch must share k).
+        let mut dim_groups: std::collections::BTreeMap<usize, Vec<usize>> = std::collections::BTreeMap::new();
+        for (idx, dm) in matmul_data.iter().enumerate() {
+            let k = dm.dims.1.next_power_of_two();
+            dim_groups.entry(k).or_default().push(idx);
+        }
         eprintln!(
-            "  {} [{}/{}] Node {} MatMul {}x{}x{}",
-            tag, i + 1, matmul_data.len(), dm.node_id, m, k, n,
+            "Phase 2/3: {} Batch proving {} matmuls in {} dimension groups...",
+            tag, matmul_data.len(), dim_groups.len(),
         );
-        let t_node = std::time::Instant::now();
-
-        let (_, estimated_mem) = estimate_sumcheck_memory(m, k, n);
-
-        let proof = if estimated_mem > TILED_MEMORY_BUDGET {
+        for (group_idx, (&k_dim, indices)) in dim_groups.iter().enumerate() {
             eprintln!(
-                "    -> tiled (est. {:.1} GB exceeds {:.0} GB budget)",
-                estimated_mem as f64 / 1e9,
-                TILED_MEMORY_BUDGET as f64 / 1e9,
+                "  {} Group {}/{}: k={}, {} matmuls",
+                tag, group_idx + 1, dim_groups.len(), k_dim, indices.len(),
             );
-            let config = TiledMatMulConfig::from_memory_budget(
-                m, k, n, TILED_MEMORY_BUDGET,
-            );
-            let tiled = prove_tiled_matmul(&dm.a, &dm.b, &dm.c, &config)
-                .map_err(|e| ModelError::ProvingError {
-                    layer: dm.node_id,
-                    message: format!("Tiled matmul: {e}"),
-                })?;
-            compose_tiled_proof(&tiled)
-        } else {
-            prove_matmul_sumcheck_onchain_auto(&dm.a, &dm.b, &dm.c)
-                .map_err(|e| ModelError::ProvingError {
-                    layer: dm.node_id,
-                    message: format!("MatMul sumcheck (on-chain): {e}"),
-                })?
-        };
+            let t_group = std::time::Instant::now();
 
+            // Prepare batch entries and GPU batch prove (all behind cuda-runtime gate)
+            #[cfg(feature = "cuda-runtime")]
+            {
+                eprintln!("    Preparing {} batch entries (MLE restriction + commitment)...", indices.len());
+                let t_prep = std::time::Instant::now();
+                let mut entries = Vec::with_capacity(indices.len());
+                for (i, &idx) in indices.iter().enumerate() {
+                    let dm = &matmul_data[idx];
+                    if (i + 1) % 20 == 0 || i + 1 == indices.len() {
+                        eprintln!("      [{}/{}] node {}", i + 1, indices.len(), dm.node_id);
+                    }
+                    let entry = crate::gpu_sumcheck::prepare_batch_entry(
+                        dm.node_id, &dm.a, &dm.b, &dm.c,
+                    ).map_err(|e| ModelError::ProvingError {
+                        layer: dm.node_id,
+                        message: format!("Batch prep: {e}"),
+                    })?;
+                    entries.push(entry);
+                }
+                eprintln!("    Prep done in {:.1}s", t_prep.elapsed().as_secs_f64());
+
+                // GPU batch prove
+                eprintln!("    {} Batch sumcheck ({} entries, k={})...", tag, entries.len(), k_dim);
+                let t_prove = std::time::Instant::now();
+
+                let batch_result = crate::gpu_sumcheck::prove_matmul_batch_onchain_gpu(&entries)
+                    .map_err(|e| AggregationError::ProvingError(
+                        format!("Batch sumcheck k={k_dim}: {e}"),
+                    ))?;
+
+                // Compute combined claimed sum for verification
+                let mut combined = SecureField::zero();
+                let mut lambda_pow = SecureField::one();
+                for entry in &entries {
+                    combined = combined + lambda_pow * entry.claimed_sum;
+                    lambda_pow = lambda_pow * batch_result.lambda;
+                }
+
+                // Build batched proof struct
+                let batch_entries: Vec<BatchedMatMulEntryOnChain> = entries.iter()
+                    .zip(batch_result.per_matmul.iter())
+                    .map(|(entry, result)| BatchedMatMulEntryOnChain {
+                        node_id: entry.node_id,
+                        m: entry.m as u32,
+                        n: entry.n as u32,
+                        claimed_sum: entry.claimed_sum,
+                        final_a_eval: result.final_a_eval,
+                        final_b_eval: result.final_b_eval,
+                        a_commitment: entry.a_commitment,
+                        b_commitment: entry.b_commitment,
+                    })
+                    .collect();
+
+                batched_matmul_proofs.push(BatchedMatMulProofOnChain {
+                    k: k_dim as u32,
+                    num_rounds: batch_result.round_polys.len() as u32,
+                    lambda: batch_result.lambda,
+                    combined_claimed_sum: combined,
+                    round_polys: batch_result.round_polys,
+                    entries: batch_entries,
+                });
+
+            }
+            eprintln!(
+                "    -> {} Group done in {:.2}s (elapsed: {:.1}s)",
+                tag, t_group.elapsed().as_secs_f64(),
+                t_start.elapsed().as_secs_f64(),
+            );
+        }
         eprintln!(
-            "    -> {} done in {:.2}s (elapsed: {:.1}s)",
-            tag, t_node.elapsed().as_secs_f64(), t_start.elapsed().as_secs_f64(),
+            "Phase 2 complete: {} batched groups ({} total matmuls) in {:.1}s",
+            batched_matmul_proofs.len(),
+            batched_matmul_proofs.iter().map(|b| b.entries.len()).sum::<usize>(),
+            t_phase2.elapsed().as_secs_f64(),
         );
+    } else {
+        // Fallback: individual proving (no GPU batch available)
+        eprintln!(
+            "Phase 2/3: {} Proving {} matmul sumchecks (individual)...",
+            tag, matmul_data.len(),
+        );
+        for (i, dm) in matmul_data.iter().enumerate() {
+            let (m, k, n) = dm.dims;
+            eprintln!(
+                "  {} [{}/{}] Node {} MatMul {}x{}x{}",
+                tag, i + 1, matmul_data.len(), dm.node_id, m, k, n,
+            );
+            let t_node = std::time::Instant::now();
 
-        matmul_proofs.push((dm.node_id, proof));
+            let (_, estimated_mem) = estimate_sumcheck_memory(m, k, n);
+
+            let proof = if estimated_mem > TILED_MEMORY_BUDGET {
+                let config = TiledMatMulConfig::from_memory_budget(
+                    m, k, n, TILED_MEMORY_BUDGET,
+                );
+                let tiled = prove_tiled_matmul(&dm.a, &dm.b, &dm.c, &config)
+                    .map_err(|e| ModelError::ProvingError {
+                        layer: dm.node_id,
+                        message: format!("Tiled matmul: {e}"),
+                    })?;
+                compose_tiled_proof(&tiled)
+            } else {
+                prove_matmul_sumcheck_onchain_auto(&dm.a, &dm.b, &dm.c)
+                    .map_err(|e| ModelError::ProvingError {
+                        layer: dm.node_id,
+                        message: format!("MatMul sumcheck (on-chain): {e}"),
+                    })?
+            };
+
+            eprintln!(
+                "    -> {} done in {:.2}s (elapsed: {:.1}s)",
+                tag, t_node.elapsed().as_secs_f64(), t_start.elapsed().as_secs_f64(),
+            );
+
+            matmul_proofs.push((dm.node_id, proof));
+        }
+        eprintln!(
+            "Phase 2 complete: {} individual matmul proofs in {:.1}s",
+            matmul_proofs.len(), t_phase2.elapsed().as_secs_f64(),
+        );
     }
-
-    eprintln!(
-        "Phase 2 complete: {} matmul proofs in {:.1}s",
-        matmul_proofs.len(), t_phase2.elapsed().as_secs_f64(),
-    );
 
     // =====================================================================
     // Phase 2b: Prove attention layers (on-chain format, GPU sumchecks)
@@ -1505,6 +1663,7 @@ where
         return Ok(AggregatedModelProofOnChain {
             unified_stark: None,
             matmul_proofs,
+            batched_matmul_proofs,
             add_claims: Vec::new(),
             mul_claims: Vec::new(),
             layernorm_claims: Vec::new(),
@@ -1939,6 +2098,7 @@ where
     Ok(AggregatedModelProofOnChain {
         unified_stark: Some(stark_proof),
         matmul_proofs,
+        batched_matmul_proofs,
         add_claims,
         mul_claims,
         layernorm_claims,

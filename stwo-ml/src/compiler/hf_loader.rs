@@ -774,66 +774,76 @@ fn load_weights_from_shards(
         }
     }
 
-    // Process one shard at a time — deserialize ONCE per shard (8 total, not 160)
+    // Process one shard at a time — deserialize ONCE per shard (8 total, not 160).
+    // Within each shard, parallelize weight processing (transpose + quantize) with rayon.
+    use rayon::prelude::*;
+
     for shard_idx in 0..shards.len() {
         let Some(weight_list) = shard_to_weights.get(&shard_idx) else { continue };
         let tensors = safetensors::SafeTensors::deserialize(&shards[shard_idx].mmap)
             .map_err(|e| WeightError::IoError(e.to_string()))?;
 
-        for &(idx, k, n, tensor_name) in weight_list {
-            loaded_count += 1;
-            if loaded_count <= 3 || loaded_count % 20 == 0 || loaded_count == total_weights {
-                eprintln!(
-                    "  Loading weight [{}/{}] node {} ({}x{}) — {}",
-                    loaded_count, total_weights, idx, k, n, tensor_name,
-                );
-            }
+        // Extract raw tensor data sequentially (SafeTensors not Send)
+        let raw_data: Vec<(usize, usize, usize, Vec<f32>, Vec<usize>)> = weight_list.iter()
+            .map(|&(idx, k, n, tensor_name)| {
+                let tensor = tensors.tensor(tensor_name)
+                    .map_err(|e| WeightError::IoError(format!("{}: {e}", tensor_name)))?;
+                let data = tensor_to_f32(tensor.data(), tensor.dtype());
+                let shape = tensor.shape().to_vec();
+                Ok((idx, k, n, data, shape))
+            })
+            .collect::<Result<Vec<_>, WeightError>>()?;
 
-            let tensor = tensors.tensor(tensor_name)
-                .map_err(|e| WeightError::IoError(format!("{}: {e}", tensor_name)))?;
+        let shard_weight_count = raw_data.len();
+        eprintln!(
+            "  Shard {}/{}: processing {} weights in parallel...",
+            shard_idx + 1, shards.len(), shard_weight_count,
+        );
 
-            let data = tensor_to_f32(tensor.data(), tensor.dtype());
-            // HuggingFace stores weights as (out_features, in_features)
-            // Our MatMul expects (k, n) = (in_features, out_features)
-            let shape = tensor.shape();
-            let (weight_data, wk, wn) = if shape.len() == 2 {
-                let rows = shape[0]; // out_features
-                let cols = shape[1]; // in_features
-                if rows == n && cols == k {
-                    // (out, in) → transpose to (in, out) = (k, n)
-                    // Cache-blocked transpose for better L1/L2 cache utilization
-                    let mut transposed = vec![0.0f32; data.len()];
-                    const BLOCK: usize = 64;
-                    for r_block in (0..rows).step_by(BLOCK) {
-                        for c_block in (0..cols).step_by(BLOCK) {
-                            let r_end = (r_block + BLOCK).min(rows);
-                            let c_end = (c_block + BLOCK).min(cols);
-                            for r in r_block..r_end {
-                                for c in c_block..c_end {
-                                    transposed[c * rows + r] = data[r * cols + c];
+        // Parallel transpose + quantize
+        let processed: Vec<(usize, M31Matrix)> = raw_data.par_iter()
+            .map(|(idx, k, n, data, shape)| {
+                let (k, n) = (*k, *n);
+                let (weight_data, wk, wn) = if shape.len() == 2 {
+                    let rows = shape[0];
+                    let cols = shape[1];
+                    if rows == n && cols == k {
+                        let mut transposed = vec![0.0f32; data.len()];
+                        const BLOCK: usize = 64;
+                        for r_block in (0..rows).step_by(BLOCK) {
+                            for c_block in (0..cols).step_by(BLOCK) {
+                                let r_end = (r_block + BLOCK).min(rows);
+                                let c_end = (c_block + BLOCK).min(cols);
+                                for r in r_block..r_end {
+                                    for c in c_block..c_end {
+                                        transposed[c * rows + r] = data[r * cols + c];
+                                    }
                                 }
                             }
                         }
+                        (transposed, k, n)
+                    } else if rows == k && cols == n {
+                        (data.clone(), k, n)
+                    } else {
+                        (data.clone(), k, n)
                     }
-                    (transposed, k, n)
-                } else if rows == k && cols == n {
-                    (data, k, n)
                 } else {
-                    eprintln!(
-                        "    WARNING: tensor {} shape ({}, {}) doesn't match expected ({}, {}), using as-is",
-                        tensor_name, rows, cols, k, n
-                    );
-                    (data, k, n)
-                }
-            } else {
-                (data, k, n)
-            };
+                    (data.clone(), k, n)
+                };
+                let (matrix, _params) = quantize_weight_matrix(&weight_data, wk, wn, strategy);
+                (*idx, matrix)
+            })
+            .collect();
 
-            let (matrix, _params) = quantize_weight_matrix(
-                &weight_data, wk, wn, strategy,
-            );
+        for (idx, matrix) in processed {
             weights.add_weight(idx, matrix);
+            loaded_count += 1;
         }
+
+        eprintln!(
+            "  Shard {}/{}: {} weights processed",
+            shard_idx + 1, shards.len(), shard_weight_count,
+        );
     }
 
     eprintln!(
