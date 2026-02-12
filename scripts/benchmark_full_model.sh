@@ -263,6 +263,7 @@ if [ "$ONE_SHOT" = true ]; then
     echo -e "${YELLOW}[ONE-SHOT] Proving all ${NUM_LAYERS} blocks in a single invocation${NC}"
     echo ""
 
+    # Prove once in cairo_serde format — reused by recursive pipeline (no double-proving)
     FULL_PROOF="benchmarks/full_${NUM_LAYERS}blocks_proof.json"
     FULL_LOG="benchmarks/full_${NUM_LAYERS}blocks.log"
 
@@ -276,7 +277,7 @@ if [ "$ONE_SHOT" = true ]; then
         --model-dir "${MODEL_DIR}" \
         --layers "${NUM_LAYERS}" \
         --output "${FULL_PROOF}" \
-        --format json \
+        --format cairo_serde \
         --gpu 2>&1 | tee "${FULL_LOG}" || true
 
     TOTAL_PROVE_END=$(date +%s%N)
@@ -322,7 +323,7 @@ else
             --model-dir "${MODEL_DIR}" \
             --layers "${block}" \
             --output "${BLOCK_PROOF}" \
-            --format json \
+            --format cairo_serde \
             --gpu 2>&1 | tee "${BLOCK_LOG}" || true
 
         BLOCK_END=$(date +%s%N)
@@ -371,24 +372,9 @@ if [ "$SKIP_RECURSIVE" = false ] && [ -n "$CAIRO_PROVE_BIN" ]; then
     echo -e "${YELLOW}[RECURSIVE] Generating recursive Circle STARK${NC}"
     echo ""
 
-    # Re-prove in cairo_serde format for recursive consumption
-    CAIRO_SERDE_PROOF="benchmarks/ml_proof_cairo_serde.json"
-    CAIRO_SERDE_LOG="benchmarks/cairo_serde_prove.log"
-    echo -e "  ${YELLOW}Step 1/2: Re-proving model in cairo_serde format...${NC}"
-    SERDE_START=$(date +%s%N)
-
-    ${PROVE_BIN} \
-        --model-dir "${MODEL_DIR}" \
-        --layers "${NUM_LAYERS}" \
-        --output "${CAIRO_SERDE_PROOF}" \
-        --format cairo_serde \
-        --gpu 2>&1 | tee "${CAIRO_SERDE_LOG}" || true
-
-    SERDE_END=$(date +%s%N)
-    SERDE_MS=$(( (SERDE_END - SERDE_START) / 1000000 ))
-    SERDE_SEC=$(echo "scale=3; ${SERDE_MS}/1000" | bc)
-    echo -e "  ${GREEN}cairo_serde proof generated in ${SERDE_SEC}s${NC}"
-    echo ""
+    # Reuse the proof from the proving phase (already in cairo_serde format)
+    CAIRO_SERDE_PROOF="${FULL_PROOF}"
+    echo -e "  Reusing proof from proving phase: ${CAIRO_SERDE_PROOF}"
 
     if [ -f "$CAIRO_SERDE_PROOF" ]; then
         EXECUTABLE="${REPO_DIR}/stwo-cairo/stwo_cairo_verifier/target/dev/obelysk_ml_verifier.executable.json"
