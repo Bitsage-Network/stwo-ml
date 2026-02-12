@@ -319,7 +319,7 @@ fn fold_circle_into_line_simd(
 fn fold_line_cuda(
     eval: &LineEvaluation<GpuBackend>,
     alpha: SecureField,
-    twiddles: &TwiddleTree<GpuBackend>,
+    _twiddles: &TwiddleTree<GpuBackend>,
     log_size: u32,
 ) -> Result<LineEvaluation<GpuBackend>, super::cuda_executor::CudaFftError> {
     use super::conversion::{secure_column_to_aos, aos_to_secure_column};
@@ -385,7 +385,7 @@ fn fold_circle_into_line_cuda(
     dst: &mut LineEvaluation<GpuBackend>,
     src: &SecureEvaluation<GpuBackend, BitReversedOrder>,
     alpha: SecureField,
-    twiddles: &TwiddleTree<GpuBackend>,
+    _twiddles: &TwiddleTree<GpuBackend>,
     _log_size: u32,
 ) -> Result<(), super::cuda_executor::CudaFftError> {
     use super::conversion::{secure_column_to_aos, aos_to_secure_column};
@@ -470,8 +470,6 @@ fn securefield_to_u32(sf: SecureField) -> [u32; 4] {
 #[cfg(feature = "cuda-runtime")]
 fn batch_inverse_m31(values: &[crate::core::fields::m31::BaseField]) -> Vec<crate::core::fields::m31::BaseField> {
     use crate::core::fields::m31::BaseField;
-    use crate::core::fields::FieldExpOps;
-
     let n = values.len();
     if n == 0 {
         return vec![];

@@ -32,7 +32,8 @@ use super::conversion::{base_col_ref_to_simd, hash_col_ref_to_simd, hash_col_to_
 use super::cuda_executor::is_cuda_available;
 use super::GpuBackend;
 
-/// Threshold for GPU acceleration (log2 of tree size)
+/// Threshold for GPU acceleration (log2 of tree size).
+#[cfg(test)]
 const GPU_MERKLE_THRESHOLD_LOG_SIZE: u32 = 16; // GPU Merkle only when columns are pre-cached (>64K leaves)
 
 /// Threshold for GPU Blake2s acceleration (log2 of tree size).
@@ -309,6 +310,7 @@ fn gpu_commit_on_layer_blake2s(
 
 /// GPU-accelerated Blake2sM31 Merkle tree layer commitment.
 #[cfg(feature = "cuda-runtime")]
+#[allow(dead_code)]
 fn gpu_commit_on_layer_blake2s_m31(
     log_size: u32,
     prev_layer: Option<&Col<GpuBackend, Blake2sHash>>,

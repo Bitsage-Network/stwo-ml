@@ -28,11 +28,11 @@ use stwo::core::fields::cm31::CM31;
 #[cfg(feature = "cuda-runtime")]
 use stwo::core::channel::{Blake2sChannel, Channel};
 #[cfg(feature = "cuda-runtime")]
-use stwo::prover::lookups::sumcheck::{self, MultivariatePolyOracle, SumcheckProof};
+use stwo::prover::lookups::sumcheck::{self, MultivariatePolyOracle};
 #[cfg(feature = "cuda-runtime")]
 use stwo::prover::lookups::utils::UnivariatePoly;
 #[cfg(feature = "cuda-runtime")]
-use stwo::prover::backend::gpu::cuda_executor::{get_cuda_executor, CudaFftExecutor, CudaFftError};
+use stwo::prover::backend::gpu::cuda_executor::{get_cuda_executor, CudaFftError};
 
 #[cfg(feature = "cuda-runtime")]
 use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, LaunchConfig, LaunchAsync};

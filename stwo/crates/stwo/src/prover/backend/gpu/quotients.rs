@@ -8,7 +8,6 @@
 //! for large domains when CUDA is available.
 
 use crate::core::fields::m31::BaseField;
-use crate::core::fields::qm31::SecureField;
 use crate::core::pcs::quotients::ColumnSampleBatch;
 use crate::prover::backend::simd::SimdBackend;
 use crate::prover::pcs::quotient_ops::{AccumulatedNumerators, QuotientOps};

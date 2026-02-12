@@ -43,8 +43,9 @@ use crate::components::matmul::M31Matrix;
 use starknet_crypto::poseidon_hash_many;
 use starknet_ff::FieldElement;
 
-use std::process::Command;
 use std::time::SystemTime;
+#[cfg(feature = "tee")]
+use std::process::Command;
 
 // ============================================================================
 // SecurityLevel System
@@ -269,6 +270,7 @@ impl TeeAttestation {
 }
 
 /// Parsed result from `nvattest` CLI tool.
+#[cfg(feature = "tee")]
 #[derive(Debug, Clone)]
 struct NvatResult {
     /// Raw JWT/JSON attestation report.

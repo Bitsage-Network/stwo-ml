@@ -130,11 +130,11 @@ pub fn clear_fri_gpu_cache() {
 // Column GPU Residency Cache
 // =============================================================================
 
-/// Thread-local cache for GPU-resident column data.
-///
-/// After IFFT, the result `CudaSlice<u32>` is cached here so the subsequent
-/// FFT (evaluate) and Merkle commit can reuse it without a fresh H2D transfer.
-/// Keyed by (cpu_pointer, length) of the output `BaseColumn`.
+// Thread-local cache for GPU-resident column data.
+//
+// After IFFT, the result `CudaSlice<u32>` is cached here so the subsequent
+// FFT (evaluate) and Merkle commit can reuse it without a fresh H2D transfer.
+// Keyed by (cpu_pointer, length) of the output `BaseColumn`.
 #[cfg(feature = "cuda-runtime")]
 thread_local! {
     static COLUMN_GPU_CACHE: RefCell<std::collections::HashMap<(usize, usize), CudaSlice<u32>>> =
@@ -201,12 +201,12 @@ pub fn clear_fri_gpu_cache() {}
 // Merkle Prev-Layer GPU Cache
 // =============================================================================
 
-/// Thread-local cache for the GPU-resident Poseidon252 Merkle hash layer.
-///
-/// After each `commit_on_layer` call, the output `CudaSlice<u64>` is cached
-/// here so the next layer can use it directly as `prev_layer` without
-/// CPU serialization + H2D re-upload. This eliminates the per-layer
-/// GPU→CPU→GPU round-trip in `MerkleProver::commit`.
+// Thread-local cache for the GPU-resident Poseidon252 Merkle hash layer.
+//
+// After each `commit_on_layer` call, the output `CudaSlice<u64>` is cached
+// here so the next layer can use it directly as `prev_layer` without
+// CPU serialization + H2D re-upload. This eliminates the per-layer
+// GPU→CPU→GPU round-trip in `MerkleProver::commit`.
 #[cfg(feature = "cuda-runtime")]
 thread_local! {
     static MERKLE_PREV_LAYER_GPU_CACHE: RefCell<Option<CudaSlice<u64>>> =
@@ -246,12 +246,12 @@ pub fn clear_merkle_prev_layer_gpu_cache() {}
 // Merkle Full-Tree Precomputed Layers Cache
 // =============================================================================
 
-/// Thread-local cache for precomputed Merkle tree layers.
-///
-/// When `commit_on_layer` is called for the leaf layer and all subsequent layers
-/// have no columns (the FRI case), we build the entire tree in one GPU pass
-/// with no per-layer sync or D2H. All layer results are stored here keyed by
-/// n_hashes (layer size). Subsequent `commit_on_layer` calls just pop results.
+// Thread-local cache for precomputed Merkle tree layers.
+//
+// When `commit_on_layer` is called for the leaf layer and all subsequent layers
+// have no columns (the FRI case), we build the entire tree in one GPU pass
+// with no per-layer sync or D2H. All layer results are stored here keyed by
+// n_hashes (layer size). Subsequent `commit_on_layer` calls just pop results.
 #[cfg(feature = "cuda-runtime")]
 thread_local! {
     static MERKLE_PRECOMPUTED_LAYERS: RefCell<std::collections::HashMap<usize, Vec<u64>>> =
@@ -289,12 +289,12 @@ pub fn clear_precomputed_merkle_layers() {}
 // Blake2s Precomputed Merkle Layers Cache
 // =============================================================================
 
-/// Thread-local cache for precomputed Blake2s Merkle tree layers.
-///
-/// When `commit_on_layer` is called for the leaf layer in the FRI case,
-/// we build the entire tree in one GPU pass with no per-layer sync or D2H.
-/// All layer results are stored here keyed by n_hashes (layer size).
-/// Subsequent `commit_on_layer` calls just pop results.
+// Thread-local cache for precomputed Blake2s Merkle tree layers.
+//
+// When `commit_on_layer` is called for the leaf layer in the FRI case,
+// we build the entire tree in one GPU pass with no per-layer sync or D2H.
+// All layer results are stored here keyed by n_hashes (layer size).
+// Subsequent `commit_on_layer` calls just pop results.
 #[cfg(feature = "cuda-runtime")]
 thread_local! {
     static BLAKE2S_PRECOMPUTED_LAYERS: RefCell<std::collections::HashMap<usize, Vec<crate::core::vcs::blake2_hash::Blake2sHash>>> =
@@ -474,15 +474,15 @@ pub fn clear_deferred_fri_pipeline() {}
 // FRI SoA Column GPU Cache
 // =============================================================================
 
-/// Cache for GPU-resident SoA column data from FRI fold outputs.
-///
-/// After a fold kernel produces AoS output, we deinterleave into 4 SoA columns
-/// on GPU and cache them here. The Poseidon252 Merkle `commit_on_layer` checks
-/// this cache before uploading columns, eliminating the GPU→CPU→GPU round-trip.
+// Cache for GPU-resident SoA column data from FRI fold outputs.
+//
+// After a fold kernel produces AoS output, we deinterleave into 4 SoA columns
+// on GPU and cache them here. The Poseidon252 Merkle `commit_on_layer` checks
+// this cache before uploading columns, eliminating the GPU→CPU→GPU round-trip.
 #[cfg(feature = "cuda-runtime")]
 thread_local! {
-    /// Maps column pointer (address of `BaseColumn.data.as_ptr()`) to its
-    /// GPU-resident `CudaSlice<u32>` (SoA, one slice per M31 coordinate).
+    // Maps column pointer (address of `BaseColumn.data.as_ptr()`) to its
+    // GPU-resident `CudaSlice<u32>` (SoA, one slice per M31 coordinate).
     static FRI_COLUMN_GPU_CACHE: RefCell<std::collections::HashMap<usize, CudaSlice<u32>>> =
         RefCell::new(std::collections::HashMap::new());
 }

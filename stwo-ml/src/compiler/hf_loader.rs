@@ -628,7 +628,7 @@ fn build_hf_transformer_graph(
 ///
 /// Plus a final LayerNorm at the end.
 fn build_weight_name_map(
-    graph: &ComputationGraph,
+    _graph: &ComputationGraph,
     num_layers: usize,
     available_tensors: &[(String, usize)],
 ) -> HashMap<usize, String> {
