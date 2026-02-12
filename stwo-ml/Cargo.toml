@@ -9,8 +9,8 @@ repository = "https://github.com/Bitsage-Network/stwo-ml"
 [features]
 default = ["std"]
 std = ["stwo/std"]
-gpu = ["stwo/gpu"]
-cuda-runtime = ["gpu", "stwo/cuda-runtime"]
+gpu = ["stwo/gpu", "stwo-constraint-framework/gpu"]
+cuda-runtime = ["gpu", "stwo/cuda-runtime", "stwo-constraint-framework/cuda-runtime", "dep:cudarc"]
 multi-gpu = ["cuda-runtime"]
 tee = ["cuda-runtime"]
 onnx = ["dep:tract-onnx"]
@@ -34,6 +34,12 @@ safetensors = { version = "0.4", optional = true }
 memmap2 = { version = "0.9", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
+
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+cudarc = { version = "0.11", features = ["driver", "nvrtc", "cuda-12050"], optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cudarc = { version = "0.11", features = ["driver", "nvrtc"], optional = true }
 
 [dev-dependencies]
 rand = "0.8"
