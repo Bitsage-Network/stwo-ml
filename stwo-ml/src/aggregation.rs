@@ -1510,29 +1510,31 @@ where
             #[cfg(feature = "cuda-runtime")]
             {
                 use rayon::prelude::*;
-                use std::sync::atomic::{AtomicUsize, Ordering};
 
-                eprintln!("    Preparing {} batch entries (parallel MLE + commitment)...", indices.len());
+                eprintln!("    Preparing {} batch entries (chunked parallel MLE + commitment)...", indices.len());
                 let t_prep = std::time::Instant::now();
-                let prep_done = AtomicUsize::new(0);
-                let prep_total = indices.len();
 
-                // Parallel batch entry preparation: each entry builds MLEs,
-                // restricts them, and computes Poseidon commitments independently.
-                let entries: Vec<crate::gpu_sumcheck::BatchEntry> = indices.par_iter().map(|&idx| {
-                    let dm = &matmul_data[idx];
-                    let entry = crate::gpu_sumcheck::prepare_batch_entry(
-                        dm.node_id, &dm.a, &dm.b, &dm.c,
-                    ).map_err(|e| ModelError::ProvingError {
-                        layer: dm.node_id,
-                        message: format!("Batch prep: {e}"),
-                    })?;
-                    let finished = prep_done.fetch_add(1, Ordering::Relaxed) + 1;
-                    if finished % 20 == 0 || finished == prep_total {
-                        eprintln!("      [{}/{}] entries prepared", finished, prep_total);
-                    }
-                    Ok(entry)
-                }).collect::<Result<Vec<_>, ModelError>>()?;
+                // Process in chunks of 16 to limit peak memory.
+                // Each entry temporarily allocates ~1.3 GB for padded weight MLE,
+                // so 16 concurrent = ~21 GB peak (safe on H200's 188 GB system RAM).
+                let chunk_size = 16;
+                let mut entries: Vec<crate::gpu_sumcheck::BatchEntry> = Vec::with_capacity(indices.len());
+                for (chunk_idx, chunk) in indices.chunks(chunk_size).enumerate() {
+                    let chunk_entries: Vec<crate::gpu_sumcheck::BatchEntry> = chunk.par_iter().map(|&idx| {
+                        let dm = &matmul_data[idx];
+                        crate::gpu_sumcheck::prepare_batch_entry(
+                            dm.node_id, &dm.a, &dm.b, &dm.c,
+                        ).map_err(|e| ModelError::ProvingError {
+                            layer: dm.node_id,
+                            message: format!("Batch prep: {e}"),
+                        })
+                    }).collect::<Result<Vec<_>, ModelError>>()?;
+                    entries.extend(chunk_entries);
+                    eprintln!(
+                        "      [{}/{}] entries prepared ({:.1}s)",
+                        entries.len(), indices.len(), t_prep.elapsed().as_secs_f64(),
+                    );
+                }
                 eprintln!("    Prep done in {:.1}s", t_prep.elapsed().as_secs_f64());
 
                 // GPU batch prove
