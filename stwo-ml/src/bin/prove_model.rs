@@ -133,6 +133,13 @@ struct Cli {
     /// Channel salt for Fiat-Shamir (optional).
     #[arg(long)]
     salt: Option<u64>,
+
+    /// Skip weight commitment computation (Poseidon hash of all weight matrices).
+    /// Useful for benchmarking: the proving pipeline completes without the slow
+    /// O(total_weight_elements) Poseidon hash. On-chain submission requires it,
+    /// so compute it separately with --commitment-only when needed.
+    #[arg(long)]
+    skip_commitment: bool,
 }
 
 fn parse_model_id(s: &str) -> FieldElement {
@@ -355,15 +362,19 @@ fn main() {
 
     // Compute weight commitment using rayon-parallel streaming Poseidon hash.
     // Each matrix is hashed independently in parallel, then all hashes are combined.
-    // For Qwen3-14B: 160 matrices × ~50M elements → parallelized across all cores.
-    let n_weights = model.weights.weights.len();
-    eprintln!("Computing weight commitment ({} matrices, parallel)...", n_weights);
-    let t_commit = std::time::Instant::now();
-    let weight_commitment = {
+    // For Qwen3-14B: 160 matrices × ~9B elements → takes minutes.
+    // Use --skip-commitment for fast benchmarks; compute separately for on-chain.
+    let weight_commitment = if cli.skip_commitment {
+        eprintln!("Skipping weight commitment (--skip-commitment)");
+        FieldElement::ZERO
+    } else {
         use rayon::prelude::*;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        // Collect (layer_id, weight) pairs for parallel processing
+        let n_weights = model.weights.weights.len();
+        eprintln!("Computing weight commitment ({} matrices, parallel)...", n_weights);
+        let t_commit = std::time::Instant::now();
+
         let weight_list: Vec<_> = model.weights.weights.iter().collect();
         let done_count = AtomicUsize::new(0);
         let total = weight_list.len();
@@ -371,7 +382,6 @@ fn main() {
         let per_matrix_hashes: Vec<FieldElement> = weight_list.par_iter().map(|(layer_id, w)| {
             let chunk_size = 4096;
             let mut layer_hash_inputs: Vec<FieldElement> = Vec::with_capacity(chunk_size + 2);
-            // Domain separation: include layer_id and dimensions
             layer_hash_inputs.push(FieldElement::from(*layer_id as u64));
             layer_hash_inputs.push(FieldElement::from((w.rows as u64) << 32 | w.cols as u64));
 
@@ -394,13 +404,14 @@ fn main() {
             running_hash
         }).collect();
 
-        if per_matrix_hashes.is_empty() {
+        let commitment = if per_matrix_hashes.is_empty() {
             FieldElement::ZERO
         } else {
             starknet_crypto::poseidon_hash_many(&per_matrix_hashes)
-        }
+        };
+        eprintln!("Weight commitment computed in {:.2}s", t_commit.elapsed().as_secs_f64());
+        commitment
     };
-    eprintln!("Weight commitment computed in {:.2}s", t_commit.elapsed().as_secs_f64());
 
     // Compute TEE attestation hash for on-chain commitment
     let tee_hash = tee_attestation
