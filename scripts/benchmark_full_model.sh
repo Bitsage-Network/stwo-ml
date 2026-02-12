@@ -49,6 +49,7 @@ OUTPUT_FILE=""
 SKIP_BUILD=false
 SKIP_RECURSIVE=false
 WARMUP_RUNS=1
+NO_WARMUP=false
 ONE_SHOT=false
 
 # Parse args
@@ -60,6 +61,7 @@ while [[ $# -gt 0 ]]; do
         --skip-build)      SKIP_BUILD=true; shift ;;
         --skip-recursive)  SKIP_RECURSIVE=true; shift ;;
         --warmup)          WARMUP_RUNS="$2"; shift 2 ;;
+        --no-warmup)       NO_WARMUP=true; shift ;;
         --one-shot)        ONE_SHOT=true; shift ;;
         -h|--help)
             echo "Usage: $0 [OPTIONS]"
@@ -71,6 +73,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --skip-build        Skip building binaries"
             echo "  --skip-recursive    Skip recursive STARK generation"
             echo "  --warmup N          GPU warmup runs before measurement (default: 1)"
+            echo "  --no-warmup         Skip warmup entirely (use after first run)"
             echo "  --one-shot          Prove all N blocks in a single invocation"
             exit 0 ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
@@ -210,15 +213,28 @@ echo -e "  ${GREEN}Model validation passed${NC}"
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Warmup
+# Warmup — lightweight CUDA context init (NOT a full model prove)
 # ─────────────────────────────────────────────────────────────────────────────
-if [ "$WARMUP_RUNS" -gt 0 ]; then
-    echo -e "${YELLOW}[WARMUP] Running ${WARMUP_RUNS} warmup pass(es)${NC}"
-    for i in $(seq 1 "$WARMUP_RUNS"); do
-        echo "  Warmup run $i/${WARMUP_RUNS}..."
-        # Single-layer prove to warm up GPU caches, JIT kernels, etc.
-        ${PROVE_BIN} --model-dir "${MODEL_DIR}" --layers 1 --output /dev/null --format json --gpu 2>/dev/null || true
-    done
+if [ "$NO_WARMUP" = true ] || [ "$WARMUP_RUNS" -eq 0 ]; then
+    echo -e "${YELLOW}[WARMUP] Skipped${NC}"
+    echo ""
+else
+    echo -e "${YELLOW}[WARMUP] Initializing CUDA context${NC}"
+    WARMUP_START=$(date +%s%N)
+
+    # Step 1: CUDA driver + context init via nvidia-smi (< 1s)
+    echo "  Initializing CUDA driver..."
+    nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null | head -1 || true
+
+    # Step 2: Model inspection (loads safetensors, builds graph — no proving)
+    echo "  Loading model weights (inspect only, no proving)..."
+    ${PROVE_BIN} --model-dir "${MODEL_DIR}" --layers 1 --inspect 2>&1 | head -20 || true
+
+    WARMUP_END=$(date +%s%N)
+    WARMUP_MS=$(( (WARMUP_END - WARMUP_START) / 1000000 ))
+    WARMUP_SEC=$(echo "scale=1; ${WARMUP_MS}/1000" | bc)
+
+    echo -e "  ${GREEN}Warmup complete in ${WARMUP_SEC}s${NC}"
     echo ""
 fi
 
