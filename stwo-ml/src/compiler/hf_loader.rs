@@ -720,20 +720,40 @@ fn load_weights_from_shards(
 ) -> Result<GraphWeights, crate::compiler::quantize_weights::WeightError> {
     use crate::compiler::quantize_weights::WeightError;
 
-    // Memory-map all shards
-    let mut shard_data: Vec<(std::fs::File, memmap2::Mmap)> = Vec::new();
+    // Memory-map all shards and deserialize headers ONCE (not per-weight)
+    let t_load_start = std::time::Instant::now();
+
+    struct ShardHandle {
+        _file: std::fs::File,
+        mmap: memmap2::Mmap,
+    }
+
+    let mut shards: Vec<ShardHandle> = Vec::with_capacity(shard_paths.len());
     for path in shard_paths {
         let file = std::fs::File::open(path)
             .map_err(|e| WeightError::IoError(e.to_string()))?;
         let mmap = unsafe { memmap2::Mmap::map(&file) }
             .map_err(|e| WeightError::IoError(e.to_string()))?;
-        shard_data.push((file, mmap));
+        shards.push(ShardHandle { _file: file, mmap });
     }
+
+    // Build tensor_name → shard_index lookup (O(1) per weight instead of scanning all shards)
+    let mut tensor_to_shard: HashMap<String, usize> = HashMap::new();
+    for (shard_idx, shard) in shards.iter().enumerate() {
+        let st = safetensors::SafeTensors::deserialize(&shard.mmap)
+            .map_err(|e| WeightError::IoError(e.to_string()))?;
+        for name in st.names() {
+            tensor_to_shard.insert(name.to_string(), shard_idx);
+        }
+    }
+    eprintln!(
+        "  Indexed {} tensors across {} shards in {:.1}s",
+        tensor_to_shard.len(), shards.len(), t_load_start.elapsed().as_secs_f64(),
+    );
 
     let mut weights = GraphWeights::new();
     let total_weights = name_map.len();
     let mut loaded_count = 0usize;
-    let t_load_start = std::time::Instant::now();
 
     for (idx, node) in graph.nodes.iter().enumerate() {
         if let GraphOp::MatMul { dims: (_m, k, n) } = &node.op {
@@ -745,53 +765,47 @@ fn load_weights_from_shards(
                         loaded_count, total_weights, idx, k, n, tensor_name,
                     );
                 }
-                // Search through shards for this tensor
-                let mut found = false;
-                for (_file, mmap) in &shard_data {
-                    let tensors = safetensors::SafeTensors::deserialize(mmap)
+
+                if let Some(&shard_idx) = tensor_to_shard.get(tensor_name) {
+                    let tensors = safetensors::SafeTensors::deserialize(&shards[shard_idx].mmap)
                         .map_err(|e| WeightError::IoError(e.to_string()))?;
+                    let tensor = tensors.tensor(tensor_name)
+                        .map_err(|e| WeightError::IoError(format!("{}: {e}", tensor_name)))?;
 
-                    if let Ok(tensor) = tensors.tensor(tensor_name) {
-                        let data = tensor_to_f32(tensor.data(), tensor.dtype());
-                        // HuggingFace stores weights as (out_features, in_features)
-                        // Our MatMul expects (k, n) = (in_features, out_features)
-                        // So we may need to transpose
-                        let shape = tensor.shape();
-                        let (weight_data, wk, wn) = if shape.len() == 2 {
-                            let rows = shape[0]; // out_features
-                            let cols = shape[1]; // in_features
-                            if rows == *n && cols == *k {
-                                // Already (out, in) — transpose to (in, out) = (k, n)
-                                let mut transposed = vec![0.0f32; data.len()];
-                                for r in 0..rows {
-                                    for c in 0..cols {
-                                        transposed[c * rows + r] = data[r * cols + c];
-                                    }
+                    let data = tensor_to_f32(tensor.data(), tensor.dtype());
+                    // HuggingFace stores weights as (out_features, in_features)
+                    // Our MatMul expects (k, n) = (in_features, out_features)
+                    let shape = tensor.shape();
+                    let (weight_data, wk, wn) = if shape.len() == 2 {
+                        let rows = shape[0]; // out_features
+                        let cols = shape[1]; // in_features
+                        if rows == *n && cols == *k {
+                            // (out, in) → transpose to (in, out) = (k, n)
+                            let mut transposed = vec![0.0f32; data.len()];
+                            for r in 0..rows {
+                                for c in 0..cols {
+                                    transposed[c * rows + r] = data[r * cols + c];
                                 }
-                                (transposed, *k, *n)
-                            } else if rows == *k && cols == *n {
-                                // Already (k, n)
-                                (data, *k, *n)
-                            } else {
-                                eprintln!(
-                                    "    WARNING: tensor {} shape ({}, {}) doesn't match expected ({}, {}), using as-is",
-                                    tensor_name, rows, cols, k, n
-                                );
-                                (data, *k, *n)
                             }
-                        } else {
+                            (transposed, *k, *n)
+                        } else if rows == *k && cols == *n {
                             (data, *k, *n)
-                        };
+                        } else {
+                            eprintln!(
+                                "    WARNING: tensor {} shape ({}, {}) doesn't match expected ({}, {}), using as-is",
+                                tensor_name, rows, cols, k, n
+                            );
+                            (data, *k, *n)
+                        }
+                    } else {
+                        (data, *k, *n)
+                    };
 
-                        let (matrix, _params) = quantize_weight_matrix(
-                            &weight_data, wk, wn, strategy,
-                        );
-                        weights.add_weight(idx, matrix);
-                        found = true;
-                        break;
-                    }
-                }
-                if !found {
+                    let (matrix, _params) = quantize_weight_matrix(
+                        &weight_data, wk, wn, strategy,
+                    );
+                    weights.add_weight(idx, matrix);
+                } else {
                     eprintln!(
                         "    ERROR: tensor '{}' not found in any shard for node {}",
                         tensor_name, idx
