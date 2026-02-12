@@ -166,6 +166,7 @@ if [ "$SKIP_BUILD" = false ]; then
 
     # Build stwo-ml prove-model
     echo "  Building prove-model..."
+    BUILD_START=$(date +%s%N)
     (
         cd "${REPO_DIR}/stwo-ml"
         FEATURES="cli"
@@ -174,15 +175,18 @@ if [ "$SKIP_BUILD" = false ]; then
         fi
         cargo build --release \
             --bin prove-model \
-            --features "${FEATURES}" 2>&1 | tail -3
+            --features "${FEATURES}" 2>&1 | tail -5
     )
+    BUILD_END=$(date +%s%N)
+    BUILD_SEC=$(echo "scale=1; ($BUILD_END - $BUILD_START) / 1000000000" | bc)
     PROVE_BIN=$(find "${REPO_DIR}" -name "prove-model" -path "*/release/*" -type f 2>/dev/null | head -1)
+    echo -e "  ${GREEN}prove-model built in ${BUILD_SEC}s${NC}"
 
     # Build cairo-prove
     echo "  Building cairo-prove..."
     (
         cd "${REPO_DIR}/stwo-cairo/cairo-prove"
-        cargo build --release 2>&1 | tail -3
+        cargo build --release 2>&1 | tail -5
     )
     CAIRO_PROVE_BIN=$(find "${REPO_DIR}" -name "cairo-prove" -path "*/release/*" -type f 2>/dev/null | head -1)
 
@@ -190,7 +194,8 @@ if [ "$SKIP_BUILD" = false ]; then
 else
     PROVE_BIN=$(find "${REPO_DIR}" -name "prove-model" -path "*/release/*" -type f 2>/dev/null | head -1)
     CAIRO_PROVE_BIN=$(find "${REPO_DIR}" -name "cairo-prove" -path "*/release/*" -type f 2>/dev/null | head -1)
-    echo -e "${YELLOW}[BUILD] Skipped (--skip-build)${NC}"
+    echo -e "${YELLOW}[BUILD] Skipped (--skip-build) — using existing binary${NC}"
+    echo -e "${YELLOW}  WARNING: If you recently changed code, remove --skip-build to rebuild!${NC}"
 fi
 
 if [ -z "$PROVE_BIN" ]; then
@@ -256,20 +261,23 @@ PEAK_GPU_MEM=0
 if [ "$ONE_SHOT" = true ]; then
     # ── ONE-SHOT MODE: Prove all N layers in a single invocation ──
     echo -e "${YELLOW}[ONE-SHOT] Proving all ${NUM_LAYERS} blocks in a single invocation${NC}"
+    echo ""
 
     FULL_PROOF="benchmarks/full_${NUM_LAYERS}blocks_proof.json"
     FULL_LOG="benchmarks/full_${NUM_LAYERS}blocks.log"
 
     GPU_MEM_BEFORE=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 | xargs || echo "0")
+    echo -e "  GPU memory before: ${GPU_MEM_BEFORE} MiB"
 
     TOTAL_PROVE_START=$(date +%s%N)
 
+    # Stream stderr to BOTH terminal and log file so the user sees live progress
     ${PROVE_BIN} \
         --model-dir "${MODEL_DIR}" \
         --layers "${NUM_LAYERS}" \
         --output "${FULL_PROOF}" \
         --format json \
-        --gpu 2>"${FULL_LOG}" || true
+        --gpu 2>&1 | tee "${FULL_LOG}" || true
 
     TOTAL_PROVE_END=$(date +%s%N)
     TOTAL_PROVE_MS=$(( (TOTAL_PROVE_END - TOTAL_PROVE_START) / 1000000 ))
@@ -291,7 +299,8 @@ if [ "$ONE_SHOT" = true ]; then
     PROOF_SIZES+=("${PROOF_SIZE}")
     MATMUL_COUNTS+=("${MATMUL_COUNT}")
 
-    echo "  Time: ${TOTAL_PROVE_SEC}s | Proof: ${PROOF_SIZE} bytes | MatMuls: ${MATMUL_COUNT} | GPU Mem: ${GPU_MEM_AFTER} MiB"
+    echo ""
+    echo -e "  ${GREEN}Time: ${TOTAL_PROVE_SEC}s | Proof: ${PROOF_SIZE} bytes | MatMuls: ${MATMUL_COUNT} | GPU Mem: ${GPU_MEM_AFTER} MiB${NC}"
 
 else
     # ── PER-BLOCK MODE: Prove each block individually ──
@@ -314,7 +323,7 @@ else
             --layers "${block}" \
             --output "${BLOCK_PROOF}" \
             --format json \
-            --gpu 2>"${BLOCK_LOG}" || true
+            --gpu 2>&1 | tee "${BLOCK_LOG}" || true
 
         BLOCK_END=$(date +%s%N)
         BLOCK_MS=$(( (BLOCK_END - BLOCK_START) / 1000000 ))

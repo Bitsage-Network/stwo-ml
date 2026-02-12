@@ -1103,7 +1103,9 @@ where
     const TILED_MEMORY_BUDGET: usize = 4 * 1024 * 1024 * 1024;
 
     let topo = graph.topological_order();
-    for &node_id in &topo {
+    let total_nodes = topo.len();
+    let t_start = std::time::Instant::now();
+    for (step, &node_id) in topo.iter().enumerate() {
         let node = &graph.nodes[node_id];
 
         // Resolve current input from first dependency
@@ -1115,6 +1117,13 @@ where
 
         match &node.op {
             GraphOp::MatMul { dims } => {
+                let (m, k, n) = *dims;
+                eprintln!(
+                    "[{}/{}] Node {} MatMul {}x{}x{} — proving sumcheck...",
+                    step + 1, total_nodes, node.id, m, k, n,
+                );
+                let t_node = std::time::Instant::now();
+
                 let weight = weights.get_weight(node.id).ok_or(
                     ModelError::MissingWeight(node.id)
                 )?;
@@ -1122,15 +1131,12 @@ where
                 let output = matmul_m31(&current, weight);
 
                 // Auto-dispatch: use tiled proving for large matmuls
-                let (m, k, n) = *dims;
                 let (_, estimated_mem) = estimate_sumcheck_memory(m, k, n);
 
                 let proof = if estimated_mem > TILED_MEMORY_BUDGET {
-                    info!(
-                        node_id = node.id,
-                        m, k, n,
-                        estimated_mem,
-                        "Using tiled matmul proving (exceeds memory budget)"
+                    eprintln!(
+                        "  -> tiled matmul (est. {:.1} GB exceeds budget)",
+                        estimated_mem as f64 / 1e9,
                     );
                     let config = TiledMatMulConfig::from_memory_budget(
                         m, k, n, TILED_MEMORY_BUDGET,
@@ -1150,6 +1156,12 @@ where
                         })?
                 };
 
+                eprintln!(
+                    "  -> done in {:.2}s (elapsed: {:.1}s)",
+                    t_node.elapsed().as_secs_f64(),
+                    t_start.elapsed().as_secs_f64(),
+                );
+
                 intermediates.push((node.id, current.clone()));
                 matmul_proofs.push((node.id, proof));
                 node_outputs.insert(node.id, output.clone());
@@ -1157,6 +1169,10 @@ where
             }
 
             GraphOp::Activation { activation_type, .. } => {
+                eprintln!(
+                    "[{}/{}] Node {} Activation {:?}",
+                    step + 1, total_nodes, node.id, activation_type,
+                );
                 let f = activation_type.as_fn();
                 let output = crate::compiler::prove::apply_activation_pub(&current, &*f);
 
@@ -1179,6 +1195,10 @@ where
             }
 
             GraphOp::Add { .. } => {
+                eprintln!(
+                    "[{}/{}] Node {} Add ({} elements)",
+                    step + 1, total_nodes, node.id, current.data.len(),
+                );
                 let lhs = node.inputs.get(0)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
@@ -1204,6 +1224,10 @@ where
             }
 
             GraphOp::Mul { .. } => {
+                eprintln!(
+                    "[{}/{}] Node {} Mul ({} elements)",
+                    step + 1, total_nodes, node.id, current.data.len(),
+                );
                 let lhs = node.inputs.get(0)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
@@ -1229,6 +1253,10 @@ where
             }
 
             GraphOp::LayerNorm { dim } => {
+                eprintln!(
+                    "[{}/{}] Node {} LayerNorm (dim={})",
+                    step + 1, total_nodes, node.id, dim,
+                );
                 let ln_log_size = LayerNormConfig::new(*dim).rsqrt_table_log_size;
                 let ln = apply_layernorm_detailed(&current, *dim);
                 let rsqrt_table = build_rsqrt_table(ln_log_size);
@@ -1250,6 +1278,13 @@ where
             }
 
             GraphOp::Attention { config: attn_config } => {
+                eprintln!(
+                    "[{}/{}] Node {} Attention (heads={}, d_model={})",
+                    step + 1, total_nodes, node.id,
+                    attn_config.num_heads, attn_config.d_model,
+                );
+                let t_node = std::time::Instant::now();
+
                 let w_q = weights.get_named_weight(node.id, "w_q");
                 let w_k = weights.get_named_weight(node.id, "w_k");
                 let w_v = weights.get_named_weight(node.id, "w_v");
@@ -1270,14 +1305,23 @@ where
                     intermediates.push((node.id, current.clone()));
                     node_outputs.insert(node.id, inter.final_output.clone());
                     current = inter.final_output;
+                    eprintln!(
+                        "  -> done in {:.2}s (elapsed: {:.1}s)",
+                        t_node.elapsed().as_secs_f64(),
+                        t_start.elapsed().as_secs_f64(),
+                    );
                 } else {
-                    info!(node_id = node.id, "Attention node missing weights, passthrough");
+                    eprintln!("  -> missing weights, passthrough");
                     intermediates.push((node.id, current.clone()));
                     node_outputs.insert(node.id, current.clone());
                 }
             }
 
-            GraphOp::Embedding { vocab_size: _, embed_dim: _ } => {
+            GraphOp::Embedding { vocab_size, embed_dim } => {
+                eprintln!(
+                    "[{}/{}] Node {} Embedding (vocab={}, dim={})",
+                    step + 1, total_nodes, node.id, vocab_size, embed_dim,
+                );
                 let embed_table = weights.get_weight(node.id).ok_or(
                     ModelError::MissingWeight(node.id)
                 )?;
@@ -1303,6 +1347,13 @@ where
             }
 
             GraphOp::Conv2D { in_channels, out_channels, kernel_size, stride, padding } => {
+                eprintln!(
+                    "[{}/{}] Node {} Conv2D ({}->{}ch, k={}, s={}, p={})",
+                    step + 1, total_nodes, node.id,
+                    in_channels, out_channels, kernel_size, stride, padding,
+                );
+                let t_node = std::time::Instant::now();
+
                 let kernel = weights.get_weight(node.id).ok_or(
                     ModelError::MissingWeight(node.id)
                 )?;
@@ -1326,6 +1377,11 @@ where
                 matmul_proofs.push((node.id, proof));
                 node_outputs.insert(node.id, output.clone());
                 current = output;
+                eprintln!(
+                    "  -> done in {:.2}s (elapsed: {:.1}s)",
+                    t_node.elapsed().as_secs_f64(),
+                    t_start.elapsed().as_secs_f64(),
+                );
             }
 
             _ => {
@@ -1336,14 +1392,33 @@ where
         }
     }
 
+    eprintln!(
+        "Forward pass + sumcheck proving complete ({} nodes in {:.1}s)",
+        total_nodes, t_start.elapsed().as_secs_f64(),
+    );
+    eprintln!(
+        "  MatMul proofs: {}, Activations: {}, Attention: {}, Add: {}, Mul: {}, LayerNorm: {}",
+        matmul_proofs.len(), activation_layers.len(), attention_layers.len(),
+        add_layers.len(), mul_layers.len(), layernorm_layers.len(),
+    );
+
     // Prove attention layers (on-chain format)
     let mut attention_proofs = Vec::new();
-    for layer in &attention_layers {
+    for (i, layer) in attention_layers.iter().enumerate() {
+        eprintln!(
+            "Proving attention sumchecks [{}/{}] (node {})...",
+            i + 1, attention_layers.len(), layer.node_id,
+        );
+        let t_attn = std::time::Instant::now();
         let proof = prove_attention_onchain(
             &layer.input, &layer.weights, &layer.config, false,
         ).map_err(|e| AggregationError::ProvingError(
             format!("Attention node {} (on-chain): {e}", layer.node_id),
         ))?;
+        eprintln!(
+            "  -> attention node {} proved in {:.2}s (elapsed: {:.1}s)",
+            layer.node_id, t_attn.elapsed().as_secs_f64(), t_start.elapsed().as_secs_f64(),
+        );
         attention_proofs.push((layer.node_id, proof));
     }
 
@@ -1372,6 +1447,8 @@ where
     }
 
     // Build unified STARK using backend B + Blake2sMerkleChannel
+    eprintln!("Building unified STARK proof (all non-matmul components)...");
+    let t_stark = std::time::Instant::now();
     // Per-component log_sizes: each component uses its own size derived from
     // its table or data length. The max_log_size drives twiddle precomputation.
     let all_log_sizes: Vec<u32> = activation_layers.iter().map(|l| l.log_size)
@@ -1783,6 +1860,12 @@ where
         channel,
         commitment_scheme,
     ).map_err(|e| AggregationError::ProvingError(format!("{e:?}")))?;
+
+    eprintln!(
+        "Unified STARK proof complete in {:.2}s (total pipeline: {:.1}s)",
+        t_stark.elapsed().as_secs_f64(),
+        t_start.elapsed().as_secs_f64(),
+    );
 
     Ok(AggregatedModelProofOnChain {
         unified_stark: Some(stark_proof),
