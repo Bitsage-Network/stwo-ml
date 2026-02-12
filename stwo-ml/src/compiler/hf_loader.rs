@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::compiler::graph::{ComputationGraph, GraphBuilder, GraphOp, GraphWeights};
+use crate::components::matmul::M31Matrix;
 use crate::compiler::onnx::{OnnxModel, OnnxError, ModelMetadata, TransformerConfig};
 use crate::compiler::quantize_weights::quantize_weight_matrix;
 use crate::compiler::safetensors::{discover_shards, list_tensors_sharded, tensor_to_f32};

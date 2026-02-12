@@ -353,18 +353,25 @@ fn main() {
         })
         .unwrap_or(0);
 
-    // Compute weight commitment using streaming Poseidon hash.
-    // Hash each weight matrix individually, then combine all per-matrix hashes.
-    // This avoids collecting 14B+ parameters into one Vec (59 GB OOM for Qwen3-14B).
-    eprintln!("Computing weight commitment ({} matrices)...", model.weights.weights.len());
+    // Compute weight commitment using rayon-parallel streaming Poseidon hash.
+    // Each matrix is hashed independently in parallel, then all hashes are combined.
+    // For Qwen3-14B: 160 matrices × ~50M elements → parallelized across all cores.
+    let n_weights = model.weights.weights.len();
+    eprintln!("Computing weight commitment ({} matrices, parallel)...", n_weights);
     let t_commit = std::time::Instant::now();
     let weight_commitment = {
-        let mut per_matrix_hashes: Vec<FieldElement> = Vec::new();
-        for (layer_id, w) in &model.weights.weights {
-            // Hash each weight matrix in chunks to avoid huge FieldElement allocations
-            let chunk_size = 4096; // 4K elements per Poseidon batch
+        use rayon::prelude::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Collect (layer_id, weight) pairs for parallel processing
+        let weight_list: Vec<_> = model.weights.weights.iter().collect();
+        let done_count = AtomicUsize::new(0);
+        let total = weight_list.len();
+
+        let per_matrix_hashes: Vec<FieldElement> = weight_list.par_iter().map(|(layer_id, w)| {
+            let chunk_size = 4096;
             let mut layer_hash_inputs: Vec<FieldElement> = Vec::with_capacity(chunk_size + 2);
-            // Include layer_id and dimensions in the hash for domain separation
+            // Domain separation: include layer_id and dimensions
             layer_hash_inputs.push(FieldElement::from(*layer_id as u64));
             layer_hash_inputs.push(FieldElement::from((w.rows as u64) << 32 | w.cols as u64));
 
@@ -379,8 +386,14 @@ fn main() {
                 }
                 running_hash = starknet_crypto::poseidon_hash_many(&layer_hash_inputs);
             }
-            per_matrix_hashes.push(running_hash);
-        }
+
+            let finished = done_count.fetch_add(1, Ordering::Relaxed) + 1;
+            if finished % 10 == 0 || finished == total {
+                eprintln!("  Weight commitment: {}/{} matrices hashed", finished, total);
+            }
+            running_hash
+        }).collect();
+
         if per_matrix_hashes.is_empty() {
             FieldElement::ZERO
         } else {
