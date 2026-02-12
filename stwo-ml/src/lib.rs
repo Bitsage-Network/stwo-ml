@@ -14,6 +14,7 @@
 //! - `model-loading`: Both ONNX + SafeTensors.
 
 #![feature(portable_simd)]
+#![feature(once_cell_try)]
 
 pub mod components;
 pub mod compiler;

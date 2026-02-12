@@ -42,9 +42,6 @@ use stwo::prover::backend::gpu::cuda_executor::{get_cuda_executor, CudaFftError}
 use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, LaunchConfig, LaunchAsync};
 
 #[cfg(feature = "cuda-runtime")]
-use starknet_ff::FieldElement;
-
-#[cfg(feature = "cuda-runtime")]
 use crate::components::matmul::{
     M31Matrix, MatMulSumcheckProof, MatMulError,
     evaluate_mle_pub, restrict_mle_pub,
@@ -1180,7 +1177,7 @@ pub fn prepare_batch_entry(
     c: &M31Matrix,
 ) -> Result<BatchEntry, MatMulError> {
     use crate::components::matmul::pad_matrix_pow2;
-    use crate::crypto::poseidon_channel::{PoseidonChannel, securefield_to_felt};
+    use crate::crypto::poseidon_channel::PoseidonChannel;
     use crate::crypto::mle_opening::commit_mle;
 
     let a = &pad_matrix_pow2(a);
