@@ -361,14 +361,41 @@ fn main() {
         .unwrap_or(0);
 
     // Weight commitment: Poseidon hash of all weight matrices.
-    // Cached to <model_dir>/.weight_commitment.hex (weights are immutable per model).
-    // First run: ~10 min for Qwen3-14B (9B elements). Subsequent runs: instant.
+    // Packed encoding: 7 M31 values per FieldElement (7×31=217 bits < 252) for ~7x speedup.
+    // Cached with fingerprint validation (file sizes + mtimes of safetensors files).
+    // If weights change, cache auto-invalidates and recomputes.
     let weight_commitment = if cli.skip_commitment {
         eprintln!("Skipping weight commitment (--skip-commitment)");
         FieldElement::ZERO
     } else {
-        // Try loading cached commitment
-        let cache_path = cli.model_dir.as_ref().map(|d| d.join(".weight_commitment.hex"));
+        // Compute fingerprint from safetensors file metadata for cache validation
+        let fingerprint = cli.model_dir.as_ref().map(|d| {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            if let Ok(mut entries) = std::fs::read_dir(d) {
+                let mut files: Vec<std::path::PathBuf> = entries
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| p.extension().map_or(false, |ext| ext == "safetensors"))
+                    .collect();
+                files.sort();
+                for f in &files {
+                    f.to_str().unwrap_or("").hash(&mut hasher);
+                    if let Ok(meta) = std::fs::metadata(f) {
+                        meta.len().hash(&mut hasher);
+                        if let Ok(mtime) = meta.modified() {
+                            mtime.hash(&mut hasher);
+                        }
+                    }
+                }
+            }
+            format!("{:016x}", hasher.finish())
+        });
+
+        // Cache path includes fingerprint so it auto-invalidates on weight changes
+        let cache_path = cli.model_dir.as_ref().zip(fingerprint.as_ref()).map(|(d, fp)| {
+            d.join(format!(".weight_commitment_{fp}.hex"))
+        });
+
         let cached = cache_path.as_ref().and_then(|p| {
             std::fs::read_to_string(p).ok().and_then(|hex| {
                 FieldElement::from_hex_be(hex.trim().trim_start_matches("0x")).ok()
@@ -376,45 +403,60 @@ fn main() {
         });
 
         if let Some(commitment) = cached {
-            eprintln!("Weight commitment loaded from cache (instant)");
+            eprintln!("Weight commitment loaded from cache (fingerprint validated)");
             commitment
         } else {
             use rayon::prelude::*;
             use std::sync::atomic::{AtomicUsize, Ordering};
 
             let n_weights = model.weights.weights.len();
-            eprintln!("Computing weight commitment ({} matrices, parallel)...", n_weights);
-            eprintln!("  First run for this model — will cache for instant reuse.");
+            eprintln!("Computing weight commitment ({} matrices, packed 7:1, parallel)...", n_weights);
+            eprintln!("  First run — will cache with fingerprint for instant validated reuse.");
             let t_commit = std::time::Instant::now();
 
             let weight_list: Vec<_> = model.weights.weights.iter().collect();
             let done_count = AtomicUsize::new(0);
             let total = weight_list.len();
 
+            // Pack 7 M31 values (7×31=217 bits) into one FieldElement via Horner's method.
+            // This reduces Poseidon calls by ~7x: 89M → 12.7M for large matrices.
+            let pack_m31 = |values: &[M31]| -> FieldElement {
+                let base = FieldElement::from(1u64 << 31);
+                let mut result = FieldElement::ZERO;
+                for &v in values.iter().rev() {
+                    result = result * base + FieldElement::from(v.0 as u64);
+                }
+                result
+            };
+
             let per_matrix_hashes: Vec<FieldElement> = weight_list.par_iter().map(|(layer_id, w)| {
-                let chunk_size = 4096;
-                let mut layer_hash_inputs: Vec<FieldElement> = Vec::with_capacity(chunk_size + 2);
-                layer_hash_inputs.push(FieldElement::from(*layer_id as u64));
-                layer_hash_inputs.push(FieldElement::from((w.rows as u64) << 32 | w.cols as u64));
+                let chunk_size = 4096; // packed felts per Poseidon call
+                let mut hash_inputs: Vec<FieldElement> = Vec::with_capacity(chunk_size + 2);
 
-                let mut running_hash = starknet_crypto::poseidon_hash_many(&layer_hash_inputs);
-                layer_hash_inputs.clear();
+                // Domain separation: layer_id + packed dimensions
+                hash_inputs.push(FieldElement::from(*layer_id as u64));
+                hash_inputs.push(FieldElement::from((w.rows as u64) << 32 | w.cols as u64));
+                let mut running_hash = starknet_crypto::poseidon_hash_many(&hash_inputs);
+                hash_inputs.clear();
 
-                for chunk in w.data.chunks(chunk_size) {
-                    layer_hash_inputs.clear();
-                    layer_hash_inputs.push(running_hash);
-                    for &v in chunk {
-                        layer_hash_inputs.push(FieldElement::from(v.0 as u64));
-                    }
-                    running_hash = starknet_crypto::poseidon_hash_many(&layer_hash_inputs);
+                // Pack 7 M31 values per FieldElement, then hash in chunks of 4096 felts
+                // Each chunk covers 4096 × 7 = 28,672 M31 values
+                let packed: Vec<FieldElement> = w.data.chunks(7)
+                    .map(|chunk| pack_m31(chunk))
+                    .collect();
+
+                for chunk in packed.chunks(chunk_size) {
+                    hash_inputs.clear();
+                    hash_inputs.push(running_hash);
+                    hash_inputs.extend_from_slice(chunk);
+                    running_hash = starknet_crypto::poseidon_hash_many(&hash_inputs);
                 }
 
                 let finished = done_count.fetch_add(1, Ordering::Relaxed) + 1;
-                // Report every matrix (not every 10) — large matrices take minutes each
                 let elapsed = t_commit.elapsed().as_secs_f64();
                 let eta = if finished > 0 { elapsed * (total as f64 / finished as f64 - 1.0) } else { 0.0 };
                 eprintln!(
-                    "  Weight commitment: {}/{} matrices hashed ({:.0}s elapsed, ~{:.0}s remaining)",
+                    "  Weight commitment: {}/{} ({:.0}s elapsed, ~{:.0}s remaining)",
                     finished, total, elapsed, eta,
                 );
                 running_hash
@@ -427,13 +469,13 @@ fn main() {
             };
             eprintln!("Weight commitment computed in {:.2}s", t_commit.elapsed().as_secs_f64());
 
-            // Cache to disk for instant reuse
+            // Cache with fingerprint for validated reuse
             if let Some(ref p) = cache_path {
                 let hex = format!("0x{:064x}", commitment);
                 if let Err(e) = std::fs::write(p, &hex) {
-                    eprintln!("  Warning: could not cache commitment to {}: {e}", p.display());
+                    eprintln!("  Warning: could not cache to {}: {e}", p.display());
                 } else {
-                    eprintln!("  Cached to {} for instant reuse", p.display());
+                    eprintln!("  Cached to {} (auto-invalidates if weights change)", p.display());
                 }
             }
             commitment
