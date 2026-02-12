@@ -429,37 +429,64 @@ fn main() {
                 result
             };
 
-            let per_matrix_hashes: Vec<FieldElement> = weight_list.par_iter().map(|(layer_id, w)| {
-                let chunk_size = 4096; // packed felts per Poseidon call
-                let mut hash_inputs: Vec<FieldElement> = Vec::with_capacity(chunk_size + 2);
+            // Two-level parallel Merkle: split each matrix into segments, hash
+            // segments in parallel (Level 0), combine segment hashes (Level 1).
+            // This breaks the sequential dependency within each matrix.
+            //
+            // Architecture (per matrix):
+            //   Level 0: N segments hashed independently in parallel → N segment hashes
+            //   Level 1: poseidon_hash_many(domain_sep + N segment hashes) → matrix hash
+            //
+            // With 96 cores, 7x packing, and parallel segments:
+            //   Large matrix (89M elements): ~1-2s instead of ~650s sequential.
+            let n_segments = 64usize; // parallel segments per matrix
 
-                // Domain separation: layer_id + packed dimensions
-                hash_inputs.push(FieldElement::from(*layer_id as u64));
-                hash_inputs.push(FieldElement::from((w.rows as u64) << 32 | w.cols as u64));
-                let mut running_hash = starknet_crypto::poseidon_hash_many(&hash_inputs);
-                hash_inputs.clear();
-
-                // Pack 7 M31 values per FieldElement, then hash in chunks of 4096 felts
-                // Each chunk covers 4096 × 7 = 28,672 M31 values
-                let packed: Vec<FieldElement> = w.data.chunks(7)
-                    .map(|chunk| pack_m31(chunk))
+            // Hash one segment: pack M31→felt, chain Poseidon over chunks
+            let hash_segment = |data: &[M31]| -> FieldElement {
+                let chunk_size = 4096;
+                let packed: Vec<FieldElement> = data.chunks(7)
+                    .map(|c| pack_m31(c))
                     .collect();
-
+                if packed.is_empty() {
+                    return FieldElement::ZERO;
+                }
+                let mut hash_inputs: Vec<FieldElement> = Vec::with_capacity(chunk_size + 1);
+                let mut running = FieldElement::ZERO;
                 for chunk in packed.chunks(chunk_size) {
                     hash_inputs.clear();
-                    hash_inputs.push(running_hash);
+                    hash_inputs.push(running);
                     hash_inputs.extend_from_slice(chunk);
-                    running_hash = starknet_crypto::poseidon_hash_many(&hash_inputs);
+                    running = starknet_crypto::poseidon_hash_many(&hash_inputs);
                 }
+                running
+            };
+
+            // Process matrices sequentially (to give all cores to inner parallelism)
+            let per_matrix_hashes: Vec<FieldElement> = weight_list.iter().map(|(layer_id, w)| {
+                let seg_size = (w.data.len() + n_segments - 1) / n_segments;
+
+                // Level 0: hash segments in parallel
+                let segment_hashes: Vec<FieldElement> = w.data
+                    .par_chunks(seg_size.max(1))
+                    .map(|segment| hash_segment(segment))
+                    .collect();
+
+                // Level 1: combine with domain separation
+                let mut final_inputs: Vec<FieldElement> = Vec::with_capacity(segment_hashes.len() + 3);
+                final_inputs.push(FieldElement::from(*layer_id as u64));
+                final_inputs.push(FieldElement::from((w.rows as u64) << 32 | w.cols as u64));
+                final_inputs.push(FieldElement::from(n_segments as u64));
+                final_inputs.extend_from_slice(&segment_hashes);
+                let matrix_hash = starknet_crypto::poseidon_hash_many(&final_inputs);
 
                 let finished = done_count.fetch_add(1, Ordering::Relaxed) + 1;
                 let elapsed = t_commit.elapsed().as_secs_f64();
                 let eta = if finished > 0 { elapsed * (total as f64 / finished as f64 - 1.0) } else { 0.0 };
                 eprintln!(
-                    "  Weight commitment: {}/{} ({:.0}s elapsed, ~{:.0}s remaining)",
+                    "  Weight commitment: {}/{} ({:.1}s elapsed, ~{:.0}s remaining)",
                     finished, total, elapsed, eta,
                 );
-                running_hash
+                matrix_hash
             }).collect();
 
             let commitment = if per_matrix_hashes.is_empty() {
