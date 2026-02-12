@@ -1511,35 +1511,75 @@ where
             {
                 use rayon::prelude::*;
 
-                eprintln!("    Preparing {} batch entries (sequential, memory-safe)...", indices.len());
+                eprintln!("    Preparing {} batch entries (parallel chunks of 16)...", indices.len());
                 let t_prep = std::time::Instant::now();
 
-                // Sequential: one entry at a time to minimize peak memory.
-                // Each entry temporarily allocates ~1-5 GB for padded weight MLE,
-                // freed immediately after restriction to k elements (~128 KB).
-                // Peak: ~37 GB weights + ~5 GB temp = ~42 GB.
-                let mut entries: Vec<crate::gpu_sumcheck::BatchEntry> = Vec::with_capacity(indices.len());
-                for (i, &idx) in indices.iter().enumerate() {
-                    let dm = &matmul_data[idx];
-                    let weight_b = weights.get_weight(dm.node_id).expect("weight exists");
-                    let entry = crate::gpu_sumcheck::prepare_batch_entry(
-                        dm.node_id, &dm.a, weight_b, &dm.c,
-                    ).map_err(|e| ModelError::ProvingError {
-                        layer: dm.node_id,
-                        message: format!("Batch prep: {e}"),
-                    })?;
-                    entries.push(entry);
+                // Extract A/C from matmul_data for parallel processing.
+                // Weight B is looked up from GraphWeights (shared ref, thread-safe).
+                let prep_inputs: Vec<(usize, M31Matrix, M31Matrix)> = indices.iter().map(|&idx| {
+                    let dm = &mut matmul_data[idx];
+                    let a = std::mem::replace(&mut dm.a, M31Matrix::new(0, 0));
+                    let c = std::mem::replace(&mut dm.c, M31Matrix::new(0, 0));
+                    (dm.node_id, a, c)
+                }).collect();
+                let total = prep_inputs.len();
 
-                    // Free A/C after prep (B looked up from GraphWeights, not cloned)
-                    matmul_data[idx].a = M31Matrix::new(0, 0);
-                    matmul_data[idx].c = M31Matrix::new(0, 0);
+                // Process in chunks of 16 to bound peak memory:
+                // Each entry peaks at ~5 GB temp (padded MLE + restrict),
+                // freed after restriction to ~128 KB via shrink_to_fit().
+                // Peak: 37 GB weights + 16 × 5 GB temp = ~117 GB < 196 GB RAM.
+                let done_count = std::sync::atomic::AtomicUsize::new(0);
+                let mut entries: Vec<crate::gpu_sumcheck::BatchEntry> = Vec::with_capacity(total);
+                let mut prep_error: Option<ModelError> = None;
+                let num_chunks = (total + 15) / 16;
 
-                    if (i + 1) % 10 == 0 || i + 1 == indices.len() {
-                        eprintln!(
-                            "      [{}/{}] entries prepared ({:.1}s)",
-                            i + 1, indices.len(), t_prep.elapsed().as_secs_f64(),
-                        );
+                for (chunk_idx, chunk) in prep_inputs.chunks(16).enumerate() {
+                    let chunk_entries: Vec<Result<crate::gpu_sumcheck::BatchEntry, ModelError>> = chunk
+                        .par_iter()
+                        .map(|(node_id, a, c)| {
+                            let weight_b = weights.get_weight(*node_id).expect("weight exists");
+                            let entry = crate::gpu_sumcheck::prepare_batch_entry(*node_id, a, weight_b, c)
+                                .map_err(|e| ModelError::ProvingError {
+                                    layer: *node_id,
+                                    message: format!("Batch prep: {e}"),
+                                })?;
+                            done_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            Ok(entry)
+                        })
+                        .collect();
+
+                    for result in chunk_entries {
+                        match result {
+                            Ok(entry) => entries.push(entry),
+                            Err(e) => { prep_error = Some(e); break; }
+                        }
                     }
+                    if prep_error.is_some() { break; }
+
+                    // Report progress with RSS
+                    let rss_mb = {
+                        #[cfg(target_os = "linux")]
+                        {
+                            std::fs::read_to_string("/proc/self/status")
+                                .ok()
+                                .and_then(|s| s.lines()
+                                    .find(|l| l.starts_with("VmRSS:"))
+                                    .and_then(|l| l.split_whitespace().nth(1))
+                                    .and_then(|v| v.parse::<u64>().ok()))
+                                .map(|kb| kb / 1024)
+                                .unwrap_or(0)
+                        }
+                        #[cfg(not(target_os = "linux"))]
+                        { 0u64 }
+                    };
+                    eprintln!(
+                        "      Chunk {}/{}: {}/{} entries prepared ({:.1}s, RSS: {} MB)",
+                        chunk_idx + 1, num_chunks, entries.len(), total,
+                        t_prep.elapsed().as_secs_f64(), rss_mb,
+                    );
+                }
+                if let Some(e) = prep_error {
+                    return Err(AggregationError::ProvingError(format!("Batch prep: {e:?}")));
                 }
                 eprintln!("    Prep done in {:.1}s", t_prep.elapsed().as_secs_f64());
 
@@ -1584,6 +1624,8 @@ where
                     entries: batch_entries,
                 });
 
+                // Explicitly free batch entries (f_a/f_b vectors) before next group
+                drop(entries);
             }
             eprintln!(
                 "    -> {} Group done in {:.2}s (elapsed: {:.1}s)",

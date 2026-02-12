@@ -146,6 +146,7 @@ fn restrict_mle(evals: &[SecureField], assignments: &[SecureField]) -> Vec<Secur
         size = mid;
     }
     current.truncate(size);
+    current.shrink_to_fit();
     current
 }
 
