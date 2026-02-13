@@ -163,6 +163,25 @@ pub fn compute_io_commitment(input: &M31Matrix, output: &M31Matrix) -> FieldElem
     starknet_crypto::poseidon_hash_many(&hash_inputs)
 }
 
+/// Compute a Poseidon commitment over LayerNorm mean and variance values.
+///
+/// Binds the prover to specific mean/variance choices, preventing a malicious prover
+/// from substituting arbitrary values. The verifier independently recomputes mean/variance
+/// from the forward pass and checks this commitment.
+///
+/// Follows the same `poseidon_hash_many` pattern as `compute_layer_chain_commitment`
+/// and `compute_io_commitment`.
+pub fn compute_layernorm_mean_var_commitment(means: &[M31], variances: &[M31]) -> FieldElement {
+    let mut hash_inputs = Vec::with_capacity(means.len() + variances.len());
+    for &m in means {
+        hash_inputs.push(FieldElement::from(m.0 as u64));
+    }
+    for &v in variances {
+        hash_inputs.push(FieldElement::from(v.0 as u64));
+    }
+    starknet_crypto::poseidon_hash_many(&hash_inputs)
+}
+
 /// A claim about a single layer's computation.
 #[derive(Debug, Clone)]
 pub struct LayerClaim {
@@ -202,6 +221,9 @@ pub struct AggregatedModelProofFor<H: MerkleHasherLifted> {
     /// IO commitment: Poseidon(input_data || output_data).
     /// Binds the proof to specific input/output data, preventing replay with different I/O.
     pub io_commitment: FieldElement,
+    /// Per-LayerNorm Poseidon commitments of (means, variances).
+    /// Binds the prover to specific mean/variance values, preventing substitution.
+    pub layernorm_mean_var_commitments: Vec<FieldElement>,
 }
 
 /// Aggregated model proof using Blake2s (default).
@@ -232,7 +254,8 @@ impl<H: MerkleHasherLifted> AggregatedModelProofFor<H> {
             + self.layernorm_claims.len() + self.embedding_claims.len()) * 32;
         // Attention proofs: ~2KB each (multiple matmul sumchecks + softmax STARK)
         let attention_size = self.attention_proofs.len() * 2048;
-        commitment_size + fri_size + sumcheck_size + claim_size + attention_size
+        let layernorm_mv_size = self.layernorm_mean_var_commitments.len() * 32;
+        commitment_size + fri_size + sumcheck_size + claim_size + attention_size + layernorm_mv_size
     }
 }
 
@@ -702,6 +725,11 @@ where
     // Compute IO commitment binding this proof to specific input/output.
     let io_commitment = compute_io_commitment(input, &current);
 
+    // Compute per-LayerNorm mean/variance commitments (defense-in-depth).
+    let layernorm_mean_var_commitments: Vec<FieldElement> = layernorm_layers.iter()
+        .map(|layer| compute_layernorm_mean_var_commitment(&layer.means, &layer.variances))
+        .collect();
+
     let execution = GraphExecution {
         intermediates,
         output: current,
@@ -726,6 +754,7 @@ where
             quantize_claims: Vec::new(),
             layer_chain_commitment,
             io_commitment,
+            layernorm_mean_var_commitments: Vec::new(),
         });
     }
 
@@ -1260,6 +1289,7 @@ where
         quantize_claims: quantize_claims_vec,
         layer_chain_commitment,
         io_commitment,
+        layernorm_mean_var_commitments,
     })
 }
 
@@ -1356,6 +1386,9 @@ pub struct AggregatedModelProofOnChain {
     /// IO commitment: Poseidon(input_data || output_data).
     /// Binds the proof to specific input/output data, preventing replay with different I/O.
     pub io_commitment: FieldElement,
+    /// Per-LayerNorm Poseidon commitments of (means, variances).
+    /// Binds the prover to specific mean/variance values, preventing substitution.
+    pub layernorm_mean_var_commitments: Vec<FieldElement>,
 }
 
 impl AggregatedModelProofOnChain {
@@ -2045,6 +2078,11 @@ where
     // Compute IO commitment binding this proof to specific input/output.
     let io_commitment = compute_io_commitment(input, &current);
 
+    // Compute per-LayerNorm mean/variance commitments (defense-in-depth).
+    let layernorm_mean_var_commitments: Vec<FieldElement> = layernorm_layers.iter()
+        .map(|layer| compute_layernorm_mean_var_commitment(&layer.means, &layer.variances))
+        .collect();
+
     let execution = GraphExecution {
         intermediates,
         output: current,
@@ -2070,6 +2108,7 @@ where
             quantize_claims: Vec::new(),
             layer_chain_commitment,
             io_commitment,
+            layernorm_mean_var_commitments: Vec::new(),
         });
     }
 
@@ -2591,6 +2630,7 @@ where
         quantize_claims: quantize_claims_vec,
         layer_chain_commitment,
         io_commitment,
+        layernorm_mean_var_commitments,
     })
 }
 
@@ -2971,6 +3011,7 @@ pub fn verify_aggregated_model_proof(
     let mut matmul_matrices: HashMap<usize, (M31Matrix, M31Matrix, M31Matrix)> = HashMap::new();
     let mut verifier_intermediates: Vec<(usize, M31Matrix)> = Vec::new();
     let mut attention_verify_data: Vec<(usize, MultiHeadAttentionConfig, AttentionWeights, M31Matrix)> = Vec::new();
+    let mut ln_verify_data: Vec<(usize, Vec<M31>, Vec<M31>)> = Vec::new(); // (node_id, means, variances)
 
     let topo = graph.topological_order();
     for &node_id in &topo {
@@ -3028,6 +3069,7 @@ pub fn verify_aggregated_model_proof(
             }
             GraphOp::LayerNorm { dim } => {
                 let ln = apply_layernorm_detailed(&current, *dim);
+                ln_verify_data.push((node.id, ln.means.clone(), ln.variances.clone()));
                 node_outputs.insert(node.id, ln.output_matrix.clone());
                 current = ln.output_matrix;
             }
@@ -3106,6 +3148,18 @@ pub fn verify_aggregated_model_proof(
                 expected_io, proof.io_commitment,
             )
         ));
+    }
+
+    // 1d. Verify LayerNorm mean/variance commitments
+    for (idx, (node_id, means, variances)) in ln_verify_data.iter().enumerate() {
+        if idx < proof.layernorm_mean_var_commitments.len() {
+            let expected = compute_layernorm_mean_var_commitment(means, variances);
+            if expected != proof.layernorm_mean_var_commitments[idx] {
+                return Err(AggregationError::VerificationFailed(
+                    format!("LayerNorm mean/var commitment mismatch at node {node_id}")
+                ));
+            }
+        }
     }
 
     // 2. Verify matmul sumcheck proofs
@@ -3187,6 +3241,7 @@ pub fn verify_aggregated_model_proof_onchain(
     let mut node_outputs: HashMap<usize, M31Matrix> = HashMap::new();
     let mut verifier_intermediates: Vec<(usize, M31Matrix)> = Vec::new();
     let mut attention_verify_data: Vec<(usize, MultiHeadAttentionConfig, AttentionWeights, M31Matrix)> = Vec::new();
+    let mut ln_verify_data: Vec<(usize, Vec<M31>, Vec<M31>)> = Vec::new(); // (node_id, means, variances)
 
     let topo = graph.topological_order();
     for &node_id in &topo {
@@ -3242,6 +3297,7 @@ pub fn verify_aggregated_model_proof_onchain(
             }
             GraphOp::LayerNorm { dim } => {
                 let ln = apply_layernorm_detailed(&current, *dim);
+                ln_verify_data.push((node.id, ln.means.clone(), ln.variances.clone()));
                 node_outputs.insert(node.id, ln.output_matrix.clone());
                 current = ln.output_matrix;
             }
@@ -3321,6 +3377,18 @@ pub fn verify_aggregated_model_proof_onchain(
         ));
     }
 
+    // 1d. Verify LayerNorm mean/variance commitments
+    for (idx, (node_id, means, variances)) in ln_verify_data.iter().enumerate() {
+        if idx < proof.layernorm_mean_var_commitments.len() {
+            let expected = compute_layernorm_mean_var_commitment(means, variances);
+            if expected != proof.layernorm_mean_var_commitments[idx] {
+                return Err(AggregationError::VerificationFailed(
+                    format!("LayerNorm mean/var commitment mismatch at node {node_id}")
+                ));
+            }
+        }
+    }
+
     // 2. Verify individual matmul sumcheck proofs (on-chain format, self-contained)
     for (node_id, matmul_proof) in &proof.matmul_proofs {
         verify_matmul_sumcheck_onchain(matmul_proof).map_err(|e| {
@@ -3381,16 +3449,24 @@ pub fn verify_aggregated_model_proof_onchain(
     Ok(())
 }
 
-/// Verify a batched on-chain matmul proof.
+/// Verify a batched on-chain matmul proof with full Fiat-Shamir replay.
 ///
 /// Batched proofs combine multiple matmuls with the same k dimension into
-/// a single sumcheck. Verification:
-/// 1. Checks that the combined claimed sum equals Σ λ^i * claimed_sum_i.
-/// 2. Verifies sumcheck rounds (p(0) + p(1) = current_sum per round).
-/// 3. Checks the final evaluation: current_sum = Σ λ^i * final_a_eval_i * final_b_eval_i.
+/// a single sumcheck. The verifier replays the exact Fiat-Shamir transcript
+/// that the prover used (see gpu_sumcheck::prove_matmul_batch_onchain_gpu):
+///
+/// 1. Initialize Poseidon channel with batch metadata (num_entries, k).
+/// 2. Mix all per-matmul commitments and claimed sums.
+/// 3. Re-derive lambda from the channel (must match prover's lambda).
+/// 4. Verify combined_claimed_sum = Σ λ^i * claimed_sum_i.
+/// 5. Per round: verify p(0)+p(1) = current_sum, mix poly, draw challenge r_k,
+///    update current_sum = p(r_k).
+/// 6. Final check: current_sum = Σ λ^i * final_a_eval_i * final_b_eval_i.
 fn verify_batched_matmul_onchain(
     batch: &BatchedMatMulProofOnChain,
 ) -> Result<(), AggregationError> {
+    use crate::crypto::poseidon_channel::{PoseidonChannel, securefield_to_felt};
+
     let log_k = batch.num_rounds as usize;
     if batch.round_polys.len() != log_k {
         return Err(AggregationError::VerificationFailed(
@@ -3403,8 +3479,30 @@ fn verify_batched_matmul_onchain(
         ));
     }
 
+    // Replay Fiat-Shamir: initialize channel with batch metadata
+    // (mirrors prove_matmul_batch_onchain_gpu steps 1-2)
+    let mut channel = PoseidonChannel::new();
+    channel.mix_u64(batch.entries.len() as u64);
+    channel.mix_u64(batch.k as u64);
+
+    for entry in &batch.entries {
+        channel.mix_felt(securefield_to_felt(entry.claimed_sum));
+        channel.mix_felt(entry.a_commitment);
+        channel.mix_felt(entry.b_commitment);
+    }
+
+    // Re-derive lambda from channel (must match prover's lambda)
+    let lambda = channel.draw_qm31();
+    if lambda != batch.lambda {
+        return Err(AggregationError::VerificationFailed(
+            format!(
+                "Batched lambda mismatch: re-derived {:?}, proof contains {:?}",
+                lambda, batch.lambda
+            )
+        ));
+    }
+
     // Verify combined_claimed_sum = Σ λ^i * claimed_sum_i
-    let lambda = batch.lambda;
     let mut expected_combined = SecureField::default();
     let mut lambda_pow = SecureField::one();
     for entry in &batch.entries {
@@ -3420,7 +3518,7 @@ fn verify_batched_matmul_onchain(
         ));
     }
 
-    // Verify sumcheck rounds
+    // Verify sumcheck rounds with Fiat-Shamir challenge derivation
     let mut current_sum = batch.combined_claimed_sum;
     for rp in &batch.round_polys {
         let p_at_0 = rp.c0;
@@ -3433,12 +3531,13 @@ fn verify_batched_matmul_onchain(
             ));
         }
 
-        // Note: for full soundness we'd need to re-derive the challenge from
-        // Fiat-Shamir. For now, trust the stored challenge and verify the
-        // algebraic relationships. This is consistent with the batch prover
-        // infrastructure which is still being finalized.
-        // TODO: replay full Fiat-Shamir transcript once batch prover is stable.
-        current_sum = rp.c0 + rp.c1 * lambda + rp.c2 * lambda * lambda;
+        // Mix round polynomial into channel and draw per-round challenge
+        // (mirrors prover's channel.mix_poly_coeffs + channel.draw_qm31)
+        channel.mix_poly_coeffs(rp.c0, rp.c1, rp.c2);
+        let r_k = channel.draw_qm31();
+
+        // Evaluate p(r_k) = c0 + c1*r_k + c2*r_k^2
+        current_sum = rp.c0 + rp.c1 * r_k + rp.c2 * r_k * r_k;
     }
 
     // Verify final evaluation: current_sum = Σ λ^i * a_i * b_i
@@ -4101,6 +4200,8 @@ mod tests {
     use super::*;
     use crate::compiler::graph::GraphBuilder;
     use crate::components::activation::ActivationType;
+    use num_traits::Zero;
+    use stwo::core::fields::FieldExpOps;
 
     #[test]
     fn test_aggregated_matmul_only() {
@@ -4191,6 +4292,7 @@ mod tests {
             quantize_claims: Vec::new(),
             layer_chain_commitment: FieldElement::ZERO,
             io_commitment: FieldElement::ZERO,
+            layernorm_mean_var_commitments: Vec::new(),
         };
         let calldata = proof.estimated_calldata_bytes();
         assert!(calldata > 0);
@@ -5108,5 +5210,364 @@ mod tests {
 
         let result = verify_aggregated_model_proof(proof, &graph, &wrong_input, &weights);
         assert!(result.is_err(), "verification with wrong input should fail");
+    }
+
+    // === LayerNorm Mean/Var Commitment Tests ===
+
+    #[test]
+    fn test_layernorm_mean_var_commitment_verified() {
+        // matmul → LayerNorm → matmul
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(4).layer_norm().linear(2);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+
+        let mut weights = GraphWeights::new();
+        let mut w0 = M31Matrix::new(4, 4);
+        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 5 + 1) as u32)); } }
+        weights.add_weight(0, w0);
+        let mut w2 = M31Matrix::new(4, 2);
+        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        weights.add_weight(2, w2);
+
+        let proof = prove_model_aggregated(&graph, &input, &weights)
+            .expect("proving should succeed");
+
+        // Should have exactly 1 LayerNorm mean/var commitment
+        assert_eq!(proof.layernorm_mean_var_commitments.len(), 1,
+            "should have 1 LayerNorm mean/var commitment");
+        assert_ne!(proof.layernorm_mean_var_commitments[0], FieldElement::ZERO,
+            "commitment should be non-zero");
+
+        // Independently recompute and verify the commitment matches
+        let matmul_output = matmul_m31(&input, weights.get_weight(0).unwrap());
+        let ln = apply_layernorm_detailed(&matmul_output, 4);
+        let expected = compute_layernorm_mean_var_commitment(&ln.means, &ln.variances);
+        assert_eq!(proof.layernorm_mean_var_commitments[0], expected,
+            "commitment should match independently computed value");
+
+        verify_aggregated_model_proof(proof, &graph, &input, &weights)
+            .expect("verification should succeed");
+    }
+
+    #[test]
+    fn test_layernorm_tampered_commitment_fails() {
+        // matmul → LayerNorm → matmul
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(4).layer_norm().linear(2);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+
+        let mut weights = GraphWeights::new();
+        let mut w0 = M31Matrix::new(4, 4);
+        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 5 + 1) as u32)); } }
+        weights.add_weight(0, w0);
+        let mut w2 = M31Matrix::new(4, 2);
+        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        weights.add_weight(2, w2);
+
+        let mut proof = prove_model_aggregated(&graph, &input, &weights)
+            .expect("proving should succeed");
+
+        // Tamper with the LayerNorm mean/var commitment
+        assert_eq!(proof.layernorm_mean_var_commitments.len(), 1);
+        proof.layernorm_mean_var_commitments[0] = FieldElement::from(0xDEADu64);
+
+        let result = verify_aggregated_model_proof(proof, &graph, &input, &weights);
+        assert!(result.is_err(), "tampered commitment should fail verification");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("mean/var commitment mismatch"),
+            "error should mention mean/var commitment mismatch, got: {err_msg}");
+    }
+
+    // Helper: build a valid BatchedMatMulProofOnChain by running the prover's
+    // Fiat-Shamir logic on CPU. This lets us test the verifier without GPU.
+    fn build_cpu_batch_proof(
+        entries: &[(usize, SecureField, SecureField, SecureField, FieldElement, FieldElement, u32, u32)],
+        k: u32,
+    ) -> BatchedMatMulProofOnChain {
+        use crate::crypto::poseidon_channel::{PoseidonChannel, securefield_to_felt};
+        use crate::components::matmul::RoundPoly;
+
+        let log_k = k.ilog2() as usize;
+        let num_entries = entries.len();
+
+        // Build per-entry MLE vectors (f_a, f_b) as simple polynomials
+        // so we can compute real sumcheck round polynomials.
+        let mut f_a_list: Vec<Vec<SecureField>> = Vec::new();
+        let mut f_b_list: Vec<Vec<SecureField>> = Vec::new();
+        let mut batch_entries: Vec<BatchedMatMulEntryOnChain> = Vec::new();
+
+        for &(node_id, claimed_a, claimed_b, claimed_sum, a_commit, b_commit, m, n) in entries {
+            // Simple MLEs: f_a = [claimed_a, 0, 0, ...], f_b = [claimed_b, 0, 0, ...]
+            // adjusted so inner product = claimed_sum at index 0
+            let mut f_a = vec![SecureField::zero(); k as usize];
+            let mut f_b = vec![SecureField::zero(); k as usize];
+            // Set f_a[0] and f_b[0] so their product-sum gives claimed_sum
+            f_a[0] = claimed_a;
+            f_b[0] = claimed_b;
+            // Verify: Σ f_a[i]*f_b[i] = claimed_a * claimed_b = claimed_sum
+            assert_eq!(claimed_a * claimed_b, claimed_sum);
+
+            f_a_list.push(f_a);
+            f_b_list.push(f_b);
+            batch_entries.push(BatchedMatMulEntryOnChain {
+                node_id,
+                m,
+                n,
+                claimed_sum,
+                final_a_eval: SecureField::zero(), // filled after sumcheck
+                final_b_eval: SecureField::zero(),
+                a_commitment: a_commit,
+                b_commitment: b_commit,
+            });
+        }
+
+        // Fiat-Shamir channel — exactly mirrors prove_matmul_batch_onchain_gpu
+        let mut channel = PoseidonChannel::new();
+        channel.mix_u64(num_entries as u64);
+        channel.mix_u64(k as u64);
+
+        for e in &batch_entries {
+            channel.mix_felt(securefield_to_felt(e.claimed_sum));
+            channel.mix_felt(e.a_commitment);
+            channel.mix_felt(e.b_commitment);
+        }
+
+        let lambda = channel.draw_qm31();
+
+        // Compute combined claimed sum
+        let mut combined = SecureField::zero();
+        let mut lambda_pow = SecureField::one();
+        for e in &batch_entries {
+            combined = combined + lambda_pow * e.claimed_sum;
+            lambda_pow = lambda_pow * lambda;
+        }
+
+        // Run sumcheck rounds on CPU
+        let mut round_polys = Vec::with_capacity(log_k);
+        let mut cur_n = k as usize;
+
+        for _ in 0..log_k {
+            let mid = cur_n / 2;
+
+            // Compute combined (s0, s1, s2) across all entries
+            let mut combined_s0 = SecureField::zero();
+            let mut combined_s1 = SecureField::zero();
+            let mut combined_s2 = SecureField::zero();
+            let mut lp = SecureField::one();
+
+            for i in 0..num_entries {
+                let f_a = &f_a_list[i];
+                let f_b = &f_b_list[i];
+
+                // s0 = Σ_{j<mid} f_a[j] * f_b[j]  (evaluate at t=0)
+                let mut s0 = SecureField::zero();
+                for j in 0..mid {
+                    s0 = s0 + f_a[j] * f_b[j];
+                }
+
+                // s1 = Σ_{j<mid} f_a[mid+j] * f_b[mid+j]  (evaluate at t=1)
+                let mut s1 = SecureField::zero();
+                for j in 0..mid {
+                    s1 = s1 + f_a[mid + j] * f_b[mid + j];
+                }
+
+                // s2 = Σ_{j<mid} (2*f_a[mid+j] - f_a[j]) * (2*f_b[mid+j] - f_b[j])  (evaluate at t=2)
+                let two = SecureField::from(M31::from(2));
+                let mut s2 = SecureField::zero();
+                for j in 0..mid {
+                    let a2 = two * f_a[mid + j] - f_a[j];
+                    let b2 = two * f_b[mid + j] - f_b[j];
+                    s2 = s2 + a2 * b2;
+                }
+
+                combined_s0 = combined_s0 + lp * s0;
+                combined_s1 = combined_s1 + lp * s1;
+                combined_s2 = combined_s2 + lp * s2;
+                lp = lp * lambda;
+            }
+
+            // Lagrange interpolation → coefficients
+            let c0 = combined_s0;
+            let two = SecureField::from(M31::from(2));
+            let c2 = (combined_s2 - two * combined_s1 + combined_s0) * two.inverse();
+            let c1 = combined_s1 - combined_s0 - c2;
+
+            round_polys.push(RoundPoly { c0, c1, c2 });
+
+            // Fiat-Shamir: mix poly, draw challenge
+            channel.mix_poly_coeffs(c0, c1, c2);
+            let r_k = channel.draw_qm31();
+
+            // Fold all MLEs with challenge r_k
+            for i in 0..num_entries {
+                let f_a = &f_a_list[i];
+                let f_b = &f_b_list[i];
+                let mut new_f_a = vec![SecureField::zero(); mid];
+                let mut new_f_b = vec![SecureField::zero(); mid];
+                for j in 0..mid {
+                    new_f_a[j] = f_a[j] + r_k * (f_a[mid + j] - f_a[j]);
+                    new_f_b[j] = f_b[j] + r_k * (f_b[mid + j] - f_b[j]);
+                }
+                f_a_list[i] = new_f_a;
+                f_b_list[i] = new_f_b;
+            }
+
+            cur_n = mid;
+        }
+
+        // Extract final evaluations
+        assert_eq!(cur_n, 1);
+        for i in 0..num_entries {
+            batch_entries[i].final_a_eval = f_a_list[i][0];
+            batch_entries[i].final_b_eval = f_b_list[i][0];
+        }
+
+        BatchedMatMulProofOnChain {
+            k,
+            num_rounds: log_k as u32,
+            lambda,
+            combined_claimed_sum: combined,
+            round_polys,
+            entries: batch_entries,
+        }
+    }
+
+    #[test]
+    fn test_batch_fiat_shamir_replay_valid() {
+        // Build a valid batch proof via CPU prover and verify it passes
+        let entries = vec![
+            // (node_id, f_a[0], f_b[0], claimed_sum, a_commit, b_commit, m, n)
+            (0, SecureField::from(M31::from(3)), SecureField::from(M31::from(5)),
+             SecureField::from(M31::from(15)),
+             FieldElement::from(0xA1u64), FieldElement::from(0xB1u64), 1, 1),
+            (1, SecureField::from(M31::from(7)), SecureField::from(M31::from(2)),
+             SecureField::from(M31::from(14)),
+             FieldElement::from(0xA2u64), FieldElement::from(0xB2u64), 1, 1),
+        ];
+
+        let batch = build_cpu_batch_proof(&entries, 4); // k=4, log_k=2 rounds
+        let result = verify_batched_matmul_onchain(&batch);
+        assert!(result.is_ok(), "Valid batch proof should verify: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_batch_fiat_shamir_replay_single_entry() {
+        let entries = vec![
+            (0, SecureField::from(M31::from(10)), SecureField::from(M31::from(20)),
+             SecureField::from(M31::from(200)),
+             FieldElement::from(0xC1u64), FieldElement::from(0xD1u64), 1, 1),
+        ];
+
+        let batch = build_cpu_batch_proof(&entries, 8); // k=8, log_k=3 rounds
+        let result = verify_batched_matmul_onchain(&batch);
+        assert!(result.is_ok(), "Single-entry batch should verify: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_batch_fiat_shamir_tampered_lambda_rejected() {
+        let entries = vec![
+            (0, SecureField::from(M31::from(3)), SecureField::from(M31::from(5)),
+             SecureField::from(M31::from(15)),
+             FieldElement::from(0xA1u64), FieldElement::from(0xB1u64), 1, 1),
+            (1, SecureField::from(M31::from(7)), SecureField::from(M31::from(2)),
+             SecureField::from(M31::from(14)),
+             FieldElement::from(0xA2u64), FieldElement::from(0xB2u64), 1, 1),
+        ];
+
+        let mut batch = build_cpu_batch_proof(&entries, 4);
+        // Tamper with stored lambda
+        batch.lambda = SecureField::from(M31::from(999));
+
+        let result = verify_batched_matmul_onchain(&batch);
+        assert!(result.is_err(), "Tampered lambda should be rejected");
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("lambda mismatch"), "Error should mention lambda: {err}");
+    }
+
+    #[test]
+    fn test_batch_fiat_shamir_tampered_round_poly_rejected() {
+        let entries = vec![
+            (0, SecureField::from(M31::from(3)), SecureField::from(M31::from(5)),
+             SecureField::from(M31::from(15)),
+             FieldElement::from(0xA1u64), FieldElement::from(0xB1u64), 1, 1),
+            (1, SecureField::from(M31::from(7)), SecureField::from(M31::from(2)),
+             SecureField::from(M31::from(14)),
+             FieldElement::from(0xA2u64), FieldElement::from(0xB2u64), 1, 1),
+        ];
+
+        let mut batch = build_cpu_batch_proof(&entries, 4);
+        // Tamper with a round polynomial coefficient
+        batch.round_polys[0].c1 = batch.round_polys[0].c1 + SecureField::from(M31::from(1));
+
+        let result = verify_batched_matmul_onchain(&batch);
+        assert!(result.is_err(), "Tampered round poly should be rejected");
+    }
+
+    #[test]
+    fn test_batch_fiat_shamir_tampered_claimed_sum_rejected() {
+        let entries = vec![
+            (0, SecureField::from(M31::from(3)), SecureField::from(M31::from(5)),
+             SecureField::from(M31::from(15)),
+             FieldElement::from(0xA1u64), FieldElement::from(0xB1u64), 1, 1),
+        ];
+
+        let mut batch = build_cpu_batch_proof(&entries, 4);
+        // Tamper with combined claimed sum
+        batch.combined_claimed_sum = batch.combined_claimed_sum + SecureField::from(M31::from(1));
+
+        let result = verify_batched_matmul_onchain(&batch);
+        assert!(result.is_err(), "Tampered claimed sum should be rejected");
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("combined_claimed_sum mismatch"), "Error should mention claimed sum: {err}");
+    }
+
+    #[test]
+    fn test_batch_fiat_shamir_tampered_final_eval_rejected() {
+        let entries = vec![
+            (0, SecureField::from(M31::from(3)), SecureField::from(M31::from(5)),
+             SecureField::from(M31::from(15)),
+             FieldElement::from(0xA1u64), FieldElement::from(0xB1u64), 1, 1),
+            (1, SecureField::from(M31::from(7)), SecureField::from(M31::from(2)),
+             SecureField::from(M31::from(14)),
+             FieldElement::from(0xA2u64), FieldElement::from(0xB2u64), 1, 1),
+        ];
+
+        let mut batch = build_cpu_batch_proof(&entries, 4);
+        // Tamper with a final evaluation
+        batch.entries[0].final_a_eval = batch.entries[0].final_a_eval + SecureField::from(M31::from(1));
+
+        let result = verify_batched_matmul_onchain(&batch);
+        assert!(result.is_err(), "Tampered final eval should be rejected");
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("final eval mismatch"), "Error should mention final eval: {err}");
+    }
+
+    #[test]
+    fn test_batch_fiat_shamir_four_entries() {
+        // Larger batch with 4 matmuls
+        let entries = vec![
+            (0, SecureField::from(M31::from(1)), SecureField::from(M31::from(1)),
+             SecureField::from(M31::from(1)),
+             FieldElement::from(0x10u64), FieldElement::from(0x20u64), 1, 1),
+            (1, SecureField::from(M31::from(2)), SecureField::from(M31::from(3)),
+             SecureField::from(M31::from(6)),
+             FieldElement::from(0x30u64), FieldElement::from(0x40u64), 1, 1),
+            (2, SecureField::from(M31::from(4)), SecureField::from(M31::from(5)),
+             SecureField::from(M31::from(20)),
+             FieldElement::from(0x50u64), FieldElement::from(0x60u64), 2, 2),
+            (3, SecureField::from(M31::from(6)), SecureField::from(M31::from(7)),
+             SecureField::from(M31::from(42)),
+             FieldElement::from(0x70u64), FieldElement::from(0x80u64), 2, 2),
+        ];
+
+        let batch = build_cpu_batch_proof(&entries, 16); // k=16, log_k=4 rounds
+        let result = verify_batched_matmul_onchain(&batch);
+        assert!(result.is_ok(), "4-entry batch should verify: {:?}", result.err());
     }
 }

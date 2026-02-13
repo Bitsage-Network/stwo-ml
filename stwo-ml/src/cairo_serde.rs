@@ -1145,6 +1145,7 @@ mod tests {
             quantize_claims: Vec::new(),
             layer_chain_commitment: starknet_ff::FieldElement::ZERO,
             io_commitment: starknet_ff::FieldElement::ZERO,
+            layernorm_mean_var_commitments: Vec::new(),
         };
 
         let metadata = MLClaimMetadata {
@@ -1218,6 +1219,7 @@ mod tests {
             quantize_claims: Vec::new(),
             layer_chain_commitment: starknet_ff::FieldElement::ZERO,
             io_commitment: starknet_ff::FieldElement::ZERO,
+            layernorm_mean_var_commitments: Vec::new(),
         };
 
         let metadata = MLClaimMetadata {
@@ -1350,6 +1352,7 @@ mod tests {
             quantize_claims: Vec::new(),
             layer_chain_commitment: starknet_ff::FieldElement::ZERO,
             io_commitment: starknet_ff::FieldElement::ZERO,
+            layernorm_mean_var_commitments: Vec::new(),
         };
         let felts_none = serialize_ml_proof_for_recursive(&aggregated_none, &metadata, None);
 
@@ -1376,6 +1379,7 @@ mod tests {
             quantize_claims: Vec::new(),
             layer_chain_commitment: starknet_ff::FieldElement::ZERO,
             io_commitment: starknet_ff::FieldElement::ZERO,
+            layernorm_mean_var_commitments: Vec::new(),
         };
         let felts_some = serialize_ml_proof_for_recursive(&aggregated_some, &metadata, None);
 
@@ -1452,6 +1456,7 @@ mod tests {
             quantize_claims: Vec::new(),
             layer_chain_commitment: starknet_ff::FieldElement::ZERO,
             io_commitment: starknet_ff::FieldElement::ZERO,
+            layernorm_mean_var_commitments: Vec::new(),
         };
 
         let metadata = MLClaimMetadata {
@@ -1706,6 +1711,7 @@ mod tests {
             quantize_claims: Vec::new(),
             layer_chain_commitment: starknet_ff::FieldElement::ZERO,
             io_commitment: starknet_ff::FieldElement::ZERO,
+            layernorm_mean_var_commitments: Vec::new(),
         };
 
         let metadata = MLClaimMetadata {
@@ -1800,6 +1806,7 @@ mod tests {
             quantize_claims: Vec::new(),
             layer_chain_commitment: starknet_ff::FieldElement::ZERO,
             io_commitment: starknet_ff::FieldElement::ZERO,
+            layernorm_mean_var_commitments: Vec::new(),
         };
 
         let metadata = MLClaimMetadata {
