@@ -738,7 +738,7 @@ fn serialize_ml_interaction_claim(sum: SecureField, output: &mut Vec<FieldElemen
 /// 7. `embedding_claims: Array<EmbeddingComponentClaim>` — len + per-claim (2 felts each)
 /// 8. `interaction_claim: MLInteractionClaim` — 4 felts (total LogUp sum across activations + layernorms)
 /// 9. `pcs_config: PcsConfig` — 4 felts (pow_bits + fri_config)
-/// 10. `interaction_pow: u64` — 1 felt (hardcode 0, Rust prover handles PoW internally)
+/// 10. `interaction_pow: u64` — 1 felt (0: matches INTERACTION_POW_BITS=0 in Cairo verifier)
 /// 11. `stark_proof: StarkProof` — CommitmentSchemeProof (existing serializer)
 fn serialize_unified_stark_proof(
     stark_proof: &Blake2sProof,
@@ -808,7 +808,7 @@ fn serialize_unified_stark_proof(
     // 9. pcs_config: PcsConfig (from the proof itself)
     serialize_pcs_config(&stark_proof.0.config, output);
 
-    // 10. interaction_pow: u64 (hardcode 0 — Rust prover handles PoW internally)
+    // 10. interaction_pow: u64 (0: INTERACTION_POW_BITS=0, prover mixes this into channel)
     serialize_u64(0, output);
 
     // 11. stark_proof: StarkProof → CommitmentSchemeProof

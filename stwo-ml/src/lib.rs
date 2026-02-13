@@ -28,6 +28,7 @@ pub mod cairo_serde;
 pub mod receipt;
 pub mod crypto;
 pub mod json_serde;
+pub mod weight_cache;
 
 #[cfg(feature = "cuda-runtime")]
 pub mod gpu_sumcheck;
@@ -54,6 +55,7 @@ pub mod prelude {
     pub use crate::aggregation::{
         prove_model_aggregated, prove_model_aggregated_with, prove_model_aggregated_auto,
         prove_model_aggregated_onchain, prove_model_aggregated_onchain_auto,
+        prove_model_aggregated_onchain_auto_cached,
         verify_aggregated_model_proof,
         verify_aggregated_model_proof_onchain,
     };
@@ -70,12 +72,17 @@ pub mod prelude {
     pub use crate::aggregation::compute_io_commitment;
     pub use crate::starknet::{
         build_starknet_proof_with_tee, build_starknet_proof_onchain_with_tee,
+        prove_for_starknet_onchain_cached,
     };
     pub use crate::tee::{
         SecurityLevel, TeeAttestation, TeeCapability, TeeModelProver,
         detect_tee_capability, verify_attestation,
     };
     pub use crate::gpu::ProofWithAttestation;
+    pub use crate::weight_cache::{
+        WeightCommitmentCache, CachedWeight, SharedWeightCache,
+        shared_cache, shared_cache_from_file,
+    };
 }
 
 /// Re-export GPU backend when available.

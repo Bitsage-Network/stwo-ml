@@ -22,7 +22,7 @@ use stwo::core::fields::qm31::SecureField;
 use stwo::core::pcs::PcsConfig;
 use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
-use stwo::core::channel::MerkleChannel;
+use stwo::core::channel::{Channel, MerkleChannel};
 use stwo::core::proof::StarkProof;
 use stwo::core::vcs_lifted::MerkleHasherLifted;
 use stwo::core::pcs::CommitmentSchemeVerifier;
@@ -920,6 +920,11 @@ where
         tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
     }
     tree_builder.commit(channel);
+
+    // Interaction PoW: grind + mix nonce into channel (matches Cairo verifier protocol).
+    // INTERACTION_POW_BITS = 0 → nonce is always 0, but mix_u64(0) still changes
+    // channel state and must be done to keep prover/verifier Fiat-Shamir in sync.
+    channel.mix_u64(0);
 
     // Draw relation elements and build Tree 2 — only if LogUp components exist
     let mut activation_lookup: Option<ActivationRelation> = None;
@@ -2296,6 +2301,9 @@ where
         tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
     }
     tree_builder.commit(channel);
+
+    // Interaction PoW: mix nonce into channel (matches Cairo verifier protocol).
+    channel.mix_u64(0);
 
     // Draw relation elements and build Tree 2 — only if LogUp components exist
     let mut activation_lookup: Option<ActivationRelation> = None;
@@ -3825,6 +3833,9 @@ fn verify_unified_stark_blake2s(
     // Step 3: Commit Tree 0 (preprocessed) and Tree 1 (execution) from proof
     commitment_scheme.commit(proof.commitments[0], &dummy_sizes.tree0, channel);
     commitment_scheme.commit(proof.commitments[1], &dummy_sizes.tree1, channel);
+
+    // Step 3.5: Interaction PoW — mix nonce into channel (matches prover + Cairo verifier).
+    channel.mix_u64(0);
 
     // Step 4: Draw relation elements (same order as prover)
     let activation_lookup = if !activation_claims.is_empty() {
