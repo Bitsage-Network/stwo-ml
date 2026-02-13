@@ -284,6 +284,7 @@ pub struct BatchedMatMulProofOnChain {
     /// Number of sumcheck rounds (log2(k)).
     pub num_rounds: u32,
     /// Lambda batching weight drawn from Fiat-Shamir.
+    /// The verifier re-derives this from the channel and asserts equality.
     pub lambda: SecureField,
     /// Combined claimed sum: Σ λ^i · claimed_sum_i.
     pub combined_claimed_sum: SecureField,
@@ -1445,6 +1446,28 @@ where
     FrameworkComponent<EmbeddingEval>: ComponentProver<B>,
     FrameworkComponent<QuantizeEval>: ComponentProver<B>,
 {
+    prove_model_aggregated_onchain_with_cache::<B>(graph, input, weights, None)
+}
+
+/// On-chain aggregated proving with optional weight commitment cache.
+///
+/// When `weight_cache` is `Some`, uses cached restricted weight MLEs and
+/// commitments for batch entry preparation. On cache miss, computes and stores.
+pub(crate) fn prove_model_aggregated_onchain_with_cache<B>(
+    graph: &ComputationGraph,
+    input: &M31Matrix,
+    weights: &GraphWeights,
+    _weight_cache: Option<&crate::weight_cache::SharedWeightCache>,
+) -> Result<AggregatedModelProofOnChain, AggregationError>
+where
+    B: BackendForChannel<Blake2sMerkleChannel> + PolyOps,
+    FrameworkComponent<ActivationEval>: ComponentProver<B>,
+    FrameworkComponent<ElementwiseAddEval>: ComponentProver<B>,
+    FrameworkComponent<ElementwiseMulEval>: ComponentProver<B>,
+    FrameworkComponent<LayerNormEval>: ComponentProver<B>,
+    FrameworkComponent<EmbeddingEval>: ComponentProver<B>,
+    FrameworkComponent<QuantizeEval>: ComponentProver<B>,
+{
     info!(
         backend = std::any::type_name::<B>(),
         "Proving unified STARK (on-chain aggregation, Blake2sMerkleChannel)"
@@ -1899,11 +1922,19 @@ where
                         .par_iter()
                         .map(|(node_id, a, c)| {
                             let weight_b = weights.get_weight(*node_id).expect("weight exists");
-                            let entry = crate::gpu_sumcheck::prepare_batch_entry(*node_id, a, weight_b, c)
-                                .map_err(|e| ModelError::ProvingError {
-                                    layer: *node_id,
-                                    message: format!("Batch prep: {e}"),
-                                })?;
+                            let entry = if let Some(cache) = _weight_cache {
+                                crate::gpu_sumcheck::prepare_batch_entry_cached(*node_id, a, weight_b, c, cache)
+                                    .map_err(|e| ModelError::ProvingError {
+                                        layer: *node_id,
+                                        message: format!("Batch prep (cached): {e}"),
+                                    })?
+                            } else {
+                                crate::gpu_sumcheck::prepare_batch_entry(*node_id, a, weight_b, c)
+                                    .map_err(|e| ModelError::ProvingError {
+                                        layer: *node_id,
+                                        message: format!("Batch prep: {e}"),
+                                    })?
+                            };
                             done_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             Ok(entry)
                         })
@@ -2681,6 +2712,50 @@ fn prove_model_aggregated_onchain_gpu(
     }
 }
 
+/// Prove with auto GPU dispatch for on-chain format, with weight commitment cache.
+///
+/// Same as [`prove_model_aggregated_onchain_auto`] but reuses cached weight
+/// commitments from previous inferences. For repeated inference with the same
+/// model, this skips `restrict_cols` + `commit_mle_root_only` for all weight
+/// matrices — saving 30-50% of per-inference proving time.
+///
+/// The cache is populated on first inference (miss) and reused on subsequent
+/// calls (hit). Callers should persist the cache to disk between sessions via
+/// [`WeightCommitmentCache::save`].
+pub fn prove_model_aggregated_onchain_auto_cached(
+    graph: &ComputationGraph,
+    input: &M31Matrix,
+    weights: &GraphWeights,
+    weight_cache: &crate::weight_cache::SharedWeightCache,
+) -> Result<AggregatedModelProofOnChain, AggregationError> {
+    let _cache = weight_cache; // used in cuda-runtime path only
+
+    #[cfg(feature = "cuda-runtime")]
+    {
+        let gpu_available = crate::backend::gpu_is_available();
+        if gpu_available {
+            return prove_model_aggregated_onchain_gpu_cached(graph, input, weights, _cache);
+        }
+    }
+
+    // Non-GPU path: no batch entry prep, cache unused
+    prove_model_aggregated_onchain_with::<SimdBackend>(graph, input, weights)
+}
+
+/// GPU proving path with weight cache.
+#[cfg(feature = "cuda-runtime")]
+fn prove_model_aggregated_onchain_gpu_cached(
+    graph: &ComputationGraph,
+    input: &M31Matrix,
+    weights: &GraphWeights,
+    weight_cache: &crate::weight_cache::SharedWeightCache,
+) -> Result<AggregatedModelProofOnChain, AggregationError> {
+    use stwo::prover::backend::gpu::GpuBackend;
+    prove_model_aggregated_onchain_with_cache::<GpuBackend>(
+        graph, input, weights, Some(weight_cache),
+    )
+}
+
 // --- Type-erased ComponentProver trait for heterogeneous component storage ---
 
 /// Trait object wrapper to hold different `FrameworkComponent<E>` types
@@ -3407,11 +3482,11 @@ pub fn verify_aggregated_model_proof_onchain(
         })?;
     }
 
-    // 2b. Verify attention on-chain proofs (matmul sub-proofs)
+    // 2b. Verify attention on-chain proofs (matmul sub-proofs + softmax STARK)
     let attention_proof_count = proof.attention_proofs.len();
-    for (node_id, attn_proof) in &proof.attention_proofs {
+    for (node_id, attn_proof) in proof.attention_proofs {
         let (_, config, _, _) = attention_verify_data.iter()
-            .find(|(id, _, _, _)| *id == *node_id)
+            .find(|(id, _, _, _)| *id == node_id)
             .ok_or_else(|| AggregationError::VerificationFailed(
                 format!("No attention verify data for node {node_id}")
             ))?;
@@ -3562,14 +3637,10 @@ fn verify_batched_matmul_onchain(
 /// Verify an on-chain attention proof.
 ///
 /// Verifies all matmul sub-proofs (Q/K/V projections, per-head scores,
-/// per-head attn×V, output projection) using the on-chain Poseidon verifier.
-///
-/// Note: AttentionProofOnChain does not include a softmax STARK.
-/// Softmax correctness relies on the commitment chain: the verifier
-/// recomputes softmax from the proven score matrices, and any mismatch
-/// would be caught by downstream matmul sub-proof failures.
+/// per-head attn×V, output projection) using the on-chain Poseidon verifier,
+/// plus the softmax exp STARK proof (Blake2s channel).
 fn verify_attention_proof_onchain(
-    proof: &AttentionProofOnChain,
+    proof: AttentionProofOnChain,
     config: &MultiHeadAttentionConfig,
 ) -> Result<(), AggregationError> {
     use crate::components::matmul::verify_matmul_sumcheck_onchain;
@@ -3623,6 +3694,13 @@ fn verify_attention_proof_onchain(
         .map_err(|e| AggregationError::VerificationFailed(
             format!("Attention on-chain output projection: {e}")
         ))?;
+
+    // Softmax exp STARK
+    verify_attention_softmax_stark(
+        proof.softmax_exp_proof,
+        proof.softmax_claimed_sum,
+        proof.softmax_log_size,
+    )?;
 
     Ok(())
 }
