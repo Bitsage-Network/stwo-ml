@@ -1004,6 +1004,142 @@ pub fn prove_matmul_sumcheck_onchain(
     })
 }
 
+/// Prove with a pre-computed weight commitment.
+///
+/// When the restricted weight MLE (`cached_f_b`) and its Merkle root
+/// (`cached_b_commitment`) are known from a previous inference, this
+/// skips `matrix_to_mle_col_major(b)` + `restrict_mle` + `commit_mle_root_only`
+/// for the B matrix — typically 30-40% of single-matmul proving time.
+///
+/// The caller must guarantee that `cached_f_b` and `cached_b_commitment`
+/// were produced with the same `(m, k, n)` padding and Fiat-Shamir challenges.
+pub fn prove_matmul_sumcheck_onchain_with_cached_weight(
+    a: &M31Matrix,
+    b: &M31Matrix,
+    c: &M31Matrix,
+    cached_f_b: &[SecureField],
+    cached_b_commitment: starknet_ff::FieldElement,
+) -> Result<MatMulSumcheckProofOnChain, MatMulError> {
+    if a.cols != b.rows {
+        return Err(MatMulError::DimensionMismatch(
+            format!("A.cols={} != B.rows={}", a.cols, b.rows),
+        ));
+    }
+    if c.rows != a.rows || c.cols != b.cols {
+        return Err(MatMulError::DimensionMismatch(
+            format!("C({},{}) != expected ({},{})", c.rows, c.cols, a.rows, b.cols),
+        ));
+    }
+
+    let a = &pad_matrix_pow2(a);
+    let b_padded = &pad_matrix_pow2(b);
+    let c = &pad_matrix_pow2(c);
+
+    let m = a.rows;
+    let k = a.cols;
+    let n = b_padded.cols;
+    let log_m = m.ilog2() as usize;
+    let log_k = k.ilog2() as usize;
+    let log_n = n.ilog2() as usize;
+
+    let mle_a = matrix_to_mle(a);
+    let mle_c = matrix_to_mle(c);
+
+    let mut channel = PoseidonChannel::new();
+    channel.mix_u64(m as u64);
+    channel.mix_u64(k as u64);
+    channel.mix_u64(n as u64);
+
+    let r_i = channel.draw_qm31s(log_m);
+    let _r_j = channel.draw_qm31s(log_n);
+
+    let mut r_ij = Vec::with_capacity(log_m + log_n);
+    r_ij.extend_from_slice(&r_i);
+    r_ij.extend_from_slice(&_r_j);
+    let claimed_sum = evaluate_mle(&mle_c, &r_ij);
+    channel.mix_felt(securefield_to_felt(claimed_sum));
+
+    let f_a = restrict_mle(&mle_a, &r_i);
+    assert_eq!(f_a.len(), k);
+
+    let f_b = cached_f_b;
+    assert_eq!(f_b.len(), k, "cached f_b length {} != k {}", f_b.len(), k);
+
+    let a_commitment = commit_mle_root_only(&f_a);
+    let b_commitment = cached_b_commitment;
+
+    channel.mix_felt(a_commitment);
+    channel.mix_felt(b_commitment);
+
+    let num_rounds = log_k;
+    let mut round_polys = Vec::with_capacity(num_rounds);
+    let mut assignment = Vec::with_capacity(num_rounds);
+    let mut cur_a = f_a.clone();
+    let mut cur_b = f_b.to_vec();
+
+    for _round in 0..num_rounds {
+        let half = cur_a.len() / 2;
+        let mut s0 = SecureField::zero();
+        let mut s1 = SecureField::zero();
+        let mut s2 = SecureField::zero();
+
+        for i in 0..half {
+            let a0 = cur_a[i];
+            let a1 = cur_a[half + i];
+            let b0 = cur_b[i];
+            let b1 = cur_b[half + i];
+            s0 += a0 * b0;
+            s1 += a1 * b1;
+            let a2 = a1 + a1 - a0;
+            let b2 = b1 + b1 - b0;
+            s2 += a2 * b2;
+        }
+
+        let c0 = s0;
+        let two = SecureField::from(M31::from(2));
+        let c2 = (s2 - two * s1 + s0) * two.inverse();
+        let c1 = s1 - s0 - c2;
+
+        round_polys.push(RoundPoly { c0, c1, c2 });
+        channel.mix_poly_coeffs(c0, c1, c2);
+        let r_k = channel.draw_qm31();
+        assignment.push(r_k);
+
+        let mut new_a = Vec::with_capacity(half);
+        let mut new_b = Vec::with_capacity(half);
+        for i in 0..half {
+            new_a.push(cur_a[i] + r_k * (cur_a[half + i] - cur_a[i]));
+            new_b.push(cur_b[i] + r_k * (cur_b[half + i] - cur_b[i]));
+        }
+        cur_a = new_a;
+        cur_b = new_b;
+    }
+
+    assert_eq!(cur_a.len(), 1);
+    assert_eq!(cur_b.len(), 1);
+    let final_a_eval = cur_a[0];
+    let final_b_eval = cur_b[0];
+
+    let f_b_owned = cached_f_b.to_vec();
+    let a_opening = prove_mle_opening(&f_a, &assignment, &mut channel);
+    let b_opening = prove_mle_opening(&f_b_owned, &assignment, &mut channel);
+
+    Ok(MatMulSumcheckProofOnChain {
+        m: m as u32,
+        k: k as u32,
+        n: n as u32,
+        num_rounds: num_rounds as u32,
+        claimed_sum,
+        round_polys,
+        final_a_eval,
+        final_b_eval,
+        a_commitment,
+        b_commitment,
+        a_opening,
+        b_opening,
+    })
+}
+
 /// Verify an on-chain matmul sumcheck proof (local pre-flight check).
 ///
 /// Replays the Fiat-Shamir transcript using PoseidonChannel, verifies
