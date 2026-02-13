@@ -195,6 +195,7 @@ where
             lookup_elements,
             claimed_sum,
             total_sum: claimed_sum,
+            activation_type_tag: 0, // standalone proof — no cross-type batching
         },
         claimed_sum,
     );
@@ -297,7 +298,7 @@ fn compute_activation_logup_simd(
     log_size: u32,
     lookup_elements: &ActivationRelation,
 ) -> (Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>, SecureField) {
-    use stwo::prover::backend::simd::m31::LOG_N_LANES;
+    use stwo::prover::backend::simd::m31::{LOG_N_LANES, PackedBaseField};
 
     let size = 1usize << log_size;
     let vec_size = size >> LOG_N_LANES;
@@ -305,12 +306,15 @@ fn compute_activation_logup_simd(
     let mut logup_gen = LogupTraceGenerator::new(log_size);
     let mut col_gen = logup_gen.new_col();
 
+    // Type tag = 0 for standalone proofs (no cross-type batching).
+    let tag_packed = PackedBaseField::broadcast(M31::from(0u32));
+
     for vec_row in 0..vec_size {
         let q_table: PackedSecureField = lookup_elements.lookup_elements().combine(
-            &[table_input_col.data[vec_row], table_output_col.data[vec_row]],
+            &[tag_packed, table_input_col.data[vec_row], table_output_col.data[vec_row]],
         );
         let q_trace: PackedSecureField = lookup_elements.lookup_elements().combine(
-            &[trace_input_col.data[vec_row], trace_output_col.data[vec_row]],
+            &[tag_packed, trace_input_col.data[vec_row], trace_output_col.data[vec_row]],
         );
 
         let mult_packed: PackedSecureField = mult_col_data_at(

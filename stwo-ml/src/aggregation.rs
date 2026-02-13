@@ -29,7 +29,7 @@ use stwo::core::pcs::CommitmentSchemeVerifier;
 use stwo::core::air::Component;
 use stwo::core::verifier::verify as stwo_verify;
 use stwo::prover::backend::simd::SimdBackend;
-use stwo::prover::backend::simd::m31::LOG_N_LANES;
+use stwo::prover::backend::simd::m31::{LOG_N_LANES, PackedBaseField};
 use stwo::prover::backend::simd::qm31::PackedSecureField;
 use stwo::prover::backend::{Col, Column, BackendForChannel};
 use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
@@ -154,9 +154,17 @@ pub fn compute_layer_chain_commitment(
 /// of a valid proof with different I/O claims.
 pub fn compute_io_commitment(input: &M31Matrix, output: &M31Matrix) -> FieldElement {
     let mut hash_inputs = Vec::new();
+    // Domain separation: prefix each section with dimensions to prevent
+    // input=[1,2,3],output=[4,5] colliding with input=[1,2],output=[3,4,5].
+    hash_inputs.push(FieldElement::from(input.rows as u64));
+    hash_inputs.push(FieldElement::from(input.cols as u64));
+    hash_inputs.push(FieldElement::from(input.data.len() as u64));
     for &v in &input.data {
         hash_inputs.push(FieldElement::from(v.0 as u64));
     }
+    hash_inputs.push(FieldElement::from(output.rows as u64));
+    hash_inputs.push(FieldElement::from(output.cols as u64));
+    hash_inputs.push(FieldElement::from(output.data.len() as u64));
     for &v in &output.data {
         hash_inputs.push(FieldElement::from(v.0 as u64));
     }
@@ -172,10 +180,13 @@ pub fn compute_io_commitment(input: &M31Matrix, output: &M31Matrix) -> FieldElem
 /// Follows the same `poseidon_hash_many` pattern as `compute_layer_chain_commitment`
 /// and `compute_io_commitment`.
 pub fn compute_layernorm_mean_var_commitment(means: &[M31], variances: &[M31]) -> FieldElement {
-    let mut hash_inputs = Vec::with_capacity(means.len() + variances.len());
+    let mut hash_inputs = Vec::with_capacity(2 + means.len() + variances.len());
+    // Domain separation: length prefix each section to prevent boundary ambiguity.
+    hash_inputs.push(FieldElement::from(means.len() as u64));
     for &m in means {
         hash_inputs.push(FieldElement::from(m.0 as u64));
     }
+    hash_inputs.push(FieldElement::from(variances.len() as u64));
     for &v in variances {
         hash_inputs.push(FieldElement::from(v.0 as u64));
     }
@@ -324,6 +335,8 @@ struct ActivationLayerData {
     outputs: Vec<M31>,
     table: PrecomputedTable,
     log_size: u32,
+    /// Activation type tag for LogUp domain separation (M1 fix).
+    type_tag: u32,
 }
 
 /// Collected Add layer data for unified STARK aggregation.
@@ -482,6 +495,7 @@ where
                     outputs: flat_outputs,
                     table,
                     log_size: act_log_size,
+                    type_tag: activation_type.type_tag(),
                 });
 
                 intermediates.push((node.id, current.clone()));
@@ -971,12 +985,15 @@ where
             let mut logup_gen = LogupTraceGenerator::new(layer.log_size);
             let mut col_gen = logup_gen.new_col();
 
+            // Type tag broadcast — domain separates activation types in LogUp (M1 fix).
+            let tag_packed = PackedBaseField::broadcast(M31::from(layer.type_tag));
+
             for vec_row in 0..layer_vec_size {
                 let q_table: PackedSecureField = lookup.lookup_elements().combine(
-                    &[table_in_col.data[vec_row], table_out_col.data[vec_row]],
+                    &[tag_packed, table_in_col.data[vec_row], table_out_col.data[vec_row]],
                 );
                 let q_trace: PackedSecureField = lookup.lookup_elements().combine(
-                    &[trace_in_col.data[vec_row], trace_out_col.data[vec_row]],
+                    &[tag_packed, trace_in_col.data[vec_row], trace_out_col.data[vec_row]],
                 );
 
                 let mult_packed = pack_multiplicities(&activation_mults[idx], vec_row);
@@ -1161,6 +1178,7 @@ where
                     lookup_elements: lookup.clone(),
                     claimed_sum,
                     total_sum: claimed_sum,
+                    activation_type_tag: layer.type_tag,
                 },
                 claimed_sum,
             );
@@ -1582,6 +1600,7 @@ where
                     outputs: flat_outputs,
                     table,
                     log_size: act_log_size,
+                    type_tag: activation_type.type_tag(),
                 });
 
                 intermediates.push((node.id, current.clone()));
@@ -2348,12 +2367,15 @@ where
                 let mut logup_gen = LogupTraceGenerator::new(layer.log_size);
                 let mut col_gen = logup_gen.new_col();
 
+                // Type tag broadcast — domain separates activation types in LogUp (M1 fix).
+                let tag_packed = PackedBaseField::broadcast(M31::from(layer.type_tag));
+
                 for vec_row in 0..layer_vec_size {
                     let q_table: PackedSecureField = lookup.lookup_elements().combine(
-                        &[table_in_col.data[vec_row], table_out_col.data[vec_row]],
+                        &[tag_packed, table_in_col.data[vec_row], table_out_col.data[vec_row]],
                     );
                     let q_trace: PackedSecureField = lookup.lookup_elements().combine(
-                        &[trace_in_col.data[vec_row], trace_out_col.data[vec_row]],
+                        &[tag_packed, trace_in_col.data[vec_row], trace_out_col.data[vec_row]],
                     );
 
                     let mult_packed = pack_multiplicities(&activation_mults[idx], vec_row);
@@ -2529,6 +2551,7 @@ where
                     lookup_elements: lookup.clone(),
                     claimed_sum,
                     total_sum: claimed_sum,
+                    activation_type_tag: layer.type_tag,
                 },
                 claimed_sum,
             );
@@ -3260,7 +3283,7 @@ pub fn verify_aggregated_model_proof(
     }
 
     // 2b. Verify attention proofs (matmul sub-proofs + softmax STARK)
-    let attention_proof_count = proof.attention_proofs.len();
+    let attention_node_ids: Vec<usize> = proof.attention_proofs.iter().map(|(id, _)| *id).collect();
     for (node_id, attn_proof) in proof.attention_proofs {
         let (_, config, attn_weights, attn_input) = attention_verify_data.iter()
             .find(|(id, _, _, _)| *id == node_id)
@@ -3285,17 +3308,18 @@ pub fn verify_aggregated_model_proof(
         )?;
     }
 
-    // 4. Verify model completeness: every provable layer has a proof/claim
+    // 4. Verify model completeness: every provable layer has a proof/claim (by node identity)
+    let matmul_ids: Vec<usize> = proof.matmul_proofs.iter().map(|(id, _)| *id).collect();
     verify_model_completeness(
         graph,
-        proof.matmul_proofs.len(),
-        proof.activation_claims.len(),
-        proof.add_claims.len(),
-        proof.mul_claims.len(),
-        proof.layernorm_claims.len(),
-        attention_proof_count,
-        proof.embedding_claims.len(),
-        proof.quantize_claims.len(),
+        &matmul_ids,
+        &proof.activation_claims,
+        &proof.add_claims,
+        &proof.mul_claims,
+        &proof.layernorm_claims,
+        &attention_node_ids,
+        &proof.embedding_claims,
+        &proof.quantize_claims,
     )?;
 
     Ok(())
@@ -3491,7 +3515,7 @@ pub fn verify_aggregated_model_proof_onchain(
     }
 
     // 2b. Verify attention on-chain proofs (matmul sub-proofs + softmax STARK)
-    let attention_proof_count = proof.attention_proofs.len();
+    let attention_node_ids: Vec<usize> = proof.attention_proofs.iter().map(|(id, _)| *id).collect();
     for (node_id, attn_proof) in proof.attention_proofs {
         let (_, config, _, _) = attention_verify_data.iter()
             .find(|(id, _, _, _)| *id == node_id)
@@ -3514,19 +3538,21 @@ pub fn verify_aggregated_model_proof_onchain(
         )?;
     }
 
-    // 4. Verify model completeness
-    let total_matmul = proof.matmul_proofs.len()
-        + proof.batched_matmul_proofs.iter().map(|b| b.entries.len()).sum::<usize>();
+    // 4. Verify model completeness (by node identity, not just count)
+    let mut matmul_ids: Vec<usize> = proof.matmul_proofs.iter().map(|(id, _)| *id).collect();
+    for batch in &proof.batched_matmul_proofs {
+        matmul_ids.extend(batch.entries.iter().map(|e| e.node_id));
+    }
     verify_model_completeness(
         graph,
-        total_matmul,
-        proof.activation_claims.len(),
-        proof.add_claims.len(),
-        proof.mul_claims.len(),
-        proof.layernorm_claims.len(),
-        attention_proof_count,
-        proof.embedding_claims.len(),
-        proof.quantize_claims.len(),
+        &matmul_ids,
+        &proof.activation_claims,
+        &proof.add_claims,
+        &proof.mul_claims,
+        &proof.layernorm_claims,
+        &attention_node_ids,
+        &proof.embedding_claims,
+        &proof.quantize_claims,
     )?;
 
     Ok(())
@@ -3713,72 +3739,86 @@ fn verify_attention_proof_onchain(
     Ok(())
 }
 
-/// Verify model completeness: every provable layer in the graph has a corresponding proof/claim.
+/// Verify model completeness: every provable layer in the graph has a corresponding proof/claim
+/// matched by node identity (not just count).
 ///
-/// Counts the expected number of each operation type from the graph, then verifies
-/// the proof contains exactly that many proofs/claims. Conv2D counts as a matmul.
-/// Identity and Quantize are passthrough (not proven).
+/// Walks the graph to collect expected node IDs per operation type, then verifies
+/// the proof covers exactly those node IDs — no duplicates, no omissions.
+/// Conv2D counts as a matmul. Identity is passthrough (not proven).
 fn verify_model_completeness(
     graph: &ComputationGraph,
-    num_matmul_proofs: usize,
-    num_activation_claims: usize,
-    num_add_claims: usize,
-    num_mul_claims: usize,
-    num_layernorm_claims: usize,
-    num_attention_proofs: usize,
-    num_embedding_claims: usize,
-    num_quantize_claims: usize,
+    matmul_node_ids: &[usize],
+    activation_claims: &[LayerClaim],
+    add_claims: &[LayerClaim],
+    mul_claims: &[LayerClaim],
+    layernorm_claims: &[LayerClaim],
+    attention_node_ids: &[usize],
+    embedding_claims: &[LayerClaim],
+    quantize_claims: &[LayerClaim],
 ) -> Result<(), AggregationError> {
-    let mut expected_matmul = 0usize;
-    let mut expected_activation = 0usize;
-    let mut expected_add = 0usize;
-    let mut expected_mul = 0usize;
-    let mut expected_layernorm = 0usize;
-    let mut expected_attention = 0usize;
-    let mut expected_embedding = 0usize;
-    let mut expected_quantize = 0usize;
+    use std::collections::HashSet;
+
+    let mut expected_matmul: HashSet<usize> = HashSet::new();
+    let mut expected_activation: HashSet<usize> = HashSet::new();
+    let mut expected_add: HashSet<usize> = HashSet::new();
+    let mut expected_mul: HashSet<usize> = HashSet::new();
+    let mut expected_layernorm: HashSet<usize> = HashSet::new();
+    let mut expected_attention: HashSet<usize> = HashSet::new();
+    let mut expected_embedding: HashSet<usize> = HashSet::new();
+    let mut expected_quantize: HashSet<usize> = HashSet::new();
 
     for node in &graph.nodes {
         match &node.op {
-            GraphOp::MatMul { .. } | GraphOp::Conv2D { .. } => expected_matmul += 1,
-            GraphOp::Activation { .. } => expected_activation += 1,
-            GraphOp::Add { .. } => expected_add += 1,
-            GraphOp::Mul { .. } => expected_mul += 1,
-            GraphOp::LayerNorm { .. } => expected_layernorm += 1,
-            GraphOp::Attention { .. } => expected_attention += 1,
-            GraphOp::Embedding { .. } => expected_embedding += 1,
-            GraphOp::Quantize { .. } => expected_quantize += 1,
-            // Identity — passthrough, not proven
+            GraphOp::MatMul { .. } | GraphOp::Conv2D { .. } => { expected_matmul.insert(node.id); }
+            GraphOp::Activation { .. } => { expected_activation.insert(node.id); }
+            GraphOp::Add { .. } => { expected_add.insert(node.id); }
+            GraphOp::Mul { .. } => { expected_mul.insert(node.id); }
+            GraphOp::LayerNorm { .. } => { expected_layernorm.insert(node.id); }
+            GraphOp::Attention { .. } => { expected_attention.insert(node.id); }
+            GraphOp::Embedding { .. } => { expected_embedding.insert(node.id); }
+            GraphOp::Quantize { .. } => { expected_quantize.insert(node.id); }
             _ => {}
         }
     }
 
     let mut mismatches = Vec::new();
 
-    if num_matmul_proofs != expected_matmul {
-        mismatches.push(format!("matmul: expected {expected_matmul}, got {num_matmul_proofs}"));
+    // Check each operation type: actual node IDs vs expected node IDs
+    fn check_identity(
+        label: &str,
+        expected: &HashSet<usize>,
+        actual_ids: &[usize],
+        mismatches: &mut Vec<String>,
+    ) {
+        let actual: HashSet<usize> = actual_ids.iter().copied().collect();
+        // Detect duplicates: actual_ids.len() > actual.len() means duplicate node IDs
+        if actual_ids.len() > actual.len() {
+            let mut seen = HashSet::new();
+            let dups: Vec<usize> = actual_ids.iter().filter(|id| !seen.insert(**id)).copied().collect();
+            mismatches.push(format!("{label}: duplicate node IDs {dups:?}"));
+        }
+        let missing: Vec<usize> = expected.difference(&actual).copied().collect();
+        let unexpected: Vec<usize> = actual.difference(expected).copied().collect();
+        if !missing.is_empty() {
+            mismatches.push(format!("{label}: missing nodes {missing:?}"));
+        }
+        if !unexpected.is_empty() {
+            mismatches.push(format!("{label}: unexpected nodes {unexpected:?}"));
+        }
     }
-    if num_activation_claims != expected_activation {
-        mismatches.push(format!("activation: expected {expected_activation}, got {num_activation_claims}"));
+
+    fn claims_to_ids(claims: &[LayerClaim]) -> Vec<usize> {
+        claims.iter().map(|c| c.layer_index).collect()
     }
-    if num_add_claims != expected_add {
-        mismatches.push(format!("add: expected {expected_add}, got {num_add_claims}"));
-    }
-    if num_mul_claims != expected_mul {
-        mismatches.push(format!("mul: expected {expected_mul}, got {num_mul_claims}"));
-    }
-    if num_layernorm_claims != expected_layernorm {
-        mismatches.push(format!("layernorm: expected {expected_layernorm}, got {num_layernorm_claims}"));
-    }
-    if num_attention_proofs != expected_attention {
-        mismatches.push(format!("attention: expected {expected_attention}, got {num_attention_proofs}"));
-    }
-    if num_embedding_claims != expected_embedding {
-        mismatches.push(format!("embedding: expected {expected_embedding}, got {num_embedding_claims}"));
-    }
-    if num_quantize_claims != expected_quantize {
-        mismatches.push(format!("quantize: expected {expected_quantize}, got {num_quantize_claims}"));
-    }
+
+    check_identity("matmul", &expected_matmul, matmul_node_ids, &mut mismatches);
+    check_identity("activation", &expected_activation, &claims_to_ids(activation_claims), &mut mismatches);
+    check_identity("add", &expected_add, &claims_to_ids(add_claims), &mut mismatches);
+    check_identity("mul", &expected_mul, &claims_to_ids(mul_claims), &mut mismatches);
+    check_identity("layernorm", &expected_layernorm, &claims_to_ids(layernorm_claims), &mut mismatches);
+    check_identity("attention", &expected_attention, attention_node_ids, &mut mismatches);
+    check_identity("embedding", &expected_embedding, &claims_to_ids(embedding_claims), &mut mismatches);
+    check_identity("quantize", &expected_quantize, &claims_to_ids(quantize_claims), &mut mismatches);
 
     if !mismatches.is_empty() {
         return Err(AggregationError::VerificationFailed(
@@ -3872,6 +3912,11 @@ fn verify_unified_stark_blake2s(
     if let Some(ref lookup) = activation_lookup {
         for claim in activation_claims {
             let ls = claim.trace_rows.ilog2();
+            // Look up activation type tag from graph for M1 domain separation.
+            let type_tag = match &graph.nodes.get(claim.layer_index).map(|n| &n.op) {
+                Some(GraphOp::Activation { activation_type, .. }) => activation_type.type_tag(),
+                _ => 0, // fallback for malformed proofs (will fail LogUp anyway)
+            };
             let component = FrameworkComponent::new(
                 &mut allocator,
                 ActivationEval {
@@ -3879,6 +3924,7 @@ fn verify_unified_stark_blake2s(
                     lookup_elements: lookup.clone(),
                     claimed_sum: claim.claimed_sum,
                     total_sum: claim.claimed_sum,
+                    activation_type_tag: type_tag,
                 },
                 claim.claimed_sum,
             );
@@ -4107,6 +4153,7 @@ fn verify_attention_softmax_stark(
             lookup_elements: ActivationRelation::dummy(),
             claimed_sum,
             total_sum: claimed_sum,
+            activation_type_tag: 0,
         },
         claimed_sum,
     );
@@ -4139,6 +4186,7 @@ fn verify_attention_softmax_stark(
             lookup_elements,
             claimed_sum,
             total_sum: claimed_sum,
+            activation_type_tag: 0, // standalone softmax proof
         },
         claimed_sum,
     );
@@ -4189,6 +4237,7 @@ fn build_component_tree_sizes(
                 lookup_elements: ActivationRelation::dummy(),
                 claimed_sum: claim.claimed_sum,
                 total_sum: claim.claimed_sum,
+                activation_type_tag: 0,
             },
             claim.claimed_sum,
         );
@@ -4965,6 +5014,42 @@ mod tests {
         assert!(
             err_msg.contains("Model completeness") && err_msg.contains("matmul"),
             "error should mention model completeness and matmul, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_completeness_check_duplicate_matmul_fails() {
+        // H4: Swapping proofs between layers (same count, different identity) must fail.
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(4).linear(2);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+
+        let mut weights = GraphWeights::new();
+        let mut w0 = M31Matrix::new(4, 4);
+        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        weights.add_weight(0, w0);
+        let mut w1 = M31Matrix::new(4, 2);
+        for i in 0..4 { for j in 0..2 { w1.set(i, j, M31::from((i + j + 1) as u32)); } }
+        weights.add_weight(1, w1);
+
+        let mut proof = prove_model_aggregated(&graph, &input, &weights)
+            .expect("proving should succeed");
+
+        // Swap: duplicate node 0's proof in place of node 1's.
+        // Count stays 2, but node 1 is missing.
+        assert_eq!(proof.matmul_proofs.len(), 2);
+        let first_proof = proof.matmul_proofs[0].clone();
+        proof.matmul_proofs[1] = first_proof;
+
+        let result = verify_aggregated_model_proof(proof, &graph, &input, &weights);
+        assert!(result.is_err(), "duplicate matmul node IDs should fail completeness");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("missing") || err_msg.contains("duplicate"),
+            "error should mention missing or duplicate nodes, got: {err_msg}"
         );
     }
 
