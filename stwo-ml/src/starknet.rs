@@ -63,6 +63,8 @@ pub struct StarknetModelProof {
     pub num_attention_proofs: usize,
     /// Number of Embedding claims in the unified STARK.
     pub num_embedding_claims: usize,
+    /// Number of LayerNorm mean/var commitments.
+    pub num_layernorm_mean_var_commitments: usize,
     /// Total number of proven layers.
     pub num_proven_layers: usize,
     /// PCS configuration used for STARK proving (security parameters).
@@ -160,6 +162,7 @@ pub fn build_starknet_proof(proof: &AggregatedModelProof) -> StarknetModelProof 
         num_layernorm_claims: proof.layernorm_claims.len(),
         num_attention_proofs: proof.attention_proofs.len(),
         num_embedding_claims: proof.embedding_claims.len(),
+        num_layernorm_mean_var_commitments: proof.layernorm_mean_var_commitments.len(),
         num_proven_layers: num_proven,
         pcs_config,
         estimated_gas,
@@ -288,6 +291,12 @@ pub fn build_starknet_proof_onchain(proof: &AggregatedModelProofOnChain) -> Star
         combined.push(FieldElement::from(claim.trace_rows as u64));
     }
 
+    // LayerNorm mean/var commitments
+    combined.push(FieldElement::from(proof.layernorm_mean_var_commitments.len() as u64));
+    for commitment in &proof.layernorm_mean_var_commitments {
+        combined.push(*commitment);
+    }
+
     let total_trace_rows: usize = proof.activation_claims.iter().map(|c| c.trace_rows).sum();
     let num_proven = proof.num_proven_layers();
     let estimated_gas = estimate_verification_gas(num_proven, total_trace_rows.max(1));
@@ -305,6 +314,7 @@ pub fn build_starknet_proof_onchain(proof: &AggregatedModelProofOnChain) -> Star
         num_layernorm_claims: proof.layernorm_claims.len(),
         num_attention_proofs: proof.attention_proofs.len(),
         num_embedding_claims: proof.embedding_claims.len(),
+        num_layernorm_mean_var_commitments: proof.layernorm_mean_var_commitments.len(),
         num_proven_layers: num_proven,
         pcs_config,
         estimated_gas,
