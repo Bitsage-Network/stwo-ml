@@ -6,6 +6,8 @@
 
 use std::path::Path;
 
+use stwo::core::fields::m31::M31;
+
 use crate::compiler::graph::{ComputationGraph, GraphWeights, GraphOp};
 use crate::compiler::quantize_weights::{quantize_weight_matrix, quantize_bias_vector, WeightError};
 use crate::gadgets::quantize::QuantStrategy;
@@ -94,6 +96,12 @@ pub fn tensor_to_f32(data: &[u8], dtype: safetensors::Dtype) -> Vec<f32> {
                 })
                 .collect()
         }
+        safetensors::Dtype::I8 => {
+            data.iter().map(|&b| b as i8 as f32).collect()
+        }
+        safetensors::Dtype::U8 => {
+            data.iter().map(|&b| b as f32).collect()
+        }
         _ => {
             // Fallback: treat as f32
             data.chunks_exact(4)
@@ -145,6 +153,47 @@ fn half_to_f32(bits: u16) -> f32 {
 /// Convert bf16 bits to f32.
 fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
+}
+
+/// Size in bytes of a single element for a SafeTensors dtype.
+pub fn dtype_byte_size(dtype: safetensors::Dtype) -> usize {
+    match dtype {
+        safetensors::Dtype::F32 => 4,
+        safetensors::Dtype::F16 | safetensors::Dtype::BF16 => 2,
+        safetensors::Dtype::I8 | safetensors::Dtype::U8 | safetensors::Dtype::BOOL => 1,
+        safetensors::Dtype::I16 | safetensors::Dtype::U16 => 2,
+        safetensors::Dtype::I32 | safetensors::Dtype::U32 => 4,
+        safetensors::Dtype::F64 | safetensors::Dtype::I64 | safetensors::Dtype::U64 => 8,
+        _ => 4, // fallback
+    }
+}
+
+/// Convert a single element's raw bytes to f32, given its dtype.
+///
+/// The `bytes` slice must have exactly `dtype_byte_size(dtype)` bytes.
+pub fn bytes_to_f32_single(bytes: &[u8], dtype: safetensors::Dtype) -> f32 {
+    match dtype {
+        safetensors::Dtype::F32 => {
+            f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        }
+        safetensors::Dtype::F16 => {
+            let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+            half_to_f32(bits)
+        }
+        safetensors::Dtype::BF16 => {
+            let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+            bf16_to_f32(bits)
+        }
+        safetensors::Dtype::I8 => bytes[0] as i8 as f32,
+        safetensors::Dtype::U8 => bytes[0] as f32,
+        _ => {
+            if bytes.len() >= 4 {
+                f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+            } else {
+                0.0
+            }
+        }
+    }
 }
 
 /// List all tensor names in a SafeTensors file.
@@ -219,6 +268,186 @@ pub fn discover_shards(
 
     shards.sort();
     Ok(shards)
+}
+
+/// Unpack packed INT4 data: each byte holds 2 values (lo nibble, hi nibble).
+///
+/// GPTQ/AWQ models store quantized weights as packed INT4 — 2 values per byte.
+/// Returns f32 values in [0, 15].
+pub fn unpack_int4(data: &[u8]) -> Vec<f32> {
+    data.iter().flat_map(|&byte| {
+        let lo = (byte & 0x0F) as f32;
+        let hi = ((byte >> 4) & 0x0F) as f32;
+        [lo, hi]
+    }).collect()
+}
+
+/// Unpack packed INT4 data directly to M31 field elements.
+///
+/// Each byte yields 2 M31 values in [0, 15]. No f32 intermediate.
+pub fn unpack_int4_to_m31(data: &[u8]) -> Vec<M31> {
+    data.iter().flat_map(|&byte| {
+        [
+            M31::from((byte & 0x0F) as u32),
+            M31::from(((byte >> 4) & 0x0F) as u32),
+        ]
+    }).collect()
+}
+
+/// Load weights from a SafeTensors file, preserving native INT8/INT4 quantization.
+///
+/// Returns weights as M31 matrices alongside per-layer QuantParams detected from
+/// companion `{name}_scale` and `{name}_zero_point` tensors.
+///
+/// Supports:
+/// - Standard I8/U8 tensors (loaded as M31 directly)
+/// - GPTQ format: `qweight` (packed INT4), `scales`, `qzeros`
+/// - Standard F32/F16/BF16 (loaded via `tensor_to_f32` + Direct quantization)
+pub fn load_weights_quantized(
+    path: &Path,
+    graph: &ComputationGraph,
+) -> Result<(GraphWeights, Vec<(usize, crate::gadgets::quantize::QuantParams)>), WeightError> {
+    use crate::gadgets::quantize::{QuantParams, QuantStrategy};
+
+    let file = std::fs::File::open(path)
+        .map_err(|e| WeightError::IoError(e.to_string()))?;
+
+    let mmap = unsafe { memmap2::Mmap::map(&file) }
+        .map_err(|e| WeightError::IoError(e.to_string()))?;
+
+    let tensors = safetensors::SafeTensors::deserialize(&mmap)
+        .map_err(|e| WeightError::IoError(e.to_string()))?;
+
+    let mut weights = GraphWeights::new();
+    let mut quant_params: Vec<(usize, QuantParams)> = Vec::new();
+
+    // Check for GPTQ pattern: look for qweight/scales/qzeros tensors
+    let has_gptq = tensors.names().iter().any(|n| n.contains("qweight"));
+
+    for (idx, node) in graph.nodes.iter().enumerate() {
+        if let GraphOp::MatMul { dims: (_m, k, n) } = &node.op {
+            // Try GPTQ packed INT4 format
+            if has_gptq {
+                let qweight_names = [
+                    format!("layers.{idx}.qweight"),
+                    format!("model.layers.{idx}.qweight"),
+                ];
+                for name in &qweight_names {
+                    if let Ok(tensor) = tensors.tensor(name) {
+                        let data = unpack_int4_to_m31(tensor.data());
+                        let matrix = crate::components::matmul::M31Matrix {
+                            rows: *k,
+                            cols: *n,
+                            data: if data.len() >= k * n { data[..k * n].to_vec() } else { data },
+                        };
+                        weights.add_weight(idx, matrix);
+
+                        // Read scale from companion tensor
+                        let scale_name = name.replace("qweight", "scales");
+                        let scale = if let Ok(st) = tensors.tensor(&scale_name) {
+                            let sf = tensor_to_f32(st.data(), st.dtype());
+                            sf.first().copied().unwrap_or(1.0) as f64
+                        } else {
+                            1.0
+                        };
+
+                        // Read zero point from companion tensor
+                        let zp_name = name.replace("qweight", "qzeros");
+                        let zero_point = if let Ok(zt) = tensors.tensor(&zp_name) {
+                            let zf = tensor_to_f32(zt.data(), zt.dtype());
+                            zf.first().copied().unwrap_or(0.0) as i32
+                        } else {
+                            0
+                        };
+
+                        quant_params.push((idx, QuantParams {
+                            strategy: QuantStrategy::Asymmetric4,
+                            scale,
+                            zero_point,
+                            bits: 4,
+                        }));
+                        break;
+                    }
+                }
+                continue;
+            }
+
+            // Try standard tensor names
+            let tensor_names = [
+                format!("weight.{idx}"),
+                format!("layers.{idx}.weight"),
+                format!("model.layers.{idx}.weight"),
+            ];
+
+            for name in &tensor_names {
+                if let Ok(tensor) = tensors.tensor(name) {
+                    match tensor.dtype() {
+                        safetensors::Dtype::I8 | safetensors::Dtype::U8 => {
+                            // Load as M31 directly (no f32 intermediate)
+                            let data: Vec<M31> = match tensor.dtype() {
+                                safetensors::Dtype::I8 => tensor.data().iter()
+                                    .map(|&b| M31::from((b as i8 as i32 + 128) as u32))
+                                    .collect(),
+                                _ => tensor.data().iter()
+                                    .map(|&b| M31::from(b as u32))
+                                    .collect(),
+                            };
+                            let matrix = crate::components::matmul::M31Matrix {
+                                rows: *k,
+                                cols: *n,
+                                data: if data.len() >= k * n { data[..k * n].to_vec() } else { data },
+                            };
+                            weights.add_weight(idx, matrix);
+
+                            // Read companion scale/zero_point
+                            let scale_name = format!("{name}_scale");
+                            let scale = if let Ok(st) = tensors.tensor(&scale_name) {
+                                let sf = tensor_to_f32(st.data(), st.dtype());
+                                sf.first().copied().unwrap_or(1.0) as f64
+                            } else {
+                                1.0
+                            };
+
+                            let zp_name = format!("{name}_zero_point");
+                            let zero_point = if let Ok(zt) = tensors.tensor(&zp_name) {
+                                let zf = tensor_to_f32(zt.data(), zt.dtype());
+                                zf.first().copied().unwrap_or(0.0) as i32
+                            } else if tensor.dtype() == safetensors::Dtype::I8 {
+                                128
+                            } else {
+                                0
+                            };
+
+                            let (strategy, bits) = if tensor.dtype() == safetensors::Dtype::I8 {
+                                (QuantStrategy::Symmetric8, 8)
+                            } else {
+                                (QuantStrategy::Asymmetric8, 8)
+                            };
+
+                            quant_params.push((idx, QuantParams {
+                                strategy,
+                                scale,
+                                zero_point,
+                                bits,
+                            }));
+                            break;
+                        }
+                        _ => {
+                            // F32/F16/BF16 — load via f32 path with Direct quantization
+                            let data = tensor_to_f32(tensor.data(), tensor.dtype());
+                            let (matrix, _) = crate::compiler::quantize_weights::quantize_weight_matrix(
+                                &data, *k, *n, QuantStrategy::Direct,
+                            );
+                            weights.add_weight(idx, matrix);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((weights, quant_params))
 }
 
 /// List all tensors across multiple shards, with shard index.
@@ -447,6 +676,43 @@ mod tests {
 
         // Cleanup
         std::fs::remove_dir_all(&tmp_dir).ok();
+    }
+
+    #[test]
+    fn test_unpack_int4() {
+        // 0xAB = lo=0xB=11, hi=0xA=10
+        let data = vec![0xAB, 0x34];
+        let unpacked = super::unpack_int4(&data);
+        assert_eq!(unpacked.len(), 4);
+        assert_eq!(unpacked[0], 11.0); // 0xB
+        assert_eq!(unpacked[1], 10.0); // 0xA
+        assert_eq!(unpacked[2], 4.0);  // 0x4
+        assert_eq!(unpacked[3], 3.0);  // 0x3
+    }
+
+    #[test]
+    fn test_unpack_int4_to_m31() {
+        let data = vec![0x12, 0xFF];
+        let unpacked = super::unpack_int4_to_m31(&data);
+        assert_eq!(unpacked.len(), 4);
+        assert_eq!(unpacked[0], M31::from(2));  // 0x2
+        assert_eq!(unpacked[1], M31::from(1));  // 0x1
+        assert_eq!(unpacked[2], M31::from(15)); // 0xF
+        assert_eq!(unpacked[3], M31::from(15)); // 0xF
+    }
+
+    #[test]
+    fn test_tensor_to_f32_i8() {
+        let data: Vec<u8> = vec![0, 127, 128, 255]; // as i8: 0, 127, -128, -1
+        let result = super::tensor_to_f32(&data, safetensors::Dtype::I8);
+        assert_eq!(result, vec![0.0, 127.0, -128.0, -1.0]);
+    }
+
+    #[test]
+    fn test_tensor_to_f32_u8() {
+        let data: Vec<u8> = vec![0, 127, 128, 255];
+        let result = super::tensor_to_f32(&data, safetensors::Dtype::U8);
+        assert_eq!(result, vec![0.0, 127.0, 128.0, 255.0]);
     }
 
     #[test]

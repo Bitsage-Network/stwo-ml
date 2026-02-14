@@ -196,11 +196,14 @@ pub fn generate_activation_trace<B: ColumnOps<BaseField>>(
 }
 
 /// Compute multiplicities for the activation table given the trace inputs.
+///
+/// Uses the table's hash index (O(1) lookup) when available for tables >= 2^10,
+/// falling back to linear scan for smaller tables.
 pub fn compute_multiplicities(trace_inputs: &[M31], table: &PrecomputedTable) -> Vec<M31> {
     let mut multiplicities = vec![0u32; table.size()];
 
     for input in trace_inputs {
-        if let Some(idx) = table.inputs.iter().position(|&x| x == *input) {
+        if let Some(idx) = table.lookup_index(*input) {
             multiplicities[idx] += 1;
         }
     }

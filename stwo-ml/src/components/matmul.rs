@@ -1281,9 +1281,7 @@ pub fn compute_lagrange_basis_pub(challenges: &[SecureField]) -> Vec<SecureField
 
 /// Prove matmul sumcheck with automatic GPU dispatch.
 ///
-/// Uses GPU when the padded inner dimension k >= 2^MLE_THRESHOLD and CUDA
-/// is available. Non-power-of-2 matrices are padded inside the GPU path.
-/// Falls back to CPU `prove_matmul_sumcheck` only when no GPU is available.
+/// Uses GPU when available. Falls back to CPU on GPU errors (OOM, context loss).
 pub fn prove_matmul_sumcheck_auto(
     a: &M31Matrix,
     b: &M31Matrix,
@@ -1292,10 +1290,12 @@ pub fn prove_matmul_sumcheck_auto(
     #[cfg(feature = "cuda-runtime")]
     {
         if crate::backend::gpu_is_available() {
-            // Use padded k for threshold (5120 → 8192 = 2^13, threshold = 2^14)
-            // Always prefer GPU when available — even below threshold, GPU avoids
-            // CPU bottlenecks for large models with many sequential matmuls.
-            return crate::gpu_sumcheck::prove_matmul_sumcheck_gpu(a, b, c);
+            match crate::gpu_sumcheck::prove_matmul_sumcheck_gpu(a, b, c) {
+                Ok(proof) => return Ok(proof),
+                Err(e) => {
+                    tracing::warn!("GPU sumcheck failed, falling back to CPU: {e}");
+                }
+            }
         }
     }
     prove_matmul_sumcheck(a, b, c)
@@ -1303,8 +1303,7 @@ pub fn prove_matmul_sumcheck_auto(
 
 /// Prove on-chain matmul sumcheck with automatic GPU dispatch.
 ///
-/// Uses GPU when available for the sumcheck inner loop (reduction + fold).
-/// Falls back to CPU `prove_matmul_sumcheck_onchain` only when no GPU is available.
+/// Uses GPU when available. Falls back to CPU on GPU errors (OOM, context loss).
 pub fn prove_matmul_sumcheck_onchain_auto(
     a: &M31Matrix,
     b: &M31Matrix,
@@ -1313,7 +1312,12 @@ pub fn prove_matmul_sumcheck_onchain_auto(
     #[cfg(feature = "cuda-runtime")]
     {
         if crate::backend::gpu_is_available() {
-            return crate::gpu_sumcheck::prove_matmul_sumcheck_onchain_gpu(a, b, c);
+            match crate::gpu_sumcheck::prove_matmul_sumcheck_onchain_gpu(a, b, c) {
+                Ok(proof) => return Ok(proof),
+                Err(e) => {
+                    tracing::warn!("GPU on-chain sumcheck failed, falling back to CPU: {e}");
+                }
+            }
         }
     }
     prove_matmul_sumcheck_onchain(a, b, c)

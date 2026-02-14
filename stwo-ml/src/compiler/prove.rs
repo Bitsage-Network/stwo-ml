@@ -56,6 +56,8 @@ pub enum LayerProofKind<H: MerkleHasherLifted> {
     ElementwiseMul(StarkProof<H>),
     /// LayerNorm: LogUp proof for rsqrt lookup + output constraint.
     LayerNorm(StarkProof<H>),
+    /// RMSNorm: LogUp proof for rsqrt lookup + output = input * rsqrt constraint.
+    RMSNorm(StarkProof<H>),
     /// Identity: no proof needed (structural op only).
     Passthrough,
 }
@@ -664,6 +666,150 @@ where
     Ok((component, proof))
 }
 
+/// Prove an RMSNorm layer via LogUp STARK.
+///
+/// Same structure as `prove_layernorm_layer` but with 5 trace columns (no mean).
+pub fn prove_rmsnorm_layer<B, MC>(
+    inputs: &[M31],
+    rms_sq_vals: &[M31],
+    rsqrt_vals: &[M31],
+    outputs: &[M31],
+    rsqrt_table: &PrecomputedTable,
+    config: PcsConfig,
+) -> Result<(FrameworkComponent<crate::components::rmsnorm::RMSNormEval>, StarkProof<<MC as MerkleChannel>::H>), ModelError>
+where
+    B: BackendForChannel<MC> + PolyOps,
+    MC: MerkleChannel,
+    FrameworkComponent<crate::components::rmsnorm::RMSNormEval>: stwo::prover::ComponentProver<B>,
+{
+    use crate::components::rmsnorm::{RMSNormEval, RMSNormRelation};
+
+    let log_size = rsqrt_table.log_size.max(4);
+    let size = 1usize << log_size;
+    let domain = CanonicCoset::new(log_size).circle_domain();
+
+    let pad_val = M31::from(0);
+    let pad_rsqrt = rsqrt_table.outputs.first().copied().unwrap_or(M31::from(0));
+
+    let multiplicities = compute_multiplicities(rms_sq_vals, rsqrt_table);
+
+    // Preprocessed columns (rsqrt table)
+    let mut table_rms_col = Col::<SimdBackend, BaseField>::zeros(size);
+    let mut table_rsqrt_col = Col::<SimdBackend, BaseField>::zeros(size);
+    for (i, (&inp, &out)) in rsqrt_table.inputs.iter().zip(rsqrt_table.outputs.iter()).enumerate().take(size) {
+        table_rms_col.set(i, inp);
+        table_rsqrt_col.set(i, out);
+    }
+
+    let preprocessed = vec![
+        CircleEvaluation::new(domain, table_rms_col.clone()),
+        CircleEvaluation::new(domain, table_rsqrt_col.clone()),
+    ];
+
+    // Execution trace (5 columns: input, rms_sq, rsqrt, output, multiplicity)
+    let mut input_col = Col::<SimdBackend, BaseField>::zeros(size);
+    let mut rms_col = Col::<SimdBackend, BaseField>::zeros(size);
+    let mut rsqrt_col = Col::<SimdBackend, BaseField>::zeros(size);
+    let mut output_col = Col::<SimdBackend, BaseField>::zeros(size);
+    let mut mult_col = Col::<SimdBackend, BaseField>::zeros(size);
+
+    let n = inputs.len().min(size);
+    for i in 0..n {
+        input_col.set(i, inputs[i]);
+        rms_col.set(i, rms_sq_vals[i]);
+        rsqrt_col.set(i, rsqrt_vals[i]);
+        output_col.set(i, outputs[i]);
+    }
+    for i in n..size {
+        input_col.set(i, pad_val);
+        rms_col.set(i, rsqrt_table.inputs.first().copied().unwrap_or(pad_val));
+        rsqrt_col.set(i, pad_rsqrt);
+        output_col.set(i, pad_val);
+    }
+    for (i, &m) in multiplicities.iter().enumerate().take(size) {
+        mult_col.set(i, m);
+    }
+
+    let execution = vec![
+        CircleEvaluation::new(domain, input_col),
+        CircleEvaluation::new(domain, rms_col.clone()),
+        CircleEvaluation::new(domain, rsqrt_col.clone()),
+        CircleEvaluation::new(domain, output_col),
+        CircleEvaluation::new(domain, mult_col),
+    ];
+
+    // Commit
+    let twiddles = B::precompute_twiddles(
+        CanonicCoset::new(log_size + 1 + config.fri_config.log_blowup_factor)
+            .circle_domain()
+            .half_coset,
+    );
+    let channel = &mut MC::C::default();
+    let mut commitment_scheme = CommitmentSchemeProver::<B, MC>::new(config, &twiddles);
+
+    let mut tree_builder = commitment_scheme.tree_builder();
+    tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(preprocessed));
+    tree_builder.commit(channel);
+
+    let mut tree_builder = commitment_scheme.tree_builder();
+    tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(execution));
+    tree_builder.commit(channel);
+
+    let lookup_elements: RMSNormRelation = RMSNormRelation::draw(channel);
+
+    // LogUp interaction trace
+    use stwo::prover::backend::simd::m31::LOG_N_LANES;
+    let vec_size = size >> LOG_N_LANES;
+
+    let mut logup_gen = LogupTraceGenerator::new(log_size);
+    let mut col_gen = logup_gen.new_col();
+
+    for vec_row in 0..vec_size {
+        let q_table: PackedSecureField = lookup_elements.lookup_elements().combine(
+            &[table_rms_col.data[vec_row], table_rsqrt_col.data[vec_row]],
+        );
+        let q_trace: PackedSecureField = lookup_elements.lookup_elements().combine(
+            &[rms_col.data[vec_row], rsqrt_col.data[vec_row]],
+        );
+
+        let mult_packed = mult_col_data_at(&multiplicities, vec_row, log_size);
+
+        let numerator = q_table - mult_packed * q_trace;
+        let denominator = q_table * q_trace;
+
+        col_gen.write_frac(vec_row, numerator, denominator);
+    }
+    col_gen.finalize_col();
+
+    let (interaction_trace, claimed_sum) = logup_gen.finalize_last();
+
+    let mut tree_builder = commitment_scheme.tree_builder();
+    tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(interaction_trace));
+    tree_builder.commit(channel);
+
+    let component = FrameworkComponent::new(
+        &mut TraceLocationAllocator::default(),
+        RMSNormEval {
+            log_n_rows: log_size,
+            dim: inputs.len(),
+            lookup_elements,
+            claimed_sum,
+        },
+        claimed_sum,
+    );
+
+    let proof = prove::<B, MC>(
+        &[&component],
+        channel,
+        commitment_scheme,
+    ).map_err(|e| ModelError::ProvingError {
+        layer: 0,
+        message: format!("RMSNorm STARK: {e:?}"),
+    })?;
+
+    Ok((component, proof))
+}
+
 /// Element-wise addition of two matrices.
 /// Parallelized with rayon for arrays >= 4096 elements.
 pub fn elementwise_add(lhs: &M31Matrix, rhs: &M31Matrix) -> M31Matrix {
@@ -853,6 +999,104 @@ fn apply_layernorm(input: &M31Matrix, dim: usize) -> M31Matrix {
     apply_layernorm_detailed(input, dim).output_matrix
 }
 
+/// RMSNorm intermediates for proving.
+pub(crate) struct RMSNormIntermediates {
+    pub inputs: Vec<M31>,
+    pub rms_sq_vals: Vec<M31>,
+    pub rsqrt_vals: Vec<M31>,
+    pub outputs: Vec<M31>,
+    pub output_matrix: M31Matrix,
+}
+
+/// Compute RMSNorm forward pass in M31 field arithmetic, returning intermediates for proving.
+///
+/// y = x × rsqrt(mean(x²))
+///
+/// Unlike LayerNorm, there is no mean subtraction. Only:
+/// 1. rms² = sum(x²) / n
+/// 2. rsqrt = lookup_table(rms²)
+/// 3. output = input × rsqrt
+pub(crate) fn apply_rmsnorm_detailed(input: &M31Matrix, dim: usize) -> RMSNormIntermediates {
+    use rayon::prelude::*;
+    use crate::components::rmsnorm::{build_rsqrt_table, RMSNormConfig};
+
+    let rsqrt_table = build_rsqrt_table(RMSNormConfig::new(dim).rsqrt_table_log_size);
+    let n = dim.min(input.cols);
+    let inv_n = m31_mod_inverse(n as u32);
+    let cols = input.cols;
+
+    let process_row = |row: usize| -> (Vec<M31>, Vec<M31>, Vec<M31>, Vec<M31>, Vec<M31>) {
+        let row_start = row * cols;
+
+        // RMS²: sum(x²) / n
+        let mut sq_sum = M31::from(0);
+        for col in 0..n {
+            let x = input.data[row_start + col];
+            sq_sum += x * x;
+        }
+        let rms_sq = sq_sum * inv_n;
+
+        let rsqrt = rsqrt_table
+            .lookup(rms_sq)
+            .unwrap_or(M31::from(1u32 << 16));
+
+        let mut row_out = Vec::with_capacity(cols);
+        let mut row_inputs = Vec::with_capacity(cols);
+        let mut row_rms = Vec::with_capacity(cols);
+        let mut row_rsqrt = Vec::with_capacity(cols);
+        let mut row_outputs = Vec::with_capacity(cols);
+
+        for col in 0..n {
+            let x = input.data[row_start + col];
+            let out_val = x * rsqrt;
+            row_out.push(out_val);
+            row_inputs.push(x);
+            row_rms.push(rms_sq);
+            row_rsqrt.push(rsqrt);
+            row_outputs.push(out_val);
+        }
+        for col in n..cols {
+            let x = input.data[row_start + col];
+            row_out.push(x);
+            row_inputs.push(x);
+            row_rms.push(M31::from(0));
+            row_rsqrt.push(M31::from(1u32 << 16));
+            row_outputs.push(x);
+        }
+
+        (row_out, row_inputs, row_rms, row_rsqrt, row_outputs)
+    };
+
+    let row_results: Vec<_> = if input.rows >= 64 {
+        (0..input.rows).into_par_iter().map(process_row).collect()
+    } else {
+        (0..input.rows).map(process_row).collect()
+    };
+
+    let total = input.rows * cols;
+    let mut out_data = Vec::with_capacity(total);
+    let mut all_inputs = Vec::with_capacity(total);
+    let mut all_rms_sq = Vec::with_capacity(total);
+    let mut all_rsqrt = Vec::with_capacity(total);
+    let mut all_outputs = Vec::with_capacity(total);
+
+    for (row_out, ri, rr, rs, ro) in row_results {
+        out_data.extend(row_out);
+        all_inputs.extend(ri);
+        all_rms_sq.extend(rr);
+        all_rsqrt.extend(rs);
+        all_outputs.extend(ro);
+    }
+
+    RMSNormIntermediates {
+        inputs: all_inputs,
+        rms_sq_vals: all_rms_sq,
+        rsqrt_vals: all_rsqrt,
+        outputs: all_outputs,
+        output_matrix: M31Matrix { rows: input.rows, cols, data: out_data },
+    }
+}
+
 /// Modular inverse of n in M31 via Fermat's little theorem: n^(P-2) mod P.
 fn m31_mod_inverse(n: u32) -> M31 {
     if n == 0 {
@@ -890,6 +1134,7 @@ where
     FrameworkComponent<ElementwiseAddEval>: stwo::prover::ComponentProver<B>,
     FrameworkComponent<ElementwiseMulEval>: stwo::prover::ComponentProver<B>,
     FrameworkComponent<LayerNormEval>: stwo::prover::ComponentProver<B>,
+    FrameworkComponent<crate::components::rmsnorm::RMSNormEval>: stwo::prover::ComponentProver<B>,
 {
     info!(
         backend = std::any::type_name::<B>(),
@@ -1012,6 +1257,36 @@ where
 
                 layer_proofs.push(LayerProof {
                     kind: LayerProofKind::LayerNorm(proof),
+                    claimed_sum: SecureField::from(M31::from(0)),
+                    layer_index: node.id,
+                });
+            }
+
+            GraphOp::RMSNorm { dim } => {
+                let rn = apply_rmsnorm_detailed(&current, *dim);
+                let rsqrt_table = crate::components::rmsnorm::build_rsqrt_table(
+                    crate::components::rmsnorm::RMSNormConfig::new(*dim).rsqrt_table_log_size,
+                );
+                let config = PcsConfig::default();
+
+                let (_component, proof) = prove_rmsnorm_layer::<B, MC>(
+                    &rn.inputs,
+                    &rn.rms_sq_vals,
+                    &rn.rsqrt_vals,
+                    &rn.outputs,
+                    &rsqrt_table,
+                    config,
+                ).map_err(|e| ModelError::ProvingError {
+                    layer: node.id,
+                    message: format!("RMSNorm STARK: {e}"),
+                })?;
+
+                intermediates.push((node.id, current.clone()));
+                node_outputs.insert(node.id, rn.output_matrix.clone());
+                current = rn.output_matrix;
+
+                layer_proofs.push(LayerProof {
+                    kind: LayerProofKind::RMSNorm(proof),
                     claimed_sum: SecureField::from(M31::from(0)),
                     layer_index: node.id,
                 });
@@ -1144,8 +1419,11 @@ where
             }
 
             GraphOp::Quantize { .. }
-            | GraphOp::Identity { .. } => {
-                // Quantize: applied to weights at load time, identity in forward pass.
+            | GraphOp::Dequantize { .. }
+            | GraphOp::Identity { .. }
+            | GraphOp::RoPE { .. } => {
+                // Quantize/Dequantize: proven in aggregation via LogUp.
+                // RoPE: proven in aggregation via LogUp rotation table.
                 // Identity: no-op by definition.
                 intermediates.push((node.id, current.clone()));
                 node_outputs.insert(node.id, current.clone());
@@ -1196,6 +1474,7 @@ where
     FrameworkComponent<ElementwiseAddEval>: stwo::prover::ComponentProver<B>,
     FrameworkComponent<ElementwiseMulEval>: stwo::prover::ComponentProver<B>,
     FrameworkComponent<LayerNormEval>: stwo::prover::ComponentProver<B>,
+    FrameworkComponent<crate::components::rmsnorm::RMSNormEval>: stwo::prover::ComponentProver<B>,
 {
     info!(
         backend = std::any::type_name::<B>(),
@@ -1339,6 +1618,27 @@ where
                     layer_index: node.id,
                 });
             }
+            GraphOp::RMSNorm { dim } => {
+                let rn = apply_rmsnorm_detailed(&current, *dim);
+                let rsqrt_table = crate::components::rmsnorm::build_rsqrt_table(
+                    crate::components::rmsnorm::RMSNormConfig::new(*dim).rsqrt_table_log_size,
+                );
+                let config = PcsConfig::default();
+                let (_component, proof) = prove_rmsnorm_layer::<B, MC>(
+                    &rn.inputs, &rn.rms_sq_vals, &rn.rsqrt_vals,
+                    &rn.outputs, &rsqrt_table, config,
+                ).map_err(|e| ModelError::ProvingError {
+                    layer: node.id,
+                    message: format!("RMSNorm STARK: {e}"),
+                })?;
+                node_outputs.insert(node.id, rn.output_matrix.clone());
+                current = rn.output_matrix;
+                layer_proofs.push(LayerProof {
+                    kind: LayerProofKind::RMSNorm(proof),
+                    claimed_sum: SecureField::from(M31::from(0)),
+                    layer_index: node.id,
+                });
+            }
             _ => {
                 // Attention, Embedding, Conv2D, Quantize, Identity
                 node_outputs.insert(node.id, current.clone());
@@ -1440,6 +1740,11 @@ pub fn verify_model_matmuls<H: MerkleHasherLifted>(
                 let output = apply_layernorm(&current, *dim);
                 node_outputs.insert(node.id, output.clone());
                 current = output;
+            }
+            GraphOp::RMSNorm { dim } => {
+                let rn = apply_rmsnorm_detailed(&current, *dim);
+                node_outputs.insert(node.id, rn.output_matrix.clone());
+                current = rn.output_matrix;
             }
             GraphOp::Add { .. } => {
                 let lhs = node.inputs.get(0)

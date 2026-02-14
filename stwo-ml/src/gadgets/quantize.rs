@@ -26,6 +26,10 @@ pub enum QuantStrategy {
     Symmetric8,
     /// INT8 asymmetric: scale with zero-point to [0, 255].
     Asymmetric8,
+    /// INT4 symmetric: scale to [-7, 7], shift to [0, 14]. 4 bits.
+    Symmetric4,
+    /// INT4 asymmetric: scale with zero-point to [0, 15]. 4 bits.
+    Asymmetric4,
 }
 
 /// Quantization parameters for a tensor.
@@ -73,6 +77,26 @@ impl QuantParams {
                     bits: 8,
                 }
             }
+            QuantStrategy::Symmetric4 => {
+                let abs_max = max_val.abs().max(min_val.abs());
+                let scale = abs_max / 7.0;
+                Self {
+                    strategy,
+                    scale,
+                    zero_point: 7, // shift so that 0 maps to 7
+                    bits: 4,
+                }
+            }
+            QuantStrategy::Asymmetric4 => {
+                let scale = (max_val - min_val) / 15.0;
+                let zero_point = (-min_val / scale).round() as i32;
+                Self {
+                    strategy,
+                    scale,
+                    zero_point: zero_point.clamp(0, 15),
+                    bits: 4,
+                }
+            }
         }
     }
 }
@@ -112,6 +136,15 @@ pub fn quantize_tensor(data: &[f32], strategy: QuantStrategy) -> (Vec<M31>, Quan
     let quantized: Vec<M31> = data.iter().map(|&v| quantize_value(v, &params)).collect();
 
     (quantized, params)
+}
+
+/// Quantize a tensor using pre-computed quantization parameters.
+///
+/// Unlike [`quantize_tensor`], this does NOT scan the data for min/max.
+/// Use this when quantizing tiles with a globally-consistent scale/zero_point
+/// computed from the full weight matrix.
+pub fn quantize_tensor_with_params(data: &[f32], params: &QuantParams) -> Vec<M31> {
+    data.iter().map(|&v| quantize_value(v, params)).collect()
 }
 
 /// Dequantize an entire tensor back to Vec<f32>.
@@ -168,5 +201,63 @@ mod tests {
     fn test_empty_tensor() {
         let (q, _) = quantize_tensor(&[], QuantStrategy::Symmetric8);
         assert!(q.is_empty());
+    }
+
+    #[test]
+    fn test_symmetric4_roundtrip() {
+        let values = vec![1.0f32, -1.0, 0.5, -0.5, 0.0];
+        let (quantized, params) = quantize_tensor(&values, QuantStrategy::Symmetric4);
+        assert_eq!(params.bits, 4);
+        let recovered = dequantize_tensor(&quantized, &params);
+
+        for (orig, recov) in values.iter().zip(recovered.iter()) {
+            let error = (orig - recov).abs();
+            assert!(
+                error < 0.2,
+                "Symmetric4 roundtrip error too large: {orig} -> {recov} (error: {error})"
+            );
+        }
+
+        // All quantized values should be in [0, 14]
+        for q in &quantized {
+            assert!(q.0 <= 14, "Symmetric4 value out of range: {}", q.0);
+        }
+    }
+
+    #[test]
+    fn test_asymmetric4_roundtrip() {
+        let values = vec![0.0f32, 1.0, 2.0, 3.0];
+        let (quantized, params) = quantize_tensor(&values, QuantStrategy::Asymmetric4);
+        assert_eq!(params.bits, 4);
+        let recovered = dequantize_tensor(&quantized, &params);
+
+        for (orig, recov) in values.iter().zip(recovered.iter()) {
+            let error = (orig - recov).abs();
+            assert!(
+                error < 0.25,
+                "Asymmetric4 roundtrip error too large: {orig} -> {recov} (error: {error})"
+            );
+        }
+
+        // All quantized values should be in [0, 15]
+        for q in &quantized {
+            assert!(q.0 <= 15, "Asymmetric4 value out of range: {}", q.0);
+        }
+    }
+
+    #[test]
+    fn test_symmetric4_params() {
+        let params = QuantParams::from_range(-1.0, 1.0, QuantStrategy::Symmetric4);
+        assert_eq!(params.bits, 4);
+        assert_eq!(params.zero_point, 7);
+        assert!((params.scale - 1.0 / 7.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_asymmetric4_params() {
+        let params = QuantParams::from_range(0.0, 3.0, QuantStrategy::Asymmetric4);
+        assert_eq!(params.bits, 4);
+        assert_eq!(params.zero_point, 0); // min=0 => zp=0
+        assert!((params.scale - 0.2).abs() < 1e-10); // 3.0/15 = 0.2
     }
 }

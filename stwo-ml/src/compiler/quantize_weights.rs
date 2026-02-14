@@ -5,7 +5,7 @@
 
 use stwo::core::fields::m31::M31;
 
-use crate::gadgets::quantize::{QuantStrategy, QuantParams, quantize_tensor};
+use crate::gadgets::quantize::{QuantStrategy, QuantParams, quantize_tensor, quantize_tensor_with_params};
 use crate::components::matmul::M31Matrix;
 
 /// Quantize a weight matrix from f32 to M31Matrix.
@@ -35,6 +35,31 @@ pub fn quantize_bias_vector(
     strategy: QuantStrategy,
 ) -> (Vec<M31>, QuantParams) {
     quantize_tensor(data, strategy)
+}
+
+/// Quantize a weight tile from f32 to M31Matrix using pre-computed parameters.
+///
+/// Unlike [`quantize_weight_matrix`], this uses existing [`QuantParams`] rather
+/// than computing min/max. This ensures all tiles of a weight matrix use the
+/// same scale/zero_point, which is required for correct tiled sumcheck.
+pub fn quantize_weight_tile(
+    data: &[f32],
+    rows: usize,
+    cols: usize,
+    params: &QuantParams,
+) -> M31Matrix {
+    assert_eq!(data.len(), rows * cols, "data length mismatch");
+
+    let quantized = quantize_tensor_with_params(data, params);
+
+    let mut matrix = M31Matrix::new(rows, cols);
+    for i in 0..rows {
+        for j in 0..cols {
+            matrix.set(i, j, quantized[i * cols + j]);
+        }
+    }
+
+    matrix
 }
 
 /// Error for weight loading.

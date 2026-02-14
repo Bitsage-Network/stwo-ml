@@ -34,3 +34,5 @@ pub mod quantize_weights;
 pub mod dual;
 pub mod checkpoint;
 pub mod chunked;
+#[cfg(feature = "safetensors")]
+pub mod streaming;

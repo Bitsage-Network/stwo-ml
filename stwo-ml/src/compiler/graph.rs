@@ -28,6 +28,11 @@ pub enum GraphOp {
         /// Dimension being normalized.
         dim: usize,
     },
+    /// RMS normalization over the last dimension (no mean subtraction).
+    RMSNorm {
+        /// Dimension being normalized.
+        dim: usize,
+    },
     /// Quantization / dequantization step.
     Quantize {
         params: QuantParams,
@@ -58,6 +63,17 @@ pub enum GraphOp {
         stride: usize,
         padding: usize,
     },
+    /// Dequantization step: maps quantized M31 values back to dequantized M31 values
+    /// via a lookup table. Provable via LogUp (table size = 2^bits).
+    Dequantize {
+        params: QuantParams,
+        size: usize,
+    },
+    /// Rotary Positional Embedding applied to Q/K vectors.
+    /// Applies position-dependent rotations to adjacent element pairs.
+    RoPE {
+        config: crate::components::rope::RoPEConfig,
+    },
     /// Identity / passthrough (for graph structure).
     Identity {
         size: usize,
@@ -80,9 +96,17 @@ impl GraphOp {
                 // Mean + variance + rsqrt lookup + scale/shift
                 dim * 4
             }
+            GraphOp::RMSNorm { dim } => {
+                // rms² + rsqrt lookup + scale (no mean)
+                dim * 3
+            }
             GraphOp::Quantize { size, .. } => {
                 // Range check per element
                 *size
+            }
+            GraphOp::Dequantize { size, params } => {
+                // Trace must be >= table size (2^bits)
+                (*size).max(1usize << params.bits)
             }
             GraphOp::Attention { config } => {
                 config.sumcheck_trace_rows()
@@ -98,6 +122,10 @@ impl GraphOp {
             GraphOp::Conv2D { in_channels, out_channels, kernel_size, .. } => {
                 // im2col + matmul cost
                 in_channels * kernel_size * kernel_size * out_channels
+            }
+            GraphOp::RoPE { config } => {
+                // 7 trace columns per dimension pair: input_x, input_y, cos, sin, out_x, out_y, mult
+                config.seq_len * config.num_pairs()
             }
             GraphOp::Identity { .. } => 0,
         }
@@ -385,6 +413,7 @@ impl ComputationGraph {
                     let (_, total) = estimate_sumcheck_memory(config.seq_len, d, d);
                     total * 4 // Q, K, V, output projections
                 }
+                GraphOp::Dequantize { size, .. } => size * 16,
                 GraphOp::Add { size } | GraphOp::Mul { size } => size * 16,
                 GraphOp::Embedding { vocab_size, embed_dim } => vocab_size * embed_dim * 4,
                 GraphOp::Conv2D { in_channels, out_channels, kernel_size, .. } => {
@@ -458,6 +487,20 @@ impl GraphBuilder {
         self
     }
 
+    /// Add a GQA attention block (num_heads query heads, num_kv_heads key/value heads).
+    pub fn gqa_attention(
+        &mut self,
+        num_heads: usize,
+        num_kv_heads: usize,
+        seq_len: usize,
+        causal: bool,
+    ) -> &mut Self {
+        let shape = self.current_output_shape();
+        let d_model = shape.1;
+        let config = MultiHeadAttentionConfig::new_gqa(num_heads, num_kv_heads, d_model, seq_len, causal);
+        self.attention(config)
+    }
+
     /// Add a layer normalization layer.
     pub fn layer_norm(&mut self) -> &mut Self {
         let shape = self.current_output_shape();
@@ -465,6 +508,37 @@ impl GraphBuilder {
 
         let id = self.graph.add_node(
             GraphOp::LayerNorm { dim: shape.1 },
+            inputs,
+            shape,
+        );
+        self.last_node = Some(id);
+        self
+    }
+
+    /// Add an RMS normalization layer (no mean subtraction).
+    pub fn rms_norm(&mut self) -> &mut Self {
+        let shape = self.current_output_shape();
+        let inputs = self.last_node.map(|n| vec![n]).unwrap_or_default();
+
+        let id = self.graph.add_node(
+            GraphOp::RMSNorm { dim: shape.1 },
+            inputs,
+            shape,
+        );
+        self.last_node = Some(id);
+        self
+    }
+
+    /// Add a RoPE (Rotary Positional Embedding) layer.
+    /// Applied to Q or K matrices before attention.
+    /// Shape is preserved: (seq_len, head_dim) → (seq_len, head_dim).
+    pub fn rope(&mut self, head_dim: usize) -> &mut Self {
+        let shape = self.current_output_shape();
+        let inputs = self.last_node.map(|n| vec![n]).unwrap_or_default();
+        let config = crate::components::rope::RoPEConfig::new(shape.0, head_dim);
+
+        let id = self.graph.add_node(
+            GraphOp::RoPE { config },
             inputs,
             shape,
         );
@@ -490,6 +564,32 @@ impl GraphBuilder {
         );
         self.last_node = Some(id);
         self
+    }
+
+    /// Add a dequantization layer (quantized M31 → dequantized M31 via lookup table).
+    pub fn dequantize(&mut self, params: QuantParams) -> &mut Self {
+        let shape = self.current_output_shape();
+        let size = shape.0 * shape.1;
+        let inputs = self.last_node.map(|n| vec![n]).unwrap_or_default();
+
+        let id = self.graph.add_node(
+            GraphOp::Dequantize { params, size },
+            inputs,
+            shape,
+        );
+        self.last_node = Some(id);
+        self
+    }
+
+    /// Convenience: quantize → linear → dequantize.
+    ///
+    /// Models quantized inference: the input is quantized, the matmul runs in quantized
+    /// domain, and the output is dequantized back to full precision.
+    pub fn quantized_linear(&mut self, out_features: usize, params: QuantParams) -> &mut Self {
+        let deq_params = params.clone();
+        self.quantize(params)
+            .linear(out_features)
+            .dequantize(deq_params)
     }
 
     /// Add a quantization layer.
@@ -594,13 +694,62 @@ impl GraphBuilder {
             None => self.graph.input_shape,
         }
     }
+
+    /// Build a Llama-style transformer block:
+    ///
+    /// ```text
+    /// residual = x
+    /// x = RMSNorm(x)
+    /// x = Attention(x)          // with GQA support
+    /// x = x + residual          // residual connection
+    /// residual = x
+    /// x = RMSNorm(x)
+    /// x = Linear(ffn_dim)       // FFN up-projection
+    /// x = GELU(x)
+    /// x = Linear(d_model)       // FFN down-projection
+    /// x = x + residual          // residual connection
+    /// ```
+    pub fn transformer_block(
+        &mut self,
+        num_heads: usize,
+        num_kv_heads: usize,
+        seq_len: usize,
+        ffn_dim: usize,
+    ) -> &mut Self {
+        // Ensure there's a node to fork from (needed for residual connections)
+        if self.last_node.is_none() {
+            self.identity();
+        }
+
+        let d_model = self.current_output_shape().1;
+        let attn_config = crate::components::attention::MultiHeadAttentionConfig::new_gqa(
+            num_heads, num_kv_heads, d_model, seq_len, true,
+        );
+
+        // Pre-attention norm + attention + residual
+        let residual1 = self.fork();
+        self.rms_norm()
+            .attention(attn_config)
+            .add_from(residual1);
+
+        // Pre-FFN norm + FFN + residual
+        let residual2 = self.fork();
+        self.rms_norm()
+            .linear(ffn_dim)
+            .activation(ActivationType::GELU)
+            .linear(d_model)
+            .add_from(residual2)
+    }
 }
 
 /// Result of executing a computation graph.
 #[derive(Debug, Clone)]
 pub struct GraphExecution {
-    /// Per-node intermediate results.
+    /// Per-node intermediate results (input to each node).
     pub intermediates: Vec<(usize, M31Matrix)>,
+    /// Per-node output results. Used by `get_binary_op_intermediates` to
+    /// look up the OUTPUT of input layers (Add/Mul need outputs, not inputs).
+    pub node_outputs: std::collections::HashMap<usize, M31Matrix>,
     /// Final output.
     pub output: M31Matrix,
 }
@@ -892,5 +1041,98 @@ mod tests {
     fn test_mul_trace_rows() {
         let op = GraphOp::Mul { size: 512 };
         assert_eq!(op.trace_rows(), 512);
+    }
+
+    #[test]
+    fn test_builder_dequantize() {
+        use crate::gadgets::quantize::QuantStrategy;
+        let params = QuantParams {
+            strategy: QuantStrategy::Symmetric8,
+            scale: 0.01,
+            zero_point: 127,
+            bits: 8,
+        };
+        let mut builder = GraphBuilder::new((1, 8));
+        builder.linear(8).dequantize(params);
+        let graph = builder.build();
+
+        assert_eq!(graph.num_layers(), 2);
+        assert!(matches!(graph.nodes[1].op, GraphOp::Dequantize { .. }));
+        assert_eq!(graph.nodes[1].output_shape, (1, 8));
+        // Trace rows: max(size=8, 2^8=256) = 256
+        assert_eq!(graph.nodes[1].op.trace_rows(), 256);
+    }
+
+    #[test]
+    fn test_quantized_linear_convenience() {
+        use crate::gadgets::quantize::QuantStrategy;
+        let params = QuantParams {
+            strategy: QuantStrategy::Symmetric4,
+            scale: 0.1,
+            zero_point: 7,
+            bits: 4,
+        };
+        let mut builder = GraphBuilder::new((1, 8));
+        builder.quantized_linear(4, params);
+        let graph = builder.build();
+
+        // Should produce: Quantize → MatMul → Dequantize
+        assert_eq!(graph.num_layers(), 3);
+        assert!(matches!(graph.nodes[0].op, GraphOp::Quantize { .. }));
+        assert!(matches!(graph.nodes[1].op, GraphOp::MatMul { .. }));
+        assert!(matches!(graph.nodes[2].op, GraphOp::Dequantize { .. }));
+        assert_eq!(graph.output_shape, (1, 4));
+    }
+
+    #[test]
+    fn test_dequantize_trace_rows_int4() {
+        use crate::gadgets::quantize::QuantStrategy;
+        // For INT4 with 2 elements: max(2, 16) = 16
+        let op = GraphOp::Dequantize {
+            params: QuantParams {
+                strategy: QuantStrategy::Symmetric4,
+                scale: 0.1,
+                zero_point: 7,
+                bits: 4,
+            },
+            size: 2,
+        };
+        assert_eq!(op.trace_rows(), 16);
+    }
+
+    #[test]
+    fn test_transformer_block_builder() {
+        // Llama-style: 8 Q heads, 2 KV heads (GQA), d_model=32, seq_len=4
+        let mut builder = GraphBuilder::new((4, 32)); // (seq_len, d_model)
+        builder.transformer_block(
+            8,  // num_heads
+            2,  // num_kv_heads (GQA)
+            4,  // seq_len
+            64, // ffn_dim (2× expansion)
+        );
+        let graph = builder.build();
+
+        // Expected ops:
+        // Identity(input anchor),
+        // RMSNorm, Attention, Add(residual),
+        // RMSNorm, MatMul(up), GELU, MatMul(down), Add(residual)
+        // = 9 nodes
+        assert_eq!(graph.num_layers(), 9);
+        assert_eq!(graph.input_shape, (4, 32));
+        assert_eq!(graph.output_shape, (4, 32)); // preserved through block
+    }
+
+    #[test]
+    fn test_multi_transformer_block() {
+        // Stack 3 transformer blocks
+        let mut builder = GraphBuilder::new((4, 16));
+        for _ in 0..3 {
+            builder.transformer_block(4, 2, 4, 32);
+        }
+        let graph = builder.build();
+
+        // 1 identity + 8 ops per block × 3 = 25 (identity only on first block)
+        assert_eq!(graph.num_layers(), 25);
+        assert_eq!(graph.output_shape, (4, 16));
     }
 }

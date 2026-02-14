@@ -571,6 +571,60 @@ pub fn load_hf_model(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Streaming Weight Pipeline
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Open a streaming weight pipeline for a HuggingFace model directory.
+///
+/// Returns the pipeline (with mmap'd shards, no weights loaded) and the
+/// computation graph. Use [`StreamingWeightPipeline::load_chunk_weights`]
+/// to load weights on demand per chunk.
+///
+/// # Arguments
+/// * `model_dir` - Path to the model directory (must contain `config.json` + SafeTensors shards)
+/// * `strategy` - Quantization strategy for weight conversion
+/// * `num_layers` - Number of transformer layers to load (None = all from config)
+pub fn open_streaming_pipeline(
+    model_dir: &std::path::Path,
+    strategy: QuantStrategy,
+    num_layers: Option<usize>,
+) -> Result<(crate::compiler::streaming::StreamingWeightPipeline, ComputationGraph), OnnxError> {
+    // Parse config
+    let config_path = model_dir.join("config.json");
+    let hf_config = HfConfig::from_file(&config_path)?;
+    let transformer_config = hf_config.to_transformer_config();
+
+    let layers = num_layers.unwrap_or(hf_config.num_hidden_layers);
+    let layers = if layers == 0 { hf_config.num_hidden_layers } else { layers };
+
+    // Build computation graph
+    let graph = build_hf_transformer_graph(&transformer_config, layers);
+
+    // Discover shards
+    let shard_paths = discover_shards(model_dir, "model")
+        .map_err(|e| OnnxError::WeightError(format!("Cannot discover shards: {e}")))?;
+
+    if shard_paths.is_empty() {
+        return Err(OnnxError::WeightError(format!(
+            "No SafeTensors weight files found in {}",
+            model_dir.display(),
+        )));
+    }
+
+    // Build name map
+    let all_tensor_names = list_tensors_sharded(&shard_paths)
+        .map_err(|e| OnnxError::WeightError(format!("Cannot list tensors: {e}")))?;
+    let name_map = build_weight_name_map(&graph, layers, &all_tensor_names);
+
+    // Open pipeline (mmap only, no weight loading)
+    let pipeline = crate::compiler::streaming::StreamingWeightPipeline::open(
+        &shard_paths, &graph, name_map, strategy,
+    ).map_err(|e| OnnxError::WeightError(format!("Cannot open streaming pipeline: {e}")))?;
+
+    Ok((pipeline, graph))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Graph Construction
 // ─────────────────────────────────────────────────────────────────────────────
 
