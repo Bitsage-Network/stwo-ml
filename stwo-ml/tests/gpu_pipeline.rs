@@ -434,12 +434,18 @@ fn test_mlp_full_onchain_pipeline() {
     assert_eq!(agg_proof.matmul_proofs.len(), 2); // 2 matmul layers in this MLP
 
     // Build complete Starknet calldata
-    let starknet_proof = build_starknet_proof_onchain(&agg_proof);
+    let starknet_proof = build_starknet_proof_onchain(&agg_proof, &input);
 
-    // IO commitment should be at index [4] in combined calldata
+    // Raw IO data starts at combined_calldata[4] as a length-prefixed array.
+    // The on-chain verifier recomputes Poseidon(raw_io_data) to derive io_commitment.
     assert!(!starknet_proof.combined_calldata.is_empty());
     assert!(starknet_proof.combined_calldata.len() > 5);
-    assert_eq!(starknet_proof.combined_calldata[4], starknet_proof.io_commitment);
+    let raw_io_len: usize = u64::try_from(starknet_proof.combined_calldata[4]).unwrap() as usize;
+    assert_eq!(raw_io_len, starknet_proof.raw_io_data.len());
+    let recomputed_io = starknet_crypto::poseidon_hash_many(
+        &starknet_proof.combined_calldata[5..5 + raw_io_len],
+    );
+    assert_eq!(recomputed_io, starknet_proof.io_commitment);
 
     // IO commitment should be non-zero
     assert_ne!(starknet_proof.io_commitment, FieldElement::ZERO);
@@ -467,14 +473,19 @@ fn test_io_commitment_binding() {
     let proof2 = prove_model_aggregated_onchain(&model.graph, &input2, &model.weights)
         .expect("proof2 should succeed");
 
-    let sp1 = build_starknet_proof_onchain(&proof1);
-    let sp2 = build_starknet_proof_onchain(&proof2);
+    let sp1 = build_starknet_proof_onchain(&proof1, &input1);
+    let sp2 = build_starknet_proof_onchain(&proof2, &input2);
 
     // Different inputs → different IO commitments
     assert_ne!(sp1.io_commitment, sp2.io_commitment);
 
-    // IO commitment at calldata[4] should also differ
-    assert_ne!(sp1.combined_calldata[4], sp2.combined_calldata[4]);
+    // Raw IO data in calldata should also differ (different inputs produce different raw data)
+    let sp1_raw_len: usize = u64::try_from(sp1.combined_calldata[4]).unwrap() as usize;
+    let sp2_raw_len: usize = u64::try_from(sp2.combined_calldata[4]).unwrap() as usize;
+    assert_ne!(
+        &sp1.combined_calldata[5..5 + sp1_raw_len],
+        &sp2.combined_calldata[5..5 + sp2_raw_len],
+    );
 
     // Verify IO commitment matches compute_io_commitment directly
     let io1 = compute_io_commitment(&input1, &proof1.execution.output);
@@ -491,7 +502,7 @@ fn test_calldata_size_reasonable() {
 
     let proof = prove_model_aggregated_onchain(&model.graph, &input, &model.weights)
         .expect("proving should succeed");
-    let sp = build_starknet_proof_onchain(&proof);
+    let sp = build_starknet_proof_onchain(&proof, &input);
 
     assert!(
         sp.combined_calldata.len() < 50_000,

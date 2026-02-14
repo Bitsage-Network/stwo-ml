@@ -1,0 +1,25 @@
+{
+  "io_commitment": "0x1eaa80d0be08125964523944a20e0a266bba3ff944ff73e55fad77ceb8599e6",
+  "layer_types": [
+    3,
+    0,
+    3,
+    0
+  ],
+  "matmul_dims": [
+    1,
+    4,
+    2,
+    1,
+    4,
+    4
+  ],
+  "model_id": "0xd9",
+  "num_layers": 3,
+  "register_calldata_len": 9,
+  "verify_calldata_len": 160,
+  "weight_commitments": [
+    "0x4e02bf7d415caf3c74621529d05c5f7fce452eceaaccac8be06910d7c2cae90",
+    "0x56294f2776eeb009ae652fc8797d603541a05da26ea35c048c449a02c985fde"
+  ]
+}

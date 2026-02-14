@@ -1,0 +1,14 @@
+{
+  "circuit_descriptor": [
+    1,
+    0
+  ],
+  "io_commitment": "0x33f205161bc350aca4d01e579e359a120a8841ab7610af04ac10ce523a0f5c5",
+  "model_id": "0xd7",
+  "num_layers": 1,
+  "register_calldata_len": 6,
+  "verify_calldata_len": 60,
+  "weight_commitments": [
+    "0x280b62c993d021a4be8ac506a2be7e41b8f4964c23a68f58d950761e3d73ded"
+  ]
+}

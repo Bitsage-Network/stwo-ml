@@ -7,8 +7,8 @@ Cargo.lock
 **/target/release/
 **/target/CACHEDIR.TAG
 
-# Internal planning docs
-docs/
+# Internal planning docs (top-level only)
+/docs/
 
 # Snfoundry cache
 .snfoundry_cache/
