@@ -7,5 +7,14 @@ Cargo.lock
 **/target/release/
 **/target/CACHEDIR.TAG
 
+# Internal planning docs (top-level only)
+/docs/
+
+# Snfoundry cache
+.snfoundry_cache/
+
+# Misc
+findingscore.md
+
 # OS
 .DS_Store

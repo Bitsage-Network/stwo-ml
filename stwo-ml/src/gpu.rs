@@ -268,6 +268,32 @@ impl GpuModelProver {
         }
     }
 
+    // ── Multi-GPU proving ─────────────────────────────────────────────
+
+    /// Prove a model using multiple GPUs with chunk-level parallelism.
+    ///
+    /// Distributes model chunks across all available GPUs using memory-aware
+    /// bin-packing, then composes the independent chunk proofs into a single
+    /// aggregated on-chain proof.
+    ///
+    /// Falls back to single-GPU proving if only one GPU is available.
+    #[cfg(feature = "multi-gpu")]
+    pub fn prove_model_multi_gpu(
+        &self,
+        graph: &ComputationGraph,
+        input: &M31Matrix,
+        weights: &GraphWeights,
+        memory_budget: usize,
+    ) -> Result<AggregatedModelProofOnChain, GpuError> {
+        use crate::compiler::chunked::{prove_model_chunked_multi_gpu, compose_chunk_proofs_auto};
+
+        let chunks = prove_model_chunked_multi_gpu(graph, input, weights, memory_budget)
+            .map_err(|e| GpuError::ProvingError(format!("Multi-GPU chunked proving: {e}")))?;
+
+        compose_chunk_proofs_auto(&chunks, graph, input, weights)
+            .map_err(|e| GpuError::ProvingError(format!("Chunk composition: {e}")))
+    }
+
     // ── TEE-aware proving methods ──────────────────────────────────────
 
     /// Prove a model and return the proof bundled with optional TEE attestation.

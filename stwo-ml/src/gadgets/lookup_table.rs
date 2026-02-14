@@ -98,7 +98,7 @@ impl PrecomputedTable {
         1 << self.log_size
     }
 
-    /// Look up an input value in the table.
+    /// Look up an input value in the table and return its output.
     ///
     /// Uses hash index for large tables, linear scan for small ones.
     pub fn lookup(&self, input: M31) -> Option<M31> {
@@ -109,6 +109,17 @@ impl PrecomputedTable {
                 .iter()
                 .position(|&x| x == input)
                 .map(|idx| self.outputs[idx])
+        }
+    }
+
+    /// Look up an input value and return its index in the table.
+    ///
+    /// Uses hash index for O(1) lookup on large tables.
+    pub fn lookup_index(&self, input: M31) -> Option<usize> {
+        if let Some(ref idx_map) = self.index {
+            idx_map.get(&input.0).copied()
+        } else {
+            self.inputs.iter().position(|&x| x == input)
         }
     }
 

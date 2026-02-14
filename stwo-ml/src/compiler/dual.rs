@@ -184,8 +184,16 @@ pub fn f32_forward(
                 // Forward pass only in f32 — passthrough
             }
 
-            GraphOp::Quantize { .. } | GraphOp::Identity { .. } => {
+            GraphOp::Quantize { .. } | GraphOp::Dequantize { .. } | GraphOp::Identity { .. } => {
                 // Passthrough in f32 — quantization is an M31 concern
+            }
+
+            GraphOp::RMSNorm { dim } => {
+                current = layernorm_f32(&current, *dim, 1e-5);
+            }
+
+            GraphOp::RoPE { .. } => {
+                // RoPE in f32: passthrough (rotation is position-dependent, handled in M31 path)
             }
         }
     }
@@ -223,6 +231,7 @@ where
     FrameworkComponent<crate::components::elementwise::ElementwiseAddEval>: stwo::prover::ComponentProver<B>,
     FrameworkComponent<crate::components::elementwise::ElementwiseMulEval>: stwo::prover::ComponentProver<B>,
     FrameworkComponent<crate::components::layernorm::LayerNormEval>: stwo::prover::ComponentProver<B>,
+    FrameworkComponent<crate::components::rmsnorm::RMSNormEval>: stwo::prover::ComponentProver<B>,
 {
     // 1. Quantize input for M31 pipeline
     let (input_m31, _input_params) = input_f32.to_m31(QuantStrategy::Direct);

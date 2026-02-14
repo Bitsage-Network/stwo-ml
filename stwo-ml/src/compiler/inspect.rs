@@ -115,6 +115,10 @@ pub fn summarize_graph(graph: &ComputationGraph, weights: &GraphWeights) -> Mode
                 num_layernorm += 1;
                 ("LayerNorm".to_string(), 0)
             }
+            GraphOp::RMSNorm { .. } => {
+                num_layernorm += 1;
+                ("RMSNorm".to_string(), 0)
+            }
             GraphOp::Quantize { .. } => {
                 num_other += 1;
                 ("Quantize".to_string(), 0)
@@ -140,6 +144,14 @@ pub fn summarize_graph(graph: &ComputationGraph, weights: &GraphWeights) -> Mode
             GraphOp::Conv2D { in_channels, out_channels, kernel_size, .. } => {
                 num_other += 1;
                 ("Conv2D".to_string(), in_channels * out_channels * kernel_size * kernel_size)
+            }
+            GraphOp::Dequantize { .. } => {
+                num_other += 1;
+                ("Dequantize".to_string(), 0)
+            }
+            GraphOp::RoPE { config } => {
+                num_other += 1;
+                (format!("RoPE(d={})", config.head_dim), 0)
             }
             GraphOp::Identity { .. } => {
                 num_other += 1;

@@ -17,6 +17,7 @@ onnx = ["dep:tract-onnx"]
 safetensors = ["dep:safetensors", "dep:memmap2"]
 model-loading = ["onnx", "safetensors"]
 cli = ["model-loading", "dep:clap", "dep:serde_json", "serde"]
+server = ["model-loading", "dep:axum", "dep:tower-http", "dep:uuid", "dep:tokio", "dep:serde_json", "serde"]
 
 [dependencies]
 stwo = { path = "../stwo/crates/stwo", features = ["prover"] }
@@ -34,6 +35,10 @@ safetensors = { version = "0.4", optional = true }
 memmap2 = { version = "0.9", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
+axum = { version = "0.7", features = ["macros"], optional = true }
+tower-http = { version = "0.5", features = ["cors"], optional = true }
+uuid = { version = "1.6", features = ["v4", "serde"], optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -53,6 +58,11 @@ serde_json = "1"
 name = "prove-model"
 path = "src/bin/prove_model.rs"
 required-features = ["cli"]
+
+[[bin]]
+name = "prove-server"
+path = "src/bin/prove_server.rs"
+required-features = ["server"]
 
 [[bench]]
 name = "matmul"

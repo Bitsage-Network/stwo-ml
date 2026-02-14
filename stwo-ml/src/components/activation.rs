@@ -54,6 +54,18 @@ impl ActivationType {
         }
     }
 
+    /// Unique type tag for LogUp domain separation (M1 fix).
+    /// Ensures ReLU, GELU, Sigmoid, and Softmax use distinct relation entries
+    /// even when they share the same ActivationRelation random challenges.
+    pub fn type_tag(&self) -> u32 {
+        match self {
+            ActivationType::ReLU => 1,
+            ActivationType::GELU => 2,
+            ActivationType::Sigmoid => 3,
+            ActivationType::Softmax => 4,
+        }
+    }
+
     /// Whether this activation can be computed exactly (no approximation).
     pub fn is_exact(&self) -> bool {
         matches!(self, ActivationType::ReLU)
@@ -71,12 +83,13 @@ impl ActivationType {
     }
 }
 
-// Relation type for activation lookups (input, output).
-stwo_constraint_framework::relation!(ActivationRelation, 2);
+// Relation type for activation lookups (type_tag, input, output).
+// 3 elements: type_tag distinguishes activation types sharing the same relation.
+stwo_constraint_framework::relation!(ActivationRelation, 3);
 
 impl ActivationRelation {
     /// Access the inner LookupElements for computing LogUp fractions in the prover.
-    pub fn lookup_elements(&self) -> &stwo_constraint_framework::logup::LookupElements<2> {
+    pub fn lookup_elements(&self) -> &stwo_constraint_framework::logup::LookupElements<3> {
         &self.0
     }
 }
@@ -88,6 +101,8 @@ pub struct ActivationEval {
     pub lookup_elements: ActivationRelation,
     pub claimed_sum: SecureField,
     pub total_sum: SecureField,
+    /// Type tag for LogUp domain separation (M1 fix).
+    pub activation_type_tag: u32,
 }
 
 impl FrameworkEval for ActivationEval {
@@ -113,18 +128,21 @@ impl FrameworkEval for ActivationEval {
         let trace_output = eval.next_trace_mask();
         let multiplicity = eval.next_trace_mask();
 
+        // Type tag: constant per activation type — domain separates ReLU/GELU/etc.
+        let tag = E::F::from(BaseField::from(self.activation_type_tag));
+
         // LogUp: table side (yield)
         eval.add_to_relation(RelationEntry::new(
             &self.lookup_elements,
             -E::EF::from(multiplicity.clone()),
-            &[table_input, table_output],
+            &[tag.clone(), table_input, table_output],
         ));
 
         // LogUp: trace side (use)
         eval.add_to_relation(RelationEntry::new(
             &self.lookup_elements,
             E::EF::from(E::F::from(BaseField::from(1))),
-            &[trace_input, trace_output],
+            &[tag, trace_input, trace_output],
         ));
 
         eval.finalize_logup_in_pairs();
@@ -178,11 +196,14 @@ pub fn generate_activation_trace<B: ColumnOps<BaseField>>(
 }
 
 /// Compute multiplicities for the activation table given the trace inputs.
+///
+/// Uses the table's hash index (O(1) lookup) when available for tables >= 2^10,
+/// falling back to linear scan for smaller tables.
 pub fn compute_multiplicities(trace_inputs: &[M31], table: &PrecomputedTable) -> Vec<M31> {
     let mut multiplicities = vec![0u32; table.size()];
 
     for input in trace_inputs {
-        if let Some(idx) = table.inputs.iter().position(|&x| x == *input) {
+        if let Some(idx) = table.lookup_index(*input) {
             multiplicities[idx] += 1;
         }
     }

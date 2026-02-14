@@ -40,7 +40,7 @@ use starknet_ff::FieldElement;
 use stwo::core::fields::m31::M31;
 
 use stwo_ml::cairo_serde::{
-    MLClaimMetadata, serialize_ml_proof_for_recursive,
+    DirectProofMetadata, MLClaimMetadata, serialize_ml_proof_for_recursive,
     serialize_ml_proof_to_file,
 };
 use stwo_ml::compiler::inspect::summarize_model;
@@ -48,7 +48,8 @@ use stwo_ml::compiler::onnx::{load_onnx, OnnxModel};
 use stwo_ml::components::matmul::M31Matrix;
 use stwo_ml::gadgets::quantize::{QuantStrategy, quantize_tensor};
 use stwo_ml::json_serde;
-use stwo_ml::starknet::compute_io_commitment;
+use stwo_ml::aggregation::compute_io_commitment;
+use stwo_ml::starknet::build_starknet_proof_direct;
 use stwo_ml::tee::{SecurityLevel, detect_tee_capability};
 
 /// Output format for the proof.
@@ -56,6 +57,11 @@ use stwo_ml::tee::{SecurityLevel, detect_tee_capability};
 enum OutputFormat {
     CairoSerde,
     Json,
+    Direct,
+    /// Full ML GKR model proof for on-chain `verify_model_gkr()`.
+    /// Uses `prove_model_pure_gkr_auto` → `build_gkr_starknet_proof` pipeline.
+    /// Output: JSON with GKR calldata, IO calldata, weight openings.
+    MlGkr,
 }
 
 impl std::str::FromStr for OutputFormat {
@@ -64,7 +70,11 @@ impl std::str::FromStr for OutputFormat {
         match s {
             "cairo_serde" | "cairo-serde" | "felt" => Ok(OutputFormat::CairoSerde),
             "json" => Ok(OutputFormat::Json),
-            _ => Err(format!("unknown format '{s}', expected 'cairo_serde' or 'json'")),
+            "direct" => Ok(OutputFormat::Direct),
+            "ml_gkr" | "ml-gkr" | "gkr" => Ok(OutputFormat::MlGkr),
+            _ => Err(format!(
+                "unknown format '{s}', expected 'cairo_serde', 'json', 'direct', or 'ml_gkr'"
+            )),
         }
     }
 }
@@ -101,7 +111,9 @@ struct Cli {
     #[arg(long, default_value = "proof.json")]
     output: PathBuf,
 
-    /// Output format: 'cairo_serde' (felt252 hex array) or 'json'.
+    /// Output format: 'cairo_serde' (felt252 hex for cairo-prove),
+    /// 'json' (human-readable), 'direct' (on-chain verify_model_direct),
+    /// or 'ml_gkr' (full ML GKR proof for on-chain verify_model_gkr).
     #[arg(long, default_value = "cairo_serde")]
     format: OutputFormat,
 
@@ -112,6 +124,18 @@ struct Cli {
     /// Use GPU backend if available.
     #[arg(long)]
     gpu: bool,
+
+    /// Distribute proving across all available GPUs.
+    /// Implies --gpu. Chunks model blocks and assigns them to GPUs
+    /// using memory-aware bin-packing.
+    #[arg(long)]
+    multi_gpu: bool,
+
+    /// Memory budget per chunk in GB (used with --multi-gpu).
+    /// Controls how aggressively the model is chunked. Smaller values
+    /// create more chunks for better load balancing. Default: 16 GB.
+    #[arg(long, default_value = "16")]
+    chunk_budget_gb: f64,
 
     /// Security level: 'auto' (default), 'tee' (require TEE), 'zk-only' (pure ZK).
     ///
@@ -130,6 +154,15 @@ struct Cli {
     #[arg(long)]
     validate: bool,
 
+    /// Use STWO-native GKR for LogUp component verification (lighter than unified STARK).
+    ///
+    /// When enabled, activation/quantize/layernorm LogUp gates are proven via STWO's
+    /// native GKR batch prover, producing a proof compatible with Cairo's
+    /// `partially_verify_batch()`. The unified STARK is still generated for backward
+    /// compatibility; GKR provides an additional lighter verification path.
+    #[arg(long)]
+    gkr: bool,
+
     /// Channel salt for Fiat-Shamir (optional).
     #[arg(long)]
     salt: Option<u64>,
@@ -140,6 +173,28 @@ struct Cli {
     /// so compute it separately with --commitment-only when needed.
     #[arg(long)]
     skip_commitment: bool,
+
+    /// Submit the GKR proof on-chain via `sncast invoke`.
+    /// Requires --format ml_gkr. Calls `verify_model_gkr()` on the contract.
+    /// For proofs >5000 felts, uses chunked upload via `upload_proof_chunk`.
+    #[arg(long)]
+    submit_gkr: bool,
+
+    /// Contract address for --submit-gkr (hex).
+    #[arg(long, default_value = "0x00c7845a80d01927826b17032a432ad9cd36ea61be17fe8cc089d9b68c57e710")]
+    contract: String,
+
+    /// sncast account name for --submit-gkr.
+    #[arg(long, default_value = "deployer")]
+    account: String,
+
+    /// Starknet network for --submit-gkr.
+    #[arg(long, default_value = "sepolia")]
+    network: String,
+
+    /// Max fee in ETH for --submit-gkr transactions.
+    #[arg(long, default_value = "0.05")]
+    max_fee: String,
 }
 
 fn parse_model_id(s: &str) -> FieldElement {
@@ -318,12 +373,35 @@ fn main() {
     // Both only need &model.weights (shared ref), so this is safe.
     // Commitment uses CPU-only (Poseidon hash), while proving uses GPU + rayon.
     // During GPU phases of proving, idle CPU cores handle commitment work.
+    let use_gpu = cli.gpu || cli.multi_gpu;
+
     eprintln!(
-        "Proving {} layers (gpu={}, security={})",
+        "Proving {} layers (gpu={}, multi_gpu={}, security={})",
         model.graph.num_layers(),
-        cli.gpu,
+        use_gpu,
+        cli.multi_gpu,
         cli.security,
     );
+
+    // Multi-GPU: print device discovery info
+    #[cfg(feature = "multi-gpu")]
+    if cli.multi_gpu {
+        let devices = stwo_ml::multi_gpu::discover_devices();
+        if devices.is_empty() {
+            eprintln!("Error: --multi-gpu specified but no GPUs found");
+            process::exit(1);
+        }
+        eprintln!("Multi-GPU: {} device(s) detected", devices.len());
+        for d in &devices {
+            eprintln!(
+                "  GPU {}: {} ({:.1} GB, SM {}.{}, {} SMs)",
+                d.ordinal, d.name,
+                d.total_memory as f64 / 1e9,
+                d.compute_capability.0, d.compute_capability.1,
+                d.sm_count,
+            );
+        }
+    }
 
     let t0 = Instant::now();
 
@@ -342,8 +420,72 @@ fn main() {
             None
         };
 
-        // Prove on main thread (uses GPU + all rayon cores)
-        let proof = if cli.gpu {
+        // Prove on main thread
+        let proof = if cli.format == OutputFormat::MlGkr {
+            // Full ML GKR pipeline: all layers via GKR sumcheck (no individual matmul proofs)
+            eprintln!("Using full ML GKR pipeline (--format ml_gkr)");
+            stwo_ml::aggregation::prove_model_pure_gkr_auto(
+                &model.graph,
+                &input,
+                &model.weights,
+            )
+        } else if cli.multi_gpu {
+            // Multi-GPU path: chunk model and distribute across GPUs
+            #[cfg(feature = "multi-gpu")]
+            {
+                let memory_budget = (cli.chunk_budget_gb * 1e9) as usize;
+                let (chunks, metrics) = stwo_ml::compiler::chunked::prove_model_chunked_multi_gpu_with_metrics(
+                    &model.graph, &input, &model.weights, memory_budget,
+                ).map_err(|e| stwo_ml::compiler::prove::ModelError::ProvingError {
+                    layer: 0,
+                    message: format!("Multi-GPU chunked proving: {e}"),
+                })?;
+
+                eprintln!(
+                    "Multi-GPU proving: {:.2}s total, {} chunks across {} devices",
+                    metrics.total_elapsed.as_secs_f64(),
+                    chunks.len(),
+                    metrics.device_stats.len(),
+                );
+                for stat in &metrics.device_stats {
+                    eprintln!(
+                        "  GPU {}: {} chunks, {} matmuls, {:.2}s",
+                        stat.device_id,
+                        stat.chunks_proven.len(),
+                        stat.matmuls_proven,
+                        stat.elapsed.as_secs_f64(),
+                    );
+                }
+
+                stwo_ml::compiler::chunked::compose_chunk_proofs_auto(
+                    &chunks, &model.graph, &input, &model.weights,
+                ).map_err(|e| stwo_ml::compiler::prove::ModelError::ProvingError {
+                    layer: 0,
+                    message: format!("Chunk composition: {e}"),
+                })
+            }
+            #[cfg(not(feature = "multi-gpu"))]
+            {
+                eprintln!("Error: --multi-gpu requires the 'multi-gpu' feature");
+                process::exit(1);
+            }
+        } else if cli.gkr {
+            // LogUp GKR pipeline: standard pipeline + STWO-native GKR for LogUp components
+            eprintln!("Using STWO-native GKR for LogUp verification");
+            if use_gpu {
+                stwo_ml::aggregation::prove_model_aggregated_onchain_logup_gkr_auto(
+                    &model.graph,
+                    &input,
+                    &model.weights,
+                )
+            } else {
+                stwo_ml::aggregation::prove_model_aggregated_onchain_logup_gkr(
+                    &model.graph,
+                    &input,
+                    &model.weights,
+                )
+            }
+        } else if use_gpu {
             stwo_ml::aggregation::prove_model_aggregated_onchain_auto(
                 &model.graph,
                 &input,
@@ -449,6 +591,101 @@ fn main() {
             });
             len
         }
+        OutputFormat::MlGkr => {
+            use stwo_ml::starknet::build_gkr_starknet_proof;
+
+            let gkr_proof = build_gkr_starknet_proof(&proof, model_id, &input)
+                .unwrap_or_else(|e| {
+                    eprintln!("Error building GKR starknet proof: {e}");
+                    eprintln!("Hint: --format ml_gkr requires the ML GKR pipeline (pure GKR proving).");
+                    process::exit(1);
+                });
+
+            eprintln!(
+                "  gkr_calldata: {} felts, io_calldata: {} felts, weight_openings: {} felts",
+                gkr_proof.gkr_calldata.len(),
+                gkr_proof.io_calldata.len(),
+                gkr_proof.weight_opening_calldata.len(),
+            );
+            eprintln!(
+                "  num_layer_proofs: {}, estimated_gas: {}, total_calldata: {} felts",
+                gkr_proof.num_layer_proofs,
+                gkr_proof.estimated_gas,
+                gkr_proof.total_calldata_size,
+            );
+
+            let json_obj = serde_json::json!({
+                "format": "ml_gkr",
+                "model_id": format!("0x{:064x}", gkr_proof.model_id),
+                "io_commitment": format!("0x{:064x}", gkr_proof.io_commitment),
+                "num_layer_proofs": gkr_proof.num_layer_proofs,
+                "estimated_gas": gkr_proof.estimated_gas,
+                "total_calldata_size": gkr_proof.total_calldata_size,
+                "gkr_calldata": gkr_proof.gkr_calldata.iter()
+                    .map(|f| format!("0x{:x}", f))
+                    .collect::<Vec<_>>(),
+                "io_calldata": gkr_proof.io_calldata.iter()
+                    .map(|f| format!("0x{:x}", f))
+                    .collect::<Vec<_>>(),
+                "weight_opening_calldata": gkr_proof.weight_opening_calldata.iter()
+                    .map(|f| format!("0x{:x}", f))
+                    .collect::<Vec<_>>(),
+            });
+            let output_str = serde_json::to_string_pretty(&json_obj).unwrap();
+            let len = output_str.len();
+            std::fs::write(&cli.output, &output_str).unwrap_or_else(|e| {
+                eprintln!("Error writing output to '{}': {e}", cli.output.display());
+                process::exit(1);
+            });
+            len
+        }
+        OutputFormat::Direct => {
+            let direct_metadata = DirectProofMetadata {
+                model_id,
+                weight_commitment,
+                num_layers: model.graph.num_layers() as u32,
+                activation_type,
+            };
+            let direct_proof = build_starknet_proof_direct(&proof, &input, direct_metadata);
+
+            eprintln!(
+                "  batched_calldata: {} batches, stark_chunks: {} chunks, has_stark: {}",
+                direct_proof.batched_calldata.len(),
+                direct_proof.stark_chunks.len(),
+                direct_proof.has_activation_stark,
+            );
+            eprintln!(
+                "  estimated_gas: {}, total_calldata: {} felts",
+                direct_proof.estimated_gas,
+                direct_proof.total_calldata_size,
+            );
+
+            // Write as JSON for inspection / pipeline consumption
+            let json_obj = serde_json::json!({
+                "model_id": format!("0x{:064x}", direct_proof.model_id),
+                "io_commitment": format!("0x{:064x}", io_commitment),
+                "raw_io_data_len": direct_proof.raw_io_data.len(),
+                "weight_commitment": format!("0x{:064x}", direct_proof.weight_commitment),
+                "num_layers": direct_proof.num_layers,
+                "activation_type": direct_proof.activation_type,
+                "has_activation_stark": direct_proof.has_activation_stark,
+                "estimated_gas": direct_proof.estimated_gas,
+                "total_calldata_size": direct_proof.total_calldata_size,
+                "batched_calldata": direct_proof.batched_calldata.iter()
+                    .map(|batch| batch.iter().map(|f| format!("0x{:x}", f)).collect::<Vec<_>>())
+                    .collect::<Vec<_>>(),
+                "stark_chunks": direct_proof.stark_chunks.iter()
+                    .map(|chunk| chunk.iter().map(|f| format!("0x{:x}", f)).collect::<Vec<_>>())
+                    .collect::<Vec<_>>(),
+            });
+            let output_str = serde_json::to_string_pretty(&json_obj).unwrap();
+            let len = output_str.len();
+            std::fs::write(&cli.output, &output_str).unwrap_or_else(|e| {
+                eprintln!("Error writing output to '{}': {e}", cli.output.display());
+                process::exit(1);
+            });
+            len
+        }
     };
 
     let ser_elapsed = t_ser.elapsed();
@@ -486,6 +723,195 @@ fn main() {
     } else {
         eprintln!("  tee: none (zk-only)");
     }
+
+    // --submit-gkr: submit GKR proof on-chain via sncast
+    if cli.submit_gkr {
+        submit_gkr_onchain(&cli, &model, &proof, &input, model_id, io_commitment);
+    }
+}
+
+/// Submit a GKR proof on-chain via `sncast invoke`.
+///
+/// Steps:
+/// 1. Compile LayeredCircuit from the model graph
+/// 2. Build calldata matching `verify_model_gkr()` contract signature
+/// 3. Write calldata to temp file (may exceed shell arg limit)
+/// 4. Invoke sncast with the calldata
+fn submit_gkr_onchain(
+    cli: &Cli,
+    model: &OnnxModel,
+    proof: &stwo_ml::aggregation::AggregatedModelProofOnChain,
+    input: &M31Matrix,
+    model_id: FieldElement,
+    _io_commitment: FieldElement,
+) {
+    use stwo_ml::starknet::{
+        build_verify_model_gkr_calldata, build_register_gkr_calldata,
+        build_circuit_descriptor,
+    };
+
+    if cli.format != OutputFormat::MlGkr {
+        eprintln!("Error: --submit-gkr requires --format ml_gkr");
+        process::exit(1);
+    }
+
+    let gkr_proof = match &proof.gkr_proof {
+        Some(p) => p,
+        None => {
+            eprintln!("Error: --submit-gkr requires a GKR proof (use --format ml_gkr)");
+            process::exit(1);
+        }
+    };
+
+    // Compile the LayeredCircuit for dimension extraction
+    let circuit = stwo_ml::gkr::LayeredCircuit::from_graph(&model.graph)
+        .unwrap_or_else(|e| {
+            eprintln!("Error compiling GKR circuit: {e}");
+            process::exit(1);
+        });
+
+    eprintln!();
+    eprintln!("=== On-Chain GKR Submission ===");
+    eprintln!("  Contract: {}", cli.contract);
+    eprintln!("  Account:  {}", cli.account);
+    eprintln!("  Network:  {}", cli.network);
+    eprintln!("  Max fee:  {} ETH", cli.max_fee);
+
+    // Step 1: Build verify_model_gkr calldata (raw IO data for on-chain recomputation)
+    let raw_io_data = stwo_ml::cairo_serde::serialize_raw_io(input, &proof.execution.output);
+    let verify_calldata = build_verify_model_gkr_calldata(
+        gkr_proof, &circuit, model_id, &raw_io_data,
+    );
+
+    eprintln!("  Calldata: {} parts ({} estimated felts)", verify_calldata.total_felts, verify_calldata.total_felts);
+
+    // Write calldata to temp file (may exceed shell arg limit for large proofs)
+    let calldata_path = cli.output.with_extension("calldata.txt");
+    let calldata_str = verify_calldata.calldata_parts.join(" ");
+    std::fs::write(&calldata_path, &calldata_str).unwrap_or_else(|e| {
+        eprintln!("Error writing calldata to '{}': {e}", calldata_path.display());
+        process::exit(1);
+    });
+    eprintln!("  Calldata written to: {}", calldata_path.display());
+
+    // Step 2: Check if model needs registration first
+    eprintln!("  Checking model registration...");
+    let check_result = std::process::Command::new("sncast")
+        .args([
+            "--account", &cli.account,
+            "--network", &cli.network,
+            "call",
+            "--contract-address", &cli.contract,
+            "--function", "get_model_circuit_hash",
+            "--calldata", &format!("0x{:x}", model_id),
+        ])
+        .output();
+
+    let needs_registration = match check_result {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // If circuit_hash is 0, model is not registered
+            stdout.contains("0x0") || !output.status.success()
+        }
+        Err(_) => {
+            eprintln!("  Warning: could not check registration (sncast not found?)");
+            eprintln!("  Attempting to register anyway...");
+            true
+        }
+    };
+
+    if needs_registration {
+        eprintln!("  Model not registered — registering for GKR verification...");
+        let circuit_desc = build_circuit_descriptor(&circuit);
+        let register_calldata = build_register_gkr_calldata(
+            model_id,
+            &gkr_proof.weight_commitments,
+            &circuit_desc,
+        );
+        let register_str = register_calldata.join(" ");
+
+        let register_result = std::process::Command::new("sncast")
+            .args([
+                "--account", &cli.account,
+                "--network", &cli.network,
+                "invoke",
+                "--contract-address", &cli.contract,
+                "--function", "register_model_gkr",
+                "--calldata", &register_str,
+                "--max-fee", &cli.max_fee,
+            ])
+            .output();
+
+        match register_result {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                eprintln!("  Registration submitted: {}", stdout.trim());
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                // May fail if already registered — that's OK
+                if stderr.contains("already registered") || stdout.contains("already registered") {
+                    eprintln!("  Model already registered (OK)");
+                } else {
+                    eprintln!("  Warning: registration may have failed:");
+                    eprintln!("    stdout: {}", stdout.trim());
+                    eprintln!("    stderr: {}", stderr.trim());
+                    eprintln!("  Continuing with verification attempt...");
+                }
+            }
+            Err(e) => {
+                eprintln!("  Error: could not run sncast: {e}");
+                eprintln!("  Make sure sncast is installed and in PATH");
+                process::exit(1);
+            }
+        }
+    } else {
+        eprintln!("  Model already registered (OK)");
+    }
+
+    // Step 3: Submit verification
+    eprintln!("  Submitting verify_model_gkr...");
+
+    // For large calldatas, read from file to avoid shell arg limit
+    let verify_result = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "sncast --account '{}' --network '{}' invoke \
+             --contract-address '{}' \
+             --function verify_model_gkr \
+             --calldata $(cat '{}') \
+             --max-fee {}",
+            cli.account,
+            cli.network,
+            cli.contract,
+            calldata_path.display(),
+            cli.max_fee,
+        ))
+        .output();
+
+    match verify_result {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            eprintln!("  Verification submitted successfully!");
+            eprintln!("  {}", stdout.trim());
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            eprintln!("  Error: verification submission failed");
+            eprintln!("    stdout: {}", stdout.trim());
+            eprintln!("    stderr: {}", stderr.trim());
+            eprintln!("  Calldata saved to: {} (retry manually)", calldata_path.display());
+            process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("  Error: could not run sncast: {e}");
+            process::exit(1);
+        }
+    }
+
+    eprintln!("==============================");
 }
 
 /// Check if a cached weight commitment exists with valid fingerprint.

@@ -55,6 +55,21 @@ pub fn channel_mix_felt(ref ch: PoseidonChannel, value: felt252) {
     ch.n_draws = 0;
 }
 
+/// Mix a QM31 value into the channel via 4 individual mix_u64 calls.
+///
+/// CRITICAL: This is NOT the same as channel_mix_felts([v]) which packs into felt252.
+/// This matches Rust gkr/verifier.rs:1906 mix_secure_field() exactly:
+///   channel.mix_u64(v.0.0.0 as u64);  // a.a
+///   channel.mix_u64(v.0.1.0 as u64);  // a.b
+///   channel.mix_u64(v.1.0.0 as u64);  // b.a
+///   channel.mix_u64(v.1.1.0 as u64);  // b.b
+pub fn channel_mix_secure_field(ref ch: PoseidonChannel, v: QM31) {
+    channel_mix_u64(ref ch, v.a.a);
+    channel_mix_u64(ref ch, v.a.b);
+    channel_mix_u64(ref ch, v.b.a);
+    channel_mix_u64(ref ch, v.b.b);
+}
+
 /// Draw a raw felt252 from the channel.
 /// Domain separator THREE(=3) distinguishes draws from mixes.
 fn channel_draw_felt252(ref ch: PoseidonChannel) -> felt252 {
@@ -145,6 +160,63 @@ pub fn channel_mix_poly_coeffs(ref ch: PoseidonChannel, c0: QM31, c1: QM31, c2: 
     packed2 = pack_qm31_into_felt(packed2, c2);
 
     ch.digest = poseidon_hash_span(array![ch.digest, packed1, packed2].span());
+    ch.n_draws = 0;
+}
+
+/// Mix degree-3 polynomial coefficients [c0, c1, c2, c3] into the channel.
+///
+/// Packing (chunks(2)):
+///   Chunk [c0, c1] → 8 M31 → 1 felt252 (starting from ONE)
+///   Chunk [c2, c3] → 8 M31 → 1 felt252 (starting from ONE)
+///   digest = poseidon_hash_many([digest, packed1, packed2])
+///
+/// Equivalent to channel_mix_felts(&[c0, c1, c2, c3]).
+/// Used for GKR eq-sumcheck round polys (Mul, Activation, LayerNorm, etc).
+pub fn channel_mix_poly_coeffs_deg3(
+    ref ch: PoseidonChannel, c0: QM31, c1: QM31, c2: QM31, c3: QM31,
+) {
+    let mut packed1: felt252 = 1;
+    packed1 = pack_qm31_into_felt(packed1, c0);
+    packed1 = pack_qm31_into_felt(packed1, c1);
+
+    let mut packed2: felt252 = 1;
+    packed2 = pack_qm31_into_felt(packed2, c2);
+    packed2 = pack_qm31_into_felt(packed2, c3);
+
+    ch.digest = poseidon_hash_span(array![ch.digest, packed1, packed2].span());
+    ch.n_draws = 0;
+}
+
+/// Mix a variable-length array of QM31 values into the channel.
+/// Matches STWO's channel.mix_felts(&[SecureField]) with chunks(2) packing.
+/// QM31 pairs are packed into felt252 (starting from ONE), leftover single packed alone.
+pub fn channel_mix_felts(ref ch: PoseidonChannel, felts: Span<QM31>) {
+    if felts.len() == 0 {
+        return;
+    }
+    let mut hash_inputs: Array<felt252> = array![ch.digest];
+    let mut i: u32 = 0;
+    loop {
+        if i >= felts.len() {
+            break;
+        }
+        let remaining = felts.len() - i;
+        if remaining >= 2 {
+            // Pack pair
+            let mut packed: felt252 = 1;
+            packed = pack_qm31_into_felt(packed, *felts.at(i));
+            packed = pack_qm31_into_felt(packed, *felts.at(i + 1));
+            hash_inputs.append(packed);
+            i += 2;
+        } else {
+            // Pack single
+            let mut packed: felt252 = 1;
+            packed = pack_qm31_into_felt(packed, *felts.at(i));
+            hash_inputs.append(packed);
+            i += 1;
+        }
+    };
+    ch.digest = poseidon_hash_span(hash_inputs.span());
     ch.n_draws = 0;
 }
 

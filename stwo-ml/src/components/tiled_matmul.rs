@@ -109,7 +109,7 @@ pub enum TiledMatMulError {
 }
 
 /// Extract a column slice `A[:, k_start..k_end]` from matrix A.
-fn extract_col_slice(a: &M31Matrix, k_start: usize, k_end: usize) -> M31Matrix {
+pub(crate) fn extract_col_slice(a: &M31Matrix, k_start: usize, k_end: usize) -> M31Matrix {
     let slice_k = k_end - k_start;
     let mut slice = M31Matrix::new(a.rows, slice_k);
     for i in 0..a.rows {
@@ -121,7 +121,7 @@ fn extract_col_slice(a: &M31Matrix, k_start: usize, k_end: usize) -> M31Matrix {
 }
 
 /// Extract a row slice `B[k_start..k_end, :]` from matrix B.
-fn extract_row_slice(b: &M31Matrix, k_start: usize, k_end: usize) -> M31Matrix {
+pub(crate) fn extract_row_slice(b: &M31Matrix, k_start: usize, k_end: usize) -> M31Matrix {
     let slice_k = k_end - k_start;
     let mut slice = M31Matrix::new(slice_k, b.cols);
     for i in 0..slice_k {
@@ -254,20 +254,29 @@ pub fn verify_tiled_matmul(proof: &TiledMatMulProof) -> Result<(), TiledMatMulEr
 
 /// Compose a tiled proof back into a single `MatMulSumcheckProofOnChain`.
 ///
-/// This enables the existing Cairo verifier to verify tiled proofs without
-/// modification. The composed proof uses the first tile's round polynomials
-/// and final evaluations, with the total_claimed_sum as the aggregated claim.
+/// This is only sound for **single-tile** proofs where the tile's sumcheck
+/// covers the entire inner dimension. For multi-tile proofs, the first tile's
+/// round polynomials correspond to a partial sum, NOT the total claimed sum,
+/// so the verifier would reject (p(0)+p(1) != claimed_sum in round 1).
 ///
-/// **Note**: This composition preserves the soundness guarantee because the
-/// verifier checks `sum(tile_claimed_sums) == MLE_C(r_i, r_j)` at the
-/// serialization/verification layer.
+/// Multi-tile proofs require a dedicated tiled verifier that checks each tile
+/// independently and sums the claimed_sums.
 pub fn compose_tiled_proof(
     tiled: &TiledMatMulProof,
-) -> MatMulSumcheckProofOnChain {
-    // Use the first tile's proof as the base
+) -> Result<MatMulSumcheckProofOnChain, TiledMatMulError> {
+    if tiled.tile_proofs.len() != 1 {
+        return Err(TiledMatMulError::DimensionMismatch(format!(
+            "compose_tiled_proof only supports single-tile proofs (got {} tiles). \
+             Multi-tile proofs cannot be soundly composed into a single sumcheck proof \
+             because the round polynomials from one tile don't match the total claimed sum. \
+             Increase TILED_MEMORY_BUDGET or use verify_tiled_matmul() directly.",
+            tiled.tile_proofs.len(),
+        )));
+    }
+
     let base = &tiled.tile_proofs[0].proof;
 
-    MatMulSumcheckProofOnChain {
+    Ok(MatMulSumcheckProofOnChain {
         m: tiled.m as u32,
         k: tiled.k as u32,
         n: tiled.n as u32,
@@ -280,7 +289,7 @@ pub fn compose_tiled_proof(
         b_commitment: base.b_commitment,
         a_opening: base.a_opening.clone(),
         b_opening: base.b_opening.clone(),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -401,19 +410,38 @@ mod tests {
     }
 
     #[test]
-    fn test_compose_tiled_proof() {
+    fn test_compose_tiled_proof_single_tile() {
+        // Single-tile composition is trivially sound
+        let a = make_matrix(2, 2, 3);
+        let b = make_matrix(2, 2, 7);
+        let c = matmul_m31(&a, &b);
+
+        let config = TiledMatMulConfig::new(2); // tile_k=2 == k=2 → single tile
+        let tiled_proof = prove_tiled_matmul(&a, &b, &c, &config)
+            .expect("tiled proving should succeed");
+        assert_eq!(tiled_proof.tile_proofs.len(), 1);
+
+        let composed = compose_tiled_proof(&tiled_proof)
+            .expect("single-tile composition should succeed");
+        assert_eq!(composed.m, 2);
+        assert_eq!(composed.k, 2);
+        assert_eq!(composed.n, 2);
+        assert_eq!(composed.claimed_sum, tiled_proof.total_claimed_sum);
+    }
+
+    #[test]
+    fn test_compose_tiled_proof_multi_tile_rejected() {
+        // Multi-tile composition is unsound and must be rejected
         let a = make_matrix(2, 4, 3);
         let b = make_matrix(4, 2, 7);
         let c = matmul_m31(&a, &b);
 
-        let config = TiledMatMulConfig::new(2);
+        let config = TiledMatMulConfig::new(2); // tile_k=2 < k=4 → 2 tiles
         let tiled_proof = prove_tiled_matmul(&a, &b, &c, &config)
             .expect("tiled proving should succeed");
+        assert_eq!(tiled_proof.tile_proofs.len(), 2);
 
-        let composed = compose_tiled_proof(&tiled_proof);
-        assert_eq!(composed.m, 2);
-        assert_eq!(composed.k, 4);
-        assert_eq!(composed.n, 2);
-        assert_eq!(composed.claimed_sum, tiled_proof.total_claimed_sum);
+        let result = compose_tiled_proof(&tiled_proof);
+        assert!(result.is_err(), "multi-tile composition must be rejected");
     }
 }

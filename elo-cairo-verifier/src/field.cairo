@@ -143,6 +143,140 @@ pub fn qm31_mul(x: QM31, y: QM31) -> QM31 {
 }
 
 // ============================================================================
+// Field Inversions (M31 → CM31 → QM31)
+// ============================================================================
+
+/// M31 exponentiation via square-and-multiply: base^exp mod P.
+pub fn m31_pow(base: u64, exp: u64) -> u64 {
+    let mut result: u64 = 1;
+    let mut b = base;
+    let mut e = exp;
+    loop {
+        if e == 0 {
+            break;
+        }
+        if e % 2 == 1 {
+            result = m31_mul(result, b);
+        }
+        b = m31_mul(b, b);
+        e = e / 2;
+    };
+    result
+}
+
+/// M31 multiplicative inverse via Fermat's little theorem: a^{P-2} mod P.
+pub fn m31_inverse(a: u64) -> u64 {
+    assert!(a != 0, "M31_ZERO_INVERSE");
+    m31_pow(a, M31_P - 2)
+}
+
+/// CM31 conjugation: conj(a + bi) = a - bi.
+pub fn cm31_conj(z: CM31) -> CM31 {
+    CM31 { a: z.a, b: m31_sub(0, z.b) }
+}
+
+/// CM31 norm squared: |a + bi|^2 = a^2 + b^2 (an M31 value).
+pub fn cm31_norm_sq(z: CM31) -> u64 {
+    m31_add(m31_mul(z.a, z.a), m31_mul(z.b, z.b))
+}
+
+/// CM31 multiplicative inverse: inv(a + bi) = conj(z) / |z|^2.
+pub fn cm31_inverse(z: CM31) -> CM31 {
+    let ns = cm31_norm_sq(z);
+    let inv_ns = m31_inverse(ns);
+    CM31 { a: m31_mul(z.a, inv_ns), b: m31_sub(0, m31_mul(z.b, inv_ns)) }
+}
+
+/// QM31 multiplicative inverse via conjugation over the j-extension.
+///
+/// x = a + b·j where j² = 2 + i.
+/// x^{-1} = conj(x) / norm(x) where:
+///   conj(a + bj) = a - bj
+///   norm(a + bj) = a·a - (2+i)·b·b  (a CM31 value)
+pub fn qm31_inverse(x: QM31) -> QM31 {
+    let a_sq = cm31_mul(x.a, x.a);
+    let b_sq = cm31_mul(x.b, x.b);
+    // (2+i) * (p+qi) = (2p - q) + (p + 2q)i
+    let b_sq_irred = CM31 {
+        a: m31_sub(m31_add(b_sq.a, b_sq.a), b_sq.b),
+        b: m31_add(b_sq.a, m31_add(b_sq.b, b_sq.b)),
+    };
+    let norm = cm31_sub(a_sq, b_sq_irred);
+    let norm_inv = cm31_inverse(norm);
+    let neg_b = CM31 { a: m31_sub(0, x.b.a), b: m31_sub(0, x.b.b) };
+    QM31 { a: cm31_mul(x.a, norm_inv), b: cm31_mul(neg_b, norm_inv) }
+}
+
+/// QM31 negation: -x.
+pub fn qm31_neg(x: QM31) -> QM31 {
+    qm31_sub(qm31_zero(), x)
+}
+
+/// Lift M31 into QM31: v → (v, 0, 0, 0).
+pub fn m31_to_qm31(v: u64) -> QM31 {
+    QM31 { a: CM31 { a: v, b: 0 }, b: CM31 { a: 0, b: 0 } }
+}
+
+/// Lift u32 into QM31 (for multiplicity values in LogUp).
+pub fn qm31_from_u32(v: u32) -> QM31 {
+    m31_to_qm31(v.into())
+}
+
+/// Montgomery batch inversion: N inversions using only 1 inverse + 3(N-1) muls.
+///
+/// Algorithm:
+///   prefix[i] = v_0 * v_1 * ... * v_i
+///   inv_acc   = prefix[N-1]^{-1}
+///   Back-sweep: result[i] = prefix[i-1] * inv_acc, then inv_acc *= v_i
+pub fn batch_inverse(values: Span<QM31>) -> Array<QM31> {
+    let n = values.len();
+    assert!(n > 0, "EMPTY_BATCH");
+
+    // Build prefix products
+    let mut prefix: Array<QM31> = array![];
+    prefix.append(*values.at(0));
+    let mut i: u32 = 1;
+    loop {
+        if i >= n {
+            break;
+        }
+        prefix.append(qm31_mul(*prefix.at(i - 1), *values.at(i)));
+        i += 1;
+    };
+
+    // Single inversion of total product
+    let mut inv_acc = qm31_inverse(*prefix.at(n - 1));
+
+    // Back-sweep: compute inverses in reverse order
+    let mut rev: Array<QM31> = array![];
+    let mut i: u32 = n;
+    loop {
+        if i == 0 {
+            break;
+        }
+        i -= 1;
+        if i == 0 {
+            rev.append(inv_acc);
+        } else {
+            rev.append(qm31_mul(*prefix.at(i - 1), inv_acc));
+        }
+        inv_acc = qm31_mul(inv_acc, *values.at(i));
+    };
+
+    // Reverse to correct order
+    let mut result: Array<QM31> = array![];
+    let mut j: u32 = rev.len();
+    loop {
+        if j == 0 {
+            break;
+        }
+        j -= 1;
+        result.append(*rev.at(j));
+    };
+    result
+}
+
+// ============================================================================
 // Polynomial Evaluation
 // ============================================================================
 
@@ -151,6 +285,148 @@ pub fn qm31_mul(x: QM31, y: QM31) -> QM31 {
 pub fn poly_eval_degree2(c0: QM31, c1: QM31, c2: QM31, x: QM31) -> QM31 {
     let inner = qm31_add(c1, qm31_mul(x, c2));
     qm31_add(c0, qm31_mul(x, inner))
+}
+
+// ============================================================================
+// GKR Field Extensions
+// ============================================================================
+
+/// Evaluate degree-3 polynomial: p(x) = c0 + c1·x + c2·x² + c3·x³.
+/// Uses Horner: p(x) = c0 + x·(c1 + x·(c2 + x·c3)).
+pub fn poly_eval_degree3(c0: QM31, c1: QM31, c2: QM31, c3: QM31, x: QM31) -> QM31 {
+    let inner = qm31_add(c2, qm31_mul(x, c3));
+    let inner = qm31_add(c1, qm31_mul(x, inner));
+    qm31_add(c0, qm31_mul(x, inner))
+}
+
+/// Evaluate the Lagrange kernel (eq function) of the boolean hypercube.
+/// eq(x, y) = Π_i (x_i · y_i + (1 - x_i) · (1 - y_i))
+/// Returns QM31::one() if x == y on {0,1}^n, zero otherwise.
+pub fn eq_eval(x: Span<QM31>, y: Span<QM31>) -> QM31 {
+    assert!(x.len() == y.len(), "eq_eval: length mismatch");
+    let one = qm31_one();
+    let mut result = one;
+    let mut i: u32 = 0;
+    loop {
+        if i >= x.len() {
+            break;
+        }
+        let xi = *x.at(i);
+        let yi = *y.at(i);
+        // term = xi*yi + (1 - xi)*(1 - yi)
+        let xi_yi = qm31_mul(xi, yi);
+        let one_minus_xi = qm31_sub(one, xi);
+        let one_minus_yi = qm31_sub(one, yi);
+        let term = qm31_add(xi_yi, qm31_mul(one_minus_xi, one_minus_yi));
+        result = qm31_mul(result, term);
+        i += 1;
+    };
+    result
+}
+
+/// Fold MLE evaluations: fold(x, v0, v1) = v0 + x · (v1 - v0) = v0·(1-x) + v1·x.
+/// Matches STWO's fold_mle_evals(assignment, eval0, eval1).
+pub fn fold_mle_eval(x: QM31, v0: QM31, v1: QM31) -> QM31 {
+    qm31_add(v0, qm31_mul(x, qm31_sub(v1, v0)))
+}
+
+/// Evaluate a multilinear extension (MLE) at an arbitrary point.
+///
+/// Given 2^n evaluations on the boolean hypercube {0,1}^n and a point r in F^n,
+/// computes f(r) by iterated folding:
+///   For each variable r_i, fold: current[j] = current[j] + r_i * (current[j+mid] - current[j])
+///   After all n variables, a single value remains.
+///
+/// Matches STWO's evaluate_mle (components/matmul.rs:118-132).
+/// Cost: 2n - 1 QM31 operations where n = evals.len().
+pub fn evaluate_mle(evals: Span<QM31>, point: Span<QM31>) -> QM31 {
+    let n = evals.len();
+    assert!(n > 0, "MLE_EMPTY_EVALS");
+
+    // Copy evals into a mutable array
+    let mut current: Array<QM31> = array![];
+    let mut i: u32 = 0;
+    loop {
+        if i >= n {
+            break;
+        }
+        current.append(*evals.at(i));
+        i += 1;
+    };
+
+    let mut size = n;
+    let mut var_idx: u32 = 0;
+    loop {
+        if var_idx >= point.len() {
+            break;
+        }
+        let r = *point.at(var_idx);
+        let mid = size / 2;
+
+        // Fold in-place: for j in 0..mid, current[j] = current[j] + r*(current[j+mid] - current[j])
+        let mut next: Array<QM31> = array![];
+        let mut j: u32 = 0;
+        loop {
+            if j >= mid {
+                break;
+            }
+            let lo = *current.at(j);
+            let hi = *current.at(j + mid);
+            next.append(qm31_add(lo, qm31_mul(r, qm31_sub(hi, lo))));
+            j += 1;
+        };
+
+        current = next;
+        size = mid;
+        var_idx += 1;
+    };
+
+    assert!(size == 1, "MLE_FOLD_INCOMPLETE");
+    *current.at(0)
+}
+
+/// Embed M31 values (as u64) into QM31 and pad to a target power-of-2 length.
+///
+/// Each M31 value v becomes QM31(v, 0, 0, 0). Padding uses QM31::zero().
+/// Used to reconstruct an MLE from raw calldata for on-chain input/output verification.
+pub fn pad_and_embed_m31s(vals: Span<u64>, target_len: u32) -> Array<QM31> {
+    assert!(target_len >= vals.len(), "MLE_TARGET_TOO_SMALL");
+    let mut result: Array<QM31> = array![];
+    let mut i: u32 = 0;
+    loop {
+        if i >= vals.len() {
+            break;
+        }
+        result.append(m31_to_qm31(*vals.at(i)));
+        i += 1;
+    };
+    // Pad with zeros to target_len
+    loop {
+        if result.len() >= target_len {
+            break;
+        }
+        result.append(qm31_zero());
+    };
+    result
+}
+
+/// Random linear combination: v_0 + alpha·v_1 + ... + alpha^(n-1)·v_{n-1}.
+/// Uses Horner evaluation (matches STWO's horner_eval on values).
+pub fn random_linear_combination(values: Span<QM31>, alpha: QM31) -> QM31 {
+    if values.len() == 0 {
+        return qm31_zero();
+    }
+    // Horner: fold from right: acc = acc * alpha + v_i
+    let mut i: u32 = values.len();
+    let mut acc = qm31_zero();
+    loop {
+        if i == 0 {
+            break;
+        }
+        i -= 1;
+        acc = qm31_add(qm31_mul(acc, alpha), *values.at(i));
+    };
+    acc
 }
 
 // ============================================================================

@@ -7,8 +7,16 @@ edition = "2024_07"
 # No token or payment dependencies — pure cryptographic verification.
 # Compatible with any Starknet dapp that needs to verify STWO ML proofs.
 
+[features]
+default = ["poseidon252_verifier"]
+poseidon252_verifier = ["stwo_verifier_core/poseidon252_verifier"]
+
 [dependencies]
 starknet = "2.12.0"
+stwo_verifier_core = { path = "../stwo-cairo/stwo_cairo_verifier/crates/verifier_core" }
+stwo_constraint_framework = { path = "../stwo-cairo/stwo_cairo_verifier/crates/constraint_framework" }
+stwo_verifier_utils = { path = "../stwo-cairo/stwo_cairo_verifier/crates/verifier_utils" }
+bounded_int = { path = "../stwo-cairo/stwo_cairo_verifier/crates/bounded_int" }
 
 [dev-dependencies]
 snforge_std = { git = "https://github.com/foundry-rs/starknet-foundry", tag = "v0.54.0" }
@@ -16,6 +24,7 @@ cairo_test = "2.12.2"
 
 [[target.starknet-contract]]
 casm = true
+allowed-libfuncs-list.name = "experimental"
 
 [tool.snforge]
 name = "elo_cairo_verifier"

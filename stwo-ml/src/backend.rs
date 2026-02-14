@@ -138,16 +138,32 @@ pub struct BackendInfo {
     pub gpu_device: Option<String>,
     pub gpu_memory_bytes: Option<usize>,
     pub gpu_compute_capability: Option<(u32, u32)>,
+    /// Number of GPU devices available (multi-GPU feature).
+    pub gpu_count: usize,
+    /// Per-device information (multi-GPU feature).
+    #[cfg(feature = "multi-gpu")]
+    pub gpu_devices: Vec<crate::multi_gpu::GpuDeviceInfo>,
 }
 
 impl BackendInfo {
     pub fn detect() -> Self {
+        #[cfg(feature = "multi-gpu")]
+        let devices = crate::multi_gpu::discover_devices();
+        #[cfg(not(feature = "multi-gpu"))]
+        let device_count = if gpu_is_available() { 1 } else { 0 };
+
         Self {
             name: if gpu_is_available() { "GpuBackend" } else { "SimdBackend" },
             gpu_available: gpu_is_available(),
             gpu_device: gpu_device_name(),
             gpu_memory_bytes: gpu_available_memory(),
             gpu_compute_capability: gpu_compute_capability(),
+            #[cfg(feature = "multi-gpu")]
+            gpu_count: devices.len(),
+            #[cfg(not(feature = "multi-gpu"))]
+            gpu_count: device_count,
+            #[cfg(feature = "multi-gpu")]
+            gpu_devices: devices,
         }
     }
 }

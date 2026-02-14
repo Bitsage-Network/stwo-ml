@@ -573,8 +573,17 @@ fn test_batch_round_sum_with_combined_poly() {
 
 #[test]
 fn test_serde_deserialization_matches_rust_layout() {
-    // Construct a felt252 array matching the exact layout from cairo_serde.rs.
+    // Construct a proof with known values, then serialize to felt252 array
+    // matching the exact layout from cairo_serde.rs.
+    //
     // Proof: k=2, num_rounds=1, 1 entry, 1 round poly
+    // lambda = QM31(100, 200, 300, 400)
+    // combined = QM31(76, 0, 0, 0)
+    // round_poly: c0=QM31(21,0,0,0), c1=QM31(34,0,0,0), c2=QM31(0,0,0,0)
+    // entry: node_id=5, m=8, n=16, claimed_sum=QM31(76,0,0,0),
+    //        final_a=QM31(99,0,0,0), final_b=QM31(1,0,0,0),
+    //        a_commit=0xDEAD, b_commit=0xBEEF
+
     let mut calldata: Array<felt252> = array![
         // k
         2,
@@ -594,33 +603,42 @@ fn test_serde_deserialization_matches_rust_layout() {
         0, 0, 0, 0,
         // entries.len = 1
         1,
-        // entry[0]: node_id=5, m=8, n=16
-        5, 8, 16,
+        // entry[0].node_id
+        5,
+        // entry[0].m
+        8,
+        // entry[0].n
+        16,
         // entry[0].claimed_sum = QM31(76, 0, 0, 0)
         76, 0, 0, 0,
         // entry[0].final_a_eval = QM31(99, 0, 0, 0)
         99, 0, 0, 0,
         // entry[0].final_b_eval = QM31(1, 0, 0, 0)
         1, 0, 0, 0,
-        // entry[0].a_commitment, b_commitment
-        0xDEAD, 0xBEEF,
+        // entry[0].a_commitment
+        0xDEAD,
+        // entry[0].b_commitment
+        0xBEEF,
     ];
 
     let mut span = calldata.span();
     let proof: BatchedMatMulProof = Serde::<BatchedMatMulProof>::deserialize(ref span)
         .expect('serde deser failed');
 
+    // Verify all fields
     assert!(proof.k == 2, "k should be 2");
     assert!(proof.num_rounds == 1, "num_rounds should be 1");
     assert!(qm31_eq(proof.lambda, qm31_new(100, 200, 300, 400)), "lambda mismatch");
     assert!(qm31_eq(proof.combined_claimed_sum, qm31_new(76, 0, 0, 0)), "combined_sum mismatch");
-    assert!(proof.round_polys.len() == 1, "should have 1 round poly");
 
+    // Round polys
+    assert!(proof.round_polys.len() == 1, "should have 1 round poly");
     let rp = *proof.round_polys.at(0);
     assert!(qm31_eq(rp.c0, qm31_new(21, 0, 0, 0)), "rp.c0 mismatch");
     assert!(qm31_eq(rp.c1, qm31_new(34, 0, 0, 0)), "rp.c1 mismatch");
     assert!(qm31_eq(rp.c2, qm31_zero()), "rp.c2 mismatch");
 
+    // Entries
     assert!(proof.entries.len() == 1, "should have 1 entry");
     let e = *proof.entries.at(0);
     assert!(e.node_id == 5, "node_id mismatch");
@@ -631,100 +649,168 @@ fn test_serde_deserialization_matches_rust_layout() {
     assert!(qm31_eq(e.final_b_eval, qm31_new(1, 0, 0, 0)), "final_b mismatch");
     assert!(e.a_commitment == 0xDEAD, "a_commit mismatch");
     assert!(e.b_commitment == 0xBEEF, "b_commit mismatch");
+
+    // Span should be fully consumed
     assert!(span.len() == 0, "all calldata should be consumed");
 }
 
 #[test]
 fn test_serde_deserialization_two_entries_two_rounds() {
-    // k=4 (2 rounds), 2 entries — tests multi-entry, multi-round layout
+    // More complex: k=4 (2 rounds), 2 entries
+    // This tests that multi-entry, multi-round serialization layout is correct.
+
     let mut calldata: Array<felt252> = array![
-        4, 2,  // k, num_rounds
-        7, 11, 13, 17,  // lambda
-        500, 100, 0, 0,  // combined_claimed_sum
-        2,  // round_polys.len
-        10, 0, 0, 0, 20, 0, 0, 0, 5, 0, 0, 0,  // round_poly[0]
-        3, 1, 0, 0, 4, 2, 0, 0, 1, 0, 0, 0,    // round_poly[1]
-        2,  // entries.len
-        // entry[0]
-        0, 4, 4,  // node_id, m, n
+        // k
+        4,
+        // num_rounds
+        2,
+        // lambda: QM31(7, 11, 13, 17)
+        7, 11, 13, 17,
+        // combined_claimed_sum: QM31(500, 100, 0, 0)
+        500, 100, 0, 0,
+        // round_polys.len = 2
+        2,
+        // round_poly[0]: c0=QM31(10,0,0,0), c1=QM31(20,0,0,0), c2=QM31(5,0,0,0)
+        10, 0, 0, 0,
+        20, 0, 0, 0,
+        5, 0, 0, 0,
+        // round_poly[1]: c0=QM31(3,1,0,0), c1=QM31(4,2,0,0), c2=QM31(1,0,0,0)
+        3, 1, 0, 0,
+        4, 2, 0, 0,
+        1, 0, 0, 0,
+        // entries.len = 2
+        2,
+        // entry[0]: node_id=0, m=4, n=4, claimed_sum=QM31(300,50,0,0),
+        //           final_a=QM31(42,0,0,0), final_b=QM31(7,0,0,0),
+        //           a_commit=0xAAAA, b_commit=0xBBBB
+        0,  // node_id
+        4,  // m
+        4,  // n
         300, 50, 0, 0,  // claimed_sum
         42, 0, 0, 0,    // final_a_eval
         7, 0, 0, 0,     // final_b_eval
-        0xAAAA, 0xBBBB,  // commitments
-        // entry[1]
-        3, 8, 2,  // node_id, m, n
+        0xAAAA,          // a_commitment
+        0xBBBB,          // b_commitment
+        // entry[1]: node_id=3, m=8, n=2, claimed_sum=QM31(200,50,0,0),
+        //           final_a=QM31(11,0,0,0), final_b=QM31(3,0,0,0),
+        //           a_commit=0xCCCC, b_commit=0xDDDD
+        3,  // node_id
+        8,  // m
+        2,  // n
         200, 50, 0, 0,  // claimed_sum
         11, 0, 0, 0,    // final_a_eval
         3, 0, 0, 0,     // final_b_eval
-        0xCCCC, 0xDDDD,  // commitments
+        0xCCCC,          // a_commitment
+        0xDDDD,          // b_commitment
     ];
 
     let mut span = calldata.span();
     let proof: BatchedMatMulProof = Serde::<BatchedMatMulProof>::deserialize(ref span)
         .expect('serde deser failed');
 
+    // Verify structure
     assert!(proof.k == 4, "k should be 4");
     assert!(proof.num_rounds == 2, "num_rounds should be 2");
     assert!(qm31_eq(proof.lambda, qm31_new(7, 11, 13, 17)), "lambda mismatch");
     assert!(proof.round_polys.len() == 2, "should have 2 round polys");
     assert!(proof.entries.len() == 2, "should have 2 entries");
 
+    // Verify entry field order
     let e0 = *proof.entries.at(0);
-    assert!(e0.node_id == 0 && e0.m == 4 && e0.n == 4, "e0 dims");
+    assert!(e0.node_id == 0, "e0 node_id");
+    assert!(e0.m == 4 && e0.n == 4, "e0 dims");
     assert!(e0.a_commitment == 0xAAAA, "e0 a_commit");
+    assert!(e0.b_commitment == 0xBBBB, "e0 b_commit");
 
     let e1 = *proof.entries.at(1);
-    assert!(e1.node_id == 3 && e1.m == 8 && e1.n == 2, "e1 dims");
+    assert!(e1.node_id == 3, "e1 node_id");
+    assert!(e1.m == 8 && e1.n == 2, "e1 dims");
     assert!(qm31_eq(e1.claimed_sum, qm31_new(200, 50, 0, 0)), "e1 claimed_sum");
     assert!(e1.a_commitment == 0xCCCC, "e1 a_commit");
+
+    // Verify round poly[1]
+    let rp1 = *proof.round_polys.at(1);
+    assert!(qm31_eq(rp1.c0, qm31_new(3, 1, 0, 0)), "rp1.c0");
+    assert!(qm31_eq(rp1.c1, qm31_new(4, 2, 0, 0)), "rp1.c1");
+
+    // Fully consumed
     assert!(span.len() == 0, "all calldata consumed");
 }
 
 // ============================================================================
-// Multi-Round Batch Verification Tests (k=4, 2 rounds)
+// Multi-Round Batch Verification Test (k=4, 2 rounds)
 // ============================================================================
 
+/// Build a valid single-entry batch proof with k=4 (2 sumcheck rounds).
+/// This exercises the iterative channel state across multiple rounds.
 fn build_valid_two_round_proof() -> BatchedMatMulProof {
     let claimed_sum = qm31_new(100, 0, 0, 0);
     let a_commitment: felt252 = 0xAA11;
     let b_commitment: felt252 = 0xBB22;
 
     let entry = BatchedMatMulEntry {
-        node_id: 0, m: 4, n: 4, claimed_sum,
-        final_a_eval: qm31_zero(), final_b_eval: qm31_zero(),
-        a_commitment, b_commitment,
+        node_id: 0, m: 4, n: 4,
+        claimed_sum,
+        final_a_eval: qm31_zero(), // placeholder
+        final_b_eval: qm31_zero(), // placeholder
+        a_commitment,
+        b_commitment,
     };
 
+    // Step 1: derive lambda
     let mut ch = derive_lambda(array![entry].span(), 4);
     let lambda = channel_draw_qm31(ref ch);
+
+    // combined = claimed_sum (single entry)
     let combined = claimed_sum;
 
-    // Round 1: p1(0)+p1(1)=100. c0=30, c1=40, c2=0 → 30+(30+40)=100
+    // Step 2: Round 1 polynomial
+    // Need: p1(0) + p1(1) = combined = 100
+    // p1(0) = c0, p1(1) = c0 + c1 + c2
+    // Pick c0=30, c1=40, c2=0 → 30 + (30+40+0) = 30 + 70 = 100 ✓
     let c0_r1 = qm31_new(30, 0, 0, 0);
     let c1_r1 = qm31_new(40, 0, 0, 0);
     let c2_r1 = qm31_zero();
 
+    // Mix round 1 poly and draw challenge
     channel_mix_poly_coeffs(ref ch, c0_r1, c1_r1, c2_r1);
     let challenge_1 = channel_draw_qm31(ref ch);
+
+    // expected_sum after round 1 = p1(challenge_1)
     let expected_sum_r2 = poly_eval_degree2(c0_r1, c1_r1, c2_r1, challenge_1);
 
-    // Round 2: p2(0)+p2(1)=expected_sum_r2. c0=0, c1=expected_sum_r2, c2=0
+    // Step 3: Round 2 polynomial
+    // Need: p2(0) + p2(1) = expected_sum_r2
+    // For simplicity: c0=0, c1=expected_sum_r2, c2=0
+    // → p2(0)=0, p2(1)=expected_sum_r2 → sum = expected_sum_r2 ✓
     let c0_r2 = qm31_zero();
     let c1_r2 = expected_sum_r2;
     let c2_r2 = qm31_zero();
 
+    // Mix round 2 poly and draw challenge
     channel_mix_poly_coeffs(ref ch, c0_r2, c1_r2, c2_r2);
     let challenge_2 = channel_draw_qm31(ref ch);
+
+    // Final sum = p2(challenge_2)
     let final_sum = poly_eval_degree2(c0_r2, c1_r2, c2_r2, challenge_2);
 
+    // Set final evals: a * b = final_sum
+    let final_a_eval = final_sum;
+    let final_b_eval = qm31_one();
+
     let entry_final = BatchedMatMulEntry {
-        node_id: 0, m: 4, n: 4, claimed_sum,
-        final_a_eval: final_sum, final_b_eval: qm31_one(),
-        a_commitment, b_commitment,
+        node_id: 0, m: 4, n: 4,
+        claimed_sum,
+        final_a_eval,
+        final_b_eval,
+        a_commitment,
+        b_commitment,
     };
 
     BatchedMatMulProof {
-        k: 4, num_rounds: 2, lambda,
+        k: 4,
+        num_rounds: 2,
+        lambda,
         combined_claimed_sum: combined,
         round_polys: array![
             RoundPoly { c0: c0_r1, c1: c1_r1, c2: c2_r1 },
@@ -734,6 +820,8 @@ fn build_valid_two_round_proof() -> BatchedMatMulProof {
     }
 }
 
+/// Build a valid two-entry, two-round batch proof (k=4).
+/// Tests lambda weighting + multi-round iteration together.
 fn build_valid_two_entry_two_round_proof() -> BatchedMatMulProof {
     let cs0 = qm31_new(80, 0, 0, 0);
     let cs1 = qm31_new(60, 0, 0, 0);
@@ -755,8 +843,12 @@ fn build_valid_two_entry_two_round_proof() -> BatchedMatMulProof {
 
     let mut ch = derive_lambda(array![e0, e1].span(), 4);
     let lambda = channel_draw_qm31(ref ch);
+
+    // combined = cs0 + λ * cs1
     let combined = qm31_add(cs0, qm31_mul(lambda, cs1));
 
+    // Round 1: p1(0)+p1(1) = combined
+    // c0 = combined/2 ish... use c0=0, c1=combined, c2=0
     let c0_r1 = qm31_zero();
     let c1_r1 = combined;
     let c2_r1 = qm31_zero();
@@ -765,6 +857,7 @@ fn build_valid_two_entry_two_round_proof() -> BatchedMatMulProof {
     let ch1 = channel_draw_qm31(ref ch);
     let sum_r2 = poly_eval_degree2(c0_r1, c1_r1, c2_r1, ch1);
 
+    // Round 2: p2(0)+p2(1) = sum_r2
     let c0_r2 = qm31_zero();
     let c1_r2 = sum_r2;
     let c2_r2 = qm31_zero();
@@ -773,6 +866,8 @@ fn build_valid_two_entry_two_round_proof() -> BatchedMatMulProof {
     let ch2 = channel_draw_qm31(ref ch);
     let final_sum = poly_eval_degree2(c0_r2, c1_r2, c2_r2, ch2);
 
+    // Σ λ^i * a_i * b_i = final_sum
+    // a0*b0 = final_sum, a1*b1 = 0
     let e0f = BatchedMatMulEntry {
         node_id: 0, m: 4, n: 4, claimed_sum: cs0,
         final_a_eval: final_sum, final_b_eval: qm31_one(),
@@ -785,7 +880,9 @@ fn build_valid_two_entry_two_round_proof() -> BatchedMatMulProof {
     };
 
     BatchedMatMulProof {
-        k: 4, num_rounds: 2, lambda,
+        k: 4,
+        num_rounds: 2,
+        lambda,
         combined_claimed_sum: combined,
         round_polys: array![
             RoundPoly { c0: c0_r1, c1: c1_r1, c2: c2_r1 },
@@ -813,6 +910,7 @@ fn test_batch_verify_two_rounds_two_entries() {
 
 #[test]
 fn test_batch_verify_two_rounds_tampered_round2_fails() {
+    // Build valid 2-round proof then tamper with round 2 polynomial
     let cs = qm31_new(100, 0, 0, 0);
     let entry = BatchedMatMulEntry {
         node_id: 0, m: 4, n: 4, claimed_sum: cs,
@@ -830,7 +928,7 @@ fn test_batch_verify_two_rounds_tampered_round2_fails() {
     channel_mix_poly_coeffs(ref ch, c0_r1, c1_r1, c2_r1);
     let _ch1 = channel_draw_qm31(ref ch);
 
-    // Tampered round 2 poly — won't satisfy p2(0)+p2(1)=expected
+    // Tamper: use wrong round 2 polynomial (won't satisfy p2(0)+p2(1)=expected)
     let c0_r2_bad = qm31_new(999, 0, 0, 0);
     let c1_r2_bad = qm31_new(111, 0, 0, 0);
     let c2_r2_bad = qm31_zero();
@@ -857,22 +955,29 @@ fn test_batch_verify_two_rounds_tampered_round2_fails() {
 }
 
 // ============================================================================
-// Serde Round-Trip Tests
+// Serde Round-Trip Test
 // ============================================================================
 
 #[test]
 fn test_serde_roundtrip_preserves_proof() {
+    // Build a valid proof, serialize to felt252 array, deserialize back,
+    // and verify the deserialized proof still passes verification.
     let original = build_valid_single_entry_proof();
 
+    // Serialize
     let mut serialized: Array<felt252> = array![];
     original.serialize(ref serialized);
 
+    // Deserialize
     let mut span = serialized.span();
     let deserialized: BatchedMatMulProof = Serde::<BatchedMatMulProof>::deserialize(ref span)
         .expect('roundtrip deser failed');
 
+    // Verify deserialized proof passes verification
     let (is_valid, _) = verify_batched_sumcheck(@deserialized);
     assert!(is_valid, "roundtrip proof should still verify");
+
+    // Verify no leftover data
     assert!(span.len() == 0, "all data consumed");
 }
 
