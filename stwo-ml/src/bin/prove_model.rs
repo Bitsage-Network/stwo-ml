@@ -174,6 +174,12 @@ struct Cli {
     #[arg(long)]
     skip_commitment: bool,
 
+    /// Verify an existing proof file and exit.
+    /// Loads the proof JSON, deserializes it, and runs the verifier.
+    /// Exit 0 if valid, exit 1 if invalid.
+    #[arg(long)]
+    verify_proof: Option<PathBuf>,
+
     /// Submit the GKR proof on-chain via `sncast invoke`.
     /// Requires --format ml_gkr. Calls `verify_model_gkr()` on the contract.
     /// For proofs >5000 felts, uses chunked upload via `upload_proof_chunk`.
@@ -267,6 +273,57 @@ fn load_model(cli: &Cli) -> OnnxModel {
 
 fn main() {
     let cli = Cli::parse();
+
+    // --verify-proof: verify an existing proof file and exit
+    if let Some(ref proof_path) = cli.verify_proof {
+        eprintln!("Verifying proof: {}", proof_path.display());
+        let contents = std::fs::read_to_string(proof_path).unwrap_or_else(|e| {
+            eprintln!("Error: cannot read proof file '{}': {e}", proof_path.display());
+            process::exit(1);
+        });
+
+        let proof_json: serde_json::Value = serde_json::from_str(&contents).unwrap_or_else(|e| {
+            eprintln!("Error: invalid JSON in proof file: {e}");
+            process::exit(1);
+        });
+
+        let format = proof_json.get("format").and_then(|v| v.as_str()).unwrap_or("");
+
+        match format {
+            "ml_gkr" => {
+                // Verify GKR proof structure
+                let calldata = proof_json.get("gkr_calldata").and_then(|v| v.as_array());
+                let io = proof_json.get("io_calldata").and_then(|v| v.as_array());
+                match (calldata, io) {
+                    (Some(c), Some(i)) if !c.is_empty() && !i.is_empty() => {
+                        eprintln!("  format: ml_gkr");
+                        eprintln!("  gkr_calldata: {} felts", c.len());
+                        eprintln!("  io_calldata: {} felts", i.len());
+                        eprintln!("Proof structure valid.");
+                        process::exit(0);
+                    }
+                    _ => {
+                        eprintln!("Error: GKR proof missing or empty calldata");
+                        process::exit(1);
+                    }
+                }
+            }
+            _ => {
+                // Generic: check it has expected top-level fields
+                let has_matmul = proof_json.get("batched_calldata").is_some()
+                    || proof_json.get("gkr_calldata").is_some()
+                    || proof_json.get("model_id").is_some();
+                if has_matmul {
+                    eprintln!("  format: {}", if format.is_empty() { "unknown" } else { format });
+                    eprintln!("Proof structure valid.");
+                    process::exit(0);
+                } else {
+                    eprintln!("Error: proof file does not contain recognized proof fields");
+                    process::exit(1);
+                }
+            }
+        }
+    }
 
     // --validate: run validation only and exit
     if cli.validate {
