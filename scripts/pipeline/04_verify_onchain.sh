@@ -303,29 +303,20 @@ if [[ "$USE_PAYMASTER" == "true" ]] && [[ "$PROOF_MODE" != "recursive" ]]; then
 
     PAYMASTER_SCRIPT="${SCRIPT_DIR}/lib/paymaster_submit.mjs"
 
-    # Auto-setup account if first run and deployer key is available
-    ACCOUNT_CONFIG="${OBELYSK_DIR}/starknet/pipeline_account.json"
-    if [[ "$DEPLOY_ACCOUNT" == "true" ]] || { [[ ! -f "$ACCOUNT_CONFIG" ]] && [[ -z "${STARKNET_PRIVATE_KEY:-}" ]] && [[ -n "${OBELYSK_DEPLOYER_KEY:-}" ]]; }; then
-        log "Deploying pipeline account via factory..."
+    # Optional: deploy via factory for ERC-8004 identity (needs deployer key)
+    if [[ "$DEPLOY_ACCOUNT" == "true" ]] && [[ -n "${OBELYSK_DEPLOYER_KEY:-}" ]]; then
+        log "Deploying pipeline account via factory (ERC-8004 identity)..."
         run_cmd node "$PAYMASTER_SCRIPT" setup \
             --network "$NETWORK" || {
-            err "Account deployment failed"
-            err "Set OBELYSK_DEPLOYER_KEY and OBELYSK_DEPLOYER_ADDRESS, or use --no-paymaster"
-            exit 1
+            err "Factory deployment failed — falling back to ephemeral account"
         }
-        ok "Pipeline account deployed"
     fi
 
-    # Verify we have an account to use
-    if [[ -z "${STARKNET_PRIVATE_KEY:-}" ]] && [[ ! -f "$ACCOUNT_CONFIG" ]]; then
-        err "No account available for paymaster submission."
-        err ""
-        err "Options:"
-        err "  1. Set OBELYSK_DEPLOYER_KEY + OBELYSK_DEPLOYER_ADDRESS to auto-deploy"
-        err "  2. Set STARKNET_PRIVATE_KEY + STARKNET_ACCOUNT_ADDRESS to use your own account"
-        err "  3. Use --no-paymaster with STARKNET_PRIVATE_KEY for legacy sncast flow"
-        exit 1
-    fi
+    # The verify command handles account resolution automatically:
+    #   1. STARKNET_PRIVATE_KEY → user's existing account
+    #   2. ~/.obelysk/starknet/pipeline_account.json → saved account
+    #   3. Neither → auto-generate ephemeral keypair + deploy in same TX
+    # No env vars needed for path 3 (true zero-config).
 
     # Submit via paymaster
     log "Submitting ${PROOF_MODE} proof via AVNU paymaster (gasless)..."

@@ -6,14 +6,20 @@
 // Uses starknet.js v8 native paymaster support (AVNU sponsored mode)
 // to submit proofs gaslessly on Starknet.
 //
+// Zero-config flow (no env vars needed):
+//   1. Auto-generate ephemeral Stark keypair
+//   2. Compute counterfactual account address
+//   3. Deploy account + submit proof in ONE paymaster-sponsored TX
+//      via PaymasterDetails.deploymentData
+//
 // Commands:
-//   setup   — Generate keypair + deploy agent account via factory
-//   verify  — Submit proof via AVNU paymaster (gasless)
+//   verify  — Submit proof via AVNU paymaster (auto-deploys account if needed)
+//   setup   — Deploy agent account via factory (ERC-8004 identity, needs deployer key)
 //   status  — Check account and verification status
 //
 // Usage:
-//   node paymaster_submit.mjs setup --network sepolia
 //   node paymaster_submit.mjs verify --proof proof.json --contract 0x... --model-id 0x1
+//   node paymaster_submit.mjs setup --network sepolia
 //   node paymaster_submit.mjs status --contract 0x... --model-id 0x1
 //
 import {
@@ -38,8 +44,10 @@ const NETWORKS = {
     paymasterUrl: "https://sepolia.paymaster.avnu.fi",
     explorer: "https://sepolia.starkscan.co/tx/",
     factory: "0x2f69e566802910359b438ccdb3565dce304a7cc52edbf9fd246d6ad2cd89ce4",
-    accountClassHash: "0x14d44fb938b43e5fbcec27894670cb94898d759e2ef30e7af70058b4da57e7f",
-    identityRegistry: "0x72eb37b0389e570bf8b158ce7f0e1e3489de85ba43ab3876a0594df7231631",
+    accountClassHash:
+      "0x14d44fb938b43e5fbcec27894670cb94898d759e2ef30e7af70058b4da57e7f",
+    identityRegistry:
+      "0x72eb37b0389e570bf8b158ce7f0e1e3489de85ba43ab3876a0594df7231631",
   },
   mainnet: {
     rpcPublic: "https://free-rpc.nethermind.io/mainnet-juno/",
@@ -119,11 +127,47 @@ function info(msg) {
   process.stderr.write(`[INFO] ${msg}\n`);
 }
 
+// ─── Ephemeral Account ───────────────────────────────────────────────
+//
+// Generates a keypair and computes the counterfactual address for the
+// agent account class (already declared on Sepolia). The account doesn't
+// need to exist on-chain yet — deploymentData in the paymaster TX will
+// deploy it atomically alongside the proof verification call.
+//
+// Constructor: (public_key: felt252, factory: ContractAddress)
+// For ephemeral accounts we pass factory = 0x0 (no identity registration).
+
+function generateEphemeralAccount(network) {
+  const net = NETWORKS[network];
+  if (!net?.accountClassHash) die(`No account class hash for ${network}`);
+
+  const privateKey = num.toHex(ec.starkCurve.utils.randomPrivateKey());
+  const publicKey = ec.starkCurve.getStarkKey(privateKey);
+  const salt = publicKey;
+
+  // Agent account constructor calldata: [public_key, factory=0x0]
+  const constructorCalldata = CallData.compile([publicKey, "0x0"]);
+
+  // Deterministic address: hash(deployer=0, salt, classHash, constructorCalldata)
+  const address = hash.calculateContractAddressFromHash(
+    salt,
+    net.accountClassHash,
+    constructorCalldata,
+    0 // deployer = 0 → self-deployed via DEPLOY_ACCOUNT
+  );
+
+  return { privateKey, publicKey, salt, address, constructorCalldata };
+}
+
 // ─── Paymaster Execution ─────────────────────────────────────────────
 
-async function executeViaPaymaster(account, calls) {
+async function executeViaPaymaster(account, calls, deploymentData) {
   const callsArray = Array.isArray(calls) ? calls : [calls];
   const feeDetails = { feeMode: { mode: "sponsored" } };
+
+  if (deploymentData) {
+    feeDetails.deploymentData = deploymentData;
+  }
 
   info("Estimating paymaster fee...");
   const estimation = await account.estimatePaymasterTransactionFee(
@@ -142,8 +186,213 @@ async function executeViaPaymaster(account, calls) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Command: setup
+// Command: verify
 // ═══════════════════════════════════════════════════════════════════════
+//
+// Three account resolution paths:
+//   1. STARKNET_PRIVATE_KEY env var → use user's existing account
+//   2. ~/.obelysk/starknet/pipeline_account.json → use saved account
+//   3. Neither → generate ephemeral keypair, deploy + verify in one TX
+//      via PaymasterDetails.deploymentData (true zero-config)
+
+async function cmdVerify(args) {
+  const network = args.network || "sepolia";
+  const net = NETWORKS[network];
+  if (!net) die(`Unknown network: ${network}`);
+
+  const proofPath = args.proof;
+  const contract = args.contract;
+  const modelId = args["model-id"] || "0x1";
+
+  if (!proofPath) die("--proof is required");
+  if (!contract) die("--contract is required");
+
+  const provider = getProvider(network);
+
+  // ── Resolve account ──
+  let privateKey, accountAddress;
+  let needsDeploy = false;
+  let ephemeral = null;
+
+  if (process.env.STARKNET_PRIVATE_KEY) {
+    // Path 1: User-provided key
+    privateKey = process.env.STARKNET_PRIVATE_KEY;
+    accountAddress = process.env.STARKNET_ACCOUNT_ADDRESS;
+    if (!accountAddress)
+      die("STARKNET_ACCOUNT_ADDRESS required when using STARKNET_PRIVATE_KEY");
+    info("Using user-provided account");
+  } else {
+    const config = loadAccountConfig();
+    if (config) {
+      // Path 2: Saved pipeline account
+      privateKey = config.privateKey;
+      accountAddress = config.address;
+      info(`Using saved pipeline account: ${accountAddress}`);
+
+      // Check if it's actually deployed
+      try {
+        await provider.getClassHashAt(accountAddress);
+      } catch {
+        info("Saved account not yet deployed on-chain, will deploy with TX");
+        needsDeploy = true;
+        ephemeral = {
+          publicKey: config.publicKey,
+          salt: config.publicKey,
+          constructorCalldata: CallData.compile([config.publicKey, "0x0"]),
+        };
+      }
+    } else {
+      // Path 3: Zero-config — generate ephemeral keypair
+      info("No account found. Generating ephemeral keypair...");
+      ephemeral = generateEphemeralAccount(network);
+      privateKey = ephemeral.privateKey;
+      accountAddress = ephemeral.address;
+      needsDeploy = true;
+
+      info(`Ephemeral account: ${accountAddress}`);
+      info(
+        "Account will be deployed atomically with the proof verification TX"
+      );
+
+      // Save for reuse in future runs
+      saveAccountConfig({
+        address: accountAddress,
+        privateKey,
+        publicKey: ephemeral.publicKey,
+        agentId: null,
+        network,
+        ephemeral: true,
+        createdAt: new Date().toISOString(),
+      });
+      info(`Keypair saved to ${ACCOUNT_CONFIG_FILE}`);
+    }
+  }
+
+  const account = getAccount(provider, privateKey, accountAddress);
+
+  // ── Read proof file ──
+  info(`Reading proof: ${proofPath}`);
+  let proofData;
+  try {
+    proofData = JSON.parse(readFileSync(proofPath, "utf-8"));
+  } catch (e) {
+    die(`Failed to read proof file: ${e.message}`);
+  }
+
+  let calldata = proofData.calldata || proofData.gkr_calldata;
+  if (!calldata || !Array.isArray(calldata)) {
+    die("Proof file missing 'calldata' or 'gkr_calldata' array");
+  }
+
+  // ── Build verification call ──
+  const verifyCall = {
+    contractAddress: contract,
+    entrypoint: "verify_model_gkr",
+    calldata: CallData.compile([modelId, ...calldata.map(String)]),
+  };
+
+  info(`Submitting verify_model_gkr for model ${modelId}...`);
+  info(`Contract: ${contract}`);
+  info(`Calldata elements: ${calldata.length}`);
+
+  // ── Build deploymentData if account needs deploying ──
+  let deploymentData = undefined;
+  if (needsDeploy && ephemeral) {
+    deploymentData = {
+      classHash: net.accountClassHash,
+      salt: ephemeral.salt,
+      uniqueDeployerAddress: "0x0",
+      constructorCalldata: ephemeral.constructorCalldata,
+    };
+    info("Including deploymentData — account will be deployed in this TX");
+  }
+
+  // ── Execute ──
+  let txHash;
+  try {
+    txHash = await executeViaPaymaster(account, verifyCall, deploymentData);
+  } catch (e) {
+    const msg = e.message || String(e);
+    if (msg.includes("not eligible") || msg.includes("not supported")) {
+      die(
+        `Paymaster rejected transaction: ${msg}\n` +
+          "This may mean:\n" +
+          "  - The dApp is not registered with AVNU for sponsored mode\n" +
+          "  - Daily gas limit exceeded\n" +
+          "  - The account class is not whitelisted\n" +
+          "Try: STARKNET_PRIVATE_KEY=0x... ./04_verify_onchain.sh --submit --no-paymaster"
+      );
+    }
+    throw e;
+  }
+
+  info(`TX submitted: ${txHash}`);
+  info("Waiting for confirmation...");
+
+  const receipt = await provider.waitForTransaction(txHash);
+  const execStatus = receipt.execution_status ?? receipt.status ?? "unknown";
+
+  if (execStatus === "REVERTED") {
+    die(`TX reverted: ${receipt.revert_reason || "unknown reason"}`);
+  }
+
+  // Update saved config with deployment TX
+  if (needsDeploy && ephemeral) {
+    const config = loadAccountConfig();
+    if (config) {
+      config.deployTxHash = txHash;
+      config.deployedAt = new Date().toISOString();
+      config.ephemeral = true;
+      saveAccountConfig(config);
+    }
+  }
+
+  // ── Check verification status ──
+  let isVerified = false;
+  try {
+    const result = await provider.callContract({
+      contractAddress: contract,
+      entrypoint: "get_verification_count",
+      calldata: CallData.compile([modelId]),
+    });
+    const count = result.result ? BigInt(result.result[0] || "0") : 0n;
+    isVerified = count > 0n;
+  } catch {
+    try {
+      const result = await provider.callContract({
+        contractAddress: contract,
+        entrypoint: "is_proof_verified",
+        calldata: CallData.compile([modelId]),
+      });
+      isVerified = result.result && BigInt(result.result[0] || "0") > 0n;
+    } catch {
+      info(
+        "Could not check verification status (contract may use different interface)"
+      );
+    }
+  }
+
+  const explorerUrl = `${net.explorer}${txHash}`;
+  info(`Explorer: ${explorerUrl}`);
+  info(`Verified: ${isVerified}`);
+
+  jsonOutput({
+    txHash,
+    explorerUrl,
+    isVerified,
+    gasSponsored: true,
+    accountDeployed: needsDeploy,
+    executionStatus: execStatus,
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Command: setup  (factory path — ERC-8004 identity)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Deploys an agent account via the AgentAccountFactory. This registers
+// the account in the identity registry and mints an ERC-8004 identity NFT.
+// Requires OBELYSK_DEPLOYER_KEY + OBELYSK_DEPLOYER_ADDRESS.
 
 async function cmdSetup(args) {
   const network = args.network || "sepolia";
@@ -154,14 +403,14 @@ async function cmdSetup(args) {
   const deployerKey = process.env.OBELYSK_DEPLOYER_KEY;
   if (!deployerKey) {
     die(
-      "OBELYSK_DEPLOYER_KEY is required for account deployment.\n" +
-        "This is the private key of the deployer that calls the factory."
+      "OBELYSK_DEPLOYER_KEY is required for factory deployment (ERC-8004 identity).\n" +
+        "For zero-config without identity, just run 'verify' directly — it auto-deploys."
     );
   }
   const deployerAddress = process.env.OBELYSK_DEPLOYER_ADDRESS;
   if (!deployerAddress) {
     die(
-      "OBELYSK_DEPLOYER_ADDRESS is required for account deployment.\n" +
+      "OBELYSK_DEPLOYER_ADDRESS is required for factory deployment.\n" +
         "This is the address of the deployer account."
     );
   }
@@ -178,7 +427,7 @@ async function cmdSetup(args) {
   // Build factory deploy_account call
   const salt = publicKey;
   const tokenUri = byteArray.byteArrayFromString(
-    'data:application/json,{"name":"ObelyskPipeline","description":"Zero-config proof submission account","agentType":"prover"}'
+    'data:application/json,{"name":"ObelyskPipeline","description":"Proof submission agent","agentType":"prover"}'
   );
 
   const deployCall = {
@@ -191,7 +440,7 @@ async function cmdSetup(args) {
     }),
   };
 
-  info("Deploying agent account via factory...");
+  info("Deploying agent account via factory (ERC-8004 identity)...");
   const txHash = await executeViaPaymaster(deployer, deployCall);
   info(`TX: ${txHash}`);
 
@@ -207,7 +456,12 @@ async function cmdSetup(args) {
   let agentId = null;
   const events = receipt.events || [];
   for (const event of events) {
-    if (event.keys && event.keys.length >= 3 && event.data && event.data.length >= 3) {
+    if (
+      event.keys &&
+      event.keys.length >= 3 &&
+      event.data &&
+      event.data.length >= 3
+    ) {
       const possiblePubKey = event.keys[2];
       if (possiblePubKey && BigInt(possiblePubKey) === BigInt(publicKey)) {
         accountAddress = "0x" + BigInt(event.keys[1]).toString(16);
@@ -230,6 +484,7 @@ async function cmdSetup(args) {
     publicKey,
     agentId,
     network,
+    ephemeral: false,
     factory: args.factory || net.factory,
     deployedAt: new Date().toISOString(),
     deployTxHash: txHash,
@@ -242,136 +497,7 @@ async function cmdSetup(args) {
     agentId,
     txHash,
     explorerUrl: `${net.explorer}${txHash}`,
-  });
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// Command: verify
-// ═══════════════════════════════════════════════════════════════════════
-
-async function cmdVerify(args) {
-  const network = args.network || "sepolia";
-  const net = NETWORKS[network];
-  if (!net) die(`Unknown network: ${network}`);
-
-  const proofPath = args.proof;
-  const contract = args.contract;
-  const modelId = args["model-id"] || "0x1";
-
-  if (!proofPath) die("--proof is required");
-  if (!contract) die("--contract is required");
-
-  // Load or resolve account
-  let privateKey, accountAddress;
-
-  if (process.env.STARKNET_PRIVATE_KEY) {
-    privateKey = process.env.STARKNET_PRIVATE_KEY;
-    accountAddress = process.env.STARKNET_ACCOUNT_ADDRESS;
-    if (!accountAddress) die("STARKNET_ACCOUNT_ADDRESS required when using STARKNET_PRIVATE_KEY");
-    info("Using user-provided account");
-  } else {
-    const config = loadAccountConfig();
-    if (!config) {
-      die(
-        "No account configured. Run 'setup' first or set STARKNET_PRIVATE_KEY.\n" +
-          "  node paymaster_submit.mjs setup --network sepolia"
-      );
-    }
-    privateKey = config.privateKey;
-    accountAddress = config.address;
-    info(`Using pipeline account: ${accountAddress}`);
-  }
-
-  const provider = getProvider(network);
-  const account = getAccount(provider, privateKey, accountAddress);
-
-  // Read proof file
-  info(`Reading proof: ${proofPath}`);
-  let proofData;
-  try {
-    proofData = JSON.parse(readFileSync(proofPath, "utf-8"));
-  } catch (e) {
-    die(`Failed to read proof file: ${e.message}`);
-  }
-
-  // Extract calldata
-  let calldata = proofData.calldata || proofData.gkr_calldata;
-  if (!calldata || !Array.isArray(calldata)) {
-    die("Proof file missing 'calldata' or 'gkr_calldata' array");
-  }
-
-  // Build the verification call
-  const verifyCall = {
-    contractAddress: contract,
-    entrypoint: "verify_model_gkr",
-    calldata: CallData.compile([modelId, ...calldata.map(String)]),
-  };
-
-  info(`Submitting verify_model_gkr for model ${modelId}...`);
-  info(`Contract: ${contract}`);
-  info(`Calldata elements: ${calldata.length}`);
-
-  let txHash;
-  try {
-    txHash = await executeViaPaymaster(account, verifyCall);
-  } catch (e) {
-    const msg = e.message || String(e);
-    if (msg.includes("not eligible") || msg.includes("not supported")) {
-      die(
-        `Paymaster rejected transaction: ${msg}\n` +
-          "This may mean:\n" +
-          "  - The account is not deployed on-chain\n" +
-          "  - The dApp is not registered with AVNU for sponsored mode\n" +
-          "  - Daily gas limit exceeded\n" +
-          "Try: STARKNET_PRIVATE_KEY=0x... ./04_verify_onchain.sh --submit --no-paymaster"
-      );
-    }
-    throw e;
-  }
-
-  info(`TX submitted: ${txHash}`);
-  info("Waiting for confirmation...");
-
-  const receipt = await provider.waitForTransaction(txHash);
-  const execStatus = receipt.execution_status ?? receipt.status ?? "unknown";
-
-  if (execStatus === "REVERTED") {
-    die(`TX reverted: ${receipt.revert_reason || "unknown reason"}`);
-  }
-
-  // Check verification status
-  let isVerified = false;
-  try {
-    const result = await provider.callContract({
-      contractAddress: contract,
-      entrypoint: "get_verification_count",
-      calldata: CallData.compile([modelId]),
-    });
-    const count = result.result ? BigInt(result.result[0] || "0") : 0n;
-    isVerified = count > 0n;
-  } catch {
-    try {
-      const result = await provider.callContract({
-        contractAddress: contract,
-        entrypoint: "is_proof_verified",
-        calldata: CallData.compile([modelId]),
-      });
-      isVerified = result.result && BigInt(result.result[0] || "0") > 0n;
-    } catch {
-      info("Could not check verification status (contract may use different interface)");
-    }
-  }
-
-  const explorerUrl = `${net.explorer}${txHash}`;
-  info(`Explorer: ${explorerUrl}`);
-  info(`Verified: ${isVerified}`);
-
-  jsonOutput({
-    txHash,
-    explorerUrl,
-    isVerified,
-    gasSponsored: true,
-    executionStatus: execStatus,
+    identity: true,
   });
 }
 
@@ -397,8 +523,9 @@ async function cmdStatus(args) {
       configured: true,
       address: config.address,
       agentId: config.agentId,
+      ephemeral: config.ephemeral ?? true,
       network: config.network,
-      deployedAt: config.deployedAt,
+      createdAt: config.createdAt || config.deployedAt,
     };
 
     // Check if deployed on-chain
@@ -420,7 +547,9 @@ async function cmdStatus(args) {
         entrypoint: "get_verification_count",
         calldata: CallData.compile([modelId]),
       });
-      const count = result.result ? Number(BigInt(result.result[0] || "0")) : 0;
+      const count = result.result
+        ? Number(BigInt(result.result[0] || "0"))
+        : 0;
       verificationStatus = {
         checked: true,
         contract,
@@ -444,11 +573,11 @@ const args = parseArgs(process.argv);
 
 try {
   switch (args.command) {
-    case "setup":
-      await cmdSetup(args);
-      break;
     case "verify":
       await cmdVerify(args);
+      break;
+    case "setup":
+      await cmdSetup(args);
       break;
     case "status":
       await cmdStatus(args);
@@ -457,13 +586,14 @@ try {
       process.stderr.write(
         "Usage: node paymaster_submit.mjs <command> [options]\n\n" +
           "Commands:\n" +
-          "  setup    Generate keypair + deploy agent account via factory\n" +
-          "  verify   Submit proof via AVNU paymaster (gasless)\n" +
+          "  verify   Submit proof via AVNU paymaster (auto-deploys account if needed)\n" +
+          "  setup    Deploy agent account via factory (ERC-8004 identity)\n" +
           "  status   Check account and verification status\n\n" +
-          "Examples:\n" +
-          "  node paymaster_submit.mjs setup --network sepolia\n" +
-          "  node paymaster_submit.mjs verify --proof proof.json --contract 0x... --model-id 0x1\n" +
-          "  node paymaster_submit.mjs status --contract 0x... --model-id 0x1\n"
+          "Zero-config (no env vars needed):\n" +
+          "  node paymaster_submit.mjs verify --proof proof.json --contract 0x... --model-id 0x1\n\n" +
+          "With ERC-8004 identity (needs deployer key):\n" +
+          "  OBELYSK_DEPLOYER_KEY=0x... OBELYSK_DEPLOYER_ADDRESS=0x... \\\n" +
+          "    node paymaster_submit.mjs setup --network sepolia\n"
       );
       process.exit(1);
   }
