@@ -72,6 +72,13 @@ OBELYSK_DIR="${OBELYSK_DIR:-$HOME/.obelysk}"
 init_obelysk_dir() {
     mkdir -p "${OBELYSK_DIR}"/{models,proofs,configs,logs}
     debug "Obelysk dir initialized: ${OBELYSK_DIR}"
+
+    # Auto-load encrypted secrets (HF_TOKEN, IRYS_TOKEN, etc.)
+    local _secrets_sh="${SCRIPT_DIR:-$(cd "$(dirname "$0")" && pwd)}/lib/secrets.sh"
+    if [[ -f "$_secrets_sh" ]]; then
+        source "$_secrets_sh"
+        load_secrets
+    fi
 }
 
 # ─── State Persistence ───────────────────────────────────────────────

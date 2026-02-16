@@ -16,5 +16,9 @@ Cargo.lock
 # Misc
 findingscore.md
 
+# Decrypted secrets (NEVER commit)
+scripts/pipeline/configs/.secrets.env
+secrets.env
+
 # OS
 .DS_Store

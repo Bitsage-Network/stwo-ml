@@ -10,13 +10,46 @@ Before running the pipeline, ensure the following are available on your machine:
 |-------------|-------|
 | **NVIDIA GPU** | RTX 3090+ recommended; see GPU Compatibility table below |
 | **NVIDIA Driver + CUDA** | Auto-installed by `00_setup_gpu.sh --install-drivers`, or install manually |
-| **Node.js 18+** | Required for paymaster submission (`lib/paymaster_submit.mjs`) |
+| **Node.js 18+** | Auto-installed via nvm if missing (needed for paymaster submission) |
 | **Python 3.8+** | Used for HuggingFace downloads, config parsing, verification receipts |
 | **git-lfs** | Installed by `00_setup_gpu.sh`; needed for large model downloads |
 | **Rust nightly-2025-07-14** | Pinned toolchain matching STWO; installed by `00_setup_gpu.sh` |
-| **`HF_TOKEN`** | HuggingFace token — required for gated models (Llama, Gemma). Get one at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) |
-| **`IRYS_TOKEN`** | Irys API token — required for `--submit` with `--privacy private`. Get one at [irys.xyz](https://irys.xyz) |
-| **`STARKNET_PRIVATE_KEY`** | For on-chain proof submission (optional on Sepolia with paymaster) |
+| **`OBELYSK_SECRETS_KEY`** | Single passphrase to unlock all pipeline secrets (see below) |
+
+### Encrypted Secrets
+
+API tokens (`HF_TOKEN`, `IRYS_TOKEN`, `STARKNET_PRIVATE_KEY`, `ALCHEMY_KEY`) are shipped encrypted in `configs/.secrets.env.enc`. The pipeline auto-decrypts at startup — you just need the passphrase.
+
+```bash
+# Option 1: Set env var (non-interactive, CI-friendly)
+export OBELYSK_SECRETS_KEY="your-passphrase"
+./run_e2e.sh --preset qwen3-14b --gpu --submit
+
+# Option 2: Interactive prompt (pipeline asks when needed)
+./run_e2e.sh --preset qwen3-14b --gpu --submit
+# → "Enter passphrase to unlock:" prompt appears
+
+# Option 3: Override individual tokens (always takes priority)
+HF_TOKEN=hf_xxx IRYS_TOKEN=irys_xxx ./run_e2e.sh --preset qwen3-14b --gpu --submit
+```
+
+**For pipeline administrators** — create or update the encrypted secrets file:
+
+```bash
+# Interactive: prompts for each token + passphrase
+./manage_secrets.sh --encrypt
+
+# From existing .env file
+./manage_secrets.sh --encrypt --from .env
+
+# Rotate passphrase
+./manage_secrets.sh --rotate
+
+# View current secrets (debugging)
+./manage_secrets.sh --decrypt
+```
+
+The encrypted file (`configs/.secrets.env.enc`) is safe to commit. The decrypted cache (`~/.obelysk/secrets.env`) is gitignored and restricted to owner-only permissions.
 
 ## Quick Start
 
