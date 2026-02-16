@@ -22,6 +22,12 @@ Prove that an ML model ran correctly, and verify the proof on-chain. Works on an
 SSH into your GPU machine and run:
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/Bitsage-Network/stwo-ml/main/scripts/pipeline/bootstrap.sh | bash -s -- --preset qwen3-14b --gpu --submit
+```
+
+Or clone and run manually:
+
+```bash
 git clone https://github.com/Bitsage-Network/stwo-ml.git
 cd stwo-ml/scripts/pipeline
 
@@ -30,6 +36,8 @@ cd stwo-ml/scripts/pipeline
 ```
 
 This does everything: installs drivers, downloads the model, tests it, captures inference logs, generates a proof, verifies it locally, and runs an audit.
+
+During setup, you'll be prompted for your email. This links your device to your [marketplace dashboard](https://marketplace.bitsage.network) where you can view all your proofs and audit reports. If you don't have an account yet, sign up at `marketplace.bitsage.network/signup` with the same email after the pipeline completes.
 
 To also submit the proof on-chain (zero-config on Sepolia — no wallet needed):
 

@@ -26,7 +26,13 @@ source "${SCRIPT_DIR}/lib/gpu_detect.sh"
 
 REPO_URL="${REPO_URL:-https://github.com/Bitsage-Network/stwo-ml.git}"
 BRANCH="${BRANCH:-main}"
-INSTALL_DIR="${INSTALL_DIR:-$HOME/obelysk}"
+
+# Auto-detect: if we're running from inside a cloned repo, use that as INSTALL_DIR
+_DETECTED_ROOT=""
+if [[ -d "${SCRIPT_DIR}/../../.git" ]]; then
+    _DETECTED_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+fi
+INSTALL_DIR="${INSTALL_DIR:-${_DETECTED_ROOT:-$HOME/obelysk}}"
 CUSTOM_CUDA_PATH=""
 
 SKIP_DEPS=false
