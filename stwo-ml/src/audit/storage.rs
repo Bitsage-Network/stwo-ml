@@ -357,6 +357,194 @@ fn extract_block_height(json: &str) -> Option<u64> {
     None
 }
 
+// ─── Relay Client ────────────────────────────────────────────────────────────
+
+/// Client that proxies audit uploads through the Obelysk relay service.
+///
+/// When users don't have an IRYS_TOKEN, the relay (running on the coordinator EC2)
+/// holds the token server-side and forwards uploads to Irys. Users never need
+/// their own Arweave/Irys account.
+///
+/// Default relay URL: `https://relay.obelysk.xyz` (override via `OBELYSK_RELAY_URL`).
+pub struct RelayClient {
+    /// Relay service URL (e.g., "https://relay.obelysk.xyz").
+    relay_url: String,
+    /// Arweave gateway URL for download/status (reads don't need relay).
+    gateway: String,
+    /// HTTP transport implementation.
+    transport: Box<dyn HttpTransport>,
+    /// Optional API key for relay authentication.
+    api_key: Option<String>,
+}
+
+impl RelayClient {
+    /// Default relay URL used when no override is provided.
+    pub const DEFAULT_RELAY_URL: &'static str = "https://relay.obelysk.xyz";
+
+    /// Create a new relay client.
+    pub fn new(
+        relay_url: impl Into<String>,
+        transport: Box<dyn HttpTransport>,
+    ) -> Self {
+        Self {
+            relay_url: relay_url.into(),
+            gateway: "https://arweave.net".to_string(),
+            transport,
+            api_key: None,
+        }
+    }
+
+    /// Create with default relay URL from environment or fallback.
+    pub fn from_env(transport: Box<dyn HttpTransport>) -> Self {
+        let url = std::env::var("OBELYSK_RELAY_URL")
+            .unwrap_or_else(|_| Self::DEFAULT_RELAY_URL.to_string());
+        Self::new(url, transport)
+    }
+
+    /// Set an API key for relay authentication.
+    pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
+        self.api_key = Some(key.into());
+        self
+    }
+
+    /// Upload data via the relay service.
+    pub fn upload(
+        &self,
+        data: &[u8],
+        audit_id: &str,
+        model_id: &str,
+        extra_tags: &[ArweaveTag],
+    ) -> Result<StorageReceipt, AuditError> {
+        let url = format!("{}/v1/audit/upload", self.relay_url);
+
+        let data_b64 = base64_encode(data);
+
+        let tags_json: Vec<String> = extra_tags
+            .iter()
+            .map(|t| {
+                format!(
+                    "{{\"name\":\"{}\",\"value\":\"{}\"}}",
+                    escape_json_string(&t.name),
+                    escape_json_string(&t.value)
+                )
+            })
+            .collect();
+
+        let body = format!(
+            "{{\"data\":\"{}\",\"audit_id\":\"{}\",\"model_id\":\"{}\",\"tags\":[{}]}}",
+            data_b64,
+            escape_json_string(audit_id),
+            escape_json_string(model_id),
+            tags_json.join(",")
+        );
+
+        let mut headers: Vec<(&str, &str)> = vec![("Content-Type", "application/json")];
+        let api_key_val;
+        if let Some(ref key) = self.api_key {
+            api_key_val = key.clone();
+            headers.push(("X-Api-Key", &api_key_val));
+        }
+
+        let response = self.transport.post(&url, &headers, body.as_bytes())?;
+
+        let tx_id = parse_upload_response(&response)?;
+
+        Ok(StorageReceipt {
+            tx_id: tx_id.clone(),
+            size_bytes: data.len(),
+            gateway_url: format!("{}/{}", self.gateway, tx_id),
+        })
+    }
+
+    /// Download data from Arweave (reads go directly to the gateway, no relay needed).
+    pub fn download(&self, tx_id: &str) -> Result<Vec<u8>, AuditError> {
+        let url = format!("{}/{}", self.gateway, tx_id);
+        self.transport.get(&url)
+    }
+
+    /// Check the status of an Arweave transaction.
+    pub fn status(&self, tx_id: &str) -> Result<TxStatus, AuditError> {
+        let url = format!("{}/v1/audit/{}", self.relay_url, tx_id);
+        match self.transport.get(&url) {
+            Ok(body) => {
+                let text = String::from_utf8_lossy(&body);
+                if text.contains("confirmed") {
+                    if let Some(height) = extract_block_height(&text) {
+                        Ok(TxStatus::Confirmed { block_height: height })
+                    } else {
+                        Ok(TxStatus::Confirmed { block_height: 0 })
+                    }
+                } else if text.contains("pending") {
+                    Ok(TxStatus::Pending)
+                } else {
+                    Ok(TxStatus::NotFound)
+                }
+            }
+            Err(_) => Ok(TxStatus::NotFound),
+        }
+    }
+}
+
+/// Create the appropriate storage client based on available credentials.
+///
+/// - If `IRYS_TOKEN` is set → direct `ArweaveClient` (user's own token)
+/// - Otherwise → `RelayClient` (proxied through coordinator EC2)
+///
+/// Returns `(uploader, is_relay)` where `is_relay` indicates which path was taken.
+#[cfg(feature = "audit-http")]
+pub fn create_audit_storage() -> (Box<dyn AuditUploader>, bool) {
+    let transport = Box::new(UreqTransport);
+
+    if let Ok(token) = std::env::var("IRYS_TOKEN") {
+        if !token.is_empty() {
+            let client = ArweaveClient::with_defaults(transport).with_auth(token);
+            return (Box::new(ArweaveUploader(client)), false);
+        }
+    }
+
+    let relay = RelayClient::from_env(transport);
+    (Box::new(RelayUploader(relay)), true)
+}
+
+/// Trait for abstracting upload behavior (direct vs relay).
+pub trait AuditUploader: Send + Sync {
+    fn upload(
+        &self,
+        data: &[u8],
+        audit_id: &str,
+        model_id: &str,
+        extra_tags: &[ArweaveTag],
+    ) -> Result<StorageReceipt, AuditError>;
+
+    fn download(&self, tx_id: &str) -> Result<Vec<u8>, AuditError>;
+
+    fn status(&self, tx_id: &str) -> Result<TxStatus, AuditError>;
+}
+
+#[cfg(feature = "audit-http")]
+struct ArweaveUploader(ArweaveClient);
+
+#[cfg(feature = "audit-http")]
+impl AuditUploader for ArweaveUploader {
+    fn upload(&self, data: &[u8], audit_id: &str, model_id: &str, extra_tags: &[ArweaveTag]) -> Result<StorageReceipt, AuditError> {
+        self.0.upload(data, audit_id, model_id, extra_tags)
+    }
+    fn download(&self, tx_id: &str) -> Result<Vec<u8>, AuditError> { self.0.download(tx_id) }
+    fn status(&self, tx_id: &str) -> Result<TxStatus, AuditError> { self.0.status(tx_id) }
+}
+
+#[cfg(feature = "audit-http")]
+struct RelayUploader(RelayClient);
+
+#[cfg(feature = "audit-http")]
+impl AuditUploader for RelayUploader {
+    fn upload(&self, data: &[u8], audit_id: &str, model_id: &str, extra_tags: &[ArweaveTag]) -> Result<StorageReceipt, AuditError> {
+        self.0.upload(data, audit_id, model_id, extra_tags)
+    }
+    fn download(&self, tx_id: &str) -> Result<Vec<u8>, AuditError> { self.0.download(tx_id) }
+    fn status(&self, tx_id: &str) -> Result<TxStatus, AuditError> { self.0.status(tx_id) }
+}
+
 // ─── Ureq Transport (real HTTP, feature-gated) ──────────────────────────────
 
 #[cfg(feature = "audit-http")]

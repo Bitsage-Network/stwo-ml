@@ -18,7 +18,13 @@ Before running the pipeline, ensure the following are available on your machine:
 
 ### Encrypted Secrets
 
-API tokens (`HF_TOKEN`, `IRYS_TOKEN`, `STARKNET_PRIVATE_KEY`, `ALCHEMY_KEY`) are shipped encrypted in `configs/.secrets.env.enc`. The pipeline auto-decrypts at startup — you just need the passphrase.
+API tokens are managed automatically:
+
+- **`IRYS_TOKEN`** — **Not needed.** Audit uploads route through the Obelysk relay (`relay.obelysk.xyz`) which holds the token server-side.
+- **`STARKNET_PRIVATE_KEY`** — **Not needed on Sepolia.** The AVNU paymaster handles gas-free submission.
+- **`HF_TOKEN`** — **Not needed for default models** (Qwen, Phi, Mistral). Only required for gated models (Llama, Gemma) where HuggingFace requires license acceptance.
+
+For teams that want to self-host or override: tokens can be shipped encrypted in `configs/.secrets.env.enc`. The pipeline auto-decrypts at startup with a single passphrase.
 
 ```bash
 # Option 1: Set env var (non-interactive, CI-friendly)
