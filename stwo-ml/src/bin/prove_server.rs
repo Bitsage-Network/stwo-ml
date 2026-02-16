@@ -25,6 +25,7 @@ use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
 use stwo::core::fields::m31::M31;
+use stwo_ml::circuits::batch::BatchPublicInputs;
 
 use stwo_ml::compiler::hf_loader::load_hf_model;
 use stwo_ml::compiler::onnx::load_onnx;
@@ -39,7 +40,6 @@ use stwo_ml::privacy::relayer::{
     compute_withdrawal_binding_digest,
     hash_batch_public_inputs_for_cairo,
 };
-use stwo_ml::crypto::poseidon2_m31::poseidon2_hash;
 use stwo_ml::cairo_serde::serialize_proof;
 
 // =============================================================================
@@ -98,6 +98,14 @@ struct PrivacyJob {
     completed_at: Option<Instant>,
     error: Option<String>,
     result: Option<PrivacyBatchResultPayload>,
+    submit_context: Option<PrivacySubmitContext>,
+}
+
+#[derive(Clone)]
+struct PrivacySubmitContext {
+    public_inputs: BatchPublicInputs,
+    payout_recipients: Vec<String>,
+    credit_recipients: Vec<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -105,13 +113,19 @@ struct PrivacyBatchResultPayload {
     num_deposits: usize,
     num_withdrawals: usize,
     num_spends: usize,
-    proof_hash: String,
+    /// Canonical verifier proof hash (`verify_model_direct` event hash).
+    /// This is never synthesized locally.
+    proof_hash: Option<String>,
+    /// `pending_verifier_canonical_hash` until caller supplies canonical hash.
+    proof_hash_status: String,
     public_inputs_hash: String,
     prove_time_ms: u64,
     deposits: Vec<PrivacyDepositResult>,
     withdrawals: Vec<PrivacyWithdrawResult>,
     spends: Vec<PrivacySpendResult>,
-    /// On-chain calldata for `submit_batch_proof` (full hardened VM31 ABI).
+    /// On-chain calldata for `submit_batch_proof` (full hardened VM31 ABI),
+    /// populated only after canonical proof hash is provided.
+    calldata_ready: bool,
     calldata: Vec<String>,
     payout_recipients: Vec<String>,
     credit_recipients: Vec<String>,
@@ -200,6 +214,37 @@ struct ProveRequest {
 
 fn default_security() -> String {
     "auto".to_string()
+}
+
+fn normalize_canonical_proof_hash(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("proof_hash must not be empty".to_string());
+    }
+
+    let raw_hex = if let Some(stripped) = trimmed.strip_prefix("0x") {
+        stripped
+    } else if let Some(stripped) = trimmed.strip_prefix("0X") {
+        stripped
+    } else {
+        trimmed
+    };
+
+    if raw_hex.is_empty() {
+        return Err("proof_hash must contain hex digits".to_string());
+    }
+    if raw_hex.len() > 64 {
+        return Err("proof_hash exceeds felt252 hex length".to_string());
+    }
+    if !raw_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("proof_hash must be a felt252 hex string".to_string());
+    }
+
+    let normalized = raw_hex.trim_start_matches('0').to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Err("proof_hash cannot be zero".to_string());
+    }
+    Ok(format!("0x{normalized}"))
 }
 
 #[derive(Serialize)]
@@ -300,6 +345,20 @@ struct PrivacyBatchStatusResponse {
     job_id: String,
     status: JobStatus,
     elapsed_secs: f64,
+}
+
+#[derive(Deserialize)]
+struct PrivacyBatchSubmitCalldataRequest {
+    /// Canonical proof hash from verifier `ModelDirectVerified`.
+    proof_hash: String,
+}
+
+#[derive(Serialize)]
+struct PrivacyBatchSubmitCalldataResponse {
+    job_id: String,
+    proof_hash: String,
+    public_inputs_hash: String,
+    calldata: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -727,6 +786,7 @@ async fn submit_privacy_batch(
         completed_at: None,
         error: None,
         result: None,
+        submit_context: None,
     };
 
     state.privacy_jobs.write().await.insert(job_id.clone(), job);
@@ -1010,12 +1070,6 @@ async fn submit_privacy_batch(
                 pi_hash_hex.push_str("0x");
                 for &e in &pi_hash { pi_hash_hex.push_str(&format!("{:08x}", e.0)); }
 
-                // Compute proof hash (hash of public inputs hash — distinct from pi_hash)
-                let proof_hash = poseidon2_hash(&pi_hash);
-                let mut proof_hash_hex = String::with_capacity(2 + 8 * 8);
-                proof_hash_hex.push_str("0x");
-                for &e in &proof_hash { proof_hash_hex.push_str(&format!("{:08x}", e.0)); }
-
                 // Serialize STARK proof as felt252 calldata for on-chain verification
                 let stark_proof_felts = serialize_proof(&batch_proof.stark_proof);
                 let stark_proof_calldata: Vec<String> = stark_proof_felts
@@ -1023,37 +1077,25 @@ async fn submit_privacy_batch(
                     .map(|f| format!("0x{:x}", f))
                     .collect();
 
-                let recipients = WithdrawalRecipients::new(
-                    payout_recipients.clone(),
-                    credit_recipients.clone(),
-                );
-                let calldata = match build_submit_batch_proof_calldata(
-                    pi,
-                    &proof_hash_hex,
-                    &recipients,
-                ) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        if let Some(j) = jobs.get_mut(&jid) {
-                            j.status = JobStatus::Failed;
-                            j.error = Some(format!("submit calldata build failed: {e}"));
-                            j.completed_at = Some(Instant::now());
-                        }
-                        return;
-                    }
+                let submit_context = PrivacySubmitContext {
+                    public_inputs: pi.clone(),
+                    payout_recipients: payout_recipients.clone(),
+                    credit_recipients: credit_recipients.clone(),
                 };
 
                 let payload = PrivacyBatchResultPayload {
                     num_deposits: pi.deposits.len(),
                     num_withdrawals: pi.withdrawals.len(),
                     num_spends: pi.spends.len(),
-                    proof_hash: proof_hash_hex,
+                    proof_hash: None,
+                    proof_hash_status: "pending_verifier_canonical_hash".to_string(),
                     public_inputs_hash: pi_hash_hex,
                     prove_time_ms: prove_elapsed.as_millis() as u64,
                     deposits: deposit_results,
                     withdrawals: withdraw_results,
                     spends: spend_results,
-                    calldata,
+                    calldata_ready: false,
+                    calldata: Vec::new(),
                     payout_recipients,
                     credit_recipients,
                     stark_proof_calldata,
@@ -1063,6 +1105,7 @@ async fn submit_privacy_batch(
                     j.status = JobStatus::Completed;
                     j.completed_at = Some(Instant::now());
                     j.result = Some(payload);
+                    j.submit_context = Some(submit_context);
                 }
             }
             Ok(Err(e)) => {
@@ -1140,6 +1183,122 @@ async fn get_privacy_batch_result(
     }
 }
 
+async fn build_privacy_submit_calldata(
+    State(state): State<Arc<AppState>>,
+    Path(job_id): Path<String>,
+    Json(req): Json<PrivacyBatchSubmitCalldataRequest>,
+) -> Result<Json<PrivacyBatchSubmitCalldataResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let proof_hash = normalize_canonical_proof_hash(&req.proof_hash).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error: format!("invalid proof_hash: {e}") }),
+        )
+    })?;
+
+    let mut jobs = state.privacy_jobs.write().await;
+    let job = jobs.get_mut(&job_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse { error: format!("Privacy job '{job_id}' not found") }),
+        )
+    })?;
+
+    match job.status {
+        JobStatus::Completed => {
+            let submit_ctx = job.submit_context.clone().ok_or_else(|| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "Privacy job completed but submit context is missing".to_string(),
+                    }),
+                )
+            })?;
+            let public_inputs_hash = job
+                .result
+                .as_ref()
+                .map(|r| r.public_inputs_hash.clone())
+                .ok_or_else(|| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: "Privacy job completed but result is missing".to_string(),
+                        }),
+                    )
+                })?;
+
+            let recipients = WithdrawalRecipients::new(
+                submit_ctx.payout_recipients.clone(),
+                submit_ctx.credit_recipients.clone(),
+            );
+            let calldata = build_submit_batch_proof_calldata(
+                &submit_ctx.public_inputs,
+                &proof_hash,
+                &recipients,
+            )
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("failed to build submit calldata: {e}"),
+                    }),
+                )
+            })?;
+
+            if let Some(result) = job.result.as_mut() {
+                result.proof_hash = Some(proof_hash.clone());
+                result.proof_hash_status = "canonical_ready".to_string();
+                result.calldata_ready = true;
+                result.calldata = calldata.clone();
+            }
+
+            Ok(Json(PrivacyBatchSubmitCalldataResponse {
+                job_id: job_id.clone(),
+                proof_hash,
+                public_inputs_hash,
+                calldata,
+            }))
+        }
+        JobStatus::Failed => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: job.error.clone().unwrap_or_else(|| "Unknown error".to_string()),
+            }),
+        )),
+        _ => Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: format!("Privacy job is still {:?}", job.status),
+            }),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_canonical_proof_hash;
+
+    #[test]
+    fn test_normalize_canonical_proof_hash_accepts_hex() {
+        assert_eq!(
+            normalize_canonical_proof_hash("0x00AbCd").unwrap(),
+            "0xabcd"
+        );
+        assert_eq!(normalize_canonical_proof_hash("1234").unwrap(), "0x1234");
+    }
+
+    #[test]
+    fn test_normalize_canonical_proof_hash_rejects_invalid_values() {
+        assert!(normalize_canonical_proof_hash("").is_err());
+        assert!(normalize_canonical_proof_hash("0x").is_err());
+        assert!(normalize_canonical_proof_hash("0x0").is_err());
+        assert!(normalize_canonical_proof_hash("0xgg").is_err());
+        assert!(normalize_canonical_proof_hash(
+            "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1"
+        )
+        .is_err());
+    }
+}
+
 // =============================================================================
 // Main
 // =============================================================================
@@ -1164,6 +1323,10 @@ async fn main() {
         .route("/api/v1/privacy/batch", post(submit_privacy_batch))
         .route("/api/v1/privacy/batch/{job_id}", get(get_privacy_batch_status))
         .route("/api/v1/privacy/batch/{job_id}/result", get(get_privacy_batch_result))
+        .route(
+            "/api/v1/privacy/batch/{job_id}/submit-calldata",
+            post(build_privacy_submit_calldata),
+        )
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -1171,6 +1334,7 @@ async fn main() {
     eprintln!("prove-server listening on {bind}");
     eprintln!("  GPU: {}", detect_tee_capability().device_name);
     eprintln!("  Privacy: POST /api/v1/privacy/batch");
+    eprintln!("  Privacy Submit: POST /api/v1/privacy/batch/{{job_id}}/submit-calldata");
     #[cfg(feature = "server-audit")]
     if let Ok(audit_dir) = std::env::var("AUDIT_LOG_DIR") {
         eprintln!("  Audit: enabled (AUDIT_LOG_DIR={audit_dir})");
