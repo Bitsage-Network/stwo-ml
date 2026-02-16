@@ -65,6 +65,78 @@ ML inference proving and privacy protocol built on [STWO](https://github.com/sta
 | Transparent | FRI commitment — no trusted setup ceremony. |
 | Native verification | Proofs verify in Cairo on Starknet. |
 
+## STWO GPU Backend
+
+The STWO prover includes a full CUDA GPU backend at `stwo/crates/stwo/src/prover/backend/gpu/` that accelerates every stage of proof generation. All GPU paths use hybrid dispatch — SIMD fallback for small operations (< 2^12–2^14 elements), CUDA kernels for large.
+
+### Core Runtime
+
+| Module | Description |
+|--------|-------------|
+| `mod.rs` | `GpuBackend` marker struct, global context (`is_available()`, `device_name()`, `available_memory()`, `compute_capability()`) |
+| `cuda_executor.rs` | NVRTC kernel compilation, device init, memory allocation. Global singleton via `get_cuda_executor()`, per-device executors via `get_executor_for_device(device_id)` |
+| `compat.rs` | cudarc 0.11+ FFI bindings for peer access, CUDA graphs, async transfers, `mem_get_info()` |
+
+### Memory & Data Transfer
+
+| Module | Description |
+|--------|-------------|
+| `memory.rs` | Type-safe `GpuBuffer<T>`, FRI GPU residency cache (`FriGpuState`), pinned memory pool for fast H2D/D2H |
+| `column.rs` | GPU bit-reversal for columns > 2^14 elements, column transfer utilities (`base_column_to_gpu()`, `gpu_to_base_column()`) |
+| `conversion.rs` | Zero-copy transmutes between `GpuBackend` and `SimdBackend` (identical column types, compile-time size assertions) |
+
+### Computation Kernels
+
+| Module | Description |
+|--------|-------------|
+| `fft.rs` | Circle FFT over M31 with shared-memory butterfly, cached twiddles. **50–112x speedup** vs SIMD for 1M–4M elements |
+| `constraints.rs` | Direct GPU evaluation of AIR constraints with embedded M31 modular arithmetic |
+| `quotients.rs` | Fused GPU quotient kernel for large domains (log_size >= 14), SIMD fallback for small |
+| `poly_ops.rs` | Polynomial interpolate/evaluate/extend (mostly SIMD-delegated; real GPU acceleration via `GpuProofPipeline`) |
+| `fri.rs` | FRI folding with GPU residency — large folds (> 2^12) on GPU, thread-local twiddle cache |
+| `gkr.rs` | GKR lookup ops: `fix_first_variable()` GPU-accelerated for > 16K elements, `gen_eq_evals()` for large outputs |
+
+### Merkle & Accumulation
+
+| Module | Description |
+|--------|-------------|
+| `merkle.rs` | GPU Blake2s hashing for trees > 2^14 leaves (2–4x speedup for > 64K leaves). Supports Blake2s, Blake2sM31, Poseidon252 hashers |
+| `merkle_lifted.rs` | Lifted (compressed) Merkle ops delegating to SIMD via zero-copy conversion |
+| `accumulation.rs` | Element-wise accumulation (SIMD-delegated — no GPU benefit at this granularity) |
+| `grind.rs` | Proof-of-work grinding (SIMD-delegated) |
+
+### Pipeline & Optimization
+
+| Module | Description |
+|--------|-------------|
+| `pipeline.rs` | `GpuProofPipeline` — persistent GPU memory across trace→FFT→quotient→FRI→Merkle. Multi-GPU via per-device executors. Optional CUDA Graphs (20–40% speedup) |
+| `cuda_streams.rs` | `CudaStreamManager` — overlapped H2D/compute/D2H with 3 primary streams (~10–15% latency hiding) |
+| `optimizations.rs` | CUDA Graphs (kernel capture/replay), pinned memory pool (`get_pinned_pool_u32()`), global memory pool with RAII cleanup |
+| `large_proofs.rs` | Support for 2^26+ polynomials. `MemoryRequirements` calculator, chunked processing for proofs exceeding GPU memory |
+| `multi_gpu.rs` | `GpuCapabilities` for device introspection (compute capability, SM count, Tensor Cores). Throughput mode (independent proofs) and distributed mode (single proof across GPUs) |
+| `multi_gpu_executor.rs` | Thread-safe `MultiGpuExecutorPool` — per-GPU executors in `Mutex`, global singleton, fallback logic |
+
+### TEE Confidential Computing (`tee/`)
+
+Hardware-based attestation and encrypted memory for H100/H200/B200 GPUs:
+
+| Module | Description |
+|--------|-------------|
+| `tee/mod.rs` | `ConfidentialGpu` enum (H100 80GB, H100 NVL 94GB, H200 141GB, B200 192GB), `SessionState` lifecycle |
+| `tee/attestation.rs` | GPU attestation (SPDM protocol) and CPU attestation (TDX/SEV-SNP) via nvTrust SDK |
+| `tee/crypto.rs` | AES-GCM-256 encryption matching GPU DMA, HKDF key derivation, SHA-256 hashing |
+| `tee/nvtrust.rs` | nvTrust SDK client — `GpuInfo`, attestation evidence, CC mode queries via Python SDK or `nvidia-smi conf-compute` |
+| `tee/cc_mode.rs` | Confidential Computing mode configuration |
+
+### Key Design Patterns
+
+- **Hybrid dispatch**: Every GPU path falls back to SIMD below a threshold (2^12–2^14 elements)
+- **GPU residency**: FRI folds and proof pipeline keep data on-device between stages — single H2D in, single D2H out
+- **Zero-copy conversion**: `GpuBackend` ↔ `SimdBackend` via `unsafe` transmute with compile-time size assertions
+- **Thread-local caching**: Twiddle factors cached per-thread in FFT and FRI to avoid recomputation
+- **CUDA Graphs**: Optional kernel sequence capture eliminates launch overhead (20–40% for repeated patterns)
+- **Multi-GPU pool**: `get_executor_for_device(id)` → true per-device parallelism with `Mutex`-wrapped executor pool
+
 ## Security
 
 The prover/verifier pipeline has undergone a comprehensive security audit (February 2026) covering 24 findings across all severity tiers — all addressed:
