@@ -4,16 +4,11 @@
 # ═══════════════════════════════════════════════════════════════════════
 #
 # Generates a cryptographic proof of ML model inference.
-# Supports 3 proof modes:
-#
-#   recursive — GPU proof → Cairo VM recursive STARK → compact proof
-#   direct    — GPU proof → chunked calldata for verify_model_direct()
-#   gkr       — GPU proof → GKR calldata for verify_model_gkr()
+# Production-hardened mode: GKR only.
 #
 # Usage:
-#   bash scripts/pipeline/03_prove.sh --model-name qwen3-14b --mode recursive
 #   bash scripts/pipeline/03_prove.sh --model-dir ~/models/qwen3-14b --layers 1 --mode gkr
-#   bash scripts/pipeline/03_prove.sh --model-name qwen3-14b --mode direct --gpu --multi-gpu
+#   bash scripts/pipeline/03_prove.sh --model-name qwen3-14b --mode gkr --gpu --multi-gpu
 #
 set -euo pipefail
 
@@ -70,10 +65,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --model-dir DIR    Path to model directory"
             echo ""
             echo "Proof mode:"
-            echo "  --mode MODE        recursive | direct | gkr (default: gkr)"
-            echo "    recursive:  prove-model → cairo-prove → Circle STARK"
-            echo "    direct:     prove-model → chunked calldata"
-            echo "    gkr:        prove-model → GKR calldata"
+            echo "  --mode MODE        gkr (default: gkr)"
+            echo "    gkr:        prove-model → GKR calldata for verify_model_gkr()"
             echo ""
             echo "Options:"
             echo "  --layers N           Number of transformer layers (default: from config)"
@@ -97,11 +90,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Validate mode
-case "$MODE" in
-    recursive|direct|gkr) ;;
-    *) err "Unknown mode: ${MODE} (expected: recursive, direct, gkr)"; exit 1 ;;
-esac
+# Validate mode (fail-closed to full on-chain GKR verification).
+if [[ "$MODE" != "gkr" ]]; then
+    err "Only --mode gkr is supported in the hardened pipeline (got: ${MODE})"
+    err "Use GKR mode for full on-chain cryptographic verification."
+    exit 1
+fi
 
 # ─── Resolve Model ──────────────────────────────────────────────────
 
@@ -155,25 +149,11 @@ if [[ -z "$PROVE_BIN" ]]; then
     exit 1
 fi
 
-# cairo-prove (for recursive mode)
-CAIRO_BIN=""
-if [[ "$MODE" == "recursive" ]]; then
-    CAIRO_BIN=$(get_state "setup_state.env" "CAIRO_PROVE_BIN" 2>/dev/null || echo "")
-    if [[ -z "$CAIRO_BIN" ]] || [[ ! -f "$CAIRO_BIN" ]]; then
-        CAIRO_BIN=$(find_binary "cairo-prove" "$LIBS_DIR" 2>/dev/null || echo "")
-    fi
-    if [[ -z "$CAIRO_BIN" ]]; then
-        err "cairo-prove not found (required for recursive mode)."
-        err "Run 00_setup_gpu.sh or use --mode direct/gkr."
-        exit 1
-    fi
-fi
-
 # Optional rebuild
 if [[ "$SKIP_BUILD" == "false" ]] && [[ -d "${LIBS_DIR}/stwo-ml" ]]; then
-    FEATURES="cli,audit"
+    FEATURES="cli"
     if [[ "$USE_GPU" == "true" ]]; then
-        FEATURES="cli,audit,cuda-runtime"
+        FEATURES="cli,cuda-runtime"
     fi
     log "Rebuilding prove-model (features: ${FEATURES})..."
     (cd "${LIBS_DIR}/stwo-ml" && cargo build --release --bin prove-model --features "${FEATURES}" 2>&1 | tail -3) || true
@@ -191,18 +171,13 @@ log "Layers:         ${MODEL_LAYERS:-all}"
 log "GPU:            ${USE_GPU} (multi: ${MULTI_GPU})"
 log "Output:         ${OUTPUT_DIR}"
 log "prove-model:    ${PROVE_BIN}"
-[[ "$MODE" == "recursive" ]] && log "cairo-prove:    ${CAIRO_BIN}"
 echo ""
 
 timer_start "prove_total"
 
 # ─── Format Mapping ─────────────────────────────────────────────────
 
-case "$MODE" in
-    recursive)  FORMAT="cairo_serde" ;;
-    direct)     FORMAT="direct" ;;
-    gkr)        FORMAT="ml_gkr" ;;
-esac
+FORMAT="ml_gkr"
 
 # ═══════════════════════════════════════════════════════════════════════
 # Phase 1: GPU ML Proof (all modes start here)

@@ -186,12 +186,6 @@ async function executeViaPaymaster(account, calls, deploymentData) {
 }
 
 
-function generateSessionId() {
-  const ts = BigInt(Date.now());
-  const rand = BigInt(Math.floor(Math.random() * 1_000_000));
-  return `0x${((ts << 20n) + rand).toString(16)}`;
-}
-
 function parseVerifyCalldata(proofData, fallbackModelId) {
   const verifyCalldata = proofData.verify_calldata;
   if (!verifyCalldata || typeof verifyCalldata !== "object" || Array.isArray(verifyCalldata)) {
@@ -207,8 +201,8 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
   if (typeof entrypoint !== "string" || entrypoint.length === 0) {
     die("verify_calldata.entrypoint must be a non-empty string");
   }
-  if (entrypoint !== "verify_model_gkr" && entrypoint !== "verify_model_direct") {
-    die(`Unsupported verify_calldata.entrypoint: ${entrypoint}`);
+  if (entrypoint !== "verify_model_gkr") {
+    die(`Only verify_model_gkr is supported in the hardened pipeline (got: ${entrypoint})`);
   }
 
   const rawCalldata = verifyCalldata.calldata;
@@ -220,40 +214,18 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
   if (!Array.isArray(rawChunks)) {
     die("verify_calldata.upload_chunks must be an array");
   }
-
-  const hasSessionPlaceholder = rawCalldata.some((v) => String(v) === "__SESSION_ID__");
-  if (entrypoint === "verify_model_direct" && !hasSessionPlaceholder) {
-    die("verify_model_direct calldata must include __SESSION_ID__ placeholder");
-  }
-  if (entrypoint === "verify_model_gkr" && hasSessionPlaceholder) {
-    die("verify_model_gkr calldata must not include __SESSION_ID__ placeholder");
-  }
-  if (entrypoint === "verify_model_gkr" && rawChunks.length > 0) {
+  if (rawChunks.length > 0) {
     die("verify_model_gkr payload must not include upload_chunks");
   }
 
-  let sessionId = null;
+  const hasSessionPlaceholder = rawCalldata.some((v) => String(v) === "__SESSION_ID__");
   if (hasSessionPlaceholder) {
-    sessionId = generateSessionId();
+    die("verify_model_gkr calldata must not include __SESSION_ID__ placeholder");
   }
 
-  const calldata = rawCalldata.map((v) => {
-    const s = String(v);
-    if (s === "__SESSION_ID__") {
-      if (!sessionId) {
-        die("session placeholder present but session id was not generated");
-      }
-      return sessionId;
-    }
-    return s;
-  });
-
-  const uploadChunks = rawChunks.map((chunk, idx) => {
-    if (!Array.isArray(chunk)) {
-      die(`verify_calldata.upload_chunks[${idx}] must be an array`);
-    }
-    return chunk.map((v) => String(v));
-  });
+  const calldata = rawCalldata.map((v) => String(v));
+  const uploadChunks = [];
+  const sessionId = null;
 
   const modelId = calldata.length > 0 ? String(calldata[0]) : fallbackModelId;
 
@@ -390,11 +362,8 @@ async function cmdVerify(args) {
   const verifyPayload = parseVerifyCalldata(proofData, modelIdArg);
   const modelId = verifyPayload.modelId || modelIdArg;
 
-  if (
-    verifyPayload.entrypoint !== "verify_model_gkr" &&
-    verifyPayload.entrypoint !== "verify_model_direct"
-  ) {
-    die(`Unsupported verify_calldata.entrypoint: ${verifyPayload.entrypoint}`);
+  if (verifyPayload.entrypoint !== "verify_model_gkr") {
+    die(`Only verify_model_gkr is supported in the hardened pipeline (got: ${verifyPayload.entrypoint})`);
   }
 
   if (
@@ -415,39 +384,14 @@ async function cmdVerify(args) {
     info(`Verification count (before): ${verificationCountBefore.toString()}`);
   }
 
-  // ── Build verification calls (direct mode may need chunk uploads first) ──
-  const calls = [];
-  if (verifyPayload.entrypoint === "verify_model_direct") {
-    info(
-      "Direct mode has partial on-chain cryptographic coverage: batch sumchecks are verified, activation STARK is currently hash-bound."
-    );
-    if (verifyPayload.uploadChunks.length > 0 && !verifyPayload.sessionId) {
-      die("Direct verify payload has upload chunks but no session id placeholder");
-    }
-
-    if (verifyPayload.uploadChunks.length > 0) {
-      info(
-        `Uploading ${verifyPayload.uploadChunks.length} direct STARK chunks in the same sponsored TX...`
-      );
-      verifyPayload.uploadChunks.forEach((chunk, idx) => {
-        calls.push({
-          contractAddress: contract,
-          entrypoint: "upload_proof_chunk",
-          calldata: CallData.compile([
-            verifyPayload.sessionId,
-            idx,
-            ...chunk,
-          ]),
-        });
-      });
-    }
-  }
-
-  calls.push({
-    contractAddress: contract,
-    entrypoint: verifyPayload.entrypoint,
-    calldata: CallData.compile(verifyPayload.calldata),
-  });
+  // ── Build verification call (GKR only) ──
+  const calls = [
+    {
+      contractAddress: contract,
+      entrypoint: verifyPayload.entrypoint,
+      calldata: CallData.compile(verifyPayload.calldata),
+    },
+  ];
 
   info(`Submitting ${verifyPayload.entrypoint} for model ${modelId}...`);
   info(`Contract: ${contract}`);
@@ -546,12 +490,8 @@ async function cmdVerify(args) {
     }
   }
 
-  const onchainAssurance =
-    verifyPayload.entrypoint === "verify_model_direct"
-      ? "partial_batch_sumcheck_plus_stark_hash_binding"
-      : "full_gkr";
-  const fullGkrVerified =
-    verifyPayload.entrypoint === "verify_model_gkr" && acceptedOnchain;
+  const onchainAssurance = "full_gkr";
+  const fullGkrVerified = acceptedOnchain;
   const isVerified = fullGkrVerified;
 
   const explorerUrl = `${net.explorer}${txHash}`;

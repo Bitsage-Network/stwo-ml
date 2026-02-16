@@ -4,17 +4,12 @@
 # ═══════════════════════════════════════════════════════════════════════
 #
 # Submits a proof to Starknet and verifies it on-chain.
-# Auto-detects proof mode from metadata.json.
-#
-# Modes:
-#   recursive — delegates to submit_recursive_proof.py
-#   direct    — upload chunks → verify_model_direct()
-#   gkr       — verify_model_gkr()
+# Production-hardened mode: GKR only (verify_model_gkr).
 #
 # Usage:
 #   bash scripts/pipeline/04_verify_onchain.sh --dry-run
 #   bash scripts/pipeline/04_verify_onchain.sh --proof-dir ~/.obelysk/proofs/latest --submit
-#   bash scripts/pipeline/04_verify_onchain.sh --proof recursive_proof.json --submit
+#   bash scripts/pipeline/04_verify_onchain.sh --proof ml_proof.json --submit
 #
 set -euo pipefail
 
@@ -131,7 +126,7 @@ if [[ -z "$PROOF_DIR" ]] && [[ -z "$PROOF_FILE" ]]; then
     log "Using latest proof: ${PROOF_DIR}"
 fi
 
-# Detect mode from metadata or file extension
+# Detect mode from metadata or proof artifact.
 PROOF_MODE=""
 METADATA_FILE=""
 
@@ -154,7 +149,7 @@ fi
 # Verify proof file exists
 if [[ -z "$PROOF_FILE" ]] || [[ ! -f "$PROOF_FILE" ]]; then
     # Try common names
-    for name in recursive_proof.json ml_proof.json proof.json; do
+    for name in ml_proof.json proof.json recursive_proof.json; do
         if [[ -n "$PROOF_DIR" ]] && [[ -f "${PROOF_DIR}/${name}" ]]; then
             PROOF_FILE="${PROOF_DIR}/${name}"
             break
@@ -164,13 +159,30 @@ fi
 
 check_file "$PROOF_FILE" "Proof file not found: ${PROOF_FILE:-<none>}" || exit 1
 
-# Infer mode if not from metadata
+# Hardened policy: metadata mode must be gkr if present.
+if [[ -n "$PROOF_MODE" ]] && [[ "$PROOF_MODE" != "gkr" ]]; then
+    err "Only gkr mode is supported in the hardened pipeline (metadata mode=${PROOF_MODE})"
+    exit 1
+fi
+
+# Infer mode from proof artifact if metadata mode is absent.
 if [[ -z "$PROOF_MODE" ]]; then
-    case "$(basename "$PROOF_FILE")" in
-        recursive_proof*)  PROOF_MODE="recursive" ;;
-        *)                 PROOF_MODE="direct" ;;
-    esac
-    warn "Inferred mode: ${PROOF_MODE} (from filename)"
+    ENTRYPOINT_IN_PROOF=$(parse_json_field "$PROOF_FILE" "verify_calldata.entrypoint")
+    if [[ "$ENTRYPOINT_IN_PROOF" == "verify_model_gkr" ]]; then
+        PROOF_MODE="gkr"
+        log "Inferred mode: gkr (from verify_calldata.entrypoint)"
+    elif [[ "$ENTRYPOINT_IN_PROOF" == "verify_model_direct" ]]; then
+        err "Direct proofs are disabled in the hardened pipeline. Regenerate proof with --mode gkr."
+        exit 1
+    else
+        err "Could not determine supported proof mode from verify_calldata.entrypoint (got: ${ENTRYPOINT_IN_PROOF:-<none>})"
+        exit 1
+    fi
+fi
+
+if [[ "$PROOF_MODE" != "gkr" ]]; then
+    err "Only gkr mode is supported in the hardened pipeline (mode=${PROOF_MODE})"
+    exit 1
 fi
 
 # ─── Resolve Contract ───────────────────────────────────────────────
@@ -178,10 +190,7 @@ fi
 if [[ -n "$CONTRACT_OVERRIDE" ]]; then
     CONTRACT="$CONTRACT_OVERRIDE"
 else
-    case "$PROOF_MODE" in
-        recursive)  CONTRACT=$(get_verifier_address "stark" "$NETWORK") ;;
-        direct|gkr) CONTRACT=$(get_verifier_address "elo" "$NETWORK") ;;
-    esac
+    CONTRACT=$(get_verifier_address "elo" "$NETWORK")
 fi
 
 if [[ -z "$CONTRACT" ]]; then
@@ -338,36 +347,24 @@ if schema_version != 1:
 entrypoint = vc.get('entrypoint')
 if not isinstance(entrypoint, str) or not entrypoint:
     fail("verify_calldata.entrypoint must be a non-empty string")
-if entrypoint not in ('verify_model_direct', 'verify_model_gkr'):
-    fail(f'Unsupported verify_calldata.entrypoint: {entrypoint}')
+if entrypoint != 'verify_model_gkr':
+    fail(f'Only verify_model_gkr is supported in the hardened pipeline (got: {entrypoint})')
 
 calldata = vc.get('calldata')
 if not isinstance(calldata, list) or len(calldata) == 0:
     fail("verify_calldata.calldata must be a non-empty array")
+if any(str(v) == '__SESSION_ID__' for v in calldata):
+    fail('verify_model_gkr calldata must not include __SESSION_ID__ placeholder')
 
-resolved = []
-for value in calldata:
-    s = str(value)
-    if s == '__SESSION_ID__':
-        if not session_id:
-            fail('verify_calldata requires session id replacement but no session id was provided')
-        s = session_id
-    resolved.append(s)
+resolved = [str(v) for v in calldata]
 
 upload_chunks = vc.get('upload_chunks', [])
 if upload_chunks is None:
     upload_chunks = []
 if not isinstance(upload_chunks, list):
     fail('verify_calldata.upload_chunks must be an array')
-
-if entrypoint == 'verify_model_direct':
-    if '__SESSION_ID__' not in [str(v) for v in calldata]:
-        fail('verify_model_direct calldata must include __SESSION_ID__ placeholder')
-else:
-    if any(str(v) == '__SESSION_ID__' for v in calldata):
-        fail('verify_model_gkr calldata must not include __SESSION_ID__ placeholder')
-    if len(upload_chunks) != 0:
-        fail('verify_model_gkr payload must not include upload_chunks')
+if len(upload_chunks) != 0:
+    fail('verify_model_gkr payload must not include upload_chunks')
 
 with open(os.path.join(out_dir, 'entrypoint.txt'), 'w', encoding='utf-8') as f:
     f.write(entrypoint)
