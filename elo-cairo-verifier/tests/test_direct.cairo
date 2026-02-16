@@ -335,15 +335,16 @@ fn test_verify_model_direct_with_stark_chunks() {
 }
 
 #[test]
-fn test_verify_model_direct_stark_data_bound_by_hash() {
+#[should_panic(expected: "DIRECT_REQUIRES_BATCHED_SUMCHECK")]
+fn test_verify_model_direct_requires_batched_proof() {
     let verifier = deploy_verifier();
 
     let model_id: felt252 = 0xface;
     verifier.register_model(model_id, 0xcafe);
 
-    // STARK data is hash-bound (not deserialized on-chain).
-    // Contract should succeed — the STARK hash is included in the proof hash.
-    let result = verifier.verify_model_direct(
+    // STARK data alone is only hash-bound; direct verification now requires
+    // at least one cryptographically verified batched sumcheck proof.
+    verifier.verify_model_direct(
         model_id,
         0x700,
         array![1, 4, 4, 1, 2, 3, 4, 1, 2, 2, 10, 20], // raw_io_data
@@ -353,8 +354,6 @@ fn test_verify_model_direct_stark_data_bound_by_hash() {
         array![],
         array![0xdead, 0xbeef], // data is hashed, not parsed
     );
-    assert!(result, "hash-bound STARK data should pass");
-    assert!(verifier.get_verification_count(model_id) == 1, "should record verification");
 }
 
 // ============================================================================

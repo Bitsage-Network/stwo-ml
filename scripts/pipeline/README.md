@@ -1,5 +1,7 @@
 # Obelysk Pipeline
 
+> Note: `scripts/pipeline` is the canonical implementation. Files in `libs/scripts/pipeline` are compatibility wrappers that delegate to `scripts/pipeline` to prevent drift.
+
 End-to-end pipeline for proving ML model inference and verifying on-chain. Works on any NVIDIA GPU from RTX 4090 to B300.
 
 ## Quick Start
@@ -27,7 +29,7 @@ STARKNET_PRIVATE_KEY=0x... ./run_e2e.sh --preset qwen3-14b --gpu --submit
 | 2 | `02_validate_model.sh` | Validate model files, dimensions, weights |
 | 2a | `02a_test_inference.sh` | Test inference via llama.cpp (single prompt, chat, benchmark) |
 | 3 | `03_prove.sh` | Generate cryptographic proof with local verification |
-| 4 | `04_verify_onchain.sh` | Submit proof to Starknet with TX confirmation + is_verified check |
+| 4 | `04_verify_onchain.sh` | Submit proof to Starknet with TX confirmation + acceptance and assurance classification (`accepted_onchain`, `full_gkr_verified`) |
 | E2E | `run_e2e.sh` | Run all steps in sequence with resume support |
 
 ## Environment Variables
@@ -78,7 +80,7 @@ GPU presets in `configs/4090.env`, `configs/b200.env`, `configs/b300.env`.
 | Mode | Pipeline | On-Chain Function | Notes |
 |------|----------|-------------------|-------|
 | `gkr` | prove-model (GKR sumcheck) | `verify_model_gkr()` | Default. Fastest |
-| `direct` | prove-model -> chunked calldata | `verify_model_direct()` | Moderate |
+| `direct` | prove-model -> chunked calldata | `verify_model_direct()` | Partial on-chain cryptographic coverage (not full GKR assurance) |
 | `recursive` | prove-model -> cairo-prove -> Circle STARK | Multi-step (9+ TXs) | Most secure |
 
 ## Per-Script Usage

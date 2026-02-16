@@ -297,3 +297,33 @@ fn test_verify_model_gkr_short_io_data() {
         array![],                        // weight_opening_proofs
     );
 }
+
+// ============================================================================
+// Test 11: Circuit hash mismatch rejected (proof tags/depth must match registration)
+// ============================================================================
+
+#[test]
+#[should_panic(expected: "CIRCUIT_HASH_MISMATCH")]
+fn test_verify_model_gkr_circuit_hash_mismatch() {
+    let dispatcher = deploy_verifier();
+    let owner: ContractAddress = 0x1234_felt252.try_into().unwrap();
+    snforge_std::start_cheat_caller_address(dispatcher.contract_address, owner);
+
+    let model_id: felt252 = 0xABC;
+
+    // Register with descriptor [1]
+    dispatcher.register_model_gkr(model_id, array![], array![1]);
+
+    // Verify with a mismatched circuit_depth so descriptor hash diverges.
+    dispatcher.verify_model_gkr(
+        model_id,
+        build_raw_io_data(),
+        2,              // wrong circuit_depth
+        0,              // no layer proofs
+        array![],
+        array![],
+        array![0],     // proof_data: num_deferred = 0 (well-formed minimal payload)
+        array![],
+        array![],
+    );
+}

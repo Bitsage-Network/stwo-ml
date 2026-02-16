@@ -19,7 +19,7 @@ stwo_verifier_utils = { path = "../stwo-cairo/stwo_cairo_verifier/crates/verifie
 bounded_int = { path = "../stwo-cairo/stwo_cairo_verifier/crates/bounded_int" }
 
 [dev-dependencies]
-snforge_std = { git = "https://github.com/foundry-rs/starknet-foundry", tag = "v0.54.0" }
+snforge_std = { git = "https://github.com/foundry-rs/starknet-foundry", tag = "v0.54.1" }
 cairo_test = "2.12.2"
 
 [[target.starknet-contract]]

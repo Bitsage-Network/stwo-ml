@@ -50,6 +50,7 @@ fn reader_new(data: Span<felt252>) -> ProofReader {
 }
 
 fn read_felt(ref r: ProofReader) -> felt252 {
+    assert!(r.offset < r.data.len(), "PROOF_DATA_TRUNCATED");
     let v = *r.data.at(r.offset);
     r.offset += 1;
     v
@@ -330,9 +331,38 @@ pub fn verify_gkr_model(
     initial_claim: GKRClaim,
     ref ch: PoseidonChannel,
 ) -> (GKRClaim, Array<WeightClaimData>) {
+    let (final_claim, weight_claims, _layer_tags, _deferred_weight_commitments) =
+        verify_gkr_model_with_trace(
+            proof_data,
+            num_layers,
+            matmul_dims,
+            dequantize_bits,
+            initial_claim,
+            ref ch,
+        );
+    (final_claim, weight_claims)
+}
+
+/// Verify a complete GKR model proof and return additional trace metadata.
+///
+/// Returns:
+///   - final_input_claim
+///   - weight_claims (main + deferred)
+///   - layer_tags observed in proof order (for circuit hash binding)
+///   - deferred_weight_commitments (one per deferred matmul proof)
+pub fn verify_gkr_model_with_trace(
+    proof_data: Span<felt252>,
+    num_layers: u32,
+    matmul_dims: Span<u32>,
+    dequantize_bits: Span<u64>,
+    initial_claim: GKRClaim,
+    ref ch: PoseidonChannel,
+) -> (GKRClaim, Array<WeightClaimData>, Array<u32>, Array<felt252>) {
     let mut reader = reader_new(proof_data);
     let mut current_claim = initial_claim;
     let mut weight_claims: Array<WeightClaimData> = array![];
+    let mut layer_tags: Array<u32> = array![];
+    let mut deferred_weight_commitments: Array<felt252> = array![];
 
     // Counters for per-type dimension arrays
     let mut matmul_idx: u32 = 0;
@@ -350,12 +380,15 @@ pub fn verify_gkr_model(
         }
 
         let tag = read_u32(ref reader);
+        layer_tags.append(tag);
 
         if tag == 0 {
             // MatMul — collect weight claim for MLE opening verification
-            let m = *matmul_dims.at(matmul_idx * 3);
-            let k = *matmul_dims.at(matmul_idx * 3 + 1);
-            let n = *matmul_dims.at(matmul_idx * 3 + 2);
+            let dims_base = matmul_idx * 3;
+            assert!(dims_base + 2 < matmul_dims.len(), "MATMUL_DIMS_UNDERRUN");
+            let m = *matmul_dims.at(dims_base);
+            let k = *matmul_dims.at(dims_base + 1);
+            let n = *matmul_dims.at(dims_base + 2);
             matmul_idx += 1;
 
             // Capture r_j from current claim before reduction
@@ -409,6 +442,7 @@ pub fn verify_gkr_model(
             current_claim = dispatch_layernorm(@current_claim, ref reader, ref ch);
         } else if tag == 6 {
             // Dequantize
+            assert!(dequantize_idx < dequantize_bits.len(), "DEQUANTIZE_BITS_UNDERRUN");
             let bits = *dequantize_bits.at(dequantize_idx);
             dequantize_idx += 1;
             current_claim = dispatch_dequantize(@current_claim, bits, ref reader, ref ch);
@@ -421,6 +455,9 @@ pub fn verify_gkr_model(
 
         layer_idx += 1;
     };
+
+    assert!(matmul_idx * 3 == matmul_dims.len(), "MATMUL_DIMS_TRAILING");
+    assert!(dequantize_idx == dequantize_bits.len(), "DEQUANTIZE_BITS_TRAILING");
 
     // ========================================================================
     // Deferred Proofs (DAG Add skip connections)
@@ -489,11 +526,13 @@ pub fn verify_gkr_model(
             expected_value: final_b_eval,
         });
 
-        // Read weight commitment (verification done externally)
-        let _weight_commitment = read_felt(ref reader);
+        // Read deferred weight commitment (bound by caller against registration)
+        let deferred_weight_commitment = read_felt(ref reader);
+        deferred_weight_commitments.append(deferred_weight_commitment);
 
         def_idx += 1;
     };
 
-    (current_claim, weight_claims)
+    assert!(reader.offset == reader.data.len(), "PROOF_DATA_TRAILING");
+    (current_claim, weight_claims, layer_tags, deferred_weight_commitments)
 }

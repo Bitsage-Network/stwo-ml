@@ -34,6 +34,60 @@ Verifies STWO ML proofs — GKR model walk with per-layer sumchecks, LogUp looku
 | v2 | [`0x01c102...bd7f8`](https://sepolia.voyager.online/contract/0x01c102bbf1b8a7c2c37b02a7cef7e2baf06dcce94432e2aecda233b79adbd7f8) | `0x7845b0...2efe5` | Sumcheck, batch |
 | v1 | [`0x053118...8569e`](https://sepolia.voyager.online/contract/0x0531182369ea82331ac39854faab986ba61907c2f88aa75120636a427ff8569e) | `0x55175...cd40` | Sumcheck only |
 
+## VM31 Privacy Pool Contract
+
+The VM31Pool contract manages a shielded transaction pool using a Poseidon2-M31 Merkle tree for note commitments. Supports deposits (public -> shielded), withdrawals (shielded -> public), and private transfers (2-in/2-out spends) — all verified via STARK proofs.
+
+### Deployed (Starknet Sepolia)
+
+| Field | Value |
+|-------|-------|
+| **Address** | [`0x07cf94...e1f9`](https://sepolia.starkscan.co/contract/0x07cf94e27a60b94658ec908a00a9bb6dfff03358e952d9d48a8ed0be080ce1f9) |
+| **Class Hash** | `0x046d316ca9ffe36adfdd3760003e9f8aa433cb34105619edcdc275315a2c8405` |
+| **Owner/Relayer** | `0x0759a4374389b0e3cfcc59d49310b6bc75bb12bbf8ce550eb5c2f026918bb344` |
+| **Verifier** | EloVerifier v9 (`0x00c784...e710`) |
+
+### Batch Processing Protocol (3-step)
+
+```
+  1. submit_batch_proof(deposits, withdrawals, spends, proof_hash, recipients)
+     -> Verifies STARK, stores batch metadata, returns batch_id
+
+  2. apply_batch_chunk(batch_id, start, count)
+     -> Processes Merkle insertions + nullifiers for a chunk of transactions
+     -> Relayer-only before timeout (120 blocks), permissionless after
+
+  3. finalize_batch(batch_id)
+     -> Verifies all transactions processed, updates canonical root
+```
+
+### Key Features
+
+| Feature | Detail |
+|---------|--------|
+| **Merkle tree** | Depth-20 on-chain Poseidon2-M31 tree (packed `lo`/`hi` felt252 digests) |
+| **Multi-asset** | Per-asset ERC-20 vault accounting, `register_asset()` for new tokens |
+| **Nullifier set** | O(1) lookup for double-spend prevention |
+| **Root history** | Ring buffer of 256 historical roots for concurrent proof generation |
+| **Upgradability** | 5-minute timelocked `propose_upgrade` / `execute_upgrade` |
+| **Verifier change** | Timelocked `propose_verifier_change` / `execute_verifier_change` |
+| **Pause/unpause** | Owner-controlled emergency pause |
+| **Batch timeout** | 120-block relayer exclusivity, then permissionless finalization |
+
+### Deployment
+
+```bash
+# Deploy the pool contract
+cd elo-cairo-verifier
+./scripts/deploy.sh \
+  --contract vm31-pool \
+  --relayer 0x<relayer_address> \
+  --verifier 0x<elo_verifier_address> \
+  0x<owner_address>
+```
+
+The deploy script auto-updates `scripts/pipeline/lib/contract_addresses.sh`.
+
 ## Architecture
 
 ```
@@ -51,6 +105,14 @@ Verifies STWO ML proofs — GKR model walk with per-layer sumchecks, LogUp looku
   |   +-- model_verifier.cairo   Full GKR model walk + deferred proofs (~500 lines)
   |   +-- ml_air.cairo           ML Air trait + STARK verification (~950 lines)
   |   +-- verifier.cairo         ISumcheckVerifier contract (~1300 lines)
+  |   +-- audit.cairo            On-chain audit record storage
+  |   +-- access_control.cairo   Role-based access control for audit/admin
+  |   +-- view_key.cairo         View key registration for note decryption
+  |   +-- vm31_merkle.cairo      Poseidon2-M31 Merkle tree (packed lo/hi digests)
+  |   +-- vm31_verifier.cairo    Batch public input verification for privacy pool
+  |   +-- vm31_pool.cairo        VM31PoolContract — privacy pool with batch protocol
+  |   +-- mock_proof_verifier.cairo  Mock verifier for pool integration tests
+  |   +-- mock_erc20.cairo       Mock ERC-20 for pool deposit/withdraw tests
   |   +-- lib.cairo              Module registry
   +-- tests/
       +-- test_field.cairo                 27 field arithmetic tests
@@ -65,6 +127,12 @@ Verifies STWO ML proofs — GKR model walk with per-layer sumchecks, LogUp looku
       +-- test_logup.cairo                 LogUp table verification tests
       +-- test_model_verifier.cairo        Full model GKR walk tests
       +-- test_sp3_cross_language.cairo    Cross-language Serde roundtrip tests
+      +-- test_access_control.cairo        13 role-based access control tests
+      +-- test_audit.cairo                 Audit record storage tests
+      +-- test_vm31_merkle.cairo           Poseidon2-M31 Merkle tree tests
+      +-- test_vm31_verifier.cairo         Batch public input verification tests
+      +-- test_vm31_pool.cairo             41 pool contract integration tests
+      +-- test_vm31_binder.cairo           Cross-component binding tests
 ```
 
 ## GKR Model Verification Pipeline

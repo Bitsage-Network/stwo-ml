@@ -15,6 +15,7 @@
 
 use crate::types::{MatMulSumcheckProof, BatchedMatMulProof, GkrBatchProof, ModelProof, GKRClaim, MleOpeningProof};
 use crate::field::QM31;
+use crate::vm31_merkle::PackedDigest;
 use starknet::ClassHash;
 
 /// Minimum delay (seconds) between propose_upgrade and execute_upgrade.
@@ -99,6 +100,20 @@ pub trait ISumcheckVerifier<TContractState> {
     /// Check if a specific proof hash has been verified.
     fn is_proof_verified(self: @TContractState, proof_hash: felt252) -> bool;
 
+    /// Bind a verified proof hash to a VM31 batch public-input hash (owner only).
+    fn bind_vm31_public_hash(
+        ref self: TContractState, proof_hash: felt252, vm31_public_hash: PackedDigest,
+    );
+
+    /// Get the VM31 batch public-input hash bound to this proof hash.
+    fn get_vm31_public_hash(self: @TContractState, proof_hash: felt252) -> PackedDigest;
+
+    /// Get current VM31 binder role address.
+    fn get_vm31_binder(self: @TContractState) -> starknet::ContractAddress;
+
+    /// Set VM31 binder role (owner only).
+    fn set_vm31_binder(ref self: TContractState, binder: starknet::ContractAddress);
+
     /// Get the contract owner.
     fn get_owner(self: @TContractState) -> starknet::ContractAddress;
 
@@ -178,7 +193,7 @@ mod SumcheckVerifierContract {
     };
     use crate::field::{
         log2_ceil, next_power_of_two, pack_qm31_to_felt,
-        evaluate_mle, m31_to_qm31,
+        evaluate_mle, m31_to_qm31, qm31_eq,
     };
     use crate::channel::{
         channel_default, channel_mix_u64, channel_mix_felt, channel_draw_qm31s,
@@ -187,7 +202,7 @@ mod SumcheckVerifierContract {
     use crate::sumcheck::{verify_sumcheck_inner, verify_batched_sumcheck};
     use crate::mle::verify_mle_opening;
     use crate::gkr::partially_verify_batch;
-    use crate::model_verifier::verify_gkr_model;
+    use crate::model_verifier::verify_gkr_model_with_trace;
     // NOTE: verify_unified_stark + UnifiedStarkProof deserialization pulls in
     // stwo_verifier_core's FRI verifier which uses Felt252Dict (squashed_felt252_dict_entries).
     // This libfunc is not yet in Starknet's allowed list, blocking deployment.
@@ -195,21 +210,31 @@ mod SumcheckVerifierContract {
     // Uncomment when Starknet adds squashed_felt252_dict_entries to allowed libfuncs:
     //   use crate::ml_air::{MLClaim, UnifiedStarkProof, verify_unified_stark};
     //   use stwo_verifier_core::channel::Channel as StwoChannel;
+    use crate::audit::{AuditRecord, AuditSubmitted, generate_audit_id, PackedDigest8};
+    use crate::access_control::{AuditAccess, AccessGranted, AccessRevoked};
+    use crate::view_key::{ViewKeyDelegation, ViewKeyDelegated, ViewKeyRevoked};
+    use crate::vm31_merkle::PackedDigest;
     use starknet::storage::{
         StoragePointerReadAccess, StoragePointerWriteAccess, Map, StoragePathEntry,
     };
-    use starknet::{ClassHash, ContractAddress, get_caller_address, get_block_timestamp};
+    use starknet::{ClassHash, ContractAddress, get_caller_address, get_block_timestamp, get_block_number};
 
     #[storage]
     struct Storage {
         /// Contract owner (can register models).
         owner: ContractAddress,
+        /// VM31 binder role (can bind proof_hash -> VM31 public hash).
+        vm31_binder: ContractAddress,
         /// model_id → Poseidon hash of model weight matrices.
         model_commitments: Map<felt252, felt252>,
         /// model_id → number of successful verifications.
         verification_counts: Map<felt252, u64>,
         /// proof_hash → verified (true/false).
         verified_proofs: Map<felt252, bool>,
+        /// proof_hash → VM31 batch public-input hash.
+        vm31_public_hash: Map<felt252, PackedDigest>,
+        /// proof_hash → whether a VM31 public hash binding exists.
+        vm31_public_hash_set: Map<felt252, bool>,
         /// session_id → number of uploaded chunks.
         session_chunk_counts: Map<felt252, u32>,
         /// (session_id, chunk_index) → chunk data hash for binding.
@@ -224,6 +249,37 @@ mod SumcheckVerifierContract {
         pending_upgrade: ClassHash,
         /// Timestamp when the upgrade was proposed.
         upgrade_proposed_at: u64,
+        // ─── Audit Records ──────────────────────────────────────
+        /// audit_id → AuditRecord.
+        audit_records: Map<felt252, AuditRecord>,
+        /// (model_id, index) → audit_id (append-only list per model).
+        model_audit_ids: Map<(felt252, u32), felt252>,
+        /// model_id → number of audits.
+        model_audit_count: Map<felt252, u32>,
+        /// Global audit nonce (for generating unique audit_ids).
+        next_audit_nonce: u32,
+        /// model_id → total proven inferences across all audits.
+        total_proven_inferences: Map<felt252, u64>,
+        // ─── Access Control ──────────────────────────────────────
+        /// (audit_id, grantee) → AuditAccess record.
+        audit_access: Map<(felt252, ContractAddress), AuditAccess>,
+        /// (audit_id, grantee) → wrapped encryption key.
+        audit_wrapped_keys: Map<(felt252, ContractAddress), felt252>,
+        /// (audit_id, index) → grantee address (for enumeration).
+        audit_access_list: Map<(felt252, u32), ContractAddress>,
+        /// audit_id → total grantees ever (for enumeration indexing).
+        audit_access_count: Map<felt252, u32>,
+        /// audit_id → number of currently active grantees.
+        audit_active_access_count: Map<felt252, u32>,
+        /// audit_id → owner address (set on submit_audit).
+        audit_owner: Map<felt252, ContractAddress>,
+        // ─── View Key Delegation ─────────────────────────────────
+        /// (owner, delegate) → ViewKeyDelegation.
+        view_delegations: Map<(ContractAddress, ContractAddress), ViewKeyDelegation>,
+        /// (owner, index) → delegate address.
+        view_delegation_list: Map<(ContractAddress, u32), ContractAddress>,
+        /// owner → number of delegations.
+        view_delegation_count: Map<ContractAddress, u32>,
     }
 
     #[event]
@@ -242,6 +298,11 @@ mod SumcheckVerifierContract {
         UpgradeProposed: UpgradeProposed,
         UpgradeExecuted: UpgradeExecuted,
         UpgradeCancelled: UpgradeCancelled,
+        AuditSubmitted: AuditSubmitted,
+        AccessGranted: AccessGranted,
+        AccessRevoked: AccessRevoked,
+        ViewKeyDelegated: ViewKeyDelegated,
+        ViewKeyRevoked: ViewKeyRevoked,
     }
 
     #[derive(Drop, starknet::Event)]
@@ -360,6 +421,7 @@ mod SumcheckVerifierContract {
     #[constructor]
     fn constructor(ref self: ContractState, owner: ContractAddress) {
         self.owner.write(owner);
+        self.vm31_binder.write(owner);
     }
 
     #[abi(embed_v0)]
@@ -790,13 +852,12 @@ mod SumcheckVerifierContract {
             );
             assert!(io_commitment != 0, "IO commitment cannot be zero");
 
-            // 4. Validate proof has content
+            // 4. Require at least one cryptographically verified component.
+            // Activation STARK data is currently hash-bound on-chain; batched
+            // sumcheck proofs are the cryptographically verified component.
             let num_batched: u32 = batched_proofs.len();
             let has_activation_stark = activation_stark_data.len() > 0;
-            assert!(
-                num_batched > 0 || has_activation_stark,
-                "Proof must contain batched proofs or activation STARK",
-            );
+            assert!(num_batched > 0, "DIRECT_REQUIRES_BATCHED_SUMCHECK");
 
             // 5. Build proof hash inputs for binding
             let has_stark_felt: felt252 = if has_activation_stark { 1 } else { 0 };
@@ -914,6 +975,41 @@ mod SumcheckVerifierContract {
 
         fn is_proof_verified(self: @ContractState, proof_hash: felt252) -> bool {
             self.verified_proofs.entry(proof_hash).read()
+        }
+
+        fn bind_vm31_public_hash(
+            ref self: ContractState, proof_hash: felt252, vm31_public_hash: PackedDigest,
+        ) {
+            assert!(get_caller_address() == self.vm31_binder.read(), "Only vm31 binder");
+            assert!(
+                self.verified_proofs.entry(proof_hash).read(),
+                "Proof hash not verified"
+            );
+            assert!(
+                !self.vm31_public_hash_set.entry(proof_hash).read(),
+                "VM31 public hash already bound"
+            );
+            self.vm31_public_hash.entry(proof_hash).write(vm31_public_hash);
+            self.vm31_public_hash_set.entry(proof_hash).write(true);
+        }
+
+        fn get_vm31_public_hash(self: @ContractState, proof_hash: felt252) -> PackedDigest {
+            assert!(
+                self.vm31_public_hash_set.entry(proof_hash).read(),
+                "VM31 public hash not bound"
+            );
+            self.vm31_public_hash.entry(proof_hash).read()
+        }
+
+        fn get_vm31_binder(self: @ContractState) -> ContractAddress {
+            self.vm31_binder.read()
+        }
+
+        fn set_vm31_binder(ref self: ContractState, binder: ContractAddress) {
+            assert!(get_caller_address() == self.owner.read(), "Only owner");
+            let binder_felt: felt252 = binder.into();
+            assert!(binder_felt != 0, "VM31 binder cannot be zero");
+            self.vm31_binder.write(binder);
         }
 
         fn get_owner(self: @ContractState) -> ContractAddress {
@@ -1072,9 +1168,11 @@ mod SumcheckVerifierContract {
             //    out_rows, out_cols, out_len, out_data...]
             // ================================================================
             let io_span = raw_io_data.span();
+            let io_len: u32 = io_span.len();
             let mut io_off: u32 = 0;
 
             // Parse input header
+            assert!(io_off + 2 < io_len, "IO_DATA_TRUNCATED_INPUT_HEADER");
             let input_rows_felt: u256 = (*io_span.at(io_off)).into();
             let input_rows: u64 = input_rows_felt.try_into().unwrap();
             io_off += 1;
@@ -1086,6 +1184,8 @@ mod SumcheckVerifierContract {
             io_off += 1;
 
             // Extract raw input M31 values
+            assert!(io_off <= io_len, "IO_DATA_OFFSET_OOB");
+            assert!(input_len <= io_len - io_off, "IO_INPUT_LENGTH_MISMATCH");
             let mut raw_input: Array<u64> = array![];
             let mut i: u32 = 0;
             loop {
@@ -1099,6 +1199,7 @@ mod SumcheckVerifierContract {
             io_off += input_len;
 
             // Parse output header
+            assert!(io_off + 2 < io_len, "IO_DATA_TRUNCATED_OUTPUT_HEADER");
             let output_rows_felt: u256 = (*io_span.at(io_off)).into();
             let output_rows: u64 = output_rows_felt.try_into().unwrap();
             io_off += 1;
@@ -1110,6 +1211,8 @@ mod SumcheckVerifierContract {
             io_off += 1;
 
             // Extract raw output M31 values
+            assert!(io_off <= io_len, "IO_DATA_OFFSET_OOB");
+            assert!(output_len <= io_len - io_off, "IO_OUTPUT_LENGTH_MISMATCH");
             let mut raw_output: Array<u64> = array![];
             i = 0;
             loop {
@@ -1120,6 +1223,8 @@ mod SumcheckVerifierContract {
                 raw_output.append(v.try_into().unwrap());
                 i += 1;
             };
+            io_off += output_len;
+            assert!(io_off == io_len, "IO_DATA_LENGTH_MISMATCH");
 
             // ================================================================
             // 5. Build output MLE (pad to power-of-2 dimensions, row-major)
@@ -1191,61 +1296,95 @@ mod SumcheckVerifierContract {
                 value: output_value,
             };
 
-            let (final_claim, weight_claims) = verify_gkr_model(
-                proof_data.span(),
-                num_layers,
-                matmul_dims.span(),
-                dequantize_bits.span(),
-                initial_claim,
-                ref ch,
-            );
+            let (final_claim, weight_claims, layer_tags, deferred_weight_commitments) =
+                verify_gkr_model_with_trace(
+                    proof_data.span(),
+                    num_layers,
+                    matmul_dims.span(),
+                    dequantize_bits.span(),
+                    initial_claim,
+                    ref ch,
+                );
 
             // ================================================================
-            // 7b. WEIGHT MLE OPENING VERIFICATION
-            //
-            // For each MatMul layer, verify that the sumcheck's final_b_eval
-            // matches the committed weight matrix via MLE opening proof.
-            // This binds the verified computation to the REGISTERED weights.
-            //
-            // Without this check, a cheating prover could construct valid
-            // sumcheck proofs for arbitrary weight matrices B' != B_registered.
+            // 7a. CIRCUIT BINDING: hash(circuit_depth || layer_tags) must match
+            //     registered model circuit hash.
             // ================================================================
-            // Main walk produces exactly registered_count weight claims (one per MatMul).
-            // Deferred proofs (DAG Add skip connections) may add extra weight claims.
+            let mut descriptor_felts: Array<felt252> = array![circuit_depth.into()];
+            let mut t_i: u32 = 0;
+            loop {
+                if t_i >= layer_tags.len() {
+                    break;
+                }
+                let tag_felt: felt252 = (*layer_tags.at(t_i)).into();
+                descriptor_felts.append(tag_felt);
+                t_i += 1;
+            };
+            let observed_circuit_hash = core::poseidon::poseidon_hash_span(
+                descriptor_felts.span(),
+            );
+            assert!(observed_circuit_hash == circuit_hash, "CIRCUIT_HASH_MISMATCH");
+
+            // ================================================================
+            // 7b. WEIGHT BINDING: verify opening proofs for both main and
+            //     deferred matmul claims.
+            // ================================================================
+            let expected_weight_claims = registered_count + deferred_weight_commitments.len();
             assert!(
-                weight_claims.len() >= registered_count,
+                weight_claims.len() == expected_weight_claims,
                 "WEIGHT_CLAIM_COUNT_MISMATCH",
             );
+            assert!(
+                weight_opening_proofs.len() == expected_weight_claims,
+                "WEIGHT_OPENING_COUNT_MISMATCH",
+            );
 
-            // Verify each weight MLE opening proof against the registered root.
-            // This binds each matmul's final_b_eval to the committed weight matrix.
-            // Skipped when weight_opening_proofs is empty (Phase 1: GKR walk only).
-            if weight_opening_proofs.len() > 0 {
-                assert!(
-                    weight_opening_proofs.len() >= registered_count,
-                    "WEIGHT_OPENING_COUNT_MISMATCH",
-                );
-                let mut w_i: u32 = 0;
-                loop {
-                    if w_i >= weight_claims.len() {
-                        break;
-                    }
-                    let registered_root = self
-                        .model_gkr_weights
-                        .entry((model_id, w_i))
-                        .read();
-                    let opening = weight_opening_proofs.at(w_i);
-                    let claim = weight_claims.at(w_i);
-                    let valid = verify_mle_opening(
-                        registered_root,
-                        opening,
-                        claim.eval_point.span(),
-                        ref ch,
-                    );
-                    assert!(valid, "WEIGHT_MLE_OPENING_FAILED");
-                    w_i += 1;
+            let mut w_i: u32 = 0;
+            loop {
+                if w_i >= expected_weight_claims {
+                    break;
+                }
+
+                let commitment = if w_i < registered_count {
+                    self.model_gkr_weights.entry((model_id, w_i)).read()
+                } else {
+                    let deferred_root = *deferred_weight_commitments.at(w_i - registered_count);
+                    assert!(deferred_root != 0, "DEFERRED_WEIGHT_COMMITMENT_ZERO");
+
+                    let mut found = false;
+                    let mut reg_i: u32 = 0;
+                    loop {
+                        if reg_i >= registered_count {
+                            break;
+                        }
+                        let reg_root = self.model_gkr_weights.entry((model_id, reg_i)).read();
+                        if reg_root == deferred_root {
+                            found = true;
+                            break;
+                        }
+                        reg_i += 1;
+                    };
+                    assert!(found, "DEFERRED_WEIGHT_NOT_REGISTERED");
+                    deferred_root
                 };
-            }
+
+                let opening = weight_opening_proofs.at(w_i);
+                let claim = weight_claims.at(w_i);
+
+                assert!(
+                    qm31_eq(*opening.final_value, *claim.expected_value),
+                    "WEIGHT_OPENING_VALUE_MISMATCH",
+                );
+
+                let valid = verify_mle_opening(
+                    commitment,
+                    opening,
+                    claim.eval_point.span(),
+                    ref ch,
+                );
+                assert!(valid, "WEIGHT_MLE_OPENING_FAILED");
+                w_i += 1;
+            };
 
             // ================================================================
             // 8. INPUT CLAIM VERIFICATION: evaluate MLE(raw_input, final_claim.point)
@@ -1323,6 +1462,400 @@ mod SumcheckVerifierContract {
 
         fn get_model_gkr_weight_count(self: @ContractState, model_id: felt252) -> u32 {
             self.model_gkr_weight_count.entry(model_id).read()
+        }
+    }
+
+    // ─── Audit Verifier Implementation ──────────────────────────────────────
+
+    #[abi(embed_v0)]
+    impl AuditVerifierImpl of crate::audit::IAuditVerifier<ContractState> {
+        fn submit_audit(
+            ref self: ContractState,
+            model_id: felt252,
+            report_hash_lo: felt252,
+            report_hash_hi: felt252,
+            merkle_root_lo: felt252,
+            merkle_root_hi: felt252,
+            weight_commitment: felt252,
+            time_start: u64,
+            time_end: u64,
+            inference_count: u32,
+            tee_attestation_hash: felt252,
+            privacy_tier: u8,
+        ) -> felt252 {
+            // 1. Verify weight commitment matches registered model
+            let registered_weight = self.model_commitments.entry(model_id).read();
+            assert!(registered_weight != 0, "Model not registered");
+            assert!(weight_commitment == registered_weight, "Weight commitment mismatch");
+
+            // 2. Validate time window
+            assert!(time_end > time_start, "Invalid time window");
+            assert!(inference_count > 0, "Empty audit");
+
+            // 3. Generate audit ID
+            let nonce = self.next_audit_nonce.read();
+            let submitter = get_caller_address();
+            let audit_id = generate_audit_id(nonce, model_id, submitter, time_start);
+            self.next_audit_nonce.write(nonce + 1);
+
+            // 4. Store audit record with PackedDigest8 fields
+            let report_hash = PackedDigest8 { lo: report_hash_lo, hi: report_hash_hi };
+            let merkle_root = PackedDigest8 { lo: merkle_root_lo, hi: merkle_root_hi };
+
+            let record = AuditRecord {
+                model_id,
+                audit_report_hash: report_hash,
+                inference_log_merkle_root: merkle_root,
+                weight_commitment,
+                time_start,
+                time_end,
+                inference_count,
+                proof_verified: false,
+                submitter,
+                submitted_at_block: get_block_number(),
+                tee_attestation_hash,
+                privacy_tier,
+            };
+            self.audit_records.entry(audit_id).write(record);
+
+            // 4b. Set audit owner for access control
+            self.audit_owner.entry(audit_id).write(submitter);
+
+            // 5. Append to model's audit list
+            let count = self.model_audit_count.entry(model_id).read();
+            self.model_audit_ids.entry((model_id, count)).write(audit_id);
+            self.model_audit_count.entry(model_id).write(count + 1);
+
+            // 6. Update total proven inferences
+            let total = self.total_proven_inferences.entry(model_id).read();
+            self.total_proven_inferences.entry(model_id).write(total + inference_count.into());
+
+            // 7. Emit event
+            self.emit(AuditSubmitted {
+                audit_id,
+                model_id,
+                submitter,
+                report_hash_lo,
+                report_hash_hi,
+                merkle_root_lo,
+                merkle_root_hi,
+                time_start,
+                time_end,
+                inference_count,
+                proof_verified: false,
+                privacy_tier,
+            });
+
+            audit_id
+        }
+
+        fn get_audit(self: @ContractState, audit_id: felt252) -> AuditRecord {
+            self.audit_records.entry(audit_id).read()
+        }
+
+        fn get_model_audits(self: @ContractState, model_id: felt252) -> Array<felt252> {
+            let count = self.model_audit_count.entry(model_id).read();
+            let mut ids: Array<felt252> = array![];
+            let mut i: u32 = 0;
+            loop {
+                if i >= count {
+                    break;
+                }
+                ids.append(self.model_audit_ids.entry((model_id, i)).read());
+                i += 1;
+            };
+            ids
+        }
+
+        fn get_audit_count(self: @ContractState, model_id: felt252) -> u32 {
+            self.model_audit_count.entry(model_id).read()
+        }
+
+        fn get_latest_audit(self: @ContractState, model_id: felt252) -> AuditRecord {
+            let count = self.model_audit_count.entry(model_id).read();
+            assert!(count > 0, "No audits for model");
+            let audit_id = self.model_audit_ids.entry((model_id, count - 1)).read();
+            self.audit_records.entry(audit_id).read()
+        }
+
+        fn is_audited_in_range(
+            self: @ContractState,
+            model_id: felt252,
+            since: u64,
+            until: u64,
+        ) -> bool {
+            let count = self.model_audit_count.entry(model_id).read();
+            let mut i = count;
+            loop {
+                if i == 0 {
+                    break false;
+                }
+                i -= 1;
+                let audit_id = self.model_audit_ids.entry((model_id, i)).read();
+                let record = self.audit_records.entry(audit_id).read();
+                if record.time_start >= since && record.time_end <= until {
+                    break true;
+                }
+            }
+        }
+
+        fn get_total_proven_inferences(self: @ContractState, model_id: felt252) -> u64 {
+            self.total_proven_inferences.entry(model_id).read()
+        }
+    }
+
+    // ─── Access Control Implementation ──────────────────────────────────────
+
+    #[abi(embed_v0)]
+    impl AccessControlImpl of crate::access_control::IAuditAccessControl<ContractState> {
+        fn grant_audit_access(
+            ref self: ContractState,
+            audit_id: felt252,
+            grantee: ContractAddress,
+            wrapped_key: felt252,
+            role: u8,
+        ) {
+            // Only the audit owner can grant access.
+            let caller = get_caller_address();
+            let owner = self.audit_owner.entry(audit_id).read();
+            assert!(owner == caller, "Only audit owner can grant access");
+
+            // Check grantee doesn't already have active access.
+            let existing = self.audit_access.entry((audit_id, grantee)).read();
+            assert!(!existing.is_active, "Access already granted");
+
+            // Store access record.
+            let access = AuditAccess {
+                address: grantee,
+                role,
+                granted_at_block: get_block_number(),
+                is_active: true,
+            };
+            self.audit_access.entry((audit_id, grantee)).write(access);
+            self.audit_wrapped_keys.entry((audit_id, grantee)).write(wrapped_key);
+
+            // Append to enumeration list.
+            let count = self.audit_access_count.entry(audit_id).read();
+            self.audit_access_list.entry((audit_id, count)).write(grantee);
+            self.audit_access_count.entry(audit_id).write(count + 1);
+
+            // Increment active counter.
+            let active = self.audit_active_access_count.entry(audit_id).read();
+            self.audit_active_access_count.entry(audit_id).write(active + 1);
+
+            self.emit(AccessGranted {
+                audit_id,
+                grantee,
+                role,
+                granted_by: caller,
+            });
+        }
+
+        fn revoke_audit_access(
+            ref self: ContractState,
+            audit_id: felt252,
+            revokee: ContractAddress,
+        ) {
+            let caller = get_caller_address();
+            let owner = self.audit_owner.entry(audit_id).read();
+            assert!(owner == caller, "Only audit owner can revoke access");
+
+            let mut access = self.audit_access.entry((audit_id, revokee)).read();
+            assert!(access.is_active, "Access not active");
+
+            // Deactivate and zero wrapped key.
+            access.is_active = false;
+            self.audit_access.entry((audit_id, revokee)).write(access);
+            self.audit_wrapped_keys.entry((audit_id, revokee)).write(0);
+
+            // Decrement active counter.
+            let active = self.audit_active_access_count.entry(audit_id).read();
+            self.audit_active_access_count.entry(audit_id).write(active - 1);
+
+            self.emit(AccessRevoked {
+                audit_id,
+                revokee,
+                revoked_by: caller,
+            });
+        }
+
+        fn grant_audit_access_batch(
+            ref self: ContractState,
+            audit_id: felt252,
+            grantees: Span<ContractAddress>,
+            wrapped_keys: Span<felt252>,
+            roles: Span<u8>,
+        ) {
+            assert!(grantees.len() == wrapped_keys.len(), "Length mismatch");
+            assert!(grantees.len() == roles.len(), "Length mismatch");
+
+            let caller = get_caller_address();
+            let owner = self.audit_owner.entry(audit_id).read();
+            assert!(owner == caller, "Only audit owner can grant access");
+
+            let mut i: u32 = 0;
+            loop {
+                if i >= grantees.len() {
+                    break;
+                }
+                let grantee = *grantees.at(i);
+                let wrapped_key = *wrapped_keys.at(i);
+                let role = *roles.at(i);
+
+                let existing = self.audit_access.entry((audit_id, grantee)).read();
+                assert!(!existing.is_active, "Access already granted");
+
+                let access = AuditAccess {
+                    address: grantee,
+                    role,
+                    granted_at_block: get_block_number(),
+                    is_active: true,
+                };
+                self.audit_access.entry((audit_id, grantee)).write(access);
+                self.audit_wrapped_keys.entry((audit_id, grantee)).write(wrapped_key);
+
+                let count = self.audit_access_count.entry(audit_id).read();
+                self.audit_access_list.entry((audit_id, count)).write(grantee);
+                self.audit_access_count.entry(audit_id).write(count + 1);
+
+                // Increment active counter.
+                let active = self.audit_active_access_count.entry(audit_id).read();
+                self.audit_active_access_count.entry(audit_id).write(active + 1);
+
+                self.emit(AccessGranted {
+                    audit_id,
+                    grantee,
+                    role,
+                    granted_by: caller,
+                });
+
+                i += 1;
+            };
+        }
+
+        fn has_audit_access(
+            self: @ContractState,
+            audit_id: felt252,
+            address: ContractAddress,
+        ) -> bool {
+            let access = self.audit_access.entry((audit_id, address)).read();
+            access.is_active
+        }
+
+        fn get_wrapped_key(
+            self: @ContractState,
+            audit_id: felt252,
+            grantee: ContractAddress,
+        ) -> felt252 {
+            let access = self.audit_access.entry((audit_id, grantee)).read();
+            assert!(access.is_active, "No active access");
+            self.audit_wrapped_keys.entry((audit_id, grantee)).read()
+        }
+
+        fn get_audit_owner(
+            self: @ContractState,
+            audit_id: felt252,
+        ) -> ContractAddress {
+            self.audit_owner.entry(audit_id).read()
+        }
+
+        fn get_access_count(
+            self: @ContractState,
+            audit_id: felt252,
+        ) -> u32 {
+            self.audit_active_access_count.entry(audit_id).read()
+        }
+    }
+
+    // ─── View Key Delegation Implementation ─────────────────────────────────
+
+    #[abi(embed_v0)]
+    impl ViewKeyDelegationImpl of crate::view_key::IViewKeyDelegation<ContractState> {
+        fn delegate_view_key(
+            ref self: ContractState,
+            delegate: ContractAddress,
+            encrypted_view_key: felt252,
+            valid_until: u64,
+        ) {
+            let owner = get_caller_address();
+
+            // Check not already delegated.
+            let existing = self.view_delegations.entry((owner, delegate)).read();
+            assert!(!existing.is_active, "View key already delegated");
+
+            let delegation = ViewKeyDelegation {
+                owner,
+                delegate,
+                encrypted_view_key,
+                valid_from: get_block_number(),
+                valid_until,
+                is_active: true,
+            };
+            self.view_delegations.entry((owner, delegate)).write(delegation);
+
+            // Append to enumeration list.
+            let count = self.view_delegation_count.entry(owner).read();
+            self.view_delegation_list.entry((owner, count)).write(delegate);
+            self.view_delegation_count.entry(owner).write(count + 1);
+
+            self.emit(ViewKeyDelegated { owner, delegate, valid_until });
+        }
+
+        fn revoke_view_key(
+            ref self: ContractState,
+            delegate: ContractAddress,
+        ) {
+            let owner = get_caller_address();
+
+            let mut delegation = self.view_delegations.entry((owner, delegate)).read();
+            assert!(delegation.is_active, "View key not active");
+
+            delegation.is_active = false;
+            delegation.encrypted_view_key = 0;
+            self.view_delegations.entry((owner, delegate)).write(delegation);
+
+            self.emit(ViewKeyRevoked { owner, delegate });
+        }
+
+        fn has_view_key(
+            self: @ContractState,
+            owner: ContractAddress,
+            delegate: ContractAddress,
+        ) -> bool {
+            let delegation = self.view_delegations.entry((owner, delegate)).read();
+            if !delegation.is_active {
+                return false;
+            }
+            // Check expiry (valid_until == 0 means forever).
+            if delegation.valid_until != 0 {
+                let current_block = get_block_number();
+                if current_block > delegation.valid_until {
+                    return false;
+                }
+            }
+            true
+        }
+
+        fn get_view_key(
+            self: @ContractState,
+            owner: ContractAddress,
+            delegate: ContractAddress,
+        ) -> felt252 {
+            let delegation = self.view_delegations.entry((owner, delegate)).read();
+            assert!(delegation.is_active, "No active view key");
+            // Check expiry (valid_until == 0 means forever).
+            if delegation.valid_until != 0 {
+                let current_block = get_block_number();
+                assert!(current_block <= delegation.valid_until, "View key expired");
+            }
+            delegation.encrypted_view_key
+        }
+
+        fn get_delegation_count(
+            self: @ContractState,
+            owner: ContractAddress,
+        ) -> u32 {
+            self.view_delegation_count.entry(owner).read()
         }
     }
 }
