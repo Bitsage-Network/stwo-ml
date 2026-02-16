@@ -78,9 +78,7 @@ GPU presets in `configs/4090.env`, `configs/b200.env`, `configs/b300.env`.
 
 | Mode | Pipeline | On-Chain Function | Notes |
 |------|----------|-------------------|-------|
-| `gkr` | prove-model (GKR sumcheck) | `verify_model_gkr()` | Default. Fastest |
-| `direct` | prove-model -> chunked calldata | `verify_model_direct()` | Partial on-chain cryptographic coverage (not full GKR assurance) |
-| `recursive` | prove-model -> cairo-prove -> Circle STARK | Multi-step (9+ TXs) | Most secure |
+| `gkr` | prove-model (GKR sumcheck) | `verify_model_gkr()` | Hardened production mode. Full on-chain GKR assurance. |
 
 ## Per-Script Usage
 
@@ -127,7 +125,6 @@ GPU presets in `configs/4090.env`, `configs/b200.env`, `configs/b300.env`.
 
 ```bash
 ./03_prove.sh --model-name qwen3-14b --layers 1 --mode gkr --gpu
-./03_prove.sh --model-name qwen3-14b --mode recursive --gpu
 ./03_prove.sh --model-name qwen3-14b --mode gkr --multi-gpu
 ./03_prove.sh --model-name qwen3-14b --server http://prover:8080
 ```

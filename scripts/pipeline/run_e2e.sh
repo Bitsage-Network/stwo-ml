@@ -93,7 +93,7 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Options:"
             echo "  --layers N           Number of layers to prove"
-            echo "  --mode MODE          Proof mode: recursive, direct, gkr (default: gkr)"
+            echo "  --mode MODE          Proof mode: gkr (default: gkr)"
             echo "  --gpu / --no-gpu     Enable/disable GPU (default: on)"
             echo "  --multi-gpu          Use all GPUs"
             echo "  --hf-token TOKEN     HuggingFace API token"
@@ -127,6 +127,11 @@ done
 
 if [[ -z "$PRESET" ]] && [[ -z "$HF_MODEL" ]]; then
     err "Specify a model with --preset or --hf-model"
+    exit 1
+fi
+
+if [[ "$MODE" != "gkr" ]]; then
+    err "Only --mode gkr is supported in the hardened pipeline (got: ${MODE})"
     exit 1
 fi
 
@@ -299,7 +304,7 @@ fi
 # ─── Step 7: On-Chain Verification ──────────────────────────────────
 
 if (( START_IDX <= 6 )); then
-    _VERIFY_ARGS=("--mode" "$MODE" "--max-fee" "$MAX_FEE")
+    _VERIFY_ARGS=("--max-fee" "$MAX_FEE")
     if [[ "$DO_SUBMIT" == "true" ]]; then
         _VERIFY_ARGS+=("--submit")
     else
