@@ -203,9 +203,9 @@ if [[ "$SKIP_BUILD" == "false" ]]; then
 
     # 5a: stwo-ml
     log "Building stwo-ml (GPU + CLI)..."
-    FEATURES="cli"
+    FEATURES="cli,audit"
     if [[ "$GPU_AVAILABLE" == "true" ]] && [[ "$CUDA_AVAILABLE" == "true" ]]; then
-        FEATURES="cli,cuda-runtime"
+        FEATURES="cli,audit,cuda-runtime"
     fi
 
     if (cd "${LIBS_DIR}/stwo-ml" && \

@@ -39,6 +39,14 @@ FORCE_PAYMASTER=false
 FORCE_NO_PAYMASTER=false
 DEPLOY_ACCOUNT=false
 
+IS_ACCEPTED_PM=""
+FULL_GKR_PM=""
+ASSURANCE_PM=""
+HAS_ANY_PM=""
+PRE_VERIFICATION_COUNT=""
+POST_VERIFICATION_COUNT=""
+VERIFICATION_COUNT_DELTA=""
+
 # ─── Parse Arguments ─────────────────────────────────────────────────
 
 while [[ $# -gt 0 ]]; do
@@ -291,11 +299,108 @@ sncast_invoke_tracked() {
     return 1
 }
 
+
+# Extract standardized verify_calldata payload into temporary files.
+# Args: proof_file session_id out_dir
+extract_verify_payload_files() {
+    local proof_file="$1"
+    local session_id="$2"
+    local out_dir="$3"
+
+    mkdir -p "${out_dir}/chunks"
+
+    python3 - "$proof_file" "$session_id" "$out_dir" <<'PYVERIFY'
+import json
+import os
+import sys
+
+proof_file, session_id, out_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+
+
+def fail(msg: str) -> None:
+    print(msg, file=sys.stderr)
+    raise SystemExit(1)
+
+try:
+    with open(proof_file, 'r', encoding='utf-8') as f:
+        proof = json.load(f)
+except Exception as e:
+    fail(f'Failed to read proof JSON: {e}')
+
+vc = proof.get('verify_calldata')
+if not isinstance(vc, dict):
+    fail("Missing 'verify_calldata' object in proof file")
+
+schema_version = vc.get('schema_version')
+if schema_version != 1:
+    fail('verify_calldata.schema_version must be 1')
+
+entrypoint = vc.get('entrypoint')
+if not isinstance(entrypoint, str) or not entrypoint:
+    fail("verify_calldata.entrypoint must be a non-empty string")
+if entrypoint not in ('verify_model_direct', 'verify_model_gkr'):
+    fail(f'Unsupported verify_calldata.entrypoint: {entrypoint}')
+
+calldata = vc.get('calldata')
+if not isinstance(calldata, list) or len(calldata) == 0:
+    fail("verify_calldata.calldata must be a non-empty array")
+
+resolved = []
+for value in calldata:
+    s = str(value)
+    if s == '__SESSION_ID__':
+        if not session_id:
+            fail('verify_calldata requires session id replacement but no session id was provided')
+        s = session_id
+    resolved.append(s)
+
+upload_chunks = vc.get('upload_chunks', [])
+if upload_chunks is None:
+    upload_chunks = []
+if not isinstance(upload_chunks, list):
+    fail('verify_calldata.upload_chunks must be an array')
+
+if entrypoint == 'verify_model_direct':
+    if '__SESSION_ID__' not in [str(v) for v in calldata]:
+        fail('verify_model_direct calldata must include __SESSION_ID__ placeholder')
+else:
+    if any(str(v) == '__SESSION_ID__' for v in calldata):
+        fail('verify_model_gkr calldata must not include __SESSION_ID__ placeholder')
+    if len(upload_chunks) != 0:
+        fail('verify_model_gkr payload must not include upload_chunks')
+
+with open(os.path.join(out_dir, 'entrypoint.txt'), 'w', encoding='utf-8') as f:
+    f.write(entrypoint)
+with open(os.path.join(out_dir, 'calldata.txt'), 'w', encoding='utf-8') as f:
+    f.write(' '.join(resolved))
+
+chunks_dir = os.path.join(out_dir, 'chunks')
+os.makedirs(chunks_dir, exist_ok=True)
+with open(os.path.join(chunks_dir, 'count.txt'), 'w', encoding='utf-8') as f:
+    f.write(str(len(upload_chunks)))
+
+for idx, chunk in enumerate(upload_chunks):
+    if not isinstance(chunk, list):
+        fail(f'verify_calldata.upload_chunks[{idx}] must be an array')
+    with open(os.path.join(chunks_dir, f'chunk_{idx}.txt'), 'w', encoding='utf-8') as f:
+        f.write(' '.join(str(v) for v in chunk))
+PYVERIFY
+}
+
 # ═══════════════════════════════════════════════════════════════════════
 # Mode-specific submission
 # ═══════════════════════════════════════════════════════════════════════
 
 MODEL_ID_FROM_META=$(parse_json_field "${METADATA_FILE:-/dev/null}" "model_id" 2>/dev/null || echo "0x1")
+
+if [[ "$DO_SUBMIT" == "true" ]] && [[ "$USE_PAYMASTER" == "false" ]] && [[ "$PROOF_MODE" != "recursive" ]] && command -v sncast &>/dev/null; then
+    PRE_VERIFICATION_COUNT=$(get_verification_count "$CONTRACT" "$MODEL_ID_FROM_META" "$RPC_URL" 2>/dev/null || echo "")
+    if [[ -n "$PRE_VERIFICATION_COUNT" ]]; then
+        log "Verification count (before): ${PRE_VERIFICATION_COUNT}"
+    else
+        warn "Could not read pre-submit verification count"
+    fi
+fi
 
 if [[ "$USE_PAYMASTER" == "true" ]] && [[ "$PROOF_MODE" != "recursive" ]]; then
     # ─── Paymaster Path (gasless via AVNU) ─────────────────────────────
@@ -352,7 +457,10 @@ for line in sys.stdin:
 
     if [[ -n "$PAYMASTER_JSON" ]]; then
         TX_HASH=$(echo "$PAYMASTER_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['txHash'])" 2>/dev/null || echo "")
-        IS_VERIFIED_PM=$(echo "$PAYMASTER_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('isVerified','false'))" 2>/dev/null || echo "false")
+        IS_ACCEPTED_PM=$(echo "$PAYMASTER_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(str(d.get('acceptedOnchain', d.get('isVerified','false'))).lower())" 2>/dev/null || echo "false")
+        FULL_GKR_PM=$(echo "$PAYMASTER_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(str(d.get('fullGkrVerified', d.get('isVerified','false'))).lower())" 2>/dev/null || echo "false")
+        ASSURANCE_PM=$(echo "$PAYMASTER_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(str(d.get('onchainAssurance','unknown')))" 2>/dev/null || echo "unknown")
+        HAS_ANY_PM=$(echo "$PAYMASTER_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(str(d.get('hasAnyVerification','false')).lower())" 2>/dev/null || echo "false")
         EXPLORER_URL=$(echo "$PAYMASTER_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('explorerUrl',''))" 2>/dev/null || echo "")
 
         if [[ -n "$TX_HASH" ]]; then
@@ -360,6 +468,9 @@ for line in sys.stdin:
             ok "TX submitted via paymaster: ${TX_HASH:0:20}..."
             log "Explorer: ${EXPLORER_URL}"
             log "Gas sponsored: true"
+            log "Accepted on-chain: ${IS_ACCEPTED_PM}"
+            log "Full GKR verified: ${FULL_GKR_PM}"
+            log "Assurance level: ${ASSURANCE_PM}"
         fi
     else
         warn "Could not parse paymaster output"
@@ -378,7 +489,7 @@ else
             # Find the submit script
             SUBMIT_SCRIPT=""
             for path in \
-                "${SCRIPT_DIR}/../submit_recursive_proof.py" \
+                "${SCRIPT_DIR}/../../../scripts/submit_recursive_proof.py" \
                 "${SCRIPT_DIR}/../../scripts/submit_recursive_proof.py" \
                 "scripts/submit_recursive_proof.py" \
                 "../scripts/submit_recursive_proof.py"; do
@@ -406,80 +517,100 @@ else
                 --account "${ACCOUNT}" \
                 ${MODE_FLAG}
             ;;
-
         # ─── Direct: upload chunks + verify_model_direct ──────────────
         direct)
             header "Direct Proof Submission"
+            warn "Direct mode has partial on-chain cryptographic coverage: batch sumchecks are verified, activation STARK is currently hash-bound."
 
             SESSION_ID="0x$(date +%s | xxd -p 2>/dev/null | head -c 16 || printf '%x' "$(date +%s)")"
             log "Session ID: ${SESSION_ID}"
 
-            # Upload STARK chunks if present
-            CHUNK_DIR="${PROOF_DIR:-$(dirname "$PROOF_FILE")}/chunks"
-            if [[ -d "$CHUNK_DIR" ]]; then
-                CHUNK_COUNT=$(ls "$CHUNK_DIR"/chunk_*.json 2>/dev/null | wc -l | tr -d ' ')
+            VERIFY_TMP=$(mktemp -d)
+            if ! extract_verify_payload_files "$PROOF_FILE" "$SESSION_ID" "$VERIFY_TMP"; then
+                err "Failed to parse standardized verify_calldata from proof"
+                rm -rf "$VERIFY_TMP"
+                exit 1
+            fi
+
+            ENTRYPOINT=$(cat "$VERIFY_TMP/entrypoint.txt")
+            if [[ "$ENTRYPOINT" != "verify_model_direct" ]]; then
+                err "verify_calldata.entrypoint must be verify_model_direct in direct mode (got: ${ENTRYPOINT})"
+                rm -rf "$VERIFY_TMP"
+                exit 1
+            fi
+            CHUNK_COUNT=$(cat "$VERIFY_TMP/chunks/count.txt")
+
+            if (( CHUNK_COUNT > 0 )); then
                 log "Uploading ${CHUNK_COUNT} STARK chunks..."
-
                 for i in $(seq 0 $((CHUNK_COUNT - 1))); do
-                    CHUNK_FILE="${CHUNK_DIR}/chunk_${i}.json"
+                    CHUNK_FILE="$VERIFY_TMP/chunks/chunk_${i}.txt"
                     if [[ -f "$CHUNK_FILE" ]]; then
-                        CHUNK_SIZE=$(wc -c < "$CHUNK_FILE" | tr -d ' ')
-                        log "  Chunk ${i}: ${CHUNK_SIZE} bytes"
-
-                        CHUNK_DATA=$(cat "$CHUNK_FILE")
-                        run_cmd sncast_invoke_tracked upload_proof_chunk "$SESSION_ID" "$i" $CHUNK_DATA
-
-                        ok "  Chunk ${i} uploaded"
+                        CHUNK_DATA_STR=$(cat "$CHUNK_FILE")
+                        if [[ -n "$CHUNK_DATA_STR" ]]; then
+                            # shellcheck disable=SC2206
+                            CHUNK_DATA_ARR=($CHUNK_DATA_STR)
+                            run_cmd sncast_invoke_tracked upload_proof_chunk "$SESSION_ID" "$i" "${CHUNK_DATA_ARR[@]}"
+                            ok "  Chunk ${i} uploaded"
+                        fi
                     fi
                 done
             else
                 log "No STARK chunks to upload"
             fi
 
-            # Call verify_model_direct
-            log "Calling verify_model_direct..."
-
-            BATCHED_DATA="${PROOF_DIR:-$(dirname "$PROOF_FILE")}/batched_calldata.json"
-            CALLDATA=""
-            if [[ -f "$BATCHED_DATA" ]]; then
-                CALLDATA=$(cat "$BATCHED_DATA")
+            log "Calling ${ENTRYPOINT}..."
+            CALLDATA_STR=$(cat "$VERIFY_TMP/calldata.txt")
+            if [[ -z "$CALLDATA_STR" ]]; then
+                err "verify_calldata.calldata is empty"
+                rm -rf "$VERIFY_TMP"
+                exit 1
             fi
+            # shellcheck disable=SC2206
+            CALLDATA_ARR=($CALLDATA_STR)
+            run_cmd sncast_invoke_tracked "$ENTRYPOINT" "${CALLDATA_ARR[@]}"
 
-            run_cmd sncast_invoke_tracked verify_model_direct "${MODEL_ID_FROM_META}" "$SESSION_ID" $CALLDATA
-
-            ok "verify_model_direct submitted"
+            ok "${ENTRYPOINT} submitted"
+            rm -rf "$VERIFY_TMP"
             ;;
-
         # ─── GKR: verify_model_gkr ───────────────────────────────────
         gkr)
             header "GKR Proof Submission"
 
             log "Submitting GKR proof for model ${MODEL_ID_FROM_META}..."
 
-            # Read the GKR calldata from proof file
-            if command -v python3 &>/dev/null && [[ -f "$PROOF_FILE" ]]; then
-                GKR_CALLDATA=$(python3 -c "
-import json
-with open('${PROOF_FILE}') as f:
-    proof = json.load(f)
-# Extract calldata array if present
-if 'calldata' in proof:
-    print(' '.join(str(x) for x in proof['calldata']))
-elif 'gkr_calldata' in proof:
-    print(' '.join(str(x) for x in proof['gkr_calldata']))
-else:
-    print('')
-" 2>/dev/null || echo "")
+            VERIFY_TMP=$(mktemp -d)
+            if ! extract_verify_payload_files "$PROOF_FILE" "" "$VERIFY_TMP"; then
+                err "Failed to parse standardized verify_calldata from proof"
+                rm -rf "$VERIFY_TMP"
+                exit 1
             fi
 
-            if [[ -n "${GKR_CALLDATA:-}" ]]; then
-                run_cmd sncast_invoke_tracked verify_model_gkr "${MODEL_ID_FROM_META}" $GKR_CALLDATA
-
-                ok "verify_model_gkr submitted"
-            else
-                warn "Could not extract GKR calldata from proof file"
-                warn "Manual submission may be required"
+            ENTRYPOINT=$(cat "$VERIFY_TMP/entrypoint.txt")
+            if [[ "$ENTRYPOINT" != "verify_model_gkr" ]]; then
+                err "verify_calldata.entrypoint must be verify_model_gkr in gkr mode (got: ${ENTRYPOINT})"
+                rm -rf "$VERIFY_TMP"
+                exit 1
             fi
+            CALLDATA_STR=$(cat "$VERIFY_TMP/calldata.txt")
+            CHUNK_COUNT=$(cat "$VERIFY_TMP/chunks/count.txt")
+            if (( CHUNK_COUNT != 0 )); then
+                err "verify_model_gkr payload must not include upload chunks"
+                rm -rf "$VERIFY_TMP"
+                exit 1
+            fi
+
+            if [[ -z "$CALLDATA_STR" ]]; then
+                err "verify_calldata.calldata is empty"
+                rm -rf "$VERIFY_TMP"
+                exit 1
+            fi
+
+            # shellcheck disable=SC2206
+            CALLDATA_ARR=($CALLDATA_STR)
+            run_cmd sncast_invoke_tracked "$ENTRYPOINT" "${CALLDATA_ARR[@]}"
+
+            ok "${ENTRYPOINT} submitted"
+            rm -rf "$VERIFY_TMP"
             ;;
     esac
 fi
@@ -503,24 +634,80 @@ if [[ "$DO_SUBMIT" == "true" ]]; then
     fi
     echo ""
 
-    # Check on-chain verification status
+    # Check on-chain acceptance + strict assurance separation
     MODEL_ID_CHECK=$(parse_json_field "${METADATA_FILE:-/dev/null}" "model_id" 2>/dev/null || echo "0x1")
-    if [[ "$USE_PAYMASTER" == "true" ]] && [[ -n "${IS_VERIFIED_PM:-}" ]]; then
-        # Paymaster script already checked verification
-        IS_VERIFIED="$IS_VERIFIED_PM"
-    elif command -v sncast &>/dev/null; then
-        IS_VERIFIED=$(check_is_verified "$CONTRACT" "$MODEL_ID_CHECK" "$RPC_URL" 2>/dev/null || echo "false")
-    else
-        # No sncast and not paymaster — try via node
-        IS_VERIFIED=$(node "${SCRIPT_DIR}/lib/paymaster_submit.mjs" status \
-            --contract "$CONTRACT" --model-id "$MODEL_ID_CHECK" --network "$NETWORK" 2>/dev/null \
-            | python3 -c "import sys,json; print(str(json.load(sys.stdin).get('verification',{}).get('isVerified','false')).lower())" 2>/dev/null || echo "false")
+    IS_ACCEPTED="unknown"
+    FULL_GKR_VERIFIED="unknown"
+    ASSURANCE_LEVEL="unknown"
+    HAS_ANY_VERIFICATION="unknown"
+
+    if [[ "$PROOF_MODE" == "gkr" ]]; then
+        ASSURANCE_LEVEL="full_gkr"
+    elif [[ "$PROOF_MODE" == "direct" ]]; then
+        ASSURANCE_LEVEL="partial_batch_sumcheck_plus_stark_hash_binding"
+    elif [[ "$PROOF_MODE" == "recursive" ]]; then
+        ASSURANCE_LEVEL="recursive"
     fi
-    if [[ "$IS_VERIFIED" == "true" ]] || [[ "$IS_VERIFIED" == "True" ]]; then
-        IS_VERIFIED="true"
-        ok "On-chain verification: VERIFIED"
+
+    if [[ "$USE_PAYMASTER" == "true" ]] && [[ -n "${IS_ACCEPTED_PM:-}" ]]; then
+        IS_ACCEPTED="$IS_ACCEPTED_PM"
+        FULL_GKR_VERIFIED="$FULL_GKR_PM"
+        HAS_ANY_VERIFICATION="$HAS_ANY_PM"
+        if [[ -n "$ASSURANCE_PM" ]] && [[ "$ASSURANCE_PM" != "unknown" ]]; then
+            ASSURANCE_LEVEL="$ASSURANCE_PM"
+        fi
+    elif command -v sncast &>/dev/null; then
+        POST_VERIFICATION_COUNT=$(get_verification_count "$CONTRACT" "$MODEL_ID_CHECK" "$RPC_URL" 2>/dev/null || echo "")
+        if [[ -n "$POST_VERIFICATION_COUNT" ]]; then
+            HAS_ANY_VERIFICATION="false"
+            [[ "$POST_VERIFICATION_COUNT" != "0" ]] && HAS_ANY_VERIFICATION="true"
+
+            if [[ -n "$PRE_VERIFICATION_COUNT" ]] && [[ "$PRE_VERIFICATION_COUNT" =~ ^[0-9]+$ ]] && [[ "$POST_VERIFICATION_COUNT" =~ ^[0-9]+$ ]]; then
+                VERIFICATION_COUNT_DELTA=$(python3 -c "import sys; print(int(sys.argv[2]) - int(sys.argv[1]))" "$PRE_VERIFICATION_COUNT" "$POST_VERIFICATION_COUNT" 2>/dev/null || echo "")
+                if [[ -n "$VERIFICATION_COUNT_DELTA" ]] && [[ "$VERIFICATION_COUNT_DELTA" =~ ^-?[0-9]+$ ]] && (( VERIFICATION_COUNT_DELTA > 0 )); then
+                    IS_ACCEPTED="true"
+                else
+                    IS_ACCEPTED="false"
+                fi
+            else
+                IS_ACCEPTED="$HAS_ANY_VERIFICATION"
+            fi
+        else
+            # Legacy fallback if count endpoint is unavailable.
+            HAS_ANY_VERIFICATION=$(check_is_verified "$CONTRACT" "$MODEL_ID_CHECK" "$RPC_URL" 2>/dev/null || echo "false")
+            IS_ACCEPTED="$HAS_ANY_VERIFICATION"
+        fi
+
+        if [[ "$PROOF_MODE" == "gkr" ]]; then
+            FULL_GKR_VERIFIED="$IS_ACCEPTED"
+        elif [[ "$PROOF_MODE" == "direct" ]]; then
+            FULL_GKR_VERIFIED="false"
+        fi
     else
-        warn "On-chain verification status: unconfirmed (may need time to propagate)"
+        # No sncast and not paymaster — use paymaster status fallback.
+        STATUS_JSON=$(node "${SCRIPT_DIR}/lib/paymaster_submit.mjs" status \
+            --contract "$CONTRACT" --model-id "$MODEL_ID_CHECK" --network "$NETWORK" 2>/dev/null || echo "{}")
+        HAS_ANY_VERIFICATION=$(echo "$STATUS_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin).get('verification',{}); print(str(d.get('hasAnyVerification', 'false')).lower())" 2>/dev/null || echo "false")
+        IS_ACCEPTED="$HAS_ANY_VERIFICATION"
+        if [[ "$PROOF_MODE" == "gkr" ]]; then
+            FULL_GKR_VERIFIED="$IS_ACCEPTED"
+        elif [[ "$PROOF_MODE" == "direct" ]]; then
+            FULL_GKR_VERIFIED="false"
+        fi
+    fi
+
+    if [[ "$IS_ACCEPTED" == "true" ]]; then
+        ok "On-chain acceptance: ACCEPTED"
+    else
+        warn "On-chain acceptance: unconfirmed"
+    fi
+
+    if [[ "$FULL_GKR_VERIFIED" == "true" ]]; then
+        ok "Full GKR assurance: VERIFIED"
+    elif [[ "$PROOF_MODE" == "direct" ]]; then
+        warn "Full GKR assurance: not applicable (direct mode is partial coverage)"
+    else
+        warn "Full GKR assurance: unconfirmed"
     fi
     echo ""
 
@@ -541,7 +728,14 @@ receipt = {
     'submitted_at': '$(date -u +%Y-%m-%dT%H:%M:%SZ)',
     'elapsed_seconds': ${ELAPSED},
     'tx_hashes': $(python3 -c "import json; print(json.dumps([$(printf "'%s'," "${ALL_TX_HASHES[@]}" | sed 's/,$//')])" 2>/dev/null || echo '[]'),
-    'is_verified': '${IS_VERIFIED}',
+    'is_verified': '${FULL_GKR_VERIFIED}',
+    'accepted_onchain': '${IS_ACCEPTED}',
+    'full_gkr_verified': '${FULL_GKR_VERIFIED}',
+    'assurance_level': '${ASSURANCE_LEVEL}',
+    'has_any_verification': '${HAS_ANY_VERIFICATION}',
+    'verification_count_before': '${PRE_VERIFICATION_COUNT}',
+    'verification_count_after': '${POST_VERIFICATION_COUNT}',
+    'verification_count_delta': '${VERIFICATION_COUNT_DELTA}',
     'gas_sponsored': ${USE_PAYMASTER},
 }
 with open('${RECEIPT_FILE}', 'w') as f:
@@ -558,7 +752,14 @@ with open('${RECEIPT_FILE}', 'w') as f:
     "submitted_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
     "elapsed_seconds": ${ELAPSED},
     "last_tx": "${LAST_TX}",
-    "is_verified": "${IS_VERIFIED}",
+    "is_verified": "${FULL_GKR_VERIFIED}",
+    "accepted_onchain": "${IS_ACCEPTED}",
+    "full_gkr_verified": "${FULL_GKR_VERIFIED}",
+    "assurance_level": "${ASSURANCE_LEVEL}",
+    "has_any_verification": "${HAS_ANY_VERIFICATION}",
+    "verification_count_before": "${PRE_VERIFICATION_COUNT}",
+    "verification_count_after": "${POST_VERIFICATION_COUNT}",
+    "verification_count_delta": "${VERIFICATION_COUNT_DELTA}",
     "gas_sponsored": ${USE_PAYMASTER}
 }
 RCPTEOF
@@ -587,7 +788,9 @@ fi
 if [[ "$DO_SUBMIT" == "true" ]] && (( ${#ALL_TX_HASHES[@]} > 0 )); then
 printf "  ║  TXs:          %-36s ║\n" "${#ALL_TX_HASHES[@]} submitted"
 printf "  ║  Last TX:      %-36s ║\n" "${ALL_TX_HASHES[${#ALL_TX_HASHES[@]}-1]:0:36}"
-printf "  ║  Verified:     %-36s ║\n" "${IS_VERIFIED:-unknown}"
+printf "  ║  Accepted:     %-36s ║\n" "${IS_ACCEPTED:-unknown}"
+printf "  ║  Assurance:    %-36s ║\n" "${ASSURANCE_LEVEL:-unknown}"
+printf "  ║  Full GKR:     %-36s ║\n" "${FULL_GKR_VERIFIED:-unknown}"
 fi
 echo "  ╠══════════════════════════════════════════════════════╣"
 if [[ "$DO_SUBMIT" == "false" ]]; then

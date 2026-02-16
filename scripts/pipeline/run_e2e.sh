@@ -4,7 +4,7 @@
 # ═══════════════════════════════════════════════════════════════════════
 #
 # Single-command execution of the full pipeline:
-#   Setup GPU → Download Model → Validate → Test Inference → Prove → Verify On-Chain
+#   Setup GPU → Download Model → Validate → [Test Inference] → Capture → Prove → Verify On-Chain → Audit
 #
 # Usage:
 #   ./run_e2e.sh --preset qwen3-14b --gpu --submit
@@ -28,6 +28,7 @@ DO_DRY_RUN=false
 DO_CHAT=false
 DO_GPU=true
 DO_MULTI_GPU=false
+DO_AUDIT=true
 SKIP_SETUP=false
 SKIP_INFERENCE=false
 RESUME_FROM=""
@@ -57,6 +58,7 @@ while [[ $# -gt 0 ]]; do
         --gpu)             DO_GPU=true; shift ;;
         --no-gpu)          DO_GPU=false; shift ;;
         --multi-gpu)       DO_MULTI_GPU=true; DO_GPU=true; shift ;;
+        --no-audit)        DO_AUDIT=false; shift ;;
         --skip-setup)      SKIP_SETUP=true; shift ;;
         --skip-inference)  SKIP_INFERENCE=true; shift ;;
         --paymaster)       FORCE_PAYMASTER=true; shift ;;
@@ -84,7 +86,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --chat               Pause for interactive chat after inference test"
             echo "  --skip-setup         Skip GPU setup (machine already configured)"
             echo "  --skip-inference     Skip inference testing"
-            echo "  --resume-from STEP   Resume from: model, validate, inference, prove, verify"
+            echo "  --no-audit           Skip inference audit (audit is on by default)"
+            echo "  --resume-from STEP   Resume from: model, validate, inference, capture, prove, verify, audit"
             echo "  --paymaster          Force AVNU paymaster (gasless, sponsored)"
             echo "  --no-paymaster       Force legacy sncast submission (you pay gas)"
             echo ""
@@ -156,7 +159,7 @@ log "Run dir:     ${RUN_DIR}"
 echo ""
 
 # Determine starting step
-STEPS=("setup" "model" "validate" "inference" "prove" "verify")
+STEPS=("setup" "model" "validate" "inference" "capture" "prove" "verify" "audit")
 START_IDX=0
 
 case "${RESUME_FROM}" in
@@ -165,9 +168,11 @@ case "${RESUME_FROM}" in
     model)     START_IDX=1 ;;
     validate)  START_IDX=2 ;;
     inference) START_IDX=3 ;;
-    prove)     START_IDX=4 ;;
-    verify)    START_IDX=5 ;;
-    *) err "Unknown step: ${RESUME_FROM}. Expected: setup, model, validate, inference, prove, verify"; exit 1 ;;
+    capture)   START_IDX=4 ;;
+    prove)     START_IDX=5 ;;
+    verify)    START_IDX=6 ;;
+    audit)     START_IDX=7 ;;
+    *) err "Unknown step: ${RESUME_FROM}. Expected: setup, model, validate, inference, capture, prove, verify, audit"; exit 1 ;;
 esac
 
 if [[ "$SKIP_SETUP" == "true" ]] && (( START_IDX == 0 )); then
@@ -202,7 +207,10 @@ run_step() {
     fi
 }
 
-TOTAL_STEPS=$(( 6 - START_IDX ))
+TOTAL_STEPS=$(( 7 - START_IDX ))
+if [[ "$DO_AUDIT" == "true" ]]; then
+    (( TOTAL_STEPS++ )) || true
+fi
 if [[ "$SKIP_INFERENCE" == "true" ]]; then
     (( TOTAL_STEPS-- )) || true
 fi
@@ -247,7 +255,7 @@ if (( START_IDX <= 2 )); then
     (( CURRENT++ ))
 fi
 
-# ─── Step 4: Inference Testing ───────────────────────────────────────
+# ─── Step 4: Inference Testing (optional, llama.cpp) ─────────────────
 
 if (( START_IDX <= 3 )) && [[ "$SKIP_INFERENCE" != "true" ]]; then
     _INFER_ARGS=()
@@ -263,9 +271,21 @@ if (( START_IDX <= 3 )) && [[ "$SKIP_INFERENCE" != "true" ]]; then
     (( CURRENT++ ))
 fi
 
-# ─── Step 5: Proof Generation ───────────────────────────────────────
+# ─── Step 5: Inference Capture (mandatory for audit) ─────────────────
 
 if (( START_IDX <= 4 )); then
+    _CAPTURE_ARGS=()
+    [[ -n "$LAYERS" ]] && _CAPTURE_ARGS+=("--layers" "$LAYERS")
+    [[ -n "$MODEL_ID" ]] && _CAPTURE_ARGS+=("--model-id" "$MODEL_ID")
+
+    run_step "Inference Capture" "$CURRENT" "$TOTAL_STEPS" \
+        bash "${SCRIPT_DIR}/02b_capture_inference.sh" "${_CAPTURE_ARGS[@]}" || exit 1
+    (( CURRENT++ ))
+fi
+
+# ─── Step 6: Proof Generation ───────────────────────────────────────
+
+if (( START_IDX <= 5 )); then
     _PROVE_ARGS=("--mode" "$MODE" "--model-id" "$MODEL_ID")
     [[ -n "$LAYERS" ]] && _PROVE_ARGS+=("--layers" "$LAYERS")
     [[ "$DO_GPU" == "true" ]] && _PROVE_ARGS+=("--gpu")
@@ -276,10 +296,10 @@ if (( START_IDX <= 4 )); then
     (( CURRENT++ ))
 fi
 
-# ─── Step 6: On-Chain Verification ──────────────────────────────────
+# ─── Step 7: On-Chain Verification ──────────────────────────────────
 
-if (( START_IDX <= 5 )); then
-    _VERIFY_ARGS=("--max-fee" "$MAX_FEE")
+if (( START_IDX <= 6 )); then
+    _VERIFY_ARGS=("--mode" "$MODE" "--max-fee" "$MAX_FEE")
     if [[ "$DO_SUBMIT" == "true" ]]; then
         _VERIFY_ARGS+=("--submit")
     else
@@ -297,6 +317,24 @@ if (( START_IDX <= 5 )); then
             exit 1
         fi
     }
+    (( CURRENT++ ))
+fi
+
+# ─── Step 8: Audit ─────────────────────────────────────────────────
+
+if (( START_IDX <= 7 )) && [[ "$DO_AUDIT" == "true" ]]; then
+    _AUDIT_ARGS=("--evaluate")
+    if [[ "$DO_SUBMIT" == "true" ]]; then
+        _AUDIT_ARGS+=("--submit")
+    else
+        _AUDIT_ARGS+=("--dry-run")
+    fi
+
+    run_step "Inference Audit" "$CURRENT" "$TOTAL_STEPS" \
+        bash "${SCRIPT_DIR}/05_audit.sh" "${_AUDIT_ARGS[@]}" || {
+        warn "Audit step failed (non-critical)"
+        STEP_RESULTS+=("Inference Audit: WARN")
+    }
 fi
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -308,12 +346,27 @@ TOTAL_ELAPSED=$(timer_elapsed "e2e")
 # Collect results from state files
 _PROOF_DIR=$(get_state "prove_state.env" "LAST_PROOF_DIR" 2>/dev/null || echo "N/A")
 _PROOF_MODE=$(get_state "prove_state.env" "LAST_PROOF_MODE" 2>/dev/null || echo "N/A")
-_IS_VERIFIED="N/A"
+_IS_ACCEPTED="N/A"
+_FULL_GKR_VERIFIED="N/A"
+_ASSURANCE_LEVEL="N/A"
 if [[ -f "${_PROOF_DIR}/verify_receipt.json" ]] 2>/dev/null; then
-    _IS_VERIFIED=$(python3 -c "
+    _IS_ACCEPTED=$(python3 -c "
 import json
 with open('${_PROOF_DIR}/verify_receipt.json') as f:
-    print(json.load(f).get('is_verified', 'N/A'))
+    d = json.load(f)
+    print(d.get('accepted_onchain', d.get('is_verified', 'N/A')))
+" 2>/dev/null || echo "N/A")
+    _FULL_GKR_VERIFIED=$(python3 -c "
+import json
+with open('${_PROOF_DIR}/verify_receipt.json') as f:
+    d = json.load(f)
+    print(d.get('full_gkr_verified', d.get('is_verified', 'N/A')))
+" 2>/dev/null || echo "N/A")
+    _ASSURANCE_LEVEL=$(python3 -c "
+import json
+with open('${_PROOF_DIR}/verify_receipt.json') as f:
+    d = json.load(f)
+    print(d.get('assurance_level', 'N/A'))
 " 2>/dev/null || echo "N/A")
 fi
 
@@ -348,7 +401,9 @@ for result in "${STEP_RESULTS[@]}"; do
 done
 echo "  ╠══════════════════════════════════════════════════════╣"
 printf "  ║  Proof dir:   %-36s ║\n" "${_PROOF_DIR}"
-printf "  ║  Verified:    %-36s ║\n" "${_IS_VERIFIED}"
+printf "  ║  Accepted:    %-36s ║\n" "${_IS_ACCEPTED}"
+printf "  ║  Assurance:   %-36s ║\n" "${_ASSURANCE_LEVEL}"
+printf "  ║  Full GKR:    %-36s ║\n" "${_FULL_GKR_VERIFIED}"
 echo "  ║                                                      ║"
 echo "  ╚══════════════════════════════════════════════════════╝"
 echo -e "${NC}"

@@ -17,3 +17,5 @@ pub mod quantize;
 pub mod dequantize;
 pub mod f32_ops;
 pub mod tiled_matmul;
+pub mod range_check;
+pub mod poseidon2_air;

@@ -261,7 +261,7 @@ call_contract() {
 
 # ─── Check Verification Status ──────────────────────────────────────
 
-check_is_verified() {
+get_verification_count() {
     local contract="$1"
     local model_id="$2"
     local rpc_url="${3:-}"
@@ -271,17 +271,50 @@ check_is_verified() {
         args=("--url" "$rpc_url" "${args[@]}")
     fi
 
+    local result raw
+    result=$(sncast call "${args[@]}" 2>/dev/null || echo "")
+    raw=$(echo "$result" | grep -oE '0x[0-9a-fA-F]+' | head -1)
+
+    if [[ -z "$raw" ]]; then
+        raw=$(echo "$result" | grep -oE '^[0-9]+' | head -1)
+    fi
+
+    if [[ -z "$raw" ]]; then
+        return 1
+    fi
+
+    python3 - "$raw" <<'PY'
+import sys
+v = sys.argv[1].strip()
+print(int(v, 0))
+PY
+}
+
+check_is_verified() {
+    local contract="$1"
+    local model_id="$2"
+    local rpc_url="${3:-}"
+
+    local count=""
+    count=$(get_verification_count "$contract" "$model_id" "$rpc_url" 2>/dev/null || echo "")
+
+    if [[ -n "$count" ]]; then
+        if [[ "$count" =~ ^[0-9]+$ ]] && [[ "$count" != "0" ]]; then
+            echo "true"
+            return 0
+        fi
+        echo "false"
+        return 1
+    fi
+
+    # Fallback for legacy contracts that only expose is_proof_verified
+    local args=("--contract-address" "$contract" "--function" "is_proof_verified" "--calldata" "$model_id")
+    if [[ -n "$rpc_url" ]]; then
+        args=("--url" "$rpc_url" "${args[@]}")
+    fi
+
     local result
     result=$(sncast call "${args[@]}" 2>/dev/null || echo "")
-
-    if [[ -z "$result" ]]; then
-        # Try alternative function name
-        args=("--contract-address" "$contract" "--function" "is_proof_verified" "--calldata" "$model_id")
-        if [[ -n "$rpc_url" ]]; then
-            args=("--url" "$rpc_url" "${args[@]}")
-        fi
-        result=$(sncast call "${args[@]}" 2>/dev/null || echo "")
-    fi
 
     if echo "$result" | grep -qE "^0x[1-9a-fA-F]"; then
         echo "true"

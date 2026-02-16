@@ -26,7 +26,9 @@ use crate::aggregation::{
     AggregationError, LayerClaim,
     prove_model_aggregated_auto, prove_model_aggregated_onchain_auto,
 };
-use crate::cairo_serde::{serialize_proof, serialize_matmul_sumcheck_proof, WeightMleOpening};
+use crate::cairo_serde::{
+    serialize_gkr_proof_data_only, serialize_matmul_sumcheck_proof, serialize_proof,
+};
 use crate::compiler::graph::{ComputationGraph, GraphWeights};
 use crate::compiler::prove::ModelError;
 use crate::components::matmul::M31Matrix;
@@ -654,14 +656,22 @@ pub fn build_starknet_proof_direct(
 pub struct GkrStarknetProof {
     /// Model identifier (Poseidon hash of architecture + weight commitment + description).
     pub model_id: FieldElement,
-    /// Serialized GKR model proof (all layer proofs + input claim + weight commitments + IO commitment).
+    /// Serialized GKR proof_data for `verify_model_gkr()`:
+    /// tags + per-layer payloads + deferred proofs (no header/footer fields).
     pub gkr_calldata: Vec<FieldElement>,
     /// Raw IO data for on-chain IO commitment recomputation.
     pub io_calldata: Vec<FieldElement>,
+    /// Weight commitments (one per MatMul/deferred MatMul), passed as
+    /// `weight_commitments: Array<felt252>` to `verify_model_gkr()`.
+    pub weight_commitments: Vec<FieldElement>,
     /// Weight MLE opening proofs for on-chain weight binding.
+    /// Already serialized as Cairo `Array<MleOpeningProof>`:
+    /// `[num_openings, opening_0..., opening_1..., ...]`.
     pub weight_opening_calldata: Vec<FieldElement>,
     /// IO commitment: Poseidon(input_data || output_data).
     pub io_commitment: FieldElement,
+    /// Layer chain commitment from the proving pipeline.
+    pub layer_chain_commitment: FieldElement,
     /// Number of GKR layer proofs.
     pub num_layer_proofs: usize,
     /// Estimated gas cost.
@@ -699,23 +709,41 @@ pub fn build_gkr_starknet_proof(
         StarknetModelError::SerializationError("No GKR proof in aggregated proof".to_string())
     })?;
 
-    // Serialize GKR proof (all layer proofs + input claim + weight commitments + IO commitment)
+    // Serialize ONLY proof_data for verify_model_gkr(proof_data: Array<felt252>).
+    // Full serialize_gkr_model_proof includes header/footer fields that the
+    // contract passes separately and would break parser alignment.
     let mut gkr_calldata = Vec::new();
-    crate::cairo_serde::serialize_gkr_model_proof(gkr_proof, &mut gkr_calldata);
+    serialize_gkr_proof_data_only(gkr_proof, &mut gkr_calldata);
 
     // Serialize raw IO for on-chain IO commitment recomputation
     let io_calldata = crate::cairo_serde::serialize_raw_io(input, &proof.execution.output);
 
+    // Weight commitments are a separate parameter to verify_model_gkr.
+    // Include both main-walk matmuls and deferred matmul branches.
+    let mut weight_commitments = gkr_proof.weight_commitments.clone();
+    for deferred in &gkr_proof.deferred_proofs {
+        weight_commitments.push(deferred.weight_commitment);
+    }
+
     // Serialize weight MLE opening proofs as Array<MleOpeningProof> for Cairo Serde.
-    // Weight claims (eval_point, expected_value) are derived during the GKR walk
-    // in Cairo, so only the MLE opening proofs themselves are included.
+    // Order must match Cairo verifier weight_claims:
+    //   1) main walk matmul claims
+    //   2) deferred matmul claims (DAG Add skip branches)
+    let total_openings = gkr_proof.weight_openings.len() + gkr_proof.deferred_proofs.len();
     let mut weight_opening_calldata = Vec::new();
-    crate::cairo_serde::serialize_u32(gkr_proof.weight_openings.len() as u32, &mut weight_opening_calldata);
+    crate::cairo_serde::serialize_u32(total_openings as u32, &mut weight_opening_calldata);
     for opening in &gkr_proof.weight_openings {
         crate::cairo_serde::serialize_mle_opening_proof(opening, &mut weight_opening_calldata);
     }
+    for deferred in &gkr_proof.deferred_proofs {
+        crate::cairo_serde::serialize_mle_opening_proof(&deferred.weight_opening, &mut weight_opening_calldata);
+    }
 
-    let total_calldata_size = 1 + gkr_calldata.len() + io_calldata.len() + weight_opening_calldata.len();
+    let total_calldata_size = 1
+        + gkr_calldata.len()
+        + io_calldata.len()
+        + (1 + weight_commitments.len())
+        + weight_opening_calldata.len();
     let num_layer_proofs = gkr_proof.layer_proofs.len();
     let estimated_gas = estimate_gkr_verification_gas(num_layer_proofs);
 
@@ -723,8 +751,10 @@ pub fn build_gkr_starknet_proof(
         model_id,
         gkr_calldata,
         io_calldata,
+        weight_commitments,
         weight_opening_calldata,
         io_commitment: proof.io_commitment,
+        layer_chain_commitment: proof.layer_chain_commitment,
         num_layer_proofs,
         estimated_gas,
         total_calldata_size,
@@ -857,6 +887,24 @@ pub struct VerifyModelGkrCalldata {
     pub total_felts: usize,
 }
 
+/// Standardized verification calldata payload for `verify_model_direct()`.
+///
+/// `calldata_parts` is flat Starknet calldata ready for:
+/// `verify_model_direct(model_id, session_id, raw_io_data, weight_commitment, ...)`.
+///
+/// The second element is a caller-provided session placeholder (for example
+/// `"__SESSION_ID__"`). Submitters should replace it with the real session ID
+/// and use the same value for all `upload_proof_chunk()` calls.
+#[derive(Debug)]
+pub struct VerifyModelDirectCalldata {
+    /// Flat calldata for `verify_model_direct`.
+    pub calldata_parts: Vec<String>,
+    /// Activation STARK chunks for `upload_proof_chunk(session_id, idx, data)`.
+    pub upload_chunks: Vec<Vec<String>>,
+    /// Total number of felt252 values in `calldata_parts`.
+    pub total_felts: usize,
+}
+
 /// Build flat sncast calldata for `verify_model_gkr()`.
 ///
 /// Matches EloVerifier v7 contract's parameter order:
@@ -919,18 +967,112 @@ pub fn build_verify_model_gkr_calldata(
         parts.push(format!("0x{:x}", f));
     }
 
-    // 7. weight_commitments: Array<felt252>
-    parts.push(format!("{}", proof.weight_commitments.len()));
-    for wc in &proof.weight_commitments {
+    // 7. weight_commitments: Array<felt252> (main + deferred matmul branches)
+    let mut weight_commitments = proof.weight_commitments.clone();
+    for deferred in &proof.deferred_proofs {
+        weight_commitments.push(deferred.weight_commitment);
+    }
+    parts.push(format!("{}", weight_commitments.len()));
+    for wc in &weight_commitments {
         parts.push(format!("0x{:x}", wc));
     }
 
-    // 8. weight_opening_proofs: Array<MleOpeningProof> (empty for Phase 1)
-    parts.push("0".to_string());
+    // 8. weight_opening_proofs: Array<MleOpeningProof>
+    // Order matches verifier weight_claims: main walk first, then deferred.
+    let total_openings = proof.weight_openings.len() + proof.deferred_proofs.len();
+    parts.push(format!("{}", total_openings));
+
+    let mut opening_buf = Vec::new();
+    for opening in &proof.weight_openings {
+        opening_buf.clear();
+        crate::cairo_serde::serialize_mle_opening_proof(opening, &mut opening_buf);
+        for felt in &opening_buf {
+            parts.push(format!("0x{:x}", felt));
+        }
+    }
+    for deferred in &proof.deferred_proofs {
+        opening_buf.clear();
+        crate::cairo_serde::serialize_mle_opening_proof(&deferred.weight_opening, &mut opening_buf);
+        for felt in &opening_buf {
+            parts.push(format!("0x{:x}", felt));
+        }
+    }
 
     let total_felts = parts.len();
     VerifyModelGkrCalldata {
         calldata_parts: parts,
+        total_felts,
+    }
+}
+
+
+/// Build flat calldata for `verify_model_direct()`.
+///
+/// Layout matches EloVerifier's signature:
+/// ```text
+/// model_id: felt252
+/// session_id: felt252
+/// raw_io_data: Array<felt252>
+/// weight_commitment: felt252
+/// num_layers: u32
+/// activation_type: u8
+/// batched_proofs: Array<BatchedMatMulProof>
+/// activation_stark_data: Array<felt252>
+/// ```
+///
+/// The returned calldata includes `session_placeholder` as the `session_id`
+/// field so submitters can choose a runtime session ID while preserving a
+/// single serialized artifact schema.
+pub fn build_verify_model_direct_calldata(
+    proof: &DirectStarknetProof,
+    session_placeholder: &str,
+) -> VerifyModelDirectCalldata {
+    let mut parts = Vec::new();
+
+    // model_id
+    parts.push(format!("0x{:x}", proof.model_id));
+    // session_id (filled by submitter)
+    parts.push(session_placeholder.to_string());
+
+    // raw_io_data: Array<felt252>
+    parts.push(format!("{}", proof.raw_io_data.len()));
+    for felt in &proof.raw_io_data {
+        parts.push(format!("0x{:x}", felt));
+    }
+
+    // weight_commitment, num_layers, activation_type
+    parts.push(format!("0x{:x}", proof.weight_commitment));
+    parts.push(format!("{}", proof.num_layers));
+    parts.push(format!("{}", proof.activation_type));
+
+    // batched_proofs: Array<BatchedMatMulProof>
+    // Each batch is already serialized according to Cairo Serde layout.
+    parts.push(format!("{}", proof.batched_calldata.len()));
+    for batch in &proof.batched_calldata {
+        for felt in batch {
+            parts.push(format!("0x{:x}", felt));
+        }
+    }
+
+    // activation_stark_data: Array<felt252>
+    let flat_stark_len: usize = proof.stark_chunks.iter().map(|c| c.len()).sum();
+    parts.push(format!("{}", flat_stark_len));
+    for chunk in &proof.stark_chunks {
+        for felt in chunk {
+            parts.push(format!("0x{:x}", felt));
+        }
+    }
+
+    let upload_chunks: Vec<Vec<String>> = proof
+        .stark_chunks
+        .iter()
+        .map(|chunk| chunk.iter().map(|f| format!("0x{:x}", f)).collect())
+        .collect();
+
+    let total_felts = parts.len();
+    VerifyModelDirectCalldata {
+        calldata_parts: parts,
+        upload_chunks,
         total_felts,
     }
 }

@@ -30,6 +30,13 @@ pub mod crypto;
 pub mod json_serde;
 pub mod weight_cache;
 pub mod gkr;
+pub mod circuits;
+
+#[cfg(any(feature = "cli", feature = "audit", feature = "server"))]
+pub mod privacy;
+
+#[cfg(feature = "audit")]
+pub mod audit;
 
 #[cfg(feature = "cuda-runtime")]
 pub mod gpu_sumcheck;

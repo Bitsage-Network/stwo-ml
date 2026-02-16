@@ -269,6 +269,9 @@ This fix addresses a **Critical** soundness gap. Before this change, the on-chai
 
 After this fix, both endpoints of the GKR walk are cryptographically bound to the raw data in calldata. The verifier independently evaluates the MLE at the Fiat-Shamir challenge points and asserts equality with the GKR claims.
 
-### Remaining Work
+### Weight MLE Opening Verification (Implemented)
 
-- **Weight MLE opening verification** (`verifier.cairo:1216`): Weight claims are collected but not yet verified against registered Merkle roots on-chain. The `TODO` marks where `weight_opening_data` should be added as a contract parameter.
+Weight MLE opening verification is fully implemented on both sides:
+- **Rust**: `crypto/mle_opening.rs` — `prove_mle_opening` / `verify_mle_opening` with Poseidon Merkle tree + 14 Fiat-Shamir queries
+- **Cairo**: `mle.cairo` — `verify_mle_opening` matching the Rust protocol exactly (lo/hi split folding, channel-based transcript)
+- **On-chain**: `verifier.cairo` verifies weight opening proofs at lines 512, 522, 725, 734, and 1379 via `weight_opening_proofs: Array<MleOpeningProof>` parameter

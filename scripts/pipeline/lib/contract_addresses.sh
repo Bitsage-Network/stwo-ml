@@ -20,8 +20,20 @@ _OBELYSK_CONTRACTS_LOADED=1
 # StweMlStarkVerifier (recursive STARK verification)
 STARK_VERIFIER_SEPOLIA="0x005928ac548dc2719ef1b34869db2b61c2a55a4b148012fad742262a8d674fba"
 
-# Obelysk/Elo Cairo Verifier (direct + GKR verification)
-ELO_VERIFIER_SEPOLIA="0x04f8c5377d94baa15291832dc3821c2fc235a95f0823f86add32f828ea965a15"
+# Obelysk/Elo Cairo Verifier (direct + GKR verification + audit)
+ELO_VERIFIER_SEPOLIA="0x00c7845a80d01927826b17032a432ad9cd36ea61be17fe8cc089d9b68c57e710"
+
+# VM31 Privacy Pool
+VM31_POOL_SEPOLIA="${VM31_POOL_ADDRESS:-0x07cf94e27a60b94658ec908a00a9bb6dfff03358e952d9d48a8ed0be080ce1f9}"
+VM31_POOL_MAINNET=""
+
+# DarkPoolAuction (commit-reveal batch auction with encrypted balances)
+DARK_POOL_SEPOLIA="${DARK_POOL_ADDRESS:-0x047765422c66c23d1639a2d93c9c4b91dc41da6273dd4baeab030b4b6ada0d46}"
+DARK_POOL_MAINNET=""
+
+# VM31ConfidentialBridge (VM31 withdrawal → ConfidentialTransfer bridge)
+VM31_BRIDGE_SEPOLIA="${VM31_BRIDGE_ADDRESS:-0x025a45900864ac136ae56338dc481e2de7bfd9a4ff83ffcceff8439fa1f630a7}"
+VM31_BRIDGE_MAINNET=""
 
 # Mainnet (not yet deployed)
 STARK_VERIFIER_MAINNET=""
@@ -128,4 +140,36 @@ get_paymaster_url() {
         mainnet)  echo "$AVNU_PAYMASTER_MAINNET" ;;
         *)        err "Unknown network: ${network}"; return 1 ;;
     esac
+}
+
+get_pool_address() {
+    local network="${1:-sepolia}"
+    case "$network" in
+        sepolia)  echo "$VM31_POOL_SEPOLIA" ;;
+        mainnet)  echo "$VM31_POOL_MAINNET" ;;
+        *)        err "Unknown network: ${network}"; return 1 ;;
+    esac
+}
+
+get_dark_pool_address() {
+    local network="${1:-sepolia}"
+    case "$network" in
+        sepolia)  echo "$DARK_POOL_SEPOLIA" ;;
+        mainnet)  echo "$DARK_POOL_MAINNET" ;;
+        *)        err "Unknown network: ${network}"; return 1 ;;
+    esac
+}
+
+get_bridge_address() {
+    local network="${1:-sepolia}"
+    case "$network" in
+        sepolia)  echo "$VM31_BRIDGE_SEPOLIA" ;;
+        mainnet)  echo "$VM31_BRIDGE_MAINNET" ;;
+        *)        err "Unknown network: ${network}"; return 1 ;;
+    esac
+}
+
+get_audit_contract() {
+    # Audit submissions go to the ELO verifier (same contract, submit_audit entrypoint)
+    get_verifier_address "elo" "${1:-sepolia}"
 }

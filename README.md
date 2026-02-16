@@ -30,7 +30,7 @@
   <img src="https://img.shields.io/badge/starknet-sepolia-purple?style=for-the-badge" alt="Starknet">
   <img src="https://img.shields.io/badge/CUDA-12.4+-green?style=for-the-badge&logo=nvidia" alt="CUDA">
   <img src="https://img.shields.io/badge/rust-nightly-orange?style=for-the-badge&logo=rust" alt="Rust">
-  <img src="https://img.shields.io/badge/tests-720+-brightgreen?style=for-the-badge" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-800+-brightgreen?style=for-the-badge" alt="Tests">
   <img src="https://img.shields.io/badge/contracts-deployed-blueviolet?style=for-the-badge" alt="Deployed">
 </p>
 
@@ -189,8 +189,8 @@ D11 proves the hardest architecture pattern — **skip connections** that create
 
 | Directory | Language | Purpose | Tests | Docs |
 |-----------|----------|---------|------:|------|
-| [`stwo-ml/`](stwo-ml/) | Rust | ML proving library — GKR, sumcheck, LogUp, attention, CUDA kernels, ONNX compiler | 471 | [README](stwo-ml/README.md) |
-| [`elo-cairo-verifier/`](elo-cairo-verifier/) | Cairo | On-chain ZKML verifier — GKR walk, layer verifiers, deferred proofs, LogUp | 249 | [README](elo-cairo-verifier/README.md) |
+| [`stwo-ml/`](stwo-ml/) | Rust | ML proving + VM31 privacy SDK — GKR, sumcheck, LogUp, attention, CUDA kernels, ONNX compiler, shielded pool client | 802 | [README](stwo-ml/README.md) |
+| [`elo-cairo-verifier/`](elo-cairo-verifier/) | Cairo | On-chain ZKML verifier + VM31 pool contract — GKR walk, layer verifiers, deferred proofs, LogUp, privacy pool | 335 | [README](elo-cairo-verifier/README.md) |
 | [`stwo-ml-verifier/`](stwo-ml-verifier/) | Cairo | ObelyskVerifier — recursive proof + SAGE payment settlement | 19 | [README](stwo-ml-verifier/README.md) |
 | [`stwo/`](stwo/) | Rust | STWO core prover (StarkWare) + custom GPU backend (20K+ lines CUDA) | 60 | upstream |
 | [`stwo-cairo/`](stwo-cairo/) | Rust+Cairo | Recursive proving CLI (`cairo-prove`) + Cairo STARK verifier | 249 | upstream |
@@ -306,11 +306,63 @@ D11 proves the hardest architecture pattern — **skip connections** that create
 | **stwo-ml** | stwo-ml-verifier | `starknet.rs` -- `verify_and_pay()` calldata |
 | **stwo-ml** | stwo-cairo | `prove_for_starknet_onchain()` -- recursive path |
 
+## VM31 Privacy Pool — Live on Starknet Sepolia
+
+The VM31 pool provides shielded transactions over the M31 field. Users deposit public ERC-20 tokens into a Poseidon2-M31 Merkle tree of note commitments, transfer privately within the pool, and withdraw back to public — all with STARK zero-knowledge proofs.
+
+```
+  Public (L1/L2)                      Shielded Pool (VM31)
+  ==============                      ====================
+
+  ERC-20 tokens ──deposit──>  Note commitment in Merkle tree
+                                    |
+                              Private transfers (2-in/2-out spend)
+                              Nullifiers prevent double-spend
+                                    |
+  ERC-20 tokens <──withdraw──  Merkle proof + STARK verification
+```
+
+| Feature | Detail |
+|---------|--------|
+| **Merkle tree** | Depth-20 append-only, Poseidon2-M31 compression (~1M notes) |
+| **Note commitments** | Poseidon2(pubkey, asset, amount, blinding) — 124-bit hiding |
+| **Nullifiers** | Poseidon2(spending_key, commitment) — double-spend prevention |
+| **Transaction STARKs** | Per-type STWO STARK proofs (deposit: 2 perms, withdraw: 32, spend: 64) |
+| **Batch proving** | Multiple transactions in one STARK, 3-step on-chain protocol |
+| **Multi-asset** | Single global tree, per-asset ERC-20 vault accounting |
+| **Upgradability** | 5-minute timelocked `propose_upgrade` / `execute_upgrade` |
+| **Tree sync** | CLI syncs global tree from on-chain `NoteInserted` events via `starknet_getEvents` |
+
+### CLI Privacy Commands
+
+```bash
+# Create a wallet
+prove-model wallet --create
+
+# Deposit into the pool
+prove-model deposit --amount 1000 --asset 0
+
+# Withdraw from the pool (syncs global Merkle tree from on-chain events)
+prove-model withdraw --amount 500 --asset 0
+
+# Private transfer (2-in/2-out spend)
+prove-model transfer --amount 300 --to 0x<recipient_pubkey> --to-viewing-key 0x<vk>
+
+# Scan for incoming notes and update merkle indices
+prove-model scan
+
+# Query pool state
+prove-model pool-status
+```
+
+> **Full protocol documentation**: [`stwo-ml/docs/vm31-privacy-protocol.md`](stwo-ml/docs/vm31-privacy-protocol.md)
+
 ## Deployed Contracts (Starknet Sepolia)
 
 | Contract | Address | Version | Features |
 |----------|---------|---------|----------|
 | **EloVerifier** | [`0x00c784...e710`](https://sepolia.starkscan.co/contract/0x00c7845a80d01927826b17032a432ad9cd36ea61be17fe8cc089d9b68c57e710) | v9 | GKR walk, deferred proofs, all layer types, 5-min upgrade |
+| **VM31Pool** | [`0x07cf94...e1f9`](https://sepolia.starkscan.co/contract/0x07cf94e27a60b94658ec908a00a9bb6dfff03358e952d9d48a8ed0be080ce1f9) | v1 | Privacy pool, Poseidon2-M31 Merkle tree, batch proving, 5-min timelocked upgrade |
 | ObelyskVerifier | [`0x04f8c5...a15`](https://sepolia.starkscan.co/contract/0x04f8c5377d94baa15291832dc3821c2fc235a95f0823f86add32f828ea965a15) | v3 | Recursive proof + SAGE payment |
 | StweMlStarkVerifier | [`0x005928...fba`](https://sepolia.starkscan.co/contract/0x005928ac548dc2719ef1b34869db2b61c2a55a4b148012fad742262a8d674fba) | v1 | Multi-step STARK verify |
 | SAGE Token | [`0x072349...850`](https://sepolia.starkscan.co/contract/0x072349097c8a802e7f66dc96b95aca84e4d78ddad22014904076c76293a99850) | v2 | ERC-20 (camelCase) |

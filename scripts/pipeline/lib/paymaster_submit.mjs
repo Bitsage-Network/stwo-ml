@@ -115,7 +115,7 @@ function getAccount(provider, privateKey, address) {
 }
 
 function jsonOutput(obj) {
-  process.stdout.write(JSON.stringify(obj, null, 2) + "\n");
+  process.stdout.write(JSON.stringify(obj) + "\n");
 }
 
 function die(msg) {
@@ -185,6 +185,114 @@ async function executeViaPaymaster(account, calls, deploymentData) {
   return result.transaction_hash;
 }
 
+
+function generateSessionId() {
+  const ts = BigInt(Date.now());
+  const rand = BigInt(Math.floor(Math.random() * 1_000_000));
+  return `0x${((ts << 20n) + rand).toString(16)}`;
+}
+
+function parseVerifyCalldata(proofData, fallbackModelId) {
+  const verifyCalldata = proofData.verify_calldata;
+  if (!verifyCalldata || typeof verifyCalldata !== "object" || Array.isArray(verifyCalldata)) {
+    die("Proof file missing 'verify_calldata' object");
+  }
+
+  const schemaVersion = verifyCalldata.schema_version;
+  if (schemaVersion !== 1) {
+    die("verify_calldata.schema_version must be 1");
+  }
+
+  const entrypoint = verifyCalldata.entrypoint;
+  if (typeof entrypoint !== "string" || entrypoint.length === 0) {
+    die("verify_calldata.entrypoint must be a non-empty string");
+  }
+  if (entrypoint !== "verify_model_gkr" && entrypoint !== "verify_model_direct") {
+    die(`Unsupported verify_calldata.entrypoint: ${entrypoint}`);
+  }
+
+  const rawCalldata = verifyCalldata.calldata;
+  if (!Array.isArray(rawCalldata) || rawCalldata.length === 0) {
+    die("verify_calldata.calldata must be a non-empty array");
+  }
+
+  const rawChunks = verifyCalldata.upload_chunks ?? [];
+  if (!Array.isArray(rawChunks)) {
+    die("verify_calldata.upload_chunks must be an array");
+  }
+
+  const hasSessionPlaceholder = rawCalldata.some((v) => String(v) === "__SESSION_ID__");
+  if (entrypoint === "verify_model_direct" && !hasSessionPlaceholder) {
+    die("verify_model_direct calldata must include __SESSION_ID__ placeholder");
+  }
+  if (entrypoint === "verify_model_gkr" && hasSessionPlaceholder) {
+    die("verify_model_gkr calldata must not include __SESSION_ID__ placeholder");
+  }
+  if (entrypoint === "verify_model_gkr" && rawChunks.length > 0) {
+    die("verify_model_gkr payload must not include upload_chunks");
+  }
+
+  let sessionId = null;
+  if (hasSessionPlaceholder) {
+    sessionId = generateSessionId();
+  }
+
+  const calldata = rawCalldata.map((v) => {
+    const s = String(v);
+    if (s === "__SESSION_ID__") {
+      if (!sessionId) {
+        die("session placeholder present but session id was not generated");
+      }
+      return sessionId;
+    }
+    return s;
+  });
+
+  const uploadChunks = rawChunks.map((chunk, idx) => {
+    if (!Array.isArray(chunk)) {
+      die(`verify_calldata.upload_chunks[${idx}] must be an array`);
+    }
+    return chunk.map((v) => String(v));
+  });
+
+  const modelId = calldata.length > 0 ? String(calldata[0]) : fallbackModelId;
+
+  return {
+    entrypoint,
+    calldata,
+    uploadChunks,
+    sessionId,
+    modelId,
+    schemaVersion,
+  };
+}
+
+async function fetchVerificationCount(provider, contract, modelId) {
+  try {
+    const result = await provider.callContract({
+      contractAddress: contract,
+      entrypoint: "get_verification_count",
+      calldata: CallData.compile([modelId]),
+    });
+    return result.result ? BigInt(result.result[0] || "0") : 0n;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchProofVerifiedFlag(provider, contract, modelId) {
+  try {
+    const result = await provider.callContract({
+      contractAddress: contract,
+      entrypoint: "is_proof_verified",
+      calldata: CallData.compile([modelId]),
+    });
+    return !!(result.result && BigInt(result.result[0] || "0") > 0n);
+  } catch {
+    return null;
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Command: verify
 // ═══════════════════════════════════════════════════════════════════════
@@ -202,7 +310,7 @@ async function cmdVerify(args) {
 
   const proofPath = args.proof;
   const contract = args.contract;
-  const modelId = args["model-id"] || "0x1";
+  const modelIdArg = args["model-id"] || "0x1";
 
   if (!proofPath) die("--proof is required");
   if (!contract) die("--contract is required");
@@ -279,21 +387,74 @@ async function cmdVerify(args) {
     die(`Failed to read proof file: ${e.message}`);
   }
 
-  let calldata = proofData.calldata || proofData.gkr_calldata;
-  if (!calldata || !Array.isArray(calldata)) {
-    die("Proof file missing 'calldata' or 'gkr_calldata' array");
+  const verifyPayload = parseVerifyCalldata(proofData, modelIdArg);
+  const modelId = verifyPayload.modelId || modelIdArg;
+
+  if (
+    verifyPayload.entrypoint !== "verify_model_gkr" &&
+    verifyPayload.entrypoint !== "verify_model_direct"
+  ) {
+    die(`Unsupported verify_calldata.entrypoint: ${verifyPayload.entrypoint}`);
   }
 
-  // ── Build verification call ──
-  const verifyCall = {
-    contractAddress: contract,
-    entrypoint: "verify_model_gkr",
-    calldata: CallData.compile([modelId, ...calldata.map(String)]),
-  };
+  if (
+    args["model-id"] &&
+    String(args["model-id"]).toLowerCase() !== String(modelId).toLowerCase()
+  ) {
+    info(
+      `--model-id ${args["model-id"]} differs from proof artifact model_id ${modelId}; using proof artifact value`
+    );
+  }
 
-  info(`Submitting verify_model_gkr for model ${modelId}...`);
+  const verificationCountBefore = await fetchVerificationCount(
+    provider,
+    contract,
+    modelId
+  );
+  if (verificationCountBefore !== null) {
+    info(`Verification count (before): ${verificationCountBefore.toString()}`);
+  }
+
+  // ── Build verification calls (direct mode may need chunk uploads first) ──
+  const calls = [];
+  if (verifyPayload.entrypoint === "verify_model_direct") {
+    info(
+      "Direct mode has partial on-chain cryptographic coverage: batch sumchecks are verified, activation STARK is currently hash-bound."
+    );
+    if (verifyPayload.uploadChunks.length > 0 && !verifyPayload.sessionId) {
+      die("Direct verify payload has upload chunks but no session id placeholder");
+    }
+
+    if (verifyPayload.uploadChunks.length > 0) {
+      info(
+        `Uploading ${verifyPayload.uploadChunks.length} direct STARK chunks in the same sponsored TX...`
+      );
+      verifyPayload.uploadChunks.forEach((chunk, idx) => {
+        calls.push({
+          contractAddress: contract,
+          entrypoint: "upload_proof_chunk",
+          calldata: CallData.compile([
+            verifyPayload.sessionId,
+            idx,
+            ...chunk,
+          ]),
+        });
+      });
+    }
+  }
+
+  calls.push({
+    contractAddress: contract,
+    entrypoint: verifyPayload.entrypoint,
+    calldata: CallData.compile(verifyPayload.calldata),
+  });
+
+  info(`Submitting ${verifyPayload.entrypoint} for model ${modelId}...`);
   info(`Contract: ${contract}`);
-  info(`Calldata elements: ${calldata.length}`);
+  info(`Calldata elements: ${verifyPayload.calldata.length}`);
+  if (verifyPayload.sessionId) {
+    info(`Session ID: ${verifyPayload.sessionId}`);
+  }
 
   // ── Build deploymentData if account needs deploying ──
   let deploymentData = undefined;
@@ -310,7 +471,7 @@ async function cmdVerify(args) {
   // ── Execute ──
   let txHash;
   try {
-    txHash = await executeViaPaymaster(account, verifyCall, deploymentData);
+    txHash = await executeViaPaymaster(account, calls, deploymentData);
   } catch (e) {
     const msg = e.message || String(e);
     if (msg.includes("not eligible") || msg.includes("not supported")) {
@@ -347,42 +508,89 @@ async function cmdVerify(args) {
     }
   }
 
-  // ── Check verification status ──
-  let isVerified = false;
-  try {
-    const result = await provider.callContract({
-      contractAddress: contract,
-      entrypoint: "get_verification_count",
-      calldata: CallData.compile([modelId]),
-    });
-    const count = result.result ? BigInt(result.result[0] || "0") : 0n;
-    isVerified = count > 0n;
-  } catch {
-    try {
-      const result = await provider.callContract({
-        contractAddress: contract,
-        entrypoint: "is_proof_verified",
-        calldata: CallData.compile([modelId]),
-      });
-      isVerified = result.result && BigInt(result.result[0] || "0") > 0n;
-    } catch {
+  // ── Check post-submit verification status with assurance separation ──
+  const verificationCountAfter = await fetchVerificationCount(
+    provider,
+    contract,
+    modelId
+  );
+  let verificationCountDelta = null;
+  let hasAnyVerification = false;
+  let acceptedOnchain = false;
+  let acceptanceEvidence = "unknown";
+
+  if (verificationCountAfter !== null) {
+    hasAnyVerification = verificationCountAfter > 0n;
+    if (verificationCountBefore !== null) {
+      verificationCountDelta = verificationCountAfter - verificationCountBefore;
+      acceptedOnchain = verificationCountDelta > 0n;
+      acceptanceEvidence = "verification_count_delta";
+    } else {
+      acceptedOnchain = hasAnyVerification;
+      acceptanceEvidence = "verification_count_observed";
+    }
+  } else {
+    const proofVerifiedFlag = await fetchProofVerifiedFlag(provider, contract, modelId);
+    if (proofVerifiedFlag !== null) {
+      hasAnyVerification = proofVerifiedFlag;
+      acceptedOnchain = proofVerifiedFlag;
+      acceptanceEvidence = "is_proof_verified_fallback";
+    } else {
+      // Final fallback: tx executed successfully, but acceptance cannot be confirmed.
+      acceptedOnchain = true;
+      hasAnyVerification = false;
+      acceptanceEvidence = "tx_success_only_unconfirmed";
       info(
-        "Could not check verification status (contract may use different interface)"
+        "Could not verify acceptance via contract view methods; using tx success only."
       );
     }
   }
 
+  const onchainAssurance =
+    verifyPayload.entrypoint === "verify_model_direct"
+      ? "partial_batch_sumcheck_plus_stark_hash_binding"
+      : "full_gkr";
+  const fullGkrVerified =
+    verifyPayload.entrypoint === "verify_model_gkr" && acceptedOnchain;
+  const isVerified = fullGkrVerified;
+
   const explorerUrl = `${net.explorer}${txHash}`;
   info(`Explorer: ${explorerUrl}`);
-  info(`Verified: ${isVerified}`);
+  info(`Accepted on-chain: ${acceptedOnchain}`);
+  info(`Full GKR verified: ${fullGkrVerified}`);
+  if (verificationCountBefore !== null) {
+    info(`Verification count (before): ${verificationCountBefore.toString()}`);
+  }
+  if (verificationCountAfter !== null) {
+    info(`Verification count (after): ${verificationCountAfter.toString()}`);
+  }
+  if (verificationCountDelta !== null) {
+    info(`Verification count delta: ${verificationCountDelta.toString()}`);
+  }
 
   jsonOutput({
     txHash,
     explorerUrl,
     isVerified,
+    acceptedOnchain,
+    fullGkrVerified,
+    hasAnyVerification,
+    verificationCountBefore:
+      verificationCountBefore === null
+        ? null
+        : verificationCountBefore.toString(),
+    verificationCountAfter:
+      verificationCountAfter === null ? null : verificationCountAfter.toString(),
+    verificationCountDelta:
+      verificationCountDelta === null ? null : verificationCountDelta.toString(),
+    acceptanceEvidence,
     gasSponsored: true,
     accountDeployed: needsDeploy,
     executionStatus: execStatus,
+    entrypoint: verifyPayload.entrypoint,
+    onchainAssurance,
+    sessionId: verifyPayload.sessionId,
+    uploadedChunks: verifyPayload.uploadChunks.length,
   });
 }
 
@@ -542,20 +750,20 @@ async function cmdStatus(args) {
   let verificationStatus = { checked: false };
   if (contract) {
     try {
-      const result = await provider.callContract({
-        contractAddress: contract,
-        entrypoint: "get_verification_count",
-        calldata: CallData.compile([modelId]),
-      });
-      const count = result.result
-        ? Number(BigInt(result.result[0] || "0"))
-        : 0;
+      const count = await fetchVerificationCount(provider, contract, modelId);
+      const countStr = count === null ? null : count.toString();
+      const hasAnyVerification = count !== null ? count > 0n : false;
       verificationStatus = {
         checked: true,
         contract,
         modelId,
-        verificationCount: count,
-        isVerified: count > 0,
+        verificationCount: countStr,
+        hasAnyVerification,
+        // Strict signal remains false here because status endpoint is mode-agnostic.
+        fullGkrVerified: false,
+        isVerified: false,
+        assuranceNote:
+          "verification_count is mode-agnostic; use verify command output for assurance-separated status",
       };
     } catch (e) {
       verificationStatus = { checked: true, error: e.message };

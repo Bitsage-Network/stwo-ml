@@ -29,7 +29,7 @@ cd stwo-ml/scripts/pipeline
 ./run_e2e.sh --preset phi3-mini --gpu --dry-run
 ```
 
-This does everything: installs drivers, downloads the model, tests it, generates a proof, and verifies it locally.
+This does everything: installs drivers, downloads the model, tests it, captures inference logs, generates a proof, verifies it locally, and runs an audit.
 
 To also submit the proof on-chain (zero-config on Sepolia — no wallet needed):
 
@@ -146,6 +146,28 @@ This runs automatically. No flags needed.
 
 ---
 
+### Step 2b — Capture Inference Log (Required)
+
+**What it does:** Runs the model through the prover's forward pass (`execute_forward_pass()`) and records each inference in a chain-linked log. This is the same code path the audit verifier checks, ensuring the log is genuine. The capture step is mandatory before proving/auditing.
+
+```bash
+# Default: 10 forward passes through the prover
+./02b_capture_inference.sh
+
+# Fewer captures (faster, for testing)
+./02b_capture_inference.sh --count 5
+
+# Specify layers (for partial model capture)
+./02b_capture_inference.sh --layers 1
+```
+
+The log is saved to `~/.obelysk/logs/<model_name>/` and contains:
+- `meta.json` — session metadata (model ID, weight commitment)
+- `log.jsonl` — chain-linked inference entries (each entry hashes the previous)
+- `matrices.bin` — M31 matrix data for input/output replay
+
+---
+
 ### Step 3 — Generate the Proof
 
 **What it does:** Runs the model through the prover, which generates a cryptographic proof that the inference was computed correctly. Then verifies the proof locally before saving it.
@@ -225,6 +247,12 @@ HF_TOKEN=hf_xxx ./run_e2e.sh --preset llama3-8b --gpu --submit
 # Resume from a failed step
 ./run_e2e.sh --preset qwen3-14b --resume-from prove --gpu --submit
 
+# Resume from capture step
+./run_e2e.sh --preset qwen3-14b --resume-from capture --gpu --submit
+
+# Skip audit (audit is on by default)
+./run_e2e.sh --preset phi3-mini --gpu --dry-run --no-audit
+
 # Skip setup (machine already configured)
 ./run_e2e.sh --preset qwen3-14b --skip-setup --gpu --submit
 ```
@@ -246,6 +274,7 @@ HF_TOKEN=hf_xxx ./run_e2e.sh --preset llama3-8b --gpu --submit
 ```
 ~/.obelysk/
   models/phi3-mini/       <- Downloaded model files
+  logs/phi3-mini/         <- Captured inference logs (from 02b)
   proofs/phi3-mini_.../   <- Generated proofs
   llama.cpp/              <- Built llama.cpp (for inference testing)
   gpu_config.env          <- Detected GPU info

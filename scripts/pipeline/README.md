@@ -5,7 +5,7 @@ End-to-end pipeline for proving ML model inference and verifying on-chain. Works
 ## Quick Start
 
 ```bash
-# Full pipeline: setup -> download -> validate -> prove -> verify
+# Full pipeline: setup -> download -> validate -> capture -> prove -> verify -> audit
 ./run_e2e.sh --preset qwen3-14b --gpu --submit
 
 # Dry run (no on-chain submission)
@@ -26,8 +26,9 @@ STARKNET_PRIVATE_KEY=0x... ./run_e2e.sh --preset qwen3-14b --gpu --submit
 | 1 | `01_setup_model.sh` | Download model from HuggingFace (with auth), verify integrity |
 | 2 | `02_validate_model.sh` | Validate model files, dimensions, weights |
 | 2a | `02a_test_inference.sh` | Test inference via llama.cpp (single prompt, chat, benchmark) |
+| 2b | `02b_capture_inference.sh` | Capture inference log via prover forward pass (required for audit) |
 | 3 | `03_prove.sh` | Generate cryptographic proof with local verification |
-| 4 | `04_verify_onchain.sh` | Submit proof to Starknet with TX confirmation + is_verified check |
+| 4 | `04_verify_onchain.sh` | Submit proof to Starknet with TX confirmation + acceptance and assurance classification (`accepted_onchain`, `full_gkr_verified`) |
 | E2E | `run_e2e.sh` | Run all steps in sequence with resume support |
 
 ## Environment Variables
@@ -78,7 +79,7 @@ GPU presets in `configs/4090.env`, `configs/b200.env`, `configs/b300.env`.
 | Mode | Pipeline | On-Chain Function | Notes |
 |------|----------|-------------------|-------|
 | `gkr` | prove-model (GKR sumcheck) | `verify_model_gkr()` | Default. Fastest |
-| `direct` | prove-model -> chunked calldata | `verify_model_direct()` | Moderate |
+| `direct` | prove-model -> chunked calldata | `verify_model_direct()` | Partial on-chain cryptographic coverage (not full GKR assurance) |
 | `recursive` | prove-model -> cairo-prove -> Circle STARK | Multi-step (9+ TXs) | Most secure |
 
 ## Per-Script Usage
@@ -113,6 +114,15 @@ GPU presets in `configs/4090.env`, `configs/b200.env`, `configs/b300.env`.
 ./02a_test_inference.sh --model-name phi3-mini --benchmark # Speed test
 ```
 
+### 02b_capture_inference.sh
+
+```bash
+./02b_capture_inference.sh                                         # Uses model from pipeline state
+./02b_capture_inference.sh --model-name phi3-mini --count 5        # 5 captures
+./02b_capture_inference.sh --model-dir ~/models/qwen3-14b --layers 1
+./02b_capture_inference.sh --skip-commitment                       # Faster, weaker audit
+```
+
 ### 03_prove.sh
 
 ```bash
@@ -138,7 +148,9 @@ STARKNET_PRIVATE_KEY=0x... ./04_verify_onchain.sh --submit
 ./run_e2e.sh --preset phi3-mini --gpu --dry-run
 ./run_e2e.sh --preset qwen3-14b --resume-from prove --submit
 ./run_e2e.sh --preset llama3-8b --chat --submit         # Pause for chat
+./run_e2e.sh --preset qwen3-14b --resume-from capture --submit  # Resume from capture
 ./run_e2e.sh --preset qwen3-14b --skip-setup --skip-inference --submit
+./run_e2e.sh --preset phi3-mini --gpu --dry-run --no-audit     # Skip audit
 ```
 
 ## Directory Structure
@@ -150,12 +162,18 @@ STARKNET_PRIVATE_KEY=0x... ./04_verify_onchain.sh --submit
   setup_state.env         # Setup step state
   model_state.env         # Current model state
   prove_state.env         # Last proof state
+  capture_state.env       # Inference capture state (02b)
   inference_state.env     # Inference test state
   models/
     qwen3-14b/
       config.env          # Model configuration
       *.safetensors       # Model weights
       config.json         # HF config
+  logs/
+    qwen3-14b/
+      meta.json           # Capture session metadata
+      log.jsonl           # Chain-linked inference entries
+      matrices.bin        # M31 matrix sidecar
   proofs/
     qwen3-14b_20260214/
       ml_proof.json       # Proof file
@@ -192,11 +210,55 @@ scripts/pipeline/
   01_setup_model.sh          Model download + HF auth
   02_validate_model.sh       Model validation
   02a_test_inference.sh      Inference testing (llama.cpp)
+  02b_capture_inference.sh   Inference capture via prover (required for audit)
   03_prove.sh                Proof generation + local verification
   04_verify_onchain.sh       On-chain submission + TX confirmation
   run_e2e.sh                 End-to-end runner
   README.md                  This file
 ```
+
+## VM31 Privacy Pool
+
+The pipeline includes a deployed privacy pool contract for shielded transactions.
+
+### Contract Addresses
+
+| Network | Contract | Address |
+|---------|----------|---------|
+| Sepolia | VM31Pool | `0x07cf94e27a60b94658ec908a00a9bb6dfff03358e952d9d48a8ed0be080ce1f9` |
+| Sepolia | EloVerifier | `0x00c7845a80d01927826b17032a432ad9cd36ea61be17fe8cc089d9b68c57e710` |
+
+Configured in `lib/contract_addresses.sh`. Override with `VM31_POOL_ADDRESS` env var.
+
+### Privacy CLI Commands
+
+```bash
+# Wallet
+prove-model wallet --create
+prove-model wallet --info
+
+# Deposit, withdraw, transfer
+prove-model deposit --amount 1000 --asset 0
+prove-model withdraw --amount 500 --asset 0
+prove-model transfer --amount 300 --to 0x<pubkey> --to-viewing-key 0x<vk>
+
+# Pool queries
+prove-model pool-status
+prove-model scan
+```
+
+### Deploying a New Pool
+
+```bash
+cd libs/elo-cairo-verifier
+./scripts/deploy.sh \
+  --contract vm31-pool \
+  --relayer 0x<relayer> \
+  --verifier 0x<elo_verifier> \
+  0x<owner>
+```
+
+The deploy script auto-updates `lib/contract_addresses.sh` with the new address.
 
 ## Troubleshooting
 

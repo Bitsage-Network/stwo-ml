@@ -7,3 +7,7 @@ pub mod hades;
 pub mod poseidon_merkle;
 pub mod mle_opening;
 pub mod poseidon_channel;
+pub mod poseidon2_m31;
+pub mod commitment;
+pub mod merkle_m31;
+pub mod encryption;

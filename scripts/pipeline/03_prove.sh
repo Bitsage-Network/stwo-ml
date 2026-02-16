@@ -171,9 +171,9 @@ fi
 
 # Optional rebuild
 if [[ "$SKIP_BUILD" == "false" ]] && [[ -d "${LIBS_DIR}/stwo-ml" ]]; then
-    FEATURES="cli"
+    FEATURES="cli,audit"
     if [[ "$USE_GPU" == "true" ]]; then
-        FEATURES="cli,cuda-runtime"
+        FEATURES="cli,audit,cuda-runtime"
     fi
     log "Rebuilding prove-model (features: ${FEATURES})..."
     (cd "${LIBS_DIR}/stwo-ml" && cargo build --release --bin prove-model --features "${FEATURES}" 2>&1 | tail -3) || true
@@ -422,11 +422,17 @@ case "$MODE" in
 import json, sys
 with open('${ML_PROOF}') as f:
     proof = json.load(f)
-bc = proof.get('batched_calldata', [])
-sc = proof.get('stark_chunks', [])
-print(f'  batched_calldata: {len(bc)} batches', file=sys.stderr)
-print(f'  stark_chunks: {len(sc)} chunks', file=sys.stderr)
-assert len(bc) > 0 or len(sc) > 0, 'No calldata in proof'
+vc = proof.get('verify_calldata')
+assert isinstance(vc, dict), 'Missing verify_calldata object'
+assert vc.get('schema_version') == 1, 'verify_calldata.schema_version must be 1'
+assert vc.get('entrypoint') == 'verify_model_direct', 'verify_calldata.entrypoint must be verify_model_direct'
+calldata = vc.get('calldata')
+chunks = vc.get('upload_chunks', [])
+assert isinstance(calldata, list) and len(calldata) > 0, 'verify_calldata.calldata must be non-empty array'
+assert isinstance(chunks, list), 'verify_calldata.upload_chunks must be an array'
+assert any(str(v) == '__SESSION_ID__' for v in calldata), 'verify_model_direct calldata must contain __SESSION_ID__ placeholder'
+print(f'  verify_calldata parts: {len(calldata)}', file=sys.stderr)
+print(f'  upload_chunks: {len(chunks)}', file=sys.stderr)
 " 2>&1; then
             ok "Direct proof structure valid"
         else
@@ -454,10 +460,18 @@ with open('${ML_PROOF}') as f:
 fmt = proof.get('format', '')
 if fmt != 'ml_gkr':
     print(f'Warning: format is {fmt}, expected ml_gkr', file=sys.stderr)
-assert 'gkr_calldata' in proof, 'Missing gkr_calldata'
-assert len(proof['gkr_calldata']) > 0, 'Empty gkr_calldata'
-print(f'  gkr_calldata: {len(proof[\"gkr_calldata\"])} felts', file=sys.stderr)
-print(f'  model_id: {proof.get(\"model_id\", \"?\")}', file=sys.stderr)
+vc = proof.get('verify_calldata')
+assert isinstance(vc, dict), 'Missing verify_calldata object'
+assert vc.get('schema_version') == 1, 'verify_calldata.schema_version must be 1'
+assert vc.get('entrypoint') == 'verify_model_gkr', 'verify_calldata.entrypoint must be verify_model_gkr'
+calldata = vc.get('calldata')
+chunks = vc.get('upload_chunks', [])
+assert isinstance(calldata, list) and len(calldata) > 0, 'verify_calldata.calldata must be non-empty array'
+assert isinstance(chunks, list), 'verify_calldata.upload_chunks must be an array'
+assert len(chunks) == 0, 'verify_model_gkr should not include upload chunks'
+assert all(str(v) != '__SESSION_ID__' for v in calldata), 'verify_model_gkr calldata must not include __SESSION_ID__ placeholder'
+print(f'  verify_calldata: {len(calldata)} felts', file=sys.stderr)
+print(f'  model_id: {proof.get("model_id", "?")}', file=sys.stderr)
 " 2>&1; then
                 ok "GKR proof structure valid"
             else

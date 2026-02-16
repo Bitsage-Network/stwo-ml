@@ -1,10 +1,15 @@
 # stwo-ml
 
-ML inference proving circuits built on [STWO](https://github.com/starkware-libs/stwo) — StarkWare's Circle STARK prover over M31.
+ML inference proving and privacy protocol built on [STWO](https://github.com/starkware-libs/stwo) — StarkWare's Circle STARK prover over M31.
 
 ## What This Is
 
-`stwo-ml` adds ML-specific proving circuits on top of STWO's Circle STARK backend:
+`stwo-ml` is a dual-purpose library:
+
+1. **Verifiable ML Inference** — Prove that a neural network forward pass was executed correctly, from ONNX model to on-chain verified proof.
+2. **VM31 Privacy Protocol** — Shielded transactions (deposit/withdraw/spend) over the M31 field with STARK-based zero-knowledge proofs, Poseidon2-M31 commitments, and append-only Merkle pool.
+
+### ML Inference Proving
 
 - **Sumcheck-based MatMul** — Verify matrix multiplication via multilinear extensions (42–1700x trace reduction vs naive encoding)
 - **GKR Protocol** — Layer-by-layer interactive proof replaces per-layer independent STARKs with a single pass from output to input
@@ -19,6 +24,17 @@ ML inference proving circuits built on [STWO](https://github.com/starkware-libs/
 - **Quantized Inference (INT4/INT8)** — Sound 2D LogUp lookup tables for both quantize and dequantize, Poseidon-committed parameters, native packed-INT4 SafeTensors loading
 - **ONNX Compiler** — Import models directly from PyTorch/TensorFlow via tract-onnx
 - **Dual-Track Execution** — Simultaneous f32 inference and M31 proving for meaningful float output alongside verifiable proofs
+
+### VM31 Privacy Protocol
+
+- **Poseidon2-M31** — Native Poseidon2 hash over the Mersenne-31 field (t=16, rate=8, x^5 S-box, 22 rounds)
+- **Note Commitments** — Poseidon2(pubkey || asset || amount || blinding) with 124-bit hiding
+- **Nullifiers** — Poseidon2(spending_key || commitment) for double-spend prevention
+- **Merkle Pool** — Append-only depth-20 Poseidon2-M31 Merkle tree (1M notes)
+- **Symmetric Encryption** — Poseidon2-M31 counter-mode encryption for note memos
+- **Transaction Circuits** — Deposit, withdraw, and 2-in/2-out spend with computational integrity proofs
+- **Transaction STARKs** — Full STWO STARK proofs wrapping transaction circuits for zero-knowledge (verifier sees only public inputs)
+- **Verifiable Audit** — Append-only inference logging with batch proving and on-chain submission
 
 ## Measured Performance
 
@@ -125,10 +141,197 @@ Key components:
 
 See [`docs/transformer-architecture.md`](docs/transformer-architecture.md) for the full block diagram, builder API, component details, and proof structure.
 
+## VM31 Privacy Protocol
+
+The VM31 privacy protocol implements shielded transactions over the M31 field. Users deposit public funds into a shielded pool (Merkle tree of note commitments), transfer privately within the pool, and withdraw back to public.
+
+### Cryptographic Primitives (`crypto/`)
+
+All cryptography is native M31 — no field conversions, no felt252 wrappers.
+
+| Primitive | Module | Description |
+|-----------|--------|-------------|
+| Poseidon2-M31 | `crypto/poseidon2_m31.rs` | t=16, rate=8, x^5 S-box, 4+14+4 rounds. Hash output: 8 M31 elements (~124-bit collision resistance) |
+| Note Commitment | `crypto/commitment.rs` | Poseidon2 sponge hash of pk, asset, amount, blinding (11 M31 input) |
+| Nullifier | `crypto/commitment.rs` | Poseidon2 sponge hash of spending\_key and commitment (12 M31 input) |
+| Key Derivation | `crypto/commitment.rs` | Domain-separated Poseidon2 hash: `"spend"` → pubkey, `"view"` → viewing key |
+| Merkle Tree | `crypto/merkle_m31.rs` | Append-only depth-20 tree, Poseidon2 compress for internal nodes |
+| Encryption | `crypto/encryption.rs` | Poseidon2-M31 counter-mode, key derivation, checksum validation |
+
+```rust
+use stwo_ml::crypto::commitment::{Note, derive_pubkey, compute_commitment, compute_nullifier};
+use stwo_ml::crypto::merkle_m31::PoseidonMerkleTreeM31;
+
+// Create a note
+let sk = [M31::from(42), M31::from(43), M31::from(44), M31::from(45)];
+let pk = derive_pubkey(&sk);
+let note = Note::new(pk, asset_id, amount_lo, amount_hi, blinding);
+let commitment = compute_commitment(&note);
+let nullifier = compute_nullifier(&sk, &commitment);
+
+// Insert into Merkle pool
+let mut tree = PoseidonMerkleTreeM31::new(20);
+let index = tree.insert(&commitment);
+let proof = tree.prove(index);
+assert!(tree.verify(&commitment, &proof));
+```
+
+### Transaction Circuits (`circuits/`)
+
+Three transaction types, each with computational integrity proofs (Phase 3) and STARK zero-knowledge proofs (Phase 4).
+
+| Transaction | Circuit | STARK | Perms | Trace Width |
+|------------|---------|-------|-------|-------------|
+| **Deposit** | `circuits/deposit.rs` | `circuits/stark_deposit.rs` | 2 | ~1,372 cols |
+| **Withdraw** | `circuits/withdraw.rs` | `circuits/stark_withdraw.rs` | 25 (real) + 7 (pad) = 32 | ~20,932 cols |
+| **Spend** | `circuits/spend.rs` | `circuits/stark_spend.rs` | 54 (real) + 10 (pad) = 64 | ~41,864 cols |
+
+**Deposit** — Convert public funds to a shielded note:
+```
+Public: (amount, asset_id) → commitment
+Proof: commitment = Poseidon2(pk || asset || amount || blinding)
+```
+
+**Withdraw** — Reveal a shielded note to public:
+```
+Public: (merkle_root, nullifier, amount, asset_id)
+Proof: ownership + commitment + nullifier + Merkle membership (20 levels)
+```
+
+**Spend** — Private 2-in/2-out transfer:
+```
+Public: (merkle_root, nullifier_0, nullifier_1, output_commitment_0, output_commitment_1)
+Proof: per-input (ownership + commitment + nullifier + Merkle) ×2
+     + per-output (commitment hash) ×2
+     + balance conservation + asset consistency
+```
+
+### Transaction STARKs (Zero-Knowledge)
+
+Phase 4 wraps each transaction circuit into a single-row STWO STARK proof. The verifier sees **only public inputs** — all private data (keys, blinding factors, Merkle paths, note contents) is hidden by the FRI protocol.
+
+**Architecture**: Each transaction type is a single wide-row `FrameworkEval` where one row = one complete transaction. All Poseidon2 permutations are unrolled within the row (no cross-row constraints). Each permutation occupies 652 trace columns (23×16 state columns + S-box auxiliaries).
+
+**Key constraint techniques**:
+- **S-box decomposition**: x^5 → `sq = (s+rc)^2`, `quad = sq^2`, `out = quad * (s+rc)` — all degree 2
+- **Merkle chain**: `(input[j] - prev_out[j]) * (input[j+8] - prev_out[j]) = 0` — degree-2 without `is_real` selector
+- **Range check**: Bit decomposition (16 bits per sub-limb), no LogUp table needed
+- **No interaction trace**: Only preprocessed + execution trees (no `finalize_logup`)
+
+```rust
+use stwo_ml::circuits::stark_spend::{prove_spend_stark, verify_spend_stark};
+
+// Prove a private transfer
+let proof = prove_spend_stark(&witness)?;
+
+// Verify with only public inputs
+verify_spend_stark(&proof, &public_inputs)?;
+// public_inputs: merkle_root, nullifiers, output_commitments — no private data
+```
+
+See [`docs/vm31-privacy-protocol.md`](docs/vm31-privacy-protocol.md) for the full protocol design, constraint details, and security analysis.
+
+### Privacy SDK (`privacy/`)
+
+High-level wallet, transaction builder, and pool interaction layer for the VM31 shielded pool.
+
+| Module | Description |
+|--------|-------------|
+| `privacy/wallet.rs` | Key management — create, load, encrypt/decrypt wallet files (`~/.vm31/wallet.json`) |
+| `privacy/tx_builder.rs` | Transaction builder — compose deposit/withdraw/spend batches for proving |
+| `privacy/pool_client.rs` | On-chain pool queries via JSON-RPC — Merkle root, tree size, nullifier checks, event scanning |
+| `privacy/tree_sync.rs` | Global Merkle tree sync from on-chain `NoteInserted` events with disk cache (`~/.vm31/tree_cache.json`) |
+| `privacy/note_store.rs` | Local note tracking — persistent JSON store, balance queries, note selection, memo scanning |
+| `privacy/relayer.rs` | Relayer interaction for batch submission |
+| `privacy/serde_utils.rs` | Batch proof serialization/deserialization |
+
+#### Pool Client
+
+Reads on-chain state from the VM31 pool contract via `starknet_call` and `starknet_getEvents` JSON-RPC:
+
+```rust
+use stwo_ml::privacy::pool_client::{PoolClient, PoolClientConfig};
+
+let config = PoolClientConfig::from_env("sepolia"); // uses default pool address
+let client = PoolClient::new(config);
+
+let root = client.get_merkle_root()?;     // [M31; 8]
+let size = client.get_tree_size()?;        // u64
+let spent = client.is_nullifier_spent(&nullifier)?;
+
+// Scan NoteInserted events (paginated)
+let events = client.get_note_inserted_events(from_block)?;
+```
+
+Function selectors use proper `sn_keccak` (Keccak-256 truncated to 250 bits).
+
+#### Tree Sync
+
+Rebuilds the full depth-20 Merkle tree locally by scanning on-chain events, then generates Merkle proofs against the real pool root:
+
+```rust
+use stwo_ml::privacy::tree_sync::TreeSync;
+
+let mut tree = TreeSync::load_or_create(&TreeSync::default_cache_path())?;
+let result = tree.sync(&pool_client)?;  // fetch new events, append, verify root
+println!("Synced: {} leaves ({} new)", result.total_leaves, result.events_added);
+
+let path = tree.prove(leaf_index)?;     // Merkle proof for a note
+let root = tree.root();                 // current synced root
+let idx = tree.find_commitment(&commitment); // lookup by commitment
+```
+
+The sync follows the standard Tornado Cash pattern: scan `NoteInserted` events, rebuild sequentially, verify root matches on-chain. Cache persists to `~/.vm31/tree_cache.json` for incremental sync (~20ms to reload 1000 leaves).
+
+#### Deployed Pool Contract (Starknet Sepolia)
+
+| Field | Value |
+|-------|-------|
+| **Address** | `0x07cf94e27a60b94658ec908a00a9bb6dfff03358e952d9d48a8ed0be080ce1f9` |
+| **Class Hash** | `0x046d316ca9ffe36adfdd3760003e9f8aa433cb34105619edcdc275315a2c8405` |
+| **Owner/Relayer** | `0x0759a4374389b0e3cfcc59d49310b6bc75bb12bbf8ce550eb5c2f026918bb344` |
+| **Verifier** | `0x00c7845a80d01927826b17032a432ad9cd36ea61be17fe8cc089d9b68c57e710` (EloVerifier) |
+| **Upgradability** | 5-minute timelocked `propose_upgrade` / `execute_upgrade` |
+
+### Verifiable Audit System (`audit/`)
+
+Captures real-time model inference into an append-only log, then batch-proves correctness over a time window with optional semantic evaluation.
+
+```text
+HOT PATH (serving)              AUDIT PATH (on-demand)
+User → Server → Response        "Prove last hour" →
+          │                              │
+          v                    ┌─────────┼─────────┐
+   Inference Log               v         v         v
+   (append-only)          Summary   Prover    Evaluator
+                          (instant) (GPU)     (parallel)
+                              │         │         │
+                              └─────────┼─────────┘
+                                        v
+                                  Audit Report
+                                  → Encrypt → Arweave → On-chain
+```
+
+| Module | Description |
+|--------|-------------|
+| `audit/log.rs` | Append-only inference log with Merkle commitment |
+| `audit/capture.rs` | Non-blocking capture hook for model servers |
+| `audit/replay.rs` | Replay verification before proving |
+| `audit/prover.rs` | Batch audit prover over time windows |
+| `audit/submit.rs` | On-chain submission of audit records |
+| `audit/deterministic.rs` | Deterministic output checks |
+| `audit/self_eval.rs` | Self-evaluation via model forward pass |
+| `audit/scoring.rs` | Aggregate semantic scoring |
+| `audit/report.rs` | Report builder and hash computation |
+| `audit/storage.rs` | Arweave upload/download client |
+| `audit/encryption.rs` | Encryption integration with VM31 |
+| `audit/orchestrator.rs` | End-to-end audit orchestration |
+
 ## Documentation
 
 | Document | Description |
 |----------|-------------|
+| [`docs/vm31-privacy-protocol.md`](docs/vm31-privacy-protocol.md) | VM31 privacy protocol: Poseidon2-M31, commitments, Merkle pool, transaction circuits, STARKs |
 | [`docs/transformer-architecture.md`](docs/transformer-architecture.md) | Full transformer block: RMSNorm, GQA/MQA attention, RoPE, KV-cache, builder API |
 | [`docs/gkr-protocol.md`](docs/gkr-protocol.md) | GKR protocol: layer types, reduction protocols, proof types, Fiat-Shamir transcript |
 | [`docs/gpu-acceleration.md`](docs/gpu-acceleration.md) | GPU pipeline: CUDA kernels, fused MLE restrict, multi-GPU distributed proving |
@@ -154,7 +357,29 @@ stwo-ml/
 │   │   ├── elementwise.rs    # Add/Mul pure AIR constraints
 │   │   ├── conv2d.rs         # Convolution via im2col + matmul
 │   │   ├── tiled_matmul.rs   # Tiled sumcheck for large k
-│   │   └── quantize.rs       # 2D LogUp quantization verification
+│   │   ├── quantize.rs       # 2D LogUp quantization verification
+│   │   ├── poseidon2_air.rs  # Poseidon2-M31 AIR constraints (shared by transaction STARKs)
+│   │   └── range_check.rs    # Range check gadgets for bounding values
+│   │
+│   ├── crypto/               # VM31 cryptographic primitives
+│   │   ├── poseidon2_m31.rs  # Poseidon2 hash over M31 (t=16, rate=8, x^5, 22 rounds)
+│   │   ├── commitment.rs     # Note commitment, nullifier, key derivation
+│   │   ├── merkle_m31.rs     # Append-only Poseidon2-M31 Merkle tree (depth 20)
+│   │   ├── encryption.rs     # Poseidon2-M31 counter-mode encryption
+│   │   ├── hades.rs          # Hades permutation (felt252, for Cairo compatibility)
+│   │   ├── poseidon_merkle.rs # Poseidon-based Merkle tree (felt252)
+│   │   ├── mle_opening.rs    # MLE commitment and opening proofs
+│   │   └── poseidon_channel.rs # Fiat-Shamir channel matching Cairo verifier
+│   │
+│   ├── circuits/             # VM31 transaction circuits
+│   │   ├── poseidon_circuit.rs # Poseidon2-M31 batch permutation proving
+│   │   ├── helpers.rs        # Permutation-recording helpers for composed proofs
+│   │   ├── deposit.rs        # Deposit: public amount → shielded note (Phase 3)
+│   │   ├── withdraw.rs       # Withdraw: shielded note → public amount (Phase 3)
+│   │   ├── spend.rs          # 2-in/2-out private transfer (Phase 3)
+│   │   ├── stark_deposit.rs  # Deposit STARK: ZK proof, 2 perms (Phase 4)
+│   │   ├── stark_withdraw.rs # Withdraw STARK: ZK proof, 32 perms (Phase 4)
+│   │   └── stark_spend.rs    # Spend STARK: ZK proof, 64 perms (Phase 4)
 │   │
 │   ├── gkr/                  # GKR interactive proof engine
 │   │   ├── mod.rs            # Module entry point
@@ -174,6 +399,33 @@ stwo-ml/
 │   │   ├── streaming.rs      # mmap-based streaming weight pipeline
 │   │   └── checkpoint.rs     # Checkpoint persistence
 │   │
+│   ├── privacy/              # VM31 privacy SDK
+│   │   ├── wallet.rs         # Key management, create/load/encrypt wallet files
+│   │   ├── tx_builder.rs     # Transaction builder — compose batches for proving
+│   │   ├── pool_client.rs    # On-chain pool queries via JSON-RPC + event scanning
+│   │   ├── tree_sync.rs      # Global Merkle tree sync from NoteInserted events
+│   │   ├── note_store.rs     # Local note tracking (persistent JSON, balance, selection)
+│   │   ├── relayer.rs        # Relayer interaction for batch submission
+│   │   └── serde_utils.rs    # Batch proof serialization/deserialization
+│   │
+│   ├── audit/                # Verifiable inference audit system
+│   │   ├── types.rs          # InferenceLogEntry, AuditReport, shared types
+│   │   ├── log.rs            # Append-only inference log with Merkle commitment
+│   │   ├── capture.rs        # Non-blocking capture hook for model servers
+│   │   ├── replay.rs         # Replay verification before proving
+│   │   ├── prover.rs         # Batch audit prover over time windows
+│   │   ├── submit.rs         # On-chain submission of audit records
+│   │   ├── deterministic.rs  # Deterministic output checks
+│   │   ├── self_eval.rs      # Self-evaluation via model forward pass
+│   │   ├── scoring.rs        # Aggregate semantic scoring
+│   │   ├── report.rs         # Report builder and hash computation
+│   │   ├── storage.rs        # Arweave upload/download client
+│   │   ├── encryption.rs     # Encryption integration with VM31
+│   │   └── orchestrator.rs   # End-to-end audit orchestration
+│   │
+│   ├── gadgets/              # Reusable constraint gadgets
+│   │   └── range_check.rs    # Range check tables (uint8, uint16, int8)
+│   │
 │   ├── aggregation.rs        # Unified STARK for non-matmul layers
 │   ├── cairo_serde.rs        # Rust → felt252 serialization
 │   ├── starknet.rs           # On-chain calldata + direct proof generation
@@ -185,7 +437,7 @@ stwo-ml/
 │
 ├── docs/                     # Technical documentation
 ├── benches/                  # Performance benchmarks
-└── tests/                    # Integration tests (442 lib + 5 cross-verify + 12 e2e)
+└── tests/                    # Integration tests (802 lib + 10 e2e_audit + 1 cli_audit)
 ```
 
 ## Tile-Level Streaming
@@ -238,6 +490,37 @@ prove-model --model-dir /path/to/hf/model --layers 1 --format cairo_serde --gpu
 | `--gpu` | off | GPU acceleration |
 | `--security` | `auto` | `auto`, `tee`, or `zk-only` |
 | `--inspect` | — | Print model summary and exit |
+
+#### Privacy Subcommands
+
+```bash
+# Wallet management
+prove-model wallet --create                     # Generate new spending key + viewing key
+prove-model wallet --info                       # Show address + balances
+
+# Deposit (public -> shielded)
+prove-model deposit --amount 1000 --asset 0     # Deposit asset 0 (STRK)
+
+# Withdraw (shielded -> public, syncs global Merkle tree)
+prove-model withdraw --amount 500 --asset 0 --pool-contract 0x07cf94...
+
+# Transfer (2-in/2-out private spend)
+prove-model transfer --amount 300 --asset 0 \
+  --to 0x<recipient_pubkey> --to-viewing-key 0x<recipient_vk>
+
+# Scan for incoming notes + sync tree
+prove-model scan --pool-contract 0x07cf94...
+
+# Query pool state
+prove-model pool-status --pool-contract 0x07cf94...
+prove-model pool-status --check-nullifier 0x<hex>
+prove-model pool-status --check-root 0x<hex>
+
+# Batch proving (deposits only via file)
+prove-model batch --tx-file transactions.json
+```
+
+The `withdraw` and `transfer` commands sync the global Merkle tree from on-chain `NoteInserted` events before generating proofs, ensuring the Merkle root matches the pool contract. The `scan` command updates pending note indices and confirms notes on-chain.
 
 #### Output Formats
 
@@ -340,6 +623,10 @@ cairo-prove prove-ml stwo_ml_recursive.executable.json args.json
 | `model-loading` | ONNX + SafeTensors | — |
 | `cli` | `prove-model` binary | `model-loading` |
 | `server` | `prove-server` HTTP API | `model-loading` |
+| `audit` | Verifiable inference audit system | — |
+| `audit-http` | Audit with HTTP submission | `audit` |
+| `aes-fallback` | AES-GCM encryption fallback for audit | `audit` |
+| `server-audit` | prove-server with audit integration | `server` + `audit` |
 
 ## License
 
