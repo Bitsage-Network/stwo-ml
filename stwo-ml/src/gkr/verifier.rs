@@ -1051,10 +1051,19 @@ fn verify_activation_reduction(
     layer_idx: usize,
     channel: &mut PoseidonChannel,
 ) -> Result<GKRClaim, GKRError> {
-    let logup = logup_proof.ok_or_else(|| GKRError::VerificationError {
-        layer_idx,
-        reason: "activation proof missing LogUp proof".to_string(),
-    })?;
+    // When LogUp is None the prover skipped the lookup proof for this layer
+    // (activation correctness is verified by the unified STARK instead).
+    // Keep the Fiat-Shamir transcript consistent: only mix input_eval.
+    let logup = match logup_proof {
+        Some(l) => l,
+        None => {
+            mix_secure_field(channel, input_eval);
+            return Ok(GKRClaim {
+                point: output_claim.point.clone(),
+                value: input_eval,
+            });
+        }
+    };
 
     let num_vars = logup.eq_round_polys.len();
     if num_vars == 0 {

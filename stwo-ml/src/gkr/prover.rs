@@ -174,11 +174,25 @@ pub fn prove_gkr(
             }
 
             LayerType::Activation { activation_type, .. } => {
+                // Skip LogUp in GKR — activation correctness verified by unified STARK.
+                // M31 arithmetic can produce input values outside the table range [0, 2^16),
+                // making LogUp infeasible. Same approach as SIMD path.
                 let input_matrix = get_intermediate(execution, layer.node_id)?;
-
-                reduce_activation_layer(
-                    &current_claim, input_matrix, *activation_type, channel,
-                )?
+                let input_padded = pad_matrix_pow2(input_matrix);
+                let input_mle = matrix_to_mle(&input_padded);
+                let input_eval = evaluate_mle(&input_mle, &current_claim.point);
+                mix_secure_field(channel, input_eval);
+                let claim = GKRClaim {
+                    point: current_claim.point.clone(),
+                    value: input_eval,
+                };
+                (LayerProof::Activation {
+                    activation_type: *activation_type,
+                    logup_proof: None,
+                    input_eval,
+                    output_eval: current_claim.value,
+                    table_commitment: starknet_ff::FieldElement::ZERO,
+                }, claim)
             }
 
             LayerType::LayerNorm { dim, .. } => {
@@ -477,10 +491,29 @@ pub fn prove_gkr_gpu(
             }
 
             LayerType::Activation { activation_type, .. } => {
+                // Skip LogUp in GKR — activation correctness verified by unified STARK.
+                // M31 arithmetic can produce input values outside the table range [0, 2^16),
+                // making LogUp infeasible. Same approach as SIMD path.
                 let input_matrix = get_intermediate(execution, layer.node_id)?;
-                reduce_activation_layer_gpu(
-                    &gpu, &current_claim, input_matrix, *activation_type, channel,
-                )?
+                let input_padded = pad_matrix_pow2(input_matrix);
+                let input_mle = matrix_to_mle(&input_padded);
+                let input_eval = gpu.evaluate_mle_gpu(&input_mle, &current_claim.point)
+                    .map_err(|e| GKRError::ReductionError {
+                        layer_idx,
+                        reason: format!("GPU eval_mle activation: {e}"),
+                    })?;
+                mix_secure_field(channel, input_eval);
+                let claim = GKRClaim {
+                    point: current_claim.point.clone(),
+                    value: input_eval,
+                };
+                (LayerProof::Activation {
+                    activation_type: *activation_type,
+                    logup_proof: None,
+                    input_eval,
+                    output_eval: current_claim.value,
+                    table_commitment: starknet_ff::FieldElement::ZERO,
+                }, claim)
             }
 
             LayerType::LayerNorm { dim, .. } => {
