@@ -12,6 +12,7 @@ use starknet_ff::FieldElement;
 use stwo::core::fields::qm31::SecureField;
 use crate::crypto::poseidon_channel::{PoseidonChannel, securefield_to_felt};
 use crate::crypto::poseidon_merkle::{PoseidonMerkleTree, MerkleAuthPath};
+use rayon::prelude::*;
 
 /// Number of queries for MLE opening (matching STARK FRI query count).
 pub const MLE_N_QUERIES: usize = 14;
@@ -120,27 +121,40 @@ pub fn prove_mle_opening_with_commitment(
 
     // Fold through each challenge
     // Variable ordering matches evaluate_mle: first variable splits into lo/hi halves
-    let mut current = evals.to_vec();
     for &r in challenges.iter() {
+        let current = layer_evals.last().expect("layer_evals is never empty");
         let mid = current.len() / 2;
-        let mut folded = Vec::with_capacity(mid);
-        for j in 0..mid {
-            // f(r, x_rest) = (1-r)*f(0, x_rest) + r*f(1, x_rest)
-            // f(0, x_rest) = current[j], f(1, x_rest) = current[mid + j]
-            folded.push(current[j] + r * (current[mid + j] - current[j]));
-        }
 
-        if folded.len() > 1 {
+        let folded: Vec<SecureField> = if mid >= 1 << 16 {
+            // Large rounds dominate opening time; parallelize safely (pure map).
+            (0..mid)
+                .into_par_iter()
+                .map(|j| {
+                    // f(r, x_rest) = (1-r)*f(0, x_rest) + r*f(1, x_rest)
+                    // f(0, x_rest) = current[j], f(1, x_rest) = current[mid + j]
+                    current[j] + r * (current[mid + j] - current[j])
+                })
+                .collect()
+        } else {
+            let mut v = Vec::with_capacity(mid);
+            for j in 0..mid {
+                v.push(current[j] + r * (current[mid + j] - current[j]));
+            }
+            v
+        };
+
+        if mid > 1 {
             let (root, tree) = commit_mle(&folded);
             channel.mix_felt(root);
             intermediate_roots.push(root);
             layer_trees.push(tree);
         }
-        layer_evals.push(folded.clone());
-        current = folded;
+        layer_evals.push(folded);
     }
 
-    let final_value = current[0];
+    let final_value = layer_evals
+        .last()
+        .expect("layer_evals has final layer")[0];
 
     // Draw query indices (each query selects an index in [0, n/2))
     let initial_n = evals.len();
