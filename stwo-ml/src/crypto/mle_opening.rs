@@ -90,6 +90,20 @@ pub fn prove_mle_opening(
     challenges: &[SecureField],
     channel: &mut PoseidonChannel,
 ) -> MleOpeningProof {
+    let (_, proof) = prove_mle_opening_with_commitment(evals, challenges, channel);
+    proof
+}
+
+/// Generate an MLE opening proof and return the initial commitment root used
+/// in the Fiat-Shamir transcript.
+///
+/// This is equivalent to calling `commit_mle(...)` then `prove_mle_opening(...)`
+/// but avoids recomputing the same root in callers that need both values.
+pub fn prove_mle_opening_with_commitment(
+    evals: &[SecureField],
+    challenges: &[SecureField],
+    channel: &mut PoseidonChannel,
+) -> (FieldElement, MleOpeningProof) {
     assert!(!evals.is_empty());
     assert!(evals.len().is_power_of_two());
     let n_vars = evals.len().ilog2() as usize;
@@ -193,11 +207,14 @@ pub fn prove_mle_opening(
         });
     }
 
-    MleOpeningProof {
-        intermediate_roots,
-        queries,
-        final_value,
-    }
+    (
+        initial_root,
+        MleOpeningProof {
+            intermediate_roots,
+            queries,
+            final_value,
+        },
+    )
 }
 
 /// Verify an MLE opening proof against a committed Poseidon Merkle root.

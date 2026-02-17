@@ -43,8 +43,9 @@ pub fn prove_gkr(
     let d = circuit.layers.len();
     let mut layer_proofs = Vec::with_capacity(d);
     let mut weight_commitments = Vec::new();
-    // Capture (b_mle_evals, eval_point, final_b_eval) per MatMul for post-walk opening proofs
-    let mut weight_data: Vec<(Vec<SecureField>, Vec<SecureField>, SecureField)> = Vec::new();
+    // Capture (weight_node_id, eval_point, final_b_eval) per MatMul for post-walk opening proofs.
+    // We intentionally avoid storing full B MLE vectors here to reduce peak memory.
+    let mut weight_data: Vec<(usize, Vec<SecureField>, SecureField)> = Vec::new();
 
     // Seed channel with circuit metadata
     channel.mix_u64(d as u64);
@@ -85,13 +86,6 @@ pub fn prove_gkr(
                 let b_matrix = weights.get_weight(*weight_node_id)
                     .ok_or(GKRError::MissingWeight { node_id: *weight_node_id })?;
 
-                // Commit weight MLE (col-major, padded to pow2) — matches verifier's expected encoding
-                let b_padded = pad_matrix_pow2(b_matrix);
-                let b_mle = matrix_to_mle_col_major(&b_padded);
-                weight_commitments.push(
-                    crate::crypto::mle_opening::commit_mle_root_only(&b_mle),
-                );
-
                 // Capture r_j before reduction for weight evaluation point
                 let pm = m.next_power_of_two();
                 let log_m = pm.ilog2() as usize;
@@ -110,7 +104,7 @@ pub fn prove_gkr(
                 let mut weight_eval_point = r_j;
                 weight_eval_point.extend_from_slice(sumcheck_challenges);
 
-                weight_data.push((b_mle, weight_eval_point, proof.final_b_eval));
+                weight_data.push((*weight_node_id, weight_eval_point, proof.final_b_eval));
 
                 (LayerProof::MatMul {
                     round_polys: proof.round_polys,
@@ -243,11 +237,9 @@ pub fn prove_gkr(
                 let b_matrix = weights.get_weight(*weight_node_id)
                     .ok_or(GKRError::MissingWeight { node_id: *weight_node_id })?;
 
-                // Commit weight MLE for this deferred matmul
+                // Build deferred weight MLE for this deferred matmul
                 let b_padded = pad_matrix_pow2(b_matrix);
                 let b_mle = matrix_to_mle_col_major(&b_padded);
-                let deferred_weight_commitment =
-                    crate::crypto::mle_opening::commit_mle_root_only(&b_mle);
 
                 // Mix deferred claim into channel (Fiat-Shamir binding)
                 mix_secure_field(channel, deferred_claim.value);
@@ -272,7 +264,8 @@ pub fn prove_gkr(
                     eval_point: weight_eval_point.clone(),
                     expected_value: reduction.final_b_eval,
                 };
-                let deferred_weight_opening = crate::crypto::mle_opening::prove_mle_opening(
+                let (deferred_weight_commitment, deferred_weight_opening) =
+                    crate::crypto::mle_opening::prove_mle_opening_with_commitment(
                     &b_mle, &weight_eval_point, channel,
                 );
 
@@ -307,14 +300,21 @@ pub fn prove_gkr(
     let mut weight_openings = Vec::with_capacity(weight_data.len());
     let mut weight_claims = Vec::with_capacity(weight_data.len());
 
-    for (b_mle, eval_point, expected_value) in weight_data {
+    for (weight_node_id, eval_point, expected_value) in weight_data {
+        let b_matrix = weights
+            .get_weight(weight_node_id)
+            .ok_or(GKRError::MissingWeight { node_id: weight_node_id })?;
+        let b_padded = pad_matrix_pow2(b_matrix);
+        let b_mle = matrix_to_mle_col_major(&b_padded);
+
         weight_claims.push(super::types::WeightClaim {
             eval_point: eval_point.clone(),
             expected_value,
         });
-        let opening = crate::crypto::mle_opening::prove_mle_opening(
+        let (commitment, opening) = crate::crypto::mle_opening::prove_mle_opening_with_commitment(
             &b_mle, &eval_point, channel,
         );
+        weight_commitments.push(commitment);
         weight_openings.push(opening);
     }
 
@@ -371,7 +371,8 @@ pub fn prove_gkr_gpu(
     let d = circuit.layers.len();
     let mut layer_proofs = Vec::with_capacity(d);
     let mut weight_commitments = Vec::new();
-    let mut weight_data: Vec<(Vec<SecureField>, Vec<SecureField>, SecureField)> = Vec::new();
+    // Capture (weight_node_id, eval_point, final_b_eval) per MatMul.
+    let mut weight_data: Vec<(usize, Vec<SecureField>, SecureField)> = Vec::new();
     let mut deferred_info: Vec<(GKRClaim, usize)> = Vec::new();
 
     // Seed channel with circuit metadata (same as CPU prover)
@@ -408,13 +409,6 @@ pub fn prove_gkr_gpu(
                 let b_matrix = weights.get_weight(*weight_node_id)
                     .ok_or(GKRError::MissingWeight { node_id: *weight_node_id })?;
 
-                // Commit weight MLE (col-major, padded to pow2) — matches verifier's expected encoding
-                let b_padded = pad_matrix_pow2(b_matrix);
-                let b_mle = matrix_to_mle_col_major(&b_padded);
-                weight_commitments.push(
-                    crate::crypto::mle_opening::commit_mle_root_only(&b_mle),
-                );
-
                 // Capture r_j before reduction for weight evaluation point
                 let pm = m.next_power_of_two();
                 let log_m = pm.ilog2() as usize;
@@ -435,7 +429,7 @@ pub fn prove_gkr_gpu(
                 let sumcheck_challenges = &claim.point[log_m..];
                 let mut weight_eval_point = r_j;
                 weight_eval_point.extend_from_slice(sumcheck_challenges);
-                weight_data.push((b_mle, weight_eval_point, final_b_eval));
+                weight_data.push((*weight_node_id, weight_eval_point, final_b_eval));
 
                 (proof, claim)
             }
@@ -537,8 +531,6 @@ pub fn prove_gkr_gpu(
                     .ok_or(GKRError::MissingWeight { node_id: *weight_node_id })?;
                 let b_padded = pad_matrix_pow2(b_matrix);
                 let b_mle = matrix_to_mle_col_major(&b_padded);
-                let deferred_weight_commitment =
-                    crate::crypto::mle_opening::commit_mle_root_only(&b_mle);
 
                 mix_secure_field(channel, deferred_claim.value);
 
@@ -560,7 +552,8 @@ pub fn prove_gkr_gpu(
                     eval_point: weight_eval_point.clone(),
                     expected_value: reduction.final_b_eval,
                 };
-                let deferred_opening = crate::crypto::mle_opening::prove_mle_opening(
+                let (deferred_weight_commitment, deferred_opening) =
+                    crate::crypto::mle_opening::prove_mle_opening_with_commitment(
                     &b_mle, &weight_eval_point, channel,
                 );
 
@@ -586,14 +579,21 @@ pub fn prove_gkr_gpu(
     let mut weight_openings = Vec::with_capacity(weight_data.len());
     let mut weight_claims = Vec::with_capacity(weight_data.len());
 
-    for (b_mle, eval_point, expected_value) in weight_data {
+    for (weight_node_id, eval_point, expected_value) in weight_data {
+        let b_matrix = weights
+            .get_weight(weight_node_id)
+            .ok_or(GKRError::MissingWeight { node_id: weight_node_id })?;
+        let b_padded = pad_matrix_pow2(b_matrix);
+        let b_mle = matrix_to_mle_col_major(&b_padded);
+
         weight_claims.push(super::types::WeightClaim {
             eval_point: eval_point.clone(),
             expected_value,
         });
-        let opening = crate::crypto::mle_opening::prove_mle_opening(
+        let (commitment, opening) = crate::crypto::mle_opening::prove_mle_opening_with_commitment(
             &b_mle, &eval_point, channel,
         );
+        weight_commitments.push(commitment);
         weight_openings.push(opening);
     }
 
@@ -1037,7 +1037,8 @@ pub fn prove_gkr_simd_gpu(
     let d = circuit.layers.len();
     let mut layer_proofs = Vec::with_capacity(d);
     let mut weight_commitments = Vec::new();
-    let mut weight_data: Vec<(Vec<SecureField>, Vec<SecureField>, SecureField)> = Vec::new();
+    // Capture (weight_node_id, eval_point, final_b_eval) per MatMul.
+    let mut weight_data: Vec<(usize, Vec<SecureField>, SecureField)> = Vec::new();
     let mut deferred_info: Vec<(GKRClaim, usize)> = Vec::new();
 
     // Seed channel with circuit + SIMD metadata
@@ -1085,13 +1086,6 @@ pub fn prove_gkr_simd_gpu(
                 let b_matrix = weights.get_weight(*weight_node_id)
                     .ok_or(GKRError::MissingWeight { node_id: *weight_node_id })?;
 
-                // Commit weight MLE (col-major, padded to pow2) — matches verifier's expected encoding
-                let b_padded = pad_matrix_pow2(b_matrix);
-                let b_mle = matrix_to_mle_col_major(&b_padded);
-                weight_commitments.push(
-                    crate::crypto::mle_opening::commit_mle_root_only(&b_mle),
-                );
-
                 // Capture r_j before reduction for weight evaluation point
                 let pm = m.next_power_of_two();
                 let log_m = pm.ilog2() as usize;
@@ -1123,7 +1117,7 @@ pub fn prove_gkr_simd_gpu(
                 let sumcheck_challenges = &claim.point[log_m..];
                 let mut weight_eval_point = r_j;
                 weight_eval_point.extend_from_slice(sumcheck_challenges);
-                weight_data.push((b_mle, weight_eval_point, final_b_eval));
+                weight_data.push((*weight_node_id, weight_eval_point, final_b_eval));
 
                 (proof, claim)
             }
@@ -1252,14 +1246,21 @@ pub fn prove_gkr_simd_gpu(
     let mut weight_openings = Vec::with_capacity(weight_data.len());
     let mut weight_claims = Vec::with_capacity(weight_data.len());
 
-    for (b_mle, eval_point, expected_value) in weight_data {
+    for (weight_node_id, eval_point, expected_value) in weight_data {
+        let b_matrix = weights
+            .get_weight(weight_node_id)
+            .ok_or(GKRError::MissingWeight { node_id: weight_node_id })?;
+        let b_padded = pad_matrix_pow2(b_matrix);
+        let b_mle = matrix_to_mle_col_major(&b_padded);
+
         weight_claims.push(super::types::WeightClaim {
             eval_point: eval_point.clone(),
             expected_value,
         });
-        let opening = crate::crypto::mle_opening::prove_mle_opening(
+        let (commitment, opening) = crate::crypto::mle_opening::prove_mle_opening_with_commitment(
             &b_mle, &eval_point, channel,
         );
+        weight_commitments.push(commitment);
         weight_openings.push(opening);
     }
 
