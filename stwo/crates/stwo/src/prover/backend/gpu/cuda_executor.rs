@@ -462,6 +462,68 @@ pub struct CompiledKernels {
     pub poseidon252_hash_many_chunked_m31: CudaFunction,
 }
 
+/// GPU-resident Poseidon252 Merkle tree layers.
+///
+/// Stores internal hash layers (not raw leaves):
+/// - `layers[0]` has `n_leaf_hashes` hashes (hash of leaf pairs)
+/// - `layers[1]` has `n_leaf_hashes/2` hashes
+/// - ...
+/// - `layers[last]` has 1 hash (root)
+#[cfg(feature = "cuda-runtime")]
+pub struct Poseidon252MerkleGpuTree {
+    device: Arc<CudaDevice>,
+    layers: Vec<CudaSlice<u64>>,
+    layer_hash_counts: Vec<usize>,
+}
+
+#[cfg(feature = "cuda-runtime")]
+impl Poseidon252MerkleGpuTree {
+    /// Number of internal hash layers (includes root layer).
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Number of hashes in a given internal layer.
+    pub fn layer_hash_count(&self, layer_idx: usize) -> usize {
+        self.layer_hash_counts[layer_idx]
+    }
+
+    /// Download one hash node (4 u64 limbs) from an internal layer.
+    pub fn node_u64(&self, layer_idx: usize, hash_idx: usize) -> Result<[u64; 4], CudaFftError> {
+        if layer_idx >= self.layers.len() {
+            return Err(CudaFftError::InvalidSize(format!(
+                "layer index out of bounds: {} (layers={})",
+                layer_idx,
+                self.layers.len()
+            )));
+        }
+        let n = self.layer_hash_counts[layer_idx];
+        if hash_idx >= n {
+            return Err(CudaFftError::InvalidSize(format!(
+                "hash index out of bounds: {} (layer={}, hashes={})",
+                hash_idx, layer_idx, n
+            )));
+        }
+        let start = hash_idx * 4;
+        let end = start + 4;
+        let mut out = [0u64; 4];
+        self.device
+            .dtoh_sync_copy_into(&self.layers[layer_idx].slice(start..end), &mut out)
+            .map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
+        Ok(out)
+    }
+
+    /// Download the Merkle root hash (4 u64 limbs).
+    pub fn root_u64(&self) -> Result<[u64; 4], CudaFftError> {
+        if self.layers.is_empty() {
+            return Err(CudaFftError::InvalidSize(
+                "cannot read root of empty GPU merkle tree".into(),
+            ));
+        }
+        self.node_u64(self.layers.len() - 1, 0)
+    }
+}
+
 /// Information about the CUDA device.
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
@@ -3795,6 +3857,168 @@ impl CudaFftExecutor {
             n_leaf_hashes
         );
         Ok(results)
+    }
+
+    /// Build an entire Poseidon252 Merkle tree on GPU and keep internal layers
+    /// resident on device memory.
+    ///
+    /// Unlike `execute_poseidon252_merkle_full_tree`, this method does NOT bulk
+    /// download layers. It returns a handle that can fetch only requested nodes
+    /// (for Merkle authentication paths), avoiding large D2H transfers.
+    pub fn execute_poseidon252_merkle_full_tree_gpu_layers(
+        &self,
+        d_columns: &CudaSlice<u32>,
+        n_columns: usize,
+        d_prev_leaf: Option<&CudaSlice<u64>>,
+        n_leaf_hashes: usize,
+        d_round_constants: &CudaSlice<u64>,
+    ) -> Result<Poseidon252MerkleGpuTree, CudaFftError> {
+        let _span = tracing::span!(
+            tracing::Level::INFO,
+            "CUDA poseidon252_full_tree_gpu_layers",
+            n_leaf_hashes = n_leaf_hashes
+        )
+        .entered();
+
+        if n_leaf_hashes == 0 {
+            return Err(CudaFftError::InvalidSize(
+                "n_leaf_hashes must be > 0".into(),
+            ));
+        }
+
+        let block_size = 256u32;
+        let n_layers = (n_leaf_hashes as f64).log2() as usize + 1;
+
+        let mut d_layers: Vec<CudaSlice<u64>> = Vec::with_capacity(n_layers);
+        let mut layer_hash_counts: Vec<usize> = Vec::with_capacity(n_layers);
+
+        let mut current_n = n_leaf_hashes;
+        for _ in 0..n_layers {
+            let d_buf = unsafe { self.device.alloc::<u64>(current_n * 4) }
+                .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+            d_layers.push(d_buf);
+            layer_hash_counts.push(current_n);
+            current_n = (current_n + 1) / 2;
+        }
+
+        {
+            let n = n_leaf_hashes;
+            let grid_size = ((n as u32) + block_size - 1) / block_size;
+            let cfg = LaunchConfig {
+                grid_dim: (grid_size, 1, 1),
+                block_dim: (block_size, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let has_prev: u32 = if d_prev_leaf.is_some() { 1 } else { 0 };
+            let col_stride = n as u32;
+
+            unsafe {
+                match d_prev_leaf {
+                    Some(prev) => {
+                        self.kernels
+                            .poseidon252_merkle_layer
+                            .clone()
+                            .launch(
+                                cfg,
+                                (
+                                    &mut d_layers[0],
+                                    d_columns,
+                                    prev,
+                                    d_round_constants,
+                                    n_columns as u32,
+                                    n as u32,
+                                    has_prev,
+                                    col_stride,
+                                ),
+                            )
+                            .map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
+                    }
+                    None => {
+                        let dummy_prev = self
+                            .device
+                            .alloc::<u64>(1)
+                            .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+                        self.kernels
+                            .poseidon252_merkle_layer
+                            .clone()
+                            .launch(
+                                cfg,
+                                (
+                                    &mut d_layers[0],
+                                    d_columns,
+                                    &dummy_prev,
+                                    d_round_constants,
+                                    n_columns as u32,
+                                    n as u32,
+                                    has_prev,
+                                    col_stride,
+                                ),
+                            )
+                            .map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
+                    }
+                }
+            }
+        }
+
+        let dummy_cols = unsafe { self.device.alloc::<u32>(1) }
+            .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+
+        current_n = n_leaf_hashes;
+        for layer_idx in 1..n_layers {
+            let next_n = current_n / 2;
+            if next_n == 0 {
+                break;
+            }
+
+            let grid_size = ((next_n as u32) + block_size - 1) / block_size;
+            let cfg = LaunchConfig {
+                grid_dim: (grid_size, 1, 1),
+                block_dim: (block_size, 1, 1),
+                shared_mem_bytes: 0,
+            };
+
+            let (prev_slice, rest) = d_layers.split_at_mut(layer_idx);
+            let d_prev = &prev_slice[layer_idx - 1];
+            let d_out = &mut rest[0];
+
+            unsafe {
+                self.kernels
+                    .poseidon252_merkle_layer
+                    .clone()
+                    .launch(
+                        cfg,
+                        (
+                            d_out,
+                            &dummy_cols,
+                            d_prev,
+                            d_round_constants,
+                            0u32,
+                            next_n as u32,
+                            1u32,
+                            0u32,
+                        ),
+                    )
+                    .map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
+            }
+
+            current_n = next_n;
+        }
+
+        self.device
+            .synchronize()
+            .map_err(|e| CudaFftError::KernelExecution(format!("Sync: {:?}", e)))?;
+
+        tracing::info!(
+            "GPU poseidon252_full_tree_gpu_layers: {} layers, {} leaf hashes (GPU-resident)",
+            d_layers.len(),
+            n_leaf_hashes
+        );
+
+        Ok(Poseidon252MerkleGpuTree {
+            device: Arc::clone(&self.device),
+            layers: d_layers,
+            layer_hash_counts,
+        })
     }
 
     // =========================================================================

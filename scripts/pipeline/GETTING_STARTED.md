@@ -248,6 +248,9 @@ Use GPU-only fail-fast mode to catch this immediately:
 - GPU fold is enabled by default for large MLE openings:
   - `STWO_GPU_MLE_FOLD=1`
   - `STWO_GPU_MLE_FOLD_MIN_POINTS=1048576`
+- GPU opening-tree path is enabled by default to avoid bulk Merkle layer downloads:
+  - `STWO_GPU_MLE_OPENING_TREE=1`
+  - (with `--gpu-only`, pipeline also enforces `STWO_GPU_MLE_OPENING_TREE_REQUIRE=1`)
 - CPU fallback sections use all CPU threads by default:
   - `RAYON_NUM_THREADS=$(nproc)`
   - `OMP_NUM_THREADS=$(nproc)`
