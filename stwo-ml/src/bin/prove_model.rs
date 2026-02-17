@@ -3633,11 +3633,12 @@ fn compute_weight_commitment(
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&v| v > 0)
-        .unwrap_or(5);
+        .unwrap_or(1);
 
     let weight_list: Vec<_> = weights.weights.iter().collect();
     let done_count = AtomicUsize::new(0);
     let total = weight_list.len();
+    eprintln!("[BG]   Progress update cadence: every {} matrix/matrices", progress_every);
 
     // Pack 7 M31 values (7×31=217 bits) into one FieldElement via Horner's method.
     let pack_m31 = |values: &[M31]| -> FieldElement {
@@ -3753,7 +3754,48 @@ fn compute_weight_commitment(
         final_inputs.push(FieldElement::from((w.rows as u64) << 32 | w.cols as u64));
         final_inputs.push(FieldElement::from(n_segments as u64));
         final_inputs.extend_from_slice(&segment_hashes);
-        let matrix_hash = starknet_crypto::poseidon_hash_many(&final_inputs);
+        let matrix_hash = {
+            #[cfg(feature = "cuda-runtime")]
+            {
+                if let Some(hasher) = gpu_hasher.as_ref() {
+                    match hasher.hash_segments(std::slice::from_ref(&final_inputs), chunk_size) {
+                        Ok(hashes) => {
+                            let gpu_hash = hashes[0];
+                            if gpu_commit_hardening_enabled() {
+                                let cpu_hash = starknet_crypto::poseidon_hash_many(&final_inputs);
+                                if gpu_hash != cpu_hash {
+                                    panic!(
+                                        "GPU weight commitment hardening failed: matrix hash mismatch on layer {}",
+                                        layer_id
+                                    );
+                                }
+                            }
+                            gpu_hash
+                        }
+                        Err(e) => {
+                            if gpu_commit_strict_mode() {
+                                panic!(
+                                    "GPU commitment strict mode enabled, but GPU matrix hash failed for layer {}: {}",
+                                    layer_id, e
+                                );
+                            }
+                            eprintln!(
+                                "[BG]   Layer {} GPU matrix hash failed ({}), using CPU fallback",
+                                layer_id, e
+                            );
+                            gpu_hasher = None;
+                            starknet_crypto::poseidon_hash_many(&final_inputs)
+                        }
+                    }
+                } else {
+                    starknet_crypto::poseidon_hash_many(&final_inputs)
+                }
+            }
+            #[cfg(not(feature = "cuda-runtime"))]
+            {
+                starknet_crypto::poseidon_hash_many(&final_inputs)
+            }
+        };
 
         let finished = done_count.fetch_add(1, Ordering::Relaxed) + 1;
         if finished % progress_every == 0 || finished == total {
@@ -3775,7 +3817,41 @@ fn compute_weight_commitment(
     let commitment = if per_matrix_hashes.is_empty() {
         FieldElement::ZERO
     } else {
-        starknet_crypto::poseidon_hash_many(&per_matrix_hashes)
+        #[cfg(feature = "cuda-runtime")]
+        {
+            if let Some(hasher) = gpu_hasher.as_ref() {
+                match hasher.hash_segments(std::slice::from_ref(&per_matrix_hashes), chunk_size) {
+                    Ok(hashes) => {
+                        let gpu_hash = hashes[0];
+                        if gpu_commit_hardening_enabled() {
+                            let cpu_hash = starknet_crypto::poseidon_hash_many(&per_matrix_hashes);
+                            if gpu_hash != cpu_hash {
+                                panic!(
+                                    "GPU weight commitment hardening failed: root hash mismatch"
+                                );
+                            }
+                        }
+                        gpu_hash
+                    }
+                    Err(e) => {
+                        if gpu_commit_strict_mode() {
+                            panic!(
+                                "GPU commitment strict mode enabled, but GPU root hash failed: {}",
+                                e
+                            );
+                        }
+                        eprintln!("[BG]   GPU root hash failed ({}), using CPU fallback", e);
+                        starknet_crypto::poseidon_hash_many(&per_matrix_hashes)
+                    }
+                }
+            } else {
+                starknet_crypto::poseidon_hash_many(&per_matrix_hashes)
+            }
+        }
+        #[cfg(not(feature = "cuda-runtime"))]
+        {
+            starknet_crypto::poseidon_hash_many(&per_matrix_hashes)
+        }
     };
     eprintln!("[BG] Weight commitment computed in {:.2}s", t_commit.elapsed().as_secs_f64());
 
