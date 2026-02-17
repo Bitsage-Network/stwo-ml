@@ -225,6 +225,7 @@ CURRENT=1
 
 if (( START_IDX <= 0 )); then
     run_step "GPU Setup" "$CURRENT" "$TOTAL_STEPS" \
+        env OBELYSK_REQUIRE_GPU="${DO_GPU}" \
         bash "${SCRIPT_DIR}/00_setup_gpu.sh" "${SETUP_ARGS[@]}" || exit 1
     (( CURRENT++ ))
 fi

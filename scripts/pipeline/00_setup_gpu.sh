@@ -34,6 +34,7 @@ if [[ -d "${SCRIPT_DIR}/../../.git" ]]; then
 fi
 INSTALL_DIR="${INSTALL_DIR:-${_DETECTED_ROOT:-$HOME/obelysk}}"
 CUSTOM_CUDA_PATH=""
+REQUIRE_GPU="${OBELYSK_REQUIRE_GPU:-true}"
 
 SKIP_DEPS=false
 SKIP_BUILD=false
@@ -156,14 +157,34 @@ step "3/7" "GPU & CUDA detection"
 
 # Install driver + CUDA if requested
 if [[ "$INSTALL_DRIVERS" == "yes" ]]; then
-    install_nvidia_driver || warn "Driver install failed (may need reboot)"
-    install_cuda_toolkit || warn "CUDA install failed"
+    install_nvidia_driver || {
+        if [[ "${GPU_REBOOT_REQUIRED:-false}" == "true" ]]; then
+            err "NVIDIA driver installed but not active yet (reboot required)."
+            err "Run: sudo reboot"
+            err "Then rerun this setup script."
+            exit 1
+        fi
+        warn "Driver install failed"
+    }
+    if [[ "${GPU_REBOOT_REQUIRED:-false}" != "true" ]]; then
+        install_cuda_toolkit || warn "CUDA install failed"
+    fi
 elif [[ "$INSTALL_DRIVERS" == "auto" ]]; then
     # Auto: install only if nvidia-smi is missing
     if ! command -v nvidia-smi &>/dev/null; then
         log "nvidia-smi not found — attempting driver install..."
-        install_nvidia_driver || warn "Driver install failed"
-        install_cuda_toolkit || warn "CUDA install failed"
+        install_nvidia_driver || {
+            if [[ "${GPU_REBOOT_REQUIRED:-false}" == "true" ]]; then
+                err "NVIDIA driver installed but not active yet (reboot required)."
+                err "Run: sudo reboot"
+                err "Then rerun this setup script."
+                exit 1
+            fi
+            warn "Driver install failed"
+        }
+        if [[ "${GPU_REBOOT_REQUIRED:-false}" != "true" ]]; then
+            install_cuda_toolkit || warn "CUDA install failed"
+        fi
     fi
 fi
 
@@ -171,6 +192,21 @@ detect_all "$CUSTOM_CUDA_PATH"
 
 if [[ "$CC_CAPABLE" == "true" ]]; then
     install_nvattest || true
+fi
+
+if [[ "$REQUIRE_GPU" == "true" ]]; then
+    if [[ "$GPU_AVAILABLE" != "true" ]]; then
+        err "GPU detection failed but GPU is required for this run."
+        err "If you just installed drivers, reboot first: sudo reboot"
+        err "Then rerun: ./scripts/pipeline/run_e2e.sh --preset <model> --gpu --dry-run"
+        exit 1
+    fi
+    if [[ "$CUDA_AVAILABLE" != "true" ]]; then
+        err "CUDA toolkit not detected but GPU mode is required."
+        err "Install CUDA toolkit, then rerun setup (or pass --cuda-path)."
+        err "Guide: https://developer.nvidia.com/cuda-downloads"
+        exit 1
+    fi
 fi
 
 save_gpu_config

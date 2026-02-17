@@ -18,6 +18,7 @@
 
 [[ -n "${_OBELYSK_GPU_DETECT_LOADED:-}" ]] && return 0
 _OBELYSK_GPU_DETECT_LOADED=1
+GPU_REBOOT_REQUIRED=false
 
 # ─── Distro Detection ────────────────────────────────────────────────
 
@@ -33,9 +34,67 @@ _detect_distro() {
     fi
 }
 
+_ensure_cuda_apt_repo() {
+    if ! command -v apt-get &>/dev/null; then
+        return 0
+    fi
+
+    if apt-cache show cuda-toolkit-12-8 &>/dev/null || apt-cache show cuda-toolkit &>/dev/null; then
+        debug "CUDA apt package already available"
+        return 0
+    fi
+
+    local id version_id repo_base
+    id="$(_detect_distro)"
+    version_id=""
+    if [[ -f /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        version_id="${VERSION_ID:-}"
+    fi
+
+    case "$id" in
+        ubuntu)
+            repo_base="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${version_id//./}/x86_64"
+            ;;
+        debian)
+            repo_base="https://developer.download.nvidia.com/compute/cuda/repos/debian${version_id%%.*}/x86_64"
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+
+    if [[ -z "$version_id" ]] || [[ "$repo_base" =~ /ubuntu/x86_64$ ]] || [[ "$repo_base" =~ /debian/x86_64$ ]]; then
+        warn "Could not determine distro version for CUDA repo setup"
+        return 1
+    fi
+
+    if grep -Rqs "developer.download.nvidia.com/compute/cuda/repos" /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null; then
+        debug "CUDA apt repo already configured"
+        return 0
+    fi
+
+    log "Adding NVIDIA CUDA apt repository..."
+    if ! run_cmd wget -qO /tmp/cuda-keyring.deb "${repo_base}/cuda-keyring_1.1-1_all.deb"; then
+        warn "Failed to download cuda-keyring from ${repo_base}"
+        return 1
+    fi
+    if ! run_cmd sudo dpkg -i /tmp/cuda-keyring.deb; then
+        warn "Failed to install cuda-keyring"
+        return 1
+    fi
+    run_cmd rm -f /tmp/cuda-keyring.deb
+    run_cmd sudo apt-get update -qq
+    ok "NVIDIA CUDA apt repository configured"
+    return 0
+}
+
 # ─── NVIDIA Driver Installation ─────────────────────────────────────
 
 install_nvidia_driver() {
+    GPU_REBOOT_REQUIRED=false
+
     # Skip if driver is already installed and working
     if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
         ok "NVIDIA driver already installed ($(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1))"
@@ -81,6 +140,7 @@ install_nvidia_driver() {
     if command -v nvidia-smi &>/dev/null; then
         warn "nvidia-smi found but cannot query GPU. A reboot may be required."
         warn "  sudo reboot"
+        GPU_REBOOT_REQUIRED=true
     else
         err "NVIDIA driver installation failed."
         err "Try the NVIDIA .run installer: https://www.nvidia.com/drivers"
@@ -111,11 +171,7 @@ install_cuda_toolkit() {
 
     case "$distro" in
         ubuntu|debian)
-            # Add NVIDIA CUDA repository
-            local arch
-            arch=$(dpkg --print-architecture 2>/dev/null || echo "amd64")
-            local codename
-            codename=$(lsb_release -cs 2>/dev/null || echo "jammy")
+            _ensure_cuda_apt_repo || true
 
             # Install cuda-toolkit via nvidia repo
             if run_cmd sudo apt-get install -y -qq cuda-toolkit-12-8 2>&1 | tail -3; then
@@ -173,10 +229,35 @@ detect_gpu() {
         return 1
     fi
 
-    GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | xargs)
-    GPU_MEM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader 2>/dev/null | head -1 | xargs)
-    GPU_DRIVER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | xargs)
-    GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l | tr -d ' ')
+    local query_out first_line raw_name raw_mem raw_driver
+    if ! query_out="$(nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader 2>&1)"; then
+        warn "nvidia-smi failed to query GPUs: $(echo "$query_out" | head -1 | xargs)"
+        warn "This is usually a driver/library mismatch. Reboot and rerun setup."
+        GPU_AVAILABLE=false
+        GPU_NAME=""
+        GPU_MEM=""
+        GPU_DRIVER=""
+        GPU_COUNT=0
+        return 1
+    fi
+
+    if echo "$query_out" | grep -qiE "failed to initialize nvml|driver/library version mismatch|nvidia-smi has failed"; then
+        warn "nvidia-smi returned an NVML error: $(echo "$query_out" | head -1 | xargs)"
+        warn "Reboot required after driver update: sudo reboot"
+        GPU_AVAILABLE=false
+        GPU_NAME=""
+        GPU_MEM=""
+        GPU_DRIVER=""
+        GPU_COUNT=0
+        return 1
+    fi
+
+    first_line="$(echo "$query_out" | sed '/^[[:space:]]*$/d' | head -1 | xargs)"
+    IFS=',' read -r raw_name raw_mem raw_driver <<< "$first_line"
+    GPU_NAME="$(echo "${raw_name:-}" | xargs)"
+    GPU_MEM="$(echo "${raw_mem:-}" | xargs)"
+    GPU_DRIVER="$(echo "${raw_driver:-}" | xargs)"
+    GPU_COUNT="$(echo "$query_out" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')"
 
     if [[ -n "$GPU_NAME" ]]; then
         GPU_AVAILABLE=true
@@ -265,10 +346,21 @@ detect_compute_cap() {
         return 1
     fi
 
-    COMPUTE_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | xargs)
+    local compute_out
+    compute_out="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | xargs || true)"
+    if [[ -z "$compute_out" ]] || ! echo "$compute_out" | grep -Eq '^[0-9]+(\.[0-9]+)?$'; then
+        warn "Could not query compute capability (got: ${compute_out:-empty})"
+        COMPUTE_CAP=""
+        COMPUTE_MAJOR=0
+        return 1
+    fi
+    COMPUTE_CAP="$compute_out"
 
     if [[ -n "$COMPUTE_CAP" ]]; then
-        COMPUTE_MAJOR=$(echo "$COMPUTE_CAP" | cut -d. -f1)
+        COMPUTE_MAJOR="$(echo "$COMPUTE_CAP" | cut -d. -f1)"
+        if ! echo "$COMPUTE_MAJOR" | grep -Eq '^[0-9]+$'; then
+            COMPUTE_MAJOR=0
+        fi
         debug "Compute capability: ${COMPUTE_CAP} (major: ${COMPUTE_MAJOR})"
         return 0
     fi
@@ -360,7 +452,11 @@ detect_cc_mode() {
     CC_MODE_STR="N/A"
 
     # CC requires Hopper+ (compute >= 9.0)
-    if (( COMPUTE_MAJOR < 9 )); then
+    local compute_major="${COMPUTE_MAJOR:-0}"
+    if ! echo "$compute_major" | grep -Eq '^[0-9]+$'; then
+        compute_major=0
+    fi
+    if (( compute_major < 9 )); then
         debug "CC not supported: compute ${COMPUTE_CAP} < 9.0 (Hopper)"
         CC_MODE_STR="Not supported (compute ${COMPUTE_CAP})"
         return 0
@@ -491,8 +587,13 @@ detect_all() {
     detect_gpu || true
     detect_cuda "$cuda_path" || true
     if [[ "$GPU_AVAILABLE" == "true" ]]; then
-        detect_compute_cap || true
-        detect_cc_mode || true
+        if detect_compute_cap; then
+            detect_cc_mode || true
+        else
+            CC_CAPABLE=false
+            CC_ACTIVE=false
+            CC_MODE_STR="Unknown (compute capability unavailable)"
+        fi
         get_gpu_preset
     fi
     if [[ "$CUDA_AVAILABLE" == "true" ]]; then
