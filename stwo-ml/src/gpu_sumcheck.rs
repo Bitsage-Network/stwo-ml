@@ -1502,6 +1502,44 @@ impl GpuSumcheckExecutor {
         })
     }
 
+    /// Start a GPU-resident MLE folding session from raw QM31 AoS u32 words.
+    ///
+    /// Input layout: `[a0,b0,c0,d0, a1,b1,c1,d1, ...]`.
+    pub fn start_mle_fold_session_u32(
+        &self,
+        mle_u32: &[u32],
+    ) -> Result<GpuMleFoldSession, CudaFftError> {
+        if mle_u32.is_empty() || (mle_u32.len() % 4 != 0) {
+            return Err(CudaFftError::InvalidSize(format!(
+                "start_mle_fold_session_u32 requires non-empty len % 4 == 0, got {}",
+                mle_u32.len()
+            )));
+        }
+        let n_points = mle_u32.len() / 4;
+        if !n_points.is_power_of_two() {
+            return Err(CudaFftError::InvalidSize(format!(
+                "start_mle_fold_session_u32 requires power-of-two points, got {}",
+                n_points
+            )));
+        }
+        let d_current = self
+            .device
+            .htod_sync_copy(mle_u32)
+            .map_err(|e| CudaFftError::MemoryAllocation(format!("mle session upload: {:?}", e)))?;
+        Ok(GpuMleFoldSession {
+            d_current,
+            n_points,
+        })
+    }
+
+    /// Return the current device buffer and point count for a fold session.
+    pub fn mle_fold_session_current_device<'a>(
+        &self,
+        session: &'a GpuMleFoldSession,
+    ) -> (&'a CudaSlice<u32>, usize) {
+        (&session.d_current, session.n_points)
+    }
+
     /// Fold one round on GPU and download the folded vector to CPU.
     ///
     /// Returns the new folded MLE evaluations (length halved).
@@ -1531,6 +1569,59 @@ impl GpuSumcheckExecutor {
             .map(|c| u32s_to_secure_field(&[c[0], c[1], c[2], c[3]]))
             .collect();
         Ok(folded)
+    }
+
+    /// Fold one round on GPU and keep the folded layer resident on device.
+    pub fn mle_fold_session_step_in_place(
+        &self,
+        session: &mut GpuMleFoldSession,
+        challenge: SecureField,
+    ) -> Result<(), CudaFftError> {
+        if session.n_points < 2 {
+            return Err(CudaFftError::InvalidSize(
+                "mle_fold_session_step_in_place requires at least 2 points".into(),
+            ));
+        }
+
+        let alpha = secure_field_to_u32s(challenge);
+        let d_next = self.mle_fold(&session.d_current, session.n_points, &alpha)?;
+        session.n_points /= 2;
+        session.d_current = d_next;
+        Ok(())
+    }
+
+    /// Fold one round on GPU and download folded QM31 AoS u32 words.
+    pub fn mle_fold_session_step_u32(
+        &self,
+        session: &mut GpuMleFoldSession,
+        challenge: SecureField,
+    ) -> Result<Vec<u32>, CudaFftError> {
+        self.mle_fold_session_step_in_place(session, challenge)?;
+        let mut folded_u32 = vec![0u32; session.n_points * 4];
+        self.device
+            .dtoh_sync_copy_into(&session.d_current, &mut folded_u32)
+            .map_err(|e| CudaFftError::MemoryTransfer(format!("mle session download: {:?}", e)))?;
+        Ok(folded_u32)
+    }
+
+    /// Read one QM31 value (4 u32 words) at index `idx` from the current session layer.
+    pub fn mle_fold_session_read_qm31_at(
+        &self,
+        session: &GpuMleFoldSession,
+        idx: usize,
+    ) -> Result<[u32; 4], CudaFftError> {
+        if idx >= session.n_points {
+            return Err(CudaFftError::InvalidSize(format!(
+                "mle_fold_session_read_qm31_at index {} out of bounds {}",
+                idx, session.n_points
+            )));
+        }
+        let base = idx * 4;
+        let mut out = [0u32; 4];
+        self.device
+            .dtoh_sync_copy_into(&session.d_current.slice(base..base + 4), &mut out)
+            .map_err(|e| CudaFftError::MemoryTransfer(format!("mle session read: {:?}", e)))?;
+        Ok(out)
     }
 
     /// Current number of points in the session.

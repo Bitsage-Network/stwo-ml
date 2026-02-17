@@ -354,9 +354,25 @@ fn build_gpu_opening_tree_from_qm31_u32_device_with_ctx(
         return Err("cannot build gpu opening tree for single-point input".to_string());
     }
 
+    // Pack QM31 AoS words into felt252 limbs.
+    // NOTE: this uses a host-side conversion step when a dedicated CUDA pack
+    // kernel is unavailable in the linked stwo backend.
+    let mut qm31_words = vec![0u32; n_points * 4];
+    executor
+        .device
+        .dtoh_sync_copy_into(d_qm31_aos, &mut qm31_words)
+        .map_err(|e| format!("D2H qm31 words: {:?}", e))?;
+    let mut leaf_limbs = vec![0u64; n_points * 4];
+    leaf_limbs
+        .par_chunks_mut(4)
+        .zip(qm31_words.par_chunks_exact(4))
+        .for_each(|(dst, src)| {
+            dst.copy_from_slice(&qm31_u32_to_u64_limbs_direct(src));
+        });
     let d_prev_leaf = executor
-        .execute_qm31_aos_to_felt252_gpu(d_qm31_aos, n_points)
-        .map_err(|e| format!("qm31->felt252 gpu packing: {e}"))?;
+        .device
+        .htod_sync_copy(&leaf_limbs)
+        .map_err(|e| format!("H2D packed felt252 limbs: {:?}", e))?;
 
     let tree = executor
         .execute_poseidon252_merkle_full_tree_gpu_layers(
