@@ -123,7 +123,7 @@ fi
 if [[ "$SKIP_BUILD" == "false" ]] && [[ -d "${LIBS_DIR}/stwo-ml" ]]; then
     FEATURES="cli,audit"
     log "Rebuilding prove-model (features: ${FEATURES})..."
-    if (cd "${LIBS_DIR}/stwo-ml" && cargo build --release --bin prove-model --features "${FEATURES}" 2>&1 | tail -3); then
+    if (export PATH="$HOME/.cargo/bin:$PATH"; cd "${LIBS_DIR}/stwo-ml" && cargo build --release --bin prove-model --features "${FEATURES}" 2>&1 | tail -3); then
         PROVE_BIN=$(find_binary "prove-model" "$LIBS_DIR" 2>/dev/null || echo "$PROVE_BIN")
         ok "prove-model rebuilt (features: ${FEATURES})"
     else

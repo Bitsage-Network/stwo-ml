@@ -18,6 +18,9 @@
 [[ -n "${_OBELYSK_COMMON_LOADED:-}" ]] && return 0
 _OBELYSK_COMMON_LOADED=1
 
+# Ensure cargo/rustup are in PATH (non-login shells may miss this)
+[[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env" 2>/dev/null || true
+
 # ─── Colors ───────────────────────────────────────────────────────────
 
 RED='\033[0;31m'

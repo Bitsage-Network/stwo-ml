@@ -156,7 +156,7 @@ if [[ "$SKIP_BUILD" == "false" ]] && [[ -d "${LIBS_DIR}/stwo-ml" ]]; then
         FEATURES="cli,cuda-runtime"
     fi
     log "Rebuilding prove-model (features: ${FEATURES})..."
-    (cd "${LIBS_DIR}/stwo-ml" && cargo build --release --bin prove-model --features "${FEATURES}" 2>&1 | tail -3) || true
+    (export PATH="$HOME/.cargo/bin:$PATH"; cd "${LIBS_DIR}/stwo-ml" && cargo build --release --bin prove-model --features "${FEATURES}" 2>&1 | tail -3) || true
 fi
 
 # ─── Display Config ─────────────────────────────────────────────────
