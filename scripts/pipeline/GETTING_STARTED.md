@@ -66,6 +66,23 @@ That's it. The rest of this guide explains what each step does and how to run th
 ```
 
 When it finishes, your GPU is detected and ready. The script saves its config to `~/.obelysk/gpu_config.env`.
+It also writes CUDA shell env to `~/.obelysk/cuda_env.sh`.
+
+If setup stops with `Driver/library version mismatch`, that means the driver was updated and a reboot is required:
+
+```bash
+sudo reboot
+# after reconnect
+cd ~/stwo-ml/scripts/pipeline
+./00_setup_gpu.sh --skip-deps
+```
+
+To use `nvcc` in your current shell after setup:
+
+```bash
+source ~/.obelysk/cuda_env.sh
+nvcc --version
+```
 
 **Common flags:**
 | Flag | What it does |

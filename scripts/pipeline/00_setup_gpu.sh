@@ -399,6 +399,11 @@ save_state "setup_state.env" \
 
 # ─── Summary ─────────────────────────────────────────────────────────
 
+if [[ -f "${OBELYSK_DIR}/cuda_env.sh" ]]; then
+    log "CUDA env saved: ${OBELYSK_DIR}/cuda_env.sh"
+    log "For interactive shells, run: source ${OBELYSK_DIR}/cuda_env.sh"
+fi
+
 echo -e "${GREEN}${BOLD}"
 echo "  ╔══════════════════════════════════════════════════════╗"
 echo "  ║  SETUP COMPLETE                                      ║"
