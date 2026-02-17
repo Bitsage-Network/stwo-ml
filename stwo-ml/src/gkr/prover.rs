@@ -405,7 +405,6 @@ pub fn prove_gkr_gpu(
     // Walk layers from output → input
     for layer_idx in (0..d).rev() {
         let layer = &circuit.layers[layer_idx];
-        let _t_layer = std::time::Instant::now();
 
         let (proof, next_claim) = match &layer.layer_type {
             LayerType::MatMul { m, k, n, weight_node_id } => {
@@ -538,9 +537,6 @@ pub fn prove_gkr_gpu(
 
             LayerType::Input => break,
         };
-
-        eprintln!("  [GKR-GPU] layer {} ({:?}) in {:.2}s",
-            layer_idx, std::mem::discriminant(&layer.layer_type), _t_layer.elapsed().as_secs_f64());
 
         layer_proofs.push(proof);
         current_claim = next_claim;
