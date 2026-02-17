@@ -332,13 +332,34 @@ else
     fi
 
     log "Building llama.cpp with CUDA..."
-    CMAKE_ARGS=(-B "${LLAMA_DIR}/build" -DGGML_CUDA=OFF)
+    log "First build can take 10-20 minutes. Building only llama-cli for speed."
+    CMAKE_ARGS=(
+        -B "${LLAMA_DIR}/build"
+        -DGGML_CUDA=OFF
+        -DLLAMA_BUILD_TESTS=OFF
+        -DLLAMA_BUILD_SERVER=OFF
+        -DLLAMA_BUILD_EXAMPLES=ON
+    )
     if [[ "$CUDA_AVAILABLE" == "true" ]] && [[ -n "$CUDA_PATH" ]]; then
-        CMAKE_ARGS=(-B "${LLAMA_DIR}/build" -DGGML_CUDA=ON -DCMAKE_CUDA_COMPILER="${CUDA_PATH}/bin/nvcc")
+        CMAKE_ARGS=(
+            -B "${LLAMA_DIR}/build"
+            -DGGML_CUDA=ON
+            -DCMAKE_CUDA_COMPILER="${CUDA_PATH}/bin/nvcc"
+            -DLLAMA_BUILD_TESTS=OFF
+            -DLLAMA_BUILD_SERVER=OFF
+            -DLLAMA_BUILD_EXAMPLES=ON
+        )
     fi
 
-    if (cd "$LLAMA_DIR" && cmake "${CMAKE_ARGS[@]}" 2>&1 | tail -3 && \
-        cmake --build build --config Release -j"$(nproc 2>/dev/null || echo 4)" 2>&1 | tail -5); then
+    if (cd "$LLAMA_DIR" && cmake "${CMAKE_ARGS[@]}"); then
+        if (cd "$LLAMA_DIR" && \
+            cmake --build build --config Release --target llama-cli -j"$(nproc 2>/dev/null || echo 4)"); then
+            :
+        else
+            warn "llama-cli target build failed, retrying full build..."
+            (cd "$LLAMA_DIR" && cmake --build build --config Release -j"$(nproc 2>/dev/null || echo 4)")
+        fi
+
         if [[ -f "$LLAMA_BIN" ]]; then
             ok "llama.cpp built: ${LLAMA_BIN}"
         else
