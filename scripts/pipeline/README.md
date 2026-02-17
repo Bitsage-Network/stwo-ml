@@ -152,11 +152,13 @@ STARKNET_PRIVATE_KEY=0x... ./run_e2e.sh --preset qwen3-14b --gpu --submit
 | `STWO_GPU_MLE_FOLD_REQUIRE` | No | Off | Fail if MLE fold falls back to CPU |
 | `STWO_GPU_MLE_OPENING_TREE_REQUIRE` | No | Off | Fail if GPU-resident opening-tree path fails |
 | `STWO_GPU_MLE_OPENING_TIMING` | No | Off | Print per-opening tree/query timing breakdown |
-| `STWO_GKR_AGGREGATE_WEIGHT_BINDING` | No | Off | Experimental batched RLC weight-binding mode (serializable artifact, not submit-ready for Starknet `verify_model_gkr`) |
+| `STWO_GKR_AGGREGATE_WEIGHT_BINDING` | No | `on` in `03_prove.sh` fast mode, auto-`off` for `run_e2e.sh --submit` | Batched RLC weight-binding mode (serializable artifact, not submit-ready for Starknet `verify_model_gkr`) |
 
 Notes:
 - The opening path now packs QM31 leaves to felt252 on GPU (no per-round CPU repack/upload), which reduces weight-opening overhead on large models.
 - Query extraction now replays folds on GPU and downloads only queried leaf pairs (instead of full folded layers), reducing opening-phase host transfer pressure.
+- `03_prove.sh` defaults to aggregated RLC weight binding for faster off-chain proving.
+- `run_e2e.sh --submit` auto-adds `--starknet-ready`, which forces sequential openings.
 - In aggregated weight-binding mode, `ml_gkr` output still serializes full proof artifacts with `submission_ready=false`, `weight_opening_mode`, and `weight_claim_calldata`.
 
 ## Model Presets

@@ -272,17 +272,25 @@ export STWO_GPU_POLY_HARDEN=1
 ./03_prove.sh --model-name qwen3-14b --gpu
 ```
 
-**Experimental (off-chain only) weight-binding aggregation:**
-```bash
-export STWO_GKR_AGGREGATE_WEIGHT_BINDING=1
-./03_prove.sh --model-name qwen3-14b --gpu
-```
-This replaces per-weight Merkle openings with a batched RLC weight-binding check.
-Current Starknet soundness gates reject this mode for on-chain submission.
-`ml_gkr` output remains serializable and includes:
+**Weight-binding mode defaults (updated):**
+- `03_prove.sh` now defaults to **aggregated RLC weight binding** for faster off-chain proving.
+- This replaces per-weight Merkle openings with a batched RLC weight-binding check.
+- Current Starknet soundness gates reject this mode for on-chain submission.
+- `ml_gkr` output remains serializable and includes:
 - `submission_ready: false`
 - `weight_opening_mode: "BatchedRlcDirectEvalV1"`
 - `weight_claim_calldata` for off-chain verification/auditing.
+
+To force submit-ready Starknet calldata (sequential openings), run:
+```bash
+./03_prove.sh --model-name qwen3-14b --gpu --starknet-ready
+```
+
+To override explicitly with env:
+```bash
+export STWO_GKR_AGGREGATE_WEIGHT_BINDING=off   # Starknet-ready
+export STWO_GKR_AGGREGATE_WEIGHT_BINDING=on    # Fast off-chain
+```
 
 ---
 
@@ -306,7 +314,7 @@ STARKNET_PRIVATE_KEY=0x_your_key ./04_verify_onchain.sh --submit --no-paymaster
 ```
 
 If your proof artifact has `submission_ready: false` (for example with
-`STWO_GKR_AGGREGATE_WEIGHT_BINDING=1`), `04_verify_onchain.sh` will print the
+aggregated RLC weight binding enabled), `04_verify_onchain.sh` will print the
 exact soundness-gate reason. In dry-run it exits cleanly; in submit mode it
 fails fast before any transaction is sent.
 

@@ -99,6 +99,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --gpu / --no-gpu     Enable/disable GPU (default: on)"
             echo "  --multi-gpu          Use all GPUs"
             echo "  --gpu-only           Fail if any critical proving path falls back to CPU"
+            echo "                       (submit path auto-forces --starknet-ready in step 6)"
             echo "  --hf-token TOKEN     HuggingFace API token"
             echo "  --max-fee ETH        Max TX fee (default: 0.05)"
             echo "  --model-id ID        On-chain model ID (default: 0x1)"
@@ -306,6 +307,7 @@ if (( START_IDX <= 5 )); then
     [[ "$DO_GPU" == "true" ]] && _PROVE_ARGS+=("--gpu")
     [[ "$DO_MULTI_GPU" == "true" ]] && _PROVE_ARGS+=("--multi-gpu")
     [[ "$DO_GPU_ONLY" == "true" ]] && _PROVE_ARGS+=("--gpu-only")
+    [[ "$DO_SUBMIT" == "true" ]] && _PROVE_ARGS+=("--starknet-ready")
 
     run_step "Proof Generation" "$CURRENT" "$TOTAL_STEPS" \
         bash "${SCRIPT_DIR}/03_prove.sh" "${_PROVE_ARGS[@]}" || exit 1

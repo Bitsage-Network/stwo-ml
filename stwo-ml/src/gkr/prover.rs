@@ -276,6 +276,12 @@ pub fn prove_gkr(
         current_claim = next_claim;
     }
 
+    let aggregate_weight_binding = gkr_aggregate_weight_binding_enabled();
+    // In aggregated mode, include deferred MatMul weight claims in the same
+    // transcript RLC binding and skip per-deferred Merkle openings.
+    let mut deferred_weight_claims_data: Vec<(usize, Vec<SecureField>, SecureField)> =
+        Vec::with_capacity(deferred_info.len());
+
     // Generate deferred proofs for skip branches of DAG Add layers BEFORE
     // weight openings. This ensures the Cairo verifier can process deferred
     // proofs inside verify_gkr_model (before the contract does weight openings).
@@ -321,23 +327,39 @@ pub fn prove_gkr(
                     eval_point: weight_eval_point.clone(),
                     expected_value: reduction.final_b_eval,
                 };
-                #[cfg(feature = "cuda-runtime")]
-                let (deferred_weight_commitment, deferred_weight_opening) = {
-                    let b_mle_u32 = matrix_to_mle_col_major_u32_padded(b_matrix);
-                    crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32(
-                        &b_mle_u32,
-                        &weight_eval_point,
-                        channel,
+                let (deferred_weight_commitment, deferred_weight_opening) = if aggregate_weight_binding {
+                    deferred_weight_claims_data.push((
+                        *weight_node_id,
+                        weight_eval_point,
+                        reduction.final_b_eval,
+                    ));
+                    (
+                        starknet_ff::FieldElement::ZERO,
+                        crate::crypto::mle_opening::MleOpeningProof {
+                            intermediate_roots: Vec::new(),
+                            queries: Vec::new(),
+                            final_value: SecureField::zero(),
+                        },
                     )
-                };
-                #[cfg(not(feature = "cuda-runtime"))]
-                let (deferred_weight_commitment, deferred_weight_opening) = {
-                    let b_mle = matrix_to_mle_col_major_padded(b_matrix);
-                    crate::crypto::mle_opening::prove_mle_opening_with_commitment(
-                        &b_mle,
-                        &weight_eval_point,
-                        channel,
-                    )
+                } else {
+                    #[cfg(feature = "cuda-runtime")]
+                    {
+                        let b_mle_u32 = matrix_to_mle_col_major_u32_padded(b_matrix);
+                        crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32(
+                            &b_mle_u32,
+                            &deferred_weight_claim.eval_point,
+                            channel,
+                        )
+                    }
+                    #[cfg(not(feature = "cuda-runtime"))]
+                    {
+                        let b_mle = matrix_to_mle_col_major_padded(b_matrix);
+                        crate::crypto::mle_opening::prove_mle_opening_with_commitment(
+                            &b_mle,
+                            &deferred_weight_claim.eval_point,
+                            channel,
+                        )
+                    }
                 };
 
                 deferred_proofs.push(super::types::DeferredProof {
@@ -371,13 +393,18 @@ pub fn prove_gkr(
     let mut weight_openings = Vec::with_capacity(weight_data.len());
     let mut weight_claims = Vec::with_capacity(weight_data.len());
     let mut weight_opening_transcript_mode = WeightOpeningTranscriptMode::Sequential;
-    let aggregate_weight_binding = gkr_aggregate_weight_binding_enabled() && !weight_data.is_empty();
+    let aggregate_weight_binding =
+        aggregate_weight_binding && (!weight_data.is_empty() || !deferred_weight_claims_data.is_empty());
 
     if aggregate_weight_binding {
         weight_opening_transcript_mode = WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1;
         let rho = channel.draw_qm31();
         let mut rho_pow = SecureField::one();
         let mut combined_expected = SecureField::zero();
+        for (_, _, expected_value) in deferred_weight_claims_data.iter() {
+            combined_expected = combined_expected + rho_pow * *expected_value;
+            rho_pow = rho_pow * rho;
+        }
         for (weight_node_id, eval_point, expected_value) in weight_data.iter() {
             weight_claims.push(super::types::WeightClaim {
                 weight_node_id: *weight_node_id,
@@ -390,8 +417,8 @@ pub fn prove_gkr(
         mix_secure_field(channel, combined_expected);
         eprintln!(
             "  [GKR] aggregated weight binding enabled (RLC): {} claims, {} openings eliminated",
-            weight_data.len(),
-            weight_data.len()
+            weight_data.len() + deferred_weight_claims_data.len(),
+            weight_data.len() + deferred_weight_claims_data.len()
         );
     } else {
         for (weight_node_id, eval_point, expected_value) in weight_data {
@@ -709,6 +736,12 @@ pub fn prove_gkr_gpu(
         weight_data.len(),
     );
 
+    let aggregate_weight_binding = gkr_aggregate_weight_binding_enabled();
+    // In aggregated mode, include deferred MatMul weight claims in the same
+    // transcript RLC binding and skip per-deferred Merkle openings.
+    let mut deferred_weight_claims_data: Vec<(usize, Vec<SecureField>, SecureField)> =
+        Vec::with_capacity(deferred_info.len());
+
     // Generate deferred proofs for skip branches of DAG Add layers BEFORE weight
     // openings. Fiat-Shamir order: walk → deferred proofs → weight openings.
     let mut deferred_proofs = Vec::with_capacity(deferred_info.len());
@@ -750,23 +783,39 @@ pub fn prove_gkr_gpu(
                     eval_point: weight_eval_point.clone(),
                     expected_value: reduction.final_b_eval,
                 };
-                #[cfg(feature = "cuda-runtime")]
-                let (deferred_weight_commitment, deferred_opening) = {
-                    let b_mle_u32 = matrix_to_mle_col_major_u32_padded(b_matrix);
-                    crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32(
-                        &b_mle_u32,
-                        &weight_eval_point,
-                        channel,
+                let (deferred_weight_commitment, deferred_opening) = if aggregate_weight_binding {
+                    deferred_weight_claims_data.push((
+                        *weight_node_id,
+                        weight_eval_point,
+                        reduction.final_b_eval,
+                    ));
+                    (
+                        starknet_ff::FieldElement::ZERO,
+                        crate::crypto::mle_opening::MleOpeningProof {
+                            intermediate_roots: Vec::new(),
+                            queries: Vec::new(),
+                            final_value: SecureField::zero(),
+                        },
                     )
-                };
-                #[cfg(not(feature = "cuda-runtime"))]
-                let (deferred_weight_commitment, deferred_opening) = {
-                    let b_mle = matrix_to_mle_col_major_padded(b_matrix);
-                    crate::crypto::mle_opening::prove_mle_opening_with_commitment(
-                        &b_mle,
-                        &weight_eval_point,
-                        channel,
-                    )
+                } else {
+                    #[cfg(feature = "cuda-runtime")]
+                    {
+                        let b_mle_u32 = matrix_to_mle_col_major_u32_padded(b_matrix);
+                        crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32(
+                            &b_mle_u32,
+                            &deferred_weight_claim.eval_point,
+                            channel,
+                        )
+                    }
+                    #[cfg(not(feature = "cuda-runtime"))]
+                    {
+                        let b_mle = matrix_to_mle_col_major_padded(b_matrix);
+                        crate::crypto::mle_opening::prove_mle_opening_with_commitment(
+                            &b_mle,
+                            &deferred_weight_claim.eval_point,
+                            channel,
+                        )
+                    }
                 };
 
                 deferred_proofs.push(super::types::DeferredProof {
@@ -819,13 +868,18 @@ pub fn prove_gkr_gpu(
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(15);
-    let aggregate_weight_binding = gkr_aggregate_weight_binding_enabled() && total_openings > 0;
+    let aggregate_weight_binding =
+        aggregate_weight_binding && (total_openings > 0 || !deferred_weight_claims_data.is_empty());
 
     if aggregate_weight_binding {
         weight_opening_transcript_mode = WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1;
         let rho = channel.draw_qm31();
         let mut rho_pow = SecureField::one();
         let mut combined_expected = SecureField::zero();
+        for (_, _, expected_value) in deferred_weight_claims_data.iter() {
+            combined_expected = combined_expected + rho_pow * *expected_value;
+            rho_pow = rho_pow * rho;
+        }
         for (weight_node_id, eval_point, expected_value) in weight_data.iter() {
             weight_claims.push(super::types::WeightClaim {
                 weight_node_id: *weight_node_id,
@@ -838,7 +892,8 @@ pub fn prove_gkr_gpu(
         mix_secure_field(channel, combined_expected);
         eprintln!(
             "  [GKR] aggregated weight binding enabled (RLC): {} claims, {} openings eliminated",
-            total_openings, total_openings
+            total_openings + deferred_weight_claims_data.len(),
+            total_openings + deferred_weight_claims_data.len()
         );
     } else {
         #[cfg(feature = "cuda-runtime")]

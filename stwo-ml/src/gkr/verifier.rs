@@ -337,6 +337,9 @@ fn verify_gkr_inner(
         });
     }
 
+    let batched_rlc_mode =
+        proof.weight_opening_transcript_mode == WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1;
+
     // Verify deferred proofs for skip branches of DAG Add layers.
     // Fiat-Shamir order: walk → deferred proofs → weight openings.
     // Each deferred proof contains a matmul sumcheck + weight opening that
@@ -383,26 +386,51 @@ fn verify_gkr_inner(
             }
         }
 
-        // Verify deferred weight opening
-        if deferred.weight_opening.final_value != deferred.weight_claim.expected_value {
-            return Err(GKRError::VerificationError {
-                layer_idx: 0,
-                reason: format!("deferred proof {} weight opening final_value mismatch", i,),
-            });
-        }
-        if !crate::crypto::mle_opening::verify_mle_opening(
-            deferred.weight_commitment,
-            &deferred.weight_opening,
-            &deferred.weight_claim.eval_point,
-            channel,
-        ) {
-            return Err(GKRError::VerificationError {
-                layer_idx: 0,
-                reason: format!(
-                    "deferred proof {} weight MLE opening failed verification",
-                    i,
-                ),
-            });
+        if batched_rlc_mode {
+            // In batched RLC mode, deferred weight binding is checked in the
+            // aggregated verifier pass (no per-deferred Merkle opening).
+            if deferred.weight_commitment != starknet_ff::FieldElement::ZERO {
+                return Err(GKRError::VerificationError {
+                    layer_idx: 0,
+                    reason: format!(
+                        "deferred proof {} expects zero weight_commitment in batched RLC mode",
+                        i
+                    ),
+                });
+            }
+            if !deferred.weight_opening.intermediate_roots.is_empty()
+                || !deferred.weight_opening.queries.is_empty()
+            {
+                return Err(GKRError::VerificationError {
+                    layer_idx: 0,
+                    reason: format!(
+                        "deferred proof {} expects empty weight_opening in batched RLC mode",
+                        i
+                    ),
+                });
+            }
+        } else {
+            // Verify deferred weight opening
+            if deferred.weight_opening.final_value != deferred.weight_claim.expected_value {
+                return Err(GKRError::VerificationError {
+                    layer_idx: 0,
+                    reason: format!("deferred proof {} weight opening final_value mismatch", i,),
+                });
+            }
+            if !crate::crypto::mle_opening::verify_mle_opening(
+                deferred.weight_commitment,
+                &deferred.weight_opening,
+                &deferred.weight_claim.eval_point,
+                channel,
+            ) {
+                return Err(GKRError::VerificationError {
+                    layer_idx: 0,
+                    reason: format!(
+                        "deferred proof {} weight MLE opening failed verification",
+                        i,
+                    ),
+                });
+            }
         }
     }
 
@@ -581,6 +609,26 @@ fn verify_gkr_inner(
             let mut rho_pow = SecureField::one();
             let mut combined_expected = SecureField::zero();
             let mut combined_actual = SecureField::zero();
+
+            for (i, deferred) in proof.deferred_proofs.iter().enumerate() {
+                let claim = &deferred.weight_claim;
+                let weight = weights
+                    .get_weight(claim.weight_node_id)
+                    .ok_or(GKRError::MissingWeight {
+                        node_id: claim.weight_node_id,
+                    })?;
+                let actual = evaluate_weight_claim_against_matrix(weight, &claim.eval_point)
+                    .map_err(|reason| GKRError::VerificationError {
+                        layer_idx: 0,
+                        reason: format!(
+                            "batched RLC deferred weight claim {} evaluation failed: {}",
+                            i, reason
+                        ),
+                    })?;
+                combined_expected = combined_expected + rho_pow * claim.expected_value;
+                combined_actual = combined_actual + rho_pow * actual;
+                rho_pow = rho_pow * rho;
+            }
 
             for (i, claim) in proof.weight_claims.iter().enumerate() {
                 let weight =
@@ -2612,6 +2660,82 @@ mod tests {
             result.is_err(),
             "tampered batched RLC claim must fail weight-binding verification"
         );
+    }
+
+    #[test]
+    fn test_batched_rlc_direct_eval_with_deferred_claims() {
+        // Residual DAG: x -> MatMul(0) -> MatMul(1) -> Add(with skip from MatMul(0))
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(4);
+        let residual = builder.fork();
+        builder.linear(4);
+        builder.add_from(residual);
+        let graph = builder.build();
+        let circuit = LayeredCircuit::from_graph(&graph).unwrap();
+
+        let mut x = M31Matrix::new(1, 4);
+        for i in 0..4 {
+            x.data[i] = M31::from((i + 1) as u32);
+        }
+        let mut w0 = M31Matrix::new(4, 4);
+        let mut w1 = M31Matrix::new(4, 4);
+        for i in 0..16 {
+            w0.data[i] = M31::from(((i % 7) + 1) as u32);
+            w1.data[i] = M31::from((((i * 3) % 11) + 1) as u32);
+        }
+
+        let y0 = matmul_forward(&x, &w0);
+        let y1 = matmul_forward(&y0, &w1);
+        let mut out = M31Matrix::new(1, 4);
+        for j in 0..4 {
+            out.set(0, j, y0.get(0, j) + y1.get(0, j));
+        }
+
+        let mut weights = GraphWeights::new();
+        weights.add_weight(0, w0);
+        weights.add_weight(1, w1);
+
+        let mut node_outputs = std::collections::HashMap::new();
+        node_outputs.insert(0usize, y0.clone());
+        node_outputs.insert(1usize, y1.clone());
+        node_outputs.insert(2usize, out.clone());
+
+        let execution = GraphExecution {
+            // Input to each node: MatMul(0)=x, MatMul(1)=y0, Add(2)=y1
+            intermediates: vec![(0, x.clone()), (1, y0.clone()), (2, y1.clone())],
+            node_outputs,
+            output: out.clone(),
+        };
+
+        let mut prover_channel = PoseidonChannel::new();
+        let mut proof = prove_gkr(&circuit, &execution, &weights, &mut prover_channel).unwrap();
+        assert!(
+            !proof.deferred_proofs.is_empty(),
+            "residual DAG should produce deferred proofs"
+        );
+
+        // Convert to batched RLC direct-eval mode and strip all per-weight openings.
+        proof.weight_opening_transcript_mode = WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1;
+        proof.weight_openings.clear();
+        proof.weight_commitments.clear();
+        for deferred in proof.deferred_proofs.iter_mut() {
+            deferred.weight_commitment = starknet_ff::FieldElement::ZERO;
+            deferred.weight_opening = crate::crypto::mle_opening::MleOpeningProof {
+                intermediate_roots: Vec::new(),
+                queries: Vec::new(),
+                final_value: SecureField::zero(),
+            };
+        }
+
+        let mut verifier_channel = PoseidonChannel::new();
+        verify_gkr_with_weights(
+            &circuit,
+            &proof,
+            &out,
+            &weights,
+            &mut verifier_channel,
+        )
+        .unwrap();
     }
 
     #[test]

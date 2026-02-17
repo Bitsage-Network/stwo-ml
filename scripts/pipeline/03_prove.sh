@@ -34,6 +34,7 @@ SKIP_COMMITMENT=false
 GKR_FLAG=false
 SALT=""
 SERVER_URL=""
+STARKNET_READY=false
 
 # ─── Parse Arguments ─────────────────────────────────────────────────
 
@@ -55,6 +56,7 @@ while [[ $# -gt 0 ]]; do
         --skip-build)       SKIP_BUILD=true; shift ;;
         --skip-commitment)  SKIP_COMMITMENT=true; shift ;;
         --gkr)              GKR_FLAG=true; shift ;;
+        --starknet-ready)   STARKNET_READY=true; shift ;;
         --salt)             SALT="$2"; shift 2 ;;
         --server)           SERVER_URL="$2"; shift 2 ;;
         -h|--help)
@@ -84,6 +86,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --skip-build         Skip building binaries"
             echo "  --skip-commitment    Skip weight commitment (faster, can't submit on-chain)"
             echo "  --gkr                Enable GKR for LogUp verification"
+            echo "  --starknet-ready     Force sequential weight openings for submit-ready Starknet calldata"
             echo "  --salt N             Fiat-Shamir channel salt"
             echo "  --server URL         Submit to remote prove-server instead of local binary"
             echo "  -h, --help           Show this help"
@@ -138,7 +141,25 @@ GPU_MLE_FOLD_REQUIRE="${STWO_GPU_MLE_FOLD_REQUIRE:-off}"
 GPU_MLE_OPENING_TREE="${STWO_GPU_MLE_OPENING_TREE:-on}"
 GPU_MLE_OPENING_TREE_REQUIRE="${STWO_GPU_MLE_OPENING_TREE_REQUIRE:-off}"
 GPU_MLE_OPENING_TIMING="${STWO_GPU_MLE_OPENING_TIMING:-off}"
-GKR_AGG_WEIGHT_BINDING="${STWO_GKR_AGGREGATE_WEIGHT_BINDING:-off}"
+
+# Default to fast aggregated weight binding for off-chain proving.
+# For submit-ready Starknet calldata, caller can pass --starknet-ready.
+GKR_AGG_WEIGHT_BINDING_DEFAULT="on"
+if [[ "$STARKNET_READY" == "true" ]]; then
+    GKR_AGG_WEIGHT_BINDING_DEFAULT="off"
+fi
+GKR_AGG_WEIGHT_BINDING="${STWO_GKR_AGGREGATE_WEIGHT_BINDING:-${GKR_AGG_WEIGHT_BINDING_DEFAULT}}"
+
+case "${GKR_AGG_WEIGHT_BINDING,,}" in
+    1|true|on|yes) GKR_AGG_WEIGHT_BINDING="on" ;;
+    *) GKR_AGG_WEIGHT_BINDING="off" ;;
+esac
+
+if [[ "$STARKNET_READY" == "true" ]] && [[ "${GKR_AGG_WEIGHT_BINDING}" == "on" ]]; then
+    warn "Overriding STWO_GKR_AGGREGATE_WEIGHT_BINDING=on -> off (--starknet-ready requested)"
+    GKR_AGG_WEIGHT_BINDING="off"
+fi
+export STWO_GKR_AGGREGATE_WEIGHT_BINDING="${GKR_AGG_WEIGHT_BINDING}"
 
 # Favor GPU fold for heavy weight-opening phases unless caller overrides.
 if [[ "$USE_GPU" == "true" ]] && [[ -z "${STWO_GPU_MLE_FOLD:-}" ]]; then
@@ -259,6 +280,7 @@ log "GPU:            ${USE_GPU} (multi: ${MULTI_GPU})"
 log "Output:         ${OUTPUT_DIR}"
 log "prove-model:    ${PROVE_BIN}"
 log "Threads:        RAYON=${RAYON_NUM_THREADS} OMP=${OMP_NUM_THREADS}"
+log "Starknet ready: ${STARKNET_READY}"
 log "GPU only mode:  ${GPU_ONLY}"
 log "GPU commit:     strict=${GPU_COMMIT_STRICT} harden=${GPU_COMMIT_HARDEN} parallel=${GPU_COMMIT_PARALLEL}"
 log "GPU poly path:  strict=${GPU_POLY_STRICT} harden=${GPU_POLY_HARDEN}"
