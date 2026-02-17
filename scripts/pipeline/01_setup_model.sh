@@ -184,7 +184,10 @@ if [[ -n "${MODEL_HF:-}" ]] && [[ "$SKIP_DOWNLOAD" == "false" ]]; then
     _REQUIRED_GB="${MODEL_SIZE_GB:-10}"
     if [[ "$_REQUIRED_GB" != "?" ]]; then
         _REQUIRED=$(( _REQUIRED_GB * 3 / 2 ))  # 1.5x for download + extraction
-        _AVAILABLE_GB=$(df -BG "${MODEL_DIR:-$HOME}" 2>/dev/null | awk 'NR==2{print $4}' | tr -d 'G')
+        # Use parent dir or $HOME if MODEL_DIR doesn't exist yet
+        _DF_TARGET="${MODEL_DIR:-$HOME}"
+        [[ -d "$_DF_TARGET" ]] || _DF_TARGET="$HOME"
+        _AVAILABLE_GB=$(df -BG "$_DF_TARGET" 2>/dev/null | awk 'NR==2{print $4}' | tr -d 'G' || echo "")
         if [[ -n "$_AVAILABLE_GB" ]] && (( _AVAILABLE_GB < _REQUIRED )); then
             err "Insufficient disk space: need ~${_REQUIRED}GB, only ${_AVAILABLE_GB}GB available."
             err "Free up space or use a larger disk."
