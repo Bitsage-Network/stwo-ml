@@ -185,6 +185,9 @@ elif [[ "$INSTALL_DRIVERS" == "auto" ]]; then
         if [[ "${GPU_REBOOT_REQUIRED:-false}" != "true" ]]; then
             install_cuda_toolkit || warn "CUDA install failed"
         fi
+    elif ! command -v nvcc &>/dev/null && [[ ! -f /usr/local/cuda/bin/nvcc ]]; then
+        log "CUDA toolkit not found — attempting install..."
+        install_cuda_toolkit || warn "CUDA install failed"
     fi
 fi
 
