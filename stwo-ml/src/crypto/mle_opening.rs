@@ -45,6 +45,17 @@ fn gpu_mle_fold_min_points() -> usize {
         .unwrap_or(1 << 20)
 }
 
+#[cfg(feature = "cuda-runtime")]
+#[inline(always)]
+fn securefield_to_felt_and_limbs(sf: SecureField) -> (FieldElement, [u64; 4]) {
+    let packed = (1u128 << 124)
+        | ((sf.0 .0 .0 as u128) << 93)
+        | ((sf.0 .1 .0 as u128) << 62)
+        | ((sf.1 .0 .0 as u128) << 31)
+        | (sf.1 .1 .0 as u128);
+    (FieldElement::from(packed), [packed as u64, (packed >> 64) as u64, 0, 0])
+}
+
 /// MLE opening proof matching Cairo's `MleOpeningProof`.
 #[derive(Debug, Clone)]
 pub struct MleOpeningProof {
@@ -80,6 +91,24 @@ pub struct MleQueryRoundData {
 ///
 /// Returns (root, tree).
 pub fn commit_mle(evals: &[SecureField]) -> (FieldElement, PoseidonMerkleTree) {
+    #[cfg(feature = "cuda-runtime")]
+    if evals.len() >= 256 {
+        // Prepack once so GPU Merkle can reuse limbs directly.
+        let mut leaves = vec![FieldElement::ZERO; evals.len()];
+        let mut leaf_limbs = vec![0u64; evals.len() * 4];
+        leaves
+            .par_iter_mut()
+            .zip(leaf_limbs.par_chunks_mut(4))
+            .zip(evals.par_iter())
+            .for_each(|((leaf, limbs), &sf)| {
+                let (felt, limb4) = securefield_to_felt_and_limbs(sf);
+                *leaf = felt;
+                limbs.copy_from_slice(&limb4);
+            });
+        let tree = PoseidonMerkleTree::build_parallel_prepacked(leaves, Some(leaf_limbs));
+        return (tree.root(), tree);
+    }
+
     let leaves: Vec<FieldElement> = if evals.len() >= 256 {
         evals.par_iter().map(|&sf| securefield_to_felt(sf)).collect()
     } else {

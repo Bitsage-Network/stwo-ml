@@ -58,7 +58,15 @@ pub fn unpack_m31s(felt: FieldElement, count: usize) -> Vec<M31> {
 
 /// Convert a SecureField (QM31) to a felt252 by packing its 4 M31 components.
 pub fn securefield_to_felt(sf: SecureField) -> FieldElement {
-    pack_m31s(&[sf.0 .0, sf.0 .1, sf.1 .0, sf.1 .1])
+    // Exact equivalent of `pack_m31s([a,b,c,d])` with sentinel prefix:
+    // (((((1 * 2^31 + a) * 2^31 + b) * 2^31 + c) * 2^31) + d)
+    let QM31(CM31(a, b), CM31(c, d)) = sf;
+    let packed = (1u128 << 124)
+        | ((a.0 as u128) << 93)
+        | ((b.0 as u128) << 62)
+        | ((c.0 as u128) << 31)
+        | (d.0 as u128);
+    FieldElement::from(packed)
 }
 
 /// Convert a felt252 back to a SecureField by unpacking 4 M31 components.
@@ -257,6 +265,22 @@ impl Default for PoseidonChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_securefield_to_felt_fast_path_matches_pack() {
+        let samples = [
+            QM31(CM31(M31::from(0), M31::from(0)), CM31(M31::from(0), M31::from(0))),
+            QM31(CM31(M31::from(1), M31::from(2)), CM31(M31::from(3), M31::from(4))),
+            QM31(
+                CM31(M31::from((1u32 << 31) - 2), M31::from(17)),
+                CM31(M31::from(1234567), M31::from((1u32 << 31) - 3)),
+            ),
+        ];
+        for sf in samples {
+            let expected = pack_m31s(&[sf.0 .0, sf.0 .1, sf.1 .0, sf.1 .1]);
+            assert_eq!(securefield_to_felt(sf), expected);
+        }
+    }
 
     #[test]
     fn test_channel_mix_draw_deterministic() {

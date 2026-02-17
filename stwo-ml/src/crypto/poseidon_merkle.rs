@@ -32,13 +32,43 @@ pub struct PoseidonMerkleTree {
     /// Tree layers from bottom (leaves) to top (root).
     /// `layers[0]` = leaves (padded to power of 2).
     /// `layers[last]` = `[root]`.
-    layers: Vec<Vec<FieldElement>>,
+    layers: Vec<MerkleLayer>,
 }
 
 /// Authentication path for a Merkle proof (bottom-up sibling hashes).
 #[derive(Debug, Clone)]
 pub struct MerkleAuthPath {
     pub siblings: Vec<FieldElement>,
+}
+
+#[derive(Debug, Clone)]
+enum MerkleLayer {
+    Felt(Vec<FieldElement>),
+    #[cfg(feature = "cuda-runtime")]
+    Limbs(Vec<u64>),
+}
+
+impl MerkleLayer {
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Self::Felt(v) => v.len(),
+            #[cfg(feature = "cuda-runtime")]
+            Self::Limbs(v) => v.len() / 4,
+        }
+    }
+
+    #[inline]
+    fn at(&self, idx: usize) -> FieldElement {
+        match self {
+            Self::Felt(v) => v[idx],
+            #[cfg(feature = "cuda-runtime")]
+            Self::Limbs(v) => {
+                let s = idx * 4;
+                u64_limbs_to_field_element(&v[s..s + 4]).expect("invalid GPU Merkle limbs")
+            }
+        }
+    }
 }
 
 impl PoseidonMerkleTree {
@@ -53,16 +83,20 @@ impl PoseidonMerkleTree {
         let mut padded = leaves;
         padded.resize(n, FieldElement::ZERO);
 
-        let mut layers = vec![padded];
+        let mut layers = vec![MerkleLayer::Felt(padded)];
 
         // Build layers bottom-up
         while layers.last().unwrap().len() > 1 {
-            let current = layers.last().unwrap();
+            let current = match layers.last().unwrap() {
+                MerkleLayer::Felt(v) => v,
+                #[cfg(feature = "cuda-runtime")]
+                MerkleLayer::Limbs(_) => unreachable!("CPU tree layers are always felt"),
+            };
             let mut next = Vec::with_capacity(current.len() / 2);
             for i in (0..current.len()).step_by(2) {
                 next.push(poseidon_hash(current[i], current[i + 1]));
             }
-            layers.push(next);
+            layers.push(MerkleLayer::Felt(next));
         }
 
         Self { layers }
@@ -73,6 +107,15 @@ impl PoseidonMerkleTree {
     /// Each layer's hash pairs are independent, so layers with >= PARALLEL_THRESHOLD
     /// pairs use `par_chunks(2)` for parallel Poseidon hashing.
     pub fn build_parallel(leaves: Vec<FieldElement>) -> Self {
+        Self::build_parallel_prepacked(leaves, None)
+    }
+
+    /// Build a Poseidon Merkle tree with rayon-parallel hashing and optional
+    /// prepacked leaf limbs for the GPU backend.
+    pub fn build_parallel_prepacked(
+        leaves: Vec<FieldElement>,
+        prepacked_leaf_limbs: Option<Vec<u64>>,
+    ) -> Self {
         assert!(!leaves.is_empty(), "cannot build tree from empty leaves");
 
         let n = leaves.len().next_power_of_two().max(2);
@@ -80,7 +123,7 @@ impl PoseidonMerkleTree {
         padded.resize(n, FieldElement::ZERO);
 
         #[cfg(feature = "cuda-runtime")]
-        match try_build_parallel_gpu(&padded) {
+        match try_build_parallel_gpu(&padded, prepacked_leaf_limbs.as_deref()) {
             Ok(Some(gpu_layers)) => {
                 if !GPU_MLE_MERKLE_BACKEND_LOGGED.swap(true, Ordering::Relaxed) {
                     eprintln!("[GKR] MLE Merkle backend: GPU Poseidon full-tree");
@@ -95,10 +138,14 @@ impl PoseidonMerkleTree {
             }
         }
 
-        let mut layers = vec![padded];
+        let mut layers = vec![MerkleLayer::Felt(padded)];
 
         while layers.last().unwrap().len() > 1 {
-            let current = layers.last().unwrap();
+            let current = match layers.last().unwrap() {
+                MerkleLayer::Felt(v) => v,
+                #[cfg(feature = "cuda-runtime")]
+                MerkleLayer::Limbs(_) => unreachable!("CPU fallback tree layers are felt"),
+            };
             let n_pairs = current.len() / 2;
 
             let next = if n_pairs >= PARALLEL_THRESHOLD {
@@ -110,7 +157,7 @@ impl PoseidonMerkleTree {
                 }
                 v
             };
-            layers.push(next);
+            layers.push(MerkleLayer::Felt(next));
         }
 
         Self { layers }
@@ -145,7 +192,7 @@ impl PoseidonMerkleTree {
 
     /// Returns the Merkle root.
     pub fn root(&self) -> FieldElement {
-        self.layers.last().unwrap()[0]
+        self.layers.last().unwrap().at(0)
     }
 
     /// Returns the number of leaves (including padding).
@@ -162,7 +209,7 @@ impl PoseidonMerkleTree {
 
         for layer in &self.layers[..self.layers.len() - 1] {
             let sibling_idx = idx ^ 1; // flip last bit
-            siblings.push(layer[sibling_idx]);
+            siblings.push(layer.at(sibling_idx));
             idx >>= 1;
         }
 
@@ -235,7 +282,10 @@ fn u64_limbs_to_field_element(limbs: &[u64]) -> Option<FieldElement> {
 }
 
 #[cfg(feature = "cuda-runtime")]
-fn try_build_parallel_gpu(leaves: &[FieldElement]) -> Result<Option<Vec<Vec<FieldElement>>>, String> {
+fn try_build_parallel_gpu(
+    leaves: &[FieldElement],
+    prepacked_leaf_limbs: Option<&[u64]>,
+) -> Result<Option<Vec<MerkleLayer>>, String> {
     if !gpu_merkle_enabled() || !is_cuda_available() {
         return Ok(None);
     }
@@ -248,14 +298,25 @@ fn try_build_parallel_gpu(leaves: &[FieldElement]) -> Result<Option<Vec<Vec<Fiel
     let d_round_constants = upload_poseidon252_round_constants(&executor.device)
         .map_err(|e| format!("upload round constants: {e}"))?;
 
-    let mut leaf_limbs = vec![0u64; leaves.len() * 4];
-    leaf_limbs
-        .par_chunks_mut(4)
-        .zip(leaves.par_iter())
-        .for_each(|(dst, fe)| {
-            let limbs = field_element_to_u64_limbs(fe);
-            dst.copy_from_slice(&limbs);
-        });
+    let leaf_limbs: Vec<u64> = if let Some(prepacked) = prepacked_leaf_limbs {
+        if prepacked.len() != leaves.len() * 4 {
+            return Err(format!(
+                "invalid prepacked limb length: got {}, expected {}",
+                prepacked.len(),
+                leaves.len() * 4,
+            ));
+        }
+        prepacked.to_vec()
+    } else {
+        let mut v = vec![0u64; leaves.len() * 4];
+        v.par_chunks_mut(4)
+            .zip(leaves.par_iter())
+            .for_each(|(dst, fe)| {
+                let limbs = field_element_to_u64_limbs(fe);
+                dst.copy_from_slice(&limbs);
+            });
+        v
+    };
     let d_prev_leaf = executor
         .device
         .htod_sync_copy(&leaf_limbs)
@@ -276,18 +337,12 @@ fn try_build_parallel_gpu(leaves: &[FieldElement]) -> Result<Option<Vec<Vec<Fiel
         .map_err(|e| format!("execute full-tree: {e}"))?;
 
     let mut layers = Vec::with_capacity(raw_layers.len() + 1);
-    layers.push(leaves.to_vec());
+    layers.push(MerkleLayer::Felt(leaves.to_vec()));
     for raw_layer in raw_layers {
         if raw_layer.len() % 4 != 0 {
             return Err(format!("invalid raw layer limb length: {}", raw_layer.len()));
         }
-        let mut layer = Vec::with_capacity(raw_layer.len() / 4);
-        for chunk in raw_layer.chunks_exact(4) {
-            layer.push(u64_limbs_to_field_element(chunk).ok_or_else(|| {
-                "invalid field element limbs in GPU Merkle output".to_string()
-            })?);
-        }
-        layers.push(layer);
+        layers.push(MerkleLayer::Limbs(raw_layer));
     }
     Ok(Some(layers))
 }
