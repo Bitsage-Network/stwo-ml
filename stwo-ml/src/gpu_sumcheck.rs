@@ -1089,6 +1089,16 @@ struct LogupKernels {
     combine_blocks_fn: CudaFunction,
 }
 
+/// GPU-resident MLE folding session.
+///
+/// Holds the current folded MLE on device memory and supports repeated
+/// `challenge` folds with only a small per-round challenge upload.
+#[cfg(feature = "cuda-runtime")]
+pub struct GpuMleFoldSession {
+    d_current: CudaSlice<u32>,
+    n_points: usize,
+}
+
 #[cfg(feature = "cuda-runtime")]
 impl GpuSumcheckExecutor {
     /// Create a new GPU sumcheck executor by compiling kernels.
@@ -1470,6 +1480,62 @@ impl GpuSumcheckExecutor {
         }
 
         Ok(d_output)
+    }
+
+    /// Start a GPU-resident MLE folding session by uploading the full MLE once.
+    pub fn start_mle_fold_session(
+        &self,
+        mle: &[SecureField],
+    ) -> Result<GpuMleFoldSession, CudaFftError> {
+        if mle.is_empty() || !mle.len().is_power_of_two() {
+            return Err(CudaFftError::InvalidSize(format!(
+                "start_mle_fold_session requires non-empty power-of-two length, got {}",
+                mle.len()
+            )));
+        }
+        let flat: Vec<u32> = mle.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
+        let d_current = self.device.htod_sync_copy(&flat)
+            .map_err(|e| CudaFftError::MemoryAllocation(format!("mle session upload: {:?}", e)))?;
+        Ok(GpuMleFoldSession {
+            d_current,
+            n_points: mle.len(),
+        })
+    }
+
+    /// Fold one round on GPU and download the folded vector to CPU.
+    ///
+    /// Returns the new folded MLE evaluations (length halved).
+    pub fn mle_fold_session_step(
+        &self,
+        session: &mut GpuMleFoldSession,
+        challenge: SecureField,
+    ) -> Result<Vec<SecureField>, CudaFftError> {
+        if session.n_points < 2 {
+            return Err(CudaFftError::InvalidSize(
+                "mle_fold_session_step requires at least 2 points".into(),
+            ));
+        }
+
+        let alpha = secure_field_to_u32s(challenge);
+        let d_next = self.mle_fold(&session.d_current, session.n_points, &alpha)?;
+        session.n_points /= 2;
+        session.d_current = d_next;
+
+        let mut folded_u32 = vec![0u32; session.n_points * 4];
+        self.device
+            .dtoh_sync_copy_into(&session.d_current, &mut folded_u32)
+            .map_err(|e| CudaFftError::MemoryTransfer(format!("mle session download: {:?}", e)))?;
+
+        let folded = folded_u32
+            .chunks_exact(4)
+            .map(|c| u32s_to_secure_field(&[c[0], c[1], c[2], c[3]]))
+            .collect();
+        Ok(folded)
+    }
+
+    /// Current number of points in the session.
+    pub fn mle_fold_session_len(&self, session: &GpuMleFoldSession) -> usize {
+        session.n_points
     }
 
     /// GPU fused row-restrict: uploads M31 matrix + Lagrange basis, returns QM31 on GPU.

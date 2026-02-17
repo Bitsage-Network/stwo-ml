@@ -13,9 +13,36 @@ use stwo::core::fields::qm31::SecureField;
 use crate::crypto::poseidon_channel::{PoseidonChannel, securefield_to_felt};
 use crate::crypto::poseidon_merkle::{PoseidonMerkleTree, MerkleAuthPath};
 use rayon::prelude::*;
+#[cfg(feature = "cuda-runtime")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "cuda-runtime")]
+use crate::gpu_sumcheck::GpuSumcheckExecutor;
 
 /// Number of queries for MLE opening (matching STARK FRI query count).
 pub const MLE_N_QUERIES: usize = 14;
+#[cfg(feature = "cuda-runtime")]
+static GPU_MLE_FOLD_BACKEND_LOGGED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(feature = "cuda-runtime")]
+fn gpu_mle_fold_enabled() -> bool {
+    match std::env::var("STWO_GPU_MLE_FOLD") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false" && v != "off"
+        }
+        // Default ON in cuda-runtime builds.
+        Err(_) => true,
+    }
+}
+
+#[cfg(feature = "cuda-runtime")]
+fn gpu_mle_fold_min_points() -> usize {
+    std::env::var("STWO_GPU_MLE_FOLD_MIN_POINTS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&v| v.is_power_of_two() && v >= 2)
+        .unwrap_or(1 << 20)
+}
 
 /// MLE opening proof matching Cairo's `MleOpeningProof`.
 #[derive(Debug, Clone)]
@@ -122,30 +149,104 @@ pub fn prove_mle_opening_with_commitment(
     let mut layer_evals: Vec<Vec<SecureField>> = vec![evals.to_vec()];
     let mut layer_trees: Vec<PoseidonMerkleTree> = vec![initial_tree];
     let mut intermediate_roots: Vec<FieldElement> = Vec::new();
+    #[cfg(feature = "cuda-runtime")]
+    let mut gpu_fold_session = {
+        if gpu_mle_fold_enabled() && evals.len() >= gpu_mle_fold_min_points() {
+            match GpuSumcheckExecutor::cached() {
+                Ok(gpu) => match gpu.start_mle_fold_session(evals) {
+                    Ok(session) => {
+                        if !GPU_MLE_FOLD_BACKEND_LOGGED.swap(true, Ordering::Relaxed) {
+                            eprintln!("[GKR] MLE fold backend: GPU session");
+                        }
+                        Some((gpu, session))
+                    }
+                    Err(e) => {
+                        if !GPU_MLE_FOLD_BACKEND_LOGGED.swap(true, Ordering::Relaxed) {
+                            eprintln!("[GKR] MLE fold backend: CPU fallback (session init: {e})");
+                        }
+                        None
+                    }
+                },
+                Err(e) => {
+                    if !GPU_MLE_FOLD_BACKEND_LOGGED.swap(true, Ordering::Relaxed) {
+                        eprintln!("[GKR] MLE fold backend: CPU fallback (GPU init: {e})");
+                    }
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
 
     // Fold through each challenge
     // Variable ordering matches evaluate_mle: first variable splits into lo/hi halves
     for &r in challenges.iter() {
-        let current = layer_evals.last().expect("layer_evals is never empty");
-        let mid = current.len() / 2;
-
-        let folded: Vec<SecureField> = if mid >= 1 << 16 {
-            // Large rounds dominate opening time; parallelize safely (pure map).
-            (0..mid)
-                .into_par_iter()
-                .map(|j| {
-                    // f(r, x_rest) = (1-r)*f(0, x_rest) + r*f(1, x_rest)
-                    // f(0, x_rest) = current[j], f(1, x_rest) = current[mid + j]
-                    current[j] + r * (current[mid + j] - current[j])
-                })
-                .collect()
-        } else {
-            let mut v = Vec::with_capacity(mid);
-            for j in 0..mid {
-                v.push(current[j] + r * (current[mid + j] - current[j]));
+        let folded: Vec<SecureField> = {
+            #[cfg(feature = "cuda-runtime")]
+            {
+                if gpu_fold_session.is_some() {
+                    let gpu_folded = {
+                        let (gpu, session) = gpu_fold_session.as_mut().expect("checked is_some");
+                        gpu.mle_fold_session_step(session, r)
+                    };
+                    match gpu_folded {
+                        Ok(vals) => vals,
+                        Err(e) => {
+                            eprintln!("[GKR] MLE fold backend: GPU step failed, switching to CPU ({e})");
+                            gpu_fold_session = None;
+                            let current = layer_evals.last().expect("layer_evals is never empty");
+                            let mid = current.len() / 2;
+                            if mid >= 1 << 16 {
+                                (0..mid)
+                                    .into_par_iter()
+                                    .map(|j| current[j] + r * (current[mid + j] - current[j]))
+                                    .collect()
+                            } else {
+                                let mut v = Vec::with_capacity(mid);
+                                for j in 0..mid {
+                                    v.push(current[j] + r * (current[mid + j] - current[j]));
+                                }
+                                v
+                            }
+                        }
+                    }
+                } else {
+                    let current = layer_evals.last().expect("layer_evals is never empty");
+                    let mid = current.len() / 2;
+                    if mid >= 1 << 16 {
+                        (0..mid)
+                            .into_par_iter()
+                            .map(|j| current[j] + r * (current[mid + j] - current[j]))
+                            .collect()
+                    } else {
+                        let mut v = Vec::with_capacity(mid);
+                        for j in 0..mid {
+                            v.push(current[j] + r * (current[mid + j] - current[j]));
+                        }
+                        v
+                    }
+                }
             }
-            v
+            #[cfg(not(feature = "cuda-runtime"))]
+            {
+                let current = layer_evals.last().expect("layer_evals is never empty");
+                let mid = current.len() / 2;
+                if mid >= 1 << 16 {
+                    (0..mid)
+                        .into_par_iter()
+                        .map(|j| current[j] + r * (current[mid + j] - current[j]))
+                        .collect()
+                } else {
+                    let mut v = Vec::with_capacity(mid);
+                    for j in 0..mid {
+                        v.push(current[j] + r * (current[mid + j] - current[j]));
+                    }
+                    v
+                }
+            }
         };
+        let mid = folded.len();
 
         if mid > 1 {
             let (root, tree) = commit_mle(&folded);
