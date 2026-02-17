@@ -3592,7 +3592,14 @@ fn u64_limbs_to_field_element(limbs: &[u64]) -> Result<FieldElement, String> {
         let offset = i * 8;
         bytes[offset..offset + 8].copy_from_slice(&limb.to_be_bytes());
     }
-    FieldElement::from_bytes_be(&bytes).map_err(|_| "invalid felt252 limbs".to_string())
+    // Match STWO GPU Poseidon conversion: keep only the low 251 bits.
+    bytes[0] &= 0x07;
+    FieldElement::from_bytes_be(&bytes).map_err(|_| {
+        format!(
+            "invalid felt252 limbs after top-bit mask: [{:#x}, {:#x}, {:#x}, {:#x}]",
+            limbs[0], limbs[1], limbs[2], limbs[3]
+        )
+    })
 }
 
 fn pack_m31_chunk_to_felt(values: &[M31]) -> FieldElement {
