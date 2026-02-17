@@ -456,6 +456,8 @@ pub struct CompiledKernels {
     pub merkle_layer: CudaFunction,
     // Poseidon252 Merkle hashing kernel
     pub poseidon252_merkle_layer: CudaFunction,
+    // Poseidon252 chunked hash_many kernel (weight commitments)
+    pub poseidon252_hash_many_chunked: CudaFunction,
 }
 
 /// Information about the CUDA device.
@@ -987,7 +989,10 @@ impl CudaFftExecutor {
             .load_ptx(
                 poseidon_ptx,
                 "merkle_poseidon252",
-                &["poseidon252_merkle_layer_kernel"],
+                &[
+                    "poseidon252_merkle_layer_kernel",
+                    "poseidon252_hash_many_chunked_kernel",
+                ],
             )
             .map_err(|e| {
                 CudaFftError::KernelCompilation(format!("Poseidon252 Merkle load: {:?}", e))
@@ -998,6 +1003,13 @@ impl CudaFftExecutor {
             .get_func("merkle_poseidon252", "poseidon252_merkle_layer_kernel")
             .ok_or_else(|| {
                 CudaFftError::KernelCompilation("poseidon252_merkle_layer_kernel not found".into())
+            })?;
+        let poseidon252_hash_many_chunked = device
+            .get_func("merkle_poseidon252", "poseidon252_hash_many_chunked_kernel")
+            .ok_or_else(|| {
+                CudaFftError::KernelCompilation(
+                    "poseidon252_hash_many_chunked_kernel not found".into(),
+                )
             })?;
 
         tracing::info!(
@@ -1022,6 +1034,7 @@ impl CudaFftExecutor {
             gen_eq_evals,
             merkle_layer,
             poseidon252_merkle_layer,
+            poseidon252_hash_many_chunked,
         })
     }
 
@@ -3000,6 +3013,131 @@ impl CudaFftExecutor {
             .map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
 
         tracing::info!("GPU poseidon252_merkle completed: {} hashes", n_hashes);
+        Ok(output)
+    }
+
+    /// Execute chunked Poseidon252 hash_many for many independent segments.
+    ///
+    /// Each segment `i` is described by `offsets[i]` and `lengths[i]` over `inputs`
+    /// (where `inputs` is flattened felt252 data in 4x u64 limbs per element).
+    /// The kernel computes:
+    ///   running = 0
+    ///   for each chunk:
+    ///     running = poseidon_hash_many([running] + chunk)
+    ///
+    /// Output is one felt252 hash per segment (4x u64 limbs each).
+    pub fn execute_poseidon252_hash_many_chunked(
+        &self,
+        inputs: &[u64],
+        offsets: &[u32],
+        lengths: &[u32],
+        chunk_size: usize,
+        d_round_constants: &CudaSlice<u64>,
+    ) -> Result<Vec<u64>, CudaFftError> {
+        if offsets.len() != lengths.len() {
+            return Err(CudaFftError::InvalidSize(format!(
+                "offsets/lengths mismatch: {} vs {}",
+                offsets.len(),
+                lengths.len()
+            )));
+        }
+        if inputs.len() % 4 != 0 {
+            return Err(CudaFftError::InvalidSize(format!(
+                "inputs must be packed felt252 limbs (len % 4 == 0), got {}",
+                inputs.len()
+            )));
+        }
+        if chunk_size == 0 {
+            return Err(CudaFftError::InvalidSize(
+                "chunk_size must be > 0".to_string(),
+            ));
+        }
+
+        let n_segments = offsets.len();
+        if n_segments == 0 {
+            return Ok(Vec::new());
+        }
+
+        let d_inputs = if inputs.is_empty() {
+            None
+        } else {
+            Some(
+                self.device
+                    .htod_sync_copy(inputs)
+                    .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?,
+            )
+        };
+        let d_offsets = self
+            .device
+            .htod_sync_copy(offsets)
+            .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        let d_lengths = self
+            .device
+            .htod_sync_copy(lengths)
+            .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+
+        let mut d_output = unsafe { self.device.alloc::<u64>(n_segments * 4) }
+            .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+
+        let block_size = 256u32;
+        let grid_size = ((n_segments as u32) + block_size - 1) / block_size;
+        let cfg = LaunchConfig {
+            grid_dim: (grid_size, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        unsafe {
+            if let Some(d_inputs) = &d_inputs {
+                self.kernels
+                    .poseidon252_hash_many_chunked
+                    .clone()
+                    .launch(
+                        cfg,
+                        (
+                            &mut d_output,
+                            d_inputs,
+                            &d_offsets,
+                            &d_lengths,
+                            d_round_constants,
+                            n_segments as u32,
+                            chunk_size as u32,
+                        ),
+                    )
+                    .map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
+            } else {
+                // No felt inputs: segments are empty, so kernel should return 0 per segment.
+                let dummy_inputs = self
+                    .device
+                    .alloc::<u64>(4)
+                    .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+                self.kernels
+                    .poseidon252_hash_many_chunked
+                    .clone()
+                    .launch(
+                        cfg,
+                        (
+                            &mut d_output,
+                            &dummy_inputs,
+                            &d_offsets,
+                            &d_lengths,
+                            d_round_constants,
+                            n_segments as u32,
+                            chunk_size as u32,
+                        ),
+                    )
+                    .map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
+            }
+        }
+
+        self.device
+            .synchronize()
+            .map_err(|e| CudaFftError::KernelExecution(format!("Sync failed: {:?}", e)))?;
+
+        let mut output = vec![0u64; n_segments * 4];
+        self.device
+            .dtoh_sync_copy_into(&d_output, &mut output)
+            .map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
         Ok(output)
     }
 

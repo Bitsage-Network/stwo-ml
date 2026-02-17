@@ -2710,6 +2710,113 @@ extern "C" __global__ void poseidon252_merkle_layer_kernel(
     output[idx * 4 + 2] = result.limb[2];
     output[idx * 4 + 3] = result.limb[3];
 }
+
+// =============================================================================
+// Poseidon252 hash_many kernel for chunked segment hashing (weight commitment)
+// =============================================================================
+//
+// Each thread hashes one segment using the exact CPU algorithm:
+//   running = 0
+//   for each chunk (size=chunk_size):
+//     running = poseidon_hash_many([running] + chunk)
+//
+// Inputs are pre-packed felt252 values (4x u64 limbs each).
+// offsets/lengths are measured in number of packed felts (not limbs).
+
+__device__ __forceinline__ void load_felt252_from_u64(
+    felt252* out, const uint64_t* ptr
+) {
+    out->limb[0] = ptr[0];
+    out->limb[1] = ptr[1];
+    out->limb[2] = ptr[2];
+    out->limb[3] = ptr[3];
+}
+
+__device__ void poseidon_hash_many_with_prefix(
+    felt252* result,
+    const felt252* prefix,
+    const uint64_t* inputs_limbs,
+    int n_inputs,
+    const uint64_t* rc
+) {
+    // Equivalent to poseidon_hash_many([prefix] + inputs[0..n_inputs]).
+    felt252 state[3];
+    felt_set_zero(&state[0]);
+    felt_set_zero(&state[1]);
+    felt_set_zero(&state[2]);
+
+    const int total = n_inputs + 1;
+    int i = 0;
+    while (i < total) {
+        felt252 v0;
+        if (i == 0) {
+            felt_copy(&v0, prefix);
+        } else {
+            load_felt252_from_u64(&v0, inputs_limbs + ((i - 1) * 4));
+        }
+        felt_add(&state[0], &state[0], &v0);
+        i++;
+
+        if (i < total) {
+            felt252 v1;
+            load_felt252_from_u64(&v1, inputs_limbs + ((i - 1) * 4));
+            felt_add(&state[1], &state[1], &v1);
+            i++;
+        } else {
+            // Odd number of absorbed elements -> pad state[1] with 1 and return.
+            felt252 one;
+            felt_set_u64(&one, 1);
+            felt_add(&state[1], &state[1], &one);
+            hades_permutation(state, rc);
+            felt_copy(result, &state[0]);
+            return;
+        }
+
+        hades_permutation(state, rc);
+    }
+
+    // Even number of absorbed elements -> pad with [1, 0].
+    felt252 one;
+    felt_set_u64(&one, 1);
+    felt_add(&state[0], &state[0], &one);
+    hades_permutation(state, rc);
+    felt_copy(result, &state[0]);
+}
+
+extern "C" __global__ void poseidon252_hash_many_chunked_kernel(
+    uint64_t* output,
+    const uint64_t* inputs,
+    const uint32_t* offsets,
+    const uint32_t* lengths,
+    const uint64_t* round_constants,
+    uint32_t n_segments,
+    uint32_t chunk_size
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_segments) return;
+
+    uint32_t off = offsets[idx];
+    uint32_t len = lengths[idx];
+
+    felt252 running;
+    felt_set_zero(&running);
+
+    uint32_t pos = 0;
+    while (pos < len) {
+        uint32_t remaining = len - pos;
+        uint32_t take = remaining > chunk_size ? chunk_size : remaining;
+        const uint64_t* chunk_ptr = inputs + ((off + pos) * 4);
+        poseidon_hash_many_with_prefix(
+            &running, &running, chunk_ptr, (int)take, round_constants
+        );
+        pos += take;
+    }
+
+    output[idx * 4 + 0] = running.limb[0];
+    output[idx * 4 + 1] = running.limb[1];
+    output[idx * 4 + 2] = running.limb[2];
+    output[idx * 4 + 3] = running.limb[3];
+}
 "#;
 
 // =============================================================================

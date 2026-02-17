@@ -682,7 +682,7 @@ where
                     type_tag: activation_type.type_tag(),
                 });
 
-                intermediates.push((node.id, current.clone()));
+                intermediates.push((node.id, reduced_matrix));
                 node_outputs.insert(node.id, output.clone());
                 current = output;
             }
@@ -2143,7 +2143,7 @@ where
                     type_tag: activation_type.type_tag(),
                 });
 
-                intermediates.push((node.id, current.clone()));
+                intermediates.push((node.id, reduced_matrix));
                 node_outputs.insert(node.id, output.clone());
                 current = output;
             }
@@ -4016,7 +4016,10 @@ where
                 let reduced_inputs: Vec<M31> = current.data.iter()
                     .map(|&x| M31::from(x.0 & table_mask))
                     .collect();
-                let output_data: Vec<M31> = reduced_inputs.iter()
+                let reduced_matrix = M31Matrix {
+                    rows: current.rows, cols: current.cols, data: reduced_inputs.clone(),
+                };
+                let output_data: Vec<M31> = reduced_matrix.data.iter()
                     .map(|&x| (*f)(x))
                     .collect();
                 let output = M31Matrix {
@@ -4034,7 +4037,7 @@ where
                     type_tag: activation_type.type_tag(),
                 });
 
-                intermediates.push((node.id, current.clone()));
+                intermediates.push((node.id, reduced_matrix));
                 node_outputs.insert(node.id, output.clone());
                 current = output;
             }
@@ -4610,7 +4613,7 @@ pub(crate) fn collect_forward_pass_layer_data(
                     type_tag: activation_type.type_tag(),
                 });
 
-                intermediates.push((node.id, current.clone()));
+                intermediates.push((node.id, reduced_matrix));
                 node_outputs.insert(node.id, output.clone());
                 current = output;
             }

@@ -31,6 +31,10 @@ use std::time::Instant;
 use clap::{Parser, Subcommand};
 use starknet_ff::FieldElement;
 use stwo::core::fields::m31::M31;
+#[cfg(feature = "cuda-runtime")]
+use stwo::prover::backend::gpu::cuda_executor::{
+    get_cuda_executor, upload_poseidon252_round_constants,
+};
 
 use stwo_ml::cairo_serde::{
     DirectProofMetadata, MLClaimMetadata, serialize_ml_proof_for_recursive,
@@ -906,8 +910,8 @@ fn main() {
 
     // Pipeline: run proving and weight commitment in parallel via std::thread::scope.
     // Both only need &model.weights (shared ref), so this is safe.
-    // Commitment uses CPU-only (Poseidon hash), while proving uses GPU + rayon.
-    // During GPU phases of proving, idle CPU cores handle commitment work.
+    // Commitment prefers GPU Poseidon hash-many when available, with strict/harden
+    // flags to fail closed or cross-check against CPU.
     let use_gpu = cli.gpu || cli.multi_gpu;
 
     eprintln!(
@@ -3499,6 +3503,118 @@ fn compute_fingerprint(model_dir: &std::path::Path) -> Option<String> {
     Some(format!("{:016x}", hasher.finish()))
 }
 
+#[cfg(feature = "cuda-runtime")]
+fn gpu_commit_flag_enabled(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false" && v != "off"
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(feature = "cuda-runtime")]
+fn gpu_commit_strict_mode() -> bool {
+    gpu_commit_flag_enabled("STWO_GPU_COMMIT_STRICT")
+}
+
+#[cfg(feature = "cuda-runtime")]
+fn gpu_commit_hardening_enabled() -> bool {
+    gpu_commit_flag_enabled("STWO_GPU_COMMIT_HARDEN")
+}
+
+#[cfg(feature = "cuda-runtime")]
+fn field_element_to_u64_limbs(fe: &FieldElement) -> [u64; 4] {
+    let bytes = fe.to_bytes_be();
+    let mut limbs = [0u64; 4];
+    for (i, limb) in limbs.iter_mut().enumerate() {
+        let offset = 24 - i * 8;
+        let mut val = 0u64;
+        for j in 0..8 {
+            val = (val << 8) | bytes[offset + j] as u64;
+        }
+        *limb = val;
+    }
+    limbs
+}
+
+#[cfg(feature = "cuda-runtime")]
+fn u64_limbs_to_field_element(limbs: &[u64]) -> Result<FieldElement, String> {
+    if limbs.len() != 4 {
+        return Err(format!("expected 4 limbs, got {}", limbs.len()));
+    }
+    let mut bytes = [0u8; 32];
+    for i in 0..4 {
+        let limb = limbs[3 - i];
+        let offset = i * 8;
+        bytes[offset..offset + 8].copy_from_slice(&limb.to_be_bytes());
+    }
+    FieldElement::from_bytes_be(&bytes).map_err(|_| "invalid felt252 limbs".to_string())
+}
+
+#[cfg(feature = "cuda-runtime")]
+struct GpuCommitHasher {
+    d_round_constants: cudarc::driver::CudaSlice<u64>,
+}
+
+#[cfg(feature = "cuda-runtime")]
+impl GpuCommitHasher {
+    fn new() -> Result<Self, String> {
+        let executor = get_cuda_executor().map_err(|e| format!("CUDA init: {e}"))?;
+        let d_round_constants = upload_poseidon252_round_constants(&executor.device)
+            .map_err(|e| format!("Poseidon252 round constants upload: {e}"))?;
+        Ok(Self { d_round_constants })
+    }
+
+    fn hash_segments(
+        &self,
+        segments: &[Vec<FieldElement>],
+        chunk_size: usize,
+    ) -> Result<Vec<FieldElement>, String> {
+        if segments.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let total_inputs: usize = segments.iter().map(|seg| seg.len()).sum();
+        let mut offsets = Vec::with_capacity(segments.len());
+        let mut lengths = Vec::with_capacity(segments.len());
+        let mut inputs_limbs = Vec::with_capacity(total_inputs * 4);
+
+        let mut cursor: u32 = 0;
+        for seg in segments {
+            let len_u32 = u32::try_from(seg.len())
+                .map_err(|_| format!("segment too large for u32: {}", seg.len()))?;
+            offsets.push(cursor);
+            lengths.push(len_u32);
+            cursor = cursor
+                .checked_add(len_u32)
+                .ok_or_else(|| "segment offsets overflow u32".to_string())?;
+
+            for fe in seg {
+                inputs_limbs.extend_from_slice(&field_element_to_u64_limbs(fe));
+            }
+        }
+
+        let executor = get_cuda_executor().map_err(|e| format!("CUDA init: {e}"))?;
+        let output_limbs = executor
+            .execute_poseidon252_hash_many_chunked(
+                &inputs_limbs,
+                &offsets,
+                &lengths,
+                chunk_size,
+                &self.d_round_constants,
+            )
+            .map_err(|e| format!("poseidon252_hash_many_chunked: {e}"))?;
+
+        let mut out = Vec::with_capacity(segments.len());
+        for chunk in output_limbs.chunks_exact(4) {
+            out.push(u64_limbs_to_field_element(chunk)?);
+        }
+        Ok(out)
+    }
+}
+
 /// Compute weight commitment: Poseidon hash of all weight matrices.
 /// Packed 7:1 (7 M31 values per FieldElement) + parallel Merkle segments.
 /// Caches result with fingerprint for instant validated reuse on subsequent runs.
@@ -3529,12 +3645,9 @@ fn compute_weight_commitment(
     };
 
     let n_segments = 64usize;
+    let chunk_size = 4096usize;
 
-    let hash_segment = |data: &[M31]| -> FieldElement {
-        let chunk_size = 4096;
-        let packed: Vec<FieldElement> = data.chunks(7)
-            .map(|c| pack_m31(c))
-            .collect();
+    let hash_packed_segment_cpu = |packed: &[FieldElement]| -> FieldElement {
         if packed.is_empty() {
             return FieldElement::ZERO;
         }
@@ -3549,12 +3662,76 @@ fn compute_weight_commitment(
         running
     };
 
+    #[cfg(feature = "cuda-runtime")]
+    let mut gpu_hasher = match GpuCommitHasher::new() {
+        Ok(hasher) => {
+            eprintln!("[BG]   GPU Poseidon hash-many enabled for segment hashing");
+            Some(hasher)
+        }
+        Err(e) => {
+            if gpu_commit_strict_mode() {
+                panic!("GPU commitment strict mode enabled, but GPU hasher init failed: {e}");
+            }
+            eprintln!("[BG]   GPU Poseidon unavailable ({e}), falling back to CPU segment hashing");
+            None
+        }
+    };
+
     let per_matrix_hashes: Vec<FieldElement> = weight_list.iter().map(|(layer_id, w)| {
         let seg_size = (w.data.len() + n_segments - 1) / n_segments;
-        let segment_hashes: Vec<FieldElement> = w.data
+        let packed_segments: Vec<Vec<FieldElement>> = w.data
             .par_chunks(seg_size.max(1))
-            .map(|segment| hash_segment(segment))
+            .map(|segment| segment.chunks(7).map(|c| pack_m31(c)).collect())
             .collect();
+
+        let cpu_hash_segments = || -> Vec<FieldElement> {
+            packed_segments
+                .par_iter()
+                .map(|packed| hash_packed_segment_cpu(packed))
+                .collect()
+        };
+
+        let segment_hashes: Vec<FieldElement> = {
+            #[cfg(feature = "cuda-runtime")]
+            {
+                if let Some(hasher) = gpu_hasher.as_ref() {
+                    match hasher.hash_segments(&packed_segments, chunk_size) {
+                        Ok(gpu_hashes) => {
+                            if gpu_commit_hardening_enabled() {
+                                let cpu_hashes = cpu_hash_segments();
+                                if gpu_hashes != cpu_hashes {
+                                    panic!(
+                                        "GPU weight commitment hardening failed: segment hash mismatch on layer {}",
+                                        layer_id
+                                    );
+                                }
+                            }
+                            gpu_hashes
+                        }
+                        Err(e) => {
+                            if gpu_commit_strict_mode() {
+                                panic!(
+                                    "GPU commitment strict mode enabled, but GPU hashing failed for layer {}: {}",
+                                    layer_id, e
+                                );
+                            }
+                            eprintln!(
+                                "[BG]   Layer {} GPU Poseidon hash-many failed ({}), using CPU fallback",
+                                layer_id, e
+                            );
+                            gpu_hasher = None;
+                            cpu_hash_segments()
+                        }
+                    }
+                } else {
+                    cpu_hash_segments()
+                }
+            }
+            #[cfg(not(feature = "cuda-runtime"))]
+            {
+                cpu_hash_segments()
+            }
+        };
 
         let mut final_inputs: Vec<FieldElement> = Vec::with_capacity(segment_hashes.len() + 3);
         final_inputs.push(FieldElement::from(*layer_id as u64));
