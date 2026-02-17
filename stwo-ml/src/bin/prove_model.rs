@@ -944,23 +944,8 @@ fn main() {
 
     let t0 = Instant::now();
 
-    let (proof_result, weight_commitment, commit_elapsed) = std::thread::scope(|s| {
-        // Spawn weight commitment on background thread if not cached
-        let commit_handle = if cached_commitment.is_none() {
-            Some(s.spawn(|| {
-                let t_commit = Instant::now();
-                let commitment = compute_weight_commitment(
-                    &model.weights,
-                    cli.model_dir.as_deref(),
-                );
-                (commitment, t_commit.elapsed())
-            }))
-        } else {
-            None
-        };
-
-        // Prove on main thread
-        let proof = if cli.format == OutputFormat::MlGkr {
+    let run_proof = || {
+        if cli.format == OutputFormat::MlGkr {
             // Full ML GKR pipeline: all layers via GKR sumcheck (no individual matmul proofs)
             eprintln!("Using full ML GKR pipeline (--format ml_gkr)");
             stwo_ml::aggregation::prove_model_pure_gkr_auto(
@@ -1036,20 +1021,71 @@ fn main() {
                 &input,
                 &model.weights,
             )
-        };
+        }
+    };
 
-        // Collect commitment result
-        let (commitment, commit_time) = match (cached_commitment, commit_handle) {
-            (Some(c), _) => (c, std::time::Duration::ZERO),
-            (None, Some(handle)) => {
-                let (c, elapsed) = handle.join().expect("commitment thread panicked");
-                (c, elapsed)
-            }
-            _ => (FieldElement::ZERO, std::time::Duration::ZERO),
-        };
+    let allow_parallel_gpu_commit = {
+        #[cfg(feature = "cuda-runtime")]
+        {
+            gpu_commit_flag_enabled("STWO_PARALLEL_GPU_COMMIT")
+        }
+        #[cfg(not(feature = "cuda-runtime"))]
+        {
+            false
+        }
+    };
 
+    // On single-GPU runs, do GPU commitment before proving by default.
+    // Parallel overlap made sense when commitment was CPU-bound, but now both
+    // proving and commitment are GPU-heavy and can contend on one device.
+    let serialize_gpu_commit = cached_commitment.is_none()
+        && use_gpu
+        && !cli.multi_gpu
+        && !allow_parallel_gpu_commit;
+
+    let (proof_result, weight_commitment, commit_elapsed) = if serialize_gpu_commit {
+        eprintln!(
+            "[BG] Single-GPU mode: running weight commitment before proving to avoid GPU contention."
+        );
+        eprintln!(
+            "[BG] Set STWO_PARALLEL_GPU_COMMIT=1 to force overlapping commitment + proving."
+        );
+        let t_commit = Instant::now();
+        let commitment = compute_weight_commitment(&model.weights, cli.model_dir.as_deref());
+        let commit_time = t_commit.elapsed();
+        let proof = run_proof();
         (proof, commitment, commit_time)
-    });
+    } else {
+        std::thread::scope(|s| {
+            // Spawn weight commitment on background thread if not cached
+            let commit_handle = if cached_commitment.is_none() {
+                Some(s.spawn(|| {
+                    let t_commit = Instant::now();
+                    let commitment = compute_weight_commitment(
+                        &model.weights,
+                        cli.model_dir.as_deref(),
+                    );
+                    (commitment, t_commit.elapsed())
+                }))
+            } else {
+                None
+            };
+
+            let proof = run_proof();
+
+            // Collect commitment result
+            let (commitment, commit_time) = match (cached_commitment, commit_handle) {
+                (Some(c), _) => (c, std::time::Duration::ZERO),
+                (None, Some(handle)) => {
+                    let (c, elapsed) = handle.join().expect("commitment thread panicked");
+                    (c, elapsed)
+                }
+                _ => (FieldElement::ZERO, std::time::Duration::ZERO),
+            };
+
+            (proof, commitment, commit_time)
+        })
+    };
 
     let prove_elapsed = t0.elapsed();
 
