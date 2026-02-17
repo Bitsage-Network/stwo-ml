@@ -5,36 +5,32 @@
 //! This is a 1D lookup (single element per relation entry), simpler than
 //! the 2D activation lookup.
 
+use stwo::core::air::Component;
+use stwo::core::channel::MerkleChannel;
 use stwo::core::fields::m31::{BaseField, M31};
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::pcs::PcsConfig;
 use stwo::core::poly::circle::CanonicCoset;
-use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
-use stwo::core::channel::MerkleChannel;
 use stwo::core::proof::StarkProof;
+use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
 use stwo::core::vcs_lifted::MerkleHasherLifted;
-use stwo::core::air::Component;
 use stwo::core::verifier::verify as stwo_verify;
-use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::simd::qm31::PackedSecureField;
+use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::{Col, Column};
 use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
 use stwo::prover::poly::BitReversedOrder;
-use stwo::prover::CommitmentSchemeProver;
 use stwo::prover::prove;
+use stwo::prover::CommitmentSchemeProver;
 
-use stwo_constraint_framework::{
-    FrameworkEval, FrameworkComponent,
-    EvalAtRow, RelationEntry,
-    TraceLocationAllocator,
-    LogupTraceGenerator,
-};
 use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
+use stwo_constraint_framework::{
+    EvalAtRow, FrameworkComponent, FrameworkEval, LogupTraceGenerator, RelationEntry,
+    TraceLocationAllocator,
+};
 
 use crate::backend::convert_evaluations;
-use crate::gadgets::range_check::{
-    RangeCheckConfig, compute_range_multiplicities,
-};
+use crate::gadgets::range_check::{compute_range_multiplicities, RangeCheckConfig};
 
 // Relation type for range check lookups: single element (the value).
 stwo_constraint_framework::relation!(RangeCheckRelation, 1);
@@ -102,7 +98,12 @@ pub type RangeCheckComponent = FrameworkComponent<RangeCheckEval>;
 #[derive(Debug, thiserror::Error)]
 pub enum RangeCheckError {
     #[error("Value out of range at index {index}: {value:?} not in [{min}, {max}]")]
-    ValueOutOfRange { index: usize, value: M31, min: u32, max: u32 },
+    ValueOutOfRange {
+        index: usize,
+        value: M31,
+        min: u32,
+        max: u32,
+    },
     #[error("Proving error: {0}")]
     ProvingError(String),
     #[error("Verification error: {0}")]
@@ -129,7 +130,10 @@ pub fn prove_range_check(
     for (i, v) in values.iter().enumerate() {
         if v.0 < config.min || v.0 > config.max {
             return Err(RangeCheckError::ValueOutOfRange {
-                index: i, value: *v, min: config.min, max: config.max,
+                index: i,
+                value: *v,
+                min: config.min,
+                max: config.max,
             });
         }
     }
@@ -164,9 +168,7 @@ pub fn prove_range_check(
     for (i, &v) in table_values.iter().enumerate() {
         table_col.set(i, v);
     }
-    let preprocessed = vec![
-        CircleEvaluation::new(domain, table_col.clone()),
-    ];
+    let preprocessed = vec![CircleEvaluation::new(domain, table_col.clone())];
 
     // Execution: (value, multiplicity)
     // The trace values mirror the table: row i → table entry i.
@@ -199,16 +201,16 @@ pub fn prove_range_check(
 
     // Tree 0: Preprocessed
     let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(
-        convert_evaluations::<SimdBackend, SimdBackend, BaseField>(preprocessed),
-    );
+    tree_builder.extend_evals(convert_evaluations::<SimdBackend, SimdBackend, BaseField>(
+        preprocessed,
+    ));
     tree_builder.commit(channel);
 
     // Tree 1: Execution
     let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(
-        convert_evaluations::<SimdBackend, SimdBackend, BaseField>(execution),
-    );
+    tree_builder.extend_evals(convert_evaluations::<SimdBackend, SimdBackend, BaseField>(
+        execution,
+    ));
     tree_builder.commit(channel);
 
     // Draw lookup elements
@@ -225,9 +227,9 @@ pub fn prove_range_check(
 
     // Tree 2: Interaction
     let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(
-        convert_evaluations::<SimdBackend, SimdBackend, BaseField>(interaction_trace),
-    );
+    tree_builder.extend_evals(convert_evaluations::<SimdBackend, SimdBackend, BaseField>(
+        interaction_trace,
+    ));
     tree_builder.commit(channel);
 
     // Build component
@@ -241,11 +243,9 @@ pub fn prove_range_check(
         claimed_sum,
     );
 
-    let stark_proof = prove::<SimdBackend, Blake2sMerkleChannel>(
-        &[&component],
-        channel,
-        commitment_scheme,
-    ).map_err(|e| RangeCheckError::ProvingError(format!("{e:?}")))?;
+    let stark_proof =
+        prove::<SimdBackend, Blake2sMerkleChannel>(&[&component], channel, commitment_scheme)
+            .map_err(|e| RangeCheckError::ProvingError(format!("{e:?}")))?;
 
     Ok(RangeCheckProof {
         stark_proof,
@@ -284,8 +284,7 @@ pub fn verify_range_check(
 
     // Set up channel and verifier
     let channel = &mut <Blake2sMerkleChannel as MerkleChannel>::C::default();
-    let mut commitment_scheme =
-        CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(pcs_config);
+    let mut commitment_scheme = CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(pcs_config);
 
     // Replay commitments
     commitment_scheme.commit(proof.stark_proof.commitments[0], &tree0, channel);
@@ -315,7 +314,8 @@ pub fn verify_range_check(
         channel,
         &mut commitment_scheme,
         proof.stark_proof.clone(),
-    ).map_err(|e| RangeCheckError::VerificationError(format!("{e:?}")))
+    )
+    .map_err(|e| RangeCheckError::VerificationError(format!("{e:?}")))
 }
 
 /// Compute LogUp interaction trace for range check on SimdBackend.
@@ -329,7 +329,10 @@ fn compute_range_check_logup_simd(
     multiplicities: &[M31],
     log_size: u32,
     lookup_elements: &RangeCheckRelation,
-) -> (Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>, SecureField) {
+) -> (
+    Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
+    SecureField,
+) {
     use stwo::prover::backend::simd::m31::LOG_N_LANES;
 
     let size = 1usize << log_size;
@@ -341,12 +344,12 @@ fn compute_range_check_logup_simd(
     // = (q_table - mult * q_trace) / (q_table * q_trace)
     let mut col_gen = logup_gen.new_col();
     for vec_row in 0..vec_size {
-        let q_table: PackedSecureField = lookup_elements.lookup_elements().combine(
-            &[table_col.data[vec_row]],
-        );
-        let q_trace: PackedSecureField = lookup_elements.lookup_elements().combine(
-            &[trace_val_col.data[vec_row]],
-        );
+        let q_table: PackedSecureField = lookup_elements
+            .lookup_elements()
+            .combine(&[table_col.data[vec_row]]);
+        let q_trace: PackedSecureField = lookup_elements
+            .lookup_elements()
+            .combine(&[trace_val_col.data[vec_row]]);
 
         let mult_packed = mult_packed_at(multiplicities, vec_row);
 
@@ -380,6 +383,7 @@ fn mult_packed_at(multiplicities: &[M31], vec_row: usize) -> PackedSecureField {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use num_traits::One;
 
     #[test]
     fn test_range_check_prove_verify_uint8() {
@@ -387,11 +391,9 @@ mod tests {
         let config = RangeCheckConfig::uint8();
         let values: Vec<M31> = (0..100).map(|i| M31::from(i % 256)).collect();
 
-        let proof = prove_range_check(&values, &config)
-            .expect("proving should succeed");
+        let proof = prove_range_check(&values, &config).expect("proving should succeed");
 
-        verify_range_check(&proof, &config, values.len())
-            .expect("verification should succeed");
+        verify_range_check(&proof, &config, values.len()).expect("verification should succeed");
     }
 
     #[test]
@@ -399,15 +401,19 @@ mod tests {
         // Small range [0, 15]
         let config = RangeCheckConfig::custom(0, 15);
         let values: Vec<M31> = vec![
-            M31::from(0), M31::from(5), M31::from(10), M31::from(15),
-            M31::from(7), M31::from(3), M31::from(12), M31::from(1),
+            M31::from(0),
+            M31::from(5),
+            M31::from(10),
+            M31::from(15),
+            M31::from(7),
+            M31::from(3),
+            M31::from(12),
+            M31::from(1),
         ];
 
-        let proof = prove_range_check(&values, &config)
-            .expect("proving should succeed");
+        let proof = prove_range_check(&values, &config).expect("proving should succeed");
 
-        verify_range_check(&proof, &config, values.len())
-            .expect("verification should succeed");
+        verify_range_check(&proof, &config, values.len()).expect("verification should succeed");
     }
 
     #[test]
@@ -428,8 +434,7 @@ mod tests {
         let config = RangeCheckConfig::custom(0, 15);
         let values: Vec<M31> = (0..16).map(|i| M31::from(i)).collect();
 
-        let mut proof = prove_range_check(&values, &config)
-            .expect("proving should succeed");
+        let mut proof = prove_range_check(&values, &config).expect("proving should succeed");
 
         // Tamper with the claimed sum
         proof.claimed_sum = proof.claimed_sum + SecureField::one();
