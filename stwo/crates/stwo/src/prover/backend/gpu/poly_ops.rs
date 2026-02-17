@@ -14,6 +14,9 @@
 
 use tracing::{span, Level};
 
+#[cfg(feature = "cuda-runtime")]
+use num_traits::One;
+
 use super::conversion::{
     circle_coeffs_ref_to_simd, circle_eval_ref_to_simd, twiddle_ref_to_simd, twiddle_to_gpu,
 };

@@ -254,12 +254,12 @@ if [[ "$SKIP_BUILD" == "false" ]]; then
     fi
 
     if (export CUDA_HOME="${CUDA_HOME:-${CUDA_PATH:-/usr/local/cuda}}"; cd "${LIBS_DIR}/stwo-ml" && \
-        cargo build --release --bin prove-model --features "${FEATURES}" 2>&1 | tail -5); then
+        cargo build --release --bin prove-model --features "${FEATURES}"); then
         ok "stwo-ml built (features: ${FEATURES})"
     else
         warn "GPU build failed, retrying CPU-only..."
         (cd "${LIBS_DIR}/stwo-ml" && \
-            cargo build --release --bin prove-model --features "cli" 2>&1 | tail -5)
+            cargo build --release --bin prove-model --features "cli")
         ok "stwo-ml built (CPU-only)"
     fi
 
