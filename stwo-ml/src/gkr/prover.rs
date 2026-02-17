@@ -399,6 +399,17 @@ pub fn prove_gkr_gpu(
     };
     let mut current_claim = output_claim.clone();
 
+    let total_work_layers = circuit.layers.iter().filter(|l| {
+        !matches!(l.layer_type, LayerType::Identity | LayerType::Input)
+    }).count();
+    let total_matmul_layers = circuit.layers.iter().filter(|l| {
+        matches!(l.layer_type, LayerType::MatMul { .. })
+    }).count();
+    let t_gkr_walk = std::time::Instant::now();
+    let mut done_work_layers: usize = 0;
+    let mut done_matmul_layers: usize = 0;
+    let mut last_progress = std::time::Instant::now();
+
     // Walk layers from output → input
     for layer_idx in (0..d).rev() {
         let layer = &circuit.layers[layer_idx];
@@ -517,6 +528,34 @@ pub fn prove_gkr_gpu(
 
         layer_proofs.push(proof);
         current_claim = next_claim;
+
+        done_work_layers += 1;
+        let is_matmul = matches!(&layer.layer_type, LayerType::MatMul { .. });
+        if is_matmul {
+            done_matmul_layers += 1;
+        }
+        let should_log = is_matmul
+            || done_work_layers == total_work_layers
+            || last_progress.elapsed().as_secs() >= 10;
+        if should_log {
+            let elapsed = t_gkr_walk.elapsed().as_secs_f64();
+            let eta = if done_work_layers > 0 {
+                let per_layer = elapsed / done_work_layers as f64;
+                per_layer * (total_work_layers.saturating_sub(done_work_layers)) as f64
+            } else {
+                0.0
+            };
+            eprintln!(
+                "  [GKR] progress: {}/{} layers (matmul {}/{}) elapsed {:.1}s, eta ~{:.0}s",
+                done_work_layers,
+                total_work_layers,
+                done_matmul_layers,
+                total_matmul_layers,
+                elapsed,
+                eta,
+            );
+            last_progress = std::time::Instant::now();
+        }
     }
 
     // Generate deferred proofs for skip branches of DAG Add layers BEFORE weight

@@ -4941,9 +4941,23 @@ where
     let has_logup = !activation_layers.is_empty() || !layernorm_layers.is_empty()
         || !embedding_layers.is_empty() || !quantize_layers.is_empty()
         || !dequantize_layers.is_empty();
+    let t_unified = std::time::Instant::now();
+    eprintln!(
+        "  [Unified STARK] components: act={} add={} mul={} ln={} emb={} q={} dq={} (logup={})",
+        activation_layers.len(),
+        add_layers.len(),
+        mul_layers.len(),
+        layernorm_layers.len(),
+        embedding_layers.len(),
+        quantize_layers.len(),
+        dequantize_layers.len(),
+        has_logup,
+    );
 
     // Tree 0: Preprocessed columns
     {
+        let t_tree0 = std::time::Instant::now();
+        eprintln!("  [Unified STARK] Tree 0/3: preprocessed columns...");
         let mut tree_builder = commitment_scheme.tree_builder();
         for layer in activation_layers {
             let sz = 1usize << layer.log_size;
@@ -4992,9 +5006,12 @@ where
             ]));
         }
         tree_builder.commit(channel);
+        eprintln!("  [Unified STARK] Tree 0 committed in {:.2}s", t_tree0.elapsed().as_secs_f64());
     }
 
     // Tree 1: Execution traces
+    let t_tree1 = std::time::Instant::now();
+    eprintln!("  [Unified STARK] Tree 1/3: execution traces...");
     let mut tree_builder = commitment_scheme.tree_builder();
     let mut activation_mults: Vec<Vec<M31>> = Vec::new();
     for layer in activation_layers {
@@ -5092,6 +5109,7 @@ where
         dequantize_mults.push(mults);
     }
     tree_builder.commit(channel);
+    eprintln!("  [Unified STARK] Tree 1 committed in {:.2}s", t_tree1.elapsed().as_secs_f64());
 
     channel.mix_u64(0);
 
@@ -5110,6 +5128,8 @@ where
     let mut dequantize_claimed_sums: Vec<SecureField> = Vec::new();
 
     if has_logup {
+        let t_tree2 = std::time::Instant::now();
+        eprintln!("  [Unified STARK] Tree 2/3: interaction (LogUp) traces...");
         if !activation_layers.is_empty() { activation_lookup = Some(ActivationRelation::draw(channel)); }
         if !layernorm_layers.is_empty() { layernorm_lookup = Some(LayerNormRelation::draw(channel)); }
         if !rmsnorm_layers.is_empty() { _rmsnorm_lookup = Some(RMSNormRelation::draw(channel)); }
@@ -5272,9 +5292,13 @@ where
         }
 
         tree_builder.commit(channel);
+        eprintln!("  [Unified STARK] Tree 2 committed in {:.2}s", t_tree2.elapsed().as_secs_f64());
+    } else {
+        eprintln!("  [Unified STARK] Tree 2/3 skipped (no LogUp components)");
     }
 
     // Build all components with shared allocator
+    eprintln!("  [Unified STARK] assembling AIR components...");
     let mut allocator = TraceLocationAllocator::default();
     let mut comp_storage: Vec<Box<dyn ComponentProverErased<B>>> = Vec::new();
     let mut activation_claims: Vec<LayerClaim> = Vec::new();
@@ -5414,12 +5438,17 @@ where
         &quantize_layers,
         &dequantize_layers,
     );
+    eprintln!("  [Unified STARK] proving (max_log_size={})...", max_log_size);
     let stark_proof = prove_unified_stark_with_gpu_pipeline::<B, Blake2sMerkleChannel>(
         &crefs,
         channel,
         commitment_scheme,
         max_log_size,
     )?;
+    eprintln!(
+        "  [Unified STARK] proof complete in {:.2}s",
+        t_unified.elapsed().as_secs_f64()
+    );
 
     Ok(UnifiedStarkOutput {
         stark_proof,
