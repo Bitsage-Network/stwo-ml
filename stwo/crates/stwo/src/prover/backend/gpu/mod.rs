@@ -54,11 +54,15 @@ use crate::core::vcs_lifted::poseidon252_merkle::Poseidon252MerkleChannel;
 pub mod compat;  // cudarc 0.11+ compatibility layer
 pub mod column;
 pub mod conversion;
+#[allow(unused)]
 pub mod fft;
+#[allow(unused)]
 pub mod fri;
 pub mod poly_ops;
+#[allow(unused)]
 pub mod quotients;
 pub mod accumulation;
+#[allow(unused)]
 pub mod merkle;
 pub mod merkle_lifted;
 pub mod gkr;
