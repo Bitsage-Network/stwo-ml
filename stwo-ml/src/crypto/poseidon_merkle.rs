@@ -7,9 +7,17 @@ use rayon::prelude::*;
 use starknet_crypto::poseidon_hash;
 use starknet_ff::FieldElement;
 
+#[cfg(feature = "cuda-runtime")]
+use stwo::prover::backend::gpu::cuda_executor::{
+    get_cuda_executor, is_cuda_available, upload_poseidon252_round_constants,
+};
+
 /// Minimum number of pairs per layer to trigger rayon parallelism.
 /// Below this, sequential hashing is faster due to rayon overhead.
 const PARALLEL_THRESHOLD: usize = 256;
+/// Minimum leaf-pair count to attempt GPU Merkle hashing in full-tree mode.
+#[cfg(feature = "cuda-runtime")]
+const GPU_MERKLE_THRESHOLD_PAIRS: usize = 1 << 14; // 16K pairs
 
 /// A binary Merkle tree with Poseidon hash.
 ///
@@ -66,6 +74,11 @@ impl PoseidonMerkleTree {
         let n = leaves.len().next_power_of_two().max(2);
         let mut padded = leaves;
         padded.resize(n, FieldElement::ZERO);
+
+        #[cfg(feature = "cuda-runtime")]
+        if let Some(gpu_layers) = try_build_parallel_gpu(&padded) {
+            return Self { layers: gpu_layers };
+        }
 
         let mut layers = vec![padded];
 
@@ -162,6 +175,93 @@ impl PoseidonMerkleTree {
 
         current == root
     }
+}
+
+#[cfg(feature = "cuda-runtime")]
+fn gpu_merkle_enabled() -> bool {
+    match std::env::var("STWO_GPU_MLE_MERKLE") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false" && v != "off"
+        }
+        // Default ON when CUDA runtime is built in.
+        Err(_) => true,
+    }
+}
+
+#[cfg(feature = "cuda-runtime")]
+fn field_element_to_u64_limbs(fe: &FieldElement) -> [u64; 4] {
+    let bytes = fe.to_bytes_be();
+    let mut limbs = [0u64; 4];
+    for (i, limb) in limbs.iter_mut().enumerate() {
+        let offset = 24 - i * 8;
+        let mut val = 0u64;
+        for j in 0..8 {
+            val = (val << 8) | bytes[offset + j] as u64;
+        }
+        *limb = val;
+    }
+    limbs
+}
+
+#[cfg(feature = "cuda-runtime")]
+fn u64_limbs_to_field_element(limbs: &[u64]) -> Option<FieldElement> {
+    if limbs.len() != 4 {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    for i in 0..4 {
+        let limb = limbs[3 - i];
+        bytes[i * 8..(i + 1) * 8].copy_from_slice(&limb.to_be_bytes());
+    }
+    // Match STWO GPU Poseidon conversion: keep only low 251 bits.
+    bytes[0] &= 0x07;
+    FieldElement::from_bytes_be(&bytes).ok()
+}
+
+#[cfg(feature = "cuda-runtime")]
+fn try_build_parallel_gpu(leaves: &[FieldElement]) -> Option<Vec<Vec<FieldElement>>> {
+    if !gpu_merkle_enabled() || !is_cuda_available() {
+        return None;
+    }
+    let n_leaf_hashes = leaves.len() / 2;
+    if n_leaf_hashes < GPU_MERKLE_THRESHOLD_PAIRS {
+        return None;
+    }
+
+    let executor = get_cuda_executor().ok()?;
+    let d_round_constants = upload_poseidon252_round_constants(&executor.device).ok()?;
+
+    let mut leaf_limbs = Vec::with_capacity(leaves.len() * 4);
+    for fe in leaves {
+        leaf_limbs.extend_from_slice(&field_element_to_u64_limbs(fe));
+    }
+    let d_prev_leaf = executor.device.htod_sync_copy(&leaf_limbs).ok()?;
+    let d_dummy_columns = executor.device.htod_sync_copy(&[0u32]).ok()?;
+
+    let raw_layers = executor
+        .execute_poseidon252_merkle_full_tree(
+            &d_dummy_columns,
+            0,
+            Some(&d_prev_leaf),
+            n_leaf_hashes,
+            &d_round_constants,
+        )
+        .ok()?;
+
+    let mut layers = Vec::with_capacity(raw_layers.len() + 1);
+    layers.push(leaves.to_vec());
+    for raw_layer in raw_layers {
+        if raw_layer.len() % 4 != 0 {
+            return None;
+        }
+        let mut layer = Vec::with_capacity(raw_layer.len() / 4);
+        for chunk in raw_layer.chunks_exact(4) {
+            layer.push(u64_limbs_to_field_element(chunk)?);
+        }
+        layers.push(layer);
+    }
+    Some(layers)
 }
 
 #[cfg(test)]

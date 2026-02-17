@@ -645,11 +645,24 @@ pub fn prove_gkr_gpu(
     let mut weight_claims = Vec::with_capacity(weight_data.len());
     let total_openings = weight_data.len();
     let t_openings = std::time::Instant::now();
+    let openings_progress_every = std::env::var("STWO_GKR_OPENINGS_PROGRESS_EVERY")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(1);
 
     for (i, (weight_node_id, eval_point, expected_value)) in weight_data.into_iter().enumerate() {
         let b_matrix = weights
             .get_weight(weight_node_id)
             .ok_or(GKRError::MissingWeight { node_id: weight_node_id })?;
+        eprintln!(
+            "  [GKR] weight opening {}/{} start: node={}, shape={}x{}",
+            i + 1,
+            total_openings,
+            weight_node_id,
+            b_matrix.rows,
+            b_matrix.cols,
+        );
         let b_padded = pad_matrix_pow2(b_matrix);
         let b_mle = matrix_to_mle_col_major(&b_padded);
 
@@ -663,7 +676,9 @@ pub fn prove_gkr_gpu(
         weight_commitments.push(commitment);
         weight_openings.push(opening);
 
-        if total_openings > 0 && ((i + 1) % 4 == 0 || i + 1 == total_openings) {
+        if total_openings > 0
+            && (((i + 1) % openings_progress_every == 0) || i + 1 == total_openings)
+        {
             let elapsed = t_openings.elapsed().as_secs_f64();
             let eta = if i + 1 > 0 {
                 let per = elapsed / (i + 1) as f64;
