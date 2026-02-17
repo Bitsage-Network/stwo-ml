@@ -284,4 +284,11 @@ mod tests {
     fn test_pcs_prove_and_verify_simd_with_barycentric() {
         assert!(prove_and_verify_pcs::<SimdBackend, false>().is_ok());
     }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_pcs_prove_and_verify_gpu_store_coeffs() {
+        use crate::prover::backend::gpu::GpuBackend;
+        assert!(prove_and_verify_pcs::<GpuBackend, true>().is_ok());
+    }
 }

@@ -102,6 +102,66 @@ pub(crate) fn data_log_size(data_len: usize) -> u32 {
     min_size.ilog2()
 }
 
+/// Maximum log-size across all unified-STARK component traces.
+fn unified_stark_max_log_size(
+    activation_layers: &[ActivationLayerData],
+    add_layers: &[AddLayerData],
+    mul_layers: &[MulLayerData],
+    layernorm_layers: &[LayerNormLayerData],
+    rmsnorm_layers: &[RMSNormLayerData],
+    embedding_layers: &[EmbeddingLayerData],
+    quantize_layers: &[QuantizeLayerData],
+    dequantize_layers: &[DequantizeLayerData],
+) -> u32 {
+    activation_layers.iter().map(|l| l.log_size)
+        .chain(add_layers.iter().map(|l| l.log_size))
+        .chain(mul_layers.iter().map(|l| l.log_size))
+        .chain(layernorm_layers.iter().map(|l| l.log_size))
+        .chain(rmsnorm_layers.iter().map(|l| l.log_size))
+        .chain(embedding_layers.iter().map(|l| l.log_size))
+        .chain(quantize_layers.iter().map(|l| l.log_size))
+        .chain(dequantize_layers.iter().map(|l| l.log_size))
+        .max()
+        .unwrap_or(LOG_N_LANES as u32)
+}
+
+#[cfg(feature = "cuda-runtime")]
+fn maybe_init_gpu_unified_pipeline<B>(
+    max_log_size: u32,
+) -> Option<stwo::prover::backend::gpu::pipeline::GpuProofPipeline> {
+    // Keep this dispatch local to avoid changing generic proving semantics.
+    // We only initialize when the selected backend is GpuBackend.
+    let is_gpu_backend = std::any::type_name::<B>().ends_with("GpuBackend");
+    if !is_gpu_backend {
+        return None;
+    }
+
+    match stwo::prover::backend::gpu::pipeline::GpuProofPipeline::new(max_log_size.max(1)) {
+        Ok(pipeline) => Some(pipeline),
+        Err(err) => {
+            tracing::warn!("GpuProofPipeline init failed, falling back to generic GPU path: {err}");
+            None
+        }
+    }
+}
+
+fn prove_unified_stark_with_gpu_pipeline<B, MC>(
+    component_refs: &[&dyn ComponentProver<B>],
+    channel: &mut MC::C,
+    commitment_scheme: CommitmentSchemeProver<'_, B, MC>,
+    _max_log_size: u32,
+) -> Result<StarkProof<MC::H>, AggregationError>
+where
+    B: BackendForChannel<MC>,
+    MC: MerkleChannel,
+{
+    #[cfg(feature = "cuda-runtime")]
+    let _pipeline_guard = maybe_init_gpu_unified_pipeline::<B>(_max_log_size);
+
+    prove::<B, MC>(component_refs, channel, commitment_scheme)
+        .map_err(|e| AggregationError::ProvingError(format!("{e:?}")))
+}
+
 /// Compute a layer chain commitment: a running Poseidon hash over ALL intermediate
 /// values at each layer boundary.
 ///
@@ -599,17 +659,24 @@ where
 
             GraphOp::Activation { activation_type, .. } => {
                 let f = activation_type.as_fn();
-                let output = crate::compiler::prove::apply_activation_pub(&current, &*f);
-
                 let act_log_size = activation_type.recommended_table_log_size();
+                let table_mask = (1u32 << act_log_size) - 1;
+
+                // Reduce inputs to table range for LogUp consistency
+                let reduced_inputs: Vec<M31> = current.data.iter()
+                    .map(|&x| M31::from(x.0 & table_mask))
+                    .collect();
+                let reduced_matrix = M31Matrix {
+                    rows: current.rows, cols: current.cols, data: reduced_inputs.clone(),
+                };
+                let output = crate::compiler::prove::apply_activation_pub(&reduced_matrix, &*f);
+
                 let table = PrecomputedTable::build(|x| (*f)(x), act_log_size);
-                let flat_inputs = current.data.clone();
-                let flat_outputs = output.data.clone();
 
                 activation_layers.push(ActivationLayerData {
                     node_id: node.id,
-                    inputs: flat_inputs,
-                    outputs: flat_outputs,
+                    inputs: reduced_inputs,
+                    outputs: output.data.clone(),
                     table,
                     log_size: act_log_size,
                     type_tag: activation_type.type_tag(),
@@ -1696,11 +1763,22 @@ where
         .map(|c| c.as_component_prover())
         .collect();
 
-    let stark_proof = prove::<B, MC>(
+    let max_log_size = unified_stark_max_log_size(
+        &activation_layers,
+        &add_layers,
+        &mul_layers,
+        &layernorm_layers,
+        &rmsnorm_layers,
+        &embedding_layers,
+        &quantize_layers,
+        &dequantize_layers,
+    );
+    let stark_proof = prove_unified_stark_with_gpu_pipeline::<B, MC>(
         &component_refs,
         channel,
         commitment_scheme,
-    ).map_err(|e| AggregationError::ProvingError(format!("{e:?}")))?;
+        max_log_size,
+    )?;
 
     let quantize_params_commitment = compute_quantize_params_commitment(&quantize_layers);
 
@@ -2042,17 +2120,24 @@ where
                     step + 1, total_nodes, node.id, activation_type,
                 );
                 let f = activation_type.as_fn();
-                let output = crate::compiler::prove::apply_activation_pub(&current, &*f);
-
                 let act_log_size = activation_type.recommended_table_log_size();
+                let table_mask = (1u32 << act_log_size) - 1;
+
+                // Reduce inputs to table range for LogUp consistency
+                let reduced_inputs: Vec<M31> = current.data.iter()
+                    .map(|&x| M31::from(x.0 & table_mask))
+                    .collect();
+                let reduced_matrix = M31Matrix {
+                    rows: current.rows, cols: current.cols, data: reduced_inputs.clone(),
+                };
+                let output = crate::compiler::prove::apply_activation_pub(&reduced_matrix, &*f);
+
                 let table = PrecomputedTable::build(|x| (*f)(x), act_log_size);
-                let flat_inputs = current.data.clone();
-                let flat_outputs = output.data.clone();
 
                 activation_layers.push(ActivationLayerData {
                     node_id: node.id,
-                    inputs: flat_inputs,
-                    outputs: flat_outputs,
+                    inputs: reduced_inputs,
+                    outputs: output.data.clone(),
                     table,
                     log_size: act_log_size,
                     type_tag: activation_type.type_tag(),
@@ -3418,11 +3503,22 @@ where
         .map(|c| c.as_component_prover())
         .collect();
 
-    let stark_proof = prove::<B, Blake2sMerkleChannel>(
+    let max_log_size = unified_stark_max_log_size(
+        &activation_layers,
+        &add_layers,
+        &mul_layers,
+        &layernorm_layers,
+        &rmsnorm_layers,
+        &embedding_layers,
+        &quantize_layers,
+        &dequantize_layers,
+    );
+    let stark_proof = prove_unified_stark_with_gpu_pipeline::<B, Blake2sMerkleChannel>(
         &component_refs,
         channel,
         commitment_scheme,
-    ).map_err(|e| AggregationError::ProvingError(format!("{e:?}")))?;
+        max_log_size,
+    )?;
 
     eprintln!(
         "Unified STARK proof complete in {:.2}s (total pipeline: {:.1}s)",
@@ -3912,19 +4008,26 @@ where
 
             GraphOp::Activation { activation_type, .. } => {
                 let f = activation_type.as_fn();
-                let output_data: Vec<M31> = current.data.iter()
+                let act_log_size = activation_type.recommended_table_log_size();
+                let table_mask = (1u32 << act_log_size) - 1;
+
+                // Reduce inputs to table range so LogUp trace entries stay within
+                // the precomputed table. M31 matmul outputs can exceed 2^16.
+                let reduced_inputs: Vec<M31> = current.data.iter()
+                    .map(|&x| M31::from(x.0 & table_mask))
+                    .collect();
+                let output_data: Vec<M31> = reduced_inputs.iter()
                     .map(|&x| (*f)(x))
                     .collect();
                 let output = M31Matrix {
                     rows: current.rows, cols: current.cols, data: output_data,
                 };
 
-                let act_log_size = activation_type.recommended_table_log_size();
                 let table = PrecomputedTable::build(|x| (*f)(x), act_log_size);
 
                 activation_layers.push(ActivationLayerData {
                     node_id: node.id,
-                    inputs: current.data.clone(),
+                    inputs: reduced_inputs,
                     outputs: output.data.clone(),
                     table,
                     log_size: act_log_size,
@@ -4484,14 +4587,23 @@ pub(crate) fn collect_forward_pass_layer_data(
 
             GraphOp::Activation { activation_type, .. } => {
                 let f = activation_type.as_fn();
-                let output = crate::compiler::prove::apply_activation_pub(&current, &*f);
-
                 let act_log_size = activation_type.recommended_table_log_size();
+                let table_mask = (1u32 << act_log_size) - 1;
+
+                // Reduce inputs to table range for LogUp consistency
+                let reduced_inputs: Vec<M31> = current.data.iter()
+                    .map(|&x| M31::from(x.0 & table_mask))
+                    .collect();
+                let reduced_matrix = M31Matrix {
+                    rows: current.rows, cols: current.cols, data: reduced_inputs.clone(),
+                };
+                let output = crate::compiler::prove::apply_activation_pub(&reduced_matrix, &*f);
+
                 let table = PrecomputedTable::build(|x| (*f)(x), act_log_size);
 
                 activation_layers.push(ActivationLayerData {
                     node_id: node.id,
-                    inputs: current.data.clone(),
+                    inputs: reduced_inputs,
                     outputs: output.data.clone(),
                     table,
                     log_size: act_log_size,
@@ -5289,9 +5401,22 @@ where
     let crefs: Vec<&dyn ComponentProver<B>> = comp_storage.iter()
         .map(|c| c.as_component_prover()).collect();
 
-    let stark_proof = prove::<B, Blake2sMerkleChannel>(
-        &crefs, channel, commitment_scheme,
-    ).map_err(|e| AggregationError::ProvingError(format!("{e:?}")))?;
+    let max_log_size = unified_stark_max_log_size(
+        &activation_layers,
+        &add_layers,
+        &mul_layers,
+        &layernorm_layers,
+        &rmsnorm_layers,
+        &embedding_layers,
+        &quantize_layers,
+        &dequantize_layers,
+    );
+    let stark_proof = prove_unified_stark_with_gpu_pipeline::<B, Blake2sMerkleChannel>(
+        &crefs,
+        channel,
+        commitment_scheme,
+        max_log_size,
+    )?;
 
     Ok(UnifiedStarkOutput {
         stark_proof,
@@ -5725,7 +5850,15 @@ pub fn verify_aggregated_model_proof(
             }
             GraphOp::Activation { activation_type, .. } => {
                 let f = activation_type.as_fn();
-                let output = crate::compiler::prove::apply_activation_pub(&current, &*f);
+                let act_log_size = activation_type.recommended_table_log_size();
+                let table_mask = (1u32 << act_log_size) - 1;
+                let reduced_data: Vec<M31> = current.data.iter()
+                    .map(|&x| M31::from(x.0 & table_mask))
+                    .collect();
+                let reduced = M31Matrix {
+                    rows: current.rows, cols: current.cols, data: reduced_data,
+                };
+                let output = crate::compiler::prove::apply_activation_pub(&reduced, &*f);
                 node_outputs.insert(node.id, output.clone());
                 current = output;
             }
@@ -6003,7 +6136,15 @@ pub fn verify_aggregated_model_proof_onchain(
             }
             GraphOp::Activation { activation_type, .. } => {
                 let f = activation_type.as_fn();
-                let output = crate::compiler::prove::apply_activation_pub(&current, &*f);
+                let act_log_size = activation_type.recommended_table_log_size();
+                let table_mask = (1u32 << act_log_size) - 1;
+                let reduced_data: Vec<M31> = current.data.iter()
+                    .map(|&x| M31::from(x.0 & table_mask))
+                    .collect();
+                let reduced = M31Matrix {
+                    rows: current.rows, cols: current.cols, data: reduced_data,
+                };
+                let output = crate::compiler::prove::apply_activation_pub(&reduced, &*f);
                 node_outputs.insert(node.id, output.clone());
                 current = output;
             }

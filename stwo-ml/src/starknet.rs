@@ -251,6 +251,8 @@ pub enum StarknetModelError {
     ProvingError(#[from] ModelError),
     #[error("Serialization error: {0}")]
     SerializationError(String),
+    #[error("Soundness gate failed: {0}")]
+    SoundnessGate(String),
     #[error("Aggregation error: {0}")]
     AggregationError(#[from] AggregationError),
 }
@@ -680,6 +682,60 @@ pub struct GkrStarknetProof {
     pub total_calldata_size: usize,
 }
 
+/// Strict soundness gates for GKR serialization/submission.
+///
+/// Rejects proofs that weaken on-chain verification guarantees:
+/// - Activation layers must include LogUp proofs.
+/// - All MatMul weight claims must have matching non-empty opening proofs.
+fn enforce_gkr_soundness_gates(proof: &crate::gkr::GKRProof) -> Result<(), StarknetModelError> {
+    use crate::gkr::LayerProof;
+
+    for (layer_idx, layer_proof) in proof.layer_proofs.iter().enumerate() {
+        if let LayerProof::Activation { logup_proof, .. } = layer_proof {
+            if logup_proof.is_none() {
+                return Err(StarknetModelError::SoundnessGate(format!(
+                    "activation layer {} missing LogUp proof",
+                    layer_idx
+                )));
+            }
+        }
+    }
+
+    let n_main = proof.weight_claims.len();
+    if proof.weight_commitments.len() != n_main {
+        return Err(StarknetModelError::SoundnessGate(format!(
+            "weight commitments ({}) != weight claims ({})",
+            proof.weight_commitments.len(),
+            n_main
+        )));
+    }
+    if proof.weight_openings.len() != n_main {
+        return Err(StarknetModelError::SoundnessGate(format!(
+            "weight openings ({}) != weight claims ({})",
+            proof.weight_openings.len(),
+            n_main
+        )));
+    }
+    for (i, opening) in proof.weight_openings.iter().enumerate() {
+        if opening.queries.is_empty() {
+            return Err(StarknetModelError::SoundnessGate(format!(
+                "weight opening {} has no Merkle queries",
+                i
+            )));
+        }
+    }
+    for (i, deferred) in proof.deferred_proofs.iter().enumerate() {
+        if deferred.weight_opening.queries.is_empty() {
+            return Err(StarknetModelError::SoundnessGate(format!(
+                "deferred weight opening {} has no Merkle queries",
+                i
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 /// Build GKR model calldata for the `verify_model_gkr()` contract entry point.
 ///
 /// Wraps `serialize_gkr_model_proof()` output with the `model_id` parameter.
@@ -708,6 +764,7 @@ pub fn build_gkr_starknet_proof(
     let gkr_proof = proof.gkr_proof.as_ref().ok_or_else(|| {
         StarknetModelError::SerializationError("No GKR proof in aggregated proof".to_string())
     })?;
+    enforce_gkr_soundness_gates(gkr_proof)?;
 
     // Serialize ONLY proof_data for verify_model_gkr(proof_data: Array<felt252>).
     // Full serialize_gkr_model_proof includes header/footer fields that the
@@ -923,8 +980,10 @@ pub fn build_verify_model_gkr_calldata(
     circuit: &crate::gkr::LayeredCircuit,
     model_id: FieldElement,
     raw_io_data: &[FieldElement],
-) -> VerifyModelGkrCalldata {
+) -> Result<VerifyModelGkrCalldata, StarknetModelError> {
     use crate::cairo_serde::serialize_gkr_proof_data_only;
+
+    enforce_gkr_soundness_gates(proof)?;
 
     let mut parts = Vec::new();
 
@@ -999,10 +1058,10 @@ pub fn build_verify_model_gkr_calldata(
     }
 
     let total_felts = parts.len();
-    VerifyModelGkrCalldata {
+    Ok(VerifyModelGkrCalldata {
         calldata_parts: parts,
         total_felts,
-    }
+    })
 }
 
 
@@ -1827,5 +1886,73 @@ mod tests {
 
         let result = build_gkr_starknet_proof(&agg_proof, FieldElement::from(1u64), &input);
         assert!(result.is_err(), "should fail: no GKR proof in standard pipeline");
+    }
+
+    #[test]
+    fn test_gkr_soundness_gate_rejects_missing_activation_logup() {
+        use crate::aggregation::prove_model_pure_gkr;
+        use crate::gkr::LayerProof;
+
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(4).activation(ActivationType::ReLU).linear(2);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+
+        let mut weights = GraphWeights::new();
+        let mut w0 = M31Matrix::new(4, 4);
+        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        weights.add_weight(0, w0);
+        let mut w2 = M31Matrix::new(4, 2);
+        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        weights.add_weight(2, w2);
+
+        let mut agg_proof = prove_model_pure_gkr(&graph, &input, &weights)
+            .expect("GKR proving should succeed");
+        let gkr = agg_proof.gkr_proof.as_mut().expect("GKR proof expected");
+        for layer in &mut gkr.layer_proofs {
+            if let LayerProof::Activation { logup_proof, .. } = layer {
+                *logup_proof = None;
+                break;
+            }
+        }
+
+        let err = build_gkr_starknet_proof(&agg_proof, FieldElement::from(7u64), &input)
+            .expect_err("soundness gate must reject missing activation LogUp");
+        match err {
+            StarknetModelError::SoundnessGate(_) => {}
+            other => panic!("expected SoundnessGate error, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_gkr_soundness_gate_rejects_missing_weight_openings() {
+        use crate::aggregation::prove_model_pure_gkr;
+
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(2);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+
+        let mut weights = GraphWeights::new();
+        let mut w = M31Matrix::new(4, 2);
+        for i in 0..4 { for j in 0..2 { w.set(i, j, M31::from((i * 2 + j + 1) as u32)); } }
+        weights.add_weight(0, w);
+
+        let mut agg_proof = prove_model_pure_gkr(&graph, &input, &weights)
+            .expect("GKR proving should succeed");
+        let gkr = agg_proof.gkr_proof.as_mut().expect("GKR proof expected");
+        assert!(!gkr.weight_openings.is_empty(), "test setup requires weight openings");
+        gkr.weight_openings.clear();
+
+        let err = build_gkr_starknet_proof(&agg_proof, FieldElement::from(9u64), &input)
+            .expect_err("soundness gate must reject missing weight openings");
+        match err {
+            StarknetModelError::SoundnessGate(_) => {}
+            other => panic!("expected SoundnessGate error, got: {other}"),
+        }
     }
 }

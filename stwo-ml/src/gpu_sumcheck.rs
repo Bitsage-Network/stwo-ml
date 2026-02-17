@@ -2060,52 +2060,29 @@ impl GpuSumcheckExecutor {
 
         let log_k = pk.ilog2() as usize;
 
-        // Run sumcheck rounds on CPU (downloading each round)
-        // This is a correct but not fully GPU-resident implementation.
-        // A fully pipelined version would keep Fiat-Shamir on device.
-        let mut f_a_u32 = vec![0u32; pk * 4];
-        let mut f_b_u32 = vec![0u32; pk * 4];
-        self.device.dtoh_sync_copy_into(&d_f_a, &mut f_a_u32)
-            .map_err(|e| CudaFftError::MemoryTransfer(format!("reduce f_a: {:?}", e)))?;
-        self.device.dtoh_sync_copy_into(&d_f_b, &mut f_b_u32)
-            .map_err(|e| CudaFftError::MemoryTransfer(format!("reduce f_b: {:?}", e)))?;
-
-        let f_a: Vec<SecureField> = f_a_u32.chunks_exact(4)
-            .map(|c| u32s_to_secure_field(&[c[0], c[1], c[2], c[3]]))
-            .collect();
-        let f_b: Vec<SecureField> = f_b_u32.chunks_exact(4)
-            .map(|c| u32s_to_secure_field(&[c[0], c[1], c[2], c[3]]))
-            .collect();
-
-        // CPU sumcheck (reuses existing prove_batch-style logic)
-        let mut cur_f_a = f_a;
-        let mut cur_f_b = f_b;
+        // GPU-resident sumcheck rounds:
+        // - round polynomial reduction on GPU
+        // - MLE folding on GPU
+        // Fiat-Shamir transcript remains on CPU for protocol compatibility.
+        let mut d_f_a_cur = d_f_a;
+        let mut d_f_b_cur = d_f_b;
         let mut round_polys = Vec::with_capacity(log_k);
         let mut challenges = Vec::with_capacity(log_k);
         let mut cur_n = pk;
+        let two = SecureField::from(M31::from(2u32));
+        let inv2 = two.inverse();
 
         for _ in 0..log_k {
             let mid = cur_n / 2;
 
-            // Evaluate round poly at t=0,1,2
-            let mut s0 = SecureField::zero();
-            let mut s1 = SecureField::zero();
-            let mut s2 = SecureField::zero();
-            for i in 0..mid {
-                let a0 = cur_f_a[i];
-                let a1 = cur_f_a[mid + i];
-                let b0 = cur_f_b[i];
-                let b1 = cur_f_b[mid + i];
-                s0 = s0 + a0 * b0;
-                s1 = s1 + a1 * b1;
-                let a2 = a1 + a1 - a0;
-                let b2 = b1 + b1 - b0;
-                s2 = s2 + a2 * b2;
-            }
+            // Evaluate round poly at t=0,1,2 on GPU.
+            let (s0_raw, s1_raw, s2_raw) =
+                self.compute_round_poly(&d_f_a_cur, &d_f_b_cur, mid)?;
+            let s0 = u32s_to_secure_field(&s0_raw);
+            let s1 = u32s_to_secure_field(&s1_raw);
+            let s2 = u32s_to_secure_field(&s2_raw);
 
             // Lagrange interpolation: (0, s0), (1, s1), (2, s2) → c0, c1, c2
-            let two = SecureField::from(M31::from(2u32));
-            let inv2 = two.inverse();
             let c0 = s0;
             let c2 = (s2 - s1 - s1 + s0) * inv2;
             let c1 = s1 - s0 - c2;
@@ -2118,20 +2095,25 @@ impl GpuSumcheckExecutor {
             let alpha = channel.draw_qm31();
             challenges.push(alpha);
 
-            // Fold
-            let mut new_f_a = Vec::with_capacity(mid);
-            let mut new_f_b = Vec::with_capacity(mid);
-            for i in 0..mid {
-                new_f_a.push(cur_f_a[i] + alpha * (cur_f_a[mid + i] - cur_f_a[i]));
-                new_f_b.push(cur_f_b[i] + alpha * (cur_f_b[mid + i] - cur_f_b[i]));
-            }
-            cur_f_a = new_f_a;
-            cur_f_b = new_f_b;
+            // Fold both MLEs on GPU at the Fiat-Shamir challenge.
+            let alpha_u32 = secure_field_to_u32s(alpha);
+            let new_d_f_a = self.mle_fold(&d_f_a_cur, cur_n, &alpha_u32)?;
+            let new_d_f_b = self.mle_fold(&d_f_b_cur, cur_n, &alpha_u32)?;
+
+            d_f_a_cur = new_d_f_a;
+            d_f_b_cur = new_d_f_b;
             cur_n = mid;
         }
 
-        let final_a_eval = cur_f_a[0];
-        let final_b_eval = cur_f_b[0];
+        debug_assert_eq!(cur_n, 1);
+        let mut final_a_u32 = [0u32; 4];
+        let mut final_b_u32 = [0u32; 4];
+        self.device.dtoh_sync_copy_into(&d_f_a_cur, &mut final_a_u32)
+            .map_err(|e| CudaFftError::MemoryTransfer(format!("reduce final_a: {:?}", e)))?;
+        self.device.dtoh_sync_copy_into(&d_f_b_cur, &mut final_b_u32)
+            .map_err(|e| CudaFftError::MemoryTransfer(format!("reduce final_b: {:?}", e)))?;
+        let final_a_eval = u32s_to_secure_field(&final_a_u32);
+        let final_b_eval = u32s_to_secure_field(&final_b_u32);
 
         Ok(GpuMatMulReduction {
             round_polys,

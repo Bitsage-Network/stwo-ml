@@ -1,0 +1,36 @@
+name: stwo-ml-soundness-gates
+
+on:
+  pull_request:
+    paths:
+      - "stwo-ml/**"
+      - ".github/workflows/stwo-ml-soundness-gates.yml"
+  push:
+    branches: [main]
+    paths:
+      - "stwo-ml/**"
+      - ".github/workflows/stwo-ml-soundness-gates.yml"
+
+jobs:
+  soundness:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: stwo-ml
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: stwo-ml
+
+      - name: Activation LogUp Gate
+        run: cargo test --lib gkr_soundness_gate_rejects_missing_activation_logup -- --nocapture
+
+      - name: Weight Opening Gate
+        run: cargo test --lib gkr_soundness_gate_rejects_missing_weight_openings -- --nocapture

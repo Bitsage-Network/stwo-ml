@@ -28,6 +28,18 @@ use crate::prover::vcs_lifted::prover::MerkleProverLifted;
 
 pub mod quotient_ops;
 
+#[cfg(feature = "gpu")]
+#[inline]
+fn use_gpu_folding_oods_eval<B>() -> bool {
+    core::any::type_name::<B>() == core::any::type_name::<crate::prover::backend::gpu::GpuBackend>()
+}
+
+#[cfg(not(feature = "gpu"))]
+#[inline]
+fn use_gpu_folding_oods_eval<B>() -> bool {
+    false
+}
+
 /// The prover side of a FRI polynomial commitment scheme. See [super].
 pub struct CommitmentSchemeProver<'a, B: BackendForChannel<MC>, MC: MerkleChannel> {
     pub trees: TreeVec<CommitmentTreeProver<B, MC>>,
@@ -158,6 +170,9 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             Some(self.build_weights_hash_map(&sampled_points, lifting_log_size))
         };
 
+        let use_folding_oods_eval =
+            self.store_polynomials_coefficients && use_gpu_folding_oods_eval::<B>();
+
         // Lambda that evaluates a polynomial on a collection of circle points and returns a vector
         // of point samples.
         let eval_at_points = |(poly, points): (&Poly<B>, &Vec<CirclePoint<SecureField>>)| {
@@ -165,10 +180,17 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
                 .iter()
                 .map(|&point| PointSample {
                     point,
-                    value: poly.eval_at_point(
-                        point.repeated_double(lifting_log_size - poly.evals.domain.log_size()),
-                        weights_hash_map.as_ref(),
-                    ),
+                    value: {
+                        let folded_point =
+                            point.repeated_double(lifting_log_size - poly.evals.domain.log_size());
+                        if use_folding_oods_eval {
+                            // Keep OODS evaluation on the fold path (GPU-native for GpuBackend).
+                            poly.evals
+                                .eval_at_point_by_folding(folded_point, self.twiddles)
+                        } else {
+                            poly.eval_at_point(folded_point, weights_hash_map.as_ref())
+                        }
+                    },
                 })
                 .collect_vec()
         };

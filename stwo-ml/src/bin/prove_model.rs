@@ -1154,15 +1154,22 @@ fn main() {
                 match stwo_ml::gkr::LayeredCircuit::from_graph(&model.graph) {
                     Ok(circuit) => {
                         let raw_io = stwo_ml::cairo_serde::serialize_raw_io(&input, &proof.execution.output);
-                        let vc = build_verify_model_gkr_calldata(gkr_p, &circuit, model_id, &raw_io);
-                        eprintln!("  verify_calldata: {} parts (ready for submission)", vc.total_felts);
-                        Some(serde_json::json!({
-                            "schema_version": 1,
-                            "entrypoint": "verify_model_gkr",
-                            "calldata": vc.calldata_parts,
-                            "total_felts": vc.total_felts,
-                            "upload_chunks": Vec::<Vec<String>>::new(),
-                        }))
+                        match build_verify_model_gkr_calldata(gkr_p, &circuit, model_id, &raw_io) {
+                            Ok(vc) => {
+                                eprintln!("  verify_calldata: {} parts (ready for submission)", vc.total_felts);
+                                Some(serde_json::json!({
+                                    "schema_version": 1,
+                                    "entrypoint": "verify_model_gkr",
+                                    "calldata": vc.calldata_parts,
+                                    "total_felts": vc.total_felts,
+                                    "upload_chunks": Vec::<Vec<String>>::new(),
+                                }))
+                            }
+                            Err(e) => {
+                                eprintln!("  Warning: soundness gate rejected verify_calldata: {e}");
+                                None
+                            }
+                        }
                     }
                     Err(e) => {
                         eprintln!("  Warning: could not build verify_calldata: {e}");
@@ -1363,7 +1370,10 @@ fn submit_gkr_onchain(
     let raw_io_data = stwo_ml::cairo_serde::serialize_raw_io(input, &proof.execution.output);
     let verify_calldata = build_verify_model_gkr_calldata(
         gkr_proof, &circuit, model_id, &raw_io_data,
-    );
+    ).unwrap_or_else(|e| {
+        eprintln!("Error: soundness gate rejected GKR calldata: {e}");
+        process::exit(1);
+    });
 
     eprintln!("  Calldata: {} parts ({} estimated felts)", verify_calldata.total_felts, verify_calldata.total_felts);
 

@@ -511,7 +511,7 @@ impl GpuFftContext {
             stats: FftStats::default(),
         }
     }
-    
+
     /// Get or compute twiddles for a given log_size.
     pub fn get_twiddles(&mut self, log_size: u32) -> &GpuTwiddles {
         if !self.twiddle_cache.contains_key(&log_size) {
@@ -526,28 +526,28 @@ impl GpuFftContext {
 fn compute_twiddles_for_gpu(log_size: u32) -> GpuTwiddles {
     use crate::core::poly::circle::CanonicCoset;
     use crate::core::utils::bit_reverse;
-    
+
     let coset = CanonicCoset::new(log_size).circle_domain().half_coset;
     let mut all_twiddles = Vec::new();
     let mut layer_offsets = Vec::new();
-    
+
     let mut current_coset = coset;
     for _layer in 0..log_size {
         layer_offsets.push(all_twiddles.len());
-        
+
         let layer_twiddles: Vec<u32> = current_coset
             .iter()
             .take(current_coset.size() / 2)
-            .map(|p| p.x.inverse().0 * 2)  // Doubled twiddle
+            .map(|p| p.x.inverse().0 * 2) // Doubled twiddle
             .collect();
-        
+
         let mut reversed = layer_twiddles;
         bit_reverse(&mut reversed);
-        
+
         all_twiddles.extend(reversed);
         current_coset = current_coset.double();
     }
-    
+
     GpuTwiddles {
         data: all_twiddles,
         layer_offsets,
@@ -559,34 +559,34 @@ fn compute_twiddles_for_gpu(log_size: u32) -> GpuTwiddles {
 // =============================================================================
 
 /// Compute inverse twiddles (doubled) on CPU for GPU IFFT.
-/// 
+///
 /// This function generates the twiddle factors needed for the inverse Circle FFT,
 /// using the EXACT same structure as the CPU backend.
-/// 
+///
 /// # Structure
-/// 
+///
 /// For a domain of size 2^log_size:
 /// - Layer 0 (circle layer): n/4 twiddles, derived from layer 1 via [y, -y, -x, x] pattern
 /// - Layer 1: n/4 twiddles (first line layer)
 /// - Layer 2: n/8 twiddles
 /// - ...
 /// - Layer log_size-1: 1 twiddle
-/// 
+///
 /// Total layers: log_size
-/// 
+///
 /// # Arguments
 /// * `log_size` - The log2 of the domain size
-/// 
+///
 /// # Returns
 /// A vector of vectors, where each inner vector contains the doubled inverse
 /// twiddles for that layer, in bit-reversed order.
-/// 
+///
 /// Note: Results are cached per log_size to avoid recomputation.
 pub fn compute_itwiddle_dbls_cpu(log_size: u32) -> Vec<Vec<u32>> {
-    use std::sync::OnceLock;
     use std::collections::HashMap;
     use std::sync::Mutex;
-    
+    use std::sync::OnceLock;
+
     // Cache for computed twiddles
     static ITWIDDLE_CACHE: OnceLock<Mutex<HashMap<u32, Vec<Vec<u32>>>>> = OnceLock::new();
 
@@ -622,35 +622,35 @@ pub fn compute_itwiddle_dbls_cpu(log_size: u32) -> Vec<Vec<u32>> {
 
 /// Internal function that actually computes the twiddles (uncached).
 fn compute_itwiddle_dbls_cpu_uncached(log_size: u32) -> Vec<Vec<u32>> {
+    use crate::core::fields::m31::BaseField;
     use crate::core::poly::circle::CanonicCoset;
     use crate::core::utils::bit_reverse;
-    use crate::core::fields::m31::BaseField;
     use itertools::Itertools;
-    
+
     // Get the half_coset from the domain
     let half_coset = CanonicCoset::new(log_size).circle_domain().half_coset;
-    
+
     // Compute line twiddles (layers 1+)
     // This matches the CPU backend's get_itwiddle_dbls
     let mut line_twiddles: Vec<Vec<u32>> = Vec::new();
     let mut current_coset = half_coset;
-    
+
     for _ in 0..current_coset.log_size() {
         // Collect twiddles: inverse of x-coordinate, doubled
         let layer_twiddles: Vec<u32> = current_coset
             .iter()
             .take(current_coset.size() / 2)
-            .map(|p| p.x.inverse().0 * 2)  // Doubled inverse twiddle
+            .map(|p| p.x.inverse().0 * 2) // Doubled inverse twiddle
             .collect_vec();
-        
+
         // Bit-reverse the twiddles
         let mut reversed = layer_twiddles;
         bit_reverse(&mut reversed);
-        
+
         line_twiddles.push(reversed);
         current_coset = current_coset.double();
     }
-    
+
     // Compute circle twiddles (layer 0) from first line layer
     // This matches CPU's circle_twiddles_from_line_twiddles
     // For each pair (x, y) in line_twiddles[0], produces [y, -y, -x, x]
@@ -658,9 +658,9 @@ fn compute_itwiddle_dbls_cpu_uncached(log_size: u32) -> Vec<Vec<u32>> {
         // Convert u32 back to BaseField to do field operations
         let first_line: Vec<BaseField> = line_twiddles[0]
             .iter()
-            .map(|&v| BaseField::from_u32_unchecked(v / 2))  // Undo doubling
+            .map(|&v| BaseField::from_u32_unchecked(v / 2)) // Undo doubling
             .collect();
-        
+
         first_line
             .chunks_exact(2)
             .flat_map(|chunk| {
@@ -673,20 +673,20 @@ fn compute_itwiddle_dbls_cpu_uncached(log_size: u32) -> Vec<Vec<u32>> {
     } else {
         Vec::new()
     };
-    
+
     // Combine: circle twiddles as layer 0, then line twiddles as layers 1+
     let mut result = Vec::with_capacity(line_twiddles.len() + 1);
     result.push(circle_twiddles);
     result.extend(line_twiddles);
-    
+
     result
 }
 
 /// Get cached inverse twiddles for a given log_size.
-/// 
+///
 /// This is a convenience function that returns a reference to the cached twiddles
 /// if they exist, or computes and caches them if they don't.
-/// 
+///
 /// Returns a clone of the cached twiddles (the cache itself stores the data).
 #[inline]
 pub fn get_cached_itwiddles(log_size: u32) -> Vec<Vec<u32>> {
@@ -700,16 +700,16 @@ pub fn get_cached_twiddles(log_size: u32) -> Vec<Vec<u32>> {
 }
 
 /// Compute forward twiddles (doubled) on CPU for GPU FFT.
-/// 
+///
 /// Uses the EXACT same structure as `compute_itwiddle_dbls_cpu` but with
 /// non-inverted x-coordinates.
-/// 
+///
 /// Note: Results are cached per log_size to avoid recomputation.
 pub fn compute_twiddle_dbls_cpu(log_size: u32) -> Vec<Vec<u32>> {
-    use std::sync::OnceLock;
     use std::collections::HashMap;
     use std::sync::Mutex;
-    
+    use std::sync::OnceLock;
+
     // Cache for computed twiddles
     static TWIDDLE_CACHE: OnceLock<Mutex<HashMap<u32, Vec<Vec<u32>>>>> = OnceLock::new();
 
@@ -747,8 +747,8 @@ pub fn compute_twiddle_dbls_cpu(log_size: u32) -> Vec<Vec<u32>> {
 /// Returns log_size layers: circle layer (layer 0) + log_size-1 line layers.
 /// The circle layer uses y-coordinate twiddles derived from the finest line twiddles.
 fn compute_twiddle_dbls_cpu_uncached(log_size: u32) -> Vec<Vec<u32>> {
-    use crate::core::poly::circle::CanonicCoset;
     use crate::core::fields::m31::BaseField;
+    use crate::core::poly::circle::CanonicCoset;
     use crate::core::utils::bit_reverse;
     use itertools::Itertools;
 
@@ -819,8 +819,8 @@ pub fn extract_itwiddles_for_gpu(
     twiddle_tree: &crate::prover::poly::twiddles::TwiddleTree<super::GpuBackend>,
     domain: crate::core::poly::circle::CircleDomain,
 ) -> Vec<Vec<u32>> {
-    use crate::core::poly::utils::domain_line_twiddles_from_tree;
     use crate::core::fields::m31::BaseField;
+    use crate::core::poly::utils::domain_line_twiddles_from_tree;
 
     let line_twiddles = domain_line_twiddles_from_tree(domain, &twiddle_tree.itwiddles);
 
@@ -855,8 +855,8 @@ pub fn extract_twiddles_for_gpu(
     twiddle_tree: &crate::prover::poly::twiddles::TwiddleTree<super::GpuBackend>,
     domain: crate::core::poly::circle::CircleDomain,
 ) -> Vec<Vec<u32>> {
-    use crate::core::poly::utils::domain_line_twiddles_from_tree;
     use crate::core::fields::m31::BaseField;
+    use crate::core::poly::utils::domain_line_twiddles_from_tree;
 
     let line_twiddles = domain_line_twiddles_from_tree(domain, &twiddle_tree.twiddles);
 
@@ -1544,6 +1544,40 @@ extern "C" __global__ void accumulate_quotients_kernel(
     output[idx * 4 + 3] = accumulator.a3;
 }
 
+// Evaluate a circle polynomial at one OODS point from coefficients in FFT basis.
+// coeffs[i] is M31, twiddles[i] is QM31 packed as 4 u32 (AoS layout).
+// The kernel computes:
+//   sum_i coeffs[i] * twiddles[i]
+// and accumulates each QM31 coordinate into 64-bit counters.
+extern "C" __global__ void eval_point_accumulate_kernel(
+    const uint32_t* __restrict__ coeffs,    // [n_coeffs]
+    const uint32_t* __restrict__ twiddles,  // [n_coeffs * 4] AoS
+    uint64_t* __restrict__ accumulator,     // [4] u64 accumulators
+    uint32_t n_coeffs
+) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t stride = blockDim.x * gridDim.x;
+
+    uint64_t local0 = 0;
+    uint64_t local1 = 0;
+    uint64_t local2 = 0;
+    uint64_t local3 = 0;
+
+    for (uint32_t i = tid; i < n_coeffs; i += stride) {
+        uint32_t coeff = coeffs[i];
+        uint32_t tw_base = i * 4;
+        local0 += (uint64_t)m31_mul(coeff, twiddles[tw_base + 0]);
+        local1 += (uint64_t)m31_mul(coeff, twiddles[tw_base + 1]);
+        local2 += (uint64_t)m31_mul(coeff, twiddles[tw_base + 2]);
+        local3 += (uint64_t)m31_mul(coeff, twiddles[tw_base + 3]);
+    }
+
+    atomicAdd((unsigned long long*)&accumulator[0], (unsigned long long)local0);
+    atomicAdd((unsigned long long*)&accumulator[1], (unsigned long long)local1);
+    atomicAdd((unsigned long long*)&accumulator[2], (unsigned long long)local2);
+    atomicAdd((unsigned long long*)&accumulator[3], (unsigned long long)local3);
+}
+
 // =============================================================================
 // MLE (Multi-Linear Extension) Operations Kernels
 // =============================================================================
@@ -1724,7 +1758,7 @@ extern "C" __global__ void gen_eq_evals_kernel(
 /// CUDA kernel source for Blake2s Merkle tree hashing.
 ///
 /// This kernel implements highly optimized Blake2s hashing for Merkle tree construction.
-/// 
+///
 /// Optimizations:
 /// 1. Vectorized memory loads (uint4) for 4x bandwidth
 /// 2. Shared memory for intermediate data
@@ -2693,7 +2727,7 @@ pub fn get_gpu_fft_context() -> &'static std::sync::Mutex<GpuFftContext> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_constants() {
         assert_eq!(M31_PRIME, 0x7FFFFFFF);
@@ -2701,7 +2735,7 @@ mod tests {
         assert!(GPU_FFT_THRESHOLD_LOG_SIZE >= 10);
         assert!(GPU_FFT_THRESHOLD_LOG_SIZE <= 22);
     }
-    
+
     #[test]
     fn test_kernel_source_not_empty() {
         assert!(!CIRCLE_FFT_CUDA_KERNEL.is_empty());
