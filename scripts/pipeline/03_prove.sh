@@ -151,12 +151,12 @@ fi
 
 # Optional rebuild
 if [[ "$SKIP_BUILD" == "false" ]] && [[ -d "${LIBS_DIR}/stwo-ml" ]]; then
-    FEATURES="cli"
-    if [[ "$USE_GPU" == "true" ]]; then
-        FEATURES="cli,cuda-runtime"
+    FEATURES="cli,audit"
+    if [[ "$USE_GPU" == "true" ]] && { command -v nvcc &>/dev/null || [[ -f /usr/local/cuda/bin/nvcc ]]; }; then
+        FEATURES="cli,audit,cuda-runtime"
     fi
     log "Rebuilding prove-model (features: ${FEATURES})..."
-    (export PATH="$HOME/.cargo/bin:$PATH"; cd "${LIBS_DIR}/stwo-ml" && cargo build --release --bin prove-model --features "${FEATURES}" 2>&1 | tail -3) || true
+    (export PATH="$HOME/.cargo/bin:$PATH" CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"; cd "${LIBS_DIR}/stwo-ml" && cargo build --release --bin prove-model --features "${FEATURES}" 2>&1 | tail -3) || true
 fi
 
 # ─── Display Config ─────────────────────────────────────────────────

@@ -214,7 +214,7 @@ if [[ "$SKIP_BUILD" == "false" ]]; then
         FEATURES="cli,audit,cuda-runtime"
     fi
 
-    if (cd "${LIBS_DIR}/stwo-ml" && \
+    if (export CUDA_HOME="${CUDA_HOME:-${CUDA_PATH:-/usr/local/cuda}}"; cd "${LIBS_DIR}/stwo-ml" && \
         cargo build --release --bin prove-model --features "${FEATURES}" 2>&1 | tail -5); then
         ok "stwo-ml built (features: ${FEATURES})"
     else

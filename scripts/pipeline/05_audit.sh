@@ -151,6 +151,9 @@ mkdir -p "$(dirname "$OUTPUT")"
 # ─── Determine Features ─────────────────────────────────────────────
 
 FEATURES="cli,audit"
+if command -v nvcc &>/dev/null || [[ -f /usr/local/cuda/bin/nvcc ]]; then
+    FEATURES="cli,audit,cuda-runtime"
+fi
 
 if [[ "$ENCRYPTION" == "aes" ]]; then
     FEATURES="${FEATURES},aes-fallback"
