@@ -311,7 +311,8 @@ else
     set +e
     "${PROVE_CMD[@]}" 2>&1 | tee "$RAW_LOG" | while IFS= read -r line; do
         # Show progress + fatal diagnostics lines
-        if echo "$line" | grep -qE '\[layer|\[BG\]|Proving|Weight commit|Error:|error:|panic|thread .+ panicked|Segmentation fault'; then
+        # Keep this broad so long-running phases don't look "stuck".
+        if echo "$line" | grep -qE '\[layer|\[BG\]|Proving|Weight commit|Phase|Forward pass|GKR|Unified STARK|\[[0-9]+/[0-9]+\]|Error:|error:|panic|thread .+ panicked|Segmentation fault'; then
             log "$line"
         fi
     done
