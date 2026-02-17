@@ -3629,6 +3629,11 @@ fn compute_weight_commitment(
     eprintln!("[BG] Computing weight commitment ({} matrices, packed 7:1, parallel)...", n_weights);
     eprintln!("[BG]   First run — will cache with fingerprint for instant validated reuse.");
     let t_commit = Instant::now();
+    let progress_every = std::env::var("STWO_WEIGHT_PROGRESS_EVERY")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(5);
 
     let weight_list: Vec<_> = weights.weights.iter().collect();
     let done_count = AtomicUsize::new(0);
@@ -3665,7 +3670,17 @@ fn compute_weight_commitment(
     #[cfg(feature = "cuda-runtime")]
     let mut gpu_hasher = match GpuCommitHasher::new() {
         Ok(hasher) => {
-            eprintln!("[BG]   GPU Poseidon hash-many enabled for segment hashing");
+            let strict = gpu_commit_strict_mode();
+            let harden = gpu_commit_hardening_enabled();
+            eprintln!(
+                "[BG]   GPU Poseidon hash-many enabled for segment hashing (strict={}, harden={})",
+                strict, harden
+            );
+            if harden {
+                eprintln!(
+                    "[BG]   Hardening enabled: GPU results are cross-checked on CPU (expect slower first run)"
+                );
+            }
             Some(hasher)
         }
         Err(e) => {
@@ -3741,12 +3756,17 @@ fn compute_weight_commitment(
         let matrix_hash = starknet_crypto::poseidon_hash_many(&final_inputs);
 
         let finished = done_count.fetch_add(1, Ordering::Relaxed) + 1;
-        if finished % 20 == 0 || finished == total {
+        if finished % progress_every == 0 || finished == total {
             let elapsed = t_commit.elapsed().as_secs_f64();
             let eta = if finished > 0 { elapsed * (total as f64 / finished as f64 - 1.0) } else { 0.0 };
+            let pct = if total > 0 {
+                100.0 * finished as f64 / total as f64
+            } else {
+                100.0
+            };
             eprintln!(
-                "[BG]   Weight commitment: {}/{} ({:.1}s elapsed, ~{:.0}s remaining)",
-                finished, total, elapsed, eta,
+                "[BG]   Weight commitment: {}/{} ({:.1}%, {:.1}s elapsed, ~{:.0}s remaining)",
+                finished, total, pct, elapsed, eta,
             );
         }
         matrix_hash
