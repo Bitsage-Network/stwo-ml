@@ -3639,6 +3639,50 @@ impl GpuCommitHasher {
         }
         Ok(out)
     }
+
+    fn hash_segments_m31(
+        &self,
+        segments: &[&[M31]],
+        chunk_size: usize,
+    ) -> Result<Vec<FieldElement>, String> {
+        if segments.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let total_inputs: usize = segments.iter().map(|seg| seg.len()).sum();
+        let mut offsets = Vec::with_capacity(segments.len());
+        let mut lengths = Vec::with_capacity(segments.len());
+        let mut inputs_m31 = Vec::with_capacity(total_inputs);
+
+        let mut cursor: u32 = 0;
+        for seg in segments {
+            let len_u32 = u32::try_from(seg.len())
+                .map_err(|_| format!("segment too large for u32: {}", seg.len()))?;
+            offsets.push(cursor);
+            lengths.push(len_u32);
+            cursor = cursor
+                .checked_add(len_u32)
+                .ok_or_else(|| "segment offsets overflow u32".to_string())?;
+            inputs_m31.extend(seg.iter().map(|v| v.0));
+        }
+
+        let executor = get_cuda_executor().map_err(|e| format!("CUDA init: {e}"))?;
+        let output_limbs = executor
+            .execute_poseidon252_hash_many_chunked_m31(
+                &inputs_m31,
+                &offsets,
+                &lengths,
+                chunk_size,
+                &self.d_round_constants,
+            )
+            .map_err(|e| format!("poseidon252_hash_many_chunked_m31: {e}"))?;
+
+        let mut out = Vec::with_capacity(segments.len());
+        for chunk in output_limbs.chunks_exact(4) {
+            out.push(u64_limbs_to_field_element(chunk)?);
+        }
+        Ok(out)
+    }
 }
 
 /// Compute weight commitment: Poseidon hash of all weight matrices.
@@ -3743,15 +3787,20 @@ fn compute_weight_commitment(
             w.data.len(),
         );
         let seg_size = (w.data.len() + n_segments - 1) / n_segments;
-        let packed_segments: Vec<Vec<FieldElement>> = w.data
-            .par_chunks(seg_size.max(1))
-            .map(|segment| segment.chunks(7).map(pack_m31_chunk_to_felt).collect())
+        let raw_segments: Vec<&[M31]> = w.data
+            .chunks(seg_size.max(1))
             .collect();
 
         let cpu_hash_segments = || -> Vec<FieldElement> {
-            packed_segments
+            raw_segments
                 .par_iter()
-                .map(|packed| hash_packed_segment_cpu(packed))
+                .map(|segment| {
+                    let packed: Vec<FieldElement> = segment
+                        .chunks(7)
+                        .map(pack_m31_chunk_to_felt)
+                        .collect();
+                    hash_packed_segment_cpu(&packed)
+                })
                 .collect()
         };
 
@@ -3759,7 +3808,7 @@ fn compute_weight_commitment(
             #[cfg(feature = "cuda-runtime")]
             {
                 if let Some(hasher) = gpu_hasher.as_ref() {
-                    match hasher.hash_segments(&packed_segments, chunk_size) {
+                    match hasher.hash_segments_m31(&raw_segments, chunk_size) {
                         Ok(gpu_hashes) => {
                             if gpu_commit_hardening_enabled() {
                                 let cpu_hashes = cpu_hash_segments();

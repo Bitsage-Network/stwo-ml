@@ -2783,6 +2783,93 @@ __device__ void poseidon_hash_many_with_prefix(
     felt_copy(result, &state[0]);
 }
 
+__device__ __forceinline__ void pack_m31_base31_no_tag(
+    felt252* out,
+    const uint32_t* inputs_m31,
+    uint32_t seg_off,
+    uint32_t seg_len,
+    uint32_t packed_idx
+) {
+    // Pack up to 7 M31 values with base 2^31:
+    // felt = v0 + v1*2^31 + ... (no length tag).
+    uint64_t limbs[4] = {0, 0, 0, 0};
+    uint32_t start = packed_idx * 7;
+    uint32_t remaining = (start < seg_len) ? (seg_len - start) : 0;
+    uint32_t take = (remaining >= 7) ? 7 : remaining;
+
+    for (uint32_t j = 0; j < take; j++) {
+        uint64_t val = (uint64_t)inputs_m31[seg_off + start + j];
+        uint32_t bit_pos = j * 31;
+        uint32_t limb_idx = bit_pos / 64;
+        uint32_t bit_off = bit_pos % 64;
+        limbs[limb_idx] |= (val << bit_off);
+        if (bit_off + 31 > 64 && limb_idx + 1 < 4) {
+            limbs[limb_idx + 1] |= (val >> (64 - bit_off));
+        }
+    }
+
+    out->limb[0] = limbs[0];
+    out->limb[1] = limbs[1];
+    out->limb[2] = limbs[2];
+    out->limb[3] = limbs[3];
+}
+
+__device__ void poseidon_hash_many_with_prefix_m31(
+    felt252* result,
+    const felt252* prefix,
+    const uint32_t* inputs_m31,
+    uint32_t seg_off,
+    uint32_t seg_len,
+    uint32_t packed_start,
+    uint32_t n_packed,
+    const uint64_t* rc
+) {
+    // Equivalent to poseidon_hash_many([prefix] + packed_inputs[packed_start..packed_start+n_packed]).
+    felt252 state[3];
+    felt_set_zero(&state[0]);
+    felt_set_zero(&state[1]);
+    felt_set_zero(&state[2]);
+
+    uint32_t total = n_packed + 1;
+    uint32_t i = 0;
+    while (i < total) {
+        felt252 v0;
+        if (i == 0) {
+            felt_copy(&v0, prefix);
+        } else {
+            pack_m31_base31_no_tag(
+                &v0, inputs_m31, seg_off, seg_len, packed_start + (i - 1)
+            );
+        }
+        felt_add(&state[0], &state[0], &v0);
+        i++;
+
+        if (i < total) {
+            felt252 v1;
+            pack_m31_base31_no_tag(
+                &v1, inputs_m31, seg_off, seg_len, packed_start + (i - 1)
+            );
+            felt_add(&state[1], &state[1], &v1);
+            i++;
+        } else {
+            felt252 one;
+            felt_set_u64(&one, 1);
+            felt_add(&state[1], &state[1], &one);
+            hades_permutation(state, rc);
+            felt_copy(result, &state[0]);
+            return;
+        }
+
+        hades_permutation(state, rc);
+    }
+
+    felt252 one;
+    felt_set_u64(&one, 1);
+    felt_add(&state[0], &state[0], &one);
+    hades_permutation(state, rc);
+    felt_copy(result, &state[0]);
+}
+
 extern "C" __global__ void poseidon252_hash_many_chunked_kernel(
     uint64_t* output,
     const uint64_t* inputs,
@@ -2810,6 +2897,48 @@ extern "C" __global__ void poseidon252_hash_many_chunked_kernel(
             &running, &running, chunk_ptr, (int)take, round_constants
         );
         pos += take;
+    }
+
+    output[idx * 4 + 0] = running.limb[0];
+    output[idx * 4 + 1] = running.limb[1];
+    output[idx * 4 + 2] = running.limb[2];
+    output[idx * 4 + 3] = running.limb[3];
+}
+
+extern "C" __global__ void poseidon252_hash_many_chunked_m31_kernel(
+    uint64_t* output,
+    const uint32_t* inputs_m31,
+    const uint32_t* offsets_m31,
+    const uint32_t* lengths_m31,
+    const uint64_t* round_constants,
+    uint32_t n_segments,
+    uint32_t chunk_size
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_segments) return;
+
+    uint32_t off = offsets_m31[idx];
+    uint32_t len = lengths_m31[idx];
+    uint32_t packed_len = (len + 6) / 7;
+
+    felt252 running;
+    felt_set_zero(&running);
+
+    uint32_t packed_pos = 0;
+    while (packed_pos < packed_len) {
+        uint32_t remaining = packed_len - packed_pos;
+        uint32_t take = remaining > chunk_size ? chunk_size : remaining;
+        poseidon_hash_many_with_prefix_m31(
+            &running,
+            &running,
+            inputs_m31,
+            off,
+            len,
+            packed_pos,
+            take,
+            round_constants
+        );
+        packed_pos += take;
     }
 
     output[idx * 4 + 0] = running.limb[0];
