@@ -4390,6 +4390,9 @@ where
         || !layernorm_layers.is_empty() || !embedding_layers.is_empty()
         || !quantize_layers.is_empty() || !dequantize_layers.is_empty();
 
+    let skip_unified_stark = flag_enabled("STWO_PURE_GKR_SKIP_UNIFIED_STARK");
+    let gkr_covers_all_non_matmul = embedding_layers.is_empty() && quantize_layers.is_empty();
+
     if !has_components {
         return Ok(AggregatedModelProofOnChain {
             unified_stark: None,
@@ -4413,6 +4416,75 @@ where
             gkr_proof: Some(gkr_proof),
             gkr_batch_data: None,
         });
+    }
+
+    if skip_unified_stark {
+        if gkr_covers_all_non_matmul {
+            eprintln!(
+                "Phase 3/3: Unified STARK skipped (STWO_PURE_GKR_SKIP_UNIFIED_STARK=1, GKR-only path)."
+            );
+            eprintln!(
+                "  [Unified STARK] skipped: GKR covers matmul/add/mul/activation/layernorm/rmsnorm/dequantize."
+            );
+
+            let activation_claims = activation_layers.iter().map(|layer| LayerClaim {
+                layer_index: layer.node_id,
+                claimed_sum: SecureField::default(),
+                trace_rows: 1 << layer.log_size,
+            }).collect();
+            let add_claims = add_layers.iter().map(|layer| LayerClaim {
+                layer_index: layer.node_id,
+                claimed_sum: SecureField::default(),
+                trace_rows: 1 << layer.log_size,
+            }).collect();
+            let mul_claims = mul_layers.iter().map(|layer| LayerClaim {
+                layer_index: layer.node_id,
+                claimed_sum: SecureField::default(),
+                trace_rows: 1 << layer.log_size,
+            }).collect();
+            let layernorm_claims = layernorm_layers.iter().map(|layer| LayerClaim {
+                layer_index: layer.node_id,
+                claimed_sum: SecureField::default(),
+                trace_rows: 1 << layer.log_size,
+            }).collect();
+            let rmsnorm_claims = rmsnorm_layers.iter().map(|layer| LayerClaim {
+                layer_index: layer.node_id,
+                claimed_sum: SecureField::default(),
+                trace_rows: 1 << layer.log_size,
+            }).collect();
+            let dequantize_claims = dequantize_layers.iter().map(|layer| LayerClaim {
+                layer_index: layer.node_id,
+                claimed_sum: SecureField::default(),
+                trace_rows: 1 << layer.log_size,
+            }).collect();
+
+            return Ok(AggregatedModelProofOnChain {
+                unified_stark: None,
+                matmul_proofs: Vec::new(),
+                batched_matmul_proofs: Vec::new(),
+                add_claims,
+                mul_claims,
+                layernorm_claims,
+                rmsnorm_claims,
+                execution,
+                activation_claims,
+                attention_proofs,
+                embedding_claims: Vec::new(),
+                quantize_claims: Vec::new(),
+                dequantize_claims,
+                layer_chain_commitment,
+                io_commitment,
+                layernorm_mean_var_commitments,
+                quantize_params_commitment: FieldElement::ZERO,
+                tiled_matmul_proofs: Vec::new(),
+                gkr_proof: Some(gkr_proof),
+                gkr_batch_data: None,
+            });
+        } else {
+            eprintln!(
+                "Phase 3/3: STWO_PURE_GKR_SKIP_UNIFIED_STARK=1 ignored (embedding/quantize still require unified STARK)."
+            );
+        }
     }
 
     eprintln!("Phase 3/3: Building unified STARK (non-matmul components)...");

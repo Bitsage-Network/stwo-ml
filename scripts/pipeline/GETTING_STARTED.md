@@ -233,6 +233,7 @@ The proof is saved to `~/.obelysk/proofs/`.
 - GPU opening trees now use device-side QM31 packing, removing per-round CPU repack/upload overhead in large weight openings.
 - Opening query extraction now replays folds on GPU and downloads only queried leaf pairs, avoiding full-layer per-round downloads.
 - Unified STARK retries once on SIMD if GPU proving returns `ConstraintsNotSatisfied` (soundness-preserving fallback). In `--gpu-only` mode this fallback is disabled and the run fails closed.
+- `03_prove.sh` now defaults to `STWO_PURE_GKR_SKIP_UNIFIED_STARK=1` for `ml_gkr` runs, skipping Phase 3 when GKR already covers non-matmul components.
 
 The pipeline now prints dense progress + heartbeat messages during long openings so it does not appear frozen.
 
@@ -272,6 +273,8 @@ export STWO_GPU_POLY_STRICT=1
 export STWO_GPU_POLY_HARDEN=1
 # Force fail-closed instead of Unified STARK GPU->SIMD fallback
 export STWO_UNIFIED_STARK_NO_FALLBACK=1
+# Re-enable Phase 3 unified STARK in pure GKR mode (default is skip)
+export STWO_PURE_GKR_SKIP_UNIFIED_STARK=0
 ./03_prove.sh --model-name qwen3-14b --gpu
 ```
 

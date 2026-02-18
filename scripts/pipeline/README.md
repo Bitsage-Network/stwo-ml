@@ -143,6 +143,7 @@ STARKNET_PRIVATE_KEY=0x... ./run_e2e.sh --preset qwen3-14b --gpu --submit
 | `STWO_GPU_POLY_STRICT` | No | Off | STWO GPU poly backend |
 | `STWO_GPU_POLY_HARDEN` | No | Off | STWO GPU poly backend |
 | `STWO_UNIFIED_STARK_NO_FALLBACK` | No | Off | `prove-model` unified STARK (disable GPU→SIMD retry on `ConstraintsNotSatisfied`) |
+| `STWO_PURE_GKR_SKIP_UNIFIED_STARK` | No | `on` in `03_prove.sh` | Skip Phase 3 unified STARK in pure `ml_gkr` runs when GKR already covers non-matmul ops |
 | `STWO_PARALLEL_GPU_COMMIT` | No | Off (single GPU default) | `03_prove.sh`, `prove-model` |
 | `STWO_WEIGHT_PROGRESS_EVERY` | No | `1` | Weight commitment progress cadence |
 | `STWO_GKR_OPENINGS_PROGRESS_EVERY` | No | `1` | Weight-opening progress cadence |
@@ -161,6 +162,7 @@ Notes:
 - `03_prove.sh` defaults to aggregated RLC weight binding for faster off-chain proving.
 - `run_e2e.sh --submit` auto-adds `--starknet-ready`, which forces sequential openings.
 - Unified STARK now retries once on SIMD if GPU path hits `ConstraintsNotSatisfied` (soundness-preserving fallback). Set `--gpu-only` or `STWO_UNIFIED_STARK_NO_FALLBACK=1` to fail closed instead.
+- `03_prove.sh` defaults `STWO_PURE_GKR_SKIP_UNIFIED_STARK=1` for `ml_gkr`, which bypasses Phase 3 when GKR already covers activation/add/mul/layernorm/rmsnorm/dequantize.
 - In aggregated weight-binding mode, `ml_gkr` output still serializes full proof artifacts with `submission_ready=false`, `weight_opening_mode`, and `weight_claim_calldata`.
 
 ## Model Presets

@@ -143,6 +143,17 @@ GPU_MLE_OPENING_TREE_REQUIRE="${STWO_GPU_MLE_OPENING_TREE_REQUIRE:-off}"
 GPU_MLE_OPENING_TIMING="${STWO_GPU_MLE_OPENING_TIMING:-off}"
 UNIFIED_STARK_NO_FALLBACK="${STWO_UNIFIED_STARK_NO_FALLBACK:-off}"
 
+# In pure ml_gkr mode, unified STARK is redundant for Starknet GKR calldata and
+# can be skipped for a major speed/stability win. Caller can override to 0/off.
+if [[ -z "${STWO_PURE_GKR_SKIP_UNIFIED_STARK:-}" ]]; then
+    export STWO_PURE_GKR_SKIP_UNIFIED_STARK=1
+fi
+PURE_GKR_SKIP_UNIFIED_STARK="${STWO_PURE_GKR_SKIP_UNIFIED_STARK:-off}"
+case "${PURE_GKR_SKIP_UNIFIED_STARK,,}" in
+    1|true|on|yes) PURE_GKR_SKIP_UNIFIED_STARK="on" ;;
+    *) PURE_GKR_SKIP_UNIFIED_STARK="off" ;;
+esac
+
 # Default to fast aggregated weight binding for off-chain proving.
 # For submit-ready Starknet calldata, caller can pass --starknet-ready.
 GKR_AGG_WEIGHT_BINDING_DEFAULT="on"
@@ -292,6 +303,7 @@ log "GPU only mode:  ${GPU_ONLY}"
 log "GPU commit:     strict=${GPU_COMMIT_STRICT} harden=${GPU_COMMIT_HARDEN} parallel=${GPU_COMMIT_PARALLEL}"
 log "GPU poly path:  strict=${GPU_POLY_STRICT} harden=${GPU_POLY_HARDEN}"
 log "Unified STARK:  gpu_constraints_fallback=${UNIFIED_STARK_FALLBACK}"
+log "Pure GKR:       skip_unified_stark=${PURE_GKR_SKIP_UNIFIED_STARK}"
 log "GPU MLE path:   fold=${GPU_MLE_FOLD} fold_min_points=${GPU_MLE_FOLD_MIN_POINTS} opening_tree=${GPU_MLE_OPENING_TREE} merkle_require=${GPU_MLE_MERKLE_REQUIRE} fold_require=${GPU_MLE_FOLD_REQUIRE} opening_tree_require=${GPU_MLE_OPENING_TREE_REQUIRE}"
 log "GPU opening:    qm31_pack=device (enabled by default)"
 log "GPU opening dbg: timing=${GPU_MLE_OPENING_TIMING}"
