@@ -29,6 +29,7 @@ GPU_LAYERS=99
 SKIP_INSTALL=false
 SKIP_CONVERT=false
 GGUF_PATH=""
+INFERENCE_TIMEOUT_SEC="${INFERENCE_TIMEOUT_SEC:-900}"
 
 # ─── Parse Arguments ─────────────────────────────────────────────────
 
@@ -281,6 +282,21 @@ echo ""
 # Step 3: Run Inference
 # ═══════════════════════════════════════════════════════════════════════
 
+run_llama_with_live_output() {
+    local out_file="$1"
+    shift
+    if [[ "${DRY_RUN:-0}" == "1" ]]; then
+        echo -e "${DIM}[DRY RUN] $*${NC}" >&2
+        return 0
+    fi
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "${INFERENCE_TIMEOUT_SEC}s" "$@" 2>&1 | tee "$out_file"
+        return ${PIPESTATUS[0]}
+    fi
+    "$@" 2>&1 | tee "$out_file"
+    return ${PIPESTATUS[0]}
+}
+
 if [[ "$DO_CHAT" == "true" ]]; then
     # ─── Interactive Chat Mode ───────────────────────────────────────
     header "Interactive Chat"
@@ -304,17 +320,19 @@ elif [[ "$DO_BENCHMARK" == "true" ]]; then
     log "Running benchmark (512 tokens)..."
     echo ""
 
-    BENCH_OUTPUT=$("$LLAMA_CLI" \
+    log "Streaming benchmark output (timeout: ${INFERENCE_TIMEOUT_SEC}s)..."
+    BENCH_LOG="/tmp/obelysk_infer_bench_$(date +%s).log"
+    run_llama_with_live_output "$BENCH_LOG" \
+        "$LLAMA_CLI" \
         -m "$GGUF_PATH" \
         -ngl "$GPU_LAYERS" \
         -p "Write a detailed essay about the history of mathematics." \
         -n 512 \
-        --no-display-prompt \
-        2>&1) || true
+        --no-display-prompt || true
 
     # Parse timing info from llama.cpp output
-    PROMPT_EVAL=$(echo "$BENCH_OUTPUT" | grep "prompt eval time" || echo "")
-    GEN_EVAL=$(echo "$BENCH_OUTPUT" | grep "eval time" | grep -v "prompt" || echo "")
+    PROMPT_EVAL=$(grep "prompt eval time" "$BENCH_LOG" 2>/dev/null || echo "")
+    GEN_EVAL=$(grep "eval time" "$BENCH_LOG" 2>/dev/null | grep -v "prompt" || echo "")
     TOKENS_SEC=$(echo "$GEN_EVAL" | grep -oP '[\d.]+\s+tokens per second' | head -1 || echo "")
 
     echo ""
@@ -328,6 +346,7 @@ elif [[ "$DO_BENCHMARK" == "true" ]]; then
     if [[ -n "$TOKENS_SEC" ]]; then
         ok "Speed: ${TOKENS_SEC}"
     fi
+    rm -f "$BENCH_LOG" 2>/dev/null || true
 
 else
     # ─── Single Prompt Test ──────────────────────────────────────────
@@ -336,17 +355,19 @@ else
     log "GPU layers: ${GPU_LAYERS}"
     echo ""
 
-    TEST_OUTPUT=$("$LLAMA_CLI" \
+    log "Streaming model output (timeout: ${INFERENCE_TIMEOUT_SEC}s)..."
+    TEST_LOG="/tmp/obelysk_infer_test_$(date +%s).log"
+    run_llama_with_live_output "$TEST_LOG" \
+        "$LLAMA_CLI" \
         -m "$GGUF_PATH" \
         -ngl "$GPU_LAYERS" \
         -p "$PROMPT" \
         -n 128 \
-        --no-display-prompt \
-        2>&1) || true
+        --no-display-prompt || true
 
     # Separate model output from timing
-    MODEL_RESPONSE=$(echo "$TEST_OUTPUT" | grep -v "^llama_" | grep -v "^$" | grep -v "eval time" | head -20)
-    TIMING=$(echo "$TEST_OUTPUT" | grep "eval time" || echo "")
+    MODEL_RESPONSE=$(grep -v "^llama_" "$TEST_LOG" 2>/dev/null | grep -v "^$" | grep -v "eval time" | head -20)
+    TIMING=$(grep "eval time" "$TEST_LOG" 2>/dev/null || echo "")
 
     if [[ -n "$MODEL_RESPONSE" ]]; then
         echo ""
@@ -366,6 +387,7 @@ else
             log "Speed: ${TOKENS_SEC}"
         fi
     fi
+    rm -f "$TEST_LOG" 2>/dev/null || true
 fi
 echo ""
 

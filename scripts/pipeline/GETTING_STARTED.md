@@ -159,6 +159,7 @@ This runs automatically. No flags needed.
 
 **What it does:** Converts the model to GGUF format and runs it through llama.cpp to confirm it produces real output. This is optional but recommended to verify the model works before proving.
 If `torch` is missing, the script auto-installs it for conversion and streams install/conversion output live.
+Use `INFERENCE_TIMEOUT_SEC` (default `900`) to control prompt/benchmark timeout.
 
 ```bash
 # Quick test — ask it a question
