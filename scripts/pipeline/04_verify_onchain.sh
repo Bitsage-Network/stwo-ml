@@ -4,7 +4,7 @@
 # ═══════════════════════════════════════════════════════════════════════
 #
 # Submits a proof to Starknet and verifies it on-chain.
-# Production-hardened mode: GKR only (verify_model_gkr / verify_model_gkr_v2).
+# Production-hardened mode: GKR only (verify_model_gkr / v2 / v3).
 #
 # Usage:
 #   bash scripts/pipeline/04_verify_onchain.sh --dry-run
@@ -168,7 +168,7 @@ fi
 # Infer mode from proof artifact if metadata mode is absent.
 if [[ -z "$PROOF_MODE" ]]; then
     ENTRYPOINT_IN_PROOF=$(parse_json_field "$PROOF_FILE" "verify_calldata.entrypoint")
-    if [[ "$ENTRYPOINT_IN_PROOF" == "verify_model_gkr" || "$ENTRYPOINT_IN_PROOF" == "verify_model_gkr_v2" ]]; then
+    if [[ "$ENTRYPOINT_IN_PROOF" == "verify_model_gkr" || "$ENTRYPOINT_IN_PROOF" == "verify_model_gkr_v2" || "$ENTRYPOINT_IN_PROOF" == "verify_model_gkr_v3" ]]; then
         PROOF_MODE="gkr"
         log "Inferred mode: gkr (from verify_calldata.entrypoint)"
     elif [[ "$ENTRYPOINT_IN_PROOF" == "unsupported" ]]; then
@@ -364,13 +364,13 @@ if schema_version != 1:
 entrypoint = vc.get('entrypoint')
 if not isinstance(entrypoint, str) or not entrypoint:
     fail("verify_calldata.entrypoint must be a non-empty string")
-allowed_entrypoints = {'verify_model_gkr', 'verify_model_gkr_v2'}
+allowed_entrypoints = {'verify_model_gkr', 'verify_model_gkr_v2', 'verify_model_gkr_v3'}
 if entrypoint not in allowed_entrypoints:
     mode = proof.get('weight_opening_mode', 'unknown')
     reason = vc.get('reason') or proof.get('soundness_gate_error') or 'unspecified'
     ready = bool(proof.get('submission_ready', False))
     fail(
-        'Only verify_model_gkr / verify_model_gkr_v2 are supported in the hardened pipeline '
+        'Only verify_model_gkr / verify_model_gkr_v2 / verify_model_gkr_v3 are supported in the hardened pipeline '
         f'(got: {entrypoint}, submission_ready={ready}, '
         f'weight_opening_mode={mode}, reason={reason})'
     )
@@ -398,7 +398,7 @@ if entrypoint == 'verify_model_gkr':
             f'{entrypoint} requires weight_opening_mode=Sequential '
             f'(got: {weight_opening_mode})'
         )
-elif entrypoint == 'verify_model_gkr_v2':
+elif entrypoint in ('verify_model_gkr_v2', 'verify_model_gkr_v3'):
     allowed_modes = {'Sequential', 'BatchedSubchannelV1'}
     if weight_opening_mode is not None and str(weight_opening_mode) not in allowed_modes:
         fail(
@@ -424,7 +424,7 @@ def parse_nat(tok: str, label: str) -> int:
         fail(f'{label} must be >= 0 (got {v})')
     return v
 
-if entrypoint == 'verify_model_gkr_v2':
+if entrypoint in ('verify_model_gkr_v2', 'verify_model_gkr_v3'):
     # Layout:
     # model_id, raw_io_data, circuit_depth, num_layers, matmul_dims,
     # dequantize_bits, proof_data, weight_commitments, weight_binding_mode, weight_openings...
@@ -461,14 +461,25 @@ if entrypoint == 'verify_model_gkr_v2':
         expected_mode = 1
     if expected_mode is not None and weight_binding_mode != expected_mode:
         fail(
-            f'verify_model_gkr_v2 expected weight_binding_mode={expected_mode} '
+            f'{entrypoint} expected weight_binding_mode={expected_mode} '
             f'for weight_opening_mode={weight_opening_mode} (got {weight_binding_mode})'
         )
     if expected_mode is None and weight_binding_mode not in (0, 1):
         fail(
-            'verify_model_gkr_v2 requires weight_binding_mode in {0,1} '
+            f'{entrypoint} requires weight_binding_mode in {{0,1}} '
             f'(got {weight_binding_mode})'
         )
+    if entrypoint == 'verify_model_gkr_v3':
+        idx += 1  # consume weight_binding_mode
+        if idx >= len(resolved):
+            fail('v3 calldata truncated before weight_binding_data length')
+        weight_binding_data_len = parse_nat(resolved[idx], 'weight_binding_data length')
+        idx += 1 + weight_binding_data_len
+        if weight_binding_mode in (0, 1) and weight_binding_data_len != 0:
+            fail(
+                f'{entrypoint} mode {weight_binding_mode} requires empty weight_binding_data '
+                f'(got len={weight_binding_data_len})'
+            )
 
 with open(os.path.join(out_dir, 'entrypoint.txt'), 'w', encoding='utf-8') as f:
     f.write(entrypoint)
@@ -673,7 +684,7 @@ else
             ok "${ENTRYPOINT} submitted"
             rm -rf "$VERIFY_TMP"
             ;;
-        # ─── GKR: verify_model_gkr / verify_model_gkr_v2 ─────────────
+        # ─── GKR: verify_model_gkr / verify_model_gkr_v2 / verify_model_gkr_v3 ─────────────
         gkr)
             header "GKR Proof Submission"
 
@@ -687,13 +698,13 @@ else
             fi
 
             ENTRYPOINT=$(cat "$VERIFY_TMP/entrypoint.txt")
-            if [[ "$ENTRYPOINT" != "verify_model_gkr" && "$ENTRYPOINT" != "verify_model_gkr_v2" ]]; then
+            if [[ "$ENTRYPOINT" != "verify_model_gkr" && "$ENTRYPOINT" != "verify_model_gkr_v2" && "$ENTRYPOINT" != "verify_model_gkr_v3" ]]; then
                 UNSUPPORTED_REASON=$(parse_json_field "$PROOF_FILE" "verify_calldata.reason")
                 if [[ -z "$UNSUPPORTED_REASON" ]]; then
                     UNSUPPORTED_REASON=$(parse_json_field "$PROOF_FILE" "soundness_gate_error")
                 fi
                 WEIGHT_OPENING_MODE=$(parse_json_field "$PROOF_FILE" "weight_opening_mode")
-                err "verify_calldata.entrypoint must be verify_model_gkr or verify_model_gkr_v2 in gkr mode (got: ${ENTRYPOINT})"
+                err "verify_calldata.entrypoint must be verify_model_gkr, verify_model_gkr_v2, or verify_model_gkr_v3 in gkr mode (got: ${ENTRYPOINT})"
                 err "  weight_opening_mode: ${WEIGHT_OPENING_MODE:-unknown}"
                 err "  reason: ${UNSUPPORTED_REASON:-unspecified}"
                 rm -rf "$VERIFY_TMP"

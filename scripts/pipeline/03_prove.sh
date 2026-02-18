@@ -36,6 +36,7 @@ SALT=""
 SERVER_URL=""
 STARKNET_READY=false
 GKR_V2=false
+GKR_V3=false
 
 # ─── Parse Arguments ─────────────────────────────────────────────────
 
@@ -59,6 +60,7 @@ while [[ $# -gt 0 ]]; do
         --gkr)              GKR_FLAG=true; shift ;;
         --starknet-ready)   STARKNET_READY=true; shift ;;
         --gkr-v2)           GKR_V2=true; shift ;;
+        --gkr-v3)           GKR_V3=true; shift ;;
         --salt)             SALT="$2"; shift 2 ;;
         --server)           SERVER_URL="$2"; shift 2 ;;
         -h|--help)
@@ -72,7 +74,7 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Proof mode:"
             echo "  --mode MODE        gkr (default: gkr)"
-            echo "    gkr:        prove-model → GKR calldata for verify_model_gkr()/verify_model_gkr_v2()"
+            echo "    gkr:        prove-model → GKR calldata for verify_model_gkr()/v2()/v3()"
             echo ""
             echo "Options:"
             echo "  --layers N           Number of transformer layers (default: from config)"
@@ -90,6 +92,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --gkr                Enable GKR for LogUp verification"
             echo "  --starknet-ready     Force sequential weight openings for submit-ready Starknet calldata"
             echo "  --gkr-v2             Emit verify_model_gkr_v2 calldata (mode-aware v2 path)"
+            echo "  --gkr-v3             Emit verify_model_gkr_v3 calldata (v3 envelope, mode-aware)"
             echo "  --salt N             Fiat-Shamir channel salt"
             echo "  --server URL         Submit to remote prove-server instead of local binary"
             echo "  -h, --help           Show this help"
@@ -106,10 +109,18 @@ if [[ "$MODE" != "gkr" ]]; then
     exit 1
 fi
 
-# Safety: v2 submission path requires Starknet-ready artifact gating.
+# Safety: v2/v3 submission paths require Starknet-ready artifact gating.
 if [[ "$GKR_V2" == "true" ]] && [[ "$STARKNET_READY" != "true" ]]; then
     warn "--gkr-v2 requested; enabling --starknet-ready for submit-ready artifact checks"
     STARKNET_READY=true
+fi
+if [[ "$GKR_V3" == "true" ]] && [[ "$STARKNET_READY" != "true" ]]; then
+    warn "--gkr-v3 requested; enabling --starknet-ready for submit-ready artifact checks"
+    STARKNET_READY=true
+fi
+if [[ "$GKR_V2" == "true" && "$GKR_V3" == "true" ]]; then
+    warn "Both --gkr-v2 and --gkr-v3 were set; preferring v3 entrypoint."
+    GKR_V2=false
 fi
 
 # ─── Resolve Model ──────────────────────────────────────────────────
@@ -185,9 +196,12 @@ export STWO_GKR_AGGREGATE_WEIGHT_BINDING="${GKR_AGG_WEIGHT_BINDING}"
 if [[ "$GKR_V2" == "true" ]]; then
     export STWO_STARKNET_GKR_V2=1
 fi
+if [[ "$GKR_V3" == "true" ]]; then
+    export STWO_STARKNET_GKR_V3=1
+fi
 
 # Batched sub-channel weight openings:
-# - Safe and submit-ready with verify_model_gkr_v2 (weight_binding_mode=1)
+# - Safe and submit-ready with verify_model_gkr_v2/v3 (weight_binding_mode=1)
 # - Keep v1 (`verify_model_gkr`) on sequential openings only.
 GKR_BATCH_WEIGHT_OPENINGS_DEFAULT="off"
 if [[ "$USE_GPU" == "true" ]] && [[ "$STARKNET_READY" == "true" ]] && [[ "$GKR_V2" == "true" ]]; then
@@ -335,7 +349,14 @@ log "Output:         ${OUTPUT_DIR}"
 log "prove-model:    ${PROVE_BIN}"
 log "Threads:        RAYON=${RAYON_NUM_THREADS} OMP=${OMP_NUM_THREADS}"
 log "Starknet ready: ${STARKNET_READY}"
-log "GKR entrypoint: $(if [[ "$GKR_V2" == "true" ]]; then echo verify_model_gkr_v2; else echo verify_model_gkr; fi)"
+if [[ "$GKR_V3" == "true" ]]; then
+    _GKR_ENTRYPOINT="verify_model_gkr_v3"
+elif [[ "$GKR_V2" == "true" ]]; then
+    _GKR_ENTRYPOINT="verify_model_gkr_v2"
+else
+    _GKR_ENTRYPOINT="verify_model_gkr"
+fi
+log "GKR entrypoint: ${_GKR_ENTRYPOINT}"
 log "GPU only mode:  ${GPU_ONLY}"
 log "GPU commit:     strict=${GPU_COMMIT_STRICT} harden=${GPU_COMMIT_HARDEN} parallel=${GPU_COMMIT_PARALLEL}"
 log "GPU poly path:  strict=${GPU_POLY_STRICT} harden=${GPU_POLY_HARDEN}"
@@ -646,7 +667,7 @@ def parse_nat(tok, label):
         raise AssertionError(f'{label} must be >= 0 (got {v})')
     return v
 
-if entrypoint in ('verify_model_gkr', 'verify_model_gkr_v2'):
+if entrypoint in ('verify_model_gkr', 'verify_model_gkr_v2', 'verify_model_gkr_v3'):
     assert ready is True, f'{entrypoint} requires submission_ready=true'
     assert isinstance(calldata, list) and len(calldata) > 0, 'verify_calldata.calldata must be non-empty array'
     assert len(chunks) == 0, 'verify_model_gkr(*) should not include upload chunks'
@@ -656,12 +677,12 @@ if entrypoint in ('verify_model_gkr', 'verify_model_gkr_v2'):
     if entrypoint == 'verify_model_gkr':
         if mode_s is not None:
             assert mode_s == 'Sequential', f'{entrypoint} requires weight_opening_mode=Sequential (got {mode})'
-    elif entrypoint == 'verify_model_gkr_v2':
+    elif entrypoint in ('verify_model_gkr_v2', 'verify_model_gkr_v3'):
         if mode_s is not None:
             assert mode_s in ('Sequential', 'BatchedSubchannelV1'), \
                 f'{entrypoint} requires weight_opening_mode in (Sequential, BatchedSubchannelV1) (got {mode})'
-    if entrypoint == 'verify_model_gkr_v2':
-        # v2 calldata inserts weight_binding_mode after weight_commitments array.
+    if entrypoint in ('verify_model_gkr_v2', 'verify_model_gkr_v3'):
+        # v2/v3 calldata inserts weight_binding_mode after weight_commitments array.
         idx = 0
         idx += 1  # model_id
         assert idx < len(calldata), 'calldata truncated before raw_io length'
@@ -689,9 +710,17 @@ if entrypoint in ('verify_model_gkr', 'verify_model_gkr_v2'):
             expected_mode = 1
         if expected_mode is not None:
             assert wb_mode == expected_mode, \
-                f'verify_model_gkr_v2 expected weight_binding_mode={expected_mode} for weight_opening_mode={mode_s} (got {wb_mode})'
+                f'{entrypoint} expected weight_binding_mode={expected_mode} for weight_opening_mode={mode_s} (got {wb_mode})'
         else:
-            assert wb_mode in (0, 1), f'verify_model_gkr_v2 requires weight_binding_mode in (0,1) (got {wb_mode})'
+            assert wb_mode in (0, 1), f'{entrypoint} requires weight_binding_mode in (0,1) (got {wb_mode})'
+        if entrypoint == 'verify_model_gkr_v3':
+            idx += 1  # consume weight_binding_mode
+            assert idx < len(calldata), 'v3 calldata truncated before weight_binding_data length'
+            binding_data_len = parse_nat(calldata[idx], 'weight_binding_data length')
+            idx += 1 + binding_data_len
+            if wb_mode in (0, 1):
+                assert binding_data_len == 0, \
+                    f'{entrypoint} mode {wb_mode} requires empty weight_binding_data (got len={binding_data_len})'
     print(f'  verify_calldata: {len(calldata)} felts', file=sys.stderr)
 else:
     # Off-chain / experimental transcript modes are serializable but not submit-ready.
@@ -732,6 +761,7 @@ cat > "${OUTPUT_DIR}/metadata.json" << METAEOF
     "gpu": ${USE_GPU},
     "multi_gpu": ${MULTI_GPU},
     "gkr_v2": ${GKR_V2},
+    "gkr_v3": ${GKR_V3},
     "security": "${SECURITY}",
     "phase1_seconds": ${PHASE1_SEC},
     "phase2_seconds": ${PHASE2_SEC},

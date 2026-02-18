@@ -1048,7 +1048,25 @@ fn starknet_weight_binding_mode(
         // v2 mode 1: batched sub-channel transcript (same opening statement).
         WeightOpeningTranscriptMode::BatchedSubchannelV1 => Ok(1),
         other => Err(StarknetModelError::SoundnessGate(format!(
-            "unsupported weight binding mode for Starknet v2 calldata: {:?}",
+            "unsupported weight binding mode for Starknet v2/v3 calldata: {:?}",
+            other
+        ))),
+    }
+}
+
+fn starknet_weight_binding_data(
+    mode: crate::gkr::types::WeightOpeningTranscriptMode,
+) -> Result<Vec<String>, StarknetModelError> {
+    use crate::gkr::types::WeightOpeningTranscriptMode;
+
+    match mode {
+        // Phase 3 currently supports v3 envelope plumbing only.
+        // For submit-ready modes (0/1) weight_binding_data stays empty.
+        WeightOpeningTranscriptMode::Sequential | WeightOpeningTranscriptMode::BatchedSubchannelV1 => {
+            Ok(Vec::new())
+        }
+        other => Err(StarknetModelError::SoundnessGate(format!(
+            "unsupported weight binding data mode for Starknet v3 calldata: {:?}",
             other
         ))),
     }
@@ -1091,7 +1109,13 @@ pub fn build_verify_model_gkr_calldata(
     model_id: FieldElement,
     raw_io_data: &[FieldElement],
 ) -> Result<VerifyModelGkrCalldata, StarknetModelError> {
-    build_verify_model_gkr_calldata_inner(proof, circuit, model_id, raw_io_data, false)
+    build_verify_model_gkr_calldata_inner(
+        proof,
+        circuit,
+        model_id,
+        raw_io_data,
+        GkrCalldataLayout::V1,
+    )
 }
 
 /// Build flat sncast calldata for `verify_model_gkr_v2()`.
@@ -1105,7 +1129,43 @@ pub fn build_verify_model_gkr_v2_calldata(
     model_id: FieldElement,
     raw_io_data: &[FieldElement],
 ) -> Result<VerifyModelGkrCalldata, StarknetModelError> {
-    build_verify_model_gkr_calldata_inner(proof, circuit, model_id, raw_io_data, true)
+    build_verify_model_gkr_calldata_inner(
+        proof,
+        circuit,
+        model_id,
+        raw_io_data,
+        GkrCalldataLayout::V2,
+    )
+}
+
+/// Build flat sncast calldata for `verify_model_gkr_v3()`.
+///
+/// v3 layout extends v2 with `weight_binding_data: Array<felt252>`:
+/// - mode `0`: sequential openings
+/// - mode `1`: batched sub-channel openings
+///
+/// Mode `2` (aggregated trustless binding) is reserved and not emitted by
+/// this builder yet.
+pub fn build_verify_model_gkr_v3_calldata(
+    proof: &crate::gkr::GKRProof,
+    circuit: &crate::gkr::LayeredCircuit,
+    model_id: FieldElement,
+    raw_io_data: &[FieldElement],
+) -> Result<VerifyModelGkrCalldata, StarknetModelError> {
+    build_verify_model_gkr_calldata_inner(
+        proof,
+        circuit,
+        model_id,
+        raw_io_data,
+        GkrCalldataLayout::V3,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GkrCalldataLayout {
+    V1,
+    V2,
+    V3,
 }
 
 fn build_verify_model_gkr_calldata_inner(
@@ -1113,7 +1173,7 @@ fn build_verify_model_gkr_calldata_inner(
     circuit: &crate::gkr::LayeredCircuit,
     model_id: FieldElement,
     raw_io_data: &[FieldElement],
-    use_v2_layout: bool,
+    layout: GkrCalldataLayout,
 ) -> Result<VerifyModelGkrCalldata, StarknetModelError> {
     use crate::cairo_serde::serialize_gkr_proof_data_only;
     use crate::gkr::types::WeightOpeningTranscriptMode;
@@ -1121,7 +1181,9 @@ fn build_verify_model_gkr_calldata_inner(
     enforce_gkr_soundness_gates(proof)?;
 
     // v1 entrypoint only supports sequential weight-opening transcript.
-    if !use_v2_layout && proof.weight_opening_transcript_mode != WeightOpeningTranscriptMode::Sequential {
+    if layout == GkrCalldataLayout::V1
+        && proof.weight_opening_transcript_mode != WeightOpeningTranscriptMode::Sequential
+    {
         return Err(StarknetModelError::SoundnessGate(format!(
             "verify_model_gkr requires Sequential weight opening mode (got: {:?})",
             proof.weight_opening_transcript_mode
@@ -1179,13 +1241,22 @@ fn build_verify_model_gkr_calldata_inner(
         parts.push(format!("0x{:x}", wc));
     }
 
-    // 8 (v2 only). weight_binding_mode: u32
-    if use_v2_layout {
+    // 8 (v2/v3). weight_binding_mode: u32
+    if layout == GkrCalldataLayout::V2 || layout == GkrCalldataLayout::V3 {
         let binding_mode = starknet_weight_binding_mode(proof.weight_opening_transcript_mode)?;
         parts.push(format!("{}", binding_mode));
     }
 
-    // 8/9. weight_opening_proofs: Array<MleOpeningProof>
+    // 9 (v3). weight_binding_data: Array<felt252>
+    if layout == GkrCalldataLayout::V3 {
+        let weight_binding_data = starknet_weight_binding_data(proof.weight_opening_transcript_mode)?;
+        parts.push(format!("{}", weight_binding_data.len()));
+        for felt in weight_binding_data {
+            parts.push(felt);
+        }
+    }
+
+    // 8/9/10. weight_opening_proofs: Array<MleOpeningProof>
     // Order matches verifier weight_claims: main walk first, then deferred.
     let total_openings = proof.weight_openings.len() + proof.deferred_proofs.len();
     parts.push(format!("{}", total_openings));
@@ -2534,5 +2605,83 @@ mod tests {
             StarknetModelError::SoundnessGate(_) => {}
             other => panic!("expected SoundnessGate error, got: {other}"),
         }
+    }
+
+    #[test]
+    fn test_build_verify_model_gkr_v3_calldata_inserts_mode_and_empty_binding_data() {
+        use crate::aggregation::prove_model_pure_gkr;
+
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(2);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
+
+        let mut weights = GraphWeights::new();
+        let mut w = M31Matrix::new(4, 2);
+        for i in 0..4 {
+            for j in 0..2 {
+                w.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
+        weights.add_weight(0, w);
+
+        let agg_proof =
+            prove_model_pure_gkr(&graph, &input, &weights).expect("GKR proving should succeed");
+        let gkr = agg_proof.gkr_proof.as_ref().expect("GKR proof expected");
+        let circuit = crate::gkr::LayeredCircuit::from_graph(&graph).expect("circuit compile");
+        let raw_io = crate::cairo_serde::serialize_raw_io(&input, &agg_proof.execution.output);
+        let model_id = FieldElement::from(0xBEEFu64);
+
+        let v2 = build_verify_model_gkr_v2_calldata(gkr, &circuit, model_id, &raw_io)
+            .expect("v2 calldata should build");
+        let v3 = build_verify_model_gkr_v3_calldata(gkr, &circuit, model_id, &raw_io)
+            .expect("v3 calldata should build");
+
+        assert_eq!(
+            v3.calldata_parts.len(),
+            v2.calldata_parts.len() + 1,
+            "v3 calldata should add exactly one felt (weight_binding_data len=0)"
+        );
+
+        // Find v2 weight_binding_mode index.
+        let mut idx = 0usize;
+        idx += 1; // model_id
+        let raw_io_len = v2.calldata_parts[idx]
+            .parse::<usize>()
+            .expect("raw_io_data len parse");
+        idx += 1 + raw_io_len;
+        idx += 2; // circuit_depth, num_layers
+        let matmul_len = v2.calldata_parts[idx]
+            .parse::<usize>()
+            .expect("matmul_dims len parse");
+        idx += 1 + matmul_len;
+        let dequant_len = v2.calldata_parts[idx]
+            .parse::<usize>()
+            .expect("dequantize_bits len parse");
+        idx += 1 + dequant_len;
+        let proof_data_len = v2.calldata_parts[idx]
+            .parse::<usize>()
+            .expect("proof_data len parse");
+        idx += 1 + proof_data_len;
+        let weight_commitments_len = v2.calldata_parts[idx]
+            .parse::<usize>()
+            .expect("weight_commitments len parse");
+        idx += 1 + weight_commitments_len;
+
+        assert_eq!(v2.calldata_parts[idx], "0", "v2 mode should be sequential (0)");
+        assert_eq!(v3.calldata_parts[idx], "0", "v3 mode should be sequential (0)");
+        assert_eq!(
+            v3.calldata_parts[idx + 1], "0",
+            "v3 should encode empty weight_binding_data"
+        );
+        assert_eq!(
+            v3.calldata_parts[idx + 2],
+            v2.calldata_parts[idx + 1],
+            "opening payload must follow v3 binding_data field"
+        );
     }
 }

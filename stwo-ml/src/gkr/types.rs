@@ -264,11 +264,14 @@ pub struct WeightClaim {
 /// - `BatchedRlcDirectEvalV1`: skips per-weight Merkle openings and binds all
 ///   weight claims with a single random-linear-combination check against model
 ///   weights (off-chain verifier path).
+/// - `AggregatedTrustlessV2`: reserved for Phase-3 trustless aggregated
+///   on-chain weight binding (not implemented yet).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WeightOpeningTranscriptMode {
     Sequential,
     BatchedSubchannelV1,
     BatchedRlcDirectEvalV1,
+    AggregatedTrustlessV2,
 }
 
 /// Deterministically derive a per-opening sub-channel from a master seed.

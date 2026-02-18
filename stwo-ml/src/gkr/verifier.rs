@@ -707,6 +707,14 @@ fn verify_gkr_inner(
                 });
             }
         }
+        WeightOpeningTranscriptMode::AggregatedTrustlessV2 => {
+            return Err(GKRError::VerificationError {
+                layer_idx: 0,
+                reason:
+                    "AggregatedTrustlessV2 verifier path is not implemented yet (Phase 3 reserved mode)"
+                        .to_string(),
+            });
+        }
     }
 
     Ok(current_claim)

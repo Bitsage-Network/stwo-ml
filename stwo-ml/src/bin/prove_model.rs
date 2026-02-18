@@ -1187,7 +1187,7 @@ fn main() {
         OutputFormat::MlGkr => {
             use stwo_ml::starknet::{
                 build_gkr_serializable_proof, build_verify_model_gkr_calldata,
-                build_verify_model_gkr_v2_calldata,
+                build_verify_model_gkr_v2_calldata, build_verify_model_gkr_v3_calldata,
             };
 
             let gkr_proof =
@@ -1218,14 +1218,24 @@ fn main() {
                 eprintln!("  Warning: Starknet soundness gate status: {reason}");
             }
 
-            let use_starknet_gkr_v2 = std::env::var("STWO_STARKNET_GKR_V2")
+            let use_starknet_gkr_v3 = std::env::var("STWO_STARKNET_GKR_V3")
                 .ok()
                 .map(|v| {
                     let v = v.trim().to_ascii_lowercase();
                     !v.is_empty() && v != "0" && v != "false" && v != "off"
                 })
                 .unwrap_or(false);
-            let verify_entrypoint = if use_starknet_gkr_v2 {
+            let use_starknet_gkr_v2 = !use_starknet_gkr_v3
+                && std::env::var("STWO_STARKNET_GKR_V2")
+                    .ok()
+                    .map(|v| {
+                        let v = v.trim().to_ascii_lowercase();
+                        !v.is_empty() && v != "0" && v != "false" && v != "off"
+                    })
+                    .unwrap_or(false);
+            let verify_entrypoint = if use_starknet_gkr_v3 {
+                "verify_model_gkr_v3"
+            } else if use_starknet_gkr_v2 {
                 "verify_model_gkr_v2"
             } else {
                 "verify_model_gkr"
@@ -1238,7 +1248,9 @@ fn main() {
                     Ok(circuit) => {
                         let raw_io =
                             stwo_ml::cairo_serde::serialize_raw_io(&input, &proof.execution.output);
-                        let verify_result = if use_starknet_gkr_v2 {
+                        let verify_result = if use_starknet_gkr_v3 {
+                            build_verify_model_gkr_v3_calldata(gkr_p, &circuit, model_id, &raw_io)
+                        } else if use_starknet_gkr_v2 {
                             build_verify_model_gkr_v2_calldata(gkr_p, &circuit, model_id, &raw_io)
                         } else {
                             build_verify_model_gkr_calldata(gkr_p, &circuit, model_id, &raw_io)
@@ -1454,7 +1466,7 @@ fn submit_gkr_onchain(
 ) {
     use stwo_ml::starknet::{
         build_circuit_descriptor, build_register_gkr_calldata, build_verify_model_gkr_calldata,
-        build_verify_model_gkr_v2_calldata,
+        build_verify_model_gkr_v2_calldata, build_verify_model_gkr_v3_calldata,
     };
 
     if cli.format != OutputFormat::MlGkr {
@@ -1483,14 +1495,24 @@ fn submit_gkr_onchain(
     eprintln!("  Network:  {}", cli.network);
     eprintln!("  Max fee:  {} ETH", cli.max_fee);
 
-    let use_starknet_gkr_v2 = std::env::var("STWO_STARKNET_GKR_V2")
+    let use_starknet_gkr_v3 = std::env::var("STWO_STARKNET_GKR_V3")
         .ok()
         .map(|v| {
             let v = v.trim().to_ascii_lowercase();
             !v.is_empty() && v != "0" && v != "false" && v != "off"
         })
         .unwrap_or(false);
-    let verify_entrypoint = if use_starknet_gkr_v2 {
+    let use_starknet_gkr_v2 = !use_starknet_gkr_v3
+        && std::env::var("STWO_STARKNET_GKR_V2")
+            .ok()
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                !v.is_empty() && v != "0" && v != "false" && v != "off"
+            })
+            .unwrap_or(false);
+    let verify_entrypoint = if use_starknet_gkr_v3 {
+        "verify_model_gkr_v3"
+    } else if use_starknet_gkr_v2 {
         "verify_model_gkr_v2"
     } else {
         "verify_model_gkr"
@@ -1499,7 +1521,9 @@ fn submit_gkr_onchain(
 
     // Step 1: Build verify_model_gkr calldata (raw IO data for on-chain recomputation)
     let raw_io_data = stwo_ml::cairo_serde::serialize_raw_io(input, &proof.execution.output);
-    let verify_calldata = if use_starknet_gkr_v2 {
+    let verify_calldata = if use_starknet_gkr_v3 {
+        build_verify_model_gkr_v3_calldata(gkr_proof, &circuit, model_id, &raw_io_data)
+    } else if use_starknet_gkr_v2 {
         build_verify_model_gkr_v2_calldata(gkr_proof, &circuit, model_id, &raw_io_data)
     } else {
         build_verify_model_gkr_calldata(gkr_proof, &circuit, model_id, &raw_io_data)

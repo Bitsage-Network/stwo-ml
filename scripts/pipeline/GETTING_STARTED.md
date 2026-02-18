@@ -299,6 +299,13 @@ statement (`weight_binding_mode=0`):
 ```
 (`--gkr-v2` auto-enables `--starknet-ready` if omitted.)
 
+To emit v3 calldata (`verify_model_gkr_v3`) with the same sequential
+statement (`weight_binding_mode=0`, `weight_binding_data=[]`):
+```bash
+./03_prove.sh --model-name qwen3-14b --gpu --starknet-ready --gkr-v3
+```
+(`--gkr-v3` auto-enables `--starknet-ready` if omitted.)
+
 To use the faster submit-ready v2 batched-subchannel opening transcript
 (`weight_binding_mode=1`):
 ```bash
@@ -338,13 +345,15 @@ aggregated RLC weight binding enabled), `04_verify_onchain.sh` will print the
 exact soundness-gate reason. In dry-run it exits cleanly; in submit mode it
 fails fast before any transaction is sent.
 
-For `verify_model_gkr_v2` artifacts, the submit pipeline also validates
+For `verify_model_gkr_v2` and `verify_model_gkr_v3` artifacts, the submit pipeline also validates
 that `weight_binding_mode` matches the artifact mode:
 - `Sequential` -> `0`
 - `BatchedSubchannelV1` -> `1`
 before sending TX.
-If the target contract does not expose `verify_model_gkr_v2`, submit with v1
-(`--starknet-ready` without `--gkr-v2`) or deploy the upgraded verifier first.
+For v3, it also enforces `weight_binding_data=[]` in modes `0/1`.
+If the target contract does not expose your requested entrypoint
+(`verify_model_gkr_v2` or `verify_model_gkr_v3`), submit with v1
+(`--starknet-ready` without `--gkr-v2/--gkr-v3`) or deploy the upgraded verifier first.
 The paymaster submit path now preflights contract ABI support and fails fast
 before transaction submission when the requested entrypoint is missing.
 
@@ -371,6 +380,9 @@ The script will:
 
 # Same flow, but emit/submit verify_model_gkr_v2 calldata
 ./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v2
+
+# Same flow, but emit/submit verify_model_gkr_v3 calldata
+./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v3
 
 # Force v2 sequential mode (weight_binding_mode=0)
 ./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v2 --gkr-v2-mode sequential

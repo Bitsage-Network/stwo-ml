@@ -158,3 +158,23 @@ Ensure v2 covers all needed layer tags in Cairo walk for target production model
 3. Paymaster preflight:
    - Submission now checks target contract ABI for requested entrypoint before TX build.
    - Missing `verify_model_gkr_v2` fails fast with actionable guidance.
+
+## Phase 3 step-2 (interface skeleton + hardened integration)
+
+1. Contract:
+   - Added `verify_model_gkr_v3(...)` entrypoint.
+   - Added explicit `weight_binding_data: Array<felt252>`.
+   - Modes `0/1` delegate to existing trustless opening verification.
+   - Mode `2` is fail-closed (`MODE2_NOT_IMPLEMENTED`) until aggregated trustless binding is fully implemented/audited.
+2. Rust serializers:
+   - Added `build_verify_model_gkr_v3_calldata(...)`.
+   - v3 layout = v2 + `weight_binding_data` array.
+   - For submit-ready modes (`0/1`), `weight_binding_data` is currently empty.
+3. Pipeline hardening:
+   - Added `--gkr-v3` in proving/e2e scripts.
+   - Submit parsers/paymaster now accept `verify_model_gkr_v3` and enforce:
+     - `weight_binding_mode` consistency with artifact mode.
+     - `weight_binding_data=[]` for modes `0/1`.
+4. Scope:
+   - This is protocol plumbing and fail-closed safety.
+   - The mode `2` aggregated trustless binding proof system is still pending.

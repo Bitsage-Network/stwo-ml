@@ -197,6 +197,29 @@ pub trait ISumcheckVerifier<TContractState> {
         weight_opening_proofs: Array<MleOpeningProof>,
     ) -> bool;
 
+    /// Phase-3 interface skeleton for trustless aggregated weight binding.
+    ///
+    /// Supported `weight_binding_mode` values:
+    ///   - `0`: sequential opening transcript (v1-compatible)
+    ///   - `1`: batched sub-channel opening transcript
+    ///   - `2`: aggregated trustless binding (reserved, not implemented yet)
+    ///
+    /// `weight_binding_data` is reserved for mode `2`.
+    fn verify_model_gkr_v3(
+        ref self: TContractState,
+        model_id: felt252,
+        raw_io_data: Array<felt252>,
+        circuit_depth: u32,
+        num_layers: u32,
+        matmul_dims: Array<u32>,
+        dequantize_bits: Array<u64>,
+        proof_data: Array<felt252>,
+        weight_commitments: Array<felt252>,
+        weight_binding_mode: u32,
+        weight_binding_data: Array<felt252>,
+        weight_opening_proofs: Array<MleOpeningProof>,
+    ) -> bool;
+
     /// Get the circuit descriptor hash for a GKR-registered model.
     fn get_model_circuit_hash(self: @TContractState, model_id: felt252) -> felt252;
 
@@ -439,6 +462,7 @@ mod SumcheckVerifierContract {
 
     const WEIGHT_BINDING_MODE_SEQUENTIAL: u32 = 0;
     const WEIGHT_BINDING_MODE_BATCHED_SUBCHANNEL_V1: u32 = 1;
+    const WEIGHT_BINDING_MODE_AGGREGATED_TRUSTLESS_V2: u32 = 2;
 
     fn derive_weight_opening_subchannel(
         opening_seed: felt252,
@@ -1541,6 +1565,55 @@ mod SumcheckVerifierContract {
                     || weight_binding_mode == WEIGHT_BINDING_MODE_BATCHED_SUBCHANNEL_V1,
                 "UNSUPPORTED_WEIGHT_BINDING_MODE",
             );
+            verify_model_gkr_core(
+                ref self,
+                model_id,
+                raw_io_data,
+                circuit_depth,
+                num_layers,
+                matmul_dims,
+                dequantize_bits,
+                proof_data,
+                weight_commitments,
+                weight_binding_mode,
+                weight_opening_proofs,
+            )
+        }
+
+        fn verify_model_gkr_v3(
+            ref self: ContractState,
+            model_id: felt252,
+            raw_io_data: Array<felt252>,
+            circuit_depth: u32,
+            num_layers: u32,
+            matmul_dims: Array<u32>,
+            dequantize_bits: Array<u64>,
+            proof_data: Array<felt252>,
+            weight_commitments: Array<felt252>,
+            weight_binding_mode: u32,
+            weight_binding_data: Array<felt252>,
+            weight_opening_proofs: Array<MleOpeningProof>,
+        ) -> bool {
+            assert!(
+                weight_binding_mode == WEIGHT_BINDING_MODE_SEQUENTIAL
+                    || weight_binding_mode == WEIGHT_BINDING_MODE_BATCHED_SUBCHANNEL_V1
+                    || weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_TRUSTLESS_V2,
+                "UNSUPPORTED_WEIGHT_BINDING_MODE",
+            );
+
+            if weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_TRUSTLESS_V2 {
+                // Phase 3 placeholder:
+                // aggregated trustless binding verifier path is intentionally
+                // fail-closed until fully implemented and audited.
+                assert!(weight_binding_data.len() > 0, "MODE2_WEIGHT_BINDING_DATA_REQUIRED");
+                assert!(false, "MODE2_NOT_IMPLEMENTED");
+            }
+
+            assert!(
+                weight_binding_data.len() == 0,
+                "UNEXPECTED_WEIGHT_BINDING_DATA_FOR_MODE",
+            );
+
             verify_model_gkr_core(
                 ref self,
                 model_id,

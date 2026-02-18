@@ -198,7 +198,7 @@ async function preflightContractEntrypoint(provider, contractAddress, entrypoint
   }
 
   if (!abiHasEntrypoint(abi, entrypoint)) {
-    if (entrypoint === "verify_model_gkr_v2") {
+    if (entrypoint === "verify_model_gkr_v2" || entrypoint === "verify_model_gkr_v3") {
       die(
         `Contract ${contractAddress} does not expose ${entrypoint}. ` +
           "Deploy the upgraded verifier, or submit with v1 (Sequential mode)."
@@ -282,10 +282,14 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
   if (typeof entrypoint !== "string" || entrypoint.length === 0) {
     die("verify_calldata.entrypoint must be a non-empty string");
   }
-  const allowedEntrypoints = new Set(["verify_model_gkr", "verify_model_gkr_v2"]);
+  const allowedEntrypoints = new Set([
+    "verify_model_gkr",
+    "verify_model_gkr_v2",
+    "verify_model_gkr_v3",
+  ]);
   if (!allowedEntrypoints.has(entrypoint)) {
     die(
-      `Only verify_model_gkr / verify_model_gkr_v2 are supported in the hardened pipeline (got: ${entrypoint})`
+      `Only verify_model_gkr / verify_model_gkr_v2 / verify_model_gkr_v3 are supported in the hardened pipeline (got: ${entrypoint})`
     );
   }
 
@@ -312,7 +316,7 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
         `${entrypoint} requires weight_opening_mode=Sequential (got: ${proofData.weight_opening_mode})`
       );
     }
-  } else if (entrypoint === "verify_model_gkr_v2") {
+  } else if (entrypoint === "verify_model_gkr_v2" || entrypoint === "verify_model_gkr_v3") {
     const allowedModes = new Set(["Sequential", "BatchedSubchannelV1"]);
     if (weightOpeningMode !== undefined && !allowedModes.has(weightOpeningMode)) {
       die(
@@ -349,7 +353,7 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
     return n;
   };
 
-  if (entrypoint === "verify_model_gkr_v2") {
+  if (entrypoint === "verify_model_gkr_v2" || entrypoint === "verify_model_gkr_v3") {
     // model_id, raw_io_data, circuit_depth, num_layers, matmul_dims,
     // dequantize_bits, proof_data, weight_commitments, weight_binding_mode, weight_openings...
     let idx = 0;
@@ -380,13 +384,24 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
     }
     if (expectedMode !== null && weightBindingMode !== expectedMode) {
       die(
-        `verify_model_gkr_v2 expected weight_binding_mode=${expectedMode} for weight_opening_mode=${weightOpeningMode} (got ${weightBindingMode})`
+        `${entrypoint} expected weight_binding_mode=${expectedMode} for weight_opening_mode=${weightOpeningMode} (got ${weightBindingMode})`
       );
     }
     if (expectedMode === null && !new Set([0, 1]).has(weightBindingMode)) {
       die(
-        `verify_model_gkr_v2 requires weight_binding_mode in {0,1} (got ${weightBindingMode})`
+        `${entrypoint} requires weight_binding_mode in {0,1} (got ${weightBindingMode})`
       );
+    }
+    if (entrypoint === "verify_model_gkr_v3") {
+      idx += 1; // consume weight_binding_mode
+      if (idx >= calldata.length) die("v3 calldata truncated before weight_binding_data length");
+      const weightBindingDataLen = parseNat(calldata[idx], "weight_binding_data length");
+      idx += 1 + weightBindingDataLen;
+      if (new Set([0, 1]).has(weightBindingMode) && weightBindingDataLen !== 0) {
+        die(
+          `${entrypoint} mode ${weightBindingMode} requires empty weight_binding_data (got len=${weightBindingDataLen})`
+        );
+      }
     }
   }
 
@@ -528,9 +543,13 @@ async function cmdVerify(args) {
   const verifyPayload = parseVerifyCalldata(proofData, modelIdArg);
   const modelId = verifyPayload.modelId || modelIdArg;
 
-  if (!new Set(["verify_model_gkr", "verify_model_gkr_v2"]).has(verifyPayload.entrypoint)) {
+  if (
+    !new Set(["verify_model_gkr", "verify_model_gkr_v2", "verify_model_gkr_v3"]).has(
+      verifyPayload.entrypoint
+    )
+  ) {
     die(
-      `Only verify_model_gkr / verify_model_gkr_v2 are supported in the hardened pipeline (got: ${verifyPayload.entrypoint})`
+      `Only verify_model_gkr / verify_model_gkr_v2 / verify_model_gkr_v3 are supported in the hardened pipeline (got: ${verifyPayload.entrypoint})`
     );
   }
 
