@@ -251,6 +251,7 @@ GPU presets in `configs/4090.env`, `configs/b200.env`, `configs/b300.env`.
 ```
 
 `02a_test_inference.sh` streams dependency install and GGUF conversion logs live (including auto-install of `torch` when needed).
+Prompt/benchmark runs now emit a heartbeat every 15s and always exit cleanly on `Ctrl-C`.
 
 ### 02b_capture_inference.sh
 

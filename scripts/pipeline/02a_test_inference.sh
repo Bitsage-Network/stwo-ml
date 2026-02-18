@@ -22,7 +22,7 @@ source "${SCRIPT_DIR}/lib/common.sh"
 
 MODEL_NAME=""
 MODEL_DIR=""
-PROMPT="Hello, what is 2+2?"
+PROMPT="Explain why 2+2=4 in two short sentences, then give one practical example."
 DO_CHAT=false
 DO_BENCHMARK=false
 GPU_LAYERS=99
@@ -289,27 +289,47 @@ run_llama_with_live_output() {
         echo -e "${DIM}[DRY RUN] $*${NC}" >&2
         return 0
     fi
+    : > "$out_file"
 
-    # Prefer PTY execution so llama output flushes live (avoids "stuck" feeling).
+    local cmd_pid=""
+    local tail_pid=""
+    local started_at
+    started_at=$(date +%s)
+
+    _stop_infer_process() {
+        local pid="$1"
+        [[ -z "$pid" ]] && return 0
+        # Kill child tree best-effort.
+        pkill -TERM -P "$pid" 2>/dev/null || true
+        kill -TERM "$pid" 2>/dev/null || true
+        sleep 1
+        pkill -KILL -P "$pid" 2>/dev/null || true
+        kill -KILL "$pid" 2>/dev/null || true
+    }
+
+    # Run under PTY when possible (improves token flush), but keep it in
+    # background so Ctrl-C handling stays deterministic.
     if command -v script >/dev/null 2>&1; then
         local cmd_quoted=""
         printf -v cmd_quoted '%q ' "$@"
         if command -v timeout >/dev/null 2>&1; then
-            script -q -e -c "timeout ${INFERENCE_TIMEOUT_SEC}s ${cmd_quoted}" /dev/null 2>&1 | tee "$out_file"
+            script -q -f -e -c "timeout ${INFERENCE_TIMEOUT_SEC}s ${cmd_quoted}" "$out_file" >/dev/null 2>&1 &
         else
-            script -q -e -c "${cmd_quoted}" /dev/null 2>&1 | tee "$out_file"
+            script -q -f -e -c "${cmd_quoted}" "$out_file" >/dev/null 2>&1 &
         fi
-        return ${PIPESTATUS[0]}
+    else
+        if command -v timeout >/dev/null 2>&1; then
+            timeout "${INFERENCE_TIMEOUT_SEC}s" "$@" >"$out_file" 2>&1 &
+        else
+            "$@" >"$out_file" 2>&1 &
+        fi
     fi
+    cmd_pid=$!
 
-    # Fallback path when `script` is unavailable: stream + heartbeat + timeout.
-    : > "$out_file"
-    "$@" >"$out_file" 2>&1 &
-    local cmd_pid=$!
     tail -n +1 -f "$out_file" &
-    local tail_pid=$!
-    local started_at
-    started_at=$(date +%s)
+    tail_pid=$!
+
+    trap '_stop_infer_process "$cmd_pid"; kill "$tail_pid" 2>/dev/null || true; trap - INT TERM; exit 130' INT TERM
 
     while kill -0 "$cmd_pid" 2>/dev/null; do
         sleep 15
@@ -319,18 +339,19 @@ run_llama_with_live_output() {
         local elapsed=$(( $(date +%s) - started_at ))
         log "Inference still running... ${elapsed}s elapsed"
         if (( elapsed >= INFERENCE_TIMEOUT_SEC )); then
-            warn "Inference timeout (${INFERENCE_TIMEOUT_SEC}s) reached, terminating llama process..."
-            kill -TERM "$cmd_pid" 2>/dev/null || true
-            sleep 2
-            kill -KILL "$cmd_pid" 2>/dev/null || true
+            warn "Inference timeout (${INFERENCE_TIMEOUT_SEC}s) reached, terminating..."
+            _stop_infer_process "$cmd_pid"
             break
         fi
     done
 
-    wait "$cmd_pid"
+    wait "$cmd_pid" 2>/dev/null
     local rc=$?
+
     kill "$tail_pid" 2>/dev/null || true
     wait "$tail_pid" 2>/dev/null || true
+    trap - INT TERM
+
     return "$rc"
 }
 
@@ -403,7 +424,7 @@ else
         --no-display-prompt || true
 
     # Separate model output from timing
-    MODEL_RESPONSE=$(grep -v "^llama_" "$TEST_LOG" 2>/dev/null | grep -v "^$" | grep -v "eval time" | head -20)
+    MODEL_RESPONSE=$(grep -v "^llama_" "$TEST_LOG" 2>/dev/null | grep -v "^Script " | grep -v "^$" | grep -v "eval time" | head -20)
     TIMING=$(grep "eval time" "$TEST_LOG" 2>/dev/null || echo "")
 
     if [[ -n "$MODEL_RESPONSE" ]]; then
