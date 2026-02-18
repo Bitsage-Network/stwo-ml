@@ -38,6 +38,11 @@ MAX_FEE="0.05"
 MODEL_ID="0x1"
 FORCE_PAYMASTER=false
 FORCE_NO_PAYMASTER=false
+GKR_V2=false
+GKR_V3=false
+GKR_V4=false
+GKR_V2_MODE="auto"  # auto|sequential|batched|mode2|mode3
+LEGACY_GKR_V1=false
 
 # Passthrough arrays for sub-scripts
 SETUP_ARGS=()
@@ -69,6 +74,11 @@ while [[ $# -gt 0 ]]; do
         --hf-token)        HF_TOKEN_ARG="$2"; shift 2 ;;
         --max-fee)         MAX_FEE="$2"; shift 2 ;;
         --model-id)        MODEL_ID="$2"; shift 2 ;;
+        --gkr-v2)          GKR_V2=true; shift ;;
+        --gkr-v3)          GKR_V3=true; shift ;;
+        --gkr-v4)          GKR_V4=true; shift ;;
+        --gkr-v2-mode)     GKR_V2_MODE="$2"; shift 2 ;;
+        --legacy-gkr-v1)   LEGACY_GKR_V1=true; shift ;;
         --install-drivers) SETUP_ARGS+=("--install-drivers"); shift ;;
         --skip-drivers)    SETUP_ARGS+=("--skip-drivers"); shift ;;
         --branch)          SETUP_ARGS+=("--branch" "$2"); shift 2 ;;
@@ -100,6 +110,12 @@ while [[ $# -gt 0 ]]; do
             echo "  --multi-gpu          Use all GPUs"
             echo "  --gpu-only           Fail if any critical proving path falls back to CPU"
             echo "                       (submit path auto-forces --starknet-ready in step 6)"
+            echo "  --gkr-v2             Use verify_model_gkr_v2 calldata"
+            echo "  --gkr-v3             Use verify_model_gkr_v3 calldata (v3 envelope)"
+            echo "  --gkr-v4             Use verify_model_gkr_v4 calldata (experimental mode-3 envelope)"
+            echo "  --gkr-v2-mode MODE   v2/v3/v4 weight-binding profile: auto|sequential|batched|mode2|mode3"
+            echo "                       auto(default): submit path prefers mode2 on v3, mode3 on v4"
+            echo "  --legacy-gkr-v1      Keep legacy verify_model_gkr (v1 sequential openings)"
             echo "  --hf-token TOKEN     HuggingFace API token"
             echo "  --max-fee ETH        Max TX fee (default: 0.05)"
             echo "  --model-id ID        On-chain model ID (default: 0x1)"
@@ -139,9 +155,72 @@ if [[ "$MODE" != "gkr" ]]; then
     exit 1
 fi
 
+case "${GKR_V2_MODE,,}" in
+    auto|sequential|batched|mode2|mode3) ;;
+    *)
+        err "Invalid --gkr-v2-mode: ${GKR_V2_MODE} (expected: auto|sequential|batched|mode2|mode3)"
+        exit 1
+        ;;
+esac
+if [[ "$GKR_V2" == "true" && "$GKR_V3" == "true" ]]; then
+    warn "Both --gkr-v2 and --gkr-v3 were set; preferring v3 entrypoint."
+    GKR_V2=false
+fi
+if [[ "$GKR_V4" == "true" && "$GKR_V3" == "true" ]]; then
+    warn "Both --gkr-v3 and --gkr-v4 were set; preferring v4 entrypoint."
+    GKR_V3=false
+fi
+if [[ "$GKR_V4" == "true" && "$GKR_V2" == "true" ]]; then
+    warn "Both --gkr-v2 and --gkr-v4 were set; preferring v4 entrypoint."
+    GKR_V2=false
+fi
+
+if [[ "${GKR_V2_MODE,,}" != "auto" ]] && [[ "$GKR_V2" != "true" ]] && [[ "$GKR_V3" != "true" ]] && [[ "$GKR_V4" != "true" ]]; then
+    err "--gkr-v2-mode requires --gkr-v2, --gkr-v3, or --gkr-v4"
+    exit 1
+fi
+if [[ "${GKR_V2_MODE,,}" == "mode2" ]] && [[ "$GKR_V3" != "true" ]]; then
+    err "--gkr-v2-mode mode2 requires --gkr-v3"
+    exit 1
+fi
+if [[ "${GKR_V2_MODE,,}" == "mode3" ]] && [[ "$GKR_V4" != "true" ]]; then
+    err "--gkr-v2-mode mode3 requires --gkr-v4"
+    exit 1
+fi
+if [[ "$GKR_V4" == "true" ]] && [[ "${GKR_V2_MODE,,}" == "sequential" || "${GKR_V2_MODE,,}" == "batched" || "${GKR_V2_MODE,,}" == "mode2" ]]; then
+    err "--gkr-v4 only supports --gkr-v2-mode auto|mode3"
+    exit 1
+fi
+
+if [[ "$LEGACY_GKR_V1" == "true" ]] && [[ "$GKR_V2" == "true" || "$GKR_V3" == "true" || "$GKR_V4" == "true" ]]; then
+    warn "--legacy-gkr-v1 ignored because a v2/v3/v4 entrypoint was explicitly selected."
+    LEGACY_GKR_V1=false
+fi
+
 if [[ "$DO_SUBMIT" == "false" ]] && [[ "$DO_DRY_RUN" == "false" ]]; then
     warn "Neither --submit nor --dry-run specified. Defaulting to --dry-run."
     DO_DRY_RUN=true
+fi
+
+if [[ "$DO_SUBMIT" == "true" ]] && [[ "$MODE" == "gkr" ]] && [[ "$GKR_V2" != "true" ]] && [[ "$GKR_V3" != "true" ]] && [[ "$GKR_V4" != "true" ]]; then
+    if [[ "$LEGACY_GKR_V1" == "true" ]]; then
+        warn "--submit + --legacy-gkr-v1: keeping verify_model_gkr (v1 sequential openings)."
+    else
+        warn "--submit requested without --gkr-v2/--gkr-v3/--gkr-v4; defaulting to verify_model_gkr_v3 mode2 (fast trustless submit path)."
+        GKR_V3=true
+        if [[ "${GKR_V2_MODE,,}" == "auto" ]]; then
+            GKR_V2_MODE="mode2"
+        fi
+    fi
+fi
+
+if [[ "$DO_SUBMIT" == "true" ]] && [[ "$GKR_V3" == "true" ]] && [[ "${GKR_V2_MODE,,}" == "auto" ]] && [[ "$LEGACY_GKR_V1" != "true" ]]; then
+    warn "--submit + --gkr-v3 with auto mode: defaulting to mode2 trustless binding."
+    GKR_V2_MODE="mode2"
+fi
+if [[ "$DO_SUBMIT" == "true" ]] && [[ "$GKR_V4" == "true" ]] && [[ "${GKR_V2_MODE,,}" == "auto" ]] && [[ "$LEGACY_GKR_V1" != "true" ]]; then
+    warn "--submit + --gkr-v4 with auto mode: defaulting to mode3 experimental binding envelope."
+    GKR_V2_MODE="mode3"
 fi
 
 # ─── Start ───────────────────────────────────────────────────────────
@@ -163,6 +242,11 @@ log "Model:       ${PRESET:-${HF_MODEL}}"
 log "Mode:        ${MODE}"
 log "GPU:         ${DO_GPU} (multi: ${DO_MULTI_GPU})"
 log "GPU only:    ${DO_GPU_ONLY}"
+log "GKR v2:      ${GKR_V2}"
+log "GKR v3:      ${GKR_V3}"
+log "GKR v4:      ${GKR_V4}"
+log "GKR v2 mode: ${GKR_V2_MODE}"
+log "Legacy v1:   ${LEGACY_GKR_V1}"
 log "Layers:      ${LAYERS:-all}"
 log "Action:      $(if [[ "$DO_SUBMIT" == "true" ]]; then echo "SUBMIT"; else echo "DRY RUN"; fi)"
 log "Run dir:     ${RUN_DIR}"
@@ -308,9 +392,38 @@ if (( START_IDX <= 5 )); then
     [[ "$DO_MULTI_GPU" == "true" ]] && _PROVE_ARGS+=("--multi-gpu")
     [[ "$DO_GPU_ONLY" == "true" ]] && _PROVE_ARGS+=("--gpu-only")
     [[ "$DO_SUBMIT" == "true" ]] && _PROVE_ARGS+=("--starknet-ready")
+    [[ "$GKR_V2" == "true" ]] && _PROVE_ARGS+=("--gkr-v2")
+    [[ "$GKR_V3" == "true" ]] && _PROVE_ARGS+=("--gkr-v3")
+    [[ "$GKR_V4" == "true" ]] && _PROVE_ARGS+=("--gkr-v4")
+    [[ "$LEGACY_GKR_V1" == "true" ]] && _PROVE_ARGS+=("--legacy-gkr-v1")
+
+    _PROVE_ENV=()
+    if [[ "$GKR_V2" == "true" || "$GKR_V3" == "true" || "$GKR_V4" == "true" ]]; then
+        case "${GKR_V2_MODE,,}" in
+            sequential)
+                _PROVE_ENV+=("STWO_GKR_BATCH_WEIGHT_OPENINGS=off")
+                ;;
+            batched)
+                _PROVE_ENV+=("STWO_GKR_BATCH_WEIGHT_OPENINGS=on")
+                ;;
+            mode2)
+                _PROVE_ARGS+=("--gkr-v3-mode2")
+                _PROVE_ENV+=("STWO_GKR_BATCH_WEIGHT_OPENINGS=on")
+                ;;
+            mode3)
+                _PROVE_ARGS+=("--gkr-v4-mode3")
+                _PROVE_ENV+=("STWO_GKR_BATCH_WEIGHT_OPENINGS=on")
+                ;;
+            auto)
+                # Keep 03_prove.sh defaults:
+                # - on for --starknet-ready --gkr-v2/--gkr-v3/--gkr-v4 --gpu
+                # - off otherwise
+                ;;
+        esac
+    fi
 
     run_step "Proof Generation" "$CURRENT" "$TOTAL_STEPS" \
-        bash "${SCRIPT_DIR}/03_prove.sh" "${_PROVE_ARGS[@]}" || exit 1
+        env "${_PROVE_ENV[@]}" bash "${SCRIPT_DIR}/03_prove.sh" "${_PROVE_ARGS[@]}" || exit 1
     (( CURRENT++ ))
 fi
 

@@ -160,7 +160,7 @@ struct Cli {
     /// Contract address for --submit-gkr (hex).
     #[arg(
         long,
-        default_value = "0x00c7845a80d01927826b17032a432ad9cd36ea61be17fe8cc089d9b68c57e710"
+        default_value = "0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005"
     )]
     contract: String,
 
@@ -1187,6 +1187,8 @@ fn main() {
         OutputFormat::MlGkr => {
             use stwo_ml::starknet::{
                 build_gkr_serializable_proof, build_verify_model_gkr_calldata,
+                build_verify_model_gkr_v2_calldata, build_verify_model_gkr_v3_calldata,
+                build_verify_model_gkr_v4_calldata,
             };
 
             let gkr_proof =
@@ -1217,13 +1219,56 @@ fn main() {
                 eprintln!("  Warning: Starknet soundness gate status: {reason}");
             }
 
+            let use_starknet_gkr_v4 = std::env::var("STWO_STARKNET_GKR_V4")
+                .ok()
+                .map(|v| {
+                    let v = v.trim().to_ascii_lowercase();
+                    !v.is_empty() && v != "0" && v != "false" && v != "off"
+                })
+                .unwrap_or(false);
+            let use_starknet_gkr_v3 = std::env::var("STWO_STARKNET_GKR_V3")
+                .ok()
+                .map(|v| {
+                    let v = v.trim().to_ascii_lowercase();
+                    !v.is_empty() && v != "0" && v != "false" && v != "off"
+                })
+                .unwrap_or(false);
+            let use_starknet_gkr_v2 = !use_starknet_gkr_v4
+                && !use_starknet_gkr_v3
+                && std::env::var("STWO_STARKNET_GKR_V2")
+                    .ok()
+                    .map(|v| {
+                        let v = v.trim().to_ascii_lowercase();
+                        !v.is_empty() && v != "0" && v != "false" && v != "off"
+                    })
+                    .unwrap_or(false);
+            let verify_entrypoint = if use_starknet_gkr_v4 {
+                "verify_model_gkr_v4"
+            } else if use_starknet_gkr_v3 {
+                "verify_model_gkr_v3"
+            } else if use_starknet_gkr_v2 {
+                "verify_model_gkr_v2"
+            } else {
+                "verify_model_gkr"
+            };
+            eprintln!("  starknet_entrypoint: {verify_entrypoint}");
+
             // Build complete verify_model_gkr calldata (all parameters pre-assembled)
             let verify_calldata_obj = if let Some(gkr_p) = proof.gkr_proof.as_ref() {
                 match stwo_ml::gkr::LayeredCircuit::from_graph(&model.graph) {
                     Ok(circuit) => {
                         let raw_io =
                             stwo_ml::cairo_serde::serialize_raw_io(&input, &proof.execution.output);
-                        match build_verify_model_gkr_calldata(gkr_p, &circuit, model_id, &raw_io) {
+                        let verify_result = if use_starknet_gkr_v4 {
+                            build_verify_model_gkr_v4_calldata(gkr_p, &circuit, model_id, &raw_io)
+                        } else if use_starknet_gkr_v3 {
+                            build_verify_model_gkr_v3_calldata(gkr_p, &circuit, model_id, &raw_io)
+                        } else if use_starknet_gkr_v2 {
+                            build_verify_model_gkr_v2_calldata(gkr_p, &circuit, model_id, &raw_io)
+                        } else {
+                            build_verify_model_gkr_calldata(gkr_p, &circuit, model_id, &raw_io)
+                        };
+                        match verify_result {
                             Ok(vc) => {
                                 eprintln!(
                                     "  verify_calldata: {} parts (ready for submission)",
@@ -1231,7 +1276,7 @@ fn main() {
                                 );
                                 serde_json::json!({
                                     "schema_version": 1,
-                                    "entrypoint": "verify_model_gkr",
+                                    "entrypoint": verify_entrypoint,
                                     "calldata": vc.calldata_parts,
                                     "total_felts": vc.total_felts,
                                     "upload_chunks": Vec::<Vec<String>>::new(),
@@ -1296,6 +1341,11 @@ fn main() {
                     .map(|f| format!("0x{:x}", f))
                     .collect::<Vec<_>>(),
                 "weight_claim_calldata": gkr_proof.weight_claim_calldata.iter()
+                    .map(|f| format!("0x{:x}", f))
+                    .collect::<Vec<_>>(),
+                "weight_binding_schema_version": gkr_proof.weight_binding_schema_version,
+                "weight_binding_mode_id": gkr_proof.weight_binding_mode_id,
+                "weight_binding_data_calldata": gkr_proof.weight_binding_data_calldata.iter()
                     .map(|f| format!("0x{:x}", f))
                     .collect::<Vec<_>>(),
                 "weight_opening_mode": format!("{:?}", gkr_proof.weight_opening_mode),
@@ -1434,6 +1484,7 @@ fn submit_gkr_onchain(
 ) {
     use stwo_ml::starknet::{
         build_circuit_descriptor, build_register_gkr_calldata, build_verify_model_gkr_calldata,
+        build_verify_model_gkr_v2_calldata, build_verify_model_gkr_v3_calldata,
     };
 
     if cli.format != OutputFormat::MlGkr {
@@ -1462,14 +1513,43 @@ fn submit_gkr_onchain(
     eprintln!("  Network:  {}", cli.network);
     eprintln!("  Max fee:  {} ETH", cli.max_fee);
 
+    let use_starknet_gkr_v3 = std::env::var("STWO_STARKNET_GKR_V3")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false" && v != "off"
+        })
+        .unwrap_or(false);
+    let use_starknet_gkr_v2 = !use_starknet_gkr_v3
+        && std::env::var("STWO_STARKNET_GKR_V2")
+            .ok()
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                !v.is_empty() && v != "0" && v != "false" && v != "off"
+            })
+            .unwrap_or(false);
+    let verify_entrypoint = if use_starknet_gkr_v3 {
+        "verify_model_gkr_v3"
+    } else if use_starknet_gkr_v2 {
+        "verify_model_gkr_v2"
+    } else {
+        "verify_model_gkr"
+    };
+    eprintln!("  Entrypoint: {}", verify_entrypoint);
+
     // Step 1: Build verify_model_gkr calldata (raw IO data for on-chain recomputation)
     let raw_io_data = stwo_ml::cairo_serde::serialize_raw_io(input, &proof.execution.output);
-    let verify_calldata =
+    let verify_calldata = if use_starknet_gkr_v3 {
+        build_verify_model_gkr_v3_calldata(gkr_proof, &circuit, model_id, &raw_io_data)
+    } else if use_starknet_gkr_v2 {
+        build_verify_model_gkr_v2_calldata(gkr_proof, &circuit, model_id, &raw_io_data)
+    } else {
         build_verify_model_gkr_calldata(gkr_proof, &circuit, model_id, &raw_io_data)
-            .unwrap_or_else(|e| {
-                eprintln!("Error: soundness gate rejected GKR calldata: {e}");
-                process::exit(1);
-            });
+    }
+    .unwrap_or_else(|e| {
+        eprintln!("Error: soundness gate rejected GKR calldata: {e}");
+        process::exit(1);
+    });
 
     eprintln!(
         "  Calldata: {} parts ({} estimated felts)",
@@ -1577,7 +1657,7 @@ fn submit_gkr_onchain(
     }
 
     // Step 3: Submit verification
-    eprintln!("  Submitting verify_model_gkr...");
+    eprintln!("  Submitting {}...", verify_entrypoint);
 
     // For large calldatas, read from file to avoid shell arg limit
     let verify_result = std::process::Command::new("sh")
@@ -1585,12 +1665,13 @@ fn submit_gkr_onchain(
         .arg(format!(
             "sncast --account '{}' --network '{}' invoke \
              --contract-address '{}' \
-             --function verify_model_gkr \
+             --function {} \
              --calldata $(cat '{}') \
              --max-fee {}",
             cli.account,
             cli.network,
             cli.contract,
+            verify_entrypoint,
             calldata_path.display(),
             cli.max_fee,
         ))

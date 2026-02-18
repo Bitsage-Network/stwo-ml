@@ -149,6 +149,69 @@ function info(msg) {
   process.stderr.write(`[INFO] ${msg}\n`);
 }
 
+function abiHasEntrypoint(abiEntries, entrypoint) {
+  if (!Array.isArray(abiEntries)) return false;
+  const stack = [...abiEntries];
+  while (stack.length > 0) {
+    const entry = stack.pop();
+    if (!entry || typeof entry !== "object") continue;
+
+    if (entry.type === "function" && typeof entry.name === "string") {
+      const fullName = entry.name;
+      const shortName = fullName.split("::").pop();
+      if (fullName === entrypoint || shortName === entrypoint) {
+        return true;
+      }
+    }
+
+    if (Array.isArray(entry.items)) {
+      for (const item of entry.items) stack.push(item);
+    }
+  }
+  return false;
+}
+
+async function preflightContractEntrypoint(provider, contractAddress, entrypoint) {
+  let classAt;
+  try {
+    classAt = await provider.getClassAt(contractAddress);
+  } catch (e) {
+    info(
+      `Entrypoint preflight skipped (failed to fetch contract class at ${contractAddress}): ${e.message || e}`
+    );
+    return;
+  }
+
+  let abi = classAt?.abi;
+  if (typeof abi === "string") {
+    try {
+      abi = JSON.parse(abi);
+    } catch {
+      abi = null;
+    }
+  }
+  if (!Array.isArray(abi)) {
+    info(
+      `Entrypoint preflight skipped (contract ABI unavailable for ${contractAddress})`
+    );
+    return;
+  }
+
+  if (!abiHasEntrypoint(abi, entrypoint)) {
+    if (
+      entrypoint === "verify_model_gkr_v2" ||
+      entrypoint === "verify_model_gkr_v3" ||
+      entrypoint === "verify_model_gkr_v4"
+    ) {
+      die(
+        `Contract ${contractAddress} does not expose ${entrypoint}. ` +
+          "Deploy the upgraded verifier, or submit with v1 (Sequential mode)."
+      );
+    }
+    die(`Contract ${contractAddress} does not expose required entrypoint: ${entrypoint}`);
+  }
+}
+
 // ─── Ephemeral Account ───────────────────────────────────────────────
 //
 // Generates a keypair and computes the counterfactual address for the
@@ -223,8 +286,16 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
   if (typeof entrypoint !== "string" || entrypoint.length === 0) {
     die("verify_calldata.entrypoint must be a non-empty string");
   }
-  if (entrypoint !== "verify_model_gkr") {
-    die(`Only verify_model_gkr is supported in the hardened pipeline (got: ${entrypoint})`);
+  const allowedEntrypoints = new Set([
+    "verify_model_gkr",
+    "verify_model_gkr_v2",
+    "verify_model_gkr_v3",
+    "verify_model_gkr_v4",
+  ]);
+  if (!allowedEntrypoints.has(entrypoint)) {
+    die(
+      `Only verify_model_gkr / verify_model_gkr_v2 / verify_model_gkr_v3 / verify_model_gkr_v4 are supported in the hardened pipeline (got: ${entrypoint})`
+    );
   }
 
   const rawCalldata = verifyCalldata.calldata;
@@ -232,20 +303,164 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
     die("verify_calldata.calldata must be a non-empty array");
   }
 
+  if (proofData.submission_ready === false) {
+    const mode = proofData.weight_opening_mode ?? "unknown";
+    const reason =
+      verifyCalldata.reason ?? proofData.soundness_gate_error ?? "unspecified";
+    die(
+      `proof is marked submission_ready=false (entrypoint=${entrypoint}, weight_opening_mode=${mode}, reason=${reason})`
+    );
+  }
+  const weightOpeningMode =
+    proofData.weight_opening_mode !== undefined
+      ? String(proofData.weight_opening_mode)
+      : undefined;
+  if (entrypoint === "verify_model_gkr") {
+    if (weightOpeningMode !== undefined && weightOpeningMode !== "Sequential") {
+      die(
+        `${entrypoint} requires weight_opening_mode=Sequential (got: ${proofData.weight_opening_mode})`
+      );
+    }
+  } else if (entrypoint === "verify_model_gkr_v2" || entrypoint === "verify_model_gkr_v3") {
+    const allowedModes = new Set(["Sequential", "BatchedSubchannelV1"]);
+    if (weightOpeningMode !== undefined && !allowedModes.has(weightOpeningMode)) {
+      die(
+        `${entrypoint} requires weight_opening_mode in {Sequential,BatchedSubchannelV1} (got: ${proofData.weight_opening_mode})`
+      );
+    }
+  } else if (entrypoint === "verify_model_gkr_v4") {
+    if (
+      weightOpeningMode !== undefined &&
+      weightOpeningMode !== "AggregatedOpeningsV4Experimental"
+    ) {
+      die(
+        `${entrypoint} requires weight_opening_mode=AggregatedOpeningsV4Experimental (got: ${proofData.weight_opening_mode})`
+      );
+    }
+  }
+
   const rawChunks = verifyCalldata.upload_chunks ?? [];
   if (!Array.isArray(rawChunks)) {
     die("verify_calldata.upload_chunks must be an array");
   }
   if (rawChunks.length > 0) {
-    die("verify_model_gkr payload must not include upload_chunks");
+    die("verify_model_gkr(*) payload must not include upload_chunks");
   }
 
   const hasSessionPlaceholder = rawCalldata.some((v) => String(v) === "__SESSION_ID__");
   if (hasSessionPlaceholder) {
-    die("verify_model_gkr calldata must not include __SESSION_ID__ placeholder");
+    die("verify_model_gkr(*) calldata must not include __SESSION_ID__ placeholder");
   }
 
   const calldata = rawCalldata.map((v) => String(v));
+  const parseNat = (token, label) => {
+    const s = String(token);
+    let n;
+    try {
+      n = s.startsWith("0x") || s.startsWith("0X") ? Number(BigInt(s)) : Number(s);
+    } catch (e) {
+      die(`invalid ${label}: ${s} (${e.message || e})`);
+    }
+    if (!Number.isSafeInteger(n) || n < 0) {
+      die(`invalid ${label}: ${s}`);
+    }
+    return n;
+  };
+
+  if (
+    entrypoint === "verify_model_gkr_v2" ||
+    entrypoint === "verify_model_gkr_v3" ||
+    entrypoint === "verify_model_gkr_v4"
+  ) {
+    // model_id, raw_io_data, circuit_depth, num_layers, matmul_dims,
+    // dequantize_bits, proof_data, weight_commitments, weight_binding_mode, weight_openings...
+    let idx = 0;
+    idx += 1;
+    if (idx >= calldata.length) die("v2 calldata truncated before raw_io length");
+    const rawIoLen = parseNat(calldata[idx], "raw_io_data length");
+    idx += 1 + rawIoLen;
+    idx += 2;
+    if (idx >= calldata.length) die("v2 calldata truncated before matmul_dims length");
+    const matmulLen = parseNat(calldata[idx], "matmul_dims length");
+    idx += 1 + matmulLen;
+    if (idx >= calldata.length) die("v2 calldata truncated before dequantize_bits length");
+    const deqLen = parseNat(calldata[idx], "dequantize_bits length");
+    idx += 1 + deqLen;
+    if (idx >= calldata.length) die("v2 calldata truncated before proof_data length");
+    const proofDataLen = parseNat(calldata[idx], "proof_data length");
+    idx += 1 + proofDataLen;
+    if (idx >= calldata.length) die("v2 calldata truncated before weight_commitments length");
+    const weightCommitmentsLen = parseNat(calldata[idx], "weight_commitments length");
+    idx += 1 + weightCommitmentsLen;
+    if (idx >= calldata.length) die("v2 calldata truncated before weight_binding_mode");
+    const weightBindingMode = parseNat(calldata[idx], "weight_binding_mode");
+    if (entrypoint === "verify_model_gkr_v2" && !new Set([0, 1]).has(weightBindingMode)) {
+      die(`${entrypoint} requires weight_binding_mode in {0,1} (got ${weightBindingMode})`);
+    }
+    if (entrypoint === "verify_model_gkr_v4" && weightBindingMode !== 3) {
+      die(`${entrypoint} requires weight_binding_mode=3 (got ${weightBindingMode})`);
+    }
+    let expectedMode = null;
+    if (weightOpeningMode === "Sequential") {
+      expectedMode = 0;
+    } else if (weightOpeningMode === "BatchedSubchannelV1") {
+      expectedMode = 1;
+    } else if (weightOpeningMode === "AggregatedTrustlessV2") {
+      expectedMode = 2;
+    } else if (weightOpeningMode === "AggregatedOpeningsV4Experimental") {
+      expectedMode = 3;
+    }
+    if (expectedMode !== null && weightBindingMode !== expectedMode) {
+      die(
+        `${entrypoint} expected weight_binding_mode=${expectedMode} for weight_opening_mode=${weightOpeningMode} (got ${weightBindingMode})`
+      );
+    }
+    const allowedModes =
+      entrypoint === "verify_model_gkr_v3"
+        ? new Set([0, 1, 2])
+        : entrypoint === "verify_model_gkr_v4"
+          ? new Set([3])
+          : new Set([0, 1]);
+    if (expectedMode === null && !allowedModes.has(weightBindingMode)) {
+      die(
+        `${entrypoint} requires weight_binding_mode in {${[...allowedModes].join(",")}} (got ${weightBindingMode})`
+      );
+    }
+    if (proofData.weight_binding_mode_id !== undefined && proofData.weight_binding_mode_id !== null) {
+      const artifactModeId = parseNat(proofData.weight_binding_mode_id, "weight_binding_mode_id");
+      if (artifactModeId !== weightBindingMode) {
+        die(
+          `weight_binding_mode_id mismatch: artifact=${artifactModeId} calldata=${weightBindingMode}`
+        );
+      }
+    }
+    if (entrypoint === "verify_model_gkr_v3" || entrypoint === "verify_model_gkr_v4") {
+      idx += 1; // consume weight_binding_mode
+      if (idx >= calldata.length) die(`${entrypoint} calldata truncated before weight_binding_data length`);
+      const weightBindingDataLen = parseNat(calldata[idx], "weight_binding_data length");
+      idx += 1 + weightBindingDataLen;
+      if (new Set([0, 1]).has(weightBindingMode) && weightBindingDataLen !== 0) {
+        die(
+          `${entrypoint} mode ${weightBindingMode} requires empty weight_binding_data (got len=${weightBindingDataLen})`
+        );
+      }
+      if (weightBindingMode === 2 && weightBindingDataLen === 0) {
+        die(`${entrypoint} mode 2 requires non-empty weight_binding_data`);
+      }
+      if (weightBindingMode === 3 && weightBindingDataLen === 0) {
+        die(`${entrypoint} mode 3 requires non-empty weight_binding_data`);
+      }
+      if (
+        Array.isArray(proofData.weight_binding_data_calldata) &&
+        proofData.weight_binding_data_calldata.length !== weightBindingDataLen
+      ) {
+        die(
+          `weight_binding_data_calldata length mismatch: artifact=${proofData.weight_binding_data_calldata.length} calldata=${weightBindingDataLen}`
+        );
+      }
+    }
+  }
+
   const uploadChunks = [];
   const sessionId = null;
 
@@ -384,8 +599,14 @@ async function cmdVerify(args) {
   const verifyPayload = parseVerifyCalldata(proofData, modelIdArg);
   const modelId = verifyPayload.modelId || modelIdArg;
 
-  if (verifyPayload.entrypoint !== "verify_model_gkr") {
-    die(`Only verify_model_gkr is supported in the hardened pipeline (got: ${verifyPayload.entrypoint})`);
+  if (
+    !new Set(["verify_model_gkr", "verify_model_gkr_v2", "verify_model_gkr_v3", "verify_model_gkr_v4"]).has(
+      verifyPayload.entrypoint
+    )
+  ) {
+    die(
+      `Only verify_model_gkr / verify_model_gkr_v2 / verify_model_gkr_v3 / verify_model_gkr_v4 are supported in the hardened pipeline (got: ${verifyPayload.entrypoint})`
+    );
   }
 
   if (
@@ -396,6 +617,8 @@ async function cmdVerify(args) {
       `--model-id ${args["model-id"]} differs from proof artifact model_id ${modelId}; using proof artifact value`
     );
   }
+
+  await preflightContractEntrypoint(provider, contract, verifyPayload.entrypoint);
 
   const verificationCountBefore = await fetchVerificationCount(
     provider,

@@ -264,16 +264,29 @@ pub struct WeightClaim {
 /// - `BatchedRlcDirectEvalV1`: skips per-weight Merkle openings and binds all
 ///   weight claims with a single random-linear-combination check against model
 ///   weights (off-chain verifier path).
+/// - `AggregatedTrustlessV2`: Phase-3 trustless on-chain binding mode.
+///   Current implementation keeps full opening proofs while adding
+///   mode-2 binding payload checks in the Starknet v3 verifier path.
+///   Openings use per-opening sub-channel transcripts for deterministic
+///   parallelizable proving/verifying.
+/// - `AggregatedOpeningsV4Experimental`: experimental mode-3 envelope for
+///   Starknet v4 integration scaffolding. Current implementation still uses
+///   full opening proofs and emits mode-3 binding metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WeightOpeningTranscriptMode {
     Sequential,
     BatchedSubchannelV1,
     BatchedRlcDirectEvalV1,
+    AggregatedTrustlessV2,
+    AggregatedOpeningsV4Experimental,
 }
 
 /// Deterministically derive a per-opening sub-channel from a master seed.
 ///
-/// Domain separation includes opening index, node id, eval point, and expected value.
+/// Domain separation includes opening index, eval point, and expected value.
+///
+/// Note: `weight_node_id` is intentionally excluded so the transcript can be
+/// reproduced by on-chain verifiers from serialized weight claims alone.
 pub(crate) fn derive_weight_opening_subchannel(
     master_seed: starknet_ff::FieldElement,
     opening_index: usize,
@@ -282,7 +295,6 @@ pub(crate) fn derive_weight_opening_subchannel(
     let mut ch = PoseidonChannel::new();
     ch.mix_felt(master_seed);
     ch.mix_u64(opening_index as u64);
-    ch.mix_u64(claim.weight_node_id as u64);
     ch.mix_felts(&claim.eval_point);
     ch.mix_felt(securefield_to_felt(claim.expected_value));
     ch

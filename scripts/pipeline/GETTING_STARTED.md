@@ -286,11 +286,59 @@ export STWO_PURE_GKR_SKIP_UNIFIED_STARK=0
 - `submission_ready: false`
 - `weight_opening_mode: "BatchedRlcDirectEvalV1"`
 - `weight_claim_calldata` for off-chain verification/auditing.
+- `weight_binding_schema_version`, `weight_binding_mode_id`, `weight_binding_data_calldata`
+  for versioned mode-2 migration plumbing.
+- For submit-ready v3 mode-2 payload checks (opening proofs retained), use
+  `--gkr-v3-mode2` or `STWO_GKR_TRUSTLESS_MODE2=1`.
+- For submit-ready v4 mode-3 envelope checks (opening proofs retained), use
+  `--gkr-v4-mode3` or `STWO_GKR_TRUSTLESS_MODE3=1`.
+- The protocol-level v4 design to eliminate per-weight openings is tracked in
+  `stwo-ml/docs/fast-gkr-onchain-v4-aggregated-openings.md`.
 
-To force submit-ready Starknet calldata (sequential openings), run:
+To generate submit-ready Starknet calldata with the default fast trustless profile (v3 mode2), run:
 ```bash
 ./03_prove.sh --model-name qwen3-14b --gpu --starknet-ready
 ```
+
+To force legacy submit-ready v1 sequential openings, run:
+```bash
+./03_prove.sh --model-name qwen3-14b --gpu --starknet-ready --legacy-gkr-v1
+```
+
+To emit v2 calldata (`verify_model_gkr_v2`) with the same sequential
+statement (`weight_binding_mode=0`):
+```bash
+./03_prove.sh --model-name qwen3-14b --gpu --starknet-ready --gkr-v2
+```
+(`--gkr-v2` auto-enables `--starknet-ready` if omitted.)
+
+To emit v3 calldata (`verify_model_gkr_v3`) with the same sequential
+statement (`weight_binding_mode=0`, `weight_binding_data=[]`):
+```bash
+./03_prove.sh --model-name qwen3-14b --gpu --starknet-ready --gkr-v3
+```
+(`--gkr-v3` auto-enables `--starknet-ready` if omitted.)
+
+To emit v3 calldata with trustless mode-2 binding metadata
+(`weight_binding_mode=2`, non-empty `weight_binding_data`):
+```bash
+./03_prove.sh --model-name qwen3-14b --gpu --starknet-ready --gkr-v3-mode2
+```
+(`03_prove.sh` enables sub-channel opening batching by default for `--starknet-ready --gkr-v3 --gpu`, including `--gkr-v3-mode2`.)
+
+To emit v4 calldata with experimental mode-3 binding metadata
+(`weight_binding_mode=3`, non-empty `weight_binding_data`):
+```bash
+./03_prove.sh --model-name qwen3-14b --gpu --starknet-ready --gkr-v4-mode3
+```
+(`--gkr-v4-mode3` auto-enables `--gkr-v4` and `--starknet-ready` if omitted.)
+
+To use the faster submit-ready v2 batched-subchannel opening transcript
+(`weight_binding_mode=1`):
+```bash
+STWO_GKR_BATCH_WEIGHT_OPENINGS=on ./03_prove.sh --model-name qwen3-14b --gpu --starknet-ready --gkr-v2
+```
+(`03_prove.sh` enables this by default for `--starknet-ready --gkr-v2 --gpu`.)
 
 To override explicitly with env:
 ```bash
@@ -324,6 +372,23 @@ aggregated RLC weight binding enabled), `04_verify_onchain.sh` will print the
 exact soundness-gate reason. In dry-run it exits cleanly; in submit mode it
 fails fast before any transaction is sent.
 
+For `verify_model_gkr_v2`, `verify_model_gkr_v3`, and `verify_model_gkr_v4` artifacts, the submit pipeline also validates
+that `weight_binding_mode` matches the artifact mode:
+- `Sequential` -> `0`
+- `BatchedSubchannelV1` -> `1`
+- `AggregatedTrustlessV2` -> `2` (v3 only)
+- `AggregatedOpeningsV4Experimental` -> `3` (v4 only)
+before sending TX.
+For v3/v4, it enforces:
+- `weight_binding_data=[]` in modes `0/1`
+- non-empty `weight_binding_data` in mode `2`
+ - non-empty `weight_binding_data` in mode `3`
+If the target contract does not expose your requested entrypoint
+(`verify_model_gkr_v2`, `verify_model_gkr_v3`, or `verify_model_gkr_v4`), submit with v1
+(`--starknet-ready --legacy-gkr-v1`) or deploy the upgraded verifier first.
+The paymaster submit path now preflights contract ABI support and fails fast
+before transaction submission when the requested entrypoint is missing.
+
 The script will:
 1. Auto-detect submission mode (paymaster on Sepolia when no key, sncast otherwise)
 2. Auto-install Node.js + starknet.js if needed (for paymaster mode)
@@ -344,6 +409,30 @@ The script will:
 
 # Full pipeline with zero-config on-chain verification (Sepolia)
 ./run_e2e.sh --preset qwen3-14b --gpu --submit
+
+# Same flow, but emit/submit verify_model_gkr_v2 calldata
+./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v2
+
+# Same flow, but emit/submit verify_model_gkr_v3 calldata (auto mode2 on submit path)
+./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v3
+
+# Same flow, but emit/submit verify_model_gkr_v4 calldata (auto mode3 on submit path)
+./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v4
+
+# Keep legacy v1 sequential openings on submit path
+./run_e2e.sh --preset qwen3-14b --gpu --submit --legacy-gkr-v1
+
+# Force v2 sequential mode (weight_binding_mode=0)
+./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v2 --gkr-v2-mode sequential
+
+# Force v2 batched-subchannel mode (weight_binding_mode=1)
+./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v2 --gkr-v2-mode batched
+
+# Enable v3 mode-2 trustless binding payload checks (weight_binding_mode=2)
+./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v3 --gkr-v2-mode mode2
+
+# Enable v4 mode-3 experimental binding envelope checks (weight_binding_mode=3)
+./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v4 --gkr-v2-mode mode3
 
 # With your own account (legacy sncast, you pay gas)
 STARKNET_PRIVATE_KEY=0x... ./run_e2e.sh --preset qwen3-14b --gpu --submit --no-paymaster

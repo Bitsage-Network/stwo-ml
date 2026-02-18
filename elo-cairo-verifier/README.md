@@ -28,7 +28,7 @@ Verifies STWO ML proofs — GKR model walk with per-layer sumchecks, LogUp looku
 
 | Version | Address | Class Hash | Features |
 |---------|---------|------------|----------|
-| **v9 (Current)** | [`0x00c784...e710`](https://sepolia.starkscan.co/contract/0x00c7845a80d01927826b17032a432ad9cd36ea61be17fe8cc089d9b68c57e710) | `0x3940fc...e0fc` | GKR walk, deferred proofs, all layer types, 5-min upgrade |
+| **v10 (Current)** | [`0x0121d1...c005`](https://sepolia.starkscan.co/contract/0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005) | `0x644792...e273` | GKR v4 path, deferred proofs, all layer types, 5-min upgrade |
 | v4 | [`0x0068c7...86eb7`](https://sepolia.starkscan.co/contract/0x0068c7023d6edcb1c086bed57e0ce2b3b5dd007f50f0d6beaec3e57427c86eb7) | `0x3b870a...79a56` | Sumcheck, batch, GKR, unified, direct, upgrade |
 | v3 | [`0x048070...29160`](https://sepolia.voyager.online/contract/0x048070fbd531a0192f3d4a37eb019ae3174600cae15e08c737982fae5d929160) | `0x32d1a0...d4a02` | Sumcheck, batch, GKR, unified |
 | v2 | [`0x01c102...bd7f8`](https://sepolia.voyager.online/contract/0x01c102bbf1b8a7c2c37b02a7cef7e2baf06dcce94432e2aecda233b79adbd7f8) | `0x7845b0...2efe5` | Sumcheck, batch |
@@ -45,7 +45,7 @@ The VM31Pool contract manages a shielded transaction pool using a Poseidon2-M31 
 | **Address** | [`0x07cf94...e1f9`](https://sepolia.starkscan.co/contract/0x07cf94e27a60b94658ec908a00a9bb6dfff03358e952d9d48a8ed0be080ce1f9) |
 | **Class Hash** | `0x046d316ca9ffe36adfdd3760003e9f8aa433cb34105619edcdc275315a2c8405` |
 | **Owner/Relayer** | `0x0759a4374389b0e3cfcc59d49310b6bc75bb12bbf8ce550eb5c2f026918bb344` |
-| **Verifier** | EloVerifier v9 (`0x00c784...e710`) |
+| **Verifier** | EloVerifier v10 (`0x0121d1...c005`) |
 
 ### Batch Processing Protocol (3-step)
 
