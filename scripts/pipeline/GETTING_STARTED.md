@@ -151,6 +151,8 @@ HF_TOKEN=hf_your_token ./01_setup_model.sh --preset llama3-8b
 
 This runs automatically. No flags needed.
 
+`run_e2e.sh` uses this real validation path by default and does not run a separate 1-layer debug proof unless `--validate-test-proof` is explicitly set.
+
 ---
 
 ### Step 2a — Test Inference (Optional)

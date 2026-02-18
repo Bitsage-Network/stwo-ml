@@ -32,6 +32,7 @@ DO_GPU_ONLY=false
 DO_AUDIT=true
 SKIP_SETUP=false
 SKIP_INFERENCE=false
+VALIDATE_TEST_PROOF=false
 RESUME_FROM=""
 HF_TOKEN_ARG=""
 MAX_FEE="0.05"
@@ -68,6 +69,7 @@ while [[ $# -gt 0 ]]; do
         --no-audit)        DO_AUDIT=false; shift ;;
         --skip-setup)      SKIP_SETUP=true; shift ;;
         --skip-inference)  SKIP_INFERENCE=true; shift ;;
+        --validate-test-proof) VALIDATE_TEST_PROOF=true; shift ;;
         --paymaster)       FORCE_PAYMASTER=true; shift ;;
         --no-paymaster)    FORCE_NO_PAYMASTER=true; shift ;;
         --resume-from)     RESUME_FROM="$2"; shift 2 ;;
@@ -98,6 +100,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --chat               Pause for interactive chat after inference test"
             echo "  --skip-setup         Skip GPU setup (machine already configured)"
             echo "  --skip-inference     Skip inference testing"
+            echo "  --validate-test-proof  Run optional 1-layer validation proof (debug only)"
             echo "  --no-audit           Skip inference audit (audit is on by default)"
             echo "  --resume-from STEP   Resume from: model, validate, inference, capture, prove, verify, audit"
             echo "  --paymaster          Force AVNU paymaster (gasless, sponsored)"
@@ -247,6 +250,7 @@ log "GKR v3:      ${GKR_V3}"
 log "GKR v4:      ${GKR_V4}"
 log "GKR v2 mode: ${GKR_V2_MODE}"
 log "Legacy v1:   ${LEGACY_GKR_V1}"
+log "Validate TP: ${VALIDATE_TEST_PROOF}"
 log "Layers:      ${LAYERS:-all}"
 log "Action:      $(if [[ "$DO_SUBMIT" == "true" ]]; then echo "SUBMIT"; else echo "DRY RUN"; fi)"
 log "Run dir:     ${RUN_DIR}"
@@ -346,8 +350,13 @@ fi
 if (( START_IDX <= 2 )); then
     _VALIDATE_SCRIPT="${SCRIPT_DIR}/02_validate_model.sh"
     if [[ -f "$_VALIDATE_SCRIPT" ]]; then
+        _VALIDATE_ARGS=()
+        if [[ "$VALIDATE_TEST_PROOF" == "true" ]]; then
+            _VALIDATE_ARGS+=("--full")
+            warn "Validation test-proof enabled (--validate-test-proof). This is a debug check, not the production proof."
+        fi
         run_step "Model Validation" "$CURRENT" "$TOTAL_STEPS" \
-            bash "$_VALIDATE_SCRIPT" --full || exit 1
+            bash "$_VALIDATE_SCRIPT" "${_VALIDATE_ARGS[@]}" || exit 1
     else
         log "02_validate_model.sh not found, skipping validation"
         STEP_RESULTS+=("Model Validation: SKIP")

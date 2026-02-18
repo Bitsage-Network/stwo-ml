@@ -6,7 +6,7 @@
 # Validates a downloaded model before proving:
 #   1. Model inspection (architecture summary)
 #   2. 8-check validation suite (weights, dims, config)
-#   3. Optional: 1-layer test proof to verify GPU pipeline
+#   3. Optional debug check: 1-layer test proof
 #   4. Resource estimation
 #
 # Usage:
@@ -46,7 +46,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --model-dir DIR    Path to model directory (overrides --model-name)"
             echo "  --layers N         Number of layers to validate (default: from config)"
             echo "  --quick            Inspect only, skip validation checks"
-            echo "  --full             Also run a 1-layer test proof"
+            echo "  --full             Also run optional 1-layer debug test proof"
             echo "  -h, --help         Show this help"
             exit 0
             ;;

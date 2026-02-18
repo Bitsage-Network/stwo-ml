@@ -175,6 +175,8 @@ Notes:
 - `run_e2e.sh --submit` auto-adds `--starknet-ready` and defaults to `verify_model_gkr_v4` mode3 unless `--legacy-gkr-v1` is set.
 - `run_e2e.sh --submit --gkr-v3` with `--gkr-v2-mode auto` now defaults to `mode2`.
 - `run_e2e.sh --submit --gkr-v4` with `--gkr-v2-mode auto` now defaults to `mode3`.
+- `run_e2e.sh` validation step now runs only structural/weight checks by default (no 1-layer debug proof).
+- Use `run_e2e.sh --validate-test-proof` only for optional debug smoke checks.
 - Unified STARK now retries once on SIMD if GPU path hits `ConstraintsNotSatisfied` (soundness-preserving fallback). Set `--gpu-only` or `STWO_UNIFIED_STARK_NO_FALLBACK=1` to fail closed instead.
 - `03_prove.sh` defaults `STWO_PURE_GKR_SKIP_UNIFIED_STARK=1` for `ml_gkr`, which bypasses Phase 3 when GKR already covers activation/add/mul/layernorm/rmsnorm/dequantize.
 - In aggregated weight-binding mode, `ml_gkr` output still serializes full proof artifacts with `submission_ready=false`, `weight_opening_mode`, `weight_claim_calldata`, and versioned `weight_binding_*` metadata.
@@ -337,6 +339,7 @@ Notes:
 ./run_e2e.sh --preset llama3-8b --chat --submit         # Pause for chat
 ./run_e2e.sh --preset qwen3-14b --resume-from capture --submit  # Resume from capture
 ./run_e2e.sh --preset qwen3-14b --skip-setup --skip-inference --submit
+./run_e2e.sh --preset qwen3-14b --gpu --submit --validate-test-proof  # Optional debug-only 1-layer validation proof
 ./run_e2e.sh --preset phi3-mini --gpu --dry-run --no-audit     # Skip audit
 ```
 
