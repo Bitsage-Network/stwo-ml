@@ -238,9 +238,20 @@ else
             exit 1
         fi
 
-        # Install conversion dependencies
-        pip3 install --quiet sentencepiece transformers 2>/dev/null || \
-            pip3 install --quiet --user sentencepiece transformers 2>/dev/null || true
+        # Install conversion dependencies.
+        # convert_hf_to_gguf.py requires torch at import-time.
+        if ! python3 -c "import torch" >/dev/null 2>&1; then
+            warn "PyTorch not found — installing for GGUF conversion..."
+            pip3 install --quiet torch sentencepiece transformers 2>/dev/null || \
+                pip3 install --quiet --user torch sentencepiece transformers 2>/dev/null || {
+                    err "Failed to install PyTorch dependencies for GGUF conversion."
+                    err "Retry later, or run with --skip-inference / provide --gguf."
+                    exit 1
+                }
+        else
+            pip3 install --quiet sentencepiece transformers 2>/dev/null || \
+                pip3 install --quiet --user sentencepiece transformers 2>/dev/null || true
+        fi
 
         GGUF_PATH="${MODEL_DIR}/model-f16.gguf"
 
