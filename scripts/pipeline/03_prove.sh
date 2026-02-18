@@ -713,6 +713,11 @@ if entrypoint in ('verify_model_gkr', 'verify_model_gkr_v2', 'verify_model_gkr_v
                 f'{entrypoint} expected weight_binding_mode={expected_mode} for weight_opening_mode={mode_s} (got {wb_mode})'
         else:
             assert wb_mode in (0, 1), f'{entrypoint} requires weight_binding_mode in (0,1) (got {wb_mode})'
+        artifact_mode_id = proof.get('weight_binding_mode_id')
+        if artifact_mode_id is not None:
+            artifact_mode_id = int(str(artifact_mode_id), 0)
+            assert artifact_mode_id == wb_mode, \
+                f'weight_binding_mode_id mismatch: artifact={artifact_mode_id} calldata={wb_mode}'
         if entrypoint == 'verify_model_gkr_v3':
             idx += 1  # consume weight_binding_mode
             assert idx < len(calldata), 'v3 calldata truncated before weight_binding_data length'
@@ -721,6 +726,10 @@ if entrypoint in ('verify_model_gkr', 'verify_model_gkr_v2', 'verify_model_gkr_v
             if wb_mode in (0, 1):
                 assert binding_data_len == 0, \
                     f'{entrypoint} mode {wb_mode} requires empty weight_binding_data (got len={binding_data_len})'
+            artifact_binding_data = proof.get('weight_binding_data_calldata')
+            if isinstance(artifact_binding_data, list):
+                assert len(artifact_binding_data) == binding_data_len, \
+                    f'weight_binding_data_calldata length mismatch: artifact={len(artifact_binding_data)} calldata={binding_data_len}'
     print(f'  verify_calldata: {len(calldata)} felts', file=sys.stderr)
 else:
     # Off-chain / experimental transcript modes are serializable but not submit-ready.

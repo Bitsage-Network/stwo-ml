@@ -1330,6 +1330,11 @@ fn main() {
                 "weight_claim_calldata": gkr_proof.weight_claim_calldata.iter()
                     .map(|f| format!("0x{:x}", f))
                     .collect::<Vec<_>>(),
+                "weight_binding_schema_version": gkr_proof.weight_binding_schema_version,
+                "weight_binding_mode_id": gkr_proof.weight_binding_mode_id,
+                "weight_binding_data_calldata": gkr_proof.weight_binding_data_calldata.iter()
+                    .map(|f| format!("0x{:x}", f))
+                    .collect::<Vec<_>>(),
                 "weight_opening_mode": format!("{:?}", gkr_proof.weight_opening_mode),
                 "submission_ready": gkr_proof.submission_ready,
                 "soundness_gate_error": gkr_proof.soundness_gate_error,

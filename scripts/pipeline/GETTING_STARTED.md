@@ -286,6 +286,8 @@ export STWO_PURE_GKR_SKIP_UNIFIED_STARK=0
 - `submission_ready: false`
 - `weight_opening_mode: "BatchedRlcDirectEvalV1"`
 - `weight_claim_calldata` for off-chain verification/auditing.
+- `weight_binding_schema_version`, `weight_binding_mode_id`, `weight_binding_data_calldata`
+  for versioned mode-2 migration plumbing.
 
 To force submit-ready Starknet calldata (v1 sequential openings), run:
 ```bash

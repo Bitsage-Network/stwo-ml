@@ -469,6 +469,17 @@ if entrypoint in ('verify_model_gkr_v2', 'verify_model_gkr_v3'):
             f'{entrypoint} requires weight_binding_mode in {{0,1}} '
             f'(got {weight_binding_mode})'
         )
+    artifact_mode_id = proof.get('weight_binding_mode_id')
+    if artifact_mode_id is not None:
+        try:
+            artifact_mode_id_i = int(str(artifact_mode_id), 0)
+        except Exception as e:
+            fail(f'invalid weight_binding_mode_id: {artifact_mode_id} ({e})')
+        if artifact_mode_id_i != weight_binding_mode:
+            fail(
+                f'weight_binding_mode_id mismatch: artifact={artifact_mode_id_i} '
+                f'calldata={weight_binding_mode}'
+            )
     if entrypoint == 'verify_model_gkr_v3':
         idx += 1  # consume weight_binding_mode
         if idx >= len(resolved):
@@ -479,6 +490,12 @@ if entrypoint in ('verify_model_gkr_v2', 'verify_model_gkr_v3'):
             fail(
                 f'{entrypoint} mode {weight_binding_mode} requires empty weight_binding_data '
                 f'(got len={weight_binding_data_len})'
+            )
+        artifact_binding_data = proof.get('weight_binding_data_calldata')
+        if isinstance(artifact_binding_data, list) and len(artifact_binding_data) != weight_binding_data_len:
+            fail(
+                f'weight_binding_data_calldata length mismatch: artifact={len(artifact_binding_data)} '
+                f'calldata={weight_binding_data_len}'
             )
 
 with open(os.path.join(out_dir, 'entrypoint.txt'), 'w', encoding='utf-8') as f:

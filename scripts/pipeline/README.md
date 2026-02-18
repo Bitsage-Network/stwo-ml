@@ -172,7 +172,7 @@ Notes:
 - `run_e2e.sh --submit` auto-adds `--starknet-ready`; with `--gkr-v2/--gkr-v3 --gpu`, batched sub-channel openings are enabled by default.
 - Unified STARK now retries once on SIMD if GPU path hits `ConstraintsNotSatisfied` (soundness-preserving fallback). Set `--gpu-only` or `STWO_UNIFIED_STARK_NO_FALLBACK=1` to fail closed instead.
 - `03_prove.sh` defaults `STWO_PURE_GKR_SKIP_UNIFIED_STARK=1` for `ml_gkr`, which bypasses Phase 3 when GKR already covers activation/add/mul/layernorm/rmsnorm/dequantize.
-- In aggregated weight-binding mode, `ml_gkr` output still serializes full proof artifacts with `submission_ready=false`, `weight_opening_mode`, and `weight_claim_calldata`.
+- In aggregated weight-binding mode, `ml_gkr` output still serializes full proof artifacts with `submission_ready=false`, `weight_opening_mode`, `weight_claim_calldata`, and versioned `weight_binding_*` metadata.
 
 ## Model Presets
 

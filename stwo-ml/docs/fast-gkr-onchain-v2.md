@@ -170,6 +170,10 @@ Ensure v2 covers all needed layer tags in Cairo walk for target production model
    - Added `build_verify_model_gkr_v3_calldata(...)`.
    - v3 layout = v2 + `weight_binding_data` array.
    - For submit-ready modes (`0/1`), `weight_binding_data` is currently empty.
+   - Artifact now carries versioned binding metadata:
+     - `weight_binding_schema_version`
+     - `weight_binding_mode_id`
+     - `weight_binding_data_calldata`
 3. Pipeline hardening:
    - Added `--gkr-v3` in proving/e2e scripts.
    - Submit parsers/paymaster now accept `verify_model_gkr_v3` and enforce:

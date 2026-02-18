@@ -392,6 +392,14 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
         `${entrypoint} requires weight_binding_mode in {0,1} (got ${weightBindingMode})`
       );
     }
+    if (proofData.weight_binding_mode_id !== undefined && proofData.weight_binding_mode_id !== null) {
+      const artifactModeId = parseNat(proofData.weight_binding_mode_id, "weight_binding_mode_id");
+      if (artifactModeId !== weightBindingMode) {
+        die(
+          `weight_binding_mode_id mismatch: artifact=${artifactModeId} calldata=${weightBindingMode}`
+        );
+      }
+    }
     if (entrypoint === "verify_model_gkr_v3") {
       idx += 1; // consume weight_binding_mode
       if (idx >= calldata.length) die("v3 calldata truncated before weight_binding_data length");
@@ -400,6 +408,14 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
       if (new Set([0, 1]).has(weightBindingMode) && weightBindingDataLen !== 0) {
         die(
           `${entrypoint} mode ${weightBindingMode} requires empty weight_binding_data (got len=${weightBindingDataLen})`
+        );
+      }
+      if (
+        Array.isArray(proofData.weight_binding_data_calldata) &&
+        proofData.weight_binding_data_calldata.length !== weightBindingDataLen
+      ) {
+        die(
+          `weight_binding_data_calldata length mismatch: artifact=${proofData.weight_binding_data_calldata.length} calldata=${weightBindingDataLen}`
         );
       }
     }
