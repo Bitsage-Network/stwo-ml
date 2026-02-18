@@ -2488,7 +2488,7 @@ pub fn gpu_matmul_m31_full(
     executor.device.dtoh_sync_copy_into(&d_output, &mut output_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU download: {:?}", e)))?;
 
-    let data: Vec<M31> = output_u32.iter().map(|&v| M31(v)).collect();
+    let data: Vec<M31> = output_u32.iter().map(|&v| M31::from(v)).collect();
     Ok(M31Matrix { rows: m, cols: n, data })
 }
 
@@ -2529,7 +2529,7 @@ pub fn gpu_elementwise_add(lhs: &[M31], rhs: &[M31]) -> Result<Vec<M31>, MatMulE
     let mut out_u32 = vec![0u32; n];
     executor.device.dtoh_sync_copy_into(&d_out, &mut out_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU download: {:?}", e)))?;
-    Ok(out_u32.iter().map(|&v| M31(v)).collect())
+    Ok(out_u32.iter().map(|&v| M31::from(v)).collect())
 }
 
 /// GPU element-wise M31 multiplication.
@@ -2569,7 +2569,7 @@ pub fn gpu_elementwise_mul(lhs: &[M31], rhs: &[M31]) -> Result<Vec<M31>, MatMulE
     let mut out_u32 = vec![0u32; n];
     executor.device.dtoh_sync_copy_into(&d_out, &mut out_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU download: {:?}", e)))?;
-    Ok(out_u32.iter().map(|&v| M31(v)).collect())
+    Ok(out_u32.iter().map(|&v| M31::from(v)).collect())
 }
 
 /// GPU ReLU activation.
@@ -2600,7 +2600,7 @@ pub fn gpu_relu(input: &[M31]) -> Result<Vec<M31>, MatMulError> {
     let mut out_u32 = vec![0u32; n];
     executor.device.dtoh_sync_copy_into(&d_out, &mut out_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU download: {:?}", e)))?;
-    Ok(out_u32.iter().map(|&v| M31(v)).collect())
+    Ok(out_u32.iter().map(|&v| M31::from(v)).collect())
 }
 
 // =============================================================================
@@ -2617,8 +2617,8 @@ pub(crate) fn secure_field_to_u32s(val: SecureField) -> [u32; 4] {
 #[inline]
 pub(crate) fn u32s_to_secure_field(data: &[u32; 4]) -> SecureField {
     QM31(
-        CM31(M31(data[0]), M31(data[1])),
-        CM31(M31(data[2]), M31(data[3])),
+        CM31(M31::from(data[0]), M31::from(data[1])),
+        CM31(M31::from(data[2]), M31::from(data[3])),
     )
 }
 
