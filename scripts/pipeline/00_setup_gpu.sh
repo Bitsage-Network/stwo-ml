@@ -306,11 +306,38 @@ echo ""
 step "6/7" "llama.cpp (inference testing)"
 
 LLAMA_DIR="${OBELYSK_DIR}/llama.cpp"
-LLAMA_BIN="${LLAMA_DIR}/build/bin/llama-cli"
+LLAMA_BIN=""
+
+find_llama_bin() {
+    local ll_dir="$1"
+    local candidate
+    for candidate in \
+        "${ll_dir}/build/bin/llama-cli" \
+        "${ll_dir}/build/bin/llama-run" \
+        "${ll_dir}/build/bin/main"; do
+        if [[ -f "$candidate" ]]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    # Fallback for custom generator layouts.
+    for candidate in \
+        "$(find "${ll_dir}/build" -name "llama-cli" -type f 2>/dev/null | head -1)" \
+        "$(find "${ll_dir}/build" -name "llama-run" -type f 2>/dev/null | head -1)" \
+        "$(find "${ll_dir}/build" -name "main" -type f 2>/dev/null | head -1)"; do
+        if [[ -n "$candidate" ]] && [[ -f "$candidate" ]]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+LLAMA_BIN="$(find_llama_bin "$LLAMA_DIR" || true)"
 
 if [[ "$SKIP_LLAMA" == "true" ]]; then
     log "Skipping llama.cpp (--skip-llama)"
-elif [[ -f "$LLAMA_BIN" ]]; then
+elif [[ -n "$LLAMA_BIN" ]]; then
     ok "llama.cpp already built: ${LLAMA_BIN}"
 else
     # Ensure cmake is available
@@ -352,24 +379,24 @@ else
     fi
 
     if (cd "$LLAMA_DIR" && cmake "${CMAKE_ARGS[@]}"); then
-        if (cd "$LLAMA_DIR" && \
-            cmake --build build --config Release --target llama-cli -j"$(nproc 2>/dev/null || echo 4)"); then
-            :
-        else
-            warn "llama-cli target build failed, retrying full build..."
+        _LLAMA_TARGET_BUILT=false
+        for _target in llama-cli llama-run main; do
+            if (cd "$LLAMA_DIR" && \
+                cmake --build build --config Release --target "$_target" -j"$(nproc 2>/dev/null || echo 4)"); then
+                _LLAMA_TARGET_BUILT=true
+                break
+            fi
+        done
+        if [[ "$_LLAMA_TARGET_BUILT" != "true" ]]; then
+            warn "No specific llama target built, retrying full build..."
             (cd "$LLAMA_DIR" && cmake --build build --config Release -j"$(nproc 2>/dev/null || echo 4)")
         fi
 
-        if [[ -f "$LLAMA_BIN" ]]; then
+        LLAMA_BIN="$(find_llama_bin "$LLAMA_DIR" || true)"
+        if [[ -n "$LLAMA_BIN" ]]; then
             ok "llama.cpp built: ${LLAMA_BIN}"
         else
-            # Binary may be in a different location
-            LLAMA_BIN=$(find "${LLAMA_DIR}/build" -name "llama-cli" -type f 2>/dev/null | head -1)
-            if [[ -n "$LLAMA_BIN" ]]; then
-                ok "llama.cpp built: ${LLAMA_BIN}"
-            else
-                warn "llama.cpp build completed but llama-cli not found"
-            fi
+            warn "llama.cpp build completed but no runnable CLI binary was found"
         fi
     else
         warn "llama.cpp build failed (inference testing will be unavailable)"

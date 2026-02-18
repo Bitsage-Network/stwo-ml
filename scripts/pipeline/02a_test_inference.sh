@@ -115,23 +115,41 @@ header "Step 1: llama.cpp"
 LLAMA_DIR="${OBELYSK_DIR}/llama.cpp"
 LLAMA_CLI=""
 
+find_llama_bin() {
+    local ll_dir="$1"
+    local candidate
+    for candidate in \
+        "${ll_dir}/build/bin/llama-cli" \
+        "${ll_dir}/build/bin/llama-run" \
+        "${ll_dir}/build/bin/main" \
+        "$(command -v llama-cli 2>/dev/null || echo "")" \
+        "$(command -v llama-run 2>/dev/null || echo "")"; do
+        if [[ -n "$candidate" ]] && [[ -f "$candidate" ]]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    for candidate in \
+        "$(find "${ll_dir}/build" -name "llama-cli" -type f 2>/dev/null | head -1)" \
+        "$(find "${ll_dir}/build" -name "llama-run" -type f 2>/dev/null | head -1)" \
+        "$(find "${ll_dir}/build" -name "main" -type f 2>/dev/null | head -1)"; do
+        if [[ -n "$candidate" ]] && [[ -f "$candidate" ]]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # Check state from setup
 _STATE_BIN=$(get_state "setup_state.env" "LLAMA_BIN" 2>/dev/null || echo "")
 if [[ -n "$_STATE_BIN" ]] && [[ -f "$_STATE_BIN" ]]; then
     LLAMA_CLI="$_STATE_BIN"
 fi
 
-# Check default location
+# Check default locations / command PATH
 if [[ -z "$LLAMA_CLI" ]]; then
-    for candidate in \
-        "${LLAMA_DIR}/build/bin/llama-cli" \
-        "${LLAMA_DIR}/build/bin/main" \
-        "$(command -v llama-cli 2>/dev/null || echo "")"; do
-        if [[ -n "$candidate" ]] && [[ -f "$candidate" ]]; then
-            LLAMA_CLI="$candidate"
-            break
-        fi
-    done
+    LLAMA_CLI="$(find_llama_bin "$LLAMA_DIR" || true)"
 fi
 
 if [[ -n "$LLAMA_CLI" ]]; then
@@ -173,9 +191,9 @@ else
     (cd "$LLAMA_DIR" && cmake "${CMAKE_ARGS[@]}" 2>&1 | tail -3)
     (cd "$LLAMA_DIR" && cmake --build build --config Release -j"$(nproc 2>/dev/null || echo 4)" 2>&1 | tail -5)
 
-    LLAMA_CLI=$(find "${LLAMA_DIR}/build" -name "llama-cli" -type f 2>/dev/null | head -1)
+    LLAMA_CLI="$(find_llama_bin "$LLAMA_DIR" || true)"
     if [[ -z "$LLAMA_CLI" ]]; then
-        err "llama.cpp build failed — llama-cli not found"
+        err "llama.cpp build failed — no runnable CLI binary found (llama-cli/llama-run/main)"
         exit 1
     fi
     ok "llama.cpp built: ${LLAMA_CLI}"
