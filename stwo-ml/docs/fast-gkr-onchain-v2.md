@@ -151,7 +151,8 @@ Ensure v2 covers all needed layer tags in Cairo walk for target production model
 
 1. Runner integration:
    - `run_e2e.sh` now supports `--gkr-v2-mode auto|sequential|batched`.
-   - `auto` preserves safe defaults and prefers batched mode on GPU submit flow.
+   - `auto` preserves safe defaults; on submit + v3 it now defaults to mode2 trustless binding,
+     and on submit + v2 it keeps the existing batched-preferred behavior.
 2. Submission gating:
    - v1 submit path still enforces sequential-only.
    - v2 submit path enforces `weight_opening_mode` ↔ `weight_binding_mode` consistency.
