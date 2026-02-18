@@ -315,6 +315,7 @@ To emit v3 calldata with trustless mode-2 binding metadata
 ```bash
 ./03_prove.sh --model-name qwen3-14b --gpu --starknet-ready --gkr-v3-mode2
 ```
+(`03_prove.sh` enables sub-channel opening batching by default for `--starknet-ready --gkr-v3 --gpu`, including `--gkr-v3-mode2`.)
 
 To use the faster submit-ready v2 batched-subchannel opening transcript
 (`weight_binding_mode=1`):

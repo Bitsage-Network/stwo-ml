@@ -267,6 +267,8 @@ pub struct WeightClaim {
 /// - `AggregatedTrustlessV2`: Phase-3 trustless on-chain binding mode.
 ///   Current implementation keeps full opening proofs while adding
 ///   mode-2 binding payload checks in the Starknet v3 verifier path.
+///   Openings use per-opening sub-channel transcripts for deterministic
+///   parallelizable proving/verifying.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WeightOpeningTranscriptMode {
     Sequential,

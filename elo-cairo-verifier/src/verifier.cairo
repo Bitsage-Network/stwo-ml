@@ -202,7 +202,7 @@ pub trait ISumcheckVerifier<TContractState> {
     /// Supported `weight_binding_mode` values:
     ///   - `0`: sequential opening transcript (v1-compatible)
     ///   - `1`: batched sub-channel opening transcript
-    ///   - `2`: aggregated trustless binding (v3 payload + opening checks)
+    ///   - `2`: aggregated trustless binding (v3 payload + opening checks, sub-channel opening transcript)
     ///
     /// `weight_binding_data`:
     ///   - mode `0|1`: must be empty
@@ -741,9 +741,10 @@ mod SumcheckVerifierContract {
             assert!(weight_binding_data.len() == 0, "UNEXPECTED_WEIGHT_BINDING_DATA_FOR_MODE");
         }
 
-        let opening_seed = if weight_binding_mode == WEIGHT_BINDING_MODE_BATCHED_SUBCHANNEL_V1
-            && expected_weight_claims > 0
-        {
+        let opening_seed = if (
+            weight_binding_mode == WEIGHT_BINDING_MODE_BATCHED_SUBCHANNEL_V1
+                || weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_TRUSTLESS_V2
+        ) && expected_weight_claims > 0 {
             channel_draw_felt252(ref ch)
         } else {
             0
@@ -813,7 +814,9 @@ mod SumcheckVerifierContract {
                 "WEIGHT_OPENING_VALUE_MISMATCH",
             );
 
-            let valid = if weight_binding_mode == WEIGHT_BINDING_MODE_BATCHED_SUBCHANNEL_V1 {
+            let valid = if weight_binding_mode == WEIGHT_BINDING_MODE_BATCHED_SUBCHANNEL_V1
+                || weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_TRUSTLESS_V2
+            {
                 let mut sub_ch = derive_weight_opening_subchannel(opening_seed, w_i, claim);
                 verify_mle_opening(
                     commitment,

@@ -264,8 +264,8 @@ fn verify_gkr_inner(
                 *output_eval,
                 *table_commitment,
                 layer_idx,
-                    channel,
-                )?,
+                channel,
+            )?,
 
             (
                 LayerType::Quantize { params, .. },
@@ -658,11 +658,12 @@ fn verify_gkr_inner(
 
             for (i, deferred) in proof.deferred_proofs.iter().enumerate() {
                 let claim = &deferred.weight_claim;
-                let weight = weights
-                    .get_weight(claim.weight_node_id)
-                    .ok_or(GKRError::MissingWeight {
-                        node_id: claim.weight_node_id,
-                    })?;
+                let weight =
+                    weights
+                        .get_weight(claim.weight_node_id)
+                        .ok_or(GKRError::MissingWeight {
+                            node_id: claim.weight_node_id,
+                        })?;
                 let actual = evaluate_weight_claim_against_matrix(weight, &claim.eval_point)
                     .map_err(|reason| GKRError::VerificationError {
                         layer_idx: 0,
@@ -728,6 +729,11 @@ fn verify_gkr_inner(
                     ),
                 });
             }
+            let opening_seed = if proof.weight_openings.is_empty() {
+                None
+            } else {
+                Some(channel.draw_felt252())
+            };
             for (i, ((opening, commitment), claim)) in proof
                 .weight_openings
                 .iter()
@@ -745,16 +751,21 @@ fn verify_gkr_inner(
                     });
                 }
 
+                let mut sub_channel = derive_weight_opening_subchannel(
+                    opening_seed.expect("seed exists when openings are non-empty"),
+                    i,
+                    claim,
+                );
                 if !crate::crypto::mle_opening::verify_mle_opening(
                     *commitment,
                     opening,
                     &claim.eval_point,
-                    channel,
+                    &mut sub_channel,
                 ) {
                     return Err(GKRError::VerificationError {
                         layer_idx: 0,
                         reason: format!(
-                            "aggregated trustless mode weight opening {} failed verification",
+                            "aggregated trustless mode weight opening {} failed verification (sub-channel transcript)",
                             i
                         ),
                     });
@@ -1034,8 +1045,8 @@ pub fn verify_gkr_simd(
                 *output_eval,
                 *table_commitment,
                 layer_idx,
-                    channel,
-                )?,
+                channel,
+            )?,
 
             (
                 LayerType::Quantize { params, .. },
@@ -2034,10 +2045,7 @@ fn verify_embedding_reduction(
             layer_idx,
             reason: format!(
                 "embedding table shape mismatch: expected {}x{}, got {}x{}",
-                vocab_size,
-                embed_dim,
-                embedding_table.rows,
-                embedding_table.cols
+                vocab_size, embed_dim, embedding_table.rows, embedding_table.cols
             ),
         });
     }
@@ -2951,8 +2959,8 @@ mod tests {
     use crate::gkr::circuit::LayeredCircuit;
     use crate::gkr::prover::{
         prove_gkr, reduce_activation_layer_for_test, reduce_embedding_layer_for_test,
-        reduce_layernorm_layer_for_test, reduce_layernorm_simd_for_test,
-        reduce_mul_layer_for_test, reduce_quantize_layer_for_test,
+        reduce_layernorm_layer_for_test, reduce_layernorm_simd_for_test, reduce_mul_layer_for_test,
+        reduce_quantize_layer_for_test,
     };
     use num_traits::Zero;
     use stwo::core::fields::m31::M31;
@@ -3120,7 +3128,8 @@ mod tests {
         proof.weight_opening_transcript_mode = WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1;
         proof.weight_openings.clear();
         proof.weight_commitments.clear();
-        proof.weight_claims[0].expected_value = proof.weight_claims[0].expected_value + SecureField::one();
+        proof.weight_claims[0].expected_value =
+            proof.weight_claims[0].expected_value + SecureField::one();
 
         let mut verifier_channel = PoseidonChannel::new();
         let result = verify_gkr_with_weights(&circuit, &proof, &c, &weights, &mut verifier_channel);
@@ -3196,14 +3205,7 @@ mod tests {
         }
 
         let mut verifier_channel = PoseidonChannel::new();
-        verify_gkr_with_weights(
-            &circuit,
-            &proof,
-            &out,
-            &weights,
-            &mut verifier_channel,
-        )
-        .unwrap();
+        verify_gkr_with_weights(&circuit, &proof, &out, &weights, &mut verifier_channel).unwrap();
     }
 
     #[test]
@@ -4762,13 +4764,9 @@ mod tests {
             value: claimed,
         };
 
-        let (proof, _) = reduce_quantize_layer_for_test(
-            &output_claim,
-            &input,
-            &params,
-            &mut prover_channel,
-        )
-        .unwrap();
+        let (proof, _) =
+            reduce_quantize_layer_for_test(&output_claim, &input, &params, &mut prover_channel)
+                .unwrap();
 
         let mut verifier_channel = PoseidonChannel::new();
         verifier_channel.mix_u64(0x51414E54);

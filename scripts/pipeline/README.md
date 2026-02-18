@@ -163,7 +163,7 @@ STARKNET_PRIVATE_KEY=0x... ./run_e2e.sh --preset qwen3-14b --gpu --submit
 | `STWO_STARKNET_GKR_V2` | No | Off | Emit `verify_model_gkr_v2` calldata in `ml_gkr` artifacts |
 | `STWO_STARKNET_GKR_V3` | No | Off | Emit `verify_model_gkr_v3` calldata in `ml_gkr` artifacts |
 | `STWO_GKR_TRUSTLESS_MODE2` | No | Off | Enable v3 `weight_binding_mode=2` (trustless mode-2 payload + opening checks) |
-| `STWO_GKR_BATCH_WEIGHT_OPENINGS` | No | `on` for `--starknet-ready --gkr-v2/--gkr-v3 --gpu`, else off | Use batched sub-channel weight-opening transcript (mode 1) |
+| `STWO_GKR_BATCH_WEIGHT_OPENINGS` | No | `on` for `--starknet-ready --gkr-v2/--gkr-v3 --gpu`, else off | Use sub-channel weight-opening transcript (mode 1, and mode 2 when enabled) |
 | `STWO_GKR_AGGREGATE_WEIGHT_BINDING` | No | `on` in `03_prove.sh` fast mode, auto-`off` for `run_e2e.sh --submit` | Batched RLC weight-binding mode (serializable artifact, not submit-ready for Starknet `verify_model_gkr`/`verify_model_gkr_v2`/`verify_model_gkr_v3`) |
 
 Notes:
@@ -174,7 +174,7 @@ Notes:
 - Unified STARK now retries once on SIMD if GPU path hits `ConstraintsNotSatisfied` (soundness-preserving fallback). Set `--gpu-only` or `STWO_UNIFIED_STARK_NO_FALLBACK=1` to fail closed instead.
 - `03_prove.sh` defaults `STWO_PURE_GKR_SKIP_UNIFIED_STARK=1` for `ml_gkr`, which bypasses Phase 3 when GKR already covers activation/add/mul/layernorm/rmsnorm/dequantize.
 - In aggregated weight-binding mode, `ml_gkr` output still serializes full proof artifacts with `submission_ready=false`, `weight_opening_mode`, `weight_claim_calldata`, and versioned `weight_binding_*` metadata.
-- v3 mode 2 (`STWO_GKR_TRUSTLESS_MODE2=1`) is submit-ready and keeps full opening proofs while adding explicit `weight_binding_data` payload checks.
+- v3 mode 2 (`STWO_GKR_TRUSTLESS_MODE2=1`) is submit-ready and keeps full opening proofs while adding explicit `weight_binding_data` payload checks; mode-2 openings now use the same sub-channel transcript strategy as batched mode.
 
 ## Model Presets
 

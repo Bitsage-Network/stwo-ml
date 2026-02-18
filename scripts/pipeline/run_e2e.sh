@@ -356,11 +356,11 @@ if (( START_IDX <= 5 )); then
                 ;;
             mode2)
                 _PROVE_ARGS+=("--gkr-v3-mode2")
-                _PROVE_ENV+=("STWO_GKR_BATCH_WEIGHT_OPENINGS=off")
+                _PROVE_ENV+=("STWO_GKR_BATCH_WEIGHT_OPENINGS=on")
                 ;;
             auto)
                 # Keep 03_prove.sh defaults:
-                # - on for --starknet-ready --gkr-v2 --gpu
+                # - on for --starknet-ready --gkr-v2/--gkr-v3 --gpu
                 # - off otherwise
                 ;;
         esac

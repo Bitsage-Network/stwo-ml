@@ -212,9 +212,10 @@ fi
 
 # Batched sub-channel weight openings:
 # - Safe and submit-ready with verify_model_gkr_v2/v3 (weight_binding_mode=1)
+# - Also used by v3 mode2 trustless path for opening transcript derivation.
 # - Keep v1 (`verify_model_gkr`) on sequential openings only.
 GKR_BATCH_WEIGHT_OPENINGS_DEFAULT="off"
-if [[ "$USE_GPU" == "true" ]] && [[ "$STARKNET_READY" == "true" ]] && [[ "$GKR_V2" == "true" ]]; then
+if [[ "$USE_GPU" == "true" ]] && [[ "$STARKNET_READY" == "true" ]] && { [[ "$GKR_V2" == "true" ]] || [[ "$GKR_V3" == "true" ]]; }; then
     GKR_BATCH_WEIGHT_OPENINGS_DEFAULT="on"
 fi
 GKR_BATCH_WEIGHT_OPENINGS="${STWO_GKR_BATCH_WEIGHT_OPENINGS:-${GKR_BATCH_WEIGHT_OPENINGS_DEFAULT}}"
@@ -223,16 +224,12 @@ case "${GKR_BATCH_WEIGHT_OPENINGS,,}" in
     *) GKR_BATCH_WEIGHT_OPENINGS="off" ;;
 esac
 
-if [[ "$STARKNET_READY" == "true" ]] && [[ "$GKR_V2" != "true" ]] && [[ "${GKR_BATCH_WEIGHT_OPENINGS}" == "on" ]]; then
+if [[ "$STARKNET_READY" == "true" ]] && [[ "$GKR_V2" != "true" ]] && [[ "$GKR_V3" != "true" ]] && [[ "${GKR_BATCH_WEIGHT_OPENINGS}" == "on" ]]; then
     warn "Overriding STWO_GKR_BATCH_WEIGHT_OPENINGS=on -> off (verify_model_gkr v1 requires Sequential openings)"
     GKR_BATCH_WEIGHT_OPENINGS="off"
 fi
 if [[ "${GKR_AGG_WEIGHT_BINDING}" == "on" ]] && [[ "${GKR_BATCH_WEIGHT_OPENINGS}" == "on" ]]; then
     warn "Disabling STWO_GKR_BATCH_WEIGHT_OPENINGS because aggregated RLC mode eliminates opening proofs."
-    GKR_BATCH_WEIGHT_OPENINGS="off"
-fi
-if [[ "$GKR_V3_MODE2" == "true" ]] && [[ "${GKR_BATCH_WEIGHT_OPENINGS}" == "on" ]]; then
-    warn "Disabling STWO_GKR_BATCH_WEIGHT_OPENINGS for --gkr-v3-mode2 (mode2 currently uses sequential openings)."
     GKR_BATCH_WEIGHT_OPENINGS="off"
 fi
 export STWO_GKR_BATCH_WEIGHT_OPENINGS="${GKR_BATCH_WEIGHT_OPENINGS}"

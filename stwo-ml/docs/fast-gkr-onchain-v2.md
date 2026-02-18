@@ -168,7 +168,8 @@ Ensure v2 covers all needed layer tags in Cairo walk for target production model
    - Mode `2` is now submit-ready with strict payload checks:
      - `weight_binding_data == [binding_digest, claim_count]`
      - digest is recomputed on-chain from resolved commitments + weight claims.
-   - Full MLE opening proofs are still required in mode `2` (no soundness downgrade).
+   - Full MLE opening proofs are still required in mode `2` (no soundness downgrade),
+     and mode-2 openings now follow the sub-channel transcript path (same as batched mode).
 2. Rust serializers:
    - Added `build_verify_model_gkr_v3_calldata(...)`.
    - v3 layout = v2 + `weight_binding_data` array.
