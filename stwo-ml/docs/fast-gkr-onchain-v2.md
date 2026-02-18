@@ -116,7 +116,7 @@ Ensure v2 covers all needed layer tags in Cairo walk for target production model
 
 1. Contract:
    - Added `verify_model_gkr_v2(...)`.
-   - Enforces `weight_binding_mode == 0` and delegates to v1 verification logic.
+   - Initial deployment enforced `weight_binding_mode == 0` and delegated to v1 logic.
 2. Rust serializers:
    - Added `build_verify_model_gkr_v2_calldata(...)`.
    - Inserts explicit `weight_binding_mode` felt into calldata.
@@ -126,8 +126,23 @@ Ensure v2 covers all needed layer tags in Cairo walk for target production model
    - Submit parsers now validate:
      - supported entrypoint (`verify_model_gkr` / `verify_model_gkr_v2`),
      - `submission_ready != false`,
-     - `weight_opening_mode == Sequential` when present,
-     - `verify_model_gkr_v2` calldata carries `weight_binding_mode=0`.
+    - `weight_opening_mode`/`weight_binding_mode` consistency checks.
 4. Backward compatibility:
    - v1 (`verify_model_gkr`) remains unchanged.
    - v2 is opt-in until target deployments include the new entrypoint.
+
+## Phase 2 (implemented): BatchedSubchannelV1 on-chain
+
+1. Contract:
+   - `verify_model_gkr_v2` now accepts `weight_binding_mode in {0,1}`.
+   - Mode `1` verifies the same MLE openings using per-opening sub-channels
+     derived from a single transcript seed.
+2. Rust + serialization:
+   - `WeightOpeningTranscriptMode::BatchedSubchannelV1` maps to
+     `weight_binding_mode=1` in v2 calldata.
+   - v1 calldata path still rejects non-sequential modes.
+3. Pipeline gates:
+   - Hardened submit scripts accept `verify_model_gkr_v2` with
+     `weight_opening_mode=BatchedSubchannelV1` and enforce mode consistency.
+4. Safety:
+   - Aggregated RLC direct-eval mode remains non-submit-ready and unchanged.

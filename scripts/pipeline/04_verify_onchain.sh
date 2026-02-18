@@ -392,11 +392,19 @@ if submission_ready is False:
     )
 
 weight_opening_mode = proof.get('weight_opening_mode')
-if weight_opening_mode is not None and str(weight_opening_mode) != 'Sequential':
-    fail(
-        f'{entrypoint} requires weight_opening_mode=Sequential '
-        f'(got: {weight_opening_mode})'
-    )
+if entrypoint == 'verify_model_gkr':
+    if weight_opening_mode is not None and str(weight_opening_mode) != 'Sequential':
+        fail(
+            f'{entrypoint} requires weight_opening_mode=Sequential '
+            f'(got: {weight_opening_mode})'
+        )
+elif entrypoint == 'verify_model_gkr_v2':
+    allowed_modes = {'Sequential', 'BatchedSubchannelV1'}
+    if weight_opening_mode is not None and str(weight_opening_mode) not in allowed_modes:
+        fail(
+            f'{entrypoint} requires weight_opening_mode in {sorted(allowed_modes)} '
+            f'(got: {weight_opening_mode})'
+        )
 
 upload_chunks = vc.get('upload_chunks', [])
 if upload_chunks is None:
@@ -446,9 +454,19 @@ if entrypoint == 'verify_model_gkr_v2':
     if idx >= len(resolved):
         fail('v2 calldata truncated before weight_binding_mode')
     weight_binding_mode = parse_nat(resolved[idx], 'weight_binding_mode')
-    if weight_binding_mode != 0:
+    expected_mode = None
+    if str(weight_opening_mode) == 'Sequential':
+        expected_mode = 0
+    elif str(weight_opening_mode) == 'BatchedSubchannelV1':
+        expected_mode = 1
+    if expected_mode is not None and weight_binding_mode != expected_mode:
         fail(
-            f'Phase 1 verify_model_gkr_v2 requires weight_binding_mode=0 '
+            f'verify_model_gkr_v2 expected weight_binding_mode={expected_mode} '
+            f'for weight_opening_mode={weight_opening_mode} (got {weight_binding_mode})'
+        )
+    if expected_mode is None and weight_binding_mode not in (0, 1):
+        fail(
+            'verify_model_gkr_v2 requires weight_binding_mode in {0,1} '
             f'(got {weight_binding_mode})'
         )
 

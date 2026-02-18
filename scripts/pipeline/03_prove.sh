@@ -89,7 +89,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --skip-commitment    Skip weight commitment (faster, can't submit on-chain)"
             echo "  --gkr                Enable GKR for LogUp verification"
             echo "  --starknet-ready     Force sequential weight openings for submit-ready Starknet calldata"
-            echo "  --gkr-v2             Emit verify_model_gkr_v2 calldata (Phase 1 compat mode)"
+            echo "  --gkr-v2             Emit verify_model_gkr_v2 calldata (mode-aware v2 path)"
             echo "  --salt N             Fiat-Shamir channel salt"
             echo "  --server URL         Submit to remote prove-server instead of local binary"
             echo "  -h, --help           Show this help"
@@ -106,9 +106,9 @@ if [[ "$MODE" != "gkr" ]]; then
     exit 1
 fi
 
-# Phase 1 safety: v2 calldata currently supports sequential weight binding only.
+# Safety: v2 submission path requires Starknet-ready artifact gating.
 if [[ "$GKR_V2" == "true" ]] && [[ "$STARKNET_READY" != "true" ]]; then
-    warn "--gkr-v2 requested; enabling --starknet-ready (Phase 1 requires sequential openings)"
+    warn "--gkr-v2 requested; enabling --starknet-ready for submit-ready artifact checks"
     STARKNET_READY=true
 fi
 
@@ -185,6 +185,29 @@ export STWO_GKR_AGGREGATE_WEIGHT_BINDING="${GKR_AGG_WEIGHT_BINDING}"
 if [[ "$GKR_V2" == "true" ]]; then
     export STWO_STARKNET_GKR_V2=1
 fi
+
+# Batched sub-channel weight openings:
+# - Safe and submit-ready with verify_model_gkr_v2 (weight_binding_mode=1)
+# - Keep v1 (`verify_model_gkr`) on sequential openings only.
+GKR_BATCH_WEIGHT_OPENINGS_DEFAULT="off"
+if [[ "$USE_GPU" == "true" ]] && [[ "$STARKNET_READY" == "true" ]] && [[ "$GKR_V2" == "true" ]]; then
+    GKR_BATCH_WEIGHT_OPENINGS_DEFAULT="on"
+fi
+GKR_BATCH_WEIGHT_OPENINGS="${STWO_GKR_BATCH_WEIGHT_OPENINGS:-${GKR_BATCH_WEIGHT_OPENINGS_DEFAULT}}"
+case "${GKR_BATCH_WEIGHT_OPENINGS,,}" in
+    1|true|on|yes) GKR_BATCH_WEIGHT_OPENINGS="on" ;;
+    *) GKR_BATCH_WEIGHT_OPENINGS="off" ;;
+esac
+
+if [[ "$STARKNET_READY" == "true" ]] && [[ "$GKR_V2" != "true" ]] && [[ "${GKR_BATCH_WEIGHT_OPENINGS}" == "on" ]]; then
+    warn "Overriding STWO_GKR_BATCH_WEIGHT_OPENINGS=on -> off (verify_model_gkr v1 requires Sequential openings)"
+    GKR_BATCH_WEIGHT_OPENINGS="off"
+fi
+if [[ "${GKR_AGG_WEIGHT_BINDING}" == "on" ]] && [[ "${GKR_BATCH_WEIGHT_OPENINGS}" == "on" ]]; then
+    warn "Disabling STWO_GKR_BATCH_WEIGHT_OPENINGS because aggregated RLC mode eliminates opening proofs."
+    GKR_BATCH_WEIGHT_OPENINGS="off"
+fi
+export STWO_GKR_BATCH_WEIGHT_OPENINGS="${GKR_BATCH_WEIGHT_OPENINGS}"
 
 # Favor GPU fold for heavy weight-opening phases unless caller overrides.
 if [[ "$USE_GPU" == "true" ]] && [[ -z "${STWO_GPU_MLE_FOLD:-}" ]]; then
@@ -322,6 +345,7 @@ log "GPU MLE path:   fold=${GPU_MLE_FOLD} fold_min_points=${GPU_MLE_FOLD_MIN_POI
 log "GPU opening:    qm31_pack=device (enabled by default)"
 log "GPU opening dbg: timing=${GPU_MLE_OPENING_TIMING}"
 log "Weight binding: aggregate_rlc=${GKR_AGG_WEIGHT_BINDING}"
+log "Weight openings: batch_subchannel=${GKR_BATCH_WEIGHT_OPENINGS} jobs=${STWO_GKR_BATCH_WEIGHT_OPENING_JOBS:-auto}"
 log "Progress:       weight_every=${STWO_WEIGHT_PROGRESS_EVERY} opening_every=${STWO_GKR_OPENINGS_PROGRESS_EVERY} opening_heartbeat=${STWO_GKR_OPENING_HEARTBEAT_SEC}s"
 echo ""
 
@@ -628,8 +652,14 @@ if entrypoint in ('verify_model_gkr', 'verify_model_gkr_v2'):
     assert len(chunks) == 0, 'verify_model_gkr(*) should not include upload chunks'
     assert all(str(v) != '__SESSION_ID__' for v in calldata), 'verify_model_gkr(*) calldata must not include __SESSION_ID__ placeholder'
     mode = proof.get('weight_opening_mode')
-    if mode is not None:
-        assert str(mode) == 'Sequential', f'{entrypoint} requires weight_opening_mode=Sequential (got {mode})'
+    mode_s = None if mode is None else str(mode)
+    if entrypoint == 'verify_model_gkr':
+        if mode_s is not None:
+            assert mode_s == 'Sequential', f'{entrypoint} requires weight_opening_mode=Sequential (got {mode})'
+    elif entrypoint == 'verify_model_gkr_v2':
+        if mode_s is not None:
+            assert mode_s in ('Sequential', 'BatchedSubchannelV1'), \
+                f'{entrypoint} requires weight_opening_mode in (Sequential, BatchedSubchannelV1) (got {mode})'
     if entrypoint == 'verify_model_gkr_v2':
         # v2 calldata inserts weight_binding_mode after weight_commitments array.
         idx = 0
@@ -652,7 +682,16 @@ if entrypoint in ('verify_model_gkr', 'verify_model_gkr_v2'):
         idx += 1 + wc_len
         assert idx < len(calldata), 'calldata truncated before weight_binding_mode'
         wb_mode = parse_nat(calldata[idx], 'weight_binding_mode')
-        assert wb_mode == 0, f'Phase 1 verify_model_gkr_v2 requires weight_binding_mode=0 (got {wb_mode})'
+        expected_mode = None
+        if mode_s == 'Sequential':
+            expected_mode = 0
+        elif mode_s == 'BatchedSubchannelV1':
+            expected_mode = 1
+        if expected_mode is not None:
+            assert wb_mode == expected_mode, \
+                f'verify_model_gkr_v2 expected weight_binding_mode={expected_mode} for weight_opening_mode={mode_s} (got {wb_mode})'
+        else:
+            assert wb_mode in (0, 1), f'verify_model_gkr_v2 requires weight_binding_mode in (0,1) (got {wb_mode})'
     print(f'  verify_calldata: {len(calldata)} felts', file=sys.stderr)
 else:
     # Off-chain / experimental transcript modes are serializable but not submit-ready.

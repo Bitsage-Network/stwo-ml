@@ -287,17 +287,24 @@ export STWO_PURE_GKR_SKIP_UNIFIED_STARK=0
 - `weight_opening_mode: "BatchedRlcDirectEvalV1"`
 - `weight_claim_calldata` for off-chain verification/auditing.
 
-To force submit-ready Starknet calldata (sequential openings), run:
+To force submit-ready Starknet calldata (v1 sequential openings), run:
 ```bash
 ./03_prove.sh --model-name qwen3-14b --gpu --starknet-ready
 ```
 
-To emit Phase 1 v2 calldata (`verify_model_gkr_v2`) with the same
-sequential statement:
+To emit v2 calldata (`verify_model_gkr_v2`) with the same sequential
+statement (`weight_binding_mode=0`):
 ```bash
 ./03_prove.sh --model-name qwen3-14b --gpu --starknet-ready --gkr-v2
 ```
 (`--gkr-v2` auto-enables `--starknet-ready` if omitted.)
+
+To use the faster submit-ready v2 batched-subchannel opening transcript
+(`weight_binding_mode=1`):
+```bash
+STWO_GKR_BATCH_WEIGHT_OPENINGS=on ./03_prove.sh --model-name qwen3-14b --gpu --starknet-ready --gkr-v2
+```
+(`03_prove.sh` enables this by default for `--starknet-ready --gkr-v2 --gpu`.)
 
 To override explicitly with env:
 ```bash
@@ -332,7 +339,10 @@ exact soundness-gate reason. In dry-run it exits cleanly; in submit mode it
 fails fast before any transaction is sent.
 
 For `verify_model_gkr_v2` artifacts, the submit pipeline also validates
-`weight_binding_mode=0` (Phase 1 compatibility requirement) before sending TX.
+that `weight_binding_mode` matches the artifact mode:
+- `Sequential` -> `0`
+- `BatchedSubchannelV1` -> `1`
+before sending TX.
 If the target contract does not expose `verify_model_gkr_v2`, submit with v1
 (`--starknet-ready` without `--gkr-v2`) or deploy the upgraded verifier first.
 
@@ -357,7 +367,7 @@ The script will:
 # Full pipeline with zero-config on-chain verification (Sepolia)
 ./run_e2e.sh --preset qwen3-14b --gpu --submit
 
-# Same flow, but emit/submit verify_model_gkr_v2 calldata (Phase 1 compat)
+# Same flow, but emit/submit verify_model_gkr_v2 calldata
 ./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v2
 
 # With your own account (legacy sncast, you pay gas)

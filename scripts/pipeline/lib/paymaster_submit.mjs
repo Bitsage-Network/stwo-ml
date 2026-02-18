@@ -243,13 +243,23 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
       `proof is marked submission_ready=false (entrypoint=${entrypoint}, weight_opening_mode=${mode}, reason=${reason})`
     );
   }
-  if (
-    proofData.weight_opening_mode !== undefined &&
-    String(proofData.weight_opening_mode) !== "Sequential"
-  ) {
-    die(
-      `${entrypoint} requires weight_opening_mode=Sequential (got: ${proofData.weight_opening_mode})`
-    );
+  const weightOpeningMode =
+    proofData.weight_opening_mode !== undefined
+      ? String(proofData.weight_opening_mode)
+      : undefined;
+  if (entrypoint === "verify_model_gkr") {
+    if (weightOpeningMode !== undefined && weightOpeningMode !== "Sequential") {
+      die(
+        `${entrypoint} requires weight_opening_mode=Sequential (got: ${proofData.weight_opening_mode})`
+      );
+    }
+  } else if (entrypoint === "verify_model_gkr_v2") {
+    const allowedModes = new Set(["Sequential", "BatchedSubchannelV1"]);
+    if (weightOpeningMode !== undefined && !allowedModes.has(weightOpeningMode)) {
+      die(
+        `${entrypoint} requires weight_opening_mode in {Sequential,BatchedSubchannelV1} (got: ${proofData.weight_opening_mode})`
+      );
+    }
   }
 
   const rawChunks = verifyCalldata.upload_chunks ?? [];
@@ -303,9 +313,20 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
     idx += 1 + weightCommitmentsLen;
     if (idx >= calldata.length) die("v2 calldata truncated before weight_binding_mode");
     const weightBindingMode = parseNat(calldata[idx], "weight_binding_mode");
-    if (weightBindingMode !== 0) {
+    let expectedMode = null;
+    if (weightOpeningMode === "Sequential") {
+      expectedMode = 0;
+    } else if (weightOpeningMode === "BatchedSubchannelV1") {
+      expectedMode = 1;
+    }
+    if (expectedMode !== null && weightBindingMode !== expectedMode) {
       die(
-        `Phase 1 verify_model_gkr_v2 requires weight_binding_mode=0 (got ${weightBindingMode})`
+        `verify_model_gkr_v2 expected weight_binding_mode=${expectedMode} for weight_opening_mode=${weightOpeningMode} (got ${weightBindingMode})`
+      );
+    }
+    if (expectedMode === null && !new Set([0, 1]).has(weightBindingMode)) {
+      die(
+        `verify_model_gkr_v2 requires weight_binding_mode in {0,1} (got ${weightBindingMode})`
       );
     }
   }

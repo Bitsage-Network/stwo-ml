@@ -95,7 +95,7 @@ cd scripts/pipeline
 # Full pipeline: setup -> download -> validate -> capture -> prove -> verify -> audit
 ./run_e2e.sh --preset qwen3-14b --gpu --submit
 
-# Same flow, using verify_model_gkr_v2 calldata (Phase 1 compat)
+# Same flow, using verify_model_gkr_v2 calldata
 ./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v2
 
 # Dry run (no on-chain submission)
@@ -158,13 +158,14 @@ STARKNET_PRIVATE_KEY=0x... ./run_e2e.sh --preset qwen3-14b --gpu --submit
 | `STWO_GPU_MLE_OPENING_TREE_REQUIRE` | No | Off | Fail if GPU-resident opening-tree path fails |
 | `STWO_GPU_MLE_OPENING_TIMING` | No | Off | Print per-opening tree/query timing breakdown |
 | `STWO_STARKNET_GKR_V2` | No | Off | Emit `verify_model_gkr_v2` calldata in `ml_gkr` artifacts |
+| `STWO_GKR_BATCH_WEIGHT_OPENINGS` | No | `on` for `--starknet-ready --gkr-v2 --gpu`, else off | Use batched sub-channel weight-opening transcript (v2 mode 1) |
 | `STWO_GKR_AGGREGATE_WEIGHT_BINDING` | No | `on` in `03_prove.sh` fast mode, auto-`off` for `run_e2e.sh --submit` | Batched RLC weight-binding mode (serializable artifact, not submit-ready for Starknet `verify_model_gkr`/`verify_model_gkr_v2`) |
 
 Notes:
 - The opening path now packs QM31 leaves to felt252 on GPU (no per-round CPU repack/upload), which reduces weight-opening overhead on large models.
 - Query extraction now replays folds on GPU and downloads only queried leaf pairs (instead of full folded layers), reducing opening-phase host transfer pressure.
 - `03_prove.sh` defaults to aggregated RLC weight binding for faster off-chain proving.
-- `run_e2e.sh --submit` auto-adds `--starknet-ready`, which forces sequential openings.
+- `run_e2e.sh --submit` auto-adds `--starknet-ready`; with `--gkr-v2 --gpu`, batched sub-channel openings are enabled by default.
 - Unified STARK now retries once on SIMD if GPU path hits `ConstraintsNotSatisfied` (soundness-preserving fallback). Set `--gpu-only` or `STWO_UNIFIED_STARK_NO_FALLBACK=1` to fail closed instead.
 - `03_prove.sh` defaults `STWO_PURE_GKR_SKIP_UNIFIED_STARK=1` for `ml_gkr`, which bypasses Phase 3 when GKR already covers activation/add/mul/layernorm/rmsnorm/dequantize.
 - In aggregated weight-binding mode, `ml_gkr` output still serializes full proof artifacts with `submission_ready=false`, `weight_opening_mode`, and `weight_claim_calldata`.
@@ -266,8 +267,10 @@ STARKNET_PRIVATE_KEY=0x... ./04_verify_onchain.sh --submit
 Notes:
 - The submit pipeline accepts `verify_calldata.entrypoint` as
   `verify_model_gkr` (v1) or `verify_model_gkr_v2` (v2).
-- `--gkr-v2` (or `STWO_STARKNET_GKR_V2=1`) is Phase 1 compatibility mode:
-  only sequential weight binding is accepted (`weight_binding_mode=0`).
+- `verify_model_gkr` (v1) requires sequential openings (`weight_binding_mode=0`).
+- `verify_model_gkr_v2` accepts:
+  - `weight_binding_mode=0` (Sequential)
+  - `weight_binding_mode=1` (BatchedSubchannelV1)
 - In `03_prove.sh`, `--gkr-v2` automatically enables `--starknet-ready`.
 - Ensure your deployed verifier includes `verify_model_gkr_v2` before
   submitting v2 artifacts.

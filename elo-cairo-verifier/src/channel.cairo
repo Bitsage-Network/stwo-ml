@@ -72,7 +72,7 @@ pub fn channel_mix_secure_field(ref ch: PoseidonChannel, v: QM31) {
 
 /// Draw a raw felt252 from the channel.
 /// Domain separator THREE(=3) distinguishes draws from mixes.
-fn channel_draw_felt252(ref ch: PoseidonChannel) -> felt252 {
+pub fn channel_draw_felt252(ref ch: PoseidonChannel) -> felt252 {
     let (s0, _, _) = hades_permutation(ch.digest, ch.n_draws.into(), 3);
     ch.n_draws += 1;
     s0

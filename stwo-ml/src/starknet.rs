@@ -716,11 +716,14 @@ fn enforce_gkr_soundness_gates(proof: &crate::gkr::GKRProof) -> Result<(), Stark
         }
     }
 
-    if proof.weight_opening_transcript_mode != WeightOpeningTranscriptMode::Sequential {
-        return Err(StarknetModelError::SoundnessGate(format!(
-            "unsupported weight opening transcript mode for Starknet serialization: {:?}",
-            proof.weight_opening_transcript_mode
-        )));
+    match proof.weight_opening_transcript_mode {
+        WeightOpeningTranscriptMode::Sequential | WeightOpeningTranscriptMode::BatchedSubchannelV1 => {}
+        other => {
+            return Err(StarknetModelError::SoundnessGate(format!(
+                "unsupported weight opening transcript mode for Starknet serialization: {:?}",
+                other
+            )));
+        }
     }
 
     let n_main = proof.weight_claims.len();
@@ -1040,8 +1043,10 @@ fn starknet_weight_binding_mode(
     use crate::gkr::types::WeightOpeningTranscriptMode;
 
     match mode {
-        // Phase 1: v2 supports compat mode only (same statement as v1).
+        // v2 mode 0: sequential transcript (v1-compatible).
         WeightOpeningTranscriptMode::Sequential => Ok(0),
+        // v2 mode 1: batched sub-channel transcript (same opening statement).
+        WeightOpeningTranscriptMode::BatchedSubchannelV1 => Ok(1),
         other => Err(StarknetModelError::SoundnessGate(format!(
             "unsupported weight binding mode for Starknet v2 calldata: {:?}",
             other
@@ -1091,8 +1096,9 @@ pub fn build_verify_model_gkr_calldata(
 
 /// Build flat sncast calldata for `verify_model_gkr_v2()`.
 ///
-/// Phase 1 compatibility: emits `weight_binding_mode = 0` and keeps the same
-/// opening payload as `verify_model_gkr()`.
+/// Emits `weight_binding_mode` based on transcript mode:
+/// - `0`: sequential openings (v1-compatible)
+/// - `1`: batched sub-channel openings
 pub fn build_verify_model_gkr_v2_calldata(
     proof: &crate::gkr::GKRProof,
     circuit: &crate::gkr::LayeredCircuit,
@@ -1110,8 +1116,17 @@ fn build_verify_model_gkr_calldata_inner(
     use_v2_layout: bool,
 ) -> Result<VerifyModelGkrCalldata, StarknetModelError> {
     use crate::cairo_serde::serialize_gkr_proof_data_only;
+    use crate::gkr::types::WeightOpeningTranscriptMode;
 
     enforce_gkr_soundness_gates(proof)?;
+
+    // v1 entrypoint only supports sequential weight-opening transcript.
+    if !use_v2_layout && proof.weight_opening_transcript_mode != WeightOpeningTranscriptMode::Sequential {
+        return Err(StarknetModelError::SoundnessGate(format!(
+            "verify_model_gkr requires Sequential weight opening mode (got: {:?})",
+            proof.weight_opening_transcript_mode
+        )));
+    }
 
     let mut parts = Vec::new();
 
@@ -2446,5 +2461,78 @@ mod tests {
             v1.calldata_parts[idx],
             "opening payload must start immediately after inserted mode"
         );
+    }
+
+    #[test]
+    fn test_build_verify_model_gkr_v2_calldata_accepts_batched_subchannel_mode() {
+        use crate::aggregation::prove_model_pure_gkr;
+        use crate::gkr::types::WeightOpeningTranscriptMode;
+
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(2);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
+
+        let mut weights = GraphWeights::new();
+        let mut w = M31Matrix::new(4, 2);
+        for i in 0..4 {
+            for j in 0..2 {
+                w.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
+        weights.add_weight(0, w);
+
+        let mut agg_proof =
+            prove_model_pure_gkr(&graph, &input, &weights).expect("GKR proving should succeed");
+        let gkr = agg_proof.gkr_proof.as_mut().expect("GKR proof expected");
+        gkr.weight_opening_transcript_mode = WeightOpeningTranscriptMode::BatchedSubchannelV1;
+
+        let circuit = crate::gkr::LayeredCircuit::from_graph(&graph).expect("circuit compile");
+        let raw_io = crate::cairo_serde::serialize_raw_io(&input, &agg_proof.execution.output);
+        let model_id = FieldElement::from(0xBEEFu64);
+
+        let v2 = build_verify_model_gkr_v2_calldata(gkr, &circuit, model_id, &raw_io)
+            .expect("v2 calldata should build for batched subchannel mode");
+
+        // Locate weight_binding_mode insertion index.
+        let mut idx = 0usize;
+        idx += 1; // model_id
+        let raw_io_len = v2.calldata_parts[idx]
+            .parse::<usize>()
+            .expect("raw_io_data len parse");
+        idx += 1 + raw_io_len;
+        idx += 2; // circuit_depth, num_layers
+        let matmul_len = v2.calldata_parts[idx]
+            .parse::<usize>()
+            .expect("matmul_dims len parse");
+        idx += 1 + matmul_len;
+        let dequant_len = v2.calldata_parts[idx]
+            .parse::<usize>()
+            .expect("dequantize_bits len parse");
+        idx += 1 + dequant_len;
+        let proof_data_len = v2.calldata_parts[idx]
+            .parse::<usize>()
+            .expect("proof_data len parse");
+        idx += 1 + proof_data_len;
+        let weight_commitments_len = v2.calldata_parts[idx]
+            .parse::<usize>()
+            .expect("weight_commitments len parse");
+        idx += 1 + weight_commitments_len;
+
+        assert_eq!(
+            v2.calldata_parts[idx], "1",
+            "v2 should encode weight_binding_mode=1 for BatchedSubchannelV1"
+        );
+
+        let v1_err = build_verify_model_gkr_calldata(gkr, &circuit, model_id, &raw_io)
+            .expect_err("v1 calldata should reject batched subchannel mode");
+        match v1_err {
+            StarknetModelError::SoundnessGate(_) => {}
+            other => panic!("expected SoundnessGate error, got: {other}"),
+        }
     }
 }

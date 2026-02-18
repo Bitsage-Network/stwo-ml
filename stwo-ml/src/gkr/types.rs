@@ -273,7 +273,10 @@ pub enum WeightOpeningTranscriptMode {
 
 /// Deterministically derive a per-opening sub-channel from a master seed.
 ///
-/// Domain separation includes opening index, node id, eval point, and expected value.
+/// Domain separation includes opening index, eval point, and expected value.
+///
+/// Note: `weight_node_id` is intentionally excluded so the transcript can be
+/// reproduced by on-chain verifiers from serialized weight claims alone.
 pub(crate) fn derive_weight_opening_subchannel(
     master_seed: starknet_ff::FieldElement,
     opening_index: usize,
@@ -282,7 +285,6 @@ pub(crate) fn derive_weight_opening_subchannel(
     let mut ch = PoseidonChannel::new();
     ch.mix_felt(master_seed);
     ch.mix_u64(opening_index as u64);
-    ch.mix_u64(claim.weight_node_id as u64);
     ch.mix_felts(&claim.eval_point);
     ch.mix_felt(securefield_to_felt(claim.expected_value));
     ch
