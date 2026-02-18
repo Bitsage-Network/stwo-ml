@@ -249,6 +249,8 @@ GPU presets in `configs/4090.env`, `configs/b200.env`, `configs/b300.env`.
 ./02a_test_inference.sh --model-name phi3-mini --benchmark # Speed test
 ```
 
+`02a_test_inference.sh` streams dependency install and GGUF conversion logs live (including auto-install of `torch` when needed).
+
 ### 02b_capture_inference.sh
 
 ```bash

@@ -242,22 +242,25 @@ else
         # convert_hf_to_gguf.py requires torch at import-time.
         if ! python3 -c "import torch" >/dev/null 2>&1; then
             warn "PyTorch not found — installing for GGUF conversion..."
-            pip3 install --quiet torch sentencepiece transformers 2>/dev/null || \
-                pip3 install --quiet --user torch sentencepiece transformers 2>/dev/null || {
+            log "Installing Python deps (torch, sentencepiece, transformers) — streaming output..."
+            run_cmd pip3 install torch sentencepiece transformers || \
+                run_cmd pip3 install --user torch sentencepiece transformers || {
                     err "Failed to install PyTorch dependencies for GGUF conversion."
                     err "Retry later, or run with --skip-inference / provide --gguf."
                     exit 1
                 }
         else
-            pip3 install --quiet sentencepiece transformers 2>/dev/null || \
-                pip3 install --quiet --user sentencepiece transformers 2>/dev/null || true
+            log "Ensuring GGUF conversion deps are installed (sentencepiece, transformers)..."
+            run_cmd pip3 install sentencepiece transformers || \
+                run_cmd pip3 install --user sentencepiece transformers || true
         fi
 
         GGUF_PATH="${MODEL_DIR}/model-f16.gguf"
 
+        log "Running convert_hf_to_gguf.py — streaming conversion logs..."
         if run_cmd python3 "$CONVERT_SCRIPT" "$MODEL_DIR" \
             --outtype f16 \
-            --outfile "$GGUF_PATH" 2>&1 | tail -5; then
+            --outfile "$GGUF_PATH" 2>&1; then
             if [[ -f "$GGUF_PATH" ]] && [[ -s "$GGUF_PATH" ]]; then
                 GGUF_SIZE=$(du -h "$GGUF_PATH" | cut -f1)
                 ok "GGUF created: ${GGUF_PATH} (${GGUF_SIZE})"

@@ -158,7 +158,7 @@ This runs automatically. No flags needed.
 ### Step 2a — Test Inference (Optional)
 
 **What it does:** Converts the model to GGUF format and runs it through llama.cpp to confirm it produces real output. This is optional but recommended to verify the model works before proving.
-If `torch` is missing, the script now auto-installs it for conversion.
+If `torch` is missing, the script auto-installs it for conversion and streams install/conversion output live.
 
 ```bash
 # Quick test — ask it a question
