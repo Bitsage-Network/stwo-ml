@@ -112,9 +112,9 @@ while [[ $# -gt 0 ]]; do
             echo "                       (submit path auto-forces --starknet-ready in step 6)"
             echo "  --gkr-v2             Use verify_model_gkr_v2 calldata"
             echo "  --gkr-v3             Use verify_model_gkr_v3 calldata (v3 envelope)"
-            echo "  --gkr-v4             Use verify_model_gkr_v4 calldata (experimental mode-3 envelope)"
+            echo "  --gkr-v4             Use verify_model_gkr_v4 calldata (latest mode-3 envelope)"
             echo "  --gkr-v2-mode MODE   v2/v3/v4 weight-binding profile: auto|sequential|batched|mode2|mode3"
-            echo "                       auto(default): submit path prefers mode2 on v3, mode3 on v4"
+            echo "                       auto(default): submit path defaults to v4 mode3 (latest), mode2 on v3"
             echo "  --legacy-gkr-v1      Keep legacy verify_model_gkr (v1 sequential openings)"
             echo "  --hf-token TOKEN     HuggingFace API token"
             echo "  --max-fee ETH        Max TX fee (default: 0.05)"
@@ -206,10 +206,10 @@ if [[ "$DO_SUBMIT" == "true" ]] && [[ "$MODE" == "gkr" ]] && [[ "$GKR_V2" != "tr
     if [[ "$LEGACY_GKR_V1" == "true" ]]; then
         warn "--submit + --legacy-gkr-v1: keeping verify_model_gkr (v1 sequential openings)."
     else
-        warn "--submit requested without --gkr-v2/--gkr-v3/--gkr-v4; defaulting to verify_model_gkr_v3 mode2 (fast trustless submit path)."
-        GKR_V3=true
+        warn "--submit requested without --gkr-v2/--gkr-v3/--gkr-v4; defaulting to verify_model_gkr_v4 mode3 (latest submit-ready path)."
+        GKR_V4=true
         if [[ "${GKR_V2_MODE,,}" == "auto" ]]; then
-            GKR_V2_MODE="mode2"
+            GKR_V2_MODE="mode3"
         fi
     fi
 fi
@@ -219,7 +219,7 @@ if [[ "$DO_SUBMIT" == "true" ]] && [[ "$GKR_V3" == "true" ]] && [[ "${GKR_V2_MOD
     GKR_V2_MODE="mode2"
 fi
 if [[ "$DO_SUBMIT" == "true" ]] && [[ "$GKR_V4" == "true" ]] && [[ "${GKR_V2_MODE,,}" == "auto" ]] && [[ "$LEGACY_GKR_V1" != "true" ]]; then
-    warn "--submit + --gkr-v4 with auto mode: defaulting to mode3 experimental binding envelope."
+    warn "--submit + --gkr-v4 with auto mode: defaulting to mode3 (latest binding envelope)."
     GKR_V2_MODE="mode3"
 fi
 

@@ -295,7 +295,7 @@ export STWO_PURE_GKR_SKIP_UNIFIED_STARK=0
 - The protocol-level v4 design to eliminate per-weight openings is tracked in
   `stwo-ml/docs/fast-gkr-onchain-v4-aggregated-openings.md`.
 
-To generate submit-ready Starknet calldata with the default fast trustless profile (v3 mode2), run:
+To generate submit-ready Starknet calldata with the default fast trustless profile (v4 mode3), run:
 ```bash
 ./03_prove.sh --model-name qwen3-14b --gpu --starknet-ready
 ```

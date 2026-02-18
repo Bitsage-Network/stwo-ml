@@ -98,12 +98,12 @@ while [[ $# -gt 0 ]]; do
             echo "  --skip-build         Skip building binaries"
             echo "  --skip-commitment    Skip weight commitment (faster, can't submit on-chain)"
             echo "  --gkr                Enable GKR for LogUp verification"
-            echo "  --starknet-ready     Enable submit-ready artifact gates (defaults to fast v3 mode2 unless legacy)"
+            echo "  --starknet-ready     Enable submit-ready artifact gates (defaults to latest v4 mode3 unless legacy)"
             echo "  --gkr-v2             Emit verify_model_gkr_v2 calldata (mode-aware v2 path)"
             echo "  --gkr-v3             Emit verify_model_gkr_v3 calldata (v3 envelope, mode-aware)"
             echo "  --gkr-v3-mode2       Enable verify_model_gkr_v3 mode=2 (trustless payload + opening checks)"
             echo "  --gkr-v4             Emit verify_model_gkr_v4 calldata (v4 envelope)"
-            echo "  --gkr-v4-mode3       Enable verify_model_gkr_v4 mode=3 (experimental aggregated openings envelope)"
+            echo "  --gkr-v4-mode3       Enable verify_model_gkr_v4 mode=3 (latest aggregated openings envelope)"
             echo "  --legacy-gkr-v1      Keep legacy verify_model_gkr v1 sequential-opening submit path"
             echo "  --salt N             Fiat-Shamir channel salt"
             echo "  --server URL         Submit to remote prove-server instead of local binary"
@@ -161,10 +161,10 @@ if [[ "$STARKNET_READY" == "true" ]] && [[ "$GKR_V2" != "true" ]] && [[ "$GKR_V3
     if [[ "${LEGACY_GKR_V1}" == "true" ]]; then
         warn "--starknet-ready + --legacy-gkr-v1: using verify_model_gkr (v1 sequential openings)."
     else
-        warn "--starknet-ready requested without v2/v3/v4 selector; defaulting to verify_model_gkr_v3 mode2 (fast trustless submit path)."
+        warn "--starknet-ready requested without v2/v3/v4 selector; defaulting to verify_model_gkr_v4 mode3 (latest submit-ready path)."
         warn "Use --legacy-gkr-v1 to force verify_model_gkr (v1 sequential openings)."
-        GKR_V3=true
-        GKR_V3_MODE2=true
+        GKR_V4=true
+        GKR_V4_MODE3=true
     fi
 fi
 

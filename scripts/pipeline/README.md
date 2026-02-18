@@ -172,7 +172,7 @@ Notes:
 - The opening path now packs QM31 leaves to felt252 on GPU (no per-round CPU repack/upload), which reduces weight-opening overhead on large models.
 - Query extraction now replays folds on GPU and downloads only queried leaf pairs (instead of full folded layers), reducing opening-phase host transfer pressure.
 - `03_prove.sh` defaults to aggregated RLC weight binding for faster off-chain proving.
-- `run_e2e.sh --submit` auto-adds `--starknet-ready` and defaults to `verify_model_gkr_v3` mode2 unless `--legacy-gkr-v1` is set.
+- `run_e2e.sh --submit` auto-adds `--starknet-ready` and defaults to `verify_model_gkr_v4` mode3 unless `--legacy-gkr-v1` is set.
 - `run_e2e.sh --submit --gkr-v3` with `--gkr-v2-mode auto` now defaults to `mode2`.
 - `run_e2e.sh --submit --gkr-v4` with `--gkr-v2-mode auto` now defaults to `mode3`.
 - Unified STARK now retries once on SIMD if GPU path hits `ConstraintsNotSatisfied` (soundness-preserving fallback). Set `--gpu-only` or `STWO_UNIFIED_STARK_NO_FALLBACK=1` to fail closed instead.
@@ -263,7 +263,7 @@ GPU presets in `configs/4090.env`, `configs/b200.env`, `configs/b300.env`.
 ./03_prove.sh --model-name qwen3-14b --mode gkr --multi-gpu
 ./03_prove.sh --model-name qwen3-14b --mode gkr --gpu --gpu-only
 ./03_prove.sh --model-name qwen3-14b --server http://prover:8080
-./03_prove.sh --model-name qwen3-14b --mode gkr --starknet-ready                # defaults to v3 mode2
+./03_prove.sh --model-name qwen3-14b --mode gkr --starknet-ready                # defaults to v4 mode3
 ./03_prove.sh --model-name qwen3-14b --mode gkr --starknet-ready --gkr-v2
 ./03_prove.sh --model-name qwen3-14b --mode gkr --starknet-ready --gkr-v3
 ./03_prove.sh --model-name qwen3-14b --mode gkr --starknet-ready --gkr-v3-mode2
@@ -294,13 +294,13 @@ Notes:
   - `weight_binding_mode=2` (AggregatedTrustlessV2, non-empty `weight_binding_data`)
  - `verify_model_gkr_v4` accepts:
    - `weight_binding_mode=3` (AggregatedOpeningsV4Experimental, non-empty `weight_binding_data`)
-- In `03_prove.sh`, `--starknet-ready` with no explicit v2/v3 selector defaults to `verify_model_gkr_v3` mode2.
+- In `03_prove.sh`, `--starknet-ready` with no explicit v2/v3/v4 selector defaults to `verify_model_gkr_v4` mode3.
 - Use `--legacy-gkr-v1` to force `verify_model_gkr` (v1 sequential openings).
 - In `03_prove.sh`, `--gkr-v2` automatically enables `--starknet-ready`.
 - In `03_prove.sh`, `--gkr-v3` automatically enables `--starknet-ready`.
 - In `03_prove.sh`, `--gkr-v4`/`--gkr-v4-mode3` automatically enables `--starknet-ready`.
 - In `run_e2e.sh`, use `--gkr-v2-mode auto|sequential|batched|mode2|mode3` to control v2/v3/v4 opening mode.
-- `--gkr-v2-mode auto` defaults to `mode2` on submit + v3, otherwise follows `03_prove.sh` defaults.
+- `--gkr-v2-mode auto` defaults to `mode3` on submit + v4 (including implicit submit defaults), `mode2` on submit + v3, and otherwise follows `03_prove.sh` defaults.
 - Ensure your deployed verifier includes the requested entrypoint
   (`verify_model_gkr_v2`, `verify_model_gkr_v3`, or `verify_model_gkr_v4`) before submitting artifacts.
 - Paymaster path now preflights ABI support and fails fast if the target
