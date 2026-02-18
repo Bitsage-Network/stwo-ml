@@ -146,3 +146,15 @@ Ensure v2 covers all needed layer tags in Cairo walk for target production model
      `weight_opening_mode=BatchedSubchannelV1` and enforce mode consistency.
 4. Safety:
    - Aggregated RLC direct-eval mode remains non-submit-ready and unchanged.
+
+## Phase 2 hardening + integration
+
+1. Runner integration:
+   - `run_e2e.sh` now supports `--gkr-v2-mode auto|sequential|batched`.
+   - `auto` preserves safe defaults and prefers batched mode on GPU submit flow.
+2. Submission gating:
+   - v1 submit path still enforces sequential-only.
+   - v2 submit path enforces `weight_opening_mode` ↔ `weight_binding_mode` consistency.
+3. Paymaster preflight:
+   - Submission now checks target contract ABI for requested entrypoint before TX build.
+   - Missing `verify_model_gkr_v2` fails fast with actionable guidance.

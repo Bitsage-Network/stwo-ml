@@ -345,6 +345,8 @@ that `weight_binding_mode` matches the artifact mode:
 before sending TX.
 If the target contract does not expose `verify_model_gkr_v2`, submit with v1
 (`--starknet-ready` without `--gkr-v2`) or deploy the upgraded verifier first.
+The paymaster submit path now preflights contract ABI support and fails fast
+before transaction submission when the requested entrypoint is missing.
 
 The script will:
 1. Auto-detect submission mode (paymaster on Sepolia when no key, sncast otherwise)
@@ -369,6 +371,12 @@ The script will:
 
 # Same flow, but emit/submit verify_model_gkr_v2 calldata
 ./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v2
+
+# Force v2 sequential mode (weight_binding_mode=0)
+./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v2 --gkr-v2-mode sequential
+
+# Force v2 batched-subchannel mode (weight_binding_mode=1)
+./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v2 --gkr-v2-mode batched
 
 # With your own account (legacy sncast, you pay gas)
 STARKNET_PRIVATE_KEY=0x... ./run_e2e.sh --preset qwen3-14b --gpu --submit --no-paymaster

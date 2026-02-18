@@ -272,8 +272,12 @@ Notes:
   - `weight_binding_mode=0` (Sequential)
   - `weight_binding_mode=1` (BatchedSubchannelV1)
 - In `03_prove.sh`, `--gkr-v2` automatically enables `--starknet-ready`.
+- In `run_e2e.sh`, use `--gkr-v2-mode auto|sequential|batched` to control v2 opening mode.
+- `--gkr-v2-mode auto` (default) prefers batched on GPU submit path.
 - Ensure your deployed verifier includes `verify_model_gkr_v2` before
   submitting v2 artifacts.
+- Paymaster path now preflights ABI support and fails fast if the target
+  contract does not expose the requested entrypoint.
 - If `verify_calldata.entrypoint` is `unsupported` (e.g. aggregated RLC
   weight-binding mode), the script prints `weight_opening_mode` + gate reason.
 - In `--dry-run`, unsupported artifacts are reported and skipped cleanly.
@@ -294,6 +298,8 @@ Notes:
 ```bash
 ./run_e2e.sh --preset qwen3-14b --gpu --submit
 ./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v2
+./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v2 --gkr-v2-mode batched
+./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v2 --gkr-v2-mode sequential
 ./run_e2e.sh --preset phi3-mini --gpu --dry-run
 ./run_e2e.sh --preset qwen3-14b --gpu --gpu-only --dry-run
 ./run_e2e.sh --preset qwen3-14b --resume-from prove --submit

@@ -39,6 +39,7 @@ MODEL_ID="0x1"
 FORCE_PAYMASTER=false
 FORCE_NO_PAYMASTER=false
 GKR_V2=false
+GKR_V2_MODE="auto"  # auto|sequential|batched
 
 # Passthrough arrays for sub-scripts
 SETUP_ARGS=()
@@ -71,6 +72,7 @@ while [[ $# -gt 0 ]]; do
         --max-fee)         MAX_FEE="$2"; shift 2 ;;
         --model-id)        MODEL_ID="$2"; shift 2 ;;
         --gkr-v2)          GKR_V2=true; shift ;;
+        --gkr-v2-mode)     GKR_V2_MODE="$2"; shift 2 ;;
         --install-drivers) SETUP_ARGS+=("--install-drivers"); shift ;;
         --skip-drivers)    SETUP_ARGS+=("--skip-drivers"); shift ;;
         --branch)          SETUP_ARGS+=("--branch" "$2"); shift 2 ;;
@@ -102,7 +104,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --multi-gpu          Use all GPUs"
             echo "  --gpu-only           Fail if any critical proving path falls back to CPU"
             echo "                       (submit path auto-forces --starknet-ready in step 6)"
-            echo "  --gkr-v2             Use verify_model_gkr_v2 calldata (Phase 1 compat mode=0)"
+            echo "  --gkr-v2             Use verify_model_gkr_v2 calldata"
+            echo "  --gkr-v2-mode MODE   v2 weight-opening mode: auto|sequential|batched"
+            echo "                       auto(default): prefer batched on GPU submit path"
             echo "  --hf-token TOKEN     HuggingFace API token"
             echo "  --max-fee ETH        Max TX fee (default: 0.05)"
             echo "  --model-id ID        On-chain model ID (default: 0x1)"
@@ -142,6 +146,18 @@ if [[ "$MODE" != "gkr" ]]; then
     exit 1
 fi
 
+case "${GKR_V2_MODE,,}" in
+    auto|sequential|batched) ;;
+    *)
+        err "Invalid --gkr-v2-mode: ${GKR_V2_MODE} (expected: auto|sequential|batched)"
+        exit 1
+        ;;
+esac
+if [[ "${GKR_V2_MODE,,}" != "auto" ]] && [[ "$GKR_V2" != "true" ]]; then
+    err "--gkr-v2-mode requires --gkr-v2"
+    exit 1
+fi
+
 if [[ "$DO_SUBMIT" == "false" ]] && [[ "$DO_DRY_RUN" == "false" ]]; then
     warn "Neither --submit nor --dry-run specified. Defaulting to --dry-run."
     DO_DRY_RUN=true
@@ -167,6 +183,7 @@ log "Mode:        ${MODE}"
 log "GPU:         ${DO_GPU} (multi: ${DO_MULTI_GPU})"
 log "GPU only:    ${DO_GPU_ONLY}"
 log "GKR v2:      ${GKR_V2}"
+log "GKR v2 mode: ${GKR_V2_MODE}"
 log "Layers:      ${LAYERS:-all}"
 log "Action:      $(if [[ "$DO_SUBMIT" == "true" ]]; then echo "SUBMIT"; else echo "DRY RUN"; fi)"
 log "Run dir:     ${RUN_DIR}"
@@ -314,8 +331,25 @@ if (( START_IDX <= 5 )); then
     [[ "$DO_SUBMIT" == "true" ]] && _PROVE_ARGS+=("--starknet-ready")
     [[ "$GKR_V2" == "true" ]] && _PROVE_ARGS+=("--gkr-v2")
 
+    _PROVE_ENV=()
+    if [[ "$GKR_V2" == "true" ]]; then
+        case "${GKR_V2_MODE,,}" in
+            sequential)
+                _PROVE_ENV+=("STWO_GKR_BATCH_WEIGHT_OPENINGS=off")
+                ;;
+            batched)
+                _PROVE_ENV+=("STWO_GKR_BATCH_WEIGHT_OPENINGS=on")
+                ;;
+            auto)
+                # Keep 03_prove.sh defaults:
+                # - on for --starknet-ready --gkr-v2 --gpu
+                # - off otherwise
+                ;;
+        esac
+    fi
+
     run_step "Proof Generation" "$CURRENT" "$TOTAL_STEPS" \
-        bash "${SCRIPT_DIR}/03_prove.sh" "${_PROVE_ARGS[@]}" || exit 1
+        env "${_PROVE_ENV[@]}" bash "${SCRIPT_DIR}/03_prove.sh" "${_PROVE_ARGS[@]}" || exit 1
     (( CURRENT++ ))
 fi
 

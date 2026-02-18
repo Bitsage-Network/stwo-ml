@@ -149,6 +149,65 @@ function info(msg) {
   process.stderr.write(`[INFO] ${msg}\n`);
 }
 
+function abiHasEntrypoint(abiEntries, entrypoint) {
+  if (!Array.isArray(abiEntries)) return false;
+  const stack = [...abiEntries];
+  while (stack.length > 0) {
+    const entry = stack.pop();
+    if (!entry || typeof entry !== "object") continue;
+
+    if (entry.type === "function" && typeof entry.name === "string") {
+      const fullName = entry.name;
+      const shortName = fullName.split("::").pop();
+      if (fullName === entrypoint || shortName === entrypoint) {
+        return true;
+      }
+    }
+
+    if (Array.isArray(entry.items)) {
+      for (const item of entry.items) stack.push(item);
+    }
+  }
+  return false;
+}
+
+async function preflightContractEntrypoint(provider, contractAddress, entrypoint) {
+  let classAt;
+  try {
+    classAt = await provider.getClassAt(contractAddress);
+  } catch (e) {
+    info(
+      `Entrypoint preflight skipped (failed to fetch contract class at ${contractAddress}): ${e.message || e}`
+    );
+    return;
+  }
+
+  let abi = classAt?.abi;
+  if (typeof abi === "string") {
+    try {
+      abi = JSON.parse(abi);
+    } catch {
+      abi = null;
+    }
+  }
+  if (!Array.isArray(abi)) {
+    info(
+      `Entrypoint preflight skipped (contract ABI unavailable for ${contractAddress})`
+    );
+    return;
+  }
+
+  if (!abiHasEntrypoint(abi, entrypoint)) {
+    if (entrypoint === "verify_model_gkr_v2") {
+      die(
+        `Contract ${contractAddress} does not expose ${entrypoint}. ` +
+          "Deploy the upgraded verifier, or submit with v1 (Sequential mode)."
+      );
+    }
+    die(`Contract ${contractAddress} does not expose required entrypoint: ${entrypoint}`);
+  }
+}
+
 // ─── Ephemeral Account ───────────────────────────────────────────────
 //
 // Generates a keypair and computes the counterfactual address for the
@@ -483,6 +542,8 @@ async function cmdVerify(args) {
       `--model-id ${args["model-id"]} differs from proof artifact model_id ${modelId}; using proof artifact value`
     );
   }
+
+  await preflightContractEntrypoint(provider, contract, verifyPayload.entrypoint);
 
   const verificationCountBefore = await fetchVerificationCount(
     provider,
