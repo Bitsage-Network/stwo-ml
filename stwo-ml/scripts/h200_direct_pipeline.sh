@@ -1,24 +1,18 @@
 #!/bin/bash
-# Phase 2: Direct On-Chain ML Verification Pipeline
+# DEPRECATED (2026-02-18): verify_model_direct() and upload_proof_chunk() were
+# removed from EloVerifier in v11. Use the GKR pipeline instead:
 #
-# Eliminates Stage 2 (Cairo VM recursive proving, 46.8s) entirely.
+#   prove-model --model model.onnx --format ml_gkr --gpu --output proof.json
+#   bash scripts/pipeline/04_verify_onchain.sh --proof proof.json --submit
 #
-# BEFORE (3-stage):
-#   Stage 1: GPU ML Proof          (~40s)
-#   Stage 2: Cairo VM recursion    (~46.8s)  <-- ELIMINATED
-#   Stage 3: On-chain verify       (~10s network)
-#
-# AFTER (2-stage):
-#   Stage 1: GPU ML Proof          (~40s)
-#   Stage 2: On-chain verify_model_direct()  (~10s network, 0s proving)
-#
-# Usage:
-#   ./h200_direct_pipeline.sh \
-#     --model /path/to/model.onnx \
-#     --input /path/to/input.json \
-#     --contract 0x<elo-cairo-verifier-address> \
-#     --model-id 0x1234 \
-#     --account deployer
+# This script is kept for historical reference only.
+
+echo "ERROR: h200_direct_pipeline.sh is deprecated."
+echo "  verify_model_direct() was removed from EloVerifier v11."
+echo "  Use the GKR pipeline: scripts/pipeline/04_verify_onchain.sh --submit"
+exit 1
+
+# --- Original script below (non-functional) ---
 
 set -euo pipefail
 

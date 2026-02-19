@@ -316,6 +316,50 @@ pub fn serialize_mle_opening_proof(proof: &MleOpeningProof, output: &mut Vec<Fie
     serialize_qm31(proof.final_value, output);
 }
 
+/// Serialize an `AggregatedWeightBindingProof` for Cairo deserialization.
+///
+/// Layout:
+/// 1. config: selector_bits, n_max, m_padded, n_global, n_claims (5 u32s)
+/// 2. sumcheck_round_polys: Array<(QM31, QM31, QM31)> — len + n_global * 12 felts
+/// 3. oracle_eval_at_s: QM31 (4 felts)
+/// 4. super_root: felt252
+/// 5. subtree_roots: Array<felt252> — len + m_padded roots
+/// 6. opening_proof: MleOpeningProof (reuses serialize_mle_opening_proof)
+pub fn serialize_aggregated_binding_proof(
+    proof: &crate::crypto::aggregated_opening::AggregatedWeightBindingProof,
+    output: &mut Vec<FieldElement>,
+) {
+    // Config
+    serialize_u32(proof.config.selector_bits as u32, output);
+    serialize_u32(proof.config.n_max as u32, output);
+    serialize_u32(proof.config.m_padded as u32, output);
+    serialize_u32(proof.config.n_global as u32, output);
+    serialize_u32(proof.config.n_claims as u32, output);
+
+    // Sumcheck round polynomials
+    serialize_u32(proof.sumcheck_round_polys.len() as u32, output);
+    for &(c0, c1, c2) in &proof.sumcheck_round_polys {
+        serialize_qm31(c0, output);
+        serialize_qm31(c1, output);
+        serialize_qm31(c2, output);
+    }
+
+    // Oracle eval at challenge point
+    serialize_qm31(proof.oracle_eval_at_s, output);
+
+    // Super root
+    output.push(proof.super_root.root);
+
+    // Subtree roots
+    serialize_u32(proof.super_root.subtree_roots.len() as u32, output);
+    for root in &proof.super_root.subtree_roots {
+        output.push(*root);
+    }
+
+    // Single MLE opening proof
+    serialize_mle_opening_proof(&proof.opening_proof, output);
+}
+
 /// Serialize a `MatMulSumcheckProofOnChain` matching the Cairo verifier's
 /// 12-field `MatMulSumcheckProof` layout.
 ///
@@ -1155,6 +1199,7 @@ pub fn serialize_gkr_model_proof(
                             crate::gkr::types::WeightOpeningTranscriptMode::Sequential,
                         io_commitment: proof.io_commitment,
                         deferred_proofs: vec![],
+                        aggregated_binding: None,
                     };
                     let mut sub_buf = Vec::new();
                     serialize_gkr_model_proof(&tmp, &mut sub_buf);
@@ -1429,6 +1474,7 @@ pub fn serialize_gkr_proof_data_only(
                             crate::gkr::types::WeightOpeningTranscriptMode::Sequential,
                         io_commitment: proof.io_commitment,
                         deferred_proofs: vec![],
+                        aggregated_binding: None,
                     };
                     let mut sub_buf = Vec::new();
                     serialize_gkr_model_proof(&tmp, &mut sub_buf);

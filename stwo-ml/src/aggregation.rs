@@ -17,37 +17,33 @@
 //! The single STARK proof covers all activation/add/mul/layernorm constraints,
 //! verified on-chain via a single Cairo verifier call.
 
+use stwo::core::air::Component;
+use stwo::core::channel::Poseidon252Channel;
+use stwo::core::channel::{Channel, MerkleChannel};
 use stwo::core::fields::m31::{BaseField, M31};
 use stwo::core::fields::qm31::SecureField;
+use stwo::core::pcs::CommitmentSchemeVerifier;
 use stwo::core::pcs::PcsConfig;
 use stwo::core::poly::circle::CanonicCoset;
-use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
-use stwo::core::channel::{Channel, MerkleChannel};
 use stwo::core::proof::StarkProof;
+use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
 use stwo::core::vcs_lifted::MerkleHasherLifted;
-use stwo::core::pcs::CommitmentSchemeVerifier;
-use stwo::core::air::Component;
 use stwo::core::verifier::verify as stwo_verify;
-use stwo::prover::backend::simd::SimdBackend;
-use stwo::prover::backend::simd::m31::{LOG_N_LANES, PackedBaseField};
+use stwo::prover::backend::simd::m31::{PackedBaseField, LOG_N_LANES};
 use stwo::prover::backend::simd::qm31::PackedSecureField;
-use stwo::prover::backend::{Col, Column, BackendForChannel};
-use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
-use stwo::prover::CommitmentSchemeProver;
-use stwo::prover::prove;
-use stwo::prover::ComponentProver;
-use stwo::core::channel::Poseidon252Channel;
+use stwo::prover::backend::simd::SimdBackend;
+use stwo::prover::backend::{BackendForChannel, Col, Column, ColumnOps};
 use stwo::prover::lookups::gkr_prover::{self, Layer as GkrLayer};
 use stwo::prover::lookups::gkr_verifier::{
-    Gate, GkrBatchProof,
-    partially_verify_batch as stwo_partially_verify_batch,
+    partially_verify_batch as stwo_partially_verify_batch, Gate, GkrBatchProof,
 };
 use stwo::prover::lookups::mle::Mle;
+use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
+use stwo::prover::prove;
+use stwo::prover::CommitmentSchemeProver;
+use stwo::prover::ComponentProver;
 
-use stwo_constraint_framework::{
-    FrameworkComponent, TraceLocationAllocator,
-    LogupTraceGenerator,
-};
+use stwo_constraint_framework::{FrameworkComponent, LogupTraceGenerator, TraceLocationAllocator};
 
 use num_traits::One;
 #[cfg(feature = "cuda-runtime")]
@@ -55,43 +51,39 @@ use num_traits::Zero;
 use starknet_ff::FieldElement;
 use std::collections::HashMap;
 
+use crate::backend::convert_evaluations;
 use crate::compiler::graph::{ComputationGraph, GraphOp, GraphWeights};
 use crate::compiler::prove::{
-    GraphExecution, ModelError, elementwise_add, elementwise_mul,
-    apply_layernorm_detailed, apply_rmsnorm_detailed,
+    apply_layernorm_detailed, apply_rmsnorm_detailed, elementwise_add, elementwise_mul,
+    GraphExecution, ModelError,
 };
+use crate::components::activation::{compute_multiplicities, ActivationEval, ActivationRelation};
+use crate::components::attention::{
+    attention_forward, pad_to_pow2, prove_attention_onchain, prove_attention_with, split_heads,
+    transpose_m31, AttentionProof, AttentionProofOnChain, AttentionWeights,
+    MultiHeadAttentionConfig,
+};
+use crate::components::conv2d::{conv2d_forward, Im2ColConfig};
+use crate::components::dequantize::{build_dequantize_table, DequantizeEval, DequantizeRelation};
 use crate::components::elementwise::{ElementwiseAddEval, ElementwiseMulEval};
-use crate::components::layernorm::{LayerNormConfig, LayerNormEval, LayerNormRelation, build_rsqrt_table};
-use crate::components::rmsnorm::{RMSNormConfig, RMSNormEval, RMSNormRelation, build_rsqrt_table as build_rmsnorm_rsqrt_table};
-use crate::components::activation::{
-    ActivationEval, ActivationRelation,
-    compute_multiplicities,
+use crate::components::embedding::{
+    build_embedding_table_columns, embedding_lookup, EmbeddingEval, EmbeddingRelation,
+};
+use crate::components::layernorm::{
+    build_rsqrt_table, LayerNormConfig, LayerNormEval, LayerNormRelation,
 };
 use crate::components::matmul::{
-    M31Matrix, matmul_m31,
-    MatMulSumcheckProof, prove_matmul_sumcheck_auto,
-    MatMulSumcheckProofOnChain, prove_matmul_sumcheck_onchain_auto,
-    estimate_sumcheck_memory,
+    estimate_sumcheck_memory, matmul_m31, prove_matmul_sumcheck_auto,
+    prove_matmul_sumcheck_onchain_auto, M31Matrix, MatMulSumcheckProof, MatMulSumcheckProofOnChain,
+};
+use crate::components::quantize::{build_quantize_table, QuantizeEval, QuantizeRelation};
+use crate::components::rmsnorm::{
+    build_rsqrt_table as build_rmsnorm_rsqrt_table, RMSNormConfig, RMSNormEval, RMSNormRelation,
 };
 use crate::components::tiled_matmul::{
-    TiledMatMulConfig, TiledMatMulProof, prove_tiled_matmul, compose_tiled_proof,
+    compose_tiled_proof, prove_tiled_matmul, TiledMatMulConfig, TiledMatMulProof,
 };
-use crate::components::attention::{
-    AttentionWeights, AttentionProof, AttentionProofOnChain,
-    MultiHeadAttentionConfig,
-    prove_attention_with, prove_attention_onchain,
-    attention_forward,
-    pad_to_pow2, split_heads, transpose_m31,
-};
-use crate::components::embedding::{
-    EmbeddingEval, EmbeddingRelation,
-    embedding_lookup, build_embedding_table_columns,
-};
-use crate::components::conv2d::{Im2ColConfig, conv2d_forward};
-use crate::components::quantize::{QuantizeEval, QuantizeRelation, build_quantize_table};
-use crate::components::dequantize::{DequantizeEval, DequantizeRelation, build_dequantize_table};
 use crate::gadgets::lookup_table::PrecomputedTable;
-use crate::backend::convert_evaluations;
 use tracing::info;
 
 type Blake2sHash = <Blake2sMerkleChannel as MerkleChannel>::H;
@@ -113,7 +105,9 @@ fn unified_stark_max_log_size(
     quantize_layers: &[QuantizeLayerData],
     dequantize_layers: &[DequantizeLayerData],
 ) -> u32 {
-    activation_layers.iter().map(|l| l.log_size)
+    activation_layers
+        .iter()
+        .map(|l| l.log_size)
         .chain(add_layers.iter().map(|l| l.log_size))
         .chain(mul_layers.iter().map(|l| l.log_size))
         .chain(layernorm_layers.iter().map(|l| l.log_size))
@@ -195,7 +189,10 @@ pub fn compute_layer_chain_commitment(
         if m.data.is_empty() {
             return vec![FieldElement::ZERO];
         }
-        m.data.iter().map(|v| FieldElement::from(v.0 as u64)).collect()
+        m.data
+            .iter()
+            .map(|v| FieldElement::from(v.0 as u64))
+            .collect()
     }
 
     // H₀ = Poseidon(rows, cols, ALL input elements)
@@ -278,7 +275,9 @@ pub fn compute_layernorm_mean_var_commitment(means: &[M31], variances: &[M31]) -
 ///
 /// Prevents a malicious prover from swapping quantization parameters without detection.
 /// Encodes each layer's params as 5 felt252s: strategy, scale_lo, scale_hi, zero_point, bits.
-pub(crate) fn compute_quantize_params_commitment(quantize_layers: &[QuantizeLayerData]) -> FieldElement {
+pub(crate) fn compute_quantize_params_commitment(
+    quantize_layers: &[QuantizeLayerData],
+) -> FieldElement {
     if quantize_layers.is_empty() {
         return FieldElement::ZERO;
     }
@@ -360,11 +359,16 @@ pub type AggregatedModelProof = AggregatedModelProofFor<Blake2sHash>;
 impl<H: MerkleHasherLifted> AggregatedModelProofFor<H> {
     /// Total number of proven layers (matmul + activation + add + mul + layernorm + rmsnorm + attention + embedding + quantize + dequantize).
     pub fn num_proven_layers(&self) -> usize {
-        self.matmul_proofs.len() + self.activation_claims.len()
-            + self.add_claims.len() + self.mul_claims.len() + self.layernorm_claims.len()
+        self.matmul_proofs.len()
+            + self.activation_claims.len()
+            + self.add_claims.len()
+            + self.mul_claims.len()
+            + self.layernorm_claims.len()
             + self.rmsnorm_claims.len()
-            + self.attention_proofs.len() + self.embedding_claims.len()
-            + self.quantize_claims.len() + self.dequantize_claims.len()
+            + self.attention_proofs.len()
+            + self.embedding_claims.len()
+            + self.quantize_claims.len()
+            + self.dequantize_claims.len()
     }
 
     /// Estimated calldata size in bytes for on-chain submission.
@@ -373,16 +377,22 @@ impl<H: MerkleHasherLifted> AggregatedModelProofFor<H> {
         let commitment_size = 3 * 32;
         // FRI proof: ~1KB per component (rough estimate)
         let num_components = self.activation_claims.len()
-            + self.add_claims.len() + self.mul_claims.len() + self.layernorm_claims.len()
+            + self.add_claims.len()
+            + self.mul_claims.len()
+            + self.layernorm_claims.len()
             + self.rmsnorm_claims.len()
-            + self.embedding_claims.len() + self.dequantize_claims.len();
+            + self.embedding_claims.len()
+            + self.dequantize_claims.len();
         let fri_size = 1024 * num_components.max(1);
         // Sumcheck proofs: ~256 bytes each
         let sumcheck_size = self.matmul_proofs.len() * 256;
         // Claims are lightweight (no separate STARK proofs)
-        let claim_size = (self.add_claims.len() + self.mul_claims.len()
-            + self.layernorm_claims.len() + self.rmsnorm_claims.len()
-            + self.embedding_claims.len()) * 32;
+        let claim_size = (self.add_claims.len()
+            + self.mul_claims.len()
+            + self.layernorm_claims.len()
+            + self.rmsnorm_claims.len()
+            + self.embedding_claims.len())
+            * 32;
         // Attention proofs: ~2KB each (multiple matmul sumchecks + softmax STARK)
         let attention_size = self.attention_proofs.len() * 2048;
         let layernorm_mv_size = self.layernorm_mean_var_commitments.len() * 32;
@@ -600,7 +610,8 @@ pub fn prove_model_aggregated_with<B, MC>(
     weights: &GraphWeights,
 ) -> Result<AggregatedModelProofFor<<MC as MerkleChannel>::H>, AggregationError>
 where
-    B: BackendForChannel<MC> + PolyOps,
+    B: BackendForChannel<MC> + PolyOps + ColumnOps<BaseField>,
+    <B as ColumnOps<BaseField>>::Column: 'static,
     MC: MerkleChannel,
     FrameworkComponent<ActivationEval>: ComponentProver<B>,
     FrameworkComponent<ElementwiseAddEval>: ComponentProver<B>,
@@ -646,9 +657,9 @@ where
 
         match &node.op {
             GraphOp::MatMul { .. } => {
-                let weight = weights.get_weight(node.id).ok_or(
-                    ModelError::MissingWeight(node.id)
-                )?;
+                let weight = weights
+                    .get_weight(node.id)
+                    .ok_or(ModelError::MissingWeight(node.id))?;
 
                 // GPU GEMM for all matrix sizes, CPU fallback
                 #[cfg(feature = "cuda-runtime")]
@@ -657,11 +668,12 @@ where
                 #[cfg(not(feature = "cuda-runtime"))]
                 let output = matmul_m31(&current, weight);
 
-                let proof = prove_matmul_sumcheck_auto(&current, weight, &output)
-                    .map_err(|e| ModelError::ProvingError {
+                let proof = prove_matmul_sumcheck_auto(&current, weight, &output).map_err(|e| {
+                    ModelError::ProvingError {
                         layer: node.id,
                         message: format!("MatMul sumcheck: {e}"),
-                    })?;
+                    }
+                })?;
 
                 intermediates.push((node.id, current.clone()));
                 matmul_proofs.push((node.id, proof));
@@ -669,17 +681,23 @@ where
                 current = output;
             }
 
-            GraphOp::Activation { activation_type, .. } => {
+            GraphOp::Activation {
+                activation_type, ..
+            } => {
                 let f = activation_type.as_fn();
                 let act_log_size = activation_type.recommended_table_log_size();
                 let table_mask = (1u32 << act_log_size) - 1;
 
                 // Reduce inputs to table range for LogUp consistency
-                let reduced_inputs: Vec<M31> = current.data.iter()
+                let reduced_inputs: Vec<M31> = current
+                    .data
+                    .iter()
                     .map(|&x| M31::from(x.0 & table_mask))
                     .collect();
                 let reduced_matrix = M31Matrix {
-                    rows: current.rows, cols: current.cols, data: reduced_inputs.clone(),
+                    rows: current.rows,
+                    cols: current.cols,
+                    data: reduced_inputs.clone(),
                 };
                 let output = crate::compiler::prove::apply_activation_pub(&reduced_matrix, &*f);
 
@@ -700,11 +718,15 @@ where
             }
 
             GraphOp::Add { .. } => {
-                let lhs = node.inputs.get(0)
+                let lhs = node
+                    .inputs
+                    .get(0)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
-                let rhs = node.inputs.get(1)
+                let rhs = node
+                    .inputs
+                    .get(1)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
@@ -735,11 +757,15 @@ where
             }
 
             GraphOp::Mul { .. } => {
-                let lhs = node.inputs.get(0)
+                let lhs = node
+                    .inputs
+                    .get(0)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
-                let rhs = node.inputs.get(1)
+                let rhs = node
+                    .inputs
+                    .get(1)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
@@ -810,7 +836,9 @@ where
                 current = rn.output_matrix;
             }
 
-            GraphOp::Attention { config: attn_config } => {
+            GraphOp::Attention {
+                config: attn_config,
+            } => {
                 let w_q = weights.get_named_weight(node.id, "w_q");
                 let w_k = weights.get_named_weight(node.id, "w_k");
                 let w_v = weights.get_named_weight(node.id, "w_v");
@@ -818,8 +846,10 @@ where
 
                 if let (Some(wq), Some(wk), Some(wv), Some(wo)) = (w_q, w_k, w_v, w_o) {
                     let attn_weights = AttentionWeights {
-                        w_q: wq.clone(), w_k: wk.clone(),
-                        w_v: wv.clone(), w_o: wo.clone(),
+                        w_q: wq.clone(),
+                        w_k: wk.clone(),
+                        w_v: wv.clone(),
+                        w_o: wo.clone(),
                     };
                     // Run forward pass to get correct output for downstream nodes
                     let inter = attention_forward(&current, &attn_weights, attn_config, false);
@@ -834,20 +864,27 @@ where
                     current = inter.final_output;
                 } else {
                     // No weights found — passthrough (log warning)
-                    info!(node_id = node.id, "Attention node missing weights, passthrough");
+                    info!(
+                        node_id = node.id,
+                        "Attention node missing weights, passthrough"
+                    );
                     intermediates.push((node.id, current.clone()));
                     node_outputs.insert(node.id, current.clone());
                 }
             }
 
-            GraphOp::Embedding { vocab_size: _, embed_dim: _ } => {
-                let embed_table = weights.get_weight(node.id).ok_or(
-                    ModelError::MissingWeight(node.id)
-                )?;
+            GraphOp::Embedding {
+                vocab_size: _,
+                embed_dim: _,
+            } => {
+                let embed_table = weights
+                    .get_weight(node.id)
+                    .ok_or(ModelError::MissingWeight(node.id))?;
                 let token_u32s: Vec<u32> = current.data.iter().map(|m| m.0).collect();
                 let (output, token_ids, col_indices, values, multiplicities) =
                     embedding_lookup(&token_u32s, embed_table);
-                let (table_tokens, table_cols, table_values) = build_embedding_table_columns(embed_table);
+                let (table_tokens, table_cols, table_values) =
+                    build_embedding_table_columns(embed_table);
                 let log_size = data_log_size(values.len());
                 embedding_layers.push(EmbeddingLayerData {
                     node_id: node.id,
@@ -865,10 +902,16 @@ where
                 current = output;
             }
 
-            GraphOp::Conv2D { in_channels, out_channels, kernel_size, stride, padding } => {
-                let kernel = weights.get_weight(node.id).ok_or(
-                    ModelError::MissingWeight(node.id)
-                )?;
+            GraphOp::Conv2D {
+                in_channels,
+                out_channels,
+                kernel_size,
+                stride,
+                padding,
+            } => {
+                let kernel = weights
+                    .get_weight(node.id)
+                    .ok_or(ModelError::MissingWeight(node.id))?;
                 let im2col_config = Im2ColConfig {
                     in_channels: *in_channels,
                     kernel_size: *kernel_size,
@@ -895,9 +938,13 @@ where
                 // Apply real quantization: interpret M31 as Direct-encoded f32, then quantize
                 let direct_params = crate::gadgets::quantize::QuantParams {
                     strategy: crate::gadgets::quantize::QuantStrategy::Direct,
-                    scale: 1.0, zero_point: 0, bits: 31,
+                    scale: 1.0,
+                    zero_point: 0,
+                    bits: 31,
                 };
-                let quantized: Vec<M31> = current.data.iter()
+                let quantized: Vec<M31> = current
+                    .data
+                    .iter()
                     .map(|&v| {
                         let f32_val = crate::gadgets::quantize::dequantize_value(v, &direct_params);
                         crate::gadgets::quantize::quantize_value(f32_val, params)
@@ -935,10 +982,10 @@ where
 
             GraphOp::Dequantize { params, size: _ } => {
                 let table = build_dequantize_table(params);
-                let output_values: Vec<M31> = current.data.iter()
-                    .map(|&v| {
-                        table.lookup(v).unwrap_or(v)
-                    })
+                let output_values: Vec<M31> = current
+                    .data
+                    .iter()
+                    .map(|&v| table.lookup(v).unwrap_or(v))
                     .collect();
                 let multiplicities = compute_multiplicities(&current.data, &table);
                 let log_size = data_log_size(current.data.len().max(table.size()));
@@ -979,23 +1026,22 @@ where
     // Prove attention layers (separate from unified STARK)
     let mut attention_proofs = Vec::new();
     for layer in &attention_layers {
-        let proof = prove_attention_with::<B, MC>(
-            &layer.input, &layer.weights, &layer.config, false,
-        ).map_err(|e| AggregationError::ProvingError(
-            format!("Attention node {}: {e}", layer.node_id),
-        ))?;
+        let proof =
+            prove_attention_with::<B, MC>(&layer.input, &layer.weights, &layer.config, false)
+                .map_err(|e| {
+                    AggregationError::ProvingError(format!("Attention node {}: {e}", layer.node_id))
+                })?;
         attention_proofs.push((layer.node_id, proof));
     }
 
     // Compute layer chain commitment before consuming `intermediates`.
-    let layer_chain_commitment = compute_layer_chain_commitment(
-        input, &intermediates, &current,
-    );
+    let layer_chain_commitment = compute_layer_chain_commitment(input, &intermediates, &current);
     // Compute IO commitment binding this proof to specific input/output.
     let io_commitment = compute_io_commitment(input, &current);
 
     // Compute per-LayerNorm mean/variance commitments (defense-in-depth).
-    let layernorm_mean_var_commitments: Vec<FieldElement> = layernorm_layers.iter()
+    let layernorm_mean_var_commitments: Vec<FieldElement> = layernorm_layers
+        .iter()
         .map(|layer| compute_layernorm_mean_var_commitment(&layer.means, &layer.variances))
         .collect();
 
@@ -1006,9 +1052,12 @@ where
 
     // Check if there are any non-matmul components to aggregate
     let has_components = !activation_layers.is_empty()
-        || !add_layers.is_empty() || !mul_layers.is_empty() || !layernorm_layers.is_empty()
+        || !add_layers.is_empty()
+        || !mul_layers.is_empty()
+        || !layernorm_layers.is_empty()
         || !rmsnorm_layers.is_empty()
-        || !embedding_layers.is_empty() || !quantize_layers.is_empty()
+        || !embedding_layers.is_empty()
+        || !quantize_layers.is_empty()
         || !dequantize_layers.is_empty();
 
     if !has_components {
@@ -1035,7 +1084,9 @@ where
     // === Build unified STARK for all non-matmul components ===
     // Per-component log_sizes: each component uses its own size derived from
     // its table or data length. The max_log_size drives twiddle precomputation.
-    let all_log_sizes: Vec<u32> = activation_layers.iter().map(|l| l.log_size)
+    let all_log_sizes: Vec<u32> = activation_layers
+        .iter()
+        .map(|l| l.log_size)
         .chain(add_layers.iter().map(|l| l.log_size))
         .chain(mul_layers.iter().map(|l| l.log_size))
         .chain(layernorm_layers.iter().map(|l| l.log_size))
@@ -1056,9 +1107,12 @@ where
     let channel = &mut MC::C::default();
     let mut commitment_scheme = CommitmentSchemeProver::<B, MC>::new(config, &twiddles);
 
-    let has_logup = !activation_layers.is_empty() || !layernorm_layers.is_empty()
-        || !rmsnorm_layers.is_empty() || !embedding_layers.is_empty()
-        || !quantize_layers.is_empty() || !dequantize_layers.is_empty();
+    let has_logup = !activation_layers.is_empty()
+        || !layernorm_layers.is_empty()
+        || !rmsnorm_layers.is_empty()
+        || !embedding_layers.is_empty()
+        || !quantize_layers.is_empty()
+        || !dequantize_layers.is_empty();
 
     // Tree 0: Preprocessed columns (always committed, may be empty)
     // - Activation tables: 2 cols per layer (table_input, table_output)
@@ -1071,7 +1125,7 @@ where
         for layer in &activation_layers {
             let layer_size = 1usize << layer.log_size;
             let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-            let (table_input_col, table_output_col) = build_table_columns(&layer.table, layer_size);
+            let (table_input_col, table_output_col) = build_table_columns::<SimdBackend>(&layer.table, layer_size);
             let simd_evals = vec![
                 CircleEvaluation::new(layer_domain, table_input_col),
                 CircleEvaluation::new(layer_domain, table_output_col),
@@ -1081,7 +1135,8 @@ where
         for layer in &layernorm_layers {
             let layer_size = 1usize << layer.log_size;
             let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-            let (table_var_col, table_rsqrt_col) = build_table_columns(&layer.rsqrt_table, layer_size);
+            let (table_var_col, table_rsqrt_col) =
+                build_table_columns::<SimdBackend>(&layer.rsqrt_table, layer_size);
             let simd_evals = vec![
                 CircleEvaluation::new(layer_domain, table_var_col),
                 CircleEvaluation::new(layer_domain, table_rsqrt_col),
@@ -1091,7 +1146,8 @@ where
         for layer in &rmsnorm_layers {
             let layer_size = 1usize << layer.log_size;
             let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-            let (table_rms_col, table_rsqrt_col) = build_table_columns(&layer.rsqrt_table, layer_size);
+            let (table_rms_col, table_rsqrt_col) =
+                build_table_columns::<SimdBackend>(&layer.rsqrt_table, layer_size);
             let simd_evals = vec![
                 CircleEvaluation::new(layer_domain, table_rms_col),
                 CircleEvaluation::new(layer_domain, table_rsqrt_col),
@@ -1101,8 +1157,12 @@ where
         for layer in &embedding_layers {
             let layer_size = 1usize << layer.log_size;
             let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-            let simd_evals = build_embedding_preprocessed_columns(
-                &layer.table_tokens, &layer.table_cols, &layer.table_values, layer_size, layer_domain,
+            let simd_evals = build_embedding_preprocessed_columns::<SimdBackend>(
+                &layer.table_tokens,
+                &layer.table_cols,
+                &layer.table_values,
+                layer_size,
+                layer_domain,
             );
             tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
         }
@@ -1110,7 +1170,8 @@ where
             let table = build_quantize_table(&layer.params, &layer.input_values);
             let layer_size = 1usize << layer.log_size;
             let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-            let (table_input_col, table_output_col) = build_quantize_table_columns(&table, layer_size);
+            let (table_input_col, table_output_col) =
+                build_quantize_table_columns::<SimdBackend>(&table, layer_size);
             let simd_evals = vec![
                 CircleEvaluation::new(layer_domain, table_input_col),
                 CircleEvaluation::new(layer_domain, table_output_col),
@@ -1121,7 +1182,7 @@ where
             let table = build_dequantize_table(&layer.params);
             let layer_size = 1usize << layer.log_size;
             let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-            let (table_input_col, table_output_col) = build_table_columns(&table, layer_size);
+            let (table_input_col, table_output_col) = build_table_columns::<SimdBackend>(&table, layer_size);
             let simd_evals = vec![
                 CircleEvaluation::new(layer_domain, table_input_col),
                 CircleEvaluation::new(layer_domain, table_output_col),
@@ -1152,9 +1213,13 @@ where
             mults[0] += M31::from(padding_count as u32);
         }
 
-        let (trace_in, trace_out, mult_col) = build_trace_columns(
-            &layer.inputs, &layer.outputs, &mults,
-            pad_input, pad_output, layer_size,
+        let (trace_in, trace_out, mult_col) = build_trace_columns::<SimdBackend>(
+            &layer.inputs,
+            &layer.outputs,
+            &mults,
+            pad_input,
+            pad_output,
+            layer_size,
         );
         let simd_evals = vec![
             CircleEvaluation::new(layer_domain, trace_in),
@@ -1167,9 +1232,8 @@ where
     for layer in &add_layers {
         let layer_size = 1usize << layer.log_size;
         let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-        let (lhs_col, rhs_col, out_col) = build_elementwise_trace_columns(
-            &layer.lhs, &layer.rhs, &layer.output, layer_size,
-        );
+        let (lhs_col, rhs_col, out_col) =
+            build_elementwise_trace_columns::<SimdBackend>(&layer.lhs, &layer.rhs, &layer.output, layer_size);
         let simd_evals = vec![
             CircleEvaluation::new(layer_domain, lhs_col),
             CircleEvaluation::new(layer_domain, rhs_col),
@@ -1180,9 +1244,8 @@ where
     for layer in &mul_layers {
         let layer_size = 1usize << layer.log_size;
         let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-        let (lhs_col, rhs_col, out_col) = build_elementwise_trace_columns(
-            &layer.lhs, &layer.rhs, &layer.output, layer_size,
-        );
+        let (lhs_col, rhs_col, out_col) =
+            build_elementwise_trace_columns::<SimdBackend>(&layer.lhs, &layer.rhs, &layer.output, layer_size);
         let simd_evals = vec![
             CircleEvaluation::new(layer_domain, lhs_col),
             CircleEvaluation::new(layer_domain, rhs_col),
@@ -1195,11 +1258,18 @@ where
         let layer_size = 1usize << layer.log_size;
         let padding = layer_size.saturating_sub(layer.variances.len());
         let mut mults = compute_multiplicities(&layer.variances, &layer.rsqrt_table);
-        if padding > 0 { mults[0] += M31::from(padding as u32); }
-        let cols = build_layernorm_trace_columns(
-            &layer.inputs, &layer.means, &layer.variances,
-            &layer.rsqrt_vals, &layer.outputs, &mults,
-            &layer.rsqrt_table, layer_size,
+        if padding > 0 {
+            mults[0] += M31::from(padding as u32);
+        }
+        let cols = build_layernorm_trace_columns::<SimdBackend>(
+            &layer.inputs,
+            &layer.means,
+            &layer.variances,
+            &layer.rsqrt_vals,
+            &layer.outputs,
+            &mults,
+            &layer.rsqrt_table,
+            layer_size,
         );
         tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(cols));
         layernorm_mults.push(mults);
@@ -1209,11 +1279,17 @@ where
         let layer_size = 1usize << layer.log_size;
         let padding = layer_size.saturating_sub(layer.rms_sq_vals.len());
         let mut mults = compute_multiplicities(&layer.rms_sq_vals, &layer.rsqrt_table);
-        if padding > 0 { mults[0] += M31::from(padding as u32); }
-        let cols = build_rmsnorm_trace_columns(
-            &layer.inputs, &layer.rms_sq_vals,
-            &layer.rsqrt_vals, &layer.outputs, &mults,
-            &layer.rsqrt_table, layer_size,
+        if padding > 0 {
+            mults[0] += M31::from(padding as u32);
+        }
+        let cols = build_rmsnorm_trace_columns::<SimdBackend>(
+            &layer.inputs,
+            &layer.rms_sq_vals,
+            &layer.rsqrt_vals,
+            &layer.outputs,
+            &mults,
+            &layer.rsqrt_table,
+            layer_size,
         );
         tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(cols));
         rmsnorm_mults.push(mults);
@@ -1221,9 +1297,13 @@ where
     for layer in &embedding_layers {
         let layer_size = 1usize << layer.log_size;
         let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-        let simd_evals = build_embedding_trace_columns(
-            &layer.token_ids, &layer.col_indices, &layer.values, &layer.multiplicities,
-            layer_size, layer_domain,
+        let simd_evals = build_embedding_trace_columns::<SimdBackend>(
+            &layer.token_ids,
+            &layer.col_indices,
+            &layer.values,
+            &layer.multiplicities,
+            layer_size,
+            layer_domain,
         );
         tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
     }
@@ -1239,9 +1319,14 @@ where
         if padding_count > 0 {
             mults[0] += M31::from(padding_count as u32);
         }
-        let simd_evals = build_quantize_trace_columns_2d(
-            &layer.input_values, &layer.values, &mults,
-            pad_input, pad_output, layer_size, layer_domain,
+        let simd_evals = build_quantize_trace_columns_2d::<SimdBackend>(
+            &layer.input_values,
+            &layer.values,
+            &mults,
+            pad_input,
+            pad_output,
+            layer_size,
+            layer_domain,
         );
         tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
         quantize_mults.push(mults);
@@ -1258,9 +1343,13 @@ where
         if padding_count > 0 {
             mults[0] += M31::from(padding_count as u32);
         }
-        let (trace_in, trace_out, mult_col) = build_trace_columns(
-            &layer.input_values, &layer.output_values, &mults,
-            pad_input, pad_output, layer_size,
+        let (trace_in, trace_out, mult_col) = build_trace_columns::<SimdBackend>(
+            &layer.input_values,
+            &layer.output_values,
+            &mults,
+            pad_input,
+            pad_output,
+            layer_size,
         );
         let simd_evals = vec![
             CircleEvaluation::new(layer_domain, trace_in),
@@ -1317,51 +1406,62 @@ where
         let mut tree_builder = commitment_scheme.tree_builder();
 
         if let Some(ref lookup) = activation_lookup {
-        for (idx, layer) in activation_layers.iter().enumerate() {
-            let layer_size = 1usize << layer.log_size;
-            let layer_vec_size = layer_size >> LOG_N_LANES;
-            let pad_input = layer.table.inputs[0];
-            let pad_output = layer.table.outputs[0];
+            for (idx, layer) in activation_layers.iter().enumerate() {
+                let layer_size = 1usize << layer.log_size;
+                let layer_vec_size = layer_size >> LOG_N_LANES;
+                let pad_input = layer.table.inputs[0];
+                let pad_output = layer.table.outputs[0];
 
-            let (table_in_col, table_out_col) = build_table_columns(&layer.table, layer_size);
-            let (trace_in_col, trace_out_col, _) = build_trace_columns(
-                &layer.inputs, &layer.outputs, &activation_mults[idx],
-                pad_input, pad_output, layer_size,
-            );
-
-            let mut logup_gen = LogupTraceGenerator::new(layer.log_size);
-            let mut col_gen = logup_gen.new_col();
-
-            // Type tag broadcast — domain separates activation types in LogUp (M1 fix).
-            let tag_packed = PackedBaseField::broadcast(M31::from(layer.type_tag));
-
-            for vec_row in 0..layer_vec_size {
-                let q_table: PackedSecureField = lookup.lookup_elements().combine(
-                    &[tag_packed, table_in_col.data[vec_row], table_out_col.data[vec_row]],
-                );
-                let q_trace: PackedSecureField = lookup.lookup_elements().combine(
-                    &[tag_packed, trace_in_col.data[vec_row], trace_out_col.data[vec_row]],
+                let (table_in_col, table_out_col) = build_table_columns::<SimdBackend>(&layer.table, layer_size);
+                let (trace_in_col, trace_out_col, _) = build_trace_columns::<SimdBackend>(
+                    &layer.inputs,
+                    &layer.outputs,
+                    &activation_mults[idx],
+                    pad_input,
+                    pad_output,
+                    layer_size,
                 );
 
-                let mult_packed = pack_multiplicities(&activation_mults[idx], vec_row);
-                let numerator = q_table - mult_packed * q_trace;
-                let denominator = q_table * q_trace;
+                let mut logup_gen = LogupTraceGenerator::new(layer.log_size);
+                let mut col_gen = logup_gen.new_col();
 
-                col_gen.write_frac(vec_row, numerator, denominator);
+                // Type tag broadcast — domain separates activation types in LogUp (M1 fix).
+                let tag_packed = PackedBaseField::broadcast(M31::from(layer.type_tag));
+
+                for vec_row in 0..layer_vec_size {
+                    let q_table: PackedSecureField = lookup.lookup_elements().combine(&[
+                        tag_packed,
+                        table_in_col.data[vec_row],
+                        table_out_col.data[vec_row],
+                    ]);
+                    let q_trace: PackedSecureField = lookup.lookup_elements().combine(&[
+                        tag_packed,
+                        trace_in_col.data[vec_row],
+                        trace_out_col.data[vec_row],
+                    ]);
+
+                    let mult_packed = pack_multiplicities(&activation_mults[idx], vec_row);
+                    let numerator = q_table - mult_packed * q_trace;
+                    let denominator = q_table * q_trace;
+
+                    col_gen.write_frac(vec_row, numerator, denominator);
+                }
+                col_gen.finalize_col();
+
+                let (interaction_trace, claimed_sum) = logup_gen.finalize_last();
+                tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(
+                    interaction_trace,
+                ));
+                activation_claimed_sums.push(claimed_sum);
             }
-            col_gen.finalize_col();
-
-            let (interaction_trace, claimed_sum) = logup_gen.finalize_last();
-            tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(interaction_trace));
-            activation_claimed_sums.push(claimed_sum);
         }
-    }
 
         if let Some(ref lookup) = layernorm_lookup {
             for (idx, layer) in layernorm_layers.iter().enumerate() {
                 let layer_size = 1usize << layer.log_size;
                 let layer_vec_size = layer_size >> LOG_N_LANES;
-                let (table_var_col, table_rsqrt_col) = build_table_columns(&layer.rsqrt_table, layer_size);
+                let (table_var_col, table_rsqrt_col) =
+                    build_table_columns::<SimdBackend>(&layer.rsqrt_table, layer_size);
 
                 // Build variance and rsqrt trace columns for LogUp
                 let mut var_col = Col::<SimdBackend, BaseField>::zeros(layer_size);
@@ -1372,8 +1472,18 @@ where
                     rsqrt_col.set(i, layer.rsqrt_vals[i]);
                 }
                 // Pad with table[0] values
-                let pad_var = layer.rsqrt_table.inputs.first().copied().unwrap_or(M31::from(0));
-                let pad_rsqrt = layer.rsqrt_table.outputs.first().copied().unwrap_or(M31::from(0));
+                let pad_var = layer
+                    .rsqrt_table
+                    .inputs
+                    .first()
+                    .copied()
+                    .unwrap_or(M31::from(0));
+                let pad_rsqrt = layer
+                    .rsqrt_table
+                    .outputs
+                    .first()
+                    .copied()
+                    .unwrap_or(M31::from(0));
                 for i in n..layer_size {
                     var_col.set(i, pad_var);
                     rsqrt_col.set(i, pad_rsqrt);
@@ -1383,12 +1493,12 @@ where
                 let mut col_gen = logup_gen.new_col();
 
                 for vec_row in 0..layer_vec_size {
-                    let q_table: PackedSecureField = lookup.lookup_elements().combine(
-                        &[table_var_col.data[vec_row], table_rsqrt_col.data[vec_row]],
-                    );
-                    let q_trace: PackedSecureField = lookup.lookup_elements().combine(
-                        &[var_col.data[vec_row], rsqrt_col.data[vec_row]],
-                    );
+                    let q_table: PackedSecureField = lookup
+                        .lookup_elements()
+                        .combine(&[table_var_col.data[vec_row], table_rsqrt_col.data[vec_row]]);
+                    let q_trace: PackedSecureField = lookup
+                        .lookup_elements()
+                        .combine(&[var_col.data[vec_row], rsqrt_col.data[vec_row]]);
 
                     let mult_packed = pack_multiplicities(&layernorm_mults[idx], vec_row);
                     let numerator = q_table - mult_packed * q_trace;
@@ -1399,7 +1509,9 @@ where
                 col_gen.finalize_col();
 
                 let (interaction_trace, claimed_sum) = logup_gen.finalize_last();
-                tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(interaction_trace));
+                tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(
+                    interaction_trace,
+                ));
                 layernorm_claimed_sums.push(claimed_sum);
             }
         }
@@ -1409,7 +1521,8 @@ where
             for (idx, layer) in rmsnorm_layers.iter().enumerate() {
                 let layer_size = 1usize << layer.log_size;
                 let layer_vec_size = layer_size >> LOG_N_LANES;
-                let (table_rms_col, table_rsqrt_col) = build_table_columns(&layer.rsqrt_table, layer_size);
+                let (table_rms_col, table_rsqrt_col) =
+                    build_table_columns::<SimdBackend>(&layer.rsqrt_table, layer_size);
 
                 let mut rms_col = Col::<SimdBackend, BaseField>::zeros(layer_size);
                 let mut rsqrt_col = Col::<SimdBackend, BaseField>::zeros(layer_size);
@@ -1418,8 +1531,18 @@ where
                     rms_col.set(i, layer.rms_sq_vals[i]);
                     rsqrt_col.set(i, layer.rsqrt_vals[i]);
                 }
-                let pad_rms = layer.rsqrt_table.inputs.first().copied().unwrap_or(M31::from(0));
-                let pad_rsqrt = layer.rsqrt_table.outputs.first().copied().unwrap_or(M31::from(0));
+                let pad_rms = layer
+                    .rsqrt_table
+                    .inputs
+                    .first()
+                    .copied()
+                    .unwrap_or(M31::from(0));
+                let pad_rsqrt = layer
+                    .rsqrt_table
+                    .outputs
+                    .first()
+                    .copied()
+                    .unwrap_or(M31::from(0));
                 for i in n..layer_size {
                     rms_col.set(i, pad_rms);
                     rsqrt_col.set(i, pad_rsqrt);
@@ -1429,12 +1552,12 @@ where
                 let mut col_gen = logup_gen.new_col();
 
                 for vec_row in 0..layer_vec_size {
-                    let q_table: PackedSecureField = lookup.lookup_elements().combine(
-                        &[table_rms_col.data[vec_row], table_rsqrt_col.data[vec_row]],
-                    );
-                    let q_trace: PackedSecureField = lookup.lookup_elements().combine(
-                        &[rms_col.data[vec_row], rsqrt_col.data[vec_row]],
-                    );
+                    let q_table: PackedSecureField = lookup
+                        .lookup_elements()
+                        .combine(&[table_rms_col.data[vec_row], table_rsqrt_col.data[vec_row]]);
+                    let q_trace: PackedSecureField = lookup
+                        .lookup_elements()
+                        .combine(&[rms_col.data[vec_row], rsqrt_col.data[vec_row]]);
 
                     let mult_packed = pack_multiplicities(&rmsnorm_mults[idx], vec_row);
                     let numerator = q_table - mult_packed * q_trace;
@@ -1445,7 +1568,9 @@ where
                 col_gen.finalize_col();
 
                 let (interaction_trace, claimed_sum) = logup_gen.finalize_last();
-                tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(interaction_trace));
+                tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(
+                    interaction_trace,
+                ));
                 rmsnorm_claimed_sums.push(claimed_sum);
             }
         }
@@ -1482,9 +1607,11 @@ where
                 // Table side (yield with -multiplicity)
                 let mut col_gen = logup_gen.new_col();
                 for vec_row in 0..layer_vec_size {
-                    let q_table: PackedSecureField = lookup.lookup_elements().combine(
-                        &[tbl_tok.data[vec_row], tbl_col.data[vec_row], tbl_val.data[vec_row]],
-                    );
+                    let q_table: PackedSecureField = lookup.lookup_elements().combine(&[
+                        tbl_tok.data[vec_row],
+                        tbl_col.data[vec_row],
+                        tbl_val.data[vec_row],
+                    ]);
                     let mult_packed = pack_multiplicities(&layer.multiplicities, vec_row);
                     col_gen.write_frac(vec_row, -mult_packed, q_table);
                 }
@@ -1493,15 +1620,19 @@ where
                 // Trace side (use with +1)
                 let mut col_gen = logup_gen.new_col();
                 for vec_row in 0..layer_vec_size {
-                    let q_trace: PackedSecureField = lookup.lookup_elements().combine(
-                        &[tr_tok.data[vec_row], tr_col.data[vec_row], tr_val.data[vec_row]],
-                    );
+                    let q_trace: PackedSecureField = lookup.lookup_elements().combine(&[
+                        tr_tok.data[vec_row],
+                        tr_col.data[vec_row],
+                        tr_val.data[vec_row],
+                    ]);
                     col_gen.write_frac(vec_row, PackedSecureField::one(), q_trace);
                 }
                 col_gen.finalize_col();
 
                 let (interaction_trace, claimed_sum) = logup_gen.finalize_last();
-                tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(interaction_trace));
+                tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(
+                    interaction_trace,
+                ));
                 embedding_claimed_sums.push(claimed_sum);
             }
         }
@@ -1516,22 +1647,27 @@ where
                 let pad_input = table.inputs[0];
                 let pad_output = table.outputs[0];
 
-                let (table_in_col, table_out_col) = build_quantize_table_columns(&table, layer_size);
-                let (trace_in_col, trace_out_col, _) = build_quantize_trace_simd_2d(
-                    &layer.input_values, &layer.values, &quantize_mults[idx],
-                    pad_input, pad_output, layer_size,
+                let (table_in_col, table_out_col) =
+                    build_quantize_table_columns::<SimdBackend>(&table, layer_size);
+                let (trace_in_col, trace_out_col, _) = build_quantize_trace_simd_2d::<SimdBackend>(
+                    &layer.input_values,
+                    &layer.values,
+                    &quantize_mults[idx],
+                    pad_input,
+                    pad_output,
+                    layer_size,
                 );
 
                 let mut logup_gen = LogupTraceGenerator::new(layer.log_size);
                 let mut col_gen = logup_gen.new_col();
 
                 for vec_row in 0..layer_vec_size {
-                    let q_table: PackedSecureField = lookup.lookup_elements().combine(
-                        &[table_in_col.data[vec_row], table_out_col.data[vec_row]],
-                    );
-                    let q_trace: PackedSecureField = lookup.lookup_elements().combine(
-                        &[trace_in_col.data[vec_row], trace_out_col.data[vec_row]],
-                    );
+                    let q_table: PackedSecureField = lookup
+                        .lookup_elements()
+                        .combine(&[table_in_col.data[vec_row], table_out_col.data[vec_row]]);
+                    let q_trace: PackedSecureField = lookup
+                        .lookup_elements()
+                        .combine(&[trace_in_col.data[vec_row], trace_out_col.data[vec_row]]);
 
                     let mult_packed = pack_multiplicities(&quantize_mults[idx], vec_row);
                     let numerator = q_table - mult_packed * q_trace;
@@ -1542,7 +1678,9 @@ where
                 col_gen.finalize_col();
 
                 let (interaction_trace, claimed_sum) = logup_gen.finalize_last();
-                tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(interaction_trace));
+                tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(
+                    interaction_trace,
+                ));
                 quantize_claimed_sums.push(claimed_sum);
             }
         }
@@ -1557,22 +1695,26 @@ where
                 let pad_input = table.inputs[0];
                 let pad_output = table.outputs[0];
 
-                let (table_in_col, table_out_col) = build_table_columns(&table, layer_size);
-                let (trace_in_col, trace_out_col, _) = build_trace_columns(
-                    &layer.input_values, &layer.output_values, &dequantize_mults[idx],
-                    pad_input, pad_output, layer_size,
+                let (table_in_col, table_out_col) = build_table_columns::<SimdBackend>(&table, layer_size);
+                let (trace_in_col, trace_out_col, _) = build_trace_columns::<SimdBackend>(
+                    &layer.input_values,
+                    &layer.output_values,
+                    &dequantize_mults[idx],
+                    pad_input,
+                    pad_output,
+                    layer_size,
                 );
 
                 let mut logup_gen = LogupTraceGenerator::new(layer.log_size);
                 let mut col_gen = logup_gen.new_col();
 
                 for vec_row in 0..layer_vec_size {
-                    let q_table: PackedSecureField = lookup.lookup_elements().combine(
-                        &[table_in_col.data[vec_row], table_out_col.data[vec_row]],
-                    );
-                    let q_trace: PackedSecureField = lookup.lookup_elements().combine(
-                        &[trace_in_col.data[vec_row], trace_out_col.data[vec_row]],
-                    );
+                    let q_table: PackedSecureField = lookup
+                        .lookup_elements()
+                        .combine(&[table_in_col.data[vec_row], table_out_col.data[vec_row]]);
+                    let q_trace: PackedSecureField = lookup
+                        .lookup_elements()
+                        .combine(&[trace_in_col.data[vec_row], trace_out_col.data[vec_row]]);
 
                     let mult_packed = pack_multiplicities(&dequantize_mults[idx], vec_row);
                     let numerator = q_table - mult_packed * q_trace;
@@ -1583,7 +1725,9 @@ where
                 col_gen.finalize_col();
 
                 let (interaction_trace, claimed_sum) = logup_gen.finalize_last();
-                tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(interaction_trace));
+                tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(
+                    interaction_trace,
+                ));
                 dequantize_claimed_sums.push(claimed_sum);
             }
         }
@@ -1630,7 +1774,9 @@ where
     for layer in &add_layers {
         let component = FrameworkComponent::new(
             &mut allocator,
-            ElementwiseAddEval { log_n_rows: layer.log_size },
+            ElementwiseAddEval {
+                log_n_rows: layer.log_size,
+            },
             SecureField::default(),
         );
         component_refs_storage.push(Box::new(component));
@@ -1645,7 +1791,9 @@ where
     for layer in &mul_layers {
         let component = FrameworkComponent::new(
             &mut allocator,
-            ElementwiseMulEval { log_n_rows: layer.log_size },
+            ElementwiseMulEval {
+                log_n_rows: layer.log_size,
+            },
             SecureField::default(),
         );
         component_refs_storage.push(Box::new(component));
@@ -1932,19 +2080,31 @@ pub struct AggregatedModelProofOnChain {
 impl AggregatedModelProofOnChain {
     /// Total number of proven layers across all proof types.
     pub fn num_proven_layers(&self) -> usize {
-        let batched_count: usize = self.batched_matmul_proofs.iter()
-            .map(|b| b.entries.len()).sum();
-        self.matmul_proofs.len() + batched_count + self.activation_claims.len()
-            + self.add_claims.len() + self.mul_claims.len() + self.layernorm_claims.len()
+        let batched_count: usize = self
+            .batched_matmul_proofs
+            .iter()
+            .map(|b| b.entries.len())
+            .sum();
+        self.matmul_proofs.len()
+            + batched_count
+            + self.activation_claims.len()
+            + self.add_claims.len()
+            + self.mul_claims.len()
+            + self.layernorm_claims.len()
             + self.rmsnorm_claims.len()
-            + self.attention_proofs.len() + self.embedding_claims.len()
-            + self.quantize_claims.len() + self.dequantize_claims.len()
+            + self.attention_proofs.len()
+            + self.embedding_claims.len()
+            + self.quantize_claims.len()
+            + self.dequantize_claims.len()
     }
 
     /// Total number of matmul proofs (individual + batched entries).
     pub fn total_matmul_count(&self) -> usize {
-        let batched: usize = self.batched_matmul_proofs.iter()
-            .map(|b| b.entries.len()).sum();
+        let batched: usize = self
+            .batched_matmul_proofs
+            .iter()
+            .map(|b| b.entries.len())
+            .sum();
         self.matmul_proofs.len() + batched
     }
 }
@@ -1976,7 +2136,8 @@ pub(crate) fn prove_model_aggregated_onchain_with<B>(
     weights: &GraphWeights,
 ) -> Result<AggregatedModelProofOnChain, AggregationError>
 where
-    B: BackendForChannel<Blake2sMerkleChannel> + PolyOps,
+    B: BackendForChannel<Blake2sMerkleChannel> + PolyOps + ColumnOps<BaseField>,
+    <B as ColumnOps<BaseField>>::Column: 'static,
     FrameworkComponent<ActivationEval>: ComponentProver<B>,
     FrameworkComponent<ElementwiseAddEval>: ComponentProver<B>,
     FrameworkComponent<ElementwiseMulEval>: ComponentProver<B>,
@@ -2006,7 +2167,8 @@ pub(crate) fn prove_model_aggregated_onchain_with_cache<B>(
     precomputed: Option<PrecomputedMatmuls>,
 ) -> Result<AggregatedModelProofOnChain, AggregationError>
 where
-    B: BackendForChannel<Blake2sMerkleChannel> + PolyOps,
+    B: BackendForChannel<Blake2sMerkleChannel> + PolyOps + ColumnOps<BaseField>,
+    <B as ColumnOps<BaseField>>::Column: 'static,
     FrameworkComponent<ActivationEval>: ComponentProver<B>,
     FrameworkComponent<ElementwiseAddEval>: ComponentProver<B>,
     FrameworkComponent<ElementwiseMulEval>: ComponentProver<B>,
@@ -2026,11 +2188,20 @@ where
     let backend_name = std::any::type_name::<B>();
     let is_gpu_backend = backend_name.contains("Gpu");
     eprintln!("=== Proving Pipeline ===");
-    eprintln!("  Backend: {} {}", backend_name,
-        if is_gpu_backend { "[GPU]" } else { "[CPU/SIMD]" });
-    eprintln!("  Sumcheck: {} {}",
+    eprintln!(
+        "  Backend: {} {}",
+        backend_name,
+        if is_gpu_backend {
+            "[GPU]"
+        } else {
+            "[CPU/SIMD]"
+        }
+    );
+    eprintln!(
+        "  Sumcheck: {} {}",
         if gpu_active { "GPU-accelerated" } else { "CPU" },
-        if gpu_active { "[GPU]" } else { "[CPU]" });
+        if gpu_active { "[GPU]" } else { "[CPU]" }
+    );
     if let Some(dev) = crate::backend::gpu_device_name() {
         if let Some(mem) = crate::backend::gpu_available_memory() {
             eprintln!("  Device: {} ({:.1} GB)", dev, mem as f64 / 1e9);
@@ -2081,7 +2252,12 @@ where
                 let (m, k, n) = *dims;
                 eprintln!(
                     "  [{}/{}] Node {} MatMul {}x{}x{} — forward pass",
-                    step + 1, total_nodes, node.id, m, k, n,
+                    step + 1,
+                    total_nodes,
+                    node.id,
+                    m,
+                    k,
+                    n,
                 );
 
                 // Use precomputed output if available (tile-level streaming path),
@@ -2091,9 +2267,9 @@ where
                         eprintln!("    (using precomputed output)");
                         c.clone()
                     } else {
-                        let weight = weights.get_weight(node.id).ok_or(
-                            ModelError::MissingWeight(node.id)
-                        )?;
+                        let weight = weights
+                            .get_weight(node.id)
+                            .ok_or(ModelError::MissingWeight(node.id))?;
                         #[cfg(feature = "cuda-runtime")]
                         let out = crate::gpu_sumcheck::gpu_matmul_m31_full(&current, weight)
                             .unwrap_or_else(|_| matmul_m31(&current, weight));
@@ -2102,9 +2278,9 @@ where
                         out
                     }
                 } else {
-                    let weight = weights.get_weight(node.id).ok_or(
-                        ModelError::MissingWeight(node.id)
-                    )?;
+                    let weight = weights
+                        .get_weight(node.id)
+                        .ok_or(ModelError::MissingWeight(node.id))?;
                     #[cfg(feature = "cuda-runtime")]
                     let out = crate::gpu_sumcheck::gpu_matmul_m31_full(&current, weight)
                         .unwrap_or_else(|_| matmul_m31(&current, weight));
@@ -2126,21 +2302,30 @@ where
                 current = output;
             }
 
-            GraphOp::Activation { activation_type, .. } => {
+            GraphOp::Activation {
+                activation_type, ..
+            } => {
                 eprintln!(
                     "[{}/{}] Node {} Activation {:?}",
-                    step + 1, total_nodes, node.id, activation_type,
+                    step + 1,
+                    total_nodes,
+                    node.id,
+                    activation_type,
                 );
                 let f = activation_type.as_fn();
                 let act_log_size = activation_type.recommended_table_log_size();
                 let table_mask = (1u32 << act_log_size) - 1;
 
                 // Reduce inputs to table range for LogUp consistency
-                let reduced_inputs: Vec<M31> = current.data.iter()
+                let reduced_inputs: Vec<M31> = current
+                    .data
+                    .iter()
                     .map(|&x| M31::from(x.0 & table_mask))
                     .collect();
                 let reduced_matrix = M31Matrix {
-                    rows: current.rows, cols: current.cols, data: reduced_inputs.clone(),
+                    rows: current.rows,
+                    cols: current.cols,
+                    data: reduced_inputs.clone(),
                 };
                 let output = crate::compiler::prove::apply_activation_pub(&reduced_matrix, &*f);
 
@@ -2163,13 +2348,20 @@ where
             GraphOp::Add { .. } => {
                 eprintln!(
                     "[{}/{}] Node {} Add ({} elements)",
-                    step + 1, total_nodes, node.id, current.data.len(),
+                    step + 1,
+                    total_nodes,
+                    node.id,
+                    current.data.len(),
                 );
-                let lhs = node.inputs.get(0)
+                let lhs = node
+                    .inputs
+                    .get(0)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
-                let rhs = node.inputs.get(1)
+                let rhs = node
+                    .inputs
+                    .get(1)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
@@ -2202,13 +2394,20 @@ where
             GraphOp::Mul { .. } => {
                 eprintln!(
                     "[{}/{}] Node {} Mul ({} elements)",
-                    step + 1, total_nodes, node.id, current.data.len(),
+                    step + 1,
+                    total_nodes,
+                    node.id,
+                    current.data.len(),
                 );
-                let lhs = node.inputs.get(0)
+                let lhs = node
+                    .inputs
+                    .get(0)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
-                let rhs = node.inputs.get(1)
+                let rhs = node
+                    .inputs
+                    .get(1)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
@@ -2241,7 +2440,10 @@ where
             GraphOp::LayerNorm { dim } => {
                 eprintln!(
                     "[{}/{}] Node {} LayerNorm (dim={})",
-                    step + 1, total_nodes, node.id, dim,
+                    step + 1,
+                    total_nodes,
+                    node.id,
+                    dim,
                 );
                 let ln_log_size = LayerNormConfig::new(*dim).rsqrt_table_log_size;
                 let ln = apply_layernorm_detailed(&current, *dim);
@@ -2266,7 +2468,10 @@ where
             GraphOp::RMSNorm { dim } => {
                 eprintln!(
                     "[{}/{}] Node {} RMSNorm (dim={})",
-                    step + 1, total_nodes, node.id, dim,
+                    step + 1,
+                    total_nodes,
+                    node.id,
+                    dim,
                 );
                 let rn_log_size = RMSNormConfig::new(*dim).rsqrt_table_log_size;
                 let rn = apply_rmsnorm_detailed(&current, *dim);
@@ -2287,12 +2492,18 @@ where
                 current = rn.output_matrix;
             }
 
-            GraphOp::Attention { config: attn_config } => {
+            GraphOp::Attention {
+                config: attn_config,
+            } => {
                 let tag = if gpu_active { "[GPU]" } else { "[CPU]" };
                 eprintln!(
                     "{} [{}/{}] Node {} Attention (heads={}, d_model={})",
-                    tag, step + 1, total_nodes, node.id,
-                    attn_config.num_heads, attn_config.d_model,
+                    tag,
+                    step + 1,
+                    total_nodes,
+                    node.id,
+                    attn_config.num_heads,
+                    attn_config.d_model,
                 );
                 let t_node = std::time::Instant::now();
 
@@ -2303,8 +2514,10 @@ where
 
                 if let (Some(wq), Some(wk), Some(wv), Some(wo)) = (w_q, w_k, w_v, w_o) {
                     let attn_weights = AttentionWeights {
-                        w_q: wq.clone(), w_k: wk.clone(),
-                        w_v: wv.clone(), w_o: wo.clone(),
+                        w_q: wq.clone(),
+                        w_k: wk.clone(),
+                        w_v: wv.clone(),
+                        w_o: wo.clone(),
                     };
                     let inter = attention_forward(&current, &attn_weights, attn_config, false);
                     attention_layers.push(AttentionLayerData {
@@ -2318,7 +2531,8 @@ where
                     current = inter.final_output;
                     eprintln!(
                         "  -> {} done in {:.2}s (elapsed: {:.1}s)",
-                        tag, t_node.elapsed().as_secs_f64(),
+                        tag,
+                        t_node.elapsed().as_secs_f64(),
                         t_start.elapsed().as_secs_f64(),
                     );
                 } else {
@@ -2328,18 +2542,26 @@ where
                 }
             }
 
-            GraphOp::Embedding { vocab_size, embed_dim } => {
+            GraphOp::Embedding {
+                vocab_size,
+                embed_dim,
+            } => {
                 eprintln!(
                     "[{}/{}] Node {} Embedding (vocab={}, dim={})",
-                    step + 1, total_nodes, node.id, vocab_size, embed_dim,
+                    step + 1,
+                    total_nodes,
+                    node.id,
+                    vocab_size,
+                    embed_dim,
                 );
-                let embed_table = weights.get_weight(node.id).ok_or(
-                    ModelError::MissingWeight(node.id)
-                )?;
+                let embed_table = weights
+                    .get_weight(node.id)
+                    .ok_or(ModelError::MissingWeight(node.id))?;
                 let token_u32s: Vec<u32> = current.data.iter().map(|m| m.0).collect();
                 let (output, token_ids, col_indices, values, multiplicities) =
                     embedding_lookup(&token_u32s, embed_table);
-                let (table_tokens, table_cols, table_values) = build_embedding_table_columns(embed_table);
+                let (table_tokens, table_cols, table_values) =
+                    build_embedding_table_columns(embed_table);
                 let log_size = data_log_size(values.len());
                 embedding_layers.push(EmbeddingLayerData {
                     node_id: node.id,
@@ -2357,18 +2579,31 @@ where
                 current = output;
             }
 
-            GraphOp::Conv2D { in_channels, out_channels, kernel_size, stride, padding } => {
+            GraphOp::Conv2D {
+                in_channels,
+                out_channels,
+                kernel_size,
+                stride,
+                padding,
+            } => {
                 let tag = if gpu_active { "[GPU]" } else { "[CPU]" };
                 eprintln!(
                     "{} [{}/{}] Node {} Conv2D ({}->{}ch, k={}, s={}, p={})",
-                    tag, step + 1, total_nodes, node.id,
-                    in_channels, out_channels, kernel_size, stride, padding,
+                    tag,
+                    step + 1,
+                    total_nodes,
+                    node.id,
+                    in_channels,
+                    out_channels,
+                    kernel_size,
+                    stride,
+                    padding,
                 );
                 let t_node = std::time::Instant::now();
 
-                let kernel = weights.get_weight(node.id).ok_or(
-                    ModelError::MissingWeight(node.id)
-                )?;
+                let kernel = weights
+                    .get_weight(node.id)
+                    .ok_or(ModelError::MissingWeight(node.id))?;
                 let im2col_config = Im2ColConfig {
                     in_channels: *in_channels,
                     kernel_size: *kernel_size,
@@ -2382,9 +2617,9 @@ where
                 // Conv2D matmul uses on-chain proving
                 let proof = prove_matmul_sumcheck_onchain_auto(&im2col_mat, &kernel_mat, &output)
                     .map_err(|e| ModelError::ProvingError {
-                        layer: node.id,
-                        message: format!("Conv2D matmul (on-chain): {e}"),
-                    })?;
+                    layer: node.id,
+                    message: format!("Conv2D matmul (on-chain): {e}"),
+                })?;
                 intermediates.push((node.id, current.clone()));
                 matmul_proofs.push((node.id, proof));
                 node_outputs.insert(node.id, output.clone());
@@ -2399,13 +2634,20 @@ where
             GraphOp::Quantize { params, size: _ } => {
                 eprintln!(
                     "[{}/{}] Node {} Quantize (bits={})",
-                    step + 1, total_nodes, node.id, params.bits,
+                    step + 1,
+                    total_nodes,
+                    node.id,
+                    params.bits,
                 );
                 let direct_params = crate::gadgets::quantize::QuantParams {
                     strategy: crate::gadgets::quantize::QuantStrategy::Direct,
-                    scale: 1.0, zero_point: 0, bits: 31,
+                    scale: 1.0,
+                    zero_point: 0,
+                    bits: 31,
                 };
-                let quantized: Vec<M31> = current.data.iter()
+                let quantized: Vec<M31> = current
+                    .data
+                    .iter()
                     .map(|&v| {
                         let f32_val = crate::gadgets::quantize::dequantize_value(v, &direct_params);
                         crate::gadgets::quantize::quantize_value(f32_val, params)
@@ -2443,13 +2685,16 @@ where
             GraphOp::Dequantize { params, size: _ } => {
                 eprintln!(
                     "[{}/{}] Node {} Dequantize (bits={})",
-                    step + 1, total_nodes, node.id, params.bits,
+                    step + 1,
+                    total_nodes,
+                    node.id,
+                    params.bits,
                 );
                 let table = build_dequantize_table(params);
-                let output_values: Vec<M31> = current.data.iter()
-                    .map(|&v| {
-                        table.lookup(v).unwrap_or(v)
-                    })
+                let output_values: Vec<M31> = current
+                    .data
+                    .iter()
+                    .map(|&v| table.lookup(v).unwrap_or(v))
                     .collect();
                 let multiplicities = compute_multiplicities(&current.data, &table);
                 let log_size = data_log_size(current.data.len().max(table.size()));
@@ -2489,7 +2734,8 @@ where
 
     eprintln!(
         "Phase 1 complete: forward pass ({} nodes in {:.1}s)",
-        total_nodes, t_start.elapsed().as_secs_f64(),
+        total_nodes,
+        t_start.elapsed().as_secs_f64(),
     );
     eprintln!(
         "  Deferred: {} matmuls, {} attention, {} activations, {} add, {} mul, {} layernorm, {} quantize, {} dequantize",
@@ -2514,7 +2760,8 @@ where
         tiled_matmul_proofs_out = pre.tiled_proofs;
         eprintln!(
             "Phase 2/3: Using {} pre-computed matmul proofs + {} tiled proofs (skipped proving)",
-            matmul_proofs.len(), tiled_matmul_proofs_out.len(),
+            matmul_proofs.len(),
+            tiled_matmul_proofs_out.len(),
         );
         true
     } else {
@@ -2525,28 +2772,39 @@ where
     // Falls back to individual proving if GPU batch isn't available.
     let batch_available = {
         #[cfg(feature = "cuda-runtime")]
-        { gpu_active }
+        {
+            gpu_active
+        }
         #[cfg(not(feature = "cuda-runtime"))]
-        { false }
+        {
+            false
+        }
     };
 
     if precomputed_used {
         // Phase 2 skipped — proofs already provided.
     } else if batch_available && !matmul_data.is_empty() {
         // Group matmuls by padded k dimension (all entries in a batch must share k).
-        let mut dim_groups: std::collections::BTreeMap<usize, Vec<usize>> = std::collections::BTreeMap::new();
+        let mut dim_groups: std::collections::BTreeMap<usize, Vec<usize>> =
+            std::collections::BTreeMap::new();
         for (idx, dm) in matmul_data.iter().enumerate() {
             let k = dm.dims.1.next_power_of_two();
             dim_groups.entry(k).or_default().push(idx);
         }
         eprintln!(
             "Phase 2/3: {} Batch proving {} matmuls in {} dimension groups...",
-            tag, matmul_data.len(), dim_groups.len(),
+            tag,
+            matmul_data.len(),
+            dim_groups.len(),
         );
         for (group_idx, (&k_dim, indices)) in dim_groups.iter().enumerate() {
             eprintln!(
                 "  {} Group {}/{}: k={}, {} matmuls",
-                tag, group_idx + 1, dim_groups.len(), k_dim, indices.len(),
+                tag,
+                group_idx + 1,
+                dim_groups.len(),
+                k_dim,
+                indices.len(),
             );
             let t_group = std::time::Instant::now();
 
@@ -2555,17 +2813,23 @@ where
             {
                 use rayon::prelude::*;
 
-                eprintln!("    Preparing {} batch entries (parallel chunks of 16)...", indices.len());
+                eprintln!(
+                    "    Preparing {} batch entries (parallel chunks of 16)...",
+                    indices.len()
+                );
                 let t_prep = std::time::Instant::now();
 
                 // Extract A/C from matmul_data for parallel processing.
                 // Weight B is looked up from GraphWeights (shared ref, thread-safe).
-                let prep_inputs: Vec<(usize, M31Matrix, M31Matrix)> = indices.iter().map(|&idx| {
-                    let dm = &mut matmul_data[idx];
-                    let a = std::mem::replace(&mut dm.a, M31Matrix::new(0, 0));
-                    let c = std::mem::replace(&mut dm.c, M31Matrix::new(0, 0));
-                    (dm.node_id, a, c)
-                }).collect();
+                let prep_inputs: Vec<(usize, M31Matrix, M31Matrix)> = indices
+                    .iter()
+                    .map(|&idx| {
+                        let dm = &mut matmul_data[idx];
+                        let a = std::mem::replace(&mut dm.a, M31Matrix::new(0, 0));
+                        let c = std::mem::replace(&mut dm.c, M31Matrix::new(0, 0));
+                        (dm.node_id, a, c)
+                    })
+                    .collect();
                 let total = prep_inputs.len();
 
                 // Process in chunks of 16 to bound peak memory:
@@ -2584,39 +2848,54 @@ where
                 let _mgpu_device_id = crate::multi_gpu::get_thread_device();
 
                 for (chunk_idx, chunk) in prep_inputs.chunks(16).enumerate() {
-                    let chunk_entries: Vec<Result<crate::gpu_sumcheck::BatchEntry, ModelError>> = chunk
-                        .par_iter()
-                        .map(|(node_id, a, c)| {
-                            // Propagate GPU device affinity to rayon worker thread (RAII)
-                            #[cfg(feature = "multi-gpu")]
-                            let _device_guard = crate::multi_gpu::propagate_device(_mgpu_device_id);
+                    let chunk_entries: Vec<Result<crate::gpu_sumcheck::BatchEntry, ModelError>> =
+                        chunk
+                            .par_iter()
+                            .map(|(node_id, a, c)| {
+                                // Propagate GPU device affinity to rayon worker thread (RAII)
+                                #[cfg(feature = "multi-gpu")]
+                                let _device_guard =
+                                    crate::multi_gpu::propagate_device(_mgpu_device_id);
 
-                            let weight_b = weights.get_weight(*node_id).expect("weight exists");
-                            let entry = if let Some(cache) = _weight_cache {
-                                crate::gpu_sumcheck::prepare_batch_entry_cached(*node_id, a, weight_b, c, cache)
-                                    .map_err(|e| ModelError::ProvingError {
-                                        layer: *node_id,
-                                        message: format!("Batch prep (cached): {e}"),
+                                let weight_b = weights.get_weight(*node_id).expect("weight exists");
+                                let entry = if let Some(cache) = _weight_cache {
+                                    crate::gpu_sumcheck::prepare_batch_entry_cached(
+                                        *node_id, a, weight_b, c, cache,
+                                    )
+                                    .map_err(|e| {
+                                        ModelError::ProvingError {
+                                            layer: *node_id,
+                                            message: format!("Batch prep (cached): {e}"),
+                                        }
                                     })?
-                            } else {
-                                crate::gpu_sumcheck::prepare_batch_entry(*node_id, a, weight_b, c)
-                                    .map_err(|e| ModelError::ProvingError {
-                                        layer: *node_id,
-                                        message: format!("Batch prep: {e}"),
+                                } else {
+                                    crate::gpu_sumcheck::prepare_batch_entry(
+                                        *node_id, a, weight_b, c,
+                                    )
+                                    .map_err(|e| {
+                                        ModelError::ProvingError {
+                                            layer: *node_id,
+                                            message: format!("Batch prep: {e}"),
+                                        }
                                     })?
-                            };
-                            done_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            Ok(entry)
-                        })
-                        .collect();
+                                };
+                                done_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                Ok(entry)
+                            })
+                            .collect();
 
                     for result in chunk_entries {
                         match result {
                             Ok(entry) => entries.push(entry),
-                            Err(e) => { prep_error = Some(e); break; }
+                            Err(e) => {
+                                prep_error = Some(e);
+                                break;
+                            }
                         }
                     }
-                    if prep_error.is_some() { break; }
+                    if prep_error.is_some() {
+                        break;
+                    }
 
                     // Report progress with RSS
                     let rss_mb = {
@@ -2624,20 +2903,28 @@ where
                         {
                             std::fs::read_to_string("/proc/self/status")
                                 .ok()
-                                .and_then(|s| s.lines()
-                                    .find(|l| l.starts_with("VmRSS:"))
-                                    .and_then(|l| l.split_whitespace().nth(1))
-                                    .and_then(|v| v.parse::<u64>().ok()))
+                                .and_then(|s| {
+                                    s.lines()
+                                        .find(|l| l.starts_with("VmRSS:"))
+                                        .and_then(|l| l.split_whitespace().nth(1))
+                                        .and_then(|v| v.parse::<u64>().ok())
+                                })
                                 .map(|kb| kb / 1024)
                                 .unwrap_or(0)
                         }
                         #[cfg(not(target_os = "linux"))]
-                        { 0u64 }
+                        {
+                            0u64
+                        }
                     };
                     eprintln!(
                         "      Chunk {}/{}: {}/{} entries prepared ({:.1}s, RSS: {} MB)",
-                        chunk_idx + 1, num_chunks, entries.len(), total,
-                        t_prep.elapsed().as_secs_f64(), rss_mb,
+                        chunk_idx + 1,
+                        num_chunks,
+                        entries.len(),
+                        total,
+                        t_prep.elapsed().as_secs_f64(),
+                        rss_mb,
                     );
                 }
                 if let Some(e) = prep_error {
@@ -2646,13 +2933,18 @@ where
                 eprintln!("    Prep done in {:.1}s", t_prep.elapsed().as_secs_f64());
 
                 // GPU batch prove
-                eprintln!("    {} Batch sumcheck ({} entries, k={})...", tag, entries.len(), k_dim);
+                eprintln!(
+                    "    {} Batch sumcheck ({} entries, k={})...",
+                    tag,
+                    entries.len(),
+                    k_dim
+                );
                 let _t_prove = std::time::Instant::now();
 
                 let batch_result = crate::gpu_sumcheck::prove_matmul_batch_onchain_gpu(&entries)
-                    .map_err(|e| AggregationError::ProvingError(
-                        format!("Batch sumcheck k={k_dim}: {e}"),
-                    ))?;
+                    .map_err(|e| {
+                        AggregationError::ProvingError(format!("Batch sumcheck k={k_dim}: {e}"))
+                    })?;
 
                 // Compute combined claimed sum for verification
                 let mut combined = SecureField::zero();
@@ -2663,7 +2955,8 @@ where
                 }
 
                 // Build batched proof struct
-                let batch_entries: Vec<BatchedMatMulEntryOnChain> = entries.iter()
+                let batch_entries: Vec<BatchedMatMulEntryOnChain> = entries
+                    .iter()
                     .zip(batch_result.per_matmul.iter())
                     .map(|(entry, result)| BatchedMatMulEntryOnChain {
                         node_id: entry.node_id,
@@ -2691,27 +2984,38 @@ where
             }
             eprintln!(
                 "    -> {} Group done in {:.2}s (elapsed: {:.1}s)",
-                tag, t_group.elapsed().as_secs_f64(),
+                tag,
+                t_group.elapsed().as_secs_f64(),
                 t_start.elapsed().as_secs_f64(),
             );
         }
         eprintln!(
             "Phase 2 complete: {} batched groups ({} total matmuls) in {:.1}s",
             batched_matmul_proofs.len(),
-            batched_matmul_proofs.iter().map(|b| b.entries.len()).sum::<usize>(),
+            batched_matmul_proofs
+                .iter()
+                .map(|b| b.entries.len())
+                .sum::<usize>(),
             t_phase2.elapsed().as_secs_f64(),
         );
     } else {
         // Fallback: individual proving (no GPU batch available)
         eprintln!(
             "Phase 2/3: {} Proving {} matmul sumchecks (individual)...",
-            tag, matmul_data.len(),
+            tag,
+            matmul_data.len(),
         );
         for (i, dm) in matmul_data.iter().enumerate() {
             let (m, k, n) = dm.dims;
             eprintln!(
                 "  {} [{}/{}] Node {} MatMul {}x{}x{}",
-                tag, i + 1, matmul_data.len(), dm.node_id, m, k, n,
+                tag,
+                i + 1,
+                matmul_data.len(),
+                dm.node_id,
+                m,
+                k,
+                n,
             );
             let t_node = std::time::Instant::now();
 
@@ -2719,37 +3023,39 @@ where
 
             let weight_b = weights.get_weight(dm.node_id).expect("weight exists");
             let proof = if estimated_mem > TILED_MEMORY_BUDGET {
-                let config = TiledMatMulConfig::from_memory_budget(
-                    m, k, n, TILED_MEMORY_BUDGET,
-                );
-                let tiled = prove_tiled_matmul(&dm.a, weight_b, &dm.c, &config)
-                    .map_err(|e| ModelError::ProvingError {
+                let config = TiledMatMulConfig::from_memory_budget(m, k, n, TILED_MEMORY_BUDGET);
+                let tiled = prove_tiled_matmul(&dm.a, weight_b, &dm.c, &config).map_err(|e| {
+                    ModelError::ProvingError {
                         layer: dm.node_id,
                         message: format!("Tiled matmul: {e}"),
-                    })?;
-                compose_tiled_proof(&tiled)
-                    .map_err(|e| ModelError::ProvingError {
-                        layer: dm.node_id,
-                        message: format!("Tiled composition: {e}"),
-                    })?
+                    }
+                })?;
+                compose_tiled_proof(&tiled).map_err(|e| ModelError::ProvingError {
+                    layer: dm.node_id,
+                    message: format!("Tiled composition: {e}"),
+                })?
             } else {
-                prove_matmul_sumcheck_onchain_auto(&dm.a, weight_b, &dm.c)
-                    .map_err(|e| ModelError::ProvingError {
+                prove_matmul_sumcheck_onchain_auto(&dm.a, weight_b, &dm.c).map_err(|e| {
+                    ModelError::ProvingError {
                         layer: dm.node_id,
                         message: format!("MatMul sumcheck (on-chain): {e}"),
-                    })?
+                    }
+                })?
             };
 
             eprintln!(
                 "    -> {} done in {:.2}s (elapsed: {:.1}s)",
-                tag, t_node.elapsed().as_secs_f64(), t_start.elapsed().as_secs_f64(),
+                tag,
+                t_node.elapsed().as_secs_f64(),
+                t_start.elapsed().as_secs_f64(),
             );
 
             matmul_proofs.push((dm.node_id, proof));
         }
         eprintln!(
             "Phase 2 complete: {} individual matmul proofs in {:.1}s",
-            matmul_proofs.len(), t_phase2.elapsed().as_secs_f64(),
+            matmul_proofs.len(),
+            t_phase2.elapsed().as_secs_f64(),
         );
     }
 
@@ -2761,30 +3067,37 @@ where
     for (i, layer) in attention_layers.iter().enumerate() {
         eprintln!(
             "{} Proving attention sumchecks [{}/{}] (node {}, 6 matmuls)...",
-            attn_tag, i + 1, attention_layers.len(), layer.node_id,
+            attn_tag,
+            i + 1,
+            attention_layers.len(),
+            layer.node_id,
         );
         let t_attn = std::time::Instant::now();
-        let proof = prove_attention_onchain(
-            &layer.input, &layer.weights, &layer.config, false,
-        ).map_err(|e| AggregationError::ProvingError(
-            format!("Attention node {} (on-chain): {e}", layer.node_id),
-        ))?;
+        let proof = prove_attention_onchain(&layer.input, &layer.weights, &layer.config, false)
+            .map_err(|e| {
+                AggregationError::ProvingError(format!(
+                    "Attention node {} (on-chain): {e}",
+                    layer.node_id
+                ))
+            })?;
         eprintln!(
             "  -> {} attention node {} proved in {:.2}s (elapsed: {:.1}s)",
-            attn_tag, layer.node_id, t_attn.elapsed().as_secs_f64(), t_start.elapsed().as_secs_f64(),
+            attn_tag,
+            layer.node_id,
+            t_attn.elapsed().as_secs_f64(),
+            t_start.elapsed().as_secs_f64(),
         );
         attention_proofs.push((layer.node_id, proof));
     }
 
     // Compute layer chain commitment before consuming `intermediates`.
-    let layer_chain_commitment = compute_layer_chain_commitment(
-        input, &intermediates, &current,
-    );
+    let layer_chain_commitment = compute_layer_chain_commitment(input, &intermediates, &current);
     // Compute IO commitment binding this proof to specific input/output.
     let io_commitment = compute_io_commitment(input, &current);
 
     // Compute per-LayerNorm mean/variance commitments (defense-in-depth).
-    let layernorm_mean_var_commitments: Vec<FieldElement> = layernorm_layers.iter()
+    let layernorm_mean_var_commitments: Vec<FieldElement> = layernorm_layers
+        .iter()
         .map(|layer| compute_layernorm_mean_var_commitment(&layer.means, &layer.variances))
         .collect();
 
@@ -2795,9 +3108,12 @@ where
 
     // Check if there are any non-matmul components to aggregate
     let has_components = !activation_layers.is_empty()
-        || !add_layers.is_empty() || !mul_layers.is_empty() || !layernorm_layers.is_empty()
+        || !add_layers.is_empty()
+        || !mul_layers.is_empty()
+        || !layernorm_layers.is_empty()
         || !rmsnorm_layers.is_empty()
-        || !embedding_layers.is_empty() || !quantize_layers.is_empty()
+        || !embedding_layers.is_empty()
+        || !quantize_layers.is_empty()
         || !dequantize_layers.is_empty();
 
     if !has_components {
@@ -2826,11 +3142,16 @@ where
     }
 
     // Build unified STARK using backend B + Blake2sMerkleChannel
-    eprintln!("Phase 3/3: {} Building unified STARK proof (all non-matmul components)...", tag);
+    eprintln!(
+        "Phase 3/3: {} Building unified STARK proof (all non-matmul components)...",
+        tag
+    );
     let t_stark = std::time::Instant::now();
     // Per-component log_sizes: each component uses its own size derived from
     // its table or data length. The max_log_size drives twiddle precomputation.
-    let all_log_sizes: Vec<u32> = activation_layers.iter().map(|l| l.log_size)
+    let all_log_sizes: Vec<u32> = activation_layers
+        .iter()
+        .map(|l| l.log_size)
         .chain(add_layers.iter().map(|l| l.log_size))
         .chain(mul_layers.iter().map(|l| l.log_size))
         .chain(layernorm_layers.iter().map(|l| l.log_size))
@@ -2849,10 +3170,13 @@ where
     );
 
     let channel = &mut <Blake2sMerkleChannel as MerkleChannel>::C::default();
-    let mut commitment_scheme = CommitmentSchemeProver::<B, Blake2sMerkleChannel>::new(config, &twiddles);
+    let mut commitment_scheme =
+        CommitmentSchemeProver::<B, Blake2sMerkleChannel>::new(config, &twiddles);
 
-    let has_logup = !activation_layers.is_empty() || !layernorm_layers.is_empty()
-        || !embedding_layers.is_empty() || !quantize_layers.is_empty()
+    let has_logup = !activation_layers.is_empty()
+        || !layernorm_layers.is_empty()
+        || !embedding_layers.is_empty()
+        || !quantize_layers.is_empty()
         || !dequantize_layers.is_empty();
 
     // Tree 0: Preprocessed (activation tables + layernorm rsqrt tables + embedding tables + quantize range tables)
@@ -2861,7 +3185,7 @@ where
         for layer in &activation_layers {
             let layer_size = 1usize << layer.log_size;
             let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-            let (table_input_col, table_output_col) = build_table_columns(&layer.table, layer_size);
+            let (table_input_col, table_output_col) = build_table_columns::<SimdBackend>(&layer.table, layer_size);
             let simd_evals = vec![
                 CircleEvaluation::new(layer_domain, table_input_col),
                 CircleEvaluation::new(layer_domain, table_output_col),
@@ -2871,7 +3195,8 @@ where
         for layer in &layernorm_layers {
             let layer_size = 1usize << layer.log_size;
             let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-            let (table_var_col, table_rsqrt_col) = build_table_columns(&layer.rsqrt_table, layer_size);
+            let (table_var_col, table_rsqrt_col) =
+                build_table_columns::<SimdBackend>(&layer.rsqrt_table, layer_size);
             let simd_evals = vec![
                 CircleEvaluation::new(layer_domain, table_var_col),
                 CircleEvaluation::new(layer_domain, table_rsqrt_col),
@@ -2881,8 +3206,12 @@ where
         for layer in &embedding_layers {
             let layer_size = 1usize << layer.log_size;
             let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-            let simd_evals = build_embedding_preprocessed_columns(
-                &layer.table_tokens, &layer.table_cols, &layer.table_values, layer_size, layer_domain,
+            let simd_evals = build_embedding_preprocessed_columns::<SimdBackend>(
+                &layer.table_tokens,
+                &layer.table_cols,
+                &layer.table_values,
+                layer_size,
+                layer_domain,
             );
             tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
         }
@@ -2890,7 +3219,8 @@ where
             let table = build_quantize_table(&layer.params, &layer.input_values);
             let layer_size = 1usize << layer.log_size;
             let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-            let (table_input_col, table_output_col) = build_quantize_table_columns(&table, layer_size);
+            let (table_input_col, table_output_col) =
+                build_quantize_table_columns::<SimdBackend>(&table, layer_size);
             let simd_evals = vec![
                 CircleEvaluation::new(layer_domain, table_input_col),
                 CircleEvaluation::new(layer_domain, table_output_col),
@@ -2901,7 +3231,7 @@ where
             let table = build_dequantize_table(&layer.params);
             let layer_size = 1usize << layer.log_size;
             let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-            let (table_input_col, table_output_col) = build_table_columns(&table, layer_size);
+            let (table_input_col, table_output_col) = build_table_columns::<SimdBackend>(&table, layer_size);
             let simd_evals = vec![
                 CircleEvaluation::new(layer_domain, table_input_col),
                 CircleEvaluation::new(layer_domain, table_output_col),
@@ -2926,9 +3256,13 @@ where
             mults[0] += M31::from(padding_count as u32);
         }
 
-        let (trace_in, trace_out, mult_col) = build_trace_columns(
-            &layer.inputs, &layer.outputs, &mults,
-            pad_input, pad_output, layer_size,
+        let (trace_in, trace_out, mult_col) = build_trace_columns::<SimdBackend>(
+            &layer.inputs,
+            &layer.outputs,
+            &mults,
+            pad_input,
+            pad_output,
+            layer_size,
         );
         let simd_evals = vec![
             CircleEvaluation::new(layer_domain, trace_in),
@@ -2941,9 +3275,8 @@ where
     for layer in &add_layers {
         let layer_size = 1usize << layer.log_size;
         let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-        let (lhs_col, rhs_col, out_col) = build_elementwise_trace_columns(
-            &layer.lhs, &layer.rhs, &layer.output, layer_size,
-        );
+        let (lhs_col, rhs_col, out_col) =
+            build_elementwise_trace_columns::<SimdBackend>(&layer.lhs, &layer.rhs, &layer.output, layer_size);
         let simd_evals = vec![
             CircleEvaluation::new(layer_domain, lhs_col),
             CircleEvaluation::new(layer_domain, rhs_col),
@@ -2954,9 +3287,8 @@ where
     for layer in &mul_layers {
         let layer_size = 1usize << layer.log_size;
         let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-        let (lhs_col, rhs_col, out_col) = build_elementwise_trace_columns(
-            &layer.lhs, &layer.rhs, &layer.output, layer_size,
-        );
+        let (lhs_col, rhs_col, out_col) =
+            build_elementwise_trace_columns::<SimdBackend>(&layer.lhs, &layer.rhs, &layer.output, layer_size);
         let simd_evals = vec![
             CircleEvaluation::new(layer_domain, lhs_col),
             CircleEvaluation::new(layer_domain, rhs_col),
@@ -2969,11 +3301,18 @@ where
         let layer_size = 1usize << layer.log_size;
         let padding = layer_size.saturating_sub(layer.variances.len());
         let mut mults = compute_multiplicities(&layer.variances, &layer.rsqrt_table);
-        if padding > 0 { mults[0] += M31::from(padding as u32); }
-        let cols = build_layernorm_trace_columns(
-            &layer.inputs, &layer.means, &layer.variances,
-            &layer.rsqrt_vals, &layer.outputs, &mults,
-            &layer.rsqrt_table, layer_size,
+        if padding > 0 {
+            mults[0] += M31::from(padding as u32);
+        }
+        let cols = build_layernorm_trace_columns::<SimdBackend>(
+            &layer.inputs,
+            &layer.means,
+            &layer.variances,
+            &layer.rsqrt_vals,
+            &layer.outputs,
+            &mults,
+            &layer.rsqrt_table,
+            layer_size,
         );
         tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(cols));
         layernorm_mults.push(mults);
@@ -2983,11 +3322,17 @@ where
         let layer_size = 1usize << layer.log_size;
         let padding = layer_size.saturating_sub(layer.rms_sq_vals.len());
         let mut mults = compute_multiplicities(&layer.rms_sq_vals, &layer.rsqrt_table);
-        if padding > 0 { mults[0] += M31::from(padding as u32); }
-        let cols = build_rmsnorm_trace_columns(
-            &layer.inputs, &layer.rms_sq_vals,
-            &layer.rsqrt_vals, &layer.outputs, &mults,
-            &layer.rsqrt_table, layer_size,
+        if padding > 0 {
+            mults[0] += M31::from(padding as u32);
+        }
+        let cols = build_rmsnorm_trace_columns::<SimdBackend>(
+            &layer.inputs,
+            &layer.rms_sq_vals,
+            &layer.rsqrt_vals,
+            &layer.outputs,
+            &mults,
+            &layer.rsqrt_table,
+            layer_size,
         );
         tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(cols));
         rmsnorm_mults.push(mults);
@@ -2995,9 +3340,13 @@ where
     for layer in &embedding_layers {
         let layer_size = 1usize << layer.log_size;
         let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-        let simd_evals = build_embedding_trace_columns(
-            &layer.token_ids, &layer.col_indices, &layer.values, &layer.multiplicities,
-            layer_size, layer_domain,
+        let simd_evals = build_embedding_trace_columns::<SimdBackend>(
+            &layer.token_ids,
+            &layer.col_indices,
+            &layer.values,
+            &layer.multiplicities,
+            layer_size,
+            layer_domain,
         );
         tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
     }
@@ -3013,9 +3362,14 @@ where
         if padding_count > 0 {
             mults[0] += M31::from(padding_count as u32);
         }
-        let simd_evals = build_quantize_trace_columns_2d(
-            &layer.input_values, &layer.values, &mults,
-            pad_input, pad_output, layer_size, layer_domain,
+        let simd_evals = build_quantize_trace_columns_2d::<SimdBackend>(
+            &layer.input_values,
+            &layer.values,
+            &mults,
+            pad_input,
+            pad_output,
+            layer_size,
+            layer_domain,
         );
         tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
         quantize_mults.push(mults);
@@ -3032,9 +3386,13 @@ where
         if padding_count > 0 {
             mults[0] += M31::from(padding_count as u32);
         }
-        let (trace_in, trace_out, mult_col) = build_trace_columns(
-            &layer.input_values, &layer.output_values, &mults,
-            pad_input, pad_output, layer_size,
+        let (trace_in, trace_out, mult_col) = build_trace_columns::<SimdBackend>(
+            &layer.input_values,
+            &layer.output_values,
+            &mults,
+            pad_input,
+            pad_output,
+            layer_size,
         );
         let simd_evals = vec![
             CircleEvaluation::new(layer_domain, trace_in),
@@ -3093,10 +3451,14 @@ where
                 let pad_input = layer.table.inputs[0];
                 let pad_output = layer.table.outputs[0];
 
-                let (table_in_col, table_out_col) = build_table_columns(&layer.table, layer_size);
-                let (trace_in_col, trace_out_col, _) = build_trace_columns(
-                    &layer.inputs, &layer.outputs, &activation_mults[idx],
-                    pad_input, pad_output, layer_size,
+                let (table_in_col, table_out_col) = build_table_columns::<SimdBackend>(&layer.table, layer_size);
+                let (trace_in_col, trace_out_col, _) = build_trace_columns::<SimdBackend>(
+                    &layer.inputs,
+                    &layer.outputs,
+                    &activation_mults[idx],
+                    pad_input,
+                    pad_output,
+                    layer_size,
                 );
 
                 let mut logup_gen = LogupTraceGenerator::new(layer.log_size);
@@ -3106,12 +3468,16 @@ where
                 let tag_packed = PackedBaseField::broadcast(M31::from(layer.type_tag));
 
                 for vec_row in 0..layer_vec_size {
-                    let q_table: PackedSecureField = lookup.lookup_elements().combine(
-                        &[tag_packed, table_in_col.data[vec_row], table_out_col.data[vec_row]],
-                    );
-                    let q_trace: PackedSecureField = lookup.lookup_elements().combine(
-                        &[tag_packed, trace_in_col.data[vec_row], trace_out_col.data[vec_row]],
-                    );
+                    let q_table: PackedSecureField = lookup.lookup_elements().combine(&[
+                        tag_packed,
+                        table_in_col.data[vec_row],
+                        table_out_col.data[vec_row],
+                    ]);
+                    let q_trace: PackedSecureField = lookup.lookup_elements().combine(&[
+                        tag_packed,
+                        trace_in_col.data[vec_row],
+                        trace_out_col.data[vec_row],
+                    ]);
 
                     let mult_packed = pack_multiplicities(&activation_mults[idx], vec_row);
                     let numerator = q_table - mult_packed * q_trace;
@@ -3122,7 +3488,9 @@ where
                 col_gen.finalize_col();
 
                 let (interaction_trace, claimed_sum) = logup_gen.finalize_last();
-                tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(interaction_trace));
+                tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(
+                    interaction_trace,
+                ));
                 activation_claimed_sums.push(claimed_sum);
             }
         }
@@ -3131,7 +3499,8 @@ where
             for (idx, layer) in layernorm_layers.iter().enumerate() {
                 let layer_size = 1usize << layer.log_size;
                 let layer_vec_size = layer_size >> LOG_N_LANES;
-                let (table_var_col, table_rsqrt_col) = build_table_columns(&layer.rsqrt_table, layer_size);
+                let (table_var_col, table_rsqrt_col) =
+                    build_table_columns::<SimdBackend>(&layer.rsqrt_table, layer_size);
 
                 let mut var_col = Col::<SimdBackend, BaseField>::zeros(layer_size);
                 let mut rsqrt_col = Col::<SimdBackend, BaseField>::zeros(layer_size);
@@ -3140,8 +3509,18 @@ where
                     var_col.set(i, layer.variances[i]);
                     rsqrt_col.set(i, layer.rsqrt_vals[i]);
                 }
-                let pad_var = layer.rsqrt_table.inputs.first().copied().unwrap_or(M31::from(0));
-                let pad_rsqrt = layer.rsqrt_table.outputs.first().copied().unwrap_or(M31::from(0));
+                let pad_var = layer
+                    .rsqrt_table
+                    .inputs
+                    .first()
+                    .copied()
+                    .unwrap_or(M31::from(0));
+                let pad_rsqrt = layer
+                    .rsqrt_table
+                    .outputs
+                    .first()
+                    .copied()
+                    .unwrap_or(M31::from(0));
                 for i in n..layer_size {
                     var_col.set(i, pad_var);
                     rsqrt_col.set(i, pad_rsqrt);
@@ -3151,12 +3530,12 @@ where
                 let mut col_gen = logup_gen.new_col();
 
                 for vec_row in 0..layer_vec_size {
-                    let q_table: PackedSecureField = lookup.lookup_elements().combine(
-                        &[table_var_col.data[vec_row], table_rsqrt_col.data[vec_row]],
-                    );
-                    let q_trace: PackedSecureField = lookup.lookup_elements().combine(
-                        &[var_col.data[vec_row], rsqrt_col.data[vec_row]],
-                    );
+                    let q_table: PackedSecureField = lookup
+                        .lookup_elements()
+                        .combine(&[table_var_col.data[vec_row], table_rsqrt_col.data[vec_row]]);
+                    let q_trace: PackedSecureField = lookup
+                        .lookup_elements()
+                        .combine(&[var_col.data[vec_row], rsqrt_col.data[vec_row]]);
 
                     let mult_packed = pack_multiplicities(&layernorm_mults[idx], vec_row);
                     let numerator = q_table - mult_packed * q_trace;
@@ -3167,7 +3546,9 @@ where
                 col_gen.finalize_col();
 
                 let (interaction_trace, claimed_sum) = logup_gen.finalize_last();
-                tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(interaction_trace));
+                tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(
+                    interaction_trace,
+                ));
                 layernorm_claimed_sums.push(claimed_sum);
             }
         }
@@ -3177,7 +3558,8 @@ where
             for (idx, layer) in rmsnorm_layers.iter().enumerate() {
                 let layer_size = 1usize << layer.log_size;
                 let layer_vec_size = layer_size >> LOG_N_LANES;
-                let (table_rms_col, table_rsqrt_col) = build_table_columns(&layer.rsqrt_table, layer_size);
+                let (table_rms_col, table_rsqrt_col) =
+                    build_table_columns::<SimdBackend>(&layer.rsqrt_table, layer_size);
 
                 let mut rms_col = Col::<SimdBackend, BaseField>::zeros(layer_size);
                 let mut rsqrt_col = Col::<SimdBackend, BaseField>::zeros(layer_size);
@@ -3186,8 +3568,18 @@ where
                     rms_col.set(i, layer.rms_sq_vals[i]);
                     rsqrt_col.set(i, layer.rsqrt_vals[i]);
                 }
-                let pad_rms = layer.rsqrt_table.inputs.first().copied().unwrap_or(M31::from(0));
-                let pad_rsqrt = layer.rsqrt_table.outputs.first().copied().unwrap_or(M31::from(0));
+                let pad_rms = layer
+                    .rsqrt_table
+                    .inputs
+                    .first()
+                    .copied()
+                    .unwrap_or(M31::from(0));
+                let pad_rsqrt = layer
+                    .rsqrt_table
+                    .outputs
+                    .first()
+                    .copied()
+                    .unwrap_or(M31::from(0));
                 for i in n..layer_size {
                     rms_col.set(i, pad_rms);
                     rsqrt_col.set(i, pad_rsqrt);
@@ -3197,12 +3589,12 @@ where
                 let mut col_gen = logup_gen.new_col();
 
                 for vec_row in 0..layer_vec_size {
-                    let q_table: PackedSecureField = lookup.lookup_elements().combine(
-                        &[table_rms_col.data[vec_row], table_rsqrt_col.data[vec_row]],
-                    );
-                    let q_trace: PackedSecureField = lookup.lookup_elements().combine(
-                        &[rms_col.data[vec_row], rsqrt_col.data[vec_row]],
-                    );
+                    let q_table: PackedSecureField = lookup
+                        .lookup_elements()
+                        .combine(&[table_rms_col.data[vec_row], table_rsqrt_col.data[vec_row]]);
+                    let q_trace: PackedSecureField = lookup
+                        .lookup_elements()
+                        .combine(&[rms_col.data[vec_row], rsqrt_col.data[vec_row]]);
 
                     let mult_packed = pack_multiplicities(&rmsnorm_mults[idx], vec_row);
                     let numerator = q_table - mult_packed * q_trace;
@@ -3213,7 +3605,9 @@ where
                 col_gen.finalize_col();
 
                 let (interaction_trace, claimed_sum) = logup_gen.finalize_last();
-                tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(interaction_trace));
+                tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(
+                    interaction_trace,
+                ));
                 rmsnorm_claimed_sums.push(claimed_sum);
             }
         }
@@ -3248,9 +3642,11 @@ where
 
                 let mut col_gen = logup_gen.new_col();
                 for vec_row in 0..layer_vec_size {
-                    let q_table: PackedSecureField = lookup.lookup_elements().combine(
-                        &[tbl_tok.data[vec_row], tbl_col.data[vec_row], tbl_val.data[vec_row]],
-                    );
+                    let q_table: PackedSecureField = lookup.lookup_elements().combine(&[
+                        tbl_tok.data[vec_row],
+                        tbl_col.data[vec_row],
+                        tbl_val.data[vec_row],
+                    ]);
                     let mult_packed = pack_multiplicities(&layer.multiplicities, vec_row);
                     col_gen.write_frac(vec_row, -mult_packed, q_table);
                 }
@@ -3258,15 +3654,19 @@ where
 
                 let mut col_gen = logup_gen.new_col();
                 for vec_row in 0..layer_vec_size {
-                    let q_trace: PackedSecureField = lookup.lookup_elements().combine(
-                        &[tr_tok.data[vec_row], tr_col.data[vec_row], tr_val.data[vec_row]],
-                    );
+                    let q_trace: PackedSecureField = lookup.lookup_elements().combine(&[
+                        tr_tok.data[vec_row],
+                        tr_col.data[vec_row],
+                        tr_val.data[vec_row],
+                    ]);
                     col_gen.write_frac(vec_row, PackedSecureField::one(), q_trace);
                 }
                 col_gen.finalize_col();
 
                 let (interaction_trace, claimed_sum) = logup_gen.finalize_last();
-                tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(interaction_trace));
+                tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(
+                    interaction_trace,
+                ));
                 embedding_claimed_sums.push(claimed_sum);
             }
         }
@@ -3280,22 +3680,27 @@ where
                 let pad_input = table.inputs[0];
                 let pad_output = table.outputs[0];
 
-                let (table_in_col, table_out_col) = build_quantize_table_columns(&table, layer_size);
-                let (trace_in_col, trace_out_col, _) = build_quantize_trace_simd_2d(
-                    &layer.input_values, &layer.values, &quantize_mults[idx],
-                    pad_input, pad_output, layer_size,
+                let (table_in_col, table_out_col) =
+                    build_quantize_table_columns::<SimdBackend>(&table, layer_size);
+                let (trace_in_col, trace_out_col, _) = build_quantize_trace_simd_2d::<SimdBackend>(
+                    &layer.input_values,
+                    &layer.values,
+                    &quantize_mults[idx],
+                    pad_input,
+                    pad_output,
+                    layer_size,
                 );
 
                 let mut logup_gen = LogupTraceGenerator::new(layer.log_size);
                 let mut col_gen = logup_gen.new_col();
 
                 for vec_row in 0..layer_vec_size {
-                    let q_table: PackedSecureField = lookup.lookup_elements().combine(
-                        &[table_in_col.data[vec_row], table_out_col.data[vec_row]],
-                    );
-                    let q_trace: PackedSecureField = lookup.lookup_elements().combine(
-                        &[trace_in_col.data[vec_row], trace_out_col.data[vec_row]],
-                    );
+                    let q_table: PackedSecureField = lookup
+                        .lookup_elements()
+                        .combine(&[table_in_col.data[vec_row], table_out_col.data[vec_row]]);
+                    let q_trace: PackedSecureField = lookup
+                        .lookup_elements()
+                        .combine(&[trace_in_col.data[vec_row], trace_out_col.data[vec_row]]);
 
                     let mult_packed = pack_multiplicities(&quantize_mults[idx], vec_row);
                     let numerator = q_table - mult_packed * q_trace;
@@ -3306,7 +3711,9 @@ where
                 col_gen.finalize_col();
 
                 let (interaction_trace, claimed_sum) = logup_gen.finalize_last();
-                tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(interaction_trace));
+                tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(
+                    interaction_trace,
+                ));
                 quantize_claimed_sums.push(claimed_sum);
             }
         }
@@ -3321,22 +3728,26 @@ where
                 let pad_input = table.inputs[0];
                 let pad_output = table.outputs[0];
 
-                let (table_in_col, table_out_col) = build_table_columns(&table, layer_size);
-                let (trace_in_col, trace_out_col, _) = build_trace_columns(
-                    &layer.input_values, &layer.output_values, &dequantize_mults[idx],
-                    pad_input, pad_output, layer_size,
+                let (table_in_col, table_out_col) = build_table_columns::<SimdBackend>(&table, layer_size);
+                let (trace_in_col, trace_out_col, _) = build_trace_columns::<SimdBackend>(
+                    &layer.input_values,
+                    &layer.output_values,
+                    &dequantize_mults[idx],
+                    pad_input,
+                    pad_output,
+                    layer_size,
                 );
 
                 let mut logup_gen = LogupTraceGenerator::new(layer.log_size);
                 let mut col_gen = logup_gen.new_col();
 
                 for vec_row in 0..layer_vec_size {
-                    let q_table: PackedSecureField = lookup.lookup_elements().combine(
-                        &[table_in_col.data[vec_row], table_out_col.data[vec_row]],
-                    );
-                    let q_trace: PackedSecureField = lookup.lookup_elements().combine(
-                        &[trace_in_col.data[vec_row], trace_out_col.data[vec_row]],
-                    );
+                    let q_table: PackedSecureField = lookup
+                        .lookup_elements()
+                        .combine(&[table_in_col.data[vec_row], table_out_col.data[vec_row]]);
+                    let q_trace: PackedSecureField = lookup
+                        .lookup_elements()
+                        .combine(&[trace_in_col.data[vec_row], trace_out_col.data[vec_row]]);
 
                     let mult_packed = pack_multiplicities(&dequantize_mults[idx], vec_row);
                     let numerator = q_table - mult_packed * q_trace;
@@ -3347,7 +3758,9 @@ where
                 col_gen.finalize_col();
 
                 let (interaction_trace, claimed_sum) = logup_gen.finalize_last();
-                tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(interaction_trace));
+                tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(
+                    interaction_trace,
+                ));
                 dequantize_claimed_sums.push(claimed_sum);
             }
         }
@@ -3394,7 +3807,9 @@ where
     for layer in &add_layers {
         let component = FrameworkComponent::new(
             &mut allocator,
-            ElementwiseAddEval { log_n_rows: layer.log_size },
+            ElementwiseAddEval {
+                log_n_rows: layer.log_size,
+            },
             SecureField::default(),
         );
         component_refs_storage.push(Box::new(component));
@@ -3409,7 +3824,9 @@ where
     for layer in &mul_layers {
         let component = FrameworkComponent::new(
             &mut allocator,
-            ElementwiseMulEval { log_n_rows: layer.log_size },
+            ElementwiseMulEval {
+                log_n_rows: layer.log_size,
+            },
             SecureField::default(),
         );
         component_refs_storage.push(Box::new(component));
@@ -3604,9 +4021,21 @@ pub(crate) fn prove_model_aggregated_onchain_with_precomputed(
     weights: &GraphWeights,
     precomputed: PrecomputedMatmuls,
 ) -> Result<AggregatedModelProofOnChain, AggregationError> {
-    prove_model_aggregated_onchain_with_cache::<SimdBackend>(
-        graph, input, weights, None, Some(precomputed),
-    )
+    #[cfg(feature = "cuda-runtime")]
+    {
+        if crate::backend::force_gpu() || crate::backend::gpu_is_available() {
+            use stwo::prover::backend::gpu::GpuBackend;
+            return prove_model_aggregated_onchain_with_cache::<GpuBackend>(
+                graph,
+                input,
+                weights,
+                None,
+                Some(precomputed),
+            );
+        }
+    }
+
+    prove_model_aggregated_onchain_with_cache::<SimdBackend>(graph, input, weights, None, Some(precomputed))
 }
 
 /// GPU proving path for on-chain aggregation.
@@ -3618,9 +4047,7 @@ fn prove_model_aggregated_onchain_gpu(
     #[cfg(feature = "cuda-runtime")]
     {
         use stwo::prover::backend::gpu::GpuBackend;
-        return prove_model_aggregated_onchain_with::<GpuBackend>(
-            graph, input, weights,
-        );
+        return prove_model_aggregated_onchain_with::<GpuBackend>(graph, input, weights);
     }
 
     #[cfg(not(feature = "cuda-runtime"))]
@@ -3669,7 +4096,11 @@ fn prove_model_aggregated_onchain_gpu_cached(
 ) -> Result<AggregatedModelProofOnChain, AggregationError> {
     use stwo::prover::backend::gpu::GpuBackend;
     prove_model_aggregated_onchain_with_cache::<GpuBackend>(
-        graph, input, weights, Some(weight_cache), None,
+        graph,
+        input,
+        weights,
+        Some(weight_cache),
+        None,
     )
 }
 
@@ -3799,8 +4230,10 @@ pub(crate) fn prove_logup_gkr(
 
     eprintln!(
         "  GKR LogUp: {} instances ({}A + {}Q + {}L), proving...",
-        n_instances, activation_layers.len(),
-        quantize_layers.len(), layernorm_layers.len(),
+        n_instances,
+        activation_layers.len(),
+        quantize_layers.len(),
+        layernorm_layers.len(),
     );
     let t_gkr = std::time::Instant::now();
 
@@ -3808,7 +4241,9 @@ pub(crate) fn prove_logup_gkr(
 
     eprintln!(
         "  GKR LogUp proof: {} layer proofs, {} instances in {:.2}s",
-        proof.sumcheck_proofs.len(), n_instances, t_gkr.elapsed().as_secs_f64(),
+        proof.sumcheck_proofs.len(),
+        n_instances,
+        t_gkr.elapsed().as_secs_f64(),
     );
 
     Ok(GkrBatchData {
@@ -3862,7 +4297,8 @@ fn prove_model_aggregated_onchain_gkr_with<B>(
     weights: &GraphWeights,
 ) -> Result<AggregatedModelProofOnChain, AggregationError>
 where
-    B: BackendForChannel<Blake2sMerkleChannel> + PolyOps,
+    B: BackendForChannel<Blake2sMerkleChannel> + PolyOps + ColumnOps<BaseField>,
+    <B as ColumnOps<BaseField>>::Column: 'static,
     FrameworkComponent<ActivationEval>: ComponentProver<B>,
     FrameworkComponent<ElementwiseAddEval>: ComponentProver<B>,
     FrameworkComponent<ElementwiseMulEval>: ComponentProver<B>,
@@ -3873,9 +4309,8 @@ where
     FrameworkComponent<DequantizeEval>: ComponentProver<B>,
 {
     // Step 1: Run the standard aggregated pipeline
-    let mut proof = prove_model_aggregated_onchain_with_cache::<B>(
-        graph, input, weights, None, None,
-    )?;
+    let mut proof =
+        prove_model_aggregated_onchain_with_cache::<B>(graph, input, weights, None, None)?;
 
     // Step 2: Compile the GKR circuit from the computation graph
     let circuit = crate::gkr::LayeredCircuit::from_graph(graph)
@@ -3890,12 +4325,8 @@ where
 
     // Step 4: Generate GKR proof
     let mut gkr_channel = crate::crypto::poseidon_channel::PoseidonChannel::new();
-    let gkr_proof = crate::gkr::prove_gkr(
-        &circuit,
-        &gkr_execution,
-        weights,
-        &mut gkr_channel,
-    ).map_err(|e| AggregationError::ProvingError(format!("GKR proving: {e}")))?;
+    let gkr_proof = crate::gkr::prove_gkr(&circuit, &gkr_execution, weights, &mut gkr_channel)
+        .map_err(|e| AggregationError::ProvingError(format!("GKR proving: {e}")))?;
 
     proof.gkr_proof = Some(gkr_proof);
     Ok(proof)
@@ -3944,7 +4375,8 @@ fn prove_model_pure_gkr_inner<B>(
     weights: &GraphWeights,
 ) -> Result<AggregatedModelProofOnChain, AggregationError>
 where
-    B: BackendForChannel<Blake2sMerkleChannel> + PolyOps,
+    B: BackendForChannel<Blake2sMerkleChannel> + PolyOps + ColumnOps<BaseField>,
+    <B as ColumnOps<BaseField>>::Column: 'static,
     FrameworkComponent<ActivationEval>: ComponentProver<B>,
     FrameworkComponent<ElementwiseAddEval>: ComponentProver<B>,
     FrameworkComponent<ElementwiseMulEval>: ComponentProver<B>,
@@ -3966,9 +4398,15 @@ where
     let _ = gpu_active; // used only with cuda-runtime
     let t_start = std::time::Instant::now();
     eprintln!("=== Pure GKR Pipeline ===");
-    eprintln!("  Backend: {} {}",
+    eprintln!(
+        "  Backend: {} {}",
         std::any::type_name::<B>(),
-        if std::any::type_name::<B>().contains("Gpu") { "[GPU]" } else { "[CPU/SIMD]" });
+        if std::any::type_name::<B>().contains("Gpu") {
+            "[GPU]"
+        } else {
+            "[CPU/SIMD]"
+        }
+    );
     if let Some(dev) = crate::backend::gpu_device_name() {
         eprintln!("  Device: {}", dev);
     }
@@ -4006,9 +4444,9 @@ where
         match &node.op {
             GraphOp::MatMul { dims } => {
                 let (m, k, n) = *dims;
-                let weight = weights.get_weight(node.id).ok_or(
-                    ModelError::MissingWeight(node.id)
-                )?;
+                let weight = weights
+                    .get_weight(node.id)
+                    .ok_or(ModelError::MissingWeight(node.id))?;
 
                 #[cfg(feature = "cuda-runtime")]
                 let output = crate::gpu_sumcheck::gpu_matmul_m31_full(&current, weight)
@@ -4018,7 +4456,12 @@ where
 
                 eprintln!(
                     "  [{}/{}] Node {} MatMul {}x{}x{} — forward only (GKR deferred)",
-                    step + 1, total_nodes, node.id, m, k, n,
+                    step + 1,
+                    total_nodes,
+                    node.id,
+                    m,
+                    k,
+                    n,
                 );
 
                 intermediates.push((node.id, current.clone()));
@@ -4026,24 +4469,30 @@ where
                 current = output;
             }
 
-            GraphOp::Activation { activation_type, .. } => {
+            GraphOp::Activation {
+                activation_type, ..
+            } => {
                 let f = activation_type.as_fn();
                 let act_log_size = activation_type.recommended_table_log_size();
                 let table_mask = (1u32 << act_log_size) - 1;
 
                 // Reduce inputs to table range so LogUp trace entries stay within
                 // the precomputed table. M31 matmul outputs can exceed 2^16.
-                let reduced_inputs: Vec<M31> = current.data.iter()
+                let reduced_inputs: Vec<M31> = current
+                    .data
+                    .iter()
                     .map(|&x| M31::from(x.0 & table_mask))
                     .collect();
                 let reduced_matrix = M31Matrix {
-                    rows: current.rows, cols: current.cols, data: reduced_inputs.clone(),
+                    rows: current.rows,
+                    cols: current.cols,
+                    data: reduced_inputs.clone(),
                 };
-                let output_data: Vec<M31> = reduced_matrix.data.iter()
-                    .map(|&x| (*f)(x))
-                    .collect();
+                let output_data: Vec<M31> = reduced_matrix.data.iter().map(|&x| (*f)(x)).collect();
                 let output = M31Matrix {
-                    rows: current.rows, cols: current.cols, data: output_data,
+                    rows: current.rows,
+                    cols: current.cols,
+                    data: output_data,
                 };
 
                 let table = PrecomputedTable::build(|x| (*f)(x), act_log_size);
@@ -4063,11 +4512,15 @@ where
             }
 
             GraphOp::Add { .. } => {
-                let lhs = node.inputs.get(0)
+                let lhs = node
+                    .inputs
+                    .get(0)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
-                let rhs = node.inputs.get(1)
+                let rhs = node
+                    .inputs
+                    .get(1)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
@@ -4098,11 +4551,15 @@ where
             }
 
             GraphOp::Mul { .. } => {
-                let lhs = node.inputs.get(0)
+                let lhs = node
+                    .inputs
+                    .get(0)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
-                let rhs = node.inputs.get(1)
+                let rhs = node
+                    .inputs
+                    .get(1)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
@@ -4173,7 +4630,9 @@ where
                 current = rn.output_matrix;
             }
 
-            GraphOp::Attention { config: attn_config } => {
+            GraphOp::Attention {
+                config: attn_config,
+            } => {
                 let w_q = weights.get_named_weight(node.id, "w_q");
                 let w_k = weights.get_named_weight(node.id, "w_k");
                 let w_v = weights.get_named_weight(node.id, "w_v");
@@ -4181,12 +4640,13 @@ where
 
                 if let (Some(wq), Some(wk), Some(wv), Some(wo)) = (w_q, w_k, w_v, w_o) {
                     let attn_weights = AttentionWeights {
-                        w_q: wq.clone(), w_k: wk.clone(),
-                        w_v: wv.clone(), w_o: wo.clone(),
+                        w_q: wq.clone(),
+                        w_k: wk.clone(),
+                        w_v: wv.clone(),
+                        w_o: wo.clone(),
                     };
-                    let inter = attention_forward(
-                        &current, &attn_weights, attn_config, attn_config.causal,
-                    );
+                    let inter =
+                        attention_forward(&current, &attn_weights, attn_config, attn_config.causal);
                     attention_layers.push(AttentionLayerData {
                         node_id: node.id,
                         config: *attn_config,
@@ -4202,10 +4662,13 @@ where
                 }
             }
 
-            GraphOp::Embedding { vocab_size: _, embed_dim: _ } => {
-                let embed_table = weights.get_weight(node.id).ok_or(
-                    ModelError::MissingWeight(node.id)
-                )?;
+            GraphOp::Embedding {
+                vocab_size: _,
+                embed_dim: _,
+            } => {
+                let embed_table = weights
+                    .get_weight(node.id)
+                    .ok_or(ModelError::MissingWeight(node.id))?;
                 let token_u32s: Vec<u32> = current.data.iter().map(|m| m.0).collect();
                 let (output, token_ids, col_indices, values, multiplicities) =
                     embedding_lookup(&token_u32s, embed_table);
@@ -4231,9 +4694,13 @@ where
             GraphOp::Quantize { params, .. } => {
                 let direct_params = crate::gadgets::quantize::QuantParams {
                     strategy: crate::gadgets::quantize::QuantStrategy::Direct,
-                    scale: 1.0, zero_point: 0, bits: 31,
+                    scale: 1.0,
+                    zero_point: 0,
+                    bits: 31,
                 };
-                let quantized: Vec<M31> = current.data.iter()
+                let quantized: Vec<M31> = current
+                    .data
+                    .iter()
                     .map(|&v| {
                         let f32_val = crate::gadgets::quantize::dequantize_value(v, &direct_params);
                         crate::gadgets::quantize::quantize_value(f32_val, params)
@@ -4259,7 +4726,9 @@ where
                 });
 
                 let output = M31Matrix {
-                    rows: current.rows, cols: current.cols, data: quantized,
+                    rows: current.rows,
+                    cols: current.cols,
+                    data: quantized,
                 };
                 intermediates.push((node.id, current.clone()));
                 node_outputs.insert(node.id, output.clone());
@@ -4268,10 +4737,10 @@ where
 
             GraphOp::Dequantize { params, size: _ } => {
                 let table = build_dequantize_table(params);
-                let output_values: Vec<M31> = current.data.iter()
-                    .map(|&v| {
-                        table.lookup(v).unwrap_or(v)
-                    })
+                let output_values: Vec<M31> = current
+                    .data
+                    .iter()
+                    .map(|&v| table.lookup(v).unwrap_or(v))
                     .collect();
                 let multiplicities = compute_multiplicities(&current.data, &table);
                 let log_size = data_log_size(current.data.len().max(table.size()));
@@ -4284,7 +4753,9 @@ where
                     log_size,
                 });
                 let output = M31Matrix {
-                    rows: current.rows, cols: current.cols, data: output_values,
+                    rows: current.rows,
+                    cols: current.cols,
+                    data: output_values,
                 };
                 intermediates.push((node.id, current.clone()));
                 node_outputs.insert(node.id, output.clone());
@@ -4293,7 +4764,8 @@ where
 
             GraphOp::RoPE { config } => {
                 let table = crate::components::rope::build_rope_table(config);
-                let (rotated, _cos_used, _sin_used) = crate::components::rope::apply_rope(&current, &table);
+                let (rotated, _cos_used, _sin_used) =
+                    crate::components::rope::apply_rope(&current, &table);
                 intermediates.push((node.id, current.clone()));
                 node_outputs.insert(node.id, rotated.clone());
                 current = rotated;
@@ -4305,15 +4777,17 @@ where
         }
     }
 
-    eprintln!("  Forward pass complete in {:.2}s", t_start.elapsed().as_secs_f64());
+    eprintln!(
+        "  Forward pass complete in {:.2}s",
+        t_start.elapsed().as_secs_f64()
+    );
 
     // Phase 2: GKR proof (replaces per-matmul sumcheck)
     let t_gkr = std::time::Instant::now();
     eprintln!("Phase 2/3: GKR proof (all matmul reductions in single pass)...");
 
-    let circuit = crate::gkr::LayeredCircuit::from_graph(graph).map_err(|e| {
-        AggregationError::ProvingError(format!("GKR circuit compilation: {e}"))
-    })?;
+    let circuit = crate::gkr::LayeredCircuit::from_graph(graph)
+        .map_err(|e| AggregationError::ProvingError(format!("GKR circuit compilation: {e}")))?;
 
     let gkr_execution = crate::compiler::graph::GraphExecution {
         intermediates: intermediates.clone(),
@@ -4328,32 +4802,24 @@ where
         #[cfg(feature = "cuda-runtime")]
         {
             if gpu_active {
-                crate::gkr::prove_gkr_gpu(
-                    &circuit, &gkr_execution, weights, &mut gkr_channel,
-                ).map_err(|e| {
-                    AggregationError::ProvingError(format!("GKR GPU proving: {e}"))
-                })?
+                crate::gkr::prove_gkr_gpu(&circuit, &gkr_execution, weights, &mut gkr_channel)
+                    .map_err(|e| AggregationError::ProvingError(format!("GKR GPU proving: {e}")))?
             } else {
-                crate::gkr::prove_gkr(
-                    &circuit, &gkr_execution, weights, &mut gkr_channel,
-                ).map_err(|e| {
-                    AggregationError::ProvingError(format!("GKR proving: {e}"))
-                })?
+                crate::gkr::prove_gkr(&circuit, &gkr_execution, weights, &mut gkr_channel)
+                    .map_err(|e| AggregationError::ProvingError(format!("GKR proving: {e}")))?
             }
         }
         #[cfg(not(feature = "cuda-runtime"))]
         {
-            crate::gkr::prove_gkr(
-                &circuit, &gkr_execution, weights, &mut gkr_channel,
-            ).map_err(|e| {
-                AggregationError::ProvingError(format!("GKR proving: {e}"))
-            })?
+            crate::gkr::prove_gkr(&circuit, &gkr_execution, weights, &mut gkr_channel)
+                .map_err(|e| AggregationError::ProvingError(format!("GKR proving: {e}")))?
         }
     };
 
     eprintln!(
         "  GKR proof: {} layer proofs in {:.2}s",
-        gkr_proof.layer_proofs.len(), t_gkr.elapsed().as_secs_f64(),
+        gkr_proof.layer_proofs.len(),
+        t_gkr.elapsed().as_secs_f64(),
     );
 
     // Phase 2b: Attention layers (still proven independently)
@@ -4361,13 +4827,23 @@ where
     for (i, layer) in attention_layers.iter().enumerate() {
         let t_attn = std::time::Instant::now();
         let proof = prove_attention_onchain(
-            &layer.input, &layer.weights, &layer.config, layer.config.causal,
-        ).map_err(|e| AggregationError::ProvingError(
-            format!("Attention node {} (on-chain): {e}", layer.node_id),
-        ))?;
+            &layer.input,
+            &layer.weights,
+            &layer.config,
+            layer.config.causal,
+        )
+        .map_err(|e| {
+            AggregationError::ProvingError(format!(
+                "Attention node {} (on-chain): {e}",
+                layer.node_id
+            ))
+        })?;
         eprintln!(
             "  Attention [{}/{}] node {} in {:.2}s",
-            i + 1, attention_layers.len(), layer.node_id, t_attn.elapsed().as_secs_f64(),
+            i + 1,
+            attention_layers.len(),
+            layer.node_id,
+            t_attn.elapsed().as_secs_f64(),
         );
         attention_proofs.push((layer.node_id, proof));
     }
@@ -4375,7 +4851,8 @@ where
     // Commitments
     let layer_chain_commitment = compute_layer_chain_commitment(input, &intermediates, &current);
     let io_commitment = compute_io_commitment(input, &current);
-    let layernorm_mean_var_commitments: Vec<FieldElement> = layernorm_layers.iter()
+    let layernorm_mean_var_commitments: Vec<FieldElement> = layernorm_layers
+        .iter()
         .map(|layer| compute_layernorm_mean_var_commitment(&layer.means, &layer.variances))
         .collect();
 
@@ -4386,9 +4863,12 @@ where
 
     // Phase 3: Unified STARK for non-matmul components
     let has_components = !activation_layers.is_empty()
-        || !add_layers.is_empty() || !mul_layers.is_empty()
-        || !layernorm_layers.is_empty() || !embedding_layers.is_empty()
-        || !quantize_layers.is_empty() || !dequantize_layers.is_empty();
+        || !add_layers.is_empty()
+        || !mul_layers.is_empty()
+        || !layernorm_layers.is_empty()
+        || !embedding_layers.is_empty()
+        || !quantize_layers.is_empty()
+        || !dequantize_layers.is_empty();
 
     let skip_unified_stark = flag_enabled("STWO_PURE_GKR_SKIP_UNIFIED_STARK");
     // Pure-GKR now has native reductions for activation/add/mul/layernorm/rmsnorm/embedding/quantize/dequantize.
@@ -4428,46 +4908,70 @@ where
                 "  [Unified STARK] skipped: GKR covers matmul/add/mul/activation/layernorm/rmsnorm/embedding/quantize/dequantize."
             );
 
-            let activation_claims = activation_layers.iter().map(|layer| LayerClaim {
-                layer_index: layer.node_id,
-                claimed_sum: SecureField::default(),
-                trace_rows: 1 << layer.log_size,
-            }).collect();
-            let add_claims = add_layers.iter().map(|layer| LayerClaim {
-                layer_index: layer.node_id,
-                claimed_sum: SecureField::default(),
-                trace_rows: 1 << layer.log_size,
-            }).collect();
-            let mul_claims = mul_layers.iter().map(|layer| LayerClaim {
-                layer_index: layer.node_id,
-                claimed_sum: SecureField::default(),
-                trace_rows: 1 << layer.log_size,
-            }).collect();
-            let layernorm_claims = layernorm_layers.iter().map(|layer| LayerClaim {
-                layer_index: layer.node_id,
-                claimed_sum: SecureField::default(),
-                trace_rows: 1 << layer.log_size,
-            }).collect();
-            let rmsnorm_claims = rmsnorm_layers.iter().map(|layer| LayerClaim {
-                layer_index: layer.node_id,
-                claimed_sum: SecureField::default(),
-                trace_rows: 1 << layer.log_size,
-            }).collect();
-            let embedding_claims = embedding_layers.iter().map(|layer| LayerClaim {
-                layer_index: layer.node_id,
-                claimed_sum: SecureField::default(),
-                trace_rows: 1 << layer.log_size,
-            }).collect();
-            let quantize_claims = quantize_layers.iter().map(|layer| LayerClaim {
-                layer_index: layer.node_id,
-                claimed_sum: SecureField::default(),
-                trace_rows: 1 << layer.log_size,
-            }).collect();
-            let dequantize_claims = dequantize_layers.iter().map(|layer| LayerClaim {
-                layer_index: layer.node_id,
-                claimed_sum: SecureField::default(),
-                trace_rows: 1 << layer.log_size,
-            }).collect();
+            let activation_claims = activation_layers
+                .iter()
+                .map(|layer| LayerClaim {
+                    layer_index: layer.node_id,
+                    claimed_sum: SecureField::default(),
+                    trace_rows: 1 << layer.log_size,
+                })
+                .collect();
+            let add_claims = add_layers
+                .iter()
+                .map(|layer| LayerClaim {
+                    layer_index: layer.node_id,
+                    claimed_sum: SecureField::default(),
+                    trace_rows: 1 << layer.log_size,
+                })
+                .collect();
+            let mul_claims = mul_layers
+                .iter()
+                .map(|layer| LayerClaim {
+                    layer_index: layer.node_id,
+                    claimed_sum: SecureField::default(),
+                    trace_rows: 1 << layer.log_size,
+                })
+                .collect();
+            let layernorm_claims = layernorm_layers
+                .iter()
+                .map(|layer| LayerClaim {
+                    layer_index: layer.node_id,
+                    claimed_sum: SecureField::default(),
+                    trace_rows: 1 << layer.log_size,
+                })
+                .collect();
+            let rmsnorm_claims = rmsnorm_layers
+                .iter()
+                .map(|layer| LayerClaim {
+                    layer_index: layer.node_id,
+                    claimed_sum: SecureField::default(),
+                    trace_rows: 1 << layer.log_size,
+                })
+                .collect();
+            let embedding_claims = embedding_layers
+                .iter()
+                .map(|layer| LayerClaim {
+                    layer_index: layer.node_id,
+                    claimed_sum: SecureField::default(),
+                    trace_rows: 1 << layer.log_size,
+                })
+                .collect();
+            let quantize_claims = quantize_layers
+                .iter()
+                .map(|layer| LayerClaim {
+                    layer_index: layer.node_id,
+                    claimed_sum: SecureField::default(),
+                    trace_rows: 1 << layer.log_size,
+                })
+                .collect();
+            let dequantize_claims = dequantize_layers
+                .iter()
+                .map(|layer| LayerClaim {
+                    layer_index: layer.node_id,
+                    claimed_sum: SecureField::default(),
+                    trace_rows: 1 << layer.log_size,
+                })
+                .collect();
             let quantize_params_commitment = compute_quantize_params_commitment(&quantize_layers);
 
             return Ok(AggregatedModelProofOnChain {
@@ -4499,8 +5003,12 @@ where
     let t_stark = std::time::Instant::now();
 
     let result = match build_unified_stark::<B>(
-        &activation_layers, &add_layers, &mul_layers,
-        &layernorm_layers, &embedding_layers, &quantize_layers,
+        &activation_layers,
+        &add_layers,
+        &mul_layers,
+        &layernorm_layers,
+        &embedding_layers,
+        &quantize_layers,
         &dequantize_layers,
     ) {
         Ok(v) => v,
@@ -4518,8 +5026,12 @@ where
                     "  [Unified STARK] Set STWO_GPU_ONLY=1 or STWO_UNIFIED_STARK_NO_FALLBACK=1 to fail closed instead."
                 );
                 build_unified_stark::<SimdBackend>(
-                    &activation_layers, &add_layers, &mul_layers,
-                    &layernorm_layers, &embedding_layers, &quantize_layers,
+                    &activation_layers,
+                    &add_layers,
+                    &mul_layers,
+                    &layernorm_layers,
+                    &embedding_layers,
+                    &quantize_layers,
                     &dequantize_layers,
                 )?
             } else {
@@ -4530,7 +5042,8 @@ where
 
     eprintln!(
         "  Unified STARK in {:.2}s (total: {:.1}s)",
-        t_stark.elapsed().as_secs_f64(), t_start.elapsed().as_secs_f64(),
+        t_stark.elapsed().as_secs_f64(),
+        t_start.elapsed().as_secs_f64(),
     );
 
     let quantize_params_commitment = compute_quantize_params_commitment(&quantize_layers);
@@ -4576,6 +5089,14 @@ pub fn prove_model_aggregated_onchain_logup_gkr(
     input: &M31Matrix,
     weights: &GraphWeights,
 ) -> Result<AggregatedModelProofOnChain, AggregationError> {
+    #[cfg(feature = "cuda-runtime")]
+    {
+        if crate::backend::force_gpu() || crate::backend::gpu_is_available() {
+            use stwo::prover::backend::gpu::GpuBackend;
+            return prove_model_aggregated_onchain_logup_gkr_inner::<GpuBackend>(graph, input, weights);
+        }
+    }
+
     prove_model_aggregated_onchain_logup_gkr_inner::<SimdBackend>(graph, input, weights)
 }
 
@@ -4604,7 +5125,8 @@ fn prove_model_aggregated_onchain_logup_gkr_inner<B>(
     weights: &GraphWeights,
 ) -> Result<AggregatedModelProofOnChain, AggregationError>
 where
-    B: BackendForChannel<Blake2sMerkleChannel> + PolyOps,
+    B: BackendForChannel<Blake2sMerkleChannel> + PolyOps + ColumnOps<BaseField>,
+    <B as ColumnOps<BaseField>>::Column: 'static,
     FrameworkComponent<ActivationEval>: ComponentProver<B>,
     FrameworkComponent<ElementwiseAddEval>: ComponentProver<B>,
     FrameworkComponent<ElementwiseMulEval>: ComponentProver<B>,
@@ -4615,9 +5137,8 @@ where
     FrameworkComponent<DequantizeEval>: ComponentProver<B>,
 {
     // Step 1: Run the standard aggregated pipeline (with unified STARK + matmul sumchecks)
-    let mut proof = prove_model_aggregated_onchain_with_cache::<B>(
-        graph, input, weights, None, None,
-    )?;
+    let mut proof =
+        prove_model_aggregated_onchain_with_cache::<B>(graph, input, weights, None, None)?;
 
     // Step 2: Collect LogUp layer data via forward pass
     let layer_data = collect_forward_pass_layer_data(graph, input, weights)?;
@@ -4634,9 +5155,9 @@ where
     // Step 3: Generate STWO-native GKR batch proof for LogUp components
     // Use a fresh Poseidon252Channel seeded with io_commitment for domain separation
     let mut gkr_channel = Poseidon252Channel::default();
-    gkr_channel.mix_felts(
-        &[SecureField::from(BaseField::from(proof.io_commitment.to_bytes_be()[31] as u32))],
-    );
+    gkr_channel.mix_felts(&[SecureField::from(BaseField::from(
+        proof.io_commitment.to_bytes_be()[31] as u32,
+    ))]);
 
     let gkr_batch_data = prove_logup_gkr(
         &layer_data.activation_layers,
@@ -4703,26 +5224,32 @@ pub(crate) fn collect_forward_pass_layer_data(
 
         match &node.op {
             GraphOp::MatMul { .. } => {
-                let weight = weights.get_weight(node.id).ok_or(
-                    ModelError::MissingWeight(node.id)
-                )?;
+                let weight = weights
+                    .get_weight(node.id)
+                    .ok_or(ModelError::MissingWeight(node.id))?;
                 let output = matmul_m31(&current, weight);
                 intermediates.push((node.id, current.clone()));
                 node_outputs.insert(node.id, output.clone());
                 current = output;
             }
 
-            GraphOp::Activation { activation_type, .. } => {
+            GraphOp::Activation {
+                activation_type, ..
+            } => {
                 let f = activation_type.as_fn();
                 let act_log_size = activation_type.recommended_table_log_size();
                 let table_mask = (1u32 << act_log_size) - 1;
 
                 // Reduce inputs to table range for LogUp consistency
-                let reduced_inputs: Vec<M31> = current.data.iter()
+                let reduced_inputs: Vec<M31> = current
+                    .data
+                    .iter()
                     .map(|&x| M31::from(x.0 & table_mask))
                     .collect();
                 let reduced_matrix = M31Matrix {
-                    rows: current.rows, cols: current.cols, data: reduced_inputs.clone(),
+                    rows: current.rows,
+                    cols: current.cols,
+                    data: reduced_inputs.clone(),
                 };
                 let output = crate::compiler::prove::apply_activation_pub(&reduced_matrix, &*f);
 
@@ -4743,11 +5270,15 @@ pub(crate) fn collect_forward_pass_layer_data(
             }
 
             GraphOp::Add { .. } => {
-                let lhs = node.inputs.get(0)
+                let lhs = node
+                    .inputs
+                    .get(0)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
-                let rhs = node.inputs.get(1)
+                let rhs = node
+                    .inputs
+                    .get(1)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
@@ -4768,11 +5299,15 @@ pub(crate) fn collect_forward_pass_layer_data(
             }
 
             GraphOp::Mul { .. } => {
-                let lhs = node.inputs.get(0)
+                let lhs = node
+                    .inputs
+                    .get(0)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
-                let rhs = node.inputs.get(1)
+                let rhs = node
+                    .inputs
+                    .get(1)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
@@ -4833,7 +5368,9 @@ pub(crate) fn collect_forward_pass_layer_data(
                 current = rn.output_matrix;
             }
 
-            GraphOp::Attention { config: attn_config } => {
+            GraphOp::Attention {
+                config: attn_config,
+            } => {
                 let w_q = weights.get_named_weight(node.id, "w_q");
                 let w_k = weights.get_named_weight(node.id, "w_k");
                 let w_v = weights.get_named_weight(node.id, "w_v");
@@ -4841,8 +5378,10 @@ pub(crate) fn collect_forward_pass_layer_data(
 
                 if let (Some(wq), Some(wk), Some(wv), Some(wo)) = (w_q, w_k, w_v, w_o) {
                     let attn_weights = AttentionWeights {
-                        w_q: wq.clone(), w_k: wk.clone(),
-                        w_v: wv.clone(), w_o: wo.clone(),
+                        w_q: wq.clone(),
+                        w_k: wk.clone(),
+                        w_v: wv.clone(),
+                        w_o: wo.clone(),
                     };
                     let inter = attention_forward(&current, &attn_weights, attn_config, false);
                     intermediates.push((node.id, current.clone()));
@@ -4854,14 +5393,18 @@ pub(crate) fn collect_forward_pass_layer_data(
                 }
             }
 
-            GraphOp::Embedding { vocab_size: _, embed_dim: _ } => {
-                let embed_table = weights.get_weight(node.id).ok_or(
-                    ModelError::MissingWeight(node.id)
-                )?;
+            GraphOp::Embedding {
+                vocab_size: _,
+                embed_dim: _,
+            } => {
+                let embed_table = weights
+                    .get_weight(node.id)
+                    .ok_or(ModelError::MissingWeight(node.id))?;
                 let token_u32s: Vec<u32> = current.data.iter().map(|m| m.0).collect();
                 let (output, token_ids, col_indices, values, multiplicities) =
                     embedding_lookup(&token_u32s, embed_table);
-                let (table_tokens, table_cols, table_values) = build_embedding_table_columns(embed_table);
+                let (table_tokens, table_cols, table_values) =
+                    build_embedding_table_columns(embed_table);
                 let log_size = data_log_size(values.len());
 
                 embedding_layers.push(EmbeddingLayerData {
@@ -4881,10 +5424,16 @@ pub(crate) fn collect_forward_pass_layer_data(
                 current = output;
             }
 
-            GraphOp::Conv2D { in_channels, out_channels, kernel_size, stride, padding } => {
-                let kernel = weights.get_weight(node.id).ok_or(
-                    ModelError::MissingWeight(node.id)
-                )?;
+            GraphOp::Conv2D {
+                in_channels,
+                out_channels,
+                kernel_size,
+                stride,
+                padding,
+            } => {
+                let kernel = weights
+                    .get_weight(node.id)
+                    .ok_or(ModelError::MissingWeight(node.id))?;
                 let im2col_config = Im2ColConfig {
                     in_channels: *in_channels,
                     kernel_size: *kernel_size,
@@ -4903,9 +5452,13 @@ pub(crate) fn collect_forward_pass_layer_data(
             GraphOp::Quantize { params, size: _ } => {
                 let direct_params = crate::gadgets::quantize::QuantParams {
                     strategy: crate::gadgets::quantize::QuantStrategy::Direct,
-                    scale: 1.0, zero_point: 0, bits: 31,
+                    scale: 1.0,
+                    zero_point: 0,
+                    bits: 31,
                 };
-                let quantized: Vec<M31> = current.data.iter()
+                let quantized: Vec<M31> = current
+                    .data
+                    .iter()
                     .map(|&v| {
                         let f32_val = crate::gadgets::quantize::dequantize_value(v, &direct_params);
                         crate::gadgets::quantize::quantize_value(f32_val, params)
@@ -4942,10 +5495,10 @@ pub(crate) fn collect_forward_pass_layer_data(
 
             GraphOp::Dequantize { params, size: _ } => {
                 let table = build_dequantize_table(params);
-                let output_values: Vec<M31> = current.data.iter()
-                    .map(|&v| {
-                        table.lookup(v).unwrap_or(v)
-                    })
+                let output_values: Vec<M31> = current
+                    .data
+                    .iter()
+                    .map(|&v| table.lookup(v).unwrap_or(v))
                     .collect();
                 let multiplicities = compute_multiplicities(&current.data, &table);
                 let log_size = data_log_size(current.data.len().max(table.size()));
@@ -4982,7 +5535,8 @@ pub(crate) fn collect_forward_pass_layer_data(
         }
     }
 
-    let layernorm_mean_var_commitments: Vec<FieldElement> = layernorm_layers.iter()
+    let layernorm_mean_var_commitments: Vec<FieldElement> = layernorm_layers
+        .iter()
         .map(|layer| compute_layernorm_mean_var_commitment(&layer.means, &layer.variances))
         .collect();
 
@@ -5028,7 +5582,8 @@ pub(crate) fn build_unified_stark<B>(
     dequantize_layers: &[DequantizeLayerData],
 ) -> Result<UnifiedStarkOutput, AggregationError>
 where
-    B: BackendForChannel<Blake2sMerkleChannel> + PolyOps,
+    B: BackendForChannel<Blake2sMerkleChannel> + PolyOps + ColumnOps<BaseField>,
+    <B as ColumnOps<BaseField>>::Column: 'static,
     FrameworkComponent<ActivationEval>: ComponentProver<B>,
     FrameworkComponent<ElementwiseAddEval>: ComponentProver<B>,
     FrameworkComponent<ElementwiseMulEval>: ComponentProver<B>,
@@ -5041,7 +5596,9 @@ where
     let config = PcsConfig::default();
     let rmsnorm_layers: &[RMSNormLayerData] = &[];
 
-    let all_log_sizes: Vec<u32> = activation_layers.iter().map(|l| l.log_size)
+    let all_log_sizes: Vec<u32> = activation_layers
+        .iter()
+        .map(|l| l.log_size)
         .chain(add_layers.iter().map(|l| l.log_size))
         .chain(mul_layers.iter().map(|l| l.log_size))
         .chain(layernorm_layers.iter().map(|l| l.log_size))
@@ -5062,8 +5619,10 @@ where
     let mut commitment_scheme =
         CommitmentSchemeProver::<B, Blake2sMerkleChannel>::new(config, &twiddles);
 
-    let has_logup = !activation_layers.is_empty() || !layernorm_layers.is_empty()
-        || !embedding_layers.is_empty() || !quantize_layers.is_empty()
+    let has_logup = !activation_layers.is_empty()
+        || !layernorm_layers.is_empty()
+        || !embedding_layers.is_empty()
+        || !quantize_layers.is_empty()
         || !dequantize_layers.is_empty();
     let t_unified = std::time::Instant::now();
     eprintln!(
@@ -5086,7 +5645,7 @@ where
         for layer in activation_layers {
             let sz = 1usize << layer.log_size;
             let dom = CanonicCoset::new(layer.log_size).circle_domain();
-            let (ti, to) = build_table_columns(&layer.table, sz);
+            let (ti, to) = build_table_columns::<SimdBackend>(&layer.table, sz);
             tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(vec![
                 CircleEvaluation::new(dom, ti),
                 CircleEvaluation::new(dom, to),
@@ -5095,7 +5654,7 @@ where
         for layer in layernorm_layers {
             let sz = 1usize << layer.log_size;
             let dom = CanonicCoset::new(layer.log_size).circle_domain();
-            let (tv, tr) = build_table_columns(&layer.rsqrt_table, sz);
+            let (tv, tr) = build_table_columns::<SimdBackend>(&layer.rsqrt_table, sz);
             tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(vec![
                 CircleEvaluation::new(dom, tv),
                 CircleEvaluation::new(dom, tr),
@@ -5104,8 +5663,12 @@ where
         for layer in embedding_layers {
             let sz = 1usize << layer.log_size;
             let dom = CanonicCoset::new(layer.log_size).circle_domain();
-            let se = build_embedding_preprocessed_columns(
-                &layer.table_tokens, &layer.table_cols, &layer.table_values, sz, dom,
+            let se = build_embedding_preprocessed_columns::<SimdBackend>(
+                &layer.table_tokens,
+                &layer.table_cols,
+                &layer.table_values,
+                sz,
+                dom,
             );
             tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(se));
         }
@@ -5113,7 +5676,7 @@ where
             let table = build_quantize_table(&layer.params, &layer.input_values);
             let sz = 1usize << layer.log_size;
             let dom = CanonicCoset::new(layer.log_size).circle_domain();
-            let (ti, to) = build_quantize_table_columns(&table, sz);
+            let (ti, to) = build_quantize_table_columns::<SimdBackend>(&table, sz);
             tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(vec![
                 CircleEvaluation::new(dom, ti),
                 CircleEvaluation::new(dom, to),
@@ -5123,14 +5686,17 @@ where
             let table = build_dequantize_table(&layer.params);
             let sz = 1usize << layer.log_size;
             let dom = CanonicCoset::new(layer.log_size).circle_domain();
-            let (ti, to) = build_table_columns(&table, sz);
+            let (ti, to) = build_table_columns::<SimdBackend>(&table, sz);
             tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(vec![
                 CircleEvaluation::new(dom, ti),
                 CircleEvaluation::new(dom, to),
             ]));
         }
         tree_builder.commit(channel);
-        eprintln!("  [Unified STARK] Tree 0 committed in {:.2}s", t_tree0.elapsed().as_secs_f64());
+        eprintln!(
+            "  [Unified STARK] Tree 0 committed in {:.2}s",
+            t_tree0.elapsed().as_secs_f64()
+        );
     }
 
     // Tree 1: Execution traces
@@ -5145,8 +5711,10 @@ where
         let po = layer.table.outputs[0];
         let padding = sz.saturating_sub(layer.inputs.len());
         let mut mults = compute_multiplicities(&layer.inputs, &layer.table);
-        if padding > 0 { mults[0] += M31::from(padding as u32); }
-        let (ti, to, mc) = build_trace_columns(&layer.inputs, &layer.outputs, &mults, pi, po, sz);
+        if padding > 0 {
+            mults[0] += M31::from(padding as u32);
+        }
+        let (ti, to, mc) = build_trace_columns::<SimdBackend>(&layer.inputs, &layer.outputs, &mults, pi, po, sz);
         tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(vec![
             CircleEvaluation::new(dom, ti),
             CircleEvaluation::new(dom, to),
@@ -5157,7 +5725,7 @@ where
     for layer in add_layers {
         let sz = 1usize << layer.log_size;
         let dom = CanonicCoset::new(layer.log_size).circle_domain();
-        let (l, r, o) = build_elementwise_trace_columns(&layer.lhs, &layer.rhs, &layer.output, sz);
+        let (l, r, o) = build_elementwise_trace_columns::<SimdBackend>(&layer.lhs, &layer.rhs, &layer.output, sz);
         tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(vec![
             CircleEvaluation::new(dom, l),
             CircleEvaluation::new(dom, r),
@@ -5167,7 +5735,7 @@ where
     for layer in mul_layers {
         let sz = 1usize << layer.log_size;
         let dom = CanonicCoset::new(layer.log_size).circle_domain();
-        let (l, r, o) = build_elementwise_trace_columns(&layer.lhs, &layer.rhs, &layer.output, sz);
+        let (l, r, o) = build_elementwise_trace_columns::<SimdBackend>(&layer.lhs, &layer.rhs, &layer.output, sz);
         tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(vec![
             CircleEvaluation::new(dom, l),
             CircleEvaluation::new(dom, r),
@@ -5179,11 +5747,18 @@ where
         let sz = 1usize << layer.log_size;
         let padding = sz.saturating_sub(layer.variances.len());
         let mut mults = compute_multiplicities(&layer.variances, &layer.rsqrt_table);
-        if padding > 0 { mults[0] += M31::from(padding as u32); }
-        let cols = build_layernorm_trace_columns(
-            &layer.inputs, &layer.means, &layer.variances,
-            &layer.rsqrt_vals, &layer.outputs, &mults,
-            &layer.rsqrt_table, sz,
+        if padding > 0 {
+            mults[0] += M31::from(padding as u32);
+        }
+        let cols = build_layernorm_trace_columns::<SimdBackend>(
+            &layer.inputs,
+            &layer.means,
+            &layer.variances,
+            &layer.rsqrt_vals,
+            &layer.outputs,
+            &mults,
+            &layer.rsqrt_table,
+            sz,
         );
         tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(cols));
         layernorm_mults.push(mults);
@@ -5191,9 +5766,13 @@ where
     for layer in embedding_layers {
         let sz = 1usize << layer.log_size;
         let dom = CanonicCoset::new(layer.log_size).circle_domain();
-        let se = build_embedding_trace_columns(
-            &layer.token_ids, &layer.col_indices, &layer.values, &layer.multiplicities,
-            sz, dom,
+        let se = build_embedding_trace_columns::<SimdBackend>(
+            &layer.token_ids,
+            &layer.col_indices,
+            &layer.values,
+            &layer.multiplicities,
+            sz,
+            dom,
         );
         tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(se));
     }
@@ -5206,10 +5785,17 @@ where
         let po = table.outputs[0];
         let padding = sz.saturating_sub(layer.input_values.len());
         let mut mults = layer.multiplicities.clone();
-        if padding > 0 { mults[0] += M31::from(padding as u32); }
-        let se = build_quantize_trace_columns_2d(
-            &layer.input_values, &layer.values, &mults,
-            pi, po, sz, dom,
+        if padding > 0 {
+            mults[0] += M31::from(padding as u32);
+        }
+        let se = build_quantize_trace_columns_2d::<SimdBackend>(
+            &layer.input_values,
+            &layer.values,
+            &mults,
+            pi,
+            po,
+            sz,
+            dom,
         );
         tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(se));
         quantize_mults.push(mults);
@@ -5223,8 +5809,17 @@ where
         let po = table.outputs[0];
         let padding = sz.saturating_sub(layer.input_values.len());
         let mut mults = layer.multiplicities.clone();
-        if padding > 0 { mults[0] += M31::from(padding as u32); }
-        let (ti, to, mc) = build_trace_columns(&layer.input_values, &layer.output_values, &mults, pi, po, sz);
+        if padding > 0 {
+            mults[0] += M31::from(padding as u32);
+        }
+        let (ti, to, mc) = build_trace_columns::<SimdBackend>(
+            &layer.input_values,
+            &layer.output_values,
+            &mults,
+            pi,
+            po,
+            sz,
+        );
         tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(vec![
             CircleEvaluation::new(dom, ti),
             CircleEvaluation::new(dom, to),
@@ -5233,7 +5828,10 @@ where
         dequantize_mults.push(mults);
     }
     tree_builder.commit(channel);
-    eprintln!("  [Unified STARK] Tree 1 committed in {:.2}s", t_tree1.elapsed().as_secs_f64());
+    eprintln!(
+        "  [Unified STARK] Tree 1 committed in {:.2}s",
+        t_tree1.elapsed().as_secs_f64()
+    );
 
     channel.mix_u64(0);
 
@@ -5254,12 +5852,24 @@ where
     if has_logup {
         let t_tree2 = std::time::Instant::now();
         eprintln!("  [Unified STARK] Tree 2/3: interaction (LogUp) traces...");
-        if !activation_layers.is_empty() { activation_lookup = Some(ActivationRelation::draw(channel)); }
-        if !layernorm_layers.is_empty() { layernorm_lookup = Some(LayerNormRelation::draw(channel)); }
-        if !rmsnorm_layers.is_empty() { _rmsnorm_lookup = Some(RMSNormRelation::draw(channel)); }
-        if !embedding_layers.is_empty() { embedding_lookup_rel = Some(EmbeddingRelation::draw(channel)); }
-        if !quantize_layers.is_empty() { quantize_lookup = Some(QuantizeRelation::draw(channel)); }
-        if !dequantize_layers.is_empty() { dequantize_lookup = Some(DequantizeRelation::draw(channel)); }
+        if !activation_layers.is_empty() {
+            activation_lookup = Some(ActivationRelation::draw(channel));
+        }
+        if !layernorm_layers.is_empty() {
+            layernorm_lookup = Some(LayerNormRelation::draw(channel));
+        }
+        if !rmsnorm_layers.is_empty() {
+            _rmsnorm_lookup = Some(RMSNormRelation::draw(channel));
+        }
+        if !embedding_layers.is_empty() {
+            embedding_lookup_rel = Some(EmbeddingRelation::draw(channel));
+        }
+        if !quantize_layers.is_empty() {
+            quantize_lookup = Some(QuantizeRelation::draw(channel));
+        }
+        if !dequantize_layers.is_empty() {
+            dequantize_lookup = Some(DequantizeRelation::draw(channel));
+        }
 
         let mut tree_builder = commitment_scheme.tree_builder();
 
@@ -5269,18 +5879,28 @@ where
                 let vsz = sz >> LOG_N_LANES;
                 let pi = layer.table.inputs[0];
                 let po = layer.table.outputs[0];
-                let (tic, toc) = build_table_columns(&layer.table, sz);
-                let (trc_in, trc_out, _) = build_trace_columns(
-                    &layer.inputs, &layer.outputs, &activation_mults[idx], pi, po, sz,
+                let (tic, toc) = build_table_columns::<SimdBackend>(&layer.table, sz);
+                let (trc_in, trc_out, _) = build_trace_columns::<SimdBackend>(
+                    &layer.inputs,
+                    &layer.outputs,
+                    &activation_mults[idx],
+                    pi,
+                    po,
+                    sz,
                 );
                 let mut lg = LogupTraceGenerator::new(layer.log_size);
                 let mut cg = lg.new_col();
                 let tag_packed = PackedBaseField::broadcast(M31::from(layer.type_tag));
                 for vr in 0..vsz {
-                    let qt: PackedSecureField = lookup.lookup_elements()
-                        .combine(&[tag_packed, tic.data[vr], toc.data[vr]]);
-                    let qr: PackedSecureField = lookup.lookup_elements()
-                        .combine(&[tag_packed, trc_in.data[vr], trc_out.data[vr]]);
+                    let qt: PackedSecureField =
+                        lookup
+                            .lookup_elements()
+                            .combine(&[tag_packed, tic.data[vr], toc.data[vr]]);
+                    let qr: PackedSecureField = lookup.lookup_elements().combine(&[
+                        tag_packed,
+                        trc_in.data[vr],
+                        trc_out.data[vr],
+                    ]);
                     let mp = pack_multiplicities(&activation_mults[idx], vr);
                     cg.write_frac(vr, qt - mp * qr, qt * qr);
                 }
@@ -5295,20 +5915,38 @@ where
             for (idx, layer) in layernorm_layers.iter().enumerate() {
                 let sz = 1usize << layer.log_size;
                 let vsz = sz >> LOG_N_LANES;
-                let (tvc, trc) = build_table_columns(&layer.rsqrt_table, sz);
+                let (tvc, trc) = build_table_columns::<SimdBackend>(&layer.rsqrt_table, sz);
                 let mut vc = Col::<SimdBackend, BaseField>::zeros(sz);
                 let mut rc = Col::<SimdBackend, BaseField>::zeros(sz);
                 let n = layer.variances.len().min(sz);
-                for i in 0..n { vc.set(i, layer.variances[i]); rc.set(i, layer.rsqrt_vals[i]); }
-                let pv = layer.rsqrt_table.inputs.first().copied().unwrap_or(M31::from(0));
-                let pr = layer.rsqrt_table.outputs.first().copied().unwrap_or(M31::from(0));
-                for i in n..sz { vc.set(i, pv); rc.set(i, pr); }
+                for i in 0..n {
+                    vc.set(i, layer.variances[i]);
+                    rc.set(i, layer.rsqrt_vals[i]);
+                }
+                let pv = layer
+                    .rsqrt_table
+                    .inputs
+                    .first()
+                    .copied()
+                    .unwrap_or(M31::from(0));
+                let pr = layer
+                    .rsqrt_table
+                    .outputs
+                    .first()
+                    .copied()
+                    .unwrap_or(M31::from(0));
+                for i in n..sz {
+                    vc.set(i, pv);
+                    rc.set(i, pr);
+                }
                 let mut lg = LogupTraceGenerator::new(layer.log_size);
                 let mut cg = lg.new_col();
                 for vr in 0..vsz {
-                    let qt: PackedSecureField = lookup.lookup_elements()
+                    let qt: PackedSecureField = lookup
+                        .lookup_elements()
                         .combine(&[tvc.data[vr], trc.data[vr]]);
-                    let qr: PackedSecureField = lookup.lookup_elements()
+                    let qr: PackedSecureField = lookup
+                        .lookup_elements()
                         .combine(&[vc.data[vr], rc.data[vr]]);
                     let mp = pack_multiplicities(&layernorm_mults[idx], vr);
                     cg.write_frac(vr, qt - mp * qr, qt * qr);
@@ -5328,25 +5966,37 @@ where
                 let mut tc = Col::<SimdBackend, BaseField>::zeros(sz);
                 let mut tv = Col::<SimdBackend, BaseField>::zeros(sz);
                 let nt = layer.table_tokens.len().min(sz);
-                for i in 0..nt { tt.set(i, layer.table_tokens[i]); tc.set(i, layer.table_cols[i]); tv.set(i, layer.table_values[i]); }
+                for i in 0..nt {
+                    tt.set(i, layer.table_tokens[i]);
+                    tc.set(i, layer.table_cols[i]);
+                    tv.set(i, layer.table_values[i]);
+                }
                 let mut et = Col::<SimdBackend, BaseField>::zeros(sz);
                 let mut ec = Col::<SimdBackend, BaseField>::zeros(sz);
                 let mut ev = Col::<SimdBackend, BaseField>::zeros(sz);
                 let ne = layer.token_ids.len().min(sz);
-                for i in 0..ne { et.set(i, layer.token_ids[i]); ec.set(i, layer.col_indices[i]); ev.set(i, layer.values[i]); }
+                for i in 0..ne {
+                    et.set(i, layer.token_ids[i]);
+                    ec.set(i, layer.col_indices[i]);
+                    ev.set(i, layer.values[i]);
+                }
                 let mut lg = LogupTraceGenerator::new(layer.log_size);
                 let mut cg = lg.new_col();
                 for vr in 0..vsz {
-                    let qt: PackedSecureField = lookup.lookup_elements()
-                        .combine(&[tt.data[vr], tc.data[vr], tv.data[vr]]);
+                    let qt: PackedSecureField =
+                        lookup
+                            .lookup_elements()
+                            .combine(&[tt.data[vr], tc.data[vr], tv.data[vr]]);
                     let mp = pack_multiplicities(&layer.multiplicities, vr);
                     cg.write_frac(vr, -mp, qt);
                 }
                 cg.finalize_col();
                 let mut cg = lg.new_col();
                 for vr in 0..vsz {
-                    let qr: PackedSecureField = lookup.lookup_elements()
-                        .combine(&[et.data[vr], ec.data[vr], ev.data[vr]]);
+                    let qr: PackedSecureField =
+                        lookup
+                            .lookup_elements()
+                            .combine(&[et.data[vr], ec.data[vr], ev.data[vr]]);
                     cg.write_frac(vr, PackedSecureField::one(), qr);
                 }
                 cg.finalize_col();
@@ -5363,17 +6013,23 @@ where
                 let vsz = sz >> LOG_N_LANES;
                 let pi = table.inputs[0];
                 let po = table.outputs[0];
-                let (tic, toc) = build_quantize_table_columns(&table, sz);
-                let (trc_in, trc_out, _) = build_quantize_trace_simd_2d(
-                    &layer.input_values, &layer.values, &quantize_mults[idx],
-                    pi, po, sz,
+                let (tic, toc) = build_quantize_table_columns::<SimdBackend>(&table, sz);
+                let (trc_in, trc_out, _) = build_quantize_trace_simd_2d::<SimdBackend>(
+                    &layer.input_values,
+                    &layer.values,
+                    &quantize_mults[idx],
+                    pi,
+                    po,
+                    sz,
                 );
                 let mut lg = LogupTraceGenerator::new(layer.log_size);
                 let mut cg = lg.new_col();
                 for vr in 0..vsz {
-                    let qt: PackedSecureField = lookup.lookup_elements()
+                    let qt: PackedSecureField = lookup
+                        .lookup_elements()
                         .combine(&[tic.data[vr], toc.data[vr]]);
-                    let qr: PackedSecureField = lookup.lookup_elements()
+                    let qr: PackedSecureField = lookup
+                        .lookup_elements()
                         .combine(&[trc_in.data[vr], trc_out.data[vr]]);
                     let mp = pack_multiplicities(&quantize_mults[idx], vr);
                     cg.write_frac(vr, qt - mp * qr, qt * qr);
@@ -5393,17 +6049,23 @@ where
                 let vsz = sz >> LOG_N_LANES;
                 let pi = table.inputs[0];
                 let po = table.outputs[0];
-                let (tic, toc) = build_table_columns(&table, sz);
-                let (trc_in, trc_out, _) = build_trace_columns(
-                    &layer.input_values, &layer.output_values, &dequantize_mults[idx],
-                    pi, po, sz,
+                let (tic, toc) = build_table_columns::<SimdBackend>(&table, sz);
+                let (trc_in, trc_out, _) = build_trace_columns::<SimdBackend>(
+                    &layer.input_values,
+                    &layer.output_values,
+                    &dequantize_mults[idx],
+                    pi,
+                    po,
+                    sz,
                 );
                 let mut lg = LogupTraceGenerator::new(layer.log_size);
                 let mut cg = lg.new_col();
                 for vr in 0..vsz {
-                    let qt: PackedSecureField = lookup.lookup_elements()
+                    let qt: PackedSecureField = lookup
+                        .lookup_elements()
                         .combine(&[tic.data[vr], toc.data[vr]]);
-                    let qr: PackedSecureField = lookup.lookup_elements()
+                    let qr: PackedSecureField = lookup
+                        .lookup_elements()
                         .combine(&[trc_in.data[vr], trc_out.data[vr]]);
                     let mp = pack_multiplicities(&dequantize_mults[idx], vr);
                     cg.write_frac(vr, qt - mp * qr, qt * qr);
@@ -5416,7 +6078,10 @@ where
         }
 
         tree_builder.commit(channel);
-        eprintln!("  [Unified STARK] Tree 2 committed in {:.2}s", t_tree2.elapsed().as_secs_f64());
+        eprintln!(
+            "  [Unified STARK] Tree 2 committed in {:.2}s",
+            t_tree2.elapsed().as_secs_f64()
+        );
     } else {
         eprintln!("  [Unified STARK] Tree 2/3 skipped (no LogUp components)");
     }
@@ -5441,13 +6106,15 @@ where
                 ActivationEval {
                     log_n_rows: layer.log_size,
                     lookup_elements: lookup.clone(),
-                    claimed_sum: cs, total_sum: cs,
+                    claimed_sum: cs,
+                    total_sum: cs,
                     activation_type_tag: layer.type_tag,
                 },
                 cs,
             )));
             activation_claims.push(LayerClaim {
-                layer_index: layer.node_id, claimed_sum: cs,
+                layer_index: layer.node_id,
+                claimed_sum: cs,
                 trace_rows: 1 << layer.log_size,
             });
         }
@@ -5455,22 +6122,28 @@ where
     for layer in add_layers {
         comp_storage.push(Box::new(FrameworkComponent::new(
             &mut allocator,
-            ElementwiseAddEval { log_n_rows: layer.log_size },
+            ElementwiseAddEval {
+                log_n_rows: layer.log_size,
+            },
             SecureField::default(),
         )));
         add_claims.push(LayerClaim {
-            layer_index: layer.node_id, claimed_sum: SecureField::default(),
+            layer_index: layer.node_id,
+            claimed_sum: SecureField::default(),
             trace_rows: 1 << layer.log_size,
         });
     }
     for layer in mul_layers {
         comp_storage.push(Box::new(FrameworkComponent::new(
             &mut allocator,
-            ElementwiseMulEval { log_n_rows: layer.log_size },
+            ElementwiseMulEval {
+                log_n_rows: layer.log_size,
+            },
             SecureField::default(),
         )));
         mul_claims.push(LayerClaim {
-            layer_index: layer.node_id, claimed_sum: SecureField::default(),
+            layer_index: layer.node_id,
+            claimed_sum: SecureField::default(),
             trace_rows: 1 << layer.log_size,
         });
     }
@@ -5488,7 +6161,8 @@ where
                 cs,
             )));
             layernorm_claims.push(LayerClaim {
-                layer_index: layer.node_id, claimed_sum: cs,
+                layer_index: layer.node_id,
+                claimed_sum: cs,
                 trace_rows: 1 << layer.log_size,
             });
         }
@@ -5506,7 +6180,8 @@ where
                 cs,
             )));
             embedding_claims.push(LayerClaim {
-                layer_index: layer.node_id, claimed_sum: cs,
+                layer_index: layer.node_id,
+                claimed_sum: cs,
                 trace_rows: 1 << layer.log_size,
             });
         }
@@ -5524,7 +6199,8 @@ where
                 cs,
             )));
             quantize_claims.push(LayerClaim {
-                layer_index: layer.node_id, claimed_sum: cs,
+                layer_index: layer.node_id,
+                claimed_sum: cs,
                 trace_rows: 1 << layer.log_size,
             });
         }
@@ -5543,14 +6219,17 @@ where
                 cs,
             )));
             dequantize_claims.push(LayerClaim {
-                layer_index: layer.node_id, claimed_sum: cs,
+                layer_index: layer.node_id,
+                claimed_sum: cs,
                 trace_rows: 1 << layer.log_size,
             });
         }
     }
 
-    let crefs: Vec<&dyn ComponentProver<B>> = comp_storage.iter()
-        .map(|c| c.as_component_prover()).collect();
+    let crefs: Vec<&dyn ComponentProver<B>> = comp_storage
+        .iter()
+        .map(|c| c.as_component_prover())
+        .collect();
 
     let max_log_size = unified_stark_max_log_size(
         &activation_layers,
@@ -5562,7 +6241,10 @@ where
         &quantize_layers,
         &dequantize_layers,
     );
-    eprintln!("  [Unified STARK] proving (max_log_size={})...", max_log_size);
+    eprintln!(
+        "  [Unified STARK] proving (max_log_size={})...",
+        max_log_size
+    );
     let stark_proof = prove_unified_stark_with_gpu_pipeline::<B, Blake2sMerkleChannel>(
         &crefs,
         channel,
@@ -5608,20 +6290,29 @@ where
 
 // --- Helper functions ---
 
-fn build_table_columns(
+fn build_table_columns<B: ColumnOps<BaseField>>(
     table: &PrecomputedTable,
     size: usize,
-) -> (Col<SimdBackend, BaseField>, Col<SimdBackend, BaseField>) {
-    let mut input_col = Col::<SimdBackend, BaseField>::zeros(size);
-    let mut output_col = Col::<SimdBackend, BaseField>::zeros(size);
-    for (i, (&inp, &out)) in table.inputs.iter().zip(table.outputs.iter()).enumerate().take(size) {
+) -> (Col<B, BaseField>, Col<B, BaseField>)
+where
+    Col<B, BaseField>: Column<BaseField>,
+{
+    let mut input_col = Col::<B, BaseField>::zeros(size);
+    let mut output_col = Col::<B, BaseField>::zeros(size);
+    for (i, (&inp, &out)) in table
+        .inputs
+        .iter()
+        .zip(table.outputs.iter())
+        .enumerate()
+        .take(size)
+    {
         input_col.set(i, inp);
         output_col.set(i, out);
     }
     (input_col, output_col)
 }
 
-fn build_trace_columns(
+fn build_trace_columns<B: ColumnOps<BaseField>>(
     inputs: &[M31],
     outputs: &[M31],
     multiplicities: &[M31],
@@ -5629,13 +6320,16 @@ fn build_trace_columns(
     pad_output: M31,
     size: usize,
 ) -> (
-    Col<SimdBackend, BaseField>,
-    Col<SimdBackend, BaseField>,
-    Col<SimdBackend, BaseField>,
-) {
-    let mut trace_in = Col::<SimdBackend, BaseField>::zeros(size);
-    let mut trace_out = Col::<SimdBackend, BaseField>::zeros(size);
-    let mut mult_col = Col::<SimdBackend, BaseField>::zeros(size);
+    Col<B, BaseField>,
+    Col<B, BaseField>,
+    Col<B, BaseField>,
+)
+where
+    Col<B, BaseField>: Column<BaseField>,
+{
+    let mut trace_in = Col::<B, BaseField>::zeros(size);
+    let mut trace_out = Col::<B, BaseField>::zeros(size);
+    let mut mult_col = Col::<B, BaseField>::zeros(size);
 
     for (i, (&inp, &out)) in inputs.iter().zip(outputs.iter()).enumerate().take(size) {
         trace_in.set(i, inp);
@@ -5653,19 +6347,22 @@ fn build_trace_columns(
 }
 
 /// Build 3 trace columns for elementwise Add/Mul (lhs, rhs, output).
-fn build_elementwise_trace_columns(
+fn build_elementwise_trace_columns<B: ColumnOps<BaseField>>(
     lhs: &[M31],
     rhs: &[M31],
     output: &[M31],
     size: usize,
 ) -> (
-    Col<SimdBackend, BaseField>,
-    Col<SimdBackend, BaseField>,
-    Col<SimdBackend, BaseField>,
-) {
-    let mut lhs_col = Col::<SimdBackend, BaseField>::zeros(size);
-    let mut rhs_col = Col::<SimdBackend, BaseField>::zeros(size);
-    let mut out_col = Col::<SimdBackend, BaseField>::zeros(size);
+    Col<B, BaseField>,
+    Col<B, BaseField>,
+    Col<B, BaseField>,
+)
+where
+    Col<B, BaseField>: Column<BaseField>,
+{
+    let mut lhs_col = Col::<B, BaseField>::zeros(size);
+    let mut rhs_col = Col::<B, BaseField>::zeros(size);
+    let mut out_col = Col::<B, BaseField>::zeros(size);
 
     let n = lhs.len().min(rhs.len()).min(output.len()).min(size);
     for i in 0..n {
@@ -5679,7 +6376,7 @@ fn build_elementwise_trace_columns(
 }
 
 /// Build 6 trace columns for LayerNorm (input, mean, var, rsqrt, output, multiplicity).
-fn build_layernorm_trace_columns(
+fn build_layernorm_trace_columns<B: ColumnOps<BaseField>>(
     inputs: &[M31],
     means: &[M31],
     variances: &[M31],
@@ -5688,18 +6385,21 @@ fn build_layernorm_trace_columns(
     multiplicities: &[M31],
     rsqrt_table: &PrecomputedTable,
     size: usize,
-) -> Vec<CircleEvaluation<SimdBackend, BaseField, stwo::prover::poly::BitReversedOrder>> {
+) -> Vec<CircleEvaluation<B, BaseField, stwo::prover::poly::BitReversedOrder>>
+where
+    Col<B, BaseField>: Column<BaseField>,
+{
     let domain = CanonicCoset::new(size.ilog2()).circle_domain();
 
     let pad_var = rsqrt_table.inputs.first().copied().unwrap_or(M31::from(0));
     let pad_rsqrt = rsqrt_table.outputs.first().copied().unwrap_or(M31::from(0));
 
-    let mut input_col = Col::<SimdBackend, BaseField>::zeros(size);
-    let mut mean_col = Col::<SimdBackend, BaseField>::zeros(size);
-    let mut var_col = Col::<SimdBackend, BaseField>::zeros(size);
-    let mut rsqrt_col = Col::<SimdBackend, BaseField>::zeros(size);
-    let mut output_col = Col::<SimdBackend, BaseField>::zeros(size);
-    let mut mult_col = Col::<SimdBackend, BaseField>::zeros(size);
+    let mut input_col = Col::<B, BaseField>::zeros(size);
+    let mut mean_col = Col::<B, BaseField>::zeros(size);
+    let mut var_col = Col::<B, BaseField>::zeros(size);
+    let mut rsqrt_col = Col::<B, BaseField>::zeros(size);
+    let mut output_col = Col::<B, BaseField>::zeros(size);
+    let mut mult_col = Col::<B, BaseField>::zeros(size);
 
     let n = inputs.len().min(size);
     for i in 0..n {
@@ -5729,7 +6429,7 @@ fn build_layernorm_trace_columns(
 
 /// Build 5-column RMSNorm execution trace: (input, rms_sq, rsqrt, output, multiplicity).
 /// Unlike LayerNorm (6 cols: input, mean, var, rsqrt, output, mult), RMSNorm has no mean column.
-fn build_rmsnorm_trace_columns(
+fn build_rmsnorm_trace_columns<B: ColumnOps<BaseField>>(
     inputs: &[M31],
     rms_sq_vals: &[M31],
     rsqrt_vals: &[M31],
@@ -5737,17 +6437,20 @@ fn build_rmsnorm_trace_columns(
     multiplicities: &[M31],
     rsqrt_table: &PrecomputedTable,
     size: usize,
-) -> Vec<CircleEvaluation<SimdBackend, BaseField, stwo::prover::poly::BitReversedOrder>> {
+) -> Vec<CircleEvaluation<B, BaseField, stwo::prover::poly::BitReversedOrder>>
+where
+    Col<B, BaseField>: Column<BaseField>,
+{
     let domain = CanonicCoset::new(size.ilog2()).circle_domain();
 
     let pad_rms = rsqrt_table.inputs.first().copied().unwrap_or(M31::from(0));
     let pad_rsqrt = rsqrt_table.outputs.first().copied().unwrap_or(M31::from(0));
 
-    let mut input_col = Col::<SimdBackend, BaseField>::zeros(size);
-    let mut rms_col = Col::<SimdBackend, BaseField>::zeros(size);
-    let mut rsqrt_col = Col::<SimdBackend, BaseField>::zeros(size);
-    let mut output_col = Col::<SimdBackend, BaseField>::zeros(size);
-    let mut mult_col = Col::<SimdBackend, BaseField>::zeros(size);
+    let mut input_col = Col::<B, BaseField>::zeros(size);
+    let mut rms_col = Col::<B, BaseField>::zeros(size);
+    let mut rsqrt_col = Col::<B, BaseField>::zeros(size);
+    let mut output_col = Col::<B, BaseField>::zeros(size);
+    let mut mult_col = Col::<B, BaseField>::zeros(size);
 
     let n = inputs.len().min(size);
     for i in 0..n {
@@ -5774,16 +6477,19 @@ fn build_rmsnorm_trace_columns(
 }
 
 /// Build 3 preprocessed columns for embedding LogUp (table_token, table_col, table_value).
-fn build_embedding_preprocessed_columns(
+fn build_embedding_preprocessed_columns<B: ColumnOps<BaseField>>(
     table_tokens: &[M31],
     table_cols: &[M31],
     table_values: &[M31],
     size: usize,
     domain: stwo::core::poly::circle::CircleDomain,
-) -> Vec<CircleEvaluation<SimdBackend, BaseField, stwo::prover::poly::BitReversedOrder>> {
-    let mut tok_col = Col::<SimdBackend, BaseField>::zeros(size);
-    let mut col_col = Col::<SimdBackend, BaseField>::zeros(size);
-    let mut val_col = Col::<SimdBackend, BaseField>::zeros(size);
+) -> Vec<CircleEvaluation<B, BaseField, stwo::prover::poly::BitReversedOrder>>
+where
+    Col<B, BaseField>: Column<BaseField>,
+{
+    let mut tok_col = Col::<B, BaseField>::zeros(size);
+    let mut col_col = Col::<B, BaseField>::zeros(size);
+    let mut val_col = Col::<B, BaseField>::zeros(size);
 
     let n = table_tokens.len().min(size);
     for i in 0..n {
@@ -5800,18 +6506,21 @@ fn build_embedding_preprocessed_columns(
 }
 
 /// Build 4 execution trace columns for embedding (token_id, col_idx, value, multiplicity).
-fn build_embedding_trace_columns(
+fn build_embedding_trace_columns<B: ColumnOps<BaseField>>(
     token_ids: &[M31],
     col_indices: &[M31],
     values: &[M31],
     multiplicities: &[M31],
     size: usize,
     domain: stwo::core::poly::circle::CircleDomain,
-) -> Vec<CircleEvaluation<SimdBackend, BaseField, stwo::prover::poly::BitReversedOrder>> {
-    let mut tok_col = Col::<SimdBackend, BaseField>::zeros(size);
-    let mut col_col = Col::<SimdBackend, BaseField>::zeros(size);
-    let mut val_col = Col::<SimdBackend, BaseField>::zeros(size);
-    let mut mult_col = Col::<SimdBackend, BaseField>::zeros(size);
+) -> Vec<CircleEvaluation<B, BaseField, stwo::prover::poly::BitReversedOrder>>
+where
+    Col<B, BaseField>: Column<BaseField>,
+{
+    let mut tok_col = Col::<B, BaseField>::zeros(size);
+    let mut col_col = Col::<B, BaseField>::zeros(size);
+    let mut val_col = Col::<B, BaseField>::zeros(size);
+    let mut mult_col = Col::<B, BaseField>::zeros(size);
 
     let n = token_ids.len().min(size);
     for i in 0..n {
@@ -5832,13 +6541,22 @@ fn build_embedding_trace_columns(
 }
 
 /// Build 2 preprocessed columns for quantize lookup table (input, output).
-fn build_quantize_table_columns(
+fn build_quantize_table_columns<B: ColumnOps<BaseField>>(
     table: &PrecomputedTable,
     size: usize,
-) -> (Col<SimdBackend, BaseField>, Col<SimdBackend, BaseField>) {
-    let mut input_col = Col::<SimdBackend, BaseField>::zeros(size);
-    let mut output_col = Col::<SimdBackend, BaseField>::zeros(size);
-    for (i, (&inp, &out)) in table.inputs.iter().zip(table.outputs.iter()).enumerate().take(size) {
+) -> (Col<B, BaseField>, Col<B, BaseField>)
+where
+    Col<B, BaseField>: Column<BaseField>,
+{
+    let mut input_col = Col::<B, BaseField>::zeros(size);
+    let mut output_col = Col::<B, BaseField>::zeros(size);
+    for (i, (&inp, &out)) in table
+        .inputs
+        .iter()
+        .zip(table.outputs.iter())
+        .enumerate()
+        .take(size)
+    {
         input_col.set(i, inp);
         output_col.set(i, out);
     }
@@ -5846,7 +6564,7 @@ fn build_quantize_table_columns(
 }
 
 /// Build 3 execution trace columns for quantize (input, output, multiplicity).
-fn build_quantize_trace_columns_2d(
+fn build_quantize_trace_columns_2d<B: ColumnOps<BaseField>>(
     input_values: &[M31],
     output_values: &[M31],
     multiplicities: &[M31],
@@ -5854,9 +6572,17 @@ fn build_quantize_trace_columns_2d(
     pad_output: M31,
     size: usize,
     domain: stwo::core::poly::circle::CircleDomain,
-) -> Vec<CircleEvaluation<SimdBackend, BaseField, stwo::prover::poly::BitReversedOrder>> {
-    let (in_col, out_col, mult_col) = build_quantize_trace_simd_2d(
-        input_values, output_values, multiplicities, pad_input, pad_output, size,
+) -> Vec<CircleEvaluation<B, BaseField, stwo::prover::poly::BitReversedOrder>>
+where
+    Col<B, BaseField>: Column<BaseField>,
+{
+    let (in_col, out_col, mult_col) = build_quantize_trace_simd_2d::<B>(
+        input_values,
+        output_values,
+        multiplicities,
+        pad_input,
+        pad_output,
+        size,
     );
     vec![
         CircleEvaluation::new(domain, in_col),
@@ -5865,20 +6591,32 @@ fn build_quantize_trace_columns_2d(
     ]
 }
 
-/// Build SIMD columns for quantize trace data (input, output, multiplicity).
-fn build_quantize_trace_simd_2d(
+/// Build columns for quantize trace data (input, output, multiplicity).
+fn build_quantize_trace_simd_2d<B: ColumnOps<BaseField>>(
     input_values: &[M31],
     output_values: &[M31],
     multiplicities: &[M31],
     pad_input: M31,
     pad_output: M31,
     size: usize,
-) -> (Col<SimdBackend, BaseField>, Col<SimdBackend, BaseField>, Col<SimdBackend, BaseField>) {
-    let mut in_col = Col::<SimdBackend, BaseField>::zeros(size);
-    let mut out_col = Col::<SimdBackend, BaseField>::zeros(size);
-    let mut mult_col = Col::<SimdBackend, BaseField>::zeros(size);
+) -> (
+    Col<B, BaseField>,
+    Col<B, BaseField>,
+    Col<B, BaseField>,
+)
+where
+    Col<B, BaseField>: Column<BaseField>,
+{
+    let mut in_col = Col::<B, BaseField>::zeros(size);
+    let mut out_col = Col::<B, BaseField>::zeros(size);
+    let mut mult_col = Col::<B, BaseField>::zeros(size);
 
-    for (i, (&inp, &out)) in input_values.iter().zip(output_values.iter()).enumerate().take(size) {
+    for (i, (&inp, &out)) in input_values
+        .iter()
+        .zip(output_values.iter())
+        .enumerate()
+        .take(size)
+    {
         in_col.set(i, inp);
         out_col.set(i, out);
     }
@@ -5894,10 +6632,7 @@ fn build_quantize_trace_simd_2d(
     (in_col, out_col, mult_col)
 }
 
-fn pack_multiplicities(
-    multiplicities: &[M31],
-    vec_row: usize,
-) -> PackedSecureField {
+fn pack_multiplicities(multiplicities: &[M31], vec_row: usize) -> PackedSecureField {
     use stwo::prover::backend::simd::m31::PackedBaseField;
 
     let n_lanes = 16usize;
@@ -5979,7 +6714,12 @@ pub fn verify_aggregated_model_proof(
     let mut node_outputs: HashMap<usize, M31Matrix> = HashMap::new();
     let mut matmul_matrices: HashMap<usize, (M31Matrix, M31Matrix, M31Matrix)> = HashMap::new();
     let mut verifier_intermediates: Vec<(usize, M31Matrix)> = Vec::new();
-    let mut attention_verify_data: Vec<(usize, MultiHeadAttentionConfig, AttentionWeights, M31Matrix)> = Vec::new();
+    let mut attention_verify_data: Vec<(
+        usize,
+        MultiHeadAttentionConfig,
+        AttentionWeights,
+        M31Matrix,
+    )> = Vec::new();
     let mut ln_verify_data: Vec<(usize, Vec<M31>, Vec<M31>)> = Vec::new(); // (node_id, means, variances)
 
     let topo = graph.topological_order();
@@ -5996,34 +6736,44 @@ pub fn verify_aggregated_model_proof(
 
         match &node.op {
             GraphOp::MatMul { .. } => {
-                let weight = weights.get_weight(node.id).ok_or(
-                    ModelError::MissingWeight(node.id)
-                )?;
+                let weight = weights
+                    .get_weight(node.id)
+                    .ok_or(ModelError::MissingWeight(node.id))?;
                 let output = matmul_m31(&current, weight);
                 matmul_matrices.insert(node.id, (current.clone(), weight.clone(), output.clone()));
                 node_outputs.insert(node.id, output.clone());
                 current = output;
             }
-            GraphOp::Activation { activation_type, .. } => {
+            GraphOp::Activation {
+                activation_type, ..
+            } => {
                 let f = activation_type.as_fn();
                 let act_log_size = activation_type.recommended_table_log_size();
                 let table_mask = (1u32 << act_log_size) - 1;
-                let reduced_data: Vec<M31> = current.data.iter()
+                let reduced_data: Vec<M31> = current
+                    .data
+                    .iter()
                     .map(|&x| M31::from(x.0 & table_mask))
                     .collect();
                 let reduced = M31Matrix {
-                    rows: current.rows, cols: current.cols, data: reduced_data,
+                    rows: current.rows,
+                    cols: current.cols,
+                    data: reduced_data,
                 };
                 let output = crate::compiler::prove::apply_activation_pub(&reduced, &*f);
                 node_outputs.insert(node.id, output.clone());
                 current = output;
             }
             GraphOp::Add { .. } => {
-                let lhs = node.inputs.get(0)
+                let lhs = node
+                    .inputs
+                    .get(0)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
-                let rhs = node.inputs.get(1)
+                let rhs = node
+                    .inputs
+                    .get(1)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
@@ -6032,11 +6782,15 @@ pub fn verify_aggregated_model_proof(
                 current = output;
             }
             GraphOp::Mul { .. } => {
-                let lhs = node.inputs.get(0)
+                let lhs = node
+                    .inputs
+                    .get(0)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
-                let rhs = node.inputs.get(1)
+                let rhs = node
+                    .inputs
+                    .get(1)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
@@ -6055,18 +6809,25 @@ pub fn verify_aggregated_model_proof(
                 node_outputs.insert(node.id, rn.output_matrix.clone());
                 current = rn.output_matrix;
             }
-            GraphOp::Attention { config: attn_config } => {
+            GraphOp::Attention {
+                config: attn_config,
+            } => {
                 let w_q = weights.get_named_weight(node.id, "w_q");
                 let w_k = weights.get_named_weight(node.id, "w_k");
                 let w_v = weights.get_named_weight(node.id, "w_v");
                 let w_o = weights.get_named_weight(node.id, "w_o");
                 if let (Some(wq), Some(wk), Some(wv), Some(wo)) = (w_q, w_k, w_v, w_o) {
                     let attn_weights = AttentionWeights {
-                        w_q: wq.clone(), w_k: wk.clone(),
-                        w_v: wv.clone(), w_o: wo.clone(),
+                        w_q: wq.clone(),
+                        w_k: wk.clone(),
+                        w_v: wv.clone(),
+                        w_o: wo.clone(),
                     };
                     attention_verify_data.push((
-                        node.id, *attn_config, attn_weights.clone(), current.clone(),
+                        node.id,
+                        *attn_config,
+                        attn_weights.clone(),
+                        current.clone(),
                     ));
                     let inter = attention_forward(&current, &attn_weights, attn_config, false);
                     node_outputs.insert(node.id, inter.final_output.clone());
@@ -6076,18 +6837,24 @@ pub fn verify_aggregated_model_proof(
                 }
             }
             GraphOp::Embedding { .. } => {
-                let embed_table = weights.get_weight(node.id).ok_or(
-                    ModelError::MissingWeight(node.id)
-                )?;
+                let embed_table = weights
+                    .get_weight(node.id)
+                    .ok_or(ModelError::MissingWeight(node.id))?;
                 let token_u32s: Vec<u32> = current.data.iter().map(|m| m.0).collect();
                 let (output, _, _, _, _) = embedding_lookup(&token_u32s, embed_table);
                 node_outputs.insert(node.id, output.clone());
                 current = output;
             }
-            GraphOp::Conv2D { in_channels, out_channels, kernel_size, stride, padding } => {
-                let kernel = weights.get_weight(node.id).ok_or(
-                    ModelError::MissingWeight(node.id)
-                )?;
+            GraphOp::Conv2D {
+                in_channels,
+                out_channels,
+                kernel_size,
+                stride,
+                padding,
+            } => {
+                let kernel = weights
+                    .get_weight(node.id)
+                    .ok_or(ModelError::MissingWeight(node.id))?;
                 let im2col_config = Im2ColConfig {
                     in_channels: *in_channels,
                     kernel_size: *kernel_size,
@@ -6105,9 +6872,13 @@ pub fn verify_aggregated_model_proof(
             GraphOp::Quantize { params, .. } => {
                 let direct_params = crate::gadgets::quantize::QuantParams {
                     strategy: crate::gadgets::quantize::QuantStrategy::Direct,
-                    scale: 1.0, zero_point: 0, bits: 31,
+                    scale: 1.0,
+                    zero_point: 0,
+                    bits: 31,
                 };
-                let quantized: Vec<M31> = current.data.iter()
+                let quantized: Vec<M31> = current
+                    .data
+                    .iter()
                     .map(|&v| {
                         let f32_val = crate::gadgets::quantize::dequantize_value(v, &direct_params);
                         crate::gadgets::quantize::quantize_value(f32_val, params)
@@ -6123,10 +6894,10 @@ pub fn verify_aggregated_model_proof(
             }
             GraphOp::Dequantize { params, .. } => {
                 let table = build_dequantize_table(params);
-                let output_values: Vec<M31> = current.data.iter()
-                    .map(|&v| {
-                        table.lookup(v).unwrap_or(v)
-                    })
+                let output_values: Vec<M31> = current
+                    .data
+                    .iter()
+                    .map(|&v| table.lookup(v).unwrap_or(v))
                     .collect();
                 let output = M31Matrix {
                     rows: current.rows,
@@ -6149,27 +6920,21 @@ pub fn verify_aggregated_model_proof(
     }
 
     // 1b. Verify layer chain commitment
-    let expected_chain = compute_layer_chain_commitment(
-        input, &verifier_intermediates, &current,
-    );
+    let expected_chain = compute_layer_chain_commitment(input, &verifier_intermediates, &current);
     if expected_chain != proof.layer_chain_commitment {
-        return Err(AggregationError::VerificationFailed(
-            format!(
-                "Layer chain commitment mismatch: expected {:#x}, got {:#x}",
-                expected_chain, proof.layer_chain_commitment,
-            )
-        ));
+        return Err(AggregationError::VerificationFailed(format!(
+            "Layer chain commitment mismatch: expected {:#x}, got {:#x}",
+            expected_chain, proof.layer_chain_commitment,
+        )));
     }
 
     // 1c. Verify IO commitment (binds proof to specific input/output)
     let expected_io = compute_io_commitment(input, &current);
     if expected_io != proof.io_commitment {
-        return Err(AggregationError::VerificationFailed(
-            format!(
-                "IO commitment mismatch: expected {:#x}, got {:#x}",
-                expected_io, proof.io_commitment,
-            )
-        ));
+        return Err(AggregationError::VerificationFailed(format!(
+            "IO commitment mismatch: expected {:#x}, got {:#x}",
+            expected_io, proof.io_commitment,
+        )));
     }
 
     // 1d. Verify LayerNorm mean/variance commitments
@@ -6177,9 +6942,9 @@ pub fn verify_aggregated_model_proof(
         if idx < proof.layernorm_mean_var_commitments.len() {
             let expected = compute_layernorm_mean_var_commitment(means, variances);
             if expected != proof.layernorm_mean_var_commitments[idx] {
-                return Err(AggregationError::VerificationFailed(
-                    format!("LayerNorm mean/var commitment mismatch at node {node_id}")
-                ));
+                return Err(AggregationError::VerificationFailed(format!(
+                    "LayerNorm mean/var commitment mismatch at node {node_id}"
+                )));
             }
         }
     }
@@ -6187,34 +6952,32 @@ pub fn verify_aggregated_model_proof(
     // 2. Verify matmul sumcheck proofs
     for (node_id, matmul_proof) in &proof.matmul_proofs {
         let (a, b, c) = matmul_matrices.get(node_id).ok_or_else(|| {
-            AggregationError::VerificationFailed(
-                format!("No matmul data for node {node_id}")
-            )
+            AggregationError::VerificationFailed(format!("No matmul data for node {node_id}"))
         })?;
         verify_matmul_sumcheck(matmul_proof, a, b, c).map_err(|e| {
-            AggregationError::VerificationFailed(
-                format!("MatMul sumcheck node {node_id}: {e}")
-            )
+            AggregationError::VerificationFailed(format!("MatMul sumcheck node {node_id}: {e}"))
         })?;
     }
 
     // 2b. Verify attention proofs (matmul sub-proofs + softmax STARK)
     let attention_node_ids: Vec<usize> = proof.attention_proofs.iter().map(|(id, _)| *id).collect();
     for (node_id, attn_proof) in proof.attention_proofs {
-        let (_, config, attn_weights, attn_input) = attention_verify_data.iter()
+        let (_, config, attn_weights, attn_input) = attention_verify_data
+            .iter()
             .find(|(id, _, _, _)| *id == node_id)
-            .ok_or_else(|| AggregationError::VerificationFailed(
-                format!("No attention verify data for node {node_id}")
-            ))?;
-        verify_attention_proof_blake2s(
-            attn_proof, attn_input, attn_weights, config,
-        )?;
+            .ok_or_else(|| {
+                AggregationError::VerificationFailed(format!(
+                    "No attention verify data for node {node_id}"
+                ))
+            })?;
+        verify_attention_proof_blake2s(attn_proof, attn_input, attn_weights, config)?;
     }
 
     // 3. Verify unified STARK
     if let Some(stark_proof) = proof.unified_stark {
         verify_unified_stark_blake2s(
-            stark_proof, graph,
+            stark_proof,
+            graph,
             &proof.activation_claims,
             &proof.add_claims,
             &proof.mul_claims,
@@ -6267,7 +7030,12 @@ pub fn verify_aggregated_model_proof_onchain(
     let mut current = input.clone();
     let mut node_outputs: HashMap<usize, M31Matrix> = HashMap::new();
     let mut verifier_intermediates: Vec<(usize, M31Matrix)> = Vec::new();
-    let mut attention_verify_data: Vec<(usize, MultiHeadAttentionConfig, AttentionWeights, M31Matrix)> = Vec::new();
+    let mut attention_verify_data: Vec<(
+        usize,
+        MultiHeadAttentionConfig,
+        AttentionWeights,
+        M31Matrix,
+    )> = Vec::new();
     let mut ln_verify_data: Vec<(usize, Vec<M31>, Vec<M31>)> = Vec::new(); // (node_id, means, variances)
 
     let topo = graph.topological_order();
@@ -6283,33 +7051,43 @@ pub fn verify_aggregated_model_proof_onchain(
 
         match &node.op {
             GraphOp::MatMul { .. } => {
-                let weight = weights.get_weight(node.id).ok_or(
-                    ModelError::MissingWeight(node.id)
-                )?;
+                let weight = weights
+                    .get_weight(node.id)
+                    .ok_or(ModelError::MissingWeight(node.id))?;
                 let output = matmul_m31(&current, weight);
                 node_outputs.insert(node.id, output.clone());
                 current = output;
             }
-            GraphOp::Activation { activation_type, .. } => {
+            GraphOp::Activation {
+                activation_type, ..
+            } => {
                 let f = activation_type.as_fn();
                 let act_log_size = activation_type.recommended_table_log_size();
                 let table_mask = (1u32 << act_log_size) - 1;
-                let reduced_data: Vec<M31> = current.data.iter()
+                let reduced_data: Vec<M31> = current
+                    .data
+                    .iter()
                     .map(|&x| M31::from(x.0 & table_mask))
                     .collect();
                 let reduced = M31Matrix {
-                    rows: current.rows, cols: current.cols, data: reduced_data,
+                    rows: current.rows,
+                    cols: current.cols,
+                    data: reduced_data,
                 };
                 let output = crate::compiler::prove::apply_activation_pub(&reduced, &*f);
                 node_outputs.insert(node.id, output.clone());
                 current = output;
             }
             GraphOp::Add { .. } => {
-                let lhs = node.inputs.get(0)
+                let lhs = node
+                    .inputs
+                    .get(0)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
-                let rhs = node.inputs.get(1)
+                let rhs = node
+                    .inputs
+                    .get(1)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
@@ -6318,11 +7096,15 @@ pub fn verify_aggregated_model_proof_onchain(
                 current = output;
             }
             GraphOp::Mul { .. } => {
-                let lhs = node.inputs.get(0)
+                let lhs = node
+                    .inputs
+                    .get(0)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
-                let rhs = node.inputs.get(1)
+                let rhs = node
+                    .inputs
+                    .get(1)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
@@ -6341,18 +7123,25 @@ pub fn verify_aggregated_model_proof_onchain(
                 node_outputs.insert(node.id, rn.output_matrix.clone());
                 current = rn.output_matrix;
             }
-            GraphOp::Attention { config: attn_config } => {
+            GraphOp::Attention {
+                config: attn_config,
+            } => {
                 let w_q = weights.get_named_weight(node.id, "w_q");
                 let w_k = weights.get_named_weight(node.id, "w_k");
                 let w_v = weights.get_named_weight(node.id, "w_v");
                 let w_o = weights.get_named_weight(node.id, "w_o");
                 if let (Some(wq), Some(wk), Some(wv), Some(wo)) = (w_q, w_k, w_v, w_o) {
                     let attn_weights = AttentionWeights {
-                        w_q: wq.clone(), w_k: wk.clone(),
-                        w_v: wv.clone(), w_o: wo.clone(),
+                        w_q: wq.clone(),
+                        w_k: wk.clone(),
+                        w_v: wv.clone(),
+                        w_o: wo.clone(),
                     };
                     attention_verify_data.push((
-                        node.id, *attn_config, attn_weights.clone(), current.clone(),
+                        node.id,
+                        *attn_config,
+                        attn_weights.clone(),
+                        current.clone(),
                     ));
                     let inter = attention_forward(&current, &attn_weights, attn_config, false);
                     node_outputs.insert(node.id, inter.final_output.clone());
@@ -6362,18 +7151,24 @@ pub fn verify_aggregated_model_proof_onchain(
                 }
             }
             GraphOp::Embedding { .. } => {
-                let embed_table = weights.get_weight(node.id).ok_or(
-                    ModelError::MissingWeight(node.id)
-                )?;
+                let embed_table = weights
+                    .get_weight(node.id)
+                    .ok_or(ModelError::MissingWeight(node.id))?;
                 let token_u32s: Vec<u32> = current.data.iter().map(|m| m.0).collect();
                 let (output, _, _, _, _) = embedding_lookup(&token_u32s, embed_table);
                 node_outputs.insert(node.id, output.clone());
                 current = output;
             }
-            GraphOp::Conv2D { in_channels, out_channels, kernel_size, stride, padding } => {
-                let kernel = weights.get_weight(node.id).ok_or(
-                    ModelError::MissingWeight(node.id)
-                )?;
+            GraphOp::Conv2D {
+                in_channels,
+                out_channels,
+                kernel_size,
+                stride,
+                padding,
+            } => {
+                let kernel = weights
+                    .get_weight(node.id)
+                    .ok_or(ModelError::MissingWeight(node.id))?;
                 let im2col_config = Im2ColConfig {
                     in_channels: *in_channels,
                     kernel_size: *kernel_size,
@@ -6390,9 +7185,13 @@ pub fn verify_aggregated_model_proof_onchain(
             GraphOp::Quantize { params, .. } => {
                 let direct_params = crate::gadgets::quantize::QuantParams {
                     strategy: crate::gadgets::quantize::QuantStrategy::Direct,
-                    scale: 1.0, zero_point: 0, bits: 31,
+                    scale: 1.0,
+                    zero_point: 0,
+                    bits: 31,
                 };
-                let quantized: Vec<M31> = current.data.iter()
+                let quantized: Vec<M31> = current
+                    .data
+                    .iter()
                     .map(|&v| {
                         let f32_val = crate::gadgets::quantize::dequantize_value(v, &direct_params);
                         crate::gadgets::quantize::quantize_value(f32_val, params)
@@ -6408,10 +7207,10 @@ pub fn verify_aggregated_model_proof_onchain(
             }
             GraphOp::Dequantize { params, .. } => {
                 let table = build_dequantize_table(params);
-                let output_values: Vec<M31> = current.data.iter()
-                    .map(|&v| {
-                        table.lookup(v).unwrap_or(v)
-                    })
+                let output_values: Vec<M31> = current
+                    .data
+                    .iter()
+                    .map(|&v| table.lookup(v).unwrap_or(v))
                     .collect();
                 let output = M31Matrix {
                     rows: current.rows,
@@ -6434,27 +7233,21 @@ pub fn verify_aggregated_model_proof_onchain(
     }
 
     // 1b. Verify layer chain commitment
-    let expected_chain = compute_layer_chain_commitment(
-        input, &verifier_intermediates, &current,
-    );
+    let expected_chain = compute_layer_chain_commitment(input, &verifier_intermediates, &current);
     if expected_chain != proof.layer_chain_commitment {
-        return Err(AggregationError::VerificationFailed(
-            format!(
-                "Layer chain commitment mismatch: expected {:#x}, got {:#x}",
-                expected_chain, proof.layer_chain_commitment,
-            )
-        ));
+        return Err(AggregationError::VerificationFailed(format!(
+            "Layer chain commitment mismatch: expected {:#x}, got {:#x}",
+            expected_chain, proof.layer_chain_commitment,
+        )));
     }
 
     // 1c. Verify IO commitment
     let expected_io = compute_io_commitment(input, &current);
     if expected_io != proof.io_commitment {
-        return Err(AggregationError::VerificationFailed(
-            format!(
-                "IO commitment mismatch: expected {:#x}, got {:#x}",
-                expected_io, proof.io_commitment,
-            )
-        ));
+        return Err(AggregationError::VerificationFailed(format!(
+            "IO commitment mismatch: expected {:#x}, got {:#x}",
+            expected_io, proof.io_commitment,
+        )));
     }
 
     // 1d. Verify LayerNorm mean/variance commitments
@@ -6462,9 +7255,9 @@ pub fn verify_aggregated_model_proof_onchain(
         if idx < proof.layernorm_mean_var_commitments.len() {
             let expected = compute_layernorm_mean_var_commitment(means, variances);
             if expected != proof.layernorm_mean_var_commitments[idx] {
-                return Err(AggregationError::VerificationFailed(
-                    format!("LayerNorm mean/var commitment mismatch at node {node_id}")
-                ));
+                return Err(AggregationError::VerificationFailed(format!(
+                    "LayerNorm mean/var commitment mismatch at node {node_id}"
+                )));
             }
         }
     }
@@ -6472,66 +7265,72 @@ pub fn verify_aggregated_model_proof_onchain(
     // 2. Verify individual matmul sumcheck proofs (on-chain format, self-contained)
     for (node_id, matmul_proof) in &proof.matmul_proofs {
         verify_matmul_sumcheck_onchain(matmul_proof).map_err(|e| {
-            AggregationError::VerificationFailed(
-                format!("On-chain matmul sumcheck node {node_id}: {e}")
-            )
+            AggregationError::VerificationFailed(format!(
+                "On-chain matmul sumcheck node {node_id}: {e}"
+            ))
         })?;
     }
 
     // 2a. Verify batched matmul proofs
     for (batch_idx, batch) in proof.batched_matmul_proofs.iter().enumerate() {
         verify_batched_matmul_onchain(batch).map_err(|e| {
-            AggregationError::VerificationFailed(
-                format!("Batched matmul batch {batch_idx}: {e}")
-            )
+            AggregationError::VerificationFailed(format!("Batched matmul batch {batch_idx}: {e}"))
         })?;
     }
 
     // 2b. Verify attention on-chain proofs (matmul sub-proofs + softmax STARK)
     let attention_node_ids: Vec<usize> = proof.attention_proofs.iter().map(|(id, _)| *id).collect();
     for (node_id, attn_proof) in proof.attention_proofs {
-        let (_, config, _, _) = attention_verify_data.iter()
+        let (_, config, _, _) = attention_verify_data
+            .iter()
             .find(|(id, _, _, _)| *id == node_id)
-            .ok_or_else(|| AggregationError::VerificationFailed(
-                format!("No attention verify data for node {node_id}")
-            ))?;
+            .ok_or_else(|| {
+                AggregationError::VerificationFailed(format!(
+                    "No attention verify data for node {node_id}"
+                ))
+            })?;
         verify_attention_proof_onchain(attn_proof, config)?;
     }
 
     // 2c. Verify GKR proof (when present, replaces individual matmul sumcheck proofs)
     if let Some(ref gkr_proof) = proof.gkr_proof {
-        let circuit = crate::gkr::LayeredCircuit::from_graph(graph)
-            .map_err(|e| AggregationError::VerificationFailed(
-                format!("GKR circuit compilation: {e}")
-            ))?;
+        let circuit = crate::gkr::LayeredCircuit::from_graph(graph).map_err(|e| {
+            AggregationError::VerificationFailed(format!("GKR circuit compilation: {e}"))
+        })?;
 
         let mut gkr_channel = crate::crypto::poseidon_channel::PoseidonChannel::new();
-        crate::gkr::verify_gkr_with_weights(&circuit, gkr_proof, &current, weights, &mut gkr_channel)
-            .map_err(|e| AggregationError::VerificationFailed(
-                format!("GKR verification: {e}")
-            ))?;
+        crate::gkr::verify_gkr_with_weights(
+            &circuit,
+            gkr_proof,
+            &current,
+            weights,
+            &mut gkr_channel,
+        )
+        .map_err(|e| AggregationError::VerificationFailed(format!("GKR verification: {e}")))?;
     }
 
     // 2d. Verify STWO-native GKR batch proof (LogUp components)
     if let Some(ref gkr_data) = proof.gkr_batch_data {
         let mut gkr_channel = Poseidon252Channel::default();
-        gkr_channel.mix_felts(
-            &[SecureField::from(BaseField::from(proof.io_commitment.to_bytes_be()[31] as u32))],
-        );
+        gkr_channel.mix_felts(&[SecureField::from(BaseField::from(
+            proof.io_commitment.to_bytes_be()[31] as u32,
+        ))]);
 
         let _artifact = stwo_partially_verify_batch(
             gkr_data.gate_types.clone(),
             &gkr_data.proof,
             &mut gkr_channel,
-        ).map_err(|e| AggregationError::VerificationFailed(
-            format!("STWO GKR batch verification: {e:?}")
-        ))?;
+        )
+        .map_err(|e| {
+            AggregationError::VerificationFailed(format!("STWO GKR batch verification: {e:?}"))
+        })?;
     }
 
     // 3. Verify unified STARK (same Blake2s format for both paths)
     if let Some(stark_proof) = proof.unified_stark {
         verify_unified_stark_blake2s(
-            stark_proof, graph,
+            stark_proof,
+            graph,
             &proof.activation_claims,
             &proof.add_claims,
             &proof.mul_claims,
@@ -6548,7 +7347,9 @@ pub fn verify_aggregated_model_proof_onchain(
     // Collect matmul node IDs from the graph directly in GKR mode.
     let matmul_ids: Vec<usize> = if proof.gkr_proof.is_some() {
         // GKR covers all matmul layers — collect expected IDs from graph
-        graph.nodes.iter()
+        graph
+            .nodes
+            .iter()
             .filter(|n| matches!(&n.op, GraphOp::MatMul { .. } | GraphOp::Conv2D { .. }))
             .map(|n| n.id)
             .collect()
@@ -6592,17 +7393,19 @@ pub fn verify_aggregated_model_proof_onchain(
 fn verify_batched_matmul_onchain(
     batch: &BatchedMatMulProofOnChain,
 ) -> Result<(), AggregationError> {
-    use crate::crypto::poseidon_channel::{PoseidonChannel, securefield_to_felt};
+    use crate::crypto::poseidon_channel::{securefield_to_felt, PoseidonChannel};
 
     let log_k = batch.num_rounds as usize;
     if batch.round_polys.len() != log_k {
-        return Err(AggregationError::VerificationFailed(
-            format!("Batched round_polys count {} != num_rounds {}", batch.round_polys.len(), log_k)
-        ));
+        return Err(AggregationError::VerificationFailed(format!(
+            "Batched round_polys count {} != num_rounds {}",
+            batch.round_polys.len(),
+            log_k
+        )));
     }
     if batch.entries.is_empty() {
         return Err(AggregationError::VerificationFailed(
-            "Batched proof has no entries".into()
+            "Batched proof has no entries".into(),
         ));
     }
 
@@ -6621,12 +7424,10 @@ fn verify_batched_matmul_onchain(
     // Re-derive lambda from channel (must match prover's lambda)
     let lambda = channel.draw_qm31();
     if lambda != batch.lambda {
-        return Err(AggregationError::VerificationFailed(
-            format!(
-                "Batched lambda mismatch: re-derived {:?}, proof contains {:?}",
-                lambda, batch.lambda
-            )
-        ));
+        return Err(AggregationError::VerificationFailed(format!(
+            "Batched lambda mismatch: re-derived {:?}, proof contains {:?}",
+            lambda, batch.lambda
+        )));
     }
 
     // Verify combined_claimed_sum = Σ λ^i * claimed_sum_i
@@ -6637,12 +7438,10 @@ fn verify_batched_matmul_onchain(
         lambda_pow = lambda_pow * lambda;
     }
     if expected_combined != batch.combined_claimed_sum {
-        return Err(AggregationError::VerificationFailed(
-            format!(
-                "Batched combined_claimed_sum mismatch: expected {:?}, got {:?}",
-                expected_combined, batch.combined_claimed_sum
-            )
-        ));
+        return Err(AggregationError::VerificationFailed(format!(
+            "Batched combined_claimed_sum mismatch: expected {:?}, got {:?}",
+            expected_combined, batch.combined_claimed_sum
+        )));
     }
 
     // Verify sumcheck rounds with Fiat-Shamir challenge derivation
@@ -6653,9 +7452,10 @@ fn verify_batched_matmul_onchain(
         let round_sum = p_at_0 + p_at_1;
 
         if round_sum != current_sum {
-            return Err(AggregationError::VerificationFailed(
-                format!("Batched round sum {:?} != expected {:?}", round_sum, current_sum)
-            ));
+            return Err(AggregationError::VerificationFailed(format!(
+                "Batched round sum {:?} != expected {:?}",
+                round_sum, current_sum
+            )));
         }
 
         // Mix round polynomial into channel and draw per-round challenge
@@ -6675,12 +7475,10 @@ fn verify_batched_matmul_onchain(
         lambda_pow = lambda_pow * lambda;
     }
     if current_sum != expected_final {
-        return Err(AggregationError::VerificationFailed(
-            format!(
-                "Batched final eval mismatch: current_sum {:?} != Σ λ^i·a_i·b_i {:?}",
-                current_sum, expected_final
-            )
-        ));
+        return Err(AggregationError::VerificationFailed(format!(
+            "Batched final eval mismatch: current_sum {:?} != Σ λ^i·a_i·b_i {:?}",
+            current_sum, expected_final
+        )));
     }
 
     Ok(())
@@ -6698,54 +7496,52 @@ fn verify_attention_proof_onchain(
     use crate::components::matmul::verify_matmul_sumcheck_onchain;
 
     // Q projection
-    verify_matmul_sumcheck_onchain(&proof.q_proof)
-        .map_err(|e| AggregationError::VerificationFailed(
-            format!("Attention on-chain Q projection: {e}")
-        ))?;
+    verify_matmul_sumcheck_onchain(&proof.q_proof).map_err(|e| {
+        AggregationError::VerificationFailed(format!("Attention on-chain Q projection: {e}"))
+    })?;
 
     // K projection
-    verify_matmul_sumcheck_onchain(&proof.k_proof)
-        .map_err(|e| AggregationError::VerificationFailed(
-            format!("Attention on-chain K projection: {e}")
-        ))?;
+    verify_matmul_sumcheck_onchain(&proof.k_proof).map_err(|e| {
+        AggregationError::VerificationFailed(format!("Attention on-chain K projection: {e}"))
+    })?;
 
     // V projection
-    verify_matmul_sumcheck_onchain(&proof.v_proof)
-        .map_err(|e| AggregationError::VerificationFailed(
-            format!("Attention on-chain V projection: {e}")
-        ))?;
+    verify_matmul_sumcheck_onchain(&proof.v_proof).map_err(|e| {
+        AggregationError::VerificationFailed(format!("Attention on-chain V projection: {e}"))
+    })?;
 
     // Per-head score proofs
     if proof.score_proofs.len() != config.num_heads {
-        return Err(AggregationError::VerificationFailed(
-            format!("Expected {} on-chain score proofs, got {}", config.num_heads, proof.score_proofs.len())
-        ));
+        return Err(AggregationError::VerificationFailed(format!(
+            "Expected {} on-chain score proofs, got {}",
+            config.num_heads,
+            proof.score_proofs.len()
+        )));
     }
     for (h, sp) in proof.score_proofs.iter().enumerate() {
-        verify_matmul_sumcheck_onchain(sp)
-            .map_err(|e| AggregationError::VerificationFailed(
-                format!("Attention on-chain score head {h}: {e}")
-            ))?;
+        verify_matmul_sumcheck_onchain(sp).map_err(|e| {
+            AggregationError::VerificationFailed(format!("Attention on-chain score head {h}: {e}"))
+        })?;
     }
 
     // Per-head attn×V proofs
     if proof.attn_v_proofs.len() != config.num_heads {
-        return Err(AggregationError::VerificationFailed(
-            format!("Expected {} on-chain attn_v proofs, got {}", config.num_heads, proof.attn_v_proofs.len())
-        ));
+        return Err(AggregationError::VerificationFailed(format!(
+            "Expected {} on-chain attn_v proofs, got {}",
+            config.num_heads,
+            proof.attn_v_proofs.len()
+        )));
     }
     for (h, avp) in proof.attn_v_proofs.iter().enumerate() {
-        verify_matmul_sumcheck_onchain(avp)
-            .map_err(|e| AggregationError::VerificationFailed(
-                format!("Attention on-chain attn_v head {h}: {e}")
-            ))?;
+        verify_matmul_sumcheck_onchain(avp).map_err(|e| {
+            AggregationError::VerificationFailed(format!("Attention on-chain attn_v head {h}: {e}"))
+        })?;
     }
 
     // Output projection
-    verify_matmul_sumcheck_onchain(&proof.output_proof)
-        .map_err(|e| AggregationError::VerificationFailed(
-            format!("Attention on-chain output projection: {e}")
-        ))?;
+    verify_matmul_sumcheck_onchain(&proof.output_proof).map_err(|e| {
+        AggregationError::VerificationFailed(format!("Attention on-chain output projection: {e}"))
+    })?;
 
     // Softmax exp STARK
     verify_attention_softmax_stark(
@@ -6791,16 +7587,36 @@ fn verify_model_completeness(
 
     for node in &graph.nodes {
         match &node.op {
-            GraphOp::MatMul { .. } | GraphOp::Conv2D { .. } => { expected_matmul.insert(node.id); }
-            GraphOp::Activation { .. } => { expected_activation.insert(node.id); }
-            GraphOp::Add { .. } => { expected_add.insert(node.id); }
-            GraphOp::Mul { .. } => { expected_mul.insert(node.id); }
-            GraphOp::LayerNorm { .. } => { expected_layernorm.insert(node.id); }
-            GraphOp::RMSNorm { .. } => { expected_rmsnorm.insert(node.id); }
-            GraphOp::Attention { .. } => { expected_attention.insert(node.id); }
-            GraphOp::Embedding { .. } => { expected_embedding.insert(node.id); }
-            GraphOp::Quantize { .. } => { expected_quantize.insert(node.id); }
-            GraphOp::Dequantize { .. } => { expected_dequantize.insert(node.id); }
+            GraphOp::MatMul { .. } | GraphOp::Conv2D { .. } => {
+                expected_matmul.insert(node.id);
+            }
+            GraphOp::Activation { .. } => {
+                expected_activation.insert(node.id);
+            }
+            GraphOp::Add { .. } => {
+                expected_add.insert(node.id);
+            }
+            GraphOp::Mul { .. } => {
+                expected_mul.insert(node.id);
+            }
+            GraphOp::LayerNorm { .. } => {
+                expected_layernorm.insert(node.id);
+            }
+            GraphOp::RMSNorm { .. } => {
+                expected_rmsnorm.insert(node.id);
+            }
+            GraphOp::Attention { .. } => {
+                expected_attention.insert(node.id);
+            }
+            GraphOp::Embedding { .. } => {
+                expected_embedding.insert(node.id);
+            }
+            GraphOp::Quantize { .. } => {
+                expected_quantize.insert(node.id);
+            }
+            GraphOp::Dequantize { .. } => {
+                expected_dequantize.insert(node.id);
+            }
             _ => {}
         }
     }
@@ -6818,7 +7634,11 @@ fn verify_model_completeness(
         // Detect duplicates: actual_ids.len() > actual.len() means duplicate node IDs
         if actual_ids.len() > actual.len() {
             let mut seen = HashSet::new();
-            let dups: Vec<usize> = actual_ids.iter().filter(|id| !seen.insert(**id)).copied().collect();
+            let dups: Vec<usize> = actual_ids
+                .iter()
+                .filter(|id| !seen.insert(**id))
+                .copied()
+                .collect();
             mismatches.push(format!("{label}: duplicate node IDs {dups:?}"));
         }
         let missing: Vec<usize> = expected.difference(&actual).copied().collect();
@@ -6836,20 +7656,66 @@ fn verify_model_completeness(
     }
 
     check_identity("matmul", &expected_matmul, matmul_node_ids, &mut mismatches);
-    check_identity("activation", &expected_activation, &claims_to_ids(activation_claims), &mut mismatches);
-    check_identity("add", &expected_add, &claims_to_ids(add_claims), &mut mismatches);
-    check_identity("mul", &expected_mul, &claims_to_ids(mul_claims), &mut mismatches);
-    check_identity("layernorm", &expected_layernorm, &claims_to_ids(layernorm_claims), &mut mismatches);
-    check_identity("rmsnorm", &expected_rmsnorm, &claims_to_ids(rmsnorm_claims), &mut mismatches);
-    check_identity("attention", &expected_attention, attention_node_ids, &mut mismatches);
-    check_identity("embedding", &expected_embedding, &claims_to_ids(embedding_claims), &mut mismatches);
-    check_identity("quantize", &expected_quantize, &claims_to_ids(quantize_claims), &mut mismatches);
-    check_identity("dequantize", &expected_dequantize, &claims_to_ids(dequantize_claims), &mut mismatches);
+    check_identity(
+        "activation",
+        &expected_activation,
+        &claims_to_ids(activation_claims),
+        &mut mismatches,
+    );
+    check_identity(
+        "add",
+        &expected_add,
+        &claims_to_ids(add_claims),
+        &mut mismatches,
+    );
+    check_identity(
+        "mul",
+        &expected_mul,
+        &claims_to_ids(mul_claims),
+        &mut mismatches,
+    );
+    check_identity(
+        "layernorm",
+        &expected_layernorm,
+        &claims_to_ids(layernorm_claims),
+        &mut mismatches,
+    );
+    check_identity(
+        "rmsnorm",
+        &expected_rmsnorm,
+        &claims_to_ids(rmsnorm_claims),
+        &mut mismatches,
+    );
+    check_identity(
+        "attention",
+        &expected_attention,
+        attention_node_ids,
+        &mut mismatches,
+    );
+    check_identity(
+        "embedding",
+        &expected_embedding,
+        &claims_to_ids(embedding_claims),
+        &mut mismatches,
+    );
+    check_identity(
+        "quantize",
+        &expected_quantize,
+        &claims_to_ids(quantize_claims),
+        &mut mismatches,
+    );
+    check_identity(
+        "dequantize",
+        &expected_dequantize,
+        &claims_to_ids(dequantize_claims),
+        &mut mismatches,
+    );
 
     if !mismatches.is_empty() {
-        return Err(AggregationError::VerificationFailed(
-            format!("Model completeness check failed: {}", mismatches.join(", "))
-        ));
+        return Err(AggregationError::VerificationFailed(format!(
+            "Model completeness check failed: {}",
+            mismatches.join(", ")
+        )));
     }
 
     Ok(())
@@ -6892,9 +7758,15 @@ fn verify_unified_stark_blake2s(
     // Step 1: Build dummy components to get per-tree column sizes.
     // Column structure depends only on log_n_rows and evaluator type, NOT on lookup elements.
     let dummy_sizes = build_component_tree_sizes(
-        activation_claims, add_claims, mul_claims,
-        layernorm_claims, rmsnorm_claims, embedding_claims, quantize_claims,
-        dequantize_claims, &layernorm_dims,
+        activation_claims,
+        add_claims,
+        mul_claims,
+        layernorm_claims,
+        rmsnorm_claims,
+        embedding_claims,
+        quantize_claims,
+        dequantize_claims,
+        &layernorm_dims,
     );
 
     // Step 2: Set up channel and commitment scheme verifier
@@ -6955,7 +7827,9 @@ fn verify_unified_stark_blake2s(
             let ls = claim.trace_rows.ilog2();
             // Look up activation type tag from graph for M1 domain separation.
             let type_tag = match &graph.nodes.get(claim.layer_index).map(|n| &n.op) {
-                Some(GraphOp::Activation { activation_type, .. }) => activation_type.type_tag(),
+                Some(GraphOp::Activation {
+                    activation_type, ..
+                }) => activation_type.type_tag(),
                 _ => 0, // fallback for malformed proofs (will fail LogUp anyway)
             };
             let component = FrameworkComponent::new(
@@ -7084,17 +7958,11 @@ fn verify_unified_stark_blake2s(
     }
 
     // Step 7: Verify
-    let component_refs: Vec<&dyn Component> = component_storage
-        .iter()
-        .map(|c| c.as_component())
-        .collect();
+    let component_refs: Vec<&dyn Component> =
+        component_storage.iter().map(|c| c.as_component()).collect();
 
-    stwo_verify::<Blake2sMerkleChannel>(
-        &component_refs,
-        channel,
-        &mut commitment_scheme,
-        proof,
-    ).map_err(|e| AggregationError::VerificationFailed(format!("Unified STARK: {e}")))?;
+    stwo_verify::<Blake2sMerkleChannel>(&component_refs, channel, &mut commitment_scheme, proof)
+        .map_err(|e| AggregationError::VerificationFailed(format!("Unified STARK: {e}")))?;
 
     Ok(())
 }
@@ -7120,7 +7988,7 @@ fn verify_attention_proof_blake2s(
     // Verify forward pass output consistency
     if inter.final_output.data != proof.intermediates.final_output.data {
         return Err(AggregationError::VerificationFailed(
-            "Attention forward pass output mismatch".into()
+            "Attention forward pass output mismatch".into(),
         ));
     }
 
@@ -7135,22 +8003,19 @@ fn verify_attention_proof_blake2s(
     let v_p = pad_to_pow2(&inter.v);
 
     // 1. Q projection: input × W_Q = Q
-    verify_matmul_sumcheck(&proof.q_proof, &input_p, &wq_p, &q_p)
-        .map_err(|e| AggregationError::VerificationFailed(
-            format!("Attention Q projection: {e}")
-        ))?;
+    verify_matmul_sumcheck(&proof.q_proof, &input_p, &wq_p, &q_p).map_err(|e| {
+        AggregationError::VerificationFailed(format!("Attention Q projection: {e}"))
+    })?;
 
     // 2. K projection: input × W_K = K
-    verify_matmul_sumcheck(&proof.k_proof, &input_p, &wk_p, &k_p)
-        .map_err(|e| AggregationError::VerificationFailed(
-            format!("Attention K projection: {e}")
-        ))?;
+    verify_matmul_sumcheck(&proof.k_proof, &input_p, &wk_p, &k_p).map_err(|e| {
+        AggregationError::VerificationFailed(format!("Attention K projection: {e}"))
+    })?;
 
     // 3. V projection: input × W_V = V
-    verify_matmul_sumcheck(&proof.v_proof, &input_p, &wv_p, &v_p)
-        .map_err(|e| AggregationError::VerificationFailed(
-            format!("Attention V projection: {e}")
-        ))?;
+    verify_matmul_sumcheck(&proof.v_proof, &input_p, &wv_p, &v_p).map_err(|e| {
+        AggregationError::VerificationFailed(format!("Attention V projection: {e}"))
+    })?;
 
     // Split for per-head verification: Q into num_heads, K/V into num_kv_heads (GQA/MQA)
     let q_heads = split_heads(&inter.q, config.num_heads);
@@ -7159,14 +8024,18 @@ fn verify_attention_proof_blake2s(
     let group_size = config.group_size();
 
     if proof.score_proofs.len() != config.num_heads {
-        return Err(AggregationError::VerificationFailed(
-            format!("Expected {} score proofs, got {}", config.num_heads, proof.score_proofs.len())
-        ));
+        return Err(AggregationError::VerificationFailed(format!(
+            "Expected {} score proofs, got {}",
+            config.num_heads,
+            proof.score_proofs.len()
+        )));
     }
     if proof.attn_v_proofs.len() != config.num_heads {
-        return Err(AggregationError::VerificationFailed(
-            format!("Expected {} attn_v proofs, got {}", config.num_heads, proof.attn_v_proofs.len())
-        ));
+        return Err(AggregationError::VerificationFailed(format!(
+            "Expected {} attn_v proofs, got {}",
+            config.num_heads,
+            proof.attn_v_proofs.len()
+        )));
     }
 
     for h in 0..config.num_heads {
@@ -7178,29 +8047,26 @@ fn verify_attention_proof_blake2s(
         let k_t_p = pad_to_pow2(&k_t);
         let scores_p = matmul_m31(&q_h_p, &k_t_p);
 
-        verify_matmul_sumcheck(&proof.score_proofs[h], &q_h_p, &k_t_p, &scores_p)
-            .map_err(|e| AggregationError::VerificationFailed(
-                format!("Attention score head {h}: {e}")
-            ))?;
+        verify_matmul_sumcheck(&proof.score_proofs[h], &q_h_p, &k_t_p, &scores_p).map_err(|e| {
+            AggregationError::VerificationFailed(format!("Attention score head {h}: {e}"))
+        })?;
 
         // Per-head: context = softmax × V_kv (padded)
         let soft_p = pad_to_pow2(&inter.softmax_outputs[h]);
         let v_h_p = pad_to_pow2(&kv_heads_v[kv_idx]);
         let context_p = matmul_m31(&soft_p, &v_h_p);
 
-        verify_matmul_sumcheck(&proof.attn_v_proofs[h], &soft_p, &v_h_p, &context_p)
-            .map_err(|e| AggregationError::VerificationFailed(
-                format!("Attention attn_v head {h}: {e}")
-            ))?;
+        verify_matmul_sumcheck(&proof.attn_v_proofs[h], &soft_p, &v_h_p, &context_p).map_err(
+            |e| AggregationError::VerificationFailed(format!("Attention attn_v head {h}: {e}")),
+        )?;
     }
 
     // Output projection: concat × W_O = output (padded)
     let concat_p = pad_to_pow2(&inter.concat);
     let out_p = pad_to_pow2(&inter.final_output);
-    verify_matmul_sumcheck(&proof.output_proof, &concat_p, &wo_p, &out_p)
-        .map_err(|e| AggregationError::VerificationFailed(
-            format!("Attention output projection: {e}")
-        ))?;
+    verify_matmul_sumcheck(&proof.output_proof, &concat_p, &wo_p, &out_p).map_err(|e| {
+        AggregationError::VerificationFailed(format!("Attention output projection: {e}"))
+    })?;
 
     // Verify softmax exp STARK
     verify_attention_softmax_stark(
@@ -7276,9 +8142,8 @@ fn verify_attention_softmax_stark(
         channel,
         &mut commitment_scheme,
         proof,
-    ).map_err(|e| AggregationError::VerificationFailed(
-        format!("Attention softmax STARK: {e}")
-    ))?;
+    )
+    .map_err(|e| AggregationError::VerificationFailed(format!("Attention softmax STARK: {e}")))?;
 
     Ok(())
 }
@@ -7439,12 +8304,22 @@ fn build_component_tree_sizes(
     let mut tree2 = Vec::new();
 
     for bounds in &all_bounds {
-        if bounds.len() > 0 { tree0.extend_from_slice(&bounds[0]); }
-        if bounds.len() > 1 { tree1.extend_from_slice(&bounds[1]); }
-        if bounds.len() > 2 { tree2.extend_from_slice(&bounds[2]); }
+        if bounds.len() > 0 {
+            tree0.extend_from_slice(&bounds[0]);
+        }
+        if bounds.len() > 1 {
+            tree1.extend_from_slice(&bounds[1]);
+        }
+        if bounds.len() > 2 {
+            tree2.extend_from_slice(&bounds[2]);
+        }
     }
 
-    TreeColumnSizes { tree0, tree1, tree2 }
+    TreeColumnSizes {
+        tree0,
+        tree1,
+        tree2,
+    }
 }
 
 #[cfg(test)]
@@ -7486,11 +8361,17 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w.set(i, j, M31::from((i * 2 + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
         weights.add_weight(0, w);
 
         let proof = prove_model_aggregated(&graph, &input, &weights)
@@ -7514,20 +8395,34 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
 
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
 
         let mut w2 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w2.set(i, j, M31::from(((i * j) % 5 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w2.set(i, j, M31::from(((i * j) % 5 + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
 
         let mut w4 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w4.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w4.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(4, w4);
 
         let proof = prove_model_aggregated(&graph, &input, &weights)
@@ -7538,7 +8433,11 @@ mod tests {
         // 3 sumcheck proofs (one per matmul)
         assert_eq!(proof.matmul_proofs.len(), 3, "3 matmul sumcheck proofs");
         // 2 activation claims
-        assert_eq!(proof.activation_claims.len(), 2, "2 activation layers in STARK");
+        assert_eq!(
+            proof.activation_claims.len(),
+            2,
+            "2 activation layers in STARK"
+        );
         // Total: 5 proven layers
         assert_eq!(proof.num_proven_layers(), 5);
         // Output shape
@@ -7560,8 +8459,16 @@ mod tests {
                 output: M31Matrix::new(1, 1),
             },
             activation_claims: vec![
-                LayerClaim { layer_index: 0, claimed_sum: SecureField::from(M31::from(0)), trace_rows: 16 },
-                LayerClaim { layer_index: 1, claimed_sum: SecureField::from(M31::from(0)), trace_rows: 16 },
+                LayerClaim {
+                    layer_index: 0,
+                    claimed_sum: SecureField::from(M31::from(0)),
+                    trace_rows: 16,
+                },
+                LayerClaim {
+                    layer_index: 1,
+                    claimed_sum: SecureField::from(M31::from(0)),
+                    trace_rows: 16,
+                },
             ],
             attention_proofs: Vec::new(),
             embedding_claims: Vec::new(),
@@ -7579,8 +8486,16 @@ mod tests {
     #[test]
     fn test_summarize_claims() {
         let claims = vec![
-            LayerClaim { layer_index: 0, claimed_sum: SecureField::from(M31::from(0)), trace_rows: 1000 },
-            LayerClaim { layer_index: 1, claimed_sum: SecureField::from(M31::from(0)), trace_rows: 2000 },
+            LayerClaim {
+                layer_index: 0,
+                claimed_sum: SecureField::from(M31::from(0)),
+                trace_rows: 1000,
+            },
+            LayerClaim {
+                layer_index: 1,
+                claimed_sum: SecureField::from(M31::from(0)),
+                trace_rows: 2000,
+            },
         ];
         let (num, total) = summarize_claims(&claims);
         assert_eq!(num, 2);
@@ -7601,17 +8516,31 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w2.set(i, j, M31::from(((i * j) % 5 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w2.set(i, j, M31::from(((i * j) % 5 + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
         let mut w4 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w4.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w4.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(4, w4);
 
         let proof = prove_model_aggregated_onchain(&graph, &input, &weights)
@@ -7635,11 +8564,17 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w.set(i, j, M31::from((i * 2 + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
         weights.add_weight(0, w);
 
         let proof = prove_model_aggregated_onchain(&graph, &input, &weights)
@@ -7658,21 +8593,28 @@ mod tests {
     #[test]
     fn test_aggregated_onchain_auto_mlp() {
         let mut builder = GraphBuilder::new((1, 4));
-        builder
-            .linear(4)
-            .activation(ActivationType::ReLU)
-            .linear(2);
+        builder.linear(4).activation(ActivationType::ReLU).linear(2);
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w2.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
 
         let proof = prove_model_aggregated_onchain_auto(&graph, &input, &weights)
@@ -7690,11 +8632,17 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w.set(i, j, M31::from((i * 2 + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
         weights.add_weight(0, w);
 
         let proof = prove_model_aggregated_onchain_auto(&graph, &input, &weights)
@@ -7717,30 +8665,55 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 8);
-        for j in 0..8 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..8 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(8, 8);
-        for i in 0..8 { for j in 0..8 { w0.set(i, j, M31::from(((i + j) % 5 + 1) as u32)); } }
+        for i in 0..8 {
+            for j in 0..8 {
+                w0.set(i, j, M31::from(((i + j) % 5 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(8, 8);
-        for i in 0..8 { for j in 0..8 { w2.set(i, j, M31::from(((i * j) % 7 + 1) as u32)); } }
+        for i in 0..8 {
+            for j in 0..8 {
+                w2.set(i, j, M31::from(((i * j) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
         let mut w4 = M31Matrix::new(8, 4);
-        for i in 0..8 { for j in 0..4 { w4.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..8 {
+            for j in 0..4 {
+                w4.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(4, w4);
 
         let proof = prove_model_aggregated(&graph, &input, &weights)
             .expect("aggregated proving with residual Add should succeed");
 
         assert_eq!(proof.matmul_proofs.len(), 3, "3 matmul proofs");
-        assert_eq!(proof.activation_claims.len(), 1, "1 activation claim (ReLU)");
+        assert_eq!(
+            proof.activation_claims.len(),
+            1,
+            "1 activation claim (ReLU)"
+        );
         assert_eq!(proof.add_claims.len(), 1, "1 Add claim");
         assert_eq!(proof.mul_claims.len(), 0, "no Mul claims");
         assert_eq!(proof.layernorm_claims.len(), 0, "no LayerNorm claims");
-        assert_eq!(proof.num_proven_layers(), 5, "total: 3 matmul + 1 activation + 1 add");
+        assert_eq!(
+            proof.num_proven_layers(),
+            5,
+            "total: 3 matmul + 1 activation + 1 add"
+        );
         // Unified STARK covers both activation and add
-        assert!(proof.unified_stark.is_some(), "unified STARK covers activation + add");
+        assert!(
+            proof.unified_stark.is_some(),
+            "unified STARK covers activation + add"
+        );
     }
 
     #[test]
@@ -7755,17 +8728,31 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 8);
-        for j in 0..8 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..8 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(8, 8);
-        for i in 0..8 { for j in 0..8 { w0.set(i, j, M31::from(((i + j) % 5 + 1) as u32)); } }
+        for i in 0..8 {
+            for j in 0..8 {
+                w0.set(i, j, M31::from(((i + j) % 5 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(8, 8);
-        for i in 0..8 { for j in 0..8 { w2.set(i, j, M31::from(((i * j) % 7 + 1) as u32)); } }
+        for i in 0..8 {
+            for j in 0..8 {
+                w2.set(i, j, M31::from(((i * j) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
         let mut w4 = M31Matrix::new(8, 4);
-        for i in 0..8 { for j in 0..4 { w4.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..8 {
+            for j in 0..4 {
+                w4.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(4, w4);
 
         let proof = prove_model_aggregated_onchain(&graph, &input, &weights)
@@ -7788,17 +8775,31 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 5 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 5 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w1 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w1.set(i, j, M31::from(((i + j + 1) % 7 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w1.set(i, j, M31::from(((i + j + 1) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(1, w1);
         let mut w3 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w3.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w3.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(3, w3);
 
         let proof = prove_model_aggregated(&graph, &input, &weights)
@@ -7820,15 +8821,21 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w.set(i, j, M31::from((i * 2 + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
         weights.add_weight(0, w);
 
-        let proof = prove_model_aggregated(&graph, &input, &weights)
-            .expect("proving should succeed");
+        let proof =
+            prove_model_aggregated(&graph, &input, &weights).expect("proving should succeed");
         assert!(proof.unified_stark.is_none());
 
         verify_aggregated_model_proof(proof, &graph, &input, &weights)
@@ -7848,21 +8855,35 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w2.set(i, j, M31::from(((i * j) % 5 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w2.set(i, j, M31::from(((i * j) % 5 + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
         let mut w4 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w4.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w4.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(4, w4);
 
-        let proof = prove_model_aggregated(&graph, &input, &weights)
-            .expect("proving should succeed");
+        let proof =
+            prove_model_aggregated(&graph, &input, &weights).expect("proving should succeed");
         assert!(proof.unified_stark.is_some());
         assert_eq!(proof.matmul_proofs.len(), 3);
         assert_eq!(proof.activation_claims.len(), 2);
@@ -7876,7 +8897,9 @@ mod tests {
     #[test]
     fn test_layer_chain_commitment_deterministic() {
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut output = M31Matrix::new(1, 2);
         output.set(0, 0, M31::from(10));
@@ -7892,7 +8915,9 @@ mod tests {
     #[test]
     fn test_layer_chain_commitment_different_intermediates() {
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
         let mut output = M31Matrix::new(1, 2);
         output.set(0, 0, M31::from(10));
         output.set(0, 1, M31::from(20));
@@ -7904,7 +8929,10 @@ mod tests {
 
         let c1 = compute_layer_chain_commitment(&input, &inter1, &output);
         let c2 = compute_layer_chain_commitment(&input, &inter2, &output);
-        assert_ne!(c1, c2, "different intermediates should produce different commitments");
+        assert_ne!(
+            c1, c2,
+            "different intermediates should produce different commitments"
+        );
     }
 
     #[test]
@@ -7913,12 +8941,16 @@ mod tests {
         // This was the C5 vulnerability: the old 16-sample approach only checked
         // evenly-spaced positions, so an attacker could tamper with unsampled elements.
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
         let output = M31Matrix::new(1, 2);
 
         // Create a 1×64 intermediate (larger than the old SAMPLE_SIZE=16)
         let mut inter = M31Matrix::new(1, 64);
-        for j in 0..64 { inter.set(0, j, M31::from(j as u32)); }
+        for j in 0..64 {
+            inter.set(0, j, M31::from(j as u32));
+        }
         let intermediates = vec![(0, inter.clone())];
         let original = compute_layer_chain_commitment(&input, &intermediates, &output);
 
@@ -7927,7 +8959,8 @@ mod tests {
             let mut tampered = inter.clone();
             tampered.data[pos] = M31::from(9999);
             let tampered_intermediates = vec![(0, tampered)];
-            let tampered_hash = compute_layer_chain_commitment(&input, &tampered_intermediates, &output);
+            let tampered_hash =
+                compute_layer_chain_commitment(&input, &tampered_intermediates, &output);
             assert_ne!(
                 original, tampered_hash,
                 "Changing element at position {pos} must change the commitment"
@@ -7942,22 +8975,33 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w2.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
 
-        let proof = prove_model_aggregated(&graph, &input, &weights)
-            .expect("proving should succeed");
+        let proof =
+            prove_model_aggregated(&graph, &input, &weights).expect("proving should succeed");
 
         // Layer chain commitment should be non-zero
         assert_ne!(
-            proof.layer_chain_commitment, FieldElement::ZERO,
+            proof.layer_chain_commitment,
+            FieldElement::ZERO,
             "layer chain commitment should be non-zero for multi-layer model"
         );
 
@@ -7973,22 +9017,31 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w.set(i, j, M31::from((i * 2 + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
         weights.add_weight(0, w);
 
-        let mut proof = prove_model_aggregated(&graph, &input, &weights)
-            .expect("proving should succeed");
+        let mut proof =
+            prove_model_aggregated(&graph, &input, &weights).expect("proving should succeed");
 
         // Tamper with the layer chain commitment
         proof.layer_chain_commitment = FieldElement::from(0xdeadbeefu64);
 
         // Verification should fail
         let result = verify_aggregated_model_proof(proof, &graph, &input, &weights);
-        assert!(result.is_err(), "tampered chain commitment should fail verification");
+        assert!(
+            result.is_err(),
+            "tampered chain commitment should fail verification"
+        );
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("Layer chain commitment mismatch"),
@@ -8005,15 +9058,21 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w.set(i, j, M31::from((i * 2 + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
         weights.add_weight(0, w);
 
-        let proof = prove_model_aggregated(&graph, &input, &weights)
-            .expect("proving should succeed");
+        let proof =
+            prove_model_aggregated(&graph, &input, &weights).expect("proving should succeed");
 
         // IO commitment should be non-zero
         assert_ne!(proof.io_commitment, FieldElement::ZERO);
@@ -8034,22 +9093,31 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w.set(i, j, M31::from((i * 2 + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
         weights.add_weight(0, w);
 
-        let mut proof = prove_model_aggregated(&graph, &input, &weights)
-            .expect("proving should succeed");
+        let mut proof =
+            prove_model_aggregated(&graph, &input, &weights).expect("proving should succeed");
 
         // Tamper with the IO commitment (simulate replay attack)
         proof.io_commitment = FieldElement::from(0xcafebabeu64);
 
         // Verification should fail
         let result = verify_aggregated_model_proof(proof, &graph, &input, &weights);
-        assert!(result.is_err(), "tampered IO commitment should fail verification");
+        assert!(
+            result.is_err(),
+            "tampered IO commitment should fail verification"
+        );
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("IO commitment mismatch"),
@@ -8065,20 +9133,28 @@ mod tests {
 
         let mut weights = GraphWeights::new();
         let mut w = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w.set(i, j, M31::from((i * 2 + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
         weights.add_weight(0, w);
 
         // Prove with input 1
         let mut input1 = M31Matrix::new(1, 4);
-        for j in 0..4 { input1.set(0, j, M31::from((j + 1) as u32)); }
-        let proof1 = prove_model_aggregated(&graph, &input1, &weights)
-            .expect("proving should succeed");
+        for j in 0..4 {
+            input1.set(0, j, M31::from((j + 1) as u32));
+        }
+        let proof1 =
+            prove_model_aggregated(&graph, &input1, &weights).expect("proving should succeed");
 
         // Prove with input 2
         let mut input2 = M31Matrix::new(1, 4);
-        for j in 0..4 { input2.set(0, j, M31::from((j + 10) as u32)); }
-        let proof2 = prove_model_aggregated(&graph, &input2, &weights)
-            .expect("proving should succeed");
+        for j in 0..4 {
+            input2.set(0, j, M31::from((j + 10) as u32));
+        }
+        let proof2 =
+            prove_model_aggregated(&graph, &input2, &weights).expect("proving should succeed");
 
         // IO commitments should differ
         assert_ne!(
@@ -8088,7 +9164,10 @@ mod tests {
 
         // Trying to verify proof1 against input2 should fail (chain commitment will catch it first)
         let result = verify_aggregated_model_proof(proof1, &graph, &input2, &weights);
-        assert!(result.is_err(), "proof for input1 should not verify against input2");
+        assert!(
+            result.is_err(),
+            "proof for input1 should not verify against input2"
+        );
     }
 
     // === Model Completeness Tests ===
@@ -8101,18 +9180,28 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w2.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
 
-        let proof = prove_model_aggregated(&graph, &input, &weights)
-            .expect("proving should succeed");
+        let proof =
+            prove_model_aggregated(&graph, &input, &weights).expect("proving should succeed");
 
         // Should have 2 matmul proofs + 1 activation claim = 3 proven layers
         assert_eq!(proof.matmul_proofs.len(), 2);
@@ -8130,18 +9219,28 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w1 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w1.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w1.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(1, w1);
 
-        let mut proof = prove_model_aggregated(&graph, &input, &weights)
-            .expect("proving should succeed");
+        let mut proof =
+            prove_model_aggregated(&graph, &input, &weights).expect("proving should succeed");
 
         // Remove one matmul proof to simulate incomplete proof
         assert_eq!(proof.matmul_proofs.len(), 2);
@@ -8149,7 +9248,10 @@ mod tests {
 
         // Verification should fail completeness check
         let result = verify_aggregated_model_proof(proof, &graph, &input, &weights);
-        assert!(result.is_err(), "missing matmul proof should fail completeness");
+        assert!(
+            result.is_err(),
+            "missing matmul proof should fail completeness"
+        );
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("Model completeness") && err_msg.contains("matmul"),
@@ -8165,18 +9267,28 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w1 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w1.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w1.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(1, w1);
 
-        let mut proof = prove_model_aggregated(&graph, &input, &weights)
-            .expect("proving should succeed");
+        let mut proof =
+            prove_model_aggregated(&graph, &input, &weights).expect("proving should succeed");
 
         // Swap: duplicate node 0's proof in place of node 1's.
         // Count stays 2, but node 1 is missing.
@@ -8185,7 +9297,10 @@ mod tests {
         proof.matmul_proofs[1] = first_proof;
 
         let result = verify_aggregated_model_proof(proof, &graph, &input, &weights);
-        assert!(result.is_err(), "duplicate matmul node IDs should fail completeness");
+        assert!(
+            result.is_err(),
+            "duplicate matmul node IDs should fail completeness"
+        );
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("missing") || err_msg.contains("duplicate"),
@@ -8194,7 +9309,11 @@ mod tests {
     }
 
     /// Helper: build a graph with an explicit Attention node and matching weights.
-    fn build_attention_test_model() -> (crate::compiler::graph::ComputationGraph, GraphWeights, M31Matrix) {
+    fn build_attention_test_model() -> (
+        crate::compiler::graph::ComputationGraph,
+        GraphWeights,
+        M31Matrix,
+    ) {
         use crate::components::attention::MultiHeadAttentionConfig;
 
         let d_model = 4;
@@ -8213,7 +9332,11 @@ mod tests {
             let mut w = M31Matrix::new(d_model, d_model);
             for i in 0..d_model {
                 for j in 0..d_model {
-                    w.set(i, j, M31::from((i * d_model + j + *seed_offset as usize) as u32 % 7 + 1));
+                    w.set(
+                        i,
+                        j,
+                        M31::from((i * d_model + j + *seed_offset as usize) as u32 % 7 + 1),
+                    );
                 }
             }
             weights.add_named_weight(attn_node_id, name, w);
@@ -8229,7 +9352,9 @@ mod tests {
         weights.add_weight(matmul_node_id, w);
 
         let mut input = M31Matrix::new(1, d_model);
-        for j in 0..d_model { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..d_model {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         (graph, weights, input)
     }
@@ -8238,11 +9363,14 @@ mod tests {
     fn test_attention_proof_verified_in_aggregation() {
         let (graph, weights, input) = build_attention_test_model();
 
-        let proof = prove_model_aggregated(&graph, &input, &weights)
-            .expect("proving should succeed");
+        let proof =
+            prove_model_aggregated(&graph, &input, &weights).expect("proving should succeed");
 
         // The proof should contain attention proofs
-        assert!(!proof.attention_proofs.is_empty(), "should have attention proofs");
+        assert!(
+            !proof.attention_proofs.is_empty(),
+            "should have attention proofs"
+        );
         assert_eq!(proof.attention_proofs.len(), 1, "one attention node");
 
         // Verification should pass (attention proofs are now verified)
@@ -8254,17 +9382,23 @@ mod tests {
     fn test_attention_proof_tampered_fails_verification() {
         let (graph, weights, input) = build_attention_test_model();
 
-        let mut proof = prove_model_aggregated(&graph, &input, &weights)
-            .expect("proving should succeed");
+        let mut proof =
+            prove_model_aggregated(&graph, &input, &weights).expect("proving should succeed");
 
-        assert!(!proof.attention_proofs.is_empty(), "should have attention proofs");
+        assert!(
+            !proof.attention_proofs.is_empty(),
+            "should have attention proofs"
+        );
 
         // Tamper with the attention intermediates (corrupt the final output)
         proof.attention_proofs[0].1.intermediates.final_output.data[0] = M31::from(99999u32);
 
         // Verification should fail because forward pass output doesn't match
         let result = verify_aggregated_model_proof(proof, &graph, &input, &weights);
-        assert!(result.is_err(), "tampered attention proof should fail verification");
+        assert!(
+            result.is_err(),
+            "tampered attention proof should fail verification"
+        );
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("Attention") || err_msg.contains("attention"),
@@ -8281,11 +9415,17 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w.set(i, j, M31::from((i * 2 + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
         weights.add_weight(0, w);
 
         let proof = prove_model_aggregated_onchain(&graph, &input, &weights)
@@ -8298,21 +9438,28 @@ mod tests {
     #[test]
     fn test_verify_onchain_mlp_with_activation() {
         let mut builder = GraphBuilder::new((1, 4));
-        builder
-            .linear(4)
-            .activation(ActivationType::ReLU)
-            .linear(2);
+        builder.linear(4).activation(ActivationType::ReLU).linear(2);
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 5 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 5 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w2.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
 
         let proof = prove_model_aggregated_onchain(&graph, &input, &weights)
@@ -8332,11 +9479,17 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w.set(i, j, M31::from((i * 2 + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
         weights.add_weight(0, w);
 
         let mut proof = prove_model_aggregated_onchain(&graph, &input, &weights)
@@ -8348,7 +9501,10 @@ mod tests {
         }
 
         let result = verify_aggregated_model_proof_onchain(proof, &graph, &input, &weights);
-        assert!(result.is_err(), "tampered on-chain proof should fail verification");
+        assert!(
+            result.is_err(),
+            "tampered on-chain proof should fail verification"
+        );
     }
 
     #[test]
@@ -8358,11 +9514,17 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w.set(i, j, M31::from((i * 2 + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
         weights.add_weight(0, w);
 
         let proof = prove_model_aggregated_onchain(&graph, &input, &weights)
@@ -8370,7 +9532,9 @@ mod tests {
 
         // Verify with different input — IO commitment should mismatch
         let mut wrong_input = M31Matrix::new(1, 4);
-        for j in 0..4 { wrong_input.set(0, j, M31::from((j + 10) as u32)); }
+        for j in 0..4 {
+            wrong_input.set(0, j, M31::from((j + 10) as u32));
+        }
 
         let result = verify_aggregated_model_proof_onchain(proof, &graph, &wrong_input, &weights);
         assert!(result.is_err(), "wrong input should fail IO commitment");
@@ -8393,17 +9557,31 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 8);
-        for j in 0..8 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..8 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(8, 8);
-        for i in 0..8 { for j in 0..8 { w0.set(i, j, M31::from(((i + j) % 5 + 1) as u32)); } }
+        for i in 0..8 {
+            for j in 0..8 {
+                w0.set(i, j, M31::from(((i + j) % 5 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(8, 8);
-        for i in 0..8 { for j in 0..8 { w2.set(i, j, M31::from(((i * j) % 7 + 1) as u32)); } }
+        for i in 0..8 {
+            for j in 0..8 {
+                w2.set(i, j, M31::from(((i * j) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
         let mut w4 = M31Matrix::new(8, 4);
-        for i in 0..8 { for j in 0..4 { w4.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..8 {
+            for j in 0..4 {
+                w4.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(4, w4);
 
         let proof = prove_model_aggregated_onchain(&graph, &input, &weights)
@@ -8432,21 +9610,35 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         // Small weights so matmul output fits in [0, 255]
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 3 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 3 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w2.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
 
         let proof = prove_model_aggregated(&graph, &input, &weights)
             .expect("aggregated proving with Quantize should succeed");
 
-        assert_eq!(proof.quantize_claims.len(), 1, "should have 1 Quantize claim");
+        assert_eq!(
+            proof.quantize_claims.len(),
+            1,
+            "should have 1 Quantize claim"
+        );
 
         verify_aggregated_model_proof(proof, &graph, &input, &weights)
             .expect("aggregated Quantize verification should succeed");
@@ -8469,20 +9661,34 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 3 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 3 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w2.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
 
         let proof = prove_model_aggregated_onchain(&graph, &input, &weights)
             .expect("on-chain proving with Quantize should succeed");
 
-        assert_eq!(proof.quantize_claims.len(), 1, "should have 1 Quantize claim (on-chain)");
+        assert_eq!(
+            proof.quantize_claims.len(),
+            1,
+            "should have 1 Quantize claim (on-chain)"
+        );
 
         verify_aggregated_model_proof_onchain(proof, &graph, &input, &weights)
             .expect("on-chain Quantize verification should succeed");
@@ -8505,22 +9711,34 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 3 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 3 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w2.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
 
         // Verify with wrong input — should fail
         let mut wrong_input = M31Matrix::new(1, 4);
-        for j in 0..4 { wrong_input.set(0, j, M31::from((j + 10) as u32)); }
+        for j in 0..4 {
+            wrong_input.set(0, j, M31::from((j + 10) as u32));
+        }
 
-        let proof = prove_model_aggregated(&graph, &input, &weights)
-            .expect("proving should succeed");
+        let proof =
+            prove_model_aggregated(&graph, &input, &weights).expect("proving should succeed");
 
         let result = verify_aggregated_model_proof(proof, &graph, &wrong_input, &weights);
         assert!(result.is_err(), "verification with wrong input should fail");
@@ -8536,31 +9754,49 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 5 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 5 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w2.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
 
-        let proof = prove_model_aggregated(&graph, &input, &weights)
-            .expect("proving should succeed");
+        let proof =
+            prove_model_aggregated(&graph, &input, &weights).expect("proving should succeed");
 
         // Should have exactly 1 LayerNorm mean/var commitment
-        assert_eq!(proof.layernorm_mean_var_commitments.len(), 1,
-            "should have 1 LayerNorm mean/var commitment");
-        assert_ne!(proof.layernorm_mean_var_commitments[0], FieldElement::ZERO,
-            "commitment should be non-zero");
+        assert_eq!(
+            proof.layernorm_mean_var_commitments.len(),
+            1,
+            "should have 1 LayerNorm mean/var commitment"
+        );
+        assert_ne!(
+            proof.layernorm_mean_var_commitments[0],
+            FieldElement::ZERO,
+            "commitment should be non-zero"
+        );
 
         // Independently recompute and verify the commitment matches
         let matmul_output = matmul_m31(&input, weights.get_weight(0).unwrap());
         let ln = apply_layernorm_detailed(&matmul_output, 4);
         let expected = compute_layernorm_mean_var_commitment(&ln.means, &ln.variances);
-        assert_eq!(proof.layernorm_mean_var_commitments[0], expected,
-            "commitment should match independently computed value");
+        assert_eq!(
+            proof.layernorm_mean_var_commitments[0], expected,
+            "commitment should match independently computed value"
+        );
 
         verify_aggregated_model_proof(proof, &graph, &input, &weights)
             .expect("verification should succeed");
@@ -8574,38 +9810,62 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 5 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 5 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w2.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
 
-        let mut proof = prove_model_aggregated(&graph, &input, &weights)
-            .expect("proving should succeed");
+        let mut proof =
+            prove_model_aggregated(&graph, &input, &weights).expect("proving should succeed");
 
         // Tamper with the LayerNorm mean/var commitment
         assert_eq!(proof.layernorm_mean_var_commitments.len(), 1);
         proof.layernorm_mean_var_commitments[0] = FieldElement::from(0xDEADu64);
 
         let result = verify_aggregated_model_proof(proof, &graph, &input, &weights);
-        assert!(result.is_err(), "tampered commitment should fail verification");
+        assert!(
+            result.is_err(),
+            "tampered commitment should fail verification"
+        );
         let err_msg = format!("{}", result.unwrap_err());
-        assert!(err_msg.contains("mean/var commitment mismatch"),
-            "error should mention mean/var commitment mismatch, got: {err_msg}");
+        assert!(
+            err_msg.contains("mean/var commitment mismatch"),
+            "error should mention mean/var commitment mismatch, got: {err_msg}"
+        );
     }
 
     // Helper: build a valid BatchedMatMulProofOnChain by running the prover's
     // Fiat-Shamir logic on CPU. This lets us test the verifier without GPU.
     fn build_cpu_batch_proof(
-        entries: &[(usize, SecureField, SecureField, SecureField, FieldElement, FieldElement, u32, u32)],
+        entries: &[(
+            usize,
+            SecureField,
+            SecureField,
+            SecureField,
+            FieldElement,
+            FieldElement,
+            u32,
+            u32,
+        )],
         k: u32,
     ) -> BatchedMatMulProofOnChain {
-        use crate::crypto::poseidon_channel::{PoseidonChannel, securefield_to_felt};
         use crate::components::matmul::RoundPoly;
+        use crate::crypto::poseidon_channel::{securefield_to_felt, PoseidonChannel};
 
         let log_k = k.ilog2() as usize;
         let num_entries = entries.len();
@@ -8757,41 +10017,82 @@ mod tests {
         // Build a valid batch proof via CPU prover and verify it passes
         let entries = vec![
             // (node_id, f_a[0], f_b[0], claimed_sum, a_commit, b_commit, m, n)
-            (0, SecureField::from(M31::from(3)), SecureField::from(M31::from(5)),
-             SecureField::from(M31::from(15)),
-             FieldElement::from(0xA1u64), FieldElement::from(0xB1u64), 1, 1),
-            (1, SecureField::from(M31::from(7)), SecureField::from(M31::from(2)),
-             SecureField::from(M31::from(14)),
-             FieldElement::from(0xA2u64), FieldElement::from(0xB2u64), 1, 1),
+            (
+                0,
+                SecureField::from(M31::from(3)),
+                SecureField::from(M31::from(5)),
+                SecureField::from(M31::from(15)),
+                FieldElement::from(0xA1u64),
+                FieldElement::from(0xB1u64),
+                1,
+                1,
+            ),
+            (
+                1,
+                SecureField::from(M31::from(7)),
+                SecureField::from(M31::from(2)),
+                SecureField::from(M31::from(14)),
+                FieldElement::from(0xA2u64),
+                FieldElement::from(0xB2u64),
+                1,
+                1,
+            ),
         ];
 
         let batch = build_cpu_batch_proof(&entries, 4); // k=4, log_k=2 rounds
         let result = verify_batched_matmul_onchain(&batch);
-        assert!(result.is_ok(), "Valid batch proof should verify: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Valid batch proof should verify: {:?}",
+            result.err()
+        );
     }
 
     #[test]
     fn test_batch_fiat_shamir_replay_single_entry() {
-        let entries = vec![
-            (0, SecureField::from(M31::from(10)), SecureField::from(M31::from(20)),
-             SecureField::from(M31::from(200)),
-             FieldElement::from(0xC1u64), FieldElement::from(0xD1u64), 1, 1),
-        ];
+        let entries = vec![(
+            0,
+            SecureField::from(M31::from(10)),
+            SecureField::from(M31::from(20)),
+            SecureField::from(M31::from(200)),
+            FieldElement::from(0xC1u64),
+            FieldElement::from(0xD1u64),
+            1,
+            1,
+        )];
 
         let batch = build_cpu_batch_proof(&entries, 8); // k=8, log_k=3 rounds
         let result = verify_batched_matmul_onchain(&batch);
-        assert!(result.is_ok(), "Single-entry batch should verify: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Single-entry batch should verify: {:?}",
+            result.err()
+        );
     }
 
     #[test]
     fn test_batch_fiat_shamir_tampered_lambda_rejected() {
         let entries = vec![
-            (0, SecureField::from(M31::from(3)), SecureField::from(M31::from(5)),
-             SecureField::from(M31::from(15)),
-             FieldElement::from(0xA1u64), FieldElement::from(0xB1u64), 1, 1),
-            (1, SecureField::from(M31::from(7)), SecureField::from(M31::from(2)),
-             SecureField::from(M31::from(14)),
-             FieldElement::from(0xA2u64), FieldElement::from(0xB2u64), 1, 1),
+            (
+                0,
+                SecureField::from(M31::from(3)),
+                SecureField::from(M31::from(5)),
+                SecureField::from(M31::from(15)),
+                FieldElement::from(0xA1u64),
+                FieldElement::from(0xB1u64),
+                1,
+                1,
+            ),
+            (
+                1,
+                SecureField::from(M31::from(7)),
+                SecureField::from(M31::from(2)),
+                SecureField::from(M31::from(14)),
+                FieldElement::from(0xA2u64),
+                FieldElement::from(0xB2u64),
+                1,
+                1,
+            ),
         ];
 
         let mut batch = build_cpu_batch_proof(&entries, 4);
@@ -8801,18 +10102,35 @@ mod tests {
         let result = verify_batched_matmul_onchain(&batch);
         assert!(result.is_err(), "Tampered lambda should be rejected");
         let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("lambda mismatch"), "Error should mention lambda: {err}");
+        assert!(
+            err.contains("lambda mismatch"),
+            "Error should mention lambda: {err}"
+        );
     }
 
     #[test]
     fn test_batch_fiat_shamir_tampered_round_poly_rejected() {
         let entries = vec![
-            (0, SecureField::from(M31::from(3)), SecureField::from(M31::from(5)),
-             SecureField::from(M31::from(15)),
-             FieldElement::from(0xA1u64), FieldElement::from(0xB1u64), 1, 1),
-            (1, SecureField::from(M31::from(7)), SecureField::from(M31::from(2)),
-             SecureField::from(M31::from(14)),
-             FieldElement::from(0xA2u64), FieldElement::from(0xB2u64), 1, 1),
+            (
+                0,
+                SecureField::from(M31::from(3)),
+                SecureField::from(M31::from(5)),
+                SecureField::from(M31::from(15)),
+                FieldElement::from(0xA1u64),
+                FieldElement::from(0xB1u64),
+                1,
+                1,
+            ),
+            (
+                1,
+                SecureField::from(M31::from(7)),
+                SecureField::from(M31::from(2)),
+                SecureField::from(M31::from(14)),
+                FieldElement::from(0xA2u64),
+                FieldElement::from(0xB2u64),
+                1,
+                1,
+            ),
         ];
 
         let mut batch = build_cpu_batch_proof(&entries, 4);
@@ -8825,11 +10143,16 @@ mod tests {
 
     #[test]
     fn test_batch_fiat_shamir_tampered_claimed_sum_rejected() {
-        let entries = vec![
-            (0, SecureField::from(M31::from(3)), SecureField::from(M31::from(5)),
-             SecureField::from(M31::from(15)),
-             FieldElement::from(0xA1u64), FieldElement::from(0xB1u64), 1, 1),
-        ];
+        let entries = vec![(
+            0,
+            SecureField::from(M31::from(3)),
+            SecureField::from(M31::from(5)),
+            SecureField::from(M31::from(15)),
+            FieldElement::from(0xA1u64),
+            FieldElement::from(0xB1u64),
+            1,
+            1,
+        )];
 
         let mut batch = build_cpu_batch_proof(&entries, 4);
         // Tamper with combined claimed sum
@@ -8838,51 +10161,104 @@ mod tests {
         let result = verify_batched_matmul_onchain(&batch);
         assert!(result.is_err(), "Tampered claimed sum should be rejected");
         let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("combined_claimed_sum mismatch"), "Error should mention claimed sum: {err}");
+        assert!(
+            err.contains("combined_claimed_sum mismatch"),
+            "Error should mention claimed sum: {err}"
+        );
     }
 
     #[test]
     fn test_batch_fiat_shamir_tampered_final_eval_rejected() {
         let entries = vec![
-            (0, SecureField::from(M31::from(3)), SecureField::from(M31::from(5)),
-             SecureField::from(M31::from(15)),
-             FieldElement::from(0xA1u64), FieldElement::from(0xB1u64), 1, 1),
-            (1, SecureField::from(M31::from(7)), SecureField::from(M31::from(2)),
-             SecureField::from(M31::from(14)),
-             FieldElement::from(0xA2u64), FieldElement::from(0xB2u64), 1, 1),
+            (
+                0,
+                SecureField::from(M31::from(3)),
+                SecureField::from(M31::from(5)),
+                SecureField::from(M31::from(15)),
+                FieldElement::from(0xA1u64),
+                FieldElement::from(0xB1u64),
+                1,
+                1,
+            ),
+            (
+                1,
+                SecureField::from(M31::from(7)),
+                SecureField::from(M31::from(2)),
+                SecureField::from(M31::from(14)),
+                FieldElement::from(0xA2u64),
+                FieldElement::from(0xB2u64),
+                1,
+                1,
+            ),
         ];
 
         let mut batch = build_cpu_batch_proof(&entries, 4);
         // Tamper with a final evaluation
-        batch.entries[0].final_a_eval = batch.entries[0].final_a_eval + SecureField::from(M31::from(1));
+        batch.entries[0].final_a_eval =
+            batch.entries[0].final_a_eval + SecureField::from(M31::from(1));
 
         let result = verify_batched_matmul_onchain(&batch);
         assert!(result.is_err(), "Tampered final eval should be rejected");
         let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("final eval mismatch"), "Error should mention final eval: {err}");
+        assert!(
+            err.contains("final eval mismatch"),
+            "Error should mention final eval: {err}"
+        );
     }
 
     #[test]
     fn test_batch_fiat_shamir_four_entries() {
         // Larger batch with 4 matmuls
         let entries = vec![
-            (0, SecureField::from(M31::from(1)), SecureField::from(M31::from(1)),
-             SecureField::from(M31::from(1)),
-             FieldElement::from(0x10u64), FieldElement::from(0x20u64), 1, 1),
-            (1, SecureField::from(M31::from(2)), SecureField::from(M31::from(3)),
-             SecureField::from(M31::from(6)),
-             FieldElement::from(0x30u64), FieldElement::from(0x40u64), 1, 1),
-            (2, SecureField::from(M31::from(4)), SecureField::from(M31::from(5)),
-             SecureField::from(M31::from(20)),
-             FieldElement::from(0x50u64), FieldElement::from(0x60u64), 2, 2),
-            (3, SecureField::from(M31::from(6)), SecureField::from(M31::from(7)),
-             SecureField::from(M31::from(42)),
-             FieldElement::from(0x70u64), FieldElement::from(0x80u64), 2, 2),
+            (
+                0,
+                SecureField::from(M31::from(1)),
+                SecureField::from(M31::from(1)),
+                SecureField::from(M31::from(1)),
+                FieldElement::from(0x10u64),
+                FieldElement::from(0x20u64),
+                1,
+                1,
+            ),
+            (
+                1,
+                SecureField::from(M31::from(2)),
+                SecureField::from(M31::from(3)),
+                SecureField::from(M31::from(6)),
+                FieldElement::from(0x30u64),
+                FieldElement::from(0x40u64),
+                1,
+                1,
+            ),
+            (
+                2,
+                SecureField::from(M31::from(4)),
+                SecureField::from(M31::from(5)),
+                SecureField::from(M31::from(20)),
+                FieldElement::from(0x50u64),
+                FieldElement::from(0x60u64),
+                2,
+                2,
+            ),
+            (
+                3,
+                SecureField::from(M31::from(6)),
+                SecureField::from(M31::from(7)),
+                SecureField::from(M31::from(42)),
+                FieldElement::from(0x70u64),
+                FieldElement::from(0x80u64),
+                2,
+                2,
+            ),
         ];
 
         let batch = build_cpu_batch_proof(&entries, 16); // k=16, log_k=4 rounds
         let result = verify_batched_matmul_onchain(&batch);
-        assert!(result.is_ok(), "4-entry batch should verify: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "4-entry batch should verify: {:?}",
+            result.err()
+        );
     }
 
     // === Pure GKR Pipeline Tests ===
@@ -8900,17 +10276,31 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w2.set(i, j, M31::from(((i * j) % 5 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w2.set(i, j, M31::from(((i * j) % 5 + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
         let mut w4 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w4.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w4.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(4, w4);
 
         let proof = prove_model_pure_gkr(&graph, &input, &weights)
@@ -8918,12 +10308,25 @@ mod tests {
 
         // GKR proof replaces individual matmul proofs
         assert!(proof.gkr_proof.is_some(), "should have GKR proof");
-        assert!(proof.matmul_proofs.is_empty(), "matmul_proofs should be empty in GKR mode");
-        assert!(proof.batched_matmul_proofs.is_empty(), "batched_matmul_proofs should be empty in GKR mode");
+        assert!(
+            proof.matmul_proofs.is_empty(),
+            "matmul_proofs should be empty in GKR mode"
+        );
+        assert!(
+            proof.batched_matmul_proofs.is_empty(),
+            "batched_matmul_proofs should be empty in GKR mode"
+        );
 
         // Unified STARK covers both ReLU layers
-        assert!(proof.unified_stark.is_some(), "should have unified STARK for activations");
-        assert_eq!(proof.activation_claims.len(), 2, "2 activation layers in STARK");
+        assert!(
+            proof.unified_stark.is_some(),
+            "should have unified STARK for activations"
+        );
+        assert_eq!(
+            proof.activation_claims.len(),
+            2,
+            "2 activation layers in STARK"
+        );
 
         // Output shape
         assert_eq!(proof.execution.output.rows, 1);
@@ -8942,19 +10345,31 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w.set(i, j, M31::from((i * 2 + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
         weights.add_weight(0, w);
 
         let proof = prove_model_pure_gkr(&graph, &input, &weights)
             .expect("pure GKR matmul-only proving should succeed");
 
         assert!(proof.gkr_proof.is_some(), "should have GKR proof");
-        assert!(proof.matmul_proofs.is_empty(), "no individual matmul proofs");
-        assert!(proof.unified_stark.is_none(), "no unified STARK without activations");
+        assert!(
+            proof.matmul_proofs.is_empty(),
+            "no individual matmul proofs"
+        );
+        assert!(
+            proof.unified_stark.is_none(),
+            "no unified STARK without activations"
+        );
         assert_eq!(proof.activation_claims.len(), 0);
     }
 
@@ -8971,27 +10386,51 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 8);
-        for j in 0..8 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..8 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(8, 8);
-        for i in 0..8 { for j in 0..8 { w0.set(i, j, M31::from(((i + j) % 5 + 1) as u32)); } }
+        for i in 0..8 {
+            for j in 0..8 {
+                w0.set(i, j, M31::from(((i + j) % 5 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(8, 8);
-        for i in 0..8 { for j in 0..8 { w2.set(i, j, M31::from(((i * j) % 7 + 1) as u32)); } }
+        for i in 0..8 {
+            for j in 0..8 {
+                w2.set(i, j, M31::from(((i * j) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
         let mut w4 = M31Matrix::new(8, 4);
-        for i in 0..8 { for j in 0..4 { w4.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..8 {
+            for j in 0..4 {
+                w4.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(4, w4);
 
         let proof = prove_model_pure_gkr(&graph, &input, &weights)
             .expect("pure GKR with residual Add should succeed");
 
         assert!(proof.gkr_proof.is_some(), "should have GKR proof");
-        assert!(proof.matmul_proofs.is_empty(), "no individual matmul proofs");
-        assert_eq!(proof.activation_claims.len(), 1, "1 activation claim (ReLU)");
+        assert!(
+            proof.matmul_proofs.is_empty(),
+            "no individual matmul proofs"
+        );
+        assert_eq!(
+            proof.activation_claims.len(),
+            1,
+            "1 activation claim (ReLU)"
+        );
         assert_eq!(proof.add_claims.len(), 1, "1 Add claim");
-        assert!(proof.unified_stark.is_some(), "unified STARK covers activation + add");
+        assert!(
+            proof.unified_stark.is_some(),
+            "unified STARK covers activation + add"
+        );
     }
 
     #[test]
@@ -9007,17 +10446,31 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w2.set(i, j, M31::from(((i * j) % 5 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w2.set(i, j, M31::from(((i * j) % 5 + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
         let mut w4 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w4.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w4.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(4, w4);
 
         let proof = prove_model_pure_gkr(&graph, &input, &weights)
@@ -9071,8 +10524,15 @@ mod tests {
             .expect("pure GKR + skip unified STARK with quantize should succeed");
 
         assert!(proof.gkr_proof.is_some(), "should have GKR proof");
-        assert!(proof.unified_stark.is_none(), "Unified STARK should be skipped");
-        assert_eq!(proof.quantize_claims.len(), 1, "quantize claim should be present");
+        assert!(
+            proof.unified_stark.is_none(),
+            "Unified STARK should be skipped"
+        );
+        assert_eq!(
+            proof.quantize_claims.len(),
+            1,
+            "quantize claim should be present"
+        );
         assert_ne!(
             proof.quantize_params_commitment,
             FieldElement::ZERO,
@@ -9116,8 +10576,15 @@ mod tests {
             .expect("pure GKR + skip unified STARK with embedding should succeed");
 
         assert!(proof.gkr_proof.is_some(), "should have GKR proof");
-        assert!(proof.unified_stark.is_none(), "Unified STARK should be skipped");
-        assert_eq!(proof.embedding_claims.len(), 1, "embedding claim should be present");
+        assert!(
+            proof.unified_stark.is_none(),
+            "Unified STARK should be skipped"
+        );
+        assert_eq!(
+            proof.embedding_claims.len(),
+            1,
+            "embedding claim should be present"
+        );
 
         verify_aggregated_model_proof_onchain(proof, &graph, &input, &weights)
             .expect("pure GKR embedding skip proof verification should succeed");
@@ -9145,22 +10612,36 @@ mod tests {
 
         // Input: small values that stay in INT4 range after matmul mod P
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         // W0: 4×4 for first linear
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 3 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 3 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         // W2: 4×2 for second linear (node 2 after dequantize at node 1)
         let mut w2 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w2.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
 
         let proof = prove_model_aggregated_onchain(&graph, &input, &weights)
             .expect("on-chain proving with Dequantize should succeed");
 
-        assert_eq!(proof.dequantize_claims.len(), 1, "should have 1 Dequantize claim");
+        assert_eq!(
+            proof.dequantize_claims.len(),
+            1,
+            "should have 1 Dequantize claim"
+        );
 
         verify_aggregated_model_proof_onchain(proof, &graph, &input, &weights)
             .expect("on-chain Dequantize verification should succeed");
@@ -9184,24 +10665,40 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         // quantized_linear inserts: quantize(node0) → linear(node1) → dequantize(node2)
         // Weight for the linear at node 1
         let mut w1 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w1.set(i, j, M31::from(((i * j) % 5 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w1.set(i, j, M31::from(((i * j) % 5 + 1) as u32));
+            }
+        }
         weights.add_weight(1, w1);
         // Weight for the second linear (node 3)
         let mut w3 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w3.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w3.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(3, w3);
 
         let proof = prove_model_aggregated_onchain(&graph, &input, &weights)
             .expect("quantized_linear pipeline proving should succeed");
 
-        assert!(proof.quantize_claims.len() >= 1, "should have at least 1 Quantize claim");
-        assert!(proof.dequantize_claims.len() >= 1, "should have at least 1 Dequantize claim");
+        assert!(
+            proof.quantize_claims.len() >= 1,
+            "should have at least 1 Quantize claim"
+        );
+        assert!(
+            proof.dequantize_claims.len() >= 1,
+            "should have at least 1 Dequantize claim"
+        );
 
         verify_aggregated_model_proof_onchain(proof, &graph, &input, &weights)
             .expect("quantized_linear pipeline verification should succeed");
@@ -9216,7 +10713,11 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(2, 4);
-        for i in 0..2 { for j in 0..4 { input.set(i, j, M31::from((i * 4 + j + 1) as u32)); } }
+        for i in 0..2 {
+            for j in 0..4 {
+                input.set(i, j, M31::from((i * 4 + j + 1) as u32));
+            }
+        }
 
         // Build weights for each MatMul and Attention node
         let mut weights = GraphWeights::new();
@@ -9224,9 +10725,11 @@ mod tests {
             match &node.op {
                 GraphOp::MatMul { dims: (_, k, n) } => {
                     let mut w = M31Matrix::new(*k, *n);
-                    for i in 0..*k { for j in 0..*n {
-                        w.set(i, j, M31::from(((i * n + j) % 7 + 1) as u32));
-                    } }
+                    for i in 0..*k {
+                        for j in 0..*n {
+                            w.set(i, j, M31::from(((i * n + j) % 7 + 1) as u32));
+                        }
+                    }
                     weights.add_weight(node.id, w);
                 }
                 GraphOp::Attention { config } => {
@@ -9234,9 +10737,15 @@ mod tests {
                     let kv_dim = config.kv_dim();
                     let make = |rows: usize, cols: usize, seed: u32| {
                         let mut m = M31Matrix::new(rows, cols);
-                        for i in 0..rows { for j in 0..cols {
-                            m.set(i, j, M31::from(((i * cols + j + seed as usize) % 5 + 1) as u32));
-                        } }
+                        for i in 0..rows {
+                            for j in 0..cols {
+                                m.set(
+                                    i,
+                                    j,
+                                    M31::from(((i * cols + j + seed as usize) % 5 + 1) as u32),
+                                );
+                            }
+                        }
                         m
                     };
                     weights.add_named_weight(node.id, "w_q", make(d, d, 1));
@@ -9253,7 +10762,10 @@ mod tests {
 
         // Should have matmul proofs (up-proj + down-proj) and attention proof
         assert!(!proof.matmul_proofs.is_empty(), "should have matmul proofs");
-        assert!(!proof.attention_proofs.is_empty(), "should have attention proof");
+        assert!(
+            !proof.attention_proofs.is_empty(),
+            "should have attention proof"
+        );
         assert!(proof.num_proven_layers() >= 5, "should prove multiple ops");
 
         verify_aggregated_model_proof(proof, &graph, &input, &weights)

@@ -56,11 +56,35 @@ const NETWORKS = {
     factory: "",
     accountClassHash: "",
     identityRegistry: "",
+    notReady: true,
   },
 };
 
 const ACCOUNT_CONFIG_DIR = join(homedir(), ".obelysk", "starknet");
 const ACCOUNT_CONFIG_FILE = join(ACCOUNT_CONFIG_DIR, "pipeline_account.json");
+
+function parsePositiveIntEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === null || String(raw).trim() === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+    throw new Error(`${name} must be a positive integer (got: ${raw})`);
+  }
+  return n;
+}
+
+const MAX_GKR_CALLDATA_FELTS = parsePositiveIntEnv(
+  "OBELYSK_MAX_GKR_CALLDATA_FELTS",
+  300000
+);
+const MAX_GKR_MODE4_CALLDATA_FELTS = parsePositiveIntEnv(
+  "OBELYSK_MAX_GKR_MODE4_CALLDATA_FELTS",
+  120000
+);
+const MIN_GKR_MODE4_CALLDATA_FELTS = parsePositiveIntEnv(
+  "OBELYSK_MIN_GKR_MODE4_CALLDATA_FELTS",
+  1000
+);
 
 // ─── Argument Parsing ─────────────────────────────────────────────────
 
@@ -271,6 +295,15 @@ async function executeViaPaymaster(account, calls, deploymentData) {
 }
 
 
+// ─── Calldata Validation ──────────────────────────────────────────────
+//
+// IMPORTANT: The canonical implementation of proof calldata validation lives in
+// validate_proof.py (same directory). This JS parseVerifyCalldata function
+// duplicates that logic for use within the Node.js paymaster flow.
+// When updating validation rules, update validate_proof.py FIRST, then
+// mirror changes here to keep both implementations in sync.
+//
+
 function parseVerifyCalldata(proofData, fallbackModelId) {
   const verifyCalldata = proofData.verify_calldata;
   if (!verifyCalldata || typeof verifyCalldata !== "object" || Array.isArray(verifyCalldata)) {
@@ -302,6 +335,13 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
   if (!Array.isArray(rawCalldata) || rawCalldata.length === 0) {
     die("verify_calldata.calldata must be a non-empty array");
   }
+  if (rawCalldata.length > MAX_GKR_CALLDATA_FELTS) {
+    die(
+      `calldata too large for hardened submit path: ${rawCalldata.length} felts ` +
+        `(max ${MAX_GKR_CALLDATA_FELTS}). ` +
+        "Likely legacy per-opening mode; use --submit to generate mode-4 aggregated proof."
+    );
+  }
 
   if (proofData.submission_ready === false) {
     const mode = proofData.weight_opening_mode ?? "unknown";
@@ -329,12 +369,14 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
       );
     }
   } else if (entrypoint === "verify_model_gkr_v4") {
-    if (
-      weightOpeningMode !== undefined &&
-      weightOpeningMode !== "AggregatedOpeningsV4Experimental"
-    ) {
+    const allowedV4Modes = new Set([
+      "AggregatedOpeningsV4Experimental",
+      "AggregatedOracleSumcheck",
+    ]);
+    if (weightOpeningMode !== undefined && !allowedV4Modes.has(weightOpeningMode)) {
       die(
-        `${entrypoint} requires weight_opening_mode=AggregatedOpeningsV4Experimental (got: ${proofData.weight_opening_mode})`
+        `${entrypoint} requires weight_opening_mode in {AggregatedOpeningsV4Experimental,AggregatedOracleSumcheck} ` +
+          `(got: ${proofData.weight_opening_mode})`
       );
     }
   }
@@ -365,6 +407,14 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
       die(`invalid ${label}: ${s}`);
     }
     return n;
+  };
+  const parseFeltBigInt = (token, label) => {
+    const s = String(token);
+    try {
+      return BigInt(s);
+    } catch (e) {
+      die(`invalid ${label}: ${s} (${e.message || e})`);
+    }
   };
 
   if (
@@ -397,8 +447,8 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
     if (entrypoint === "verify_model_gkr_v2" && !new Set([0, 1]).has(weightBindingMode)) {
       die(`${entrypoint} requires weight_binding_mode in {0,1} (got ${weightBindingMode})`);
     }
-    if (entrypoint === "verify_model_gkr_v4" && weightBindingMode !== 3) {
-      die(`${entrypoint} requires weight_binding_mode=3 (got ${weightBindingMode})`);
+    if (entrypoint === "verify_model_gkr_v4" && !new Set([3, 4]).has(weightBindingMode)) {
+      die(`${entrypoint} requires weight_binding_mode in {3,4} (got ${weightBindingMode})`);
     }
     let expectedMode = null;
     if (weightOpeningMode === "Sequential") {
@@ -409,6 +459,8 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
       expectedMode = 2;
     } else if (weightOpeningMode === "AggregatedOpeningsV4Experimental") {
       expectedMode = 3;
+    } else if (weightOpeningMode === "AggregatedOracleSumcheck") {
+      expectedMode = 4;
     }
     if (expectedMode !== null && weightBindingMode !== expectedMode) {
       die(
@@ -419,7 +471,7 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
       entrypoint === "verify_model_gkr_v3"
         ? new Set([0, 1, 2])
         : entrypoint === "verify_model_gkr_v4"
-          ? new Set([3])
+          ? new Set([3, 4])
           : new Set([0, 1]);
     if (expectedMode === null && !allowedModes.has(weightBindingMode)) {
       die(
@@ -450,6 +502,24 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
       if (weightBindingMode === 3 && weightBindingDataLen === 0) {
         die(`${entrypoint} mode 3 requires non-empty weight_binding_data`);
       }
+      if (weightBindingMode === 4 && weightBindingDataLen === 0) {
+        die(`${entrypoint} mode 4 requires non-empty weight_binding_data`);
+      }
+      if (entrypoint === "verify_model_gkr_v4" && weightBindingMode === 4) {
+        if (calldata.length > MAX_GKR_MODE4_CALLDATA_FELTS) {
+          die(
+            `${entrypoint} mode 4 calldata unexpectedly large: ${calldata.length} felts ` +
+              `(max ${MAX_GKR_MODE4_CALLDATA_FELTS}). ` +
+              "This looks like non-aggregated payload; regenerate proof with --submit."
+          );
+        }
+        if (calldata.length < MIN_GKR_MODE4_CALLDATA_FELTS) {
+          die(
+            `${entrypoint} mode 4 calldata unexpectedly small: ${calldata.length} felts ` +
+              `(min ${MIN_GKR_MODE4_CALLDATA_FELTS}).`
+          );
+        }
+      }
       if (
         Array.isArray(proofData.weight_binding_data_calldata) &&
         proofData.weight_binding_data_calldata.length !== weightBindingDataLen
@@ -457,6 +527,27 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
         die(
           `weight_binding_data_calldata length mismatch: artifact=${proofData.weight_binding_data_calldata.length} calldata=${weightBindingDataLen}`
         );
+      }
+      if (Array.isArray(proofData.weight_binding_data_calldata)) {
+        const calldataBindingData = calldata.slice(
+          idx - weightBindingDataLen,
+          idx
+        );
+        for (let j = 0; j < weightBindingDataLen; j++) {
+          const artifactVal = parseFeltBigInt(
+            proofData.weight_binding_data_calldata[j],
+            `weight_binding_data_calldata[${j}]`
+          );
+          const calldataVal = parseFeltBigInt(
+            calldataBindingData[j],
+            `weight_binding_data[${j}]`
+          );
+          if (artifactVal !== calldataVal) {
+            die(
+              `weight_binding_data_calldata mismatch at index ${j}: artifact=${proofData.weight_binding_data_calldata[j]} calldata=${calldataBindingData[j]}`
+            );
+          }
+        }
       }
     }
   }
@@ -516,6 +607,11 @@ async function cmdVerify(args) {
   const network = args.network || "sepolia";
   const net = NETWORKS[network];
   if (!net) die(`Unknown network: ${network}`);
+  if (net.notReady) {
+    die(`${network} is not yet configured for paymaster submissions. ` +
+        `Deploy the agent factory and account class on ${network} first, ` +
+        `then populate NETWORKS.${network} in paymaster_submit.mjs.`);
+  }
 
   const proofPath = args.proof;
   const contract = args.contract;
@@ -733,6 +829,13 @@ async function cmdVerify(args) {
         "Could not verify acceptance via contract view methods; using tx success only."
       );
     }
+  }
+
+  if (!acceptedOnchain && acceptanceEvidence === "verification_count_delta") {
+    die(
+      "On-chain acceptance check failed: verification_count did not increase. " +
+        "Likely replayed proof (already verified) or verifier-side rejection."
+    );
   }
 
   const onchainAssurance = "full_gkr";

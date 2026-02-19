@@ -527,8 +527,8 @@ fn test_gkr_calldata_size_small_models() {
     );
 
     // MLP with ReLU activation has a LogUp proof with 2^16 multiplicities table.
-    // This makes the calldata ~65K felts. Document this: large activation tables
-    // need chunked verification via upload_proof_chunk for on-chain deployment.
+    // This makes the calldata ~65K felts. Large proofs use GKR mode 4
+    // (aggregated oracle sumcheck) for 140x calldata reduction.
     // The important thing is that it serializes correctly.
     assert!(
         cd_mlp.len() > 100,
@@ -542,7 +542,7 @@ fn test_gkr_calldata_size_small_models() {
     );
 
     // Document: if LogUp multiplicities table is large, calldata exceeds single-tx limit.
-    // This is expected — real deployment uses upload_proof_chunk for large proofs.
+    // Real deployment uses GKR v4 mode 4 (aggregated weight binding) for compact calldata.
     if cd_mlp.len() > 5000 {
         eprintln!(
             "NOTE: MLP calldata ({} felts) exceeds single-tx limit (~5000 felts). \

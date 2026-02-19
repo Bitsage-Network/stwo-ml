@@ -16,6 +16,9 @@ use crate::components::matmul::{
     matrix_to_mle_col_major_padded_pub as matrix_to_mle_col_major_padded,
     matrix_to_mle_pub as matrix_to_mle, pad_matrix_pow2, M31Matrix, RoundPoly,
 };
+use crate::crypto::aggregated_opening::{
+    verify_aggregated_binding, AggregatedWeightClaim,
+};
 use crate::crypto::poseidon_channel::PoseidonChannel;
 use crate::gadgets::lookup_table::PrecomputedTable;
 
@@ -771,6 +774,61 @@ fn verify_gkr_inner(
                         ),
                     });
                 }
+            }
+        }
+
+        WeightOpeningTranscriptMode::AggregatedOracleSumcheck => {
+            let binding_proof = proof.aggregated_binding.as_ref().ok_or_else(|| {
+                GKRError::VerificationError {
+                    layer_idx: 0,
+                    reason: "AggregatedOracleSumcheck mode requires aggregated_binding proof"
+                        .to_string(),
+                }
+            })?;
+
+            // Reconstruct AggregatedWeightClaim structs for verification.
+            // Main walk claims use proof.weight_commitments; deferred claims
+            // use deferred_proofs[i].weight_commitment.
+            let mut agg_claims = Vec::new();
+            for (idx, (claim, commitment)) in proof
+                .weight_claims
+                .iter()
+                .zip(proof.weight_commitments.iter())
+                .enumerate()
+            {
+                agg_claims.push(AggregatedWeightClaim {
+                    matrix_index: idx,
+                    local_n_vars: claim.eval_point.len(),
+                    eval_point: claim.eval_point.clone(),
+                    expected_value: claim.expected_value,
+                    commitment: *commitment,
+                });
+            }
+            for (deferred_idx, deferred) in proof.deferred_proofs.iter().enumerate() {
+                let claim = &deferred.weight_claim;
+                let claim_idx = proof.weight_claims.len() + deferred_idx;
+                agg_claims.push(AggregatedWeightClaim {
+                    matrix_index: claim_idx,
+                    local_n_vars: claim.eval_point.len(),
+                    eval_point: claim.eval_point.clone(),
+                    expected_value: claim.expected_value,
+                    commitment: deferred.weight_commitment,
+                });
+            }
+
+            if agg_claims.is_empty() {
+                return Err(GKRError::VerificationError {
+                    layer_idx: 0,
+                    reason: "AggregatedOracleSumcheck mode with zero claims".to_string(),
+                });
+            }
+
+            if !verify_aggregated_binding(binding_proof, &agg_claims, channel) {
+                return Err(GKRError::VerificationError {
+                    layer_idx: 0,
+                    reason: "aggregated oracle sumcheck weight binding verification failed"
+                        .to_string(),
+                });
             }
         }
     }
@@ -2966,6 +3024,29 @@ mod tests {
     use num_traits::Zero;
     use stwo::core::fields::m31::M31;
 
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(prev) = self.prev.as_ref() {
+                std::env::set_var(self.key, prev);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
     fn matmul_forward(a: &M31Matrix, b: &M31Matrix) -> M31Matrix {
         let mut c = M31Matrix::new(a.rows, b.cols);
         for i in 0..a.rows {
@@ -3207,6 +3288,145 @@ mod tests {
 
         let mut verifier_channel = PoseidonChannel::new();
         verify_gkr_with_weights(&circuit, &proof, &out, &weights, &mut verifier_channel).unwrap();
+    }
+
+    #[test]
+    fn test_aggregated_oracle_sumcheck_requires_binding_proof() {
+        let mut builder = GraphBuilder::new((2, 4));
+        builder.linear(2);
+        let graph = builder.build();
+        let circuit = LayeredCircuit::from_graph(&graph).unwrap();
+
+        let mut a = M31Matrix::new(2, 4);
+        let mut b = M31Matrix::new(4, 2);
+        for i in 0..8 {
+            a.data[i] = M31::from((i + 1) as u32);
+            b.data[i] = M31::from((i + 1) as u32);
+        }
+        let c = matmul_forward(&a, &b);
+
+        let mut weights = GraphWeights::new();
+        weights.add_weight(0, b.clone());
+        let execution = GraphExecution {
+            intermediates: vec![(0, a.clone())],
+            node_outputs: std::collections::HashMap::new(),
+            output: c.clone(),
+        };
+
+        let mut prover_channel = PoseidonChannel::new();
+        let mut proof = prove_gkr(&circuit, &execution, &weights, &mut prover_channel).unwrap();
+        proof.weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
+        proof.aggregated_binding = None;
+
+        let mut verifier_channel = PoseidonChannel::new();
+        let err = verify_gkr(&circuit, &proof, &c, &mut verifier_channel)
+            .expect_err("mode4 must require aggregated binding proof");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("requires aggregated_binding proof"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_aggregated_oracle_sumcheck_tampered_binding_fails() {
+        let _binding_mode = EnvVarGuard::set("STWO_WEIGHT_BINDING", "aggregated");
+
+        let mut builder = GraphBuilder::new((2, 4));
+        builder.linear(2);
+        let graph = builder.build();
+        let circuit = LayeredCircuit::from_graph(&graph).unwrap();
+
+        let mut a = M31Matrix::new(2, 4);
+        let mut b = M31Matrix::new(4, 2);
+        for i in 0..8 {
+            a.data[i] = M31::from((i + 1) as u32);
+            b.data[i] = M31::from((i + 1) as u32);
+        }
+        let c = matmul_forward(&a, &b);
+
+        let mut weights = GraphWeights::new();
+        weights.add_weight(0, b.clone());
+        let execution = GraphExecution {
+            intermediates: vec![(0, a.clone())],
+            node_outputs: std::collections::HashMap::new(),
+            output: c.clone(),
+        };
+
+        let mut prover_channel = PoseidonChannel::new();
+        let mut proof = prove_gkr(&circuit, &execution, &weights, &mut prover_channel).unwrap();
+        assert_eq!(
+            proof.weight_opening_transcript_mode,
+            WeightOpeningTranscriptMode::AggregatedOracleSumcheck
+        );
+        assert!(
+            proof.aggregated_binding.is_some(),
+            "mode4 prover must include aggregated binding proof"
+        );
+
+        let mut verifier_channel_ok = PoseidonChannel::new();
+        verify_gkr(&circuit, &proof, &c, &mut verifier_channel_ok)
+            .expect("mode4 proof with valid binding should verify");
+
+        if let Some(binding) = proof.aggregated_binding.as_mut() {
+            binding.oracle_eval_at_s = binding.oracle_eval_at_s + SecureField::one();
+        }
+
+        let mut verifier_channel_bad = PoseidonChannel::new();
+        let err = verify_gkr(&circuit, &proof, &c, &mut verifier_channel_bad)
+            .expect_err("tampered mode4 binding must fail verification");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("aggregated oracle sumcheck weight binding verification failed"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_aggregated_oracle_sumcheck_cross_mode_confusion_fails() {
+        let _binding_mode = EnvVarGuard::set("STWO_WEIGHT_BINDING", "aggregated");
+
+        let mut builder = GraphBuilder::new((2, 4));
+        builder.linear(2);
+        let graph = builder.build();
+        let circuit = LayeredCircuit::from_graph(&graph).unwrap();
+
+        let mut a = M31Matrix::new(2, 4);
+        let mut b = M31Matrix::new(4, 2);
+        for i in 0..8 {
+            a.data[i] = M31::from((i + 1) as u32);
+            b.data[i] = M31::from((i + 1) as u32);
+        }
+        let c = matmul_forward(&a, &b);
+
+        let mut weights = GraphWeights::new();
+        weights.add_weight(0, b.clone());
+        let execution = GraphExecution {
+            intermediates: vec![(0, a.clone())],
+            node_outputs: std::collections::HashMap::new(),
+            output: c.clone(),
+        };
+
+        let mut prover_channel = PoseidonChannel::new();
+        let mut proof = prove_gkr(&circuit, &execution, &weights, &mut prover_channel).unwrap();
+        assert_eq!(
+            proof.weight_opening_transcript_mode,
+            WeightOpeningTranscriptMode::AggregatedOracleSumcheck
+        );
+        assert!(proof.aggregated_binding.is_some());
+
+        // Adversarial relabeling: try to reinterpret mode4 proof as mode3 path.
+        proof.weight_opening_transcript_mode =
+            WeightOpeningTranscriptMode::AggregatedOpeningsV4Experimental;
+
+        let mut verifier_channel = PoseidonChannel::new();
+        let err = verify_gkr(&circuit, &proof, &c, &mut verifier_channel)
+            .expect_err("mode relabeling must fail verification");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("weight_openings count"),
+            "unexpected cross-mode error: {msg}"
+        );
     }
 
     #[test]

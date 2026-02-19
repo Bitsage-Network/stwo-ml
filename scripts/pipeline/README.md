@@ -93,13 +93,8 @@ The bootstrap script clones the repo to `~/obelysk/`, installs dependencies, det
 cd scripts/pipeline
 
 # Full pipeline: setup -> download -> validate -> capture -> prove -> verify -> audit
+# Uses aggregated oracle sumcheck (~17K felts calldata, 140x reduction from legacy)
 ./run_e2e.sh --preset qwen3-14b --gpu --submit
-
-# Same flow, using verify_model_gkr_v2 calldata
-./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v2
-
-# Same flow, using verify_model_gkr_v3 calldata (defaults to mode2 on submit path)
-./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v3
 
 # Dry run (no on-chain submission)
 ./run_e2e.sh --preset phi3-mini --gpu --dry-run
@@ -110,7 +105,7 @@ cd scripts/pipeline
 # With HuggingFace auth (for gated models like Llama)
 HF_TOKEN=hf_xxx ./run_e2e.sh --preset llama3-8b --gpu --submit
 
-# With on-chain submission
+# With explicit Starknet key (default on Sepolia: AVNU paymaster, no key needed)
 STARKNET_PRIVATE_KEY=0x... ./run_e2e.sh --preset qwen3-14b --gpu --submit
 ```
 
@@ -162,28 +157,25 @@ STARKNET_PRIVATE_KEY=0x... ./run_e2e.sh --preset qwen3-14b --gpu --submit
 | `STWO_GPU_MLE_FOLD_REQUIRE` | No | Off | Fail if MLE fold falls back to CPU |
 | `STWO_GPU_MLE_OPENING_TREE_REQUIRE` | No | Off | Fail if GPU-resident opening-tree path fails |
 | `STWO_GPU_MLE_OPENING_TIMING` | No | Off | Print per-opening tree/query timing breakdown |
-| `STWO_STARKNET_GKR_V2` | No | Off | Emit `verify_model_gkr_v2` calldata in `ml_gkr` artifacts |
-| `STWO_STARKNET_GKR_V3` | No | Off | Emit `verify_model_gkr_v3` calldata in `ml_gkr` artifacts |
-| `STWO_STARKNET_GKR_V4` | No | Off | Emit `verify_model_gkr_v4` calldata in `ml_gkr` artifacts |
-| `STWO_GKR_TRUSTLESS_MODE2` | No | Off | Enable v3 `weight_binding_mode=2` (trustless mode-2 payload + opening checks) |
-| `STWO_GKR_TRUSTLESS_MODE3` | No | Off | Enable v4 `weight_binding_mode=3` (experimental aggregated-openings envelope + opening checks) |
-| `STWO_GKR_BATCH_WEIGHT_OPENINGS` | No | `on` for `--starknet-ready --gkr-v2/--gkr-v3/--gkr-v4 --gpu`, else off | Use sub-channel weight-opening transcript (mode 1, and mode 2/3 when enabled) |
-| `STWO_GKR_AGGREGATE_WEIGHT_BINDING` | No | `on` in `03_prove.sh` fast mode, auto-`off` for `run_e2e.sh --submit` | Batched RLC weight-binding mode (serializable artifact, not submit-ready for Starknet `verify_model_gkr`/`verify_model_gkr_v2`/`verify_model_gkr_v3`/`verify_model_gkr_v4`) |
+| `STWO_WEIGHT_BINDING` | No | Off | Set to `aggregated` for aggregated oracle sumcheck (mode 4). Auto-set by `--submit`. |
+| `STWO_STARKNET_GKR_V2` | No | Off | (Legacy) Emit `verify_model_gkr_v2` calldata |
+| `STWO_STARKNET_GKR_V3` | No | Off | (Legacy) Emit `verify_model_gkr_v3` calldata |
+| `STWO_STARKNET_GKR_V4` | No | Off | Emit `verify_model_gkr_v4` calldata (auto-set by `--submit`) |
+| `STWO_GKR_TRUSTLESS_MODE2` | No | Off | (Legacy) Enable v3 `weight_binding_mode=2` |
+| `STWO_GKR_TRUSTLESS_MODE3` | No | Off | (Legacy) Enable v4 `weight_binding_mode=3` |
+| `STWO_GKR_BATCH_WEIGHT_OPENINGS` | No | Varies | (Legacy) Sub-channel weight-opening transcript |
+| `STWO_GKR_AGGREGATE_WEIGHT_BINDING` | No | `on` off-chain, `off` for submit | (Legacy) RLC weight-binding mode for fast off-chain proving |
+| `OBELYSK_MAX_GKR_CALLDATA_FELTS` | No | `300000` | Hard fail in verify submit preflight when calldata is too large |
+| `OBELYSK_MAX_GKR_MODE4_CALLDATA_FELTS` | No | `120000` | Hard fail in verify submit preflight when mode-4 calldata is unexpectedly large |
+| `OBELYSK_MIN_GKR_MODE4_CALLDATA_FELTS` | No | `1000` | Hard fail in verify submit preflight when mode-4 calldata is unexpectedly small |
 
 Notes:
-- The opening path now packs QM31 leaves to felt252 on GPU (no per-round CPU repack/upload), which reduces weight-opening overhead on large models.
-- Query extraction now replays folds on GPU and downloads only queried leaf pairs (instead of full folded layers), reducing opening-phase host transfer pressure.
-- `03_prove.sh` defaults to aggregated RLC weight binding for faster off-chain proving.
-- `run_e2e.sh --submit` auto-adds `--starknet-ready` and defaults to `verify_model_gkr_v4` mode3 unless `--legacy-gkr-v1` is set.
-- `run_e2e.sh --submit --gkr-v3` with `--gkr-v2-mode auto` now defaults to `mode2`.
-- `run_e2e.sh --submit --gkr-v4` with `--gkr-v2-mode auto` now defaults to `mode3`.
-- `run_e2e.sh` validation step now runs only structural/weight checks by default (no 1-layer debug proof).
-- Use `run_e2e.sh --validate-test-proof` only for optional debug smoke checks.
-- Unified STARK now retries once on SIMD if GPU path hits `ConstraintsNotSatisfied` (soundness-preserving fallback). Set `--gpu-only` or `STWO_UNIFIED_STARK_NO_FALLBACK=1` to fail closed instead.
+- **`--submit` is the recommended path.** It uses aggregated oracle sumcheck (mode 4) which produces ~17K felts calldata — a 140x reduction from the legacy per-opening modes (~2.4M felts).
+- The aggregated protocol maps all M weight matrices into one virtual address space, runs a single mismatch sumcheck, and opens one MLE against the super-root.
+- `run_e2e.sh --submit` always uses aggregated oracle sumcheck unless `--legacy-gkr-v1` is explicitly set.
 - `03_prove.sh` defaults `STWO_PURE_GKR_SKIP_UNIFIED_STARK=1` for `ml_gkr`, which bypasses Phase 3 when GKR already covers activation/add/mul/layernorm/rmsnorm/dequantize.
-- In aggregated weight-binding mode, `ml_gkr` output still serializes full proof artifacts with `submission_ready=false`, `weight_opening_mode`, `weight_claim_calldata`, and versioned `weight_binding_*` metadata.
-- v3 mode 2 (`STWO_GKR_TRUSTLESS_MODE2=1`) is submit-ready and keeps full opening proofs while adding explicit `weight_binding_data` payload checks; mode-2 openings now use the same sub-channel transcript strategy as batched mode.
-- v4 aggregated-opening redesign spec (eliminate per-weight openings): `stwo-ml/docs/fast-gkr-onchain-v4-aggregated-openings.md`.
+- Unified STARK retries once on SIMD if GPU path hits `ConstraintsNotSatisfied`. Set `--gpu-only` or `STWO_UNIFIED_STARK_NO_FALLBACK=1` to fail closed instead.
+- Legacy modes (v1/v2/v3 and v4 mode3) remain supported via explicit non-default flags for backward compatibility.
 
 ## Model Presets
 
@@ -215,9 +207,11 @@ GPU presets in `configs/4090.env`, `configs/b200.env`, `configs/b300.env`.
 
 ## Proof Modes
 
-| Mode | Pipeline | On-Chain Function | Notes |
-|------|----------|-------------------|-------|
-| `gkr` | prove-model (GKR sumcheck) | `verify_model_gkr()` / `verify_model_gkr_v2()` | Hardened production mode. Full on-chain GKR assurance. |
+| Mode | Pipeline | On-Chain Function | Calldata | Notes |
+|------|----------|-------------------|----------|-------|
+| `gkr` + `--submit` | prove-model → aggregated oracle sumcheck | `verify_model_gkr_v4()` mode=4 | ~17K felts | **Default.** One unified mismatch sumcheck + single MLE opening. |
+| `gkr` + `--gkr-v4` | prove-model → per-opening mode 3 | `verify_model_gkr_v4()` mode=3 | ~2.4M felts | Legacy: 160 individual MLE openings. |
+| `gkr` + `--legacy-gkr-v1` | prove-model → sequential openings | `verify_model_gkr()` mode=0 | ~2.4M felts | Legacy v1 path. |
 
 ## Per-Script Usage
 
@@ -266,15 +260,16 @@ Prompt/benchmark runs now emit a heartbeat every 15s and always exit cleanly on 
 ### 03_prove.sh
 
 ```bash
+# Recommended: aggregated oracle sumcheck (~17K felts, on-chain ready)
+./03_prove.sh --model-name qwen3-14b --mode gkr --gpu --submit
+
+# Local proving only (no on-chain submission)
 ./03_prove.sh --model-name qwen3-14b --layers 1 --mode gkr --gpu
 ./03_prove.sh --model-name qwen3-14b --mode gkr --multi-gpu
 ./03_prove.sh --model-name qwen3-14b --mode gkr --gpu --gpu-only
 ./03_prove.sh --model-name qwen3-14b --server http://prover:8080
-./03_prove.sh --model-name qwen3-14b --mode gkr --starknet-ready                # defaults to v4 mode3
-./03_prove.sh --model-name qwen3-14b --mode gkr --starknet-ready --gkr-v2
-./03_prove.sh --model-name qwen3-14b --mode gkr --starknet-ready --gkr-v3
-./03_prove.sh --model-name qwen3-14b --mode gkr --starknet-ready --gkr-v3-mode2
-./03_prove.sh --model-name qwen3-14b --mode gkr --starknet-ready --gkr-v4
+
+# Legacy modes (still supported)
 ./03_prove.sh --model-name qwen3-14b --mode gkr --starknet-ready --gkr-v4-mode3
 ./03_prove.sh --model-name qwen3-14b --mode gkr --starknet-ready --legacy-gkr-v1
 ```
@@ -289,31 +284,17 @@ STARKNET_PRIVATE_KEY=0x... ./04_verify_onchain.sh --submit
 ```
 
 Notes:
-- The submit pipeline accepts `verify_calldata.entrypoint` as
-  `verify_model_gkr` (v1), `verify_model_gkr_v2` (v2), `verify_model_gkr_v3` (v3 envelope), or `verify_model_gkr_v4` (v4 envelope).
-- `verify_model_gkr` (v1) requires sequential openings (`weight_binding_mode=0`).
-- `verify_model_gkr_v2` accepts:
-  - `weight_binding_mode=0` (Sequential)
-  - `weight_binding_mode=1` (BatchedSubchannelV1)
-- `verify_model_gkr_v3` accepts:
-  - `weight_binding_mode=0` (Sequential, `weight_binding_data=[]`)
-  - `weight_binding_mode=1` (BatchedSubchannelV1, `weight_binding_data=[]`)
-  - `weight_binding_mode=2` (AggregatedTrustlessV2, non-empty `weight_binding_data`)
- - `verify_model_gkr_v4` accepts:
-   - `weight_binding_mode=3` (AggregatedOpeningsV4Experimental, non-empty `weight_binding_data`)
-- In `03_prove.sh`, `--starknet-ready` with no explicit v2/v3/v4 selector defaults to `verify_model_gkr_v4` mode3.
-- Use `--legacy-gkr-v1` to force `verify_model_gkr` (v1 sequential openings).
-- In `03_prove.sh`, `--gkr-v2` automatically enables `--starknet-ready`.
-- In `03_prove.sh`, `--gkr-v3` automatically enables `--starknet-ready`.
-- In `03_prove.sh`, `--gkr-v4`/`--gkr-v4-mode3` automatically enables `--starknet-ready`.
-- In `run_e2e.sh`, use `--gkr-v2-mode auto|sequential|batched|mode2|mode3` to control v2/v3/v4 opening mode.
-- `--gkr-v2-mode auto` defaults to `mode3` on submit + v4 (including implicit submit defaults), `mode2` on submit + v3, and otherwise follows `03_prove.sh` defaults.
-- Ensure your deployed verifier includes the requested entrypoint
-  (`verify_model_gkr_v2`, `verify_model_gkr_v3`, or `verify_model_gkr_v4`) before submitting artifacts.
-- Paymaster path now preflights ABI support and fails fast if the target
+- **Default path (`--submit`)**: Uses `verify_model_gkr_v4` with `weight_binding_mode=4` (aggregated oracle sumcheck). ~17K felts calldata.
+- `verify_model_gkr_v4` accepts:
+  - `weight_binding_mode=3` (AggregatedOpeningsV4Experimental, legacy per-opening)
+  - `weight_binding_mode=4` (AggregatedOracleSumcheck, unified oracle mismatch sumcheck)
+- Legacy modes (`verify_model_gkr` v1/v2/v3) still supported via explicit flags.
+- Replay/tamper hardening: submit path rejects artifacts where `weight_binding_data_calldata`
+  does not exactly match serialized calldata and fails closed when verification count does not increase.
+- Paymaster path preflights ABI support and fails fast if the target
   contract does not expose the requested entrypoint.
-- If `verify_calldata.entrypoint` is `unsupported` (e.g. aggregated RLC
-  weight-binding mode), the script prints `weight_opening_mode` + gate reason.
+- If `verify_calldata.entrypoint` is `unsupported`, the script prints
+  `weight_opening_mode` + gate reason.
 - In `--dry-run`, unsupported artifacts are reported and skipped cleanly.
 - In `--submit`, unsupported artifacts fail fast before submitting any tx.
 
@@ -330,22 +311,29 @@ Notes:
 ### run_e2e.sh
 
 ```bash
+# Recommended: aggregated oracle sumcheck (one command, ~17K felts)
 ./run_e2e.sh --preset qwen3-14b --gpu --submit
-./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v2
-./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v3
-./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v4 --gkr-v2-mode mode3
-./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v2 --gkr-v2-mode batched
-./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v2 --gkr-v2-mode sequential
-./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v3 --gkr-v2-mode mode2
-./run_e2e.sh --preset qwen3-14b --gpu --submit --legacy-gkr-v1
+
+# Dry run (no on-chain submission)
 ./run_e2e.sh --preset phi3-mini --gpu --dry-run
+
+# GPU-only (fail if any critical path falls back to CPU)
 ./run_e2e.sh --preset qwen3-14b --gpu --gpu-only --dry-run
+
+# Resume from a specific step
 ./run_e2e.sh --preset qwen3-14b --resume-from prove --submit
-./run_e2e.sh --preset llama3-8b --chat --submit         # Pause for chat
-./run_e2e.sh --preset qwen3-14b --resume-from capture --submit  # Resume from capture
+
+# Interactive chat after inference test
+./run_e2e.sh --preset llama3-8b --chat --submit
+
+# Skip setup/inference for faster iteration
 ./run_e2e.sh --preset qwen3-14b --skip-setup --skip-inference --submit
-./run_e2e.sh --preset qwen3-14b --gpu --submit --validate-test-proof  # Optional debug-only 1-layer validation proof
-./run_e2e.sh --preset phi3-mini --gpu --dry-run --no-audit     # Skip audit
+
+# Skip audit
+./run_e2e.sh --preset phi3-mini --gpu --dry-run --no-audit
+
+# Legacy per-opening mode (v1 sequential openings)
+./run_e2e.sh --preset qwen3-14b --gpu --submit --legacy-gkr-v1
 ```
 
 ## Directory Structure

@@ -601,7 +601,7 @@ Three security levels via `SecurityLevel` enum:
 
 ```
   +===============================================================================+
-  |                        3 VERIFICATION PATHS                                   |
+  |                        2 VERIFICATION PATHS                                   |
   +===============================================================================+
   |                                                                               |
   |  1. GKR Model (RECOMMENDED)                                                  |
@@ -611,17 +611,9 @@ Three security levels via `SecurityLevel` enum:
   |     - 100% on-chain cryptographic verification                                |
   |     - No FRI, no dictionaries, no recursion                                   |
   |     - Supports ALL layer types including DAG circuits                          |
-  |     - Single transaction                                                      |
+  |     - Single transaction, 140x calldata reduction (mode 4)                    |
   |                                                                               |
-  |  2. Direct                                                                    |
-  |     ======                                                                    |
-  |     GPU prove ---> verify_model_direct()                                      |
-  |                                                                               |
-  |     - Batch sumchecks + STARK hash binding                                    |
-  |     - Eliminates 46.8s Cairo VM recursion                                     |
-  |     - STARK data hash-bound (full STARK verify blocked by libfunc)            |
-  |                                                                               |
-  |  3. Recursive (legacy)                                                        |
+  |  2. Recursive (legacy)                                                        |
   |     =========                                                                 |
   |     GPU prove ---> Cairo VM STARK ---> verify(recursive_proof)                |
   |                                                                               |
@@ -635,7 +627,6 @@ Three security levels via `SecurityLevel` enum:
 | Pipeline | Stages | Total Time | Use Case |
 |----------|--------|-----------|----------|
 | **GKR Model (recommended)** | GPU prove + `verify_model_gkr()` | ~7s + on-chain | Full on-chain verification, all layer types |
-| Direct | GPU prove + `verify_model_direct()` | ~38s + on-chain | Batch sumchecks + STARK hash binding |
 | Recursive | GPU prove + Cairo VM STARK + on-chain | ~85s + on-chain | Maximum proof compression |
 
 ### Integration Points
@@ -657,14 +648,14 @@ Trusted submitter model. Owner verifies recursive STARK proof off-chain, then su
 - **Events**: ModelRegistered, JobCreated, ProofSubmitted, InferenceVerified, PaymentProcessed, WorkerRewarded, VerificationComplete, TeeAttested
 - **TEE support**: Records attestation hash for proofs generated inside CC enclaves
 
-#### Path 2: SumcheckVerifier (Generic, Trustless)
+#### Path 2: EloVerifier GKR (Generic, Trustless)
 
-Fully on-chain Fiat-Shamir transcript replay. No token dependencies, no trusted submitter — pure cryptographic verification. Any Starknet project can use this.
+Fully on-chain GKR verification with Fiat-Shamir transcript replay. No token dependencies, no trusted submitter — pure cryptographic verification. Any Starknet project can use this.
 
-- **Entry point**: `verify_matmul(model_id, proof)` where proof is a full `MatMulSumcheckProof`
-- **Verification flow**: Mix dimensions into Poseidon channel -> draw challenges -> verify each sumcheck round (`p(0) + p(1) == expected_sum`) -> verify final product (`a_eval * b_eval`) -> verify MLE opening proofs (14 Merkle-authenticated queries per matrix)
+- **Entry points**: `verify_model_gkr()`, `verify_model_gkr_v2()`, `verify_model_gkr_v3()`, `verify_model_gkr_v4()`
+- **Verification flow**: ML GKR walk over full computation DAG, sumcheck per layer, deferred proofs for skip connections, weight binding via aggregated oracle sumcheck (mode 4)
 - **Field arithmetic**: Full M31/CM31/QM31 tower in Cairo using u64 to avoid overflow
-- **Events**: ModelRegistered, MatMulVerified, VerificationFailed
+- **Events**: ModelGkrRegistered, ModelGkrVerified, VerificationFailed
 
 #### Path 3: StweMlStarkVerifier (Multi-Step Full STARK)
 
@@ -743,7 +734,7 @@ prove-model pool-status
 
 | Contract | Address | Version | Features |
 |----------|---------|---------|----------|
-| **EloVerifier** | [`0x0121d1...c005`](https://sepolia.starkscan.co/contract/0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005) | v10 | GKR v4 path, deferred proofs, all layer types, 5-min upgrade |
+| **EloVerifier** | [`0x0121d1...c005`](https://sepolia.starkscan.co/contract/0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005) | v11 | GKR v4, deferred proofs, aggregated weight binding, input validation, 5-min upgrade |
 | **VM31Pool** | [`0x07cf94...e1f9`](https://sepolia.starkscan.co/contract/0x07cf94e27a60b94658ec908a00a9bb6dfff03358e952d9d48a8ed0be080ce1f9) | v1 | Privacy pool, Poseidon2-M31 Merkle tree, batch proving, 5-min timelocked upgrade |
 | ObelyskVerifier | [`0x04f8c5...a15`](https://sepolia.starkscan.co/contract/0x04f8c5377d94baa15291832dc3821c2fc235a95f0823f86add32f828ea965a15) | v3 | Recursive proof + SAGE payment |
 | StweMlStarkVerifier | [`0x005928...fba`](https://sepolia.starkscan.co/contract/0x005928ac548dc2719ef1b34869db2b61c2a55a4b148012fad742262a8d674fba) | v1 | Multi-step STARK verify |

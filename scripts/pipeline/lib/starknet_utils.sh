@@ -345,8 +345,7 @@ estimate_gas() {
         verify_merkle_step)   echo "0.02" ;;
         verify_oods)          echo "0.01" ;;
         finalize_session)     echo "0.005" ;;
-        verify_model_direct)  echo "0.05" ;;
-        verify_model_gkr)     echo "0.05" ;;
+        verify_model_gkr*)    echo "0.05" ;;
         *)                    echo "0.05" ;;
     esac
 }

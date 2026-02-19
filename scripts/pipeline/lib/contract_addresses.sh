@@ -20,7 +20,7 @@ _OBELYSK_CONTRACTS_LOADED=1
 # StweMlStarkVerifier (recursive STARK verification)
 STARK_VERIFIER_SEPOLIA="0x005928ac548dc2719ef1b34869db2b61c2a55a4b148012fad742262a8d674fba"
 
-# Obelysk/Elo Cairo Verifier (direct + GKR verification + audit)
+# Obelysk/Elo Cairo Verifier (GKR verification + audit) — v11
 ELO_VERIFIER_SEPOLIA="0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005"
 
 # VM31 Privacy Pool

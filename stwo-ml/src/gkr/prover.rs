@@ -24,8 +24,12 @@ use crate::components::matmul::matrix_to_mle_col_major_padded_pub as matrix_to_m
 use crate::components::matmul::matrix_to_mle_col_major_u32_padded_pub as matrix_to_mle_col_major_u32_padded;
 use crate::components::matmul::{
     evaluate_mle_pub as evaluate_mle, matrix_to_mle_col_major_pub as matrix_to_mle_col_major,
-    matrix_to_mle_pub as matrix_to_mle, pad_matrix_pow2, restrict_mle_pub as restrict_mle,
-    M31Matrix,
+    matrix_to_mle_pub as matrix_to_mle, pad_matrix_pow2, M31Matrix,
+};
+#[cfg(any(feature = "cuda-runtime", test))]
+use crate::components::matmul::restrict_mle_pub as restrict_mle;
+use crate::crypto::aggregated_opening::{
+    prove_aggregated_binding, AggregatedWeightClaim,
 };
 use crate::crypto::poseidon_channel::PoseidonChannel;
 
@@ -89,6 +93,274 @@ fn gkr_trustless_mode3_enabled() -> bool {
         }
         Err(_) => false,
     }
+}
+
+fn gkr_aggregated_oracle_sumcheck_enabled() -> bool {
+    match std::env::var("STWO_WEIGHT_BINDING") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            v == "aggregated" || v == "oracle_sumcheck" || v == "1"
+        }
+        Err(_) => false,
+    }
+}
+
+// =============================================================================
+// Shared weight opening helpers (used by both CPU and GPU provers)
+// =============================================================================
+
+/// Computed mode flags for weight opening strategy.
+struct WeightModeFlags {
+    aggregate_weight_binding: bool,
+    trustless_mode2: bool,
+    trustless_mode3: bool,
+}
+
+/// Compute weight opening mode flags from environment variables.
+fn compute_weight_mode_flags() -> WeightModeFlags {
+    let aggregate_weight_binding_env = gkr_aggregate_weight_binding_enabled();
+    let trustless_mode3 = gkr_trustless_mode3_enabled();
+    let trustless_mode2 = gkr_trustless_mode2_enabled() && !trustless_mode3;
+    if trustless_mode3 && gkr_trustless_mode2_enabled() {
+        eprintln!("  [GKR] STWO_GKR_TRUSTLESS_MODE3=1 overrides STWO_GKR_TRUSTLESS_MODE2=1");
+    }
+    if (trustless_mode2 || trustless_mode3) && aggregate_weight_binding_env {
+        let mode = if trustless_mode3 { "MODE3" } else { "MODE2" };
+        eprintln!(
+            "  [GKR] STWO_GKR_TRUSTLESS_{mode}=1 overrides STWO_GKR_AGGREGATE_WEIGHT_BINDING=on (keeping opening proofs)"
+        );
+    }
+    let aggregate_weight_binding =
+        aggregate_weight_binding_env && !(trustless_mode2 || trustless_mode3);
+    WeightModeFlags {
+        aggregate_weight_binding,
+        trustless_mode2,
+        trustless_mode3,
+    }
+}
+
+/// Apply aggregated oracle sumcheck binding for all weight claims.
+///
+/// Returns (weight_commitments, weight_claims, proof). The `deferred_proofs`
+/// are updated in-place with the correct weight commitments.
+fn apply_aggregated_oracle_sumcheck(
+    weight_data: &[(usize, Vec<SecureField>, SecureField)],
+    deferred_weight_claims_data: &[(usize, Vec<SecureField>, SecureField)],
+    deferred_proofs: &mut [super::types::DeferredProof],
+    weights: &GraphWeights,
+    channel: &mut PoseidonChannel,
+    log_tag: &str,
+) -> Result<
+    (
+        Vec<starknet_ff::FieldElement>,
+        Vec<super::types::WeightClaim>,
+        Option<crate::crypto::aggregated_opening::AggregatedWeightBindingProof>,
+    ),
+    GKRError,
+> {
+    let mut weight_commitments = Vec::new();
+    let mut weight_claims = Vec::with_capacity(weight_data.len());
+
+    // Build weight claims for main walk
+    for (weight_node_id, eval_point, expected_value) in weight_data.iter() {
+        weight_claims.push(super::types::WeightClaim {
+            weight_node_id: *weight_node_id,
+            eval_point: eval_point.clone(),
+            expected_value: *expected_value,
+        });
+    }
+
+    // Collect aggregated claims with MLEs
+    let mut agg_claims = Vec::new();
+    let mut all_mles: Vec<Vec<SecureField>> = Vec::new();
+
+    // Main walk claims
+    for (idx, (weight_node_id, eval_point, expected_value)) in weight_data.iter().enumerate() {
+        let b_matrix = weights
+            .get_weight(*weight_node_id)
+            .ok_or(GKRError::MissingWeight {
+                node_id: *weight_node_id,
+            })?;
+        let b_mle = matrix_to_mle_col_major(b_matrix);
+        let n_vars = b_mle.len().trailing_zeros() as usize;
+        let commitment = crate::crypto::mle_opening::commit_mle_root_only(&b_mle);
+        weight_commitments.push(commitment);
+
+        agg_claims.push(AggregatedWeightClaim {
+            matrix_index: idx,
+            local_n_vars: n_vars,
+            eval_point: eval_point.clone(),
+            expected_value: *expected_value,
+            commitment,
+        });
+        all_mles.push(b_mle);
+    }
+
+    // Deferred claims
+    for (deferred_idx, (weight_node_id, eval_point, expected_value)) in
+        deferred_weight_claims_data.iter().enumerate()
+    {
+        let b_matrix = weights
+            .get_weight(*weight_node_id)
+            .ok_or(GKRError::MissingWeight {
+                node_id: *weight_node_id,
+            })?;
+        let b_mle = matrix_to_mle_col_major(b_matrix);
+        let n_vars = b_mle.len().trailing_zeros() as usize;
+        let commitment = crate::crypto::mle_opening::commit_mle_root_only(&b_mle);
+
+        // Update deferred proof's weight commitment
+        if let Some(dp) = deferred_proofs.get_mut(deferred_idx) {
+            dp.weight_commitment = commitment;
+        }
+
+        let claim_idx = weight_data.len() + deferred_idx;
+        agg_claims.push(AggregatedWeightClaim {
+            matrix_index: claim_idx,
+            local_n_vars: n_vars,
+            eval_point: eval_point.clone(),
+            expected_value: *expected_value,
+            commitment,
+        });
+        all_mles.push(b_mle);
+    }
+
+    let binding_proof = if !agg_claims.is_empty() {
+        let mle_refs: Vec<&[SecureField]> = all_mles.iter().map(|m| m.as_slice()).collect();
+        let proof = prove_aggregated_binding(&agg_claims, &mle_refs, channel);
+        eprintln!(
+            "  [{log_tag}] aggregated oracle sumcheck: {} claims, ~{} felts calldata (vs ~{} felts per-opening)",
+            agg_claims.len(),
+            proof.estimated_calldata_felts(),
+            agg_claims.len() * 15_000,
+        );
+        Some(proof)
+    } else {
+        None
+    };
+
+    Ok((weight_commitments, weight_claims, binding_proof))
+}
+
+/// Apply aggregated RLC weight binding.
+///
+/// Returns weight claims with the combined expected value mixed into the channel.
+fn apply_aggregated_rlc_binding(
+    weight_data: &[(usize, Vec<SecureField>, SecureField)],
+    deferred_weight_claims_data: &[(usize, Vec<SecureField>, SecureField)],
+    channel: &mut PoseidonChannel,
+) -> Vec<super::types::WeightClaim> {
+    let rho = channel.draw_qm31();
+    let mut rho_pow = SecureField::one();
+    let mut combined_expected = SecureField::zero();
+    for (_, _, expected_value) in deferred_weight_claims_data.iter() {
+        combined_expected = combined_expected + rho_pow * *expected_value;
+        rho_pow = rho_pow * rho;
+    }
+    let mut weight_claims = Vec::with_capacity(weight_data.len());
+    for (weight_node_id, eval_point, expected_value) in weight_data.iter() {
+        weight_claims.push(super::types::WeightClaim {
+            weight_node_id: *weight_node_id,
+            eval_point: eval_point.clone(),
+            expected_value: *expected_value,
+        });
+        combined_expected = combined_expected + rho_pow * *expected_value;
+        rho_pow = rho_pow * rho;
+    }
+    mix_secure_field(channel, combined_expected);
+    eprintln!(
+        "  [GKR] aggregated weight binding enabled (RLC): {} claims, {} openings eliminated",
+        weight_data.len() + deferred_weight_claims_data.len(),
+        weight_data.len() + deferred_weight_claims_data.len()
+    );
+    weight_claims
+}
+
+/// Finalize the weight opening transcript mode after per-opening processing.
+fn finalize_weight_transcript_mode(
+    flags: &WeightModeFlags,
+    aggregate_weight_binding: bool,
+) -> Option<WeightOpeningTranscriptMode> {
+    if (flags.trustless_mode2 || flags.trustless_mode3) && !aggregate_weight_binding {
+        if flags.trustless_mode3 {
+            eprintln!(
+                "  [GKR] aggregated trustless mode v4 (experimental) enabled: opening proofs retained with mode-3 binding metadata"
+            );
+            Some(WeightOpeningTranscriptMode::AggregatedOpeningsV4Experimental)
+        } else {
+            eprintln!(
+                "  [GKR] aggregated trustless mode v2 enabled: opening proofs retained with mode-2 binding metadata"
+            );
+            Some(WeightOpeningTranscriptMode::AggregatedTrustlessV2)
+        }
+    } else {
+        None
+    }
+}
+
+/// Process Add layer reduction result: determine trunk/skip, push deferred claim.
+///
+/// Returns `(LayerProof, trunk_claim)`.
+fn process_add_deferred(
+    add_proof: LayerProof,
+    current_claim: &GKRClaim,
+    input_layers: &[usize],
+    deferred_info: &mut Vec<(GKRClaim, usize)>,
+) -> (LayerProof, GKRClaim) {
+    let LayerProof::Add {
+        lhs_eval, rhs_eval, ..
+    } = &add_proof
+    else {
+        unreachable!("process_add_deferred called with non-Add proof")
+    };
+    // Trunk = higher layer index (encountered next in reverse walk).
+    let (trunk_eval, skip_eval, skip_layer_idx, trunk_idx) =
+        if input_layers[1] > input_layers[0] {
+            (*rhs_eval, *lhs_eval, input_layers[0], 1u8)
+        } else {
+            (*lhs_eval, *rhs_eval, input_layers[1], 0u8)
+        };
+    deferred_info.push((
+        GKRClaim {
+            point: current_claim.point.clone(),
+            value: skip_eval,
+        },
+        skip_layer_idx,
+    ));
+    let claim = GKRClaim {
+        point: current_claim.point.clone(),
+        value: trunk_eval,
+    };
+    let proof = LayerProof::Add {
+        lhs_eval: *lhs_eval,
+        rhs_eval: *rhs_eval,
+        trunk_idx,
+    };
+    (proof, claim)
+}
+
+/// Compute weight evaluation point from a MatMul reduction and push to weight_data.
+///
+/// `current_point` is the claim point before reduction. `reduction_claim_point`
+/// is the claim point after reduction (contains sumcheck challenges).
+fn push_matmul_weight_data(
+    weight_node_id: usize,
+    m: usize,
+    n: usize,
+    current_point: &[SecureField],
+    reduction_claim_point: &[SecureField],
+    final_b_eval: SecureField,
+    weight_data: &mut Vec<(usize, Vec<SecureField>, SecureField)>,
+) {
+    let pm = m.next_power_of_two();
+    let log_m = pm.ilog2() as usize;
+    let pn = n.next_power_of_two();
+    let log_n = pn.ilog2() as usize;
+    let r_j = current_point[log_m..log_m + log_n].to_vec();
+    let sumcheck_challenges = &reduction_claim_point[log_m..];
+    let mut weight_eval_point = r_j;
+    weight_eval_point.extend_from_slice(sumcheck_challenges);
+    weight_data.push((weight_node_id, weight_eval_point, final_b_eval));
 }
 
 /// Prove a full model forward pass using the GKR protocol.
@@ -157,29 +429,20 @@ pub fn prove_gkr(
                             node_id: *weight_node_id,
                         })?;
 
-                // Capture r_j before reduction for weight evaluation point
-                let pm = m.next_power_of_two();
-                let log_m = pm.ilog2() as usize;
-                let pn = n.next_power_of_two();
-                let log_n = pn.ilog2() as usize;
-                let r_j = current_claim.point[log_m..log_m + log_n].to_vec();
-
-                let (proof, claim) =
+                let (reduction, claim) =
                     reduce_matmul_layer(&current_claim, a_matrix, b_matrix, *m, *k, *n, channel)?;
 
-                // Weight eval point: [r_j || sumcheck_challenges]
-                // claim.point = [r_i || sumcheck_challenges], so challenges start at log_m
-                let sumcheck_challenges = &claim.point[log_m..];
-                let mut weight_eval_point = r_j;
-                weight_eval_point.extend_from_slice(sumcheck_challenges);
-
-                weight_data.push((*weight_node_id, weight_eval_point, proof.final_b_eval));
+                push_matmul_weight_data(
+                    *weight_node_id, *m, *n,
+                    &current_claim.point, &claim.point,
+                    reduction.final_b_eval, &mut weight_data,
+                );
 
                 (
                     LayerProof::MatMul {
-                        round_polys: proof.round_polys,
-                        final_a_eval: proof.final_a_eval,
-                        final_b_eval: proof.final_b_eval,
+                        round_polys: reduction.round_polys,
+                        final_a_eval: reduction.final_a_eval,
+                        final_b_eval: reduction.final_b_eval,
                     },
                     claim,
                 )
@@ -191,55 +454,15 @@ pub fn prove_gkr(
                 let (proof, _claim) =
                     reduce_add_layer(&current_claim, &lhs_vals, &rhs_vals, channel)?;
 
-                // Determine trunk vs skip: the trunk is the input with the
-                // higher layer index (the one the sequential walk encounters next).
-                // The skip connection gets a deferred proof.
-                let LayerProof::Add {
-                    lhs_eval, rhs_eval, ..
-                } = &proof
-                else {
-                    unreachable!()
-                };
-                let (trunk_eval, skip_eval, skip_layer_idx, trunk_idx) =
-                    if layer.input_layers[1] > layer.input_layers[0] {
-                        // rhs (input_layers[1]) is the trunk
-                        (*rhs_eval, *lhs_eval, layer.input_layers[0], 1u8)
-                    } else {
-                        // lhs (input_layers[0]) is the trunk
-                        (*lhs_eval, *rhs_eval, layer.input_layers[1], 0u8)
-                    };
-
-                // Store deferred claim for the skip connection branch.
-                deferred_info.push((
-                    GKRClaim {
-                        point: current_claim.point.clone(),
-                        value: skip_eval,
-                    },
-                    skip_layer_idx,
-                ));
-
-                let claim = GKRClaim {
-                    point: current_claim.point.clone(),
-                    value: trunk_eval,
-                };
-
-                // Reconstruct with correct trunk_idx
-                let proof = LayerProof::Add {
-                    lhs_eval: *lhs_eval,
-                    rhs_eval: *rhs_eval,
-                    trunk_idx,
-                };
-
-                (proof, claim)
+                process_add_deferred(
+                    proof, &current_claim, &layer.input_layers, &mut deferred_info,
+                )
             }
 
             LayerType::Mul { .. } => {
                 let (lhs_vals, rhs_vals) = get_binary_op_intermediates(execution, layer, circuit)?;
 
-                let (proof, claim) =
-                    reduce_mul_layer(&current_claim, &lhs_vals, &rhs_vals, channel)?;
-
-                (proof, claim)
+                reduce_mul_layer(&current_claim, &lhs_vals, &rhs_vals, channel)?
             }
 
             LayerType::Activation {
@@ -319,29 +542,15 @@ pub fn prove_gkr(
         current_claim = next_claim;
     }
 
-    let aggregate_weight_binding_env = gkr_aggregate_weight_binding_enabled();
-    let trustless_mode3 = gkr_trustless_mode3_enabled();
-    let trustless_mode2 = gkr_trustless_mode2_enabled() && !trustless_mode3;
-    if trustless_mode3 && gkr_trustless_mode2_enabled() {
-        eprintln!("  [GKR] STWO_GKR_TRUSTLESS_MODE3=1 overrides STWO_GKR_TRUSTLESS_MODE2=1");
-    }
-    if (trustless_mode2 || trustless_mode3) && aggregate_weight_binding_env {
-        let mode = if trustless_mode3 { "MODE3" } else { "MODE2" };
-        eprintln!(
-            "  [GKR] STWO_GKR_TRUSTLESS_{mode}=1 overrides STWO_GKR_AGGREGATE_WEIGHT_BINDING=on (keeping opening proofs)"
-        );
-    }
-    let aggregate_weight_binding =
-        aggregate_weight_binding_env && !(trustless_mode2 || trustless_mode3);
+    let flags = compute_weight_mode_flags();
+    let aggregate_weight_binding = flags.aggregate_weight_binding;
     // In aggregated mode, include deferred MatMul weight claims in the same
     // transcript RLC binding and skip per-deferred Merkle openings.
     let mut deferred_weight_claims_data: Vec<(usize, Vec<SecureField>, SecureField)> =
         Vec::with_capacity(deferred_info.len());
 
     // Generate deferred proofs for skip branches of DAG Add layers BEFORE
-    // weight openings. This ensures the Cairo verifier can process deferred
-    // proofs inside verify_gkr_model (before the contract does weight openings).
-    // Fiat-Shamir order: walk → deferred proofs → weight openings.
+    // weight openings. Fiat-Shamir order: walk → deferred proofs → weight openings.
     let mut deferred_proofs = Vec::with_capacity(deferred_info.len());
     for (deferred_claim, rhs_layer_idx) in &deferred_info {
         let rhs_layer = &circuit.layers[*rhs_layer_idx];
@@ -352,7 +561,6 @@ pub fn prove_gkr(
                 n,
                 weight_node_id,
             } => {
-                // Get the input to the rhs matmul (its data input)
                 let a_matrix = get_intermediate(execution, rhs_layer.node_id)?;
                 let b_matrix =
                     weights
@@ -361,14 +569,11 @@ pub fn prove_gkr(
                             node_id: *weight_node_id,
                         })?;
 
-                // Mix deferred claim into channel (Fiat-Shamir binding)
                 mix_secure_field(channel, deferred_claim.value);
 
-                // Run matmul sumcheck at the deferred evaluation point
                 let (reduction, input_claim) =
                     reduce_matmul_layer(deferred_claim, a_matrix, b_matrix, *m, *k, *n, channel)?;
 
-                // Weight opening for the deferred matmul
                 let pm = m.next_power_of_two();
                 let log_m = pm.ilog2() as usize;
                 let pn = n.next_power_of_two();
@@ -445,40 +650,39 @@ pub fn prove_gkr(
         }
     }
 
-    // Generate MLE opening proofs for weight matrices (post-deferred channel state),
-    // or use aggregated RLC weight binding (off-chain verification mode).
+    // Weight opening strategy dispatch using shared helpers.
     let mut weight_openings = Vec::with_capacity(weight_data.len());
-    let mut weight_claims = Vec::with_capacity(weight_data.len());
     let mut weight_opening_transcript_mode = WeightOpeningTranscriptMode::Sequential;
-    let aggregate_weight_binding = aggregate_weight_binding
+    let mut aggregated_binding_proof = None;
+
+    let use_aggregated_oracle_sumcheck = gkr_aggregated_oracle_sumcheck_enabled()
         && (!weight_data.is_empty() || !deferred_weight_claims_data.is_empty());
 
-    if aggregate_weight_binding {
+    let aggregate_weight_binding = aggregate_weight_binding
+        && (!weight_data.is_empty() || !deferred_weight_claims_data.is_empty())
+        && !use_aggregated_oracle_sumcheck;
+
+    let (mut weight_claims, weight_commitments_new);
+
+    if use_aggregated_oracle_sumcheck {
+        weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
+        let (wc, claims, proof) = apply_aggregated_oracle_sumcheck(
+            &weight_data, &deferred_weight_claims_data, &mut deferred_proofs,
+            weights, channel, "GKR",
+        )?;
+        weight_commitments_new = wc;
+        weight_claims = claims;
+        aggregated_binding_proof = proof;
+    } else if aggregate_weight_binding {
         weight_opening_transcript_mode = WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1;
-        let rho = channel.draw_qm31();
-        let mut rho_pow = SecureField::one();
-        let mut combined_expected = SecureField::zero();
-        for (_, _, expected_value) in deferred_weight_claims_data.iter() {
-            combined_expected = combined_expected + rho_pow * *expected_value;
-            rho_pow = rho_pow * rho;
-        }
-        for (weight_node_id, eval_point, expected_value) in weight_data.iter() {
-            weight_claims.push(super::types::WeightClaim {
-                weight_node_id: *weight_node_id,
-                eval_point: eval_point.clone(),
-                expected_value: *expected_value,
-            });
-            combined_expected = combined_expected + rho_pow * *expected_value;
-            rho_pow = rho_pow * rho;
-        }
-        mix_secure_field(channel, combined_expected);
-        eprintln!(
-            "  [GKR] aggregated weight binding enabled (RLC): {} claims, {} openings eliminated",
-            weight_data.len() + deferred_weight_claims_data.len(),
-            weight_data.len() + deferred_weight_claims_data.len()
+        weight_claims = apply_aggregated_rlc_binding(
+            &weight_data, &deferred_weight_claims_data, channel,
         );
+        weight_commitments_new = Vec::new();
     } else {
-        let opening_seed = if (trustless_mode2 || trustless_mode3) && !weight_data.is_empty() {
+        weight_claims = Vec::with_capacity(weight_data.len());
+        weight_commitments_new = Vec::new();
+        let opening_seed = if (flags.trustless_mode2 || flags.trustless_mode3) && !weight_data.is_empty() {
             Some(channel.draw_felt252())
         } else {
             None
@@ -540,20 +744,10 @@ pub fn prove_gkr(
             weight_openings.push(opening);
         }
     }
+    weight_commitments.extend(weight_commitments_new);
 
-    if (trustless_mode2 || trustless_mode3) && !aggregate_weight_binding {
-        if trustless_mode3 {
-            weight_opening_transcript_mode =
-                WeightOpeningTranscriptMode::AggregatedOpeningsV4Experimental;
-            eprintln!(
-                "  [GKR] aggregated trustless mode v4 (experimental) enabled: opening proofs retained with mode-3 binding metadata"
-            );
-        } else {
-            weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedTrustlessV2;
-            eprintln!(
-                "  [GKR] aggregated trustless mode v2 enabled: opening proofs retained with mode-2 binding metadata"
-            );
-        }
+    if let Some(mode) = finalize_weight_transcript_mode(&flags, aggregate_weight_binding) {
+        weight_opening_transcript_mode = mode;
     }
 
     // Compute IO commitment from model input and output
@@ -574,7 +768,27 @@ pub fn prove_gkr(
         weight_opening_transcript_mode,
         io_commitment,
         deferred_proofs,
+        aggregated_binding: aggregated_binding_proof,
     })
+}
+
+/// Prove a full model forward pass using the best available backend.
+///
+/// Uses `prove_gkr_gpu` when CUDA runtime is enabled and GPU is available
+/// (or `OBELYSK_FORCE_GPU=1` is set), otherwise falls back to `prove_gkr`.
+pub fn prove_gkr_auto(
+    circuit: &LayeredCircuit,
+    execution: &GraphExecution,
+    weights: &GraphWeights,
+    channel: &mut PoseidonChannel,
+) -> Result<GKRProof, GKRError> {
+    #[cfg(feature = "cuda-runtime")]
+    {
+        if crate::backend::force_gpu() || crate::backend::gpu_is_available() {
+            return prove_gkr_gpu(circuit, execution, weights, channel);
+        }
+    }
+    prove_gkr(circuit, execution, weights, channel)
 }
 
 // =============================================================================
@@ -669,13 +883,6 @@ pub fn prove_gkr_gpu(
                             node_id: *weight_node_id,
                         })?;
 
-                // Capture r_j before reduction for weight evaluation point
-                let pm = m.next_power_of_two();
-                let log_m = pm.ilog2() as usize;
-                let pn = n.next_power_of_two();
-                let log_n = pn.ilog2() as usize;
-                let r_j = current_claim.point[log_m..log_m + log_n].to_vec();
-
                 let (proof, claim) = reduce_matmul_layer_gpu(
                     &gpu,
                     &current_claim,
@@ -687,15 +894,15 @@ pub fn prove_gkr_gpu(
                     channel,
                 )?;
 
-                // Extract final_b_eval and compute weight eval point
                 let final_b_eval = match &proof {
                     LayerProof::MatMul { final_b_eval, .. } => *final_b_eval,
                     _ => unreachable!("reduce_matmul_layer_gpu returns MatMul"),
                 };
-                let sumcheck_challenges = &claim.point[log_m..];
-                let mut weight_eval_point = r_j;
-                weight_eval_point.extend_from_slice(sumcheck_challenges);
-                weight_data.push((*weight_node_id, weight_eval_point, final_b_eval));
+                push_matmul_weight_data(
+                    *weight_node_id, *m, *n,
+                    &current_claim.point, &claim.point,
+                    final_b_eval, &mut weight_data,
+                );
 
                 (proof, claim)
             }
@@ -706,39 +913,9 @@ pub fn prove_gkr_gpu(
                 let (proof, _claim) =
                     reduce_add_layer_gpu(&gpu, &current_claim, &lhs_vals, &rhs_vals, channel)?;
 
-                // Determine trunk vs skip (same logic as CPU path)
-                let LayerProof::Add {
-                    lhs_eval, rhs_eval, ..
-                } = &proof
-                else {
-                    unreachable!()
-                };
-                let (trunk_eval, skip_eval, skip_layer_idx, trunk_idx) =
-                    if layer.input_layers[1] > layer.input_layers[0] {
-                        (*rhs_eval, *lhs_eval, layer.input_layers[0], 1u8)
-                    } else {
-                        (*lhs_eval, *rhs_eval, layer.input_layers[1], 0u8)
-                    };
-
-                deferred_info.push((
-                    GKRClaim {
-                        point: current_claim.point.clone(),
-                        value: skip_eval,
-                    },
-                    skip_layer_idx,
-                ));
-
-                let claim = GKRClaim {
-                    point: current_claim.point.clone(),
-                    value: trunk_eval,
-                };
-                let proof = LayerProof::Add {
-                    lhs_eval: *lhs_eval,
-                    rhs_eval: *rhs_eval,
-                    trunk_idx,
-                };
-
-                (proof, claim)
+                process_add_deferred(
+                    proof, &current_claim, &layer.input_layers, &mut deferred_info,
+                )
             }
 
             LayerType::Mul { .. } => {
@@ -861,20 +1038,10 @@ pub fn prove_gkr_gpu(
         weight_data.len(),
     );
 
-    let aggregate_weight_binding_env = gkr_aggregate_weight_binding_enabled();
-    let trustless_mode3 = gkr_trustless_mode3_enabled();
-    let trustless_mode2 = gkr_trustless_mode2_enabled() && !trustless_mode3;
-    if trustless_mode3 && gkr_trustless_mode2_enabled() {
-        eprintln!("  [GKR] STWO_GKR_TRUSTLESS_MODE3=1 overrides STWO_GKR_TRUSTLESS_MODE2=1");
-    }
-    if (trustless_mode2 || trustless_mode3) && aggregate_weight_binding_env {
-        let mode = if trustless_mode3 { "MODE3" } else { "MODE2" };
-        eprintln!(
-            "  [GKR] STWO_GKR_TRUSTLESS_{mode}=1 overrides STWO_GKR_AGGREGATE_WEIGHT_BINDING=on (keeping opening proofs)"
-        );
-    }
-    let aggregate_weight_binding =
-        aggregate_weight_binding_env && !(trustless_mode2 || trustless_mode3);
+    let flags = compute_weight_mode_flags();
+    let aggregate_weight_binding = flags.aggregate_weight_binding;
+    let trustless_mode2 = flags.trustless_mode2;
+    let trustless_mode3 = flags.trustless_mode3;
     // In aggregated mode, include deferred MatMul weight claims in the same
     // transcript RLC binding and skip per-deferred Merkle openings.
     let mut deferred_weight_claims_data: Vec<(usize, Vec<SecureField>, SecureField)> =
@@ -904,8 +1071,11 @@ pub fn prove_gkr_gpu(
 
                 mix_secure_field(channel, deferred_claim.value);
 
+                // Use GPU backend for deferred matmul reductions (was CPU-only before).
                 let (reduction, input_claim) =
-                    reduce_matmul_layer(deferred_claim, a_matrix, b_matrix, *m, *k, *n, channel)?;
+                    reduce_matmul_layer_with_backend::<stwo::prover::backend::gpu::GpuBackend>(
+                        deferred_claim, a_matrix, b_matrix, *m, *k, *n, channel,
+                    )?;
 
                 let pm = m.next_power_of_two();
                 let log_m = pm.ilog2() as usize;
@@ -936,24 +1106,12 @@ pub fn prove_gkr_gpu(
                         },
                     )
                 } else {
-                    #[cfg(feature = "cuda-runtime")]
-                    {
-                        let b_mle_u32 = matrix_to_mle_col_major_u32_padded(b_matrix);
-                        crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32(
-                            &b_mle_u32,
-                            &deferred_weight_claim.eval_point,
-                            channel,
-                        )
-                    }
-                    #[cfg(not(feature = "cuda-runtime"))]
-                    {
-                        let b_mle = matrix_to_mle_col_major_padded(b_matrix);
-                        crate::crypto::mle_opening::prove_mle_opening_with_commitment(
-                            &b_mle,
-                            &deferred_weight_claim.eval_point,
-                            channel,
-                        )
-                    }
+                    let b_mle_u32 = matrix_to_mle_col_major_u32_padded(b_matrix);
+                    crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32(
+                        &b_mle_u32,
+                        &deferred_weight_claim.eval_point,
+                        channel,
+                    )
                 };
 
                 deferred_proofs.push(super::types::DeferredProof {
@@ -991,10 +1149,12 @@ pub fn prove_gkr_gpu(
         }
     }
 
-    // Generate MLE opening proofs for weight matrices (post-deferred channel state)
+    // Generate MLE opening proofs for weight matrices (post-deferred channel state),
+    // or use aggregated oracle sumcheck (production on-chain mode).
     let mut weight_openings = Vec::with_capacity(weight_data.len());
     let mut weight_claims = Vec::with_capacity(weight_data.len());
     let mut weight_opening_transcript_mode = WeightOpeningTranscriptMode::Sequential;
+    let mut aggregated_binding_proof = None;
     let total_openings = weight_data.len();
     let t_openings = std::time::Instant::now();
     let openings_progress_every = std::env::var("STWO_GKR_OPENINGS_PROGRESS_EVERY")
@@ -1006,34 +1166,32 @@ pub fn prove_gkr_gpu(
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(15);
-    let aggregate_weight_binding =
-        aggregate_weight_binding && (total_openings > 0 || !deferred_weight_claims_data.is_empty());
 
-    if aggregate_weight_binding {
+    let use_aggregated_oracle_sumcheck = gkr_aggregated_oracle_sumcheck_enabled()
+        && (!weight_data.is_empty() || !deferred_weight_claims_data.is_empty());
+
+    let aggregate_weight_binding =
+        aggregate_weight_binding && (total_openings > 0 || !deferred_weight_claims_data.is_empty())
+        && !use_aggregated_oracle_sumcheck;
+
+    let mut weight_commitments_new;
+    if use_aggregated_oracle_sumcheck {
+        weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
+        let (wc, claims, proof) = apply_aggregated_oracle_sumcheck(
+            &weight_data, &deferred_weight_claims_data, &mut deferred_proofs,
+            weights, channel, "GKR-GPU",
+        )?;
+        weight_commitments_new = wc;
+        weight_claims = claims;
+        aggregated_binding_proof = proof;
+    } else if aggregate_weight_binding {
         weight_opening_transcript_mode = WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1;
-        let rho = channel.draw_qm31();
-        let mut rho_pow = SecureField::one();
-        let mut combined_expected = SecureField::zero();
-        for (_, _, expected_value) in deferred_weight_claims_data.iter() {
-            combined_expected = combined_expected + rho_pow * *expected_value;
-            rho_pow = rho_pow * rho;
-        }
-        for (weight_node_id, eval_point, expected_value) in weight_data.iter() {
-            weight_claims.push(super::types::WeightClaim {
-                weight_node_id: *weight_node_id,
-                eval_point: eval_point.clone(),
-                expected_value: *expected_value,
-            });
-            combined_expected = combined_expected + rho_pow * *expected_value;
-            rho_pow = rho_pow * rho;
-        }
-        mix_secure_field(channel, combined_expected);
-        eprintln!(
-            "  [GKR] aggregated weight binding enabled (RLC): {} claims, {} openings eliminated",
-            total_openings + deferred_weight_claims_data.len(),
-            total_openings + deferred_weight_claims_data.len()
+        weight_claims = apply_aggregated_rlc_binding(
+            &weight_data, &deferred_weight_claims_data, channel,
         );
+        weight_commitments_new = Vec::new();
     } else {
+        weight_commitments_new = Vec::new();
         #[cfg(feature = "cuda-runtime")]
         {
             let weight_data = weight_data;
@@ -1332,19 +1490,10 @@ pub fn prove_gkr_gpu(
         }
     }
 
-    if (trustless_mode2 || trustless_mode3) && !aggregate_weight_binding {
-        if trustless_mode3 {
-            weight_opening_transcript_mode =
-                WeightOpeningTranscriptMode::AggregatedOpeningsV4Experimental;
-            eprintln!(
-                "  [GKR] aggregated trustless mode v4 (experimental) enabled: opening proofs retained with mode-3 binding metadata (sub-channel transcript)"
-            );
-        } else {
-            weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedTrustlessV2;
-            eprintln!(
-                "  [GKR] aggregated trustless mode v2 enabled: opening proofs retained with mode-2 binding metadata (sub-channel transcript)"
-            );
-        }
+    weight_commitments.extend(weight_commitments_new);
+
+    if let Some(mode) = finalize_weight_transcript_mode(&flags, aggregate_weight_binding) {
+        weight_opening_transcript_mode = mode;
     }
 
     let model_input = execution
@@ -1364,13 +1513,14 @@ pub fn prove_gkr_gpu(
         weight_opening_transcript_mode,
         io_commitment,
         deferred_proofs,
+        aggregated_binding: aggregated_binding_proof,
     })
 }
 
 /// GPU matmul reduction: dispatches to `GpuSumcheckExecutor::reduce_matmul_layer_gpu`.
 #[cfg(feature = "cuda-runtime")]
 fn reduce_matmul_layer_gpu(
-    gpu: &std::sync::Arc<crate::gpu_sumcheck::GpuSumcheckExecutor>,
+    _gpu: &std::sync::Arc<crate::gpu_sumcheck::GpuSumcheckExecutor>,
     output_claim: &GKRClaim,
     a: &M31Matrix,
     b: &M31Matrix,
@@ -1379,113 +1529,39 @@ fn reduce_matmul_layer_gpu(
     n: usize,
     channel: &mut PoseidonChannel,
 ) -> Result<(LayerProof, GKRClaim), GKRError> {
-    let pm = m.next_power_of_two();
-    let pk = k.next_power_of_two();
-    let pn = n.next_power_of_two();
+    let (reduction, claim) =
+        reduce_matmul_layer_with_backend::<stwo::prover::backend::gpu::GpuBackend>(
+            output_claim,
+            a,
+            b,
+            m,
+            k,
+            n,
+            channel,
+        )?;
 
-    let log_m = pm.ilog2() as usize;
-    let log_k = pk.ilog2() as usize;
-    let log_n = pn.ilog2() as usize;
-
-    let total_out_vars = log_m + log_n;
-    if output_claim.point.len() < total_out_vars {
-        return Err(GKRError::ReductionError {
-            layer_idx: 0,
-            reason: format!(
-                "output claim has {} vars, need {} (log_m={} + log_n={})",
-                output_claim.point.len(),
-                total_out_vars,
-                log_m,
-                log_n
-            ),
-        });
-    }
-
-    let r_i = &output_claim.point[..log_m];
-    let r_j = &output_claim.point[log_m..log_m + log_n];
-
-    // Mix matmul dims into channel (same as CPU prover)
-    channel.mix_u64(m as u64);
-    channel.mix_u64(k as u64);
-    channel.mix_u64(n as u64);
-    mix_secure_field(channel, output_claim.value);
-
-    // GPU-resident sumcheck
-    let reduction = gpu
-        .reduce_matmul_layer_gpu(a, b, r_i, r_j, pk, channel)
-        .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0,
-            reason: format!("GPU matmul reduction: {e}"),
-        })?;
-
-    // Mix final evals
-    mix_secure_field(channel, reduction.final_a_eval);
-    mix_secure_field(channel, reduction.final_b_eval);
-
-    // Build input claim: A evaluated at (r_i, sumcheck_challenges)
-    let mut input_point = Vec::with_capacity(log_m + log_k);
-    input_point.extend_from_slice(r_i);
-    input_point.extend_from_slice(&reduction.challenges);
-
-    let proof = LayerProof::MatMul {
-        round_polys: reduction.round_polys,
-        final_a_eval: reduction.final_a_eval,
-        final_b_eval: reduction.final_b_eval,
-    };
-
-    let claim = GKRClaim {
-        point: input_point,
-        value: reduction.final_a_eval,
-    };
-
-    Ok((proof, claim))
+    Ok((
+        LayerProof::MatMul {
+            round_polys: reduction.round_polys,
+            final_a_eval: reduction.final_a_eval,
+            final_b_eval: reduction.final_b_eval,
+        },
+        claim,
+    ))
 }
 
-/// GPU Add reduction: evaluates both input MLEs on GPU.
+/// GPU Add reduction: delegates to `reduce_add_layer_with_backend::<GpuBackend>`.
 #[cfg(feature = "cuda-runtime")]
 fn reduce_add_layer_gpu(
-    gpu: &std::sync::Arc<crate::gpu_sumcheck::GpuSumcheckExecutor>,
+    _gpu: &std::sync::Arc<crate::gpu_sumcheck::GpuSumcheckExecutor>,
     output_claim: &GKRClaim,
     lhs_vals: &[SecureField],
     rhs_vals: &[SecureField],
     channel: &mut PoseidonChannel,
 ) -> Result<(LayerProof, GKRClaim), GKRError> {
-    let lhs_eval = gpu
-        .evaluate_mle_gpu(lhs_vals, &output_claim.point)
-        .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0,
-            reason: format!("GPU eval_mle add lhs: {e}"),
-        })?;
-    let rhs_eval = gpu
-        .evaluate_mle_gpu(rhs_vals, &output_claim.point)
-        .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0,
-            reason: format!("GPU eval_mle add rhs: {e}"),
-        })?;
-
-    mix_secure_field(channel, lhs_eval);
-    mix_secure_field(channel, rhs_eval);
-    let alpha = channel.draw_qm31();
-
-    // Draw alpha for transcript binding (NOT used for claim combination
-    // in DAG circuits — the trunk gets a separate deferred proof instead)
-    let _ = alpha;
-
-    // Main walk follows the lhs branch by default. The caller (prove_gkr_gpu)
-    // will set the correct trunk_idx and claim based on input_layers.
-    let claim = GKRClaim {
-        point: output_claim.point.clone(),
-        value: lhs_eval,
-    };
-
-    Ok((
-        LayerProof::Add {
-            lhs_eval,
-            rhs_eval,
-            trunk_idx: 0,
-        },
-        claim,
-    ))
+    reduce_add_layer_with_backend::<stwo::prover::backend::gpu::GpuBackend>(
+        output_claim, lhs_vals, rhs_vals, channel,
+    )
 }
 
 /// GPU Mul reduction: falls back to CPU eq-sumcheck.
@@ -1882,13 +1958,6 @@ pub fn prove_gkr_simd_gpu(
                             node_id: *weight_node_id,
                         })?;
 
-                // Capture r_j before reduction for weight evaluation point
-                let pm = m.next_power_of_two();
-                let log_m = pm.ilog2() as usize;
-                let pn = n.next_power_of_two();
-                let log_n = pn.ilog2() as usize;
-                let r_j = current_claim.point[log_m..log_m + log_n].to_vec();
-
                 // Per-block input activations
                 let block_a_matrices: Vec<&M31Matrix> = (0..n_blocks)
                     .map(|b| {
@@ -1911,15 +1980,15 @@ pub fn prove_gkr_simd_gpu(
                     channel,
                 )?;
 
-                // Extract final_b_eval and compute weight eval point
                 let final_b_eval = match &proof {
                     LayerProof::MatMul { final_b_eval, .. } => *final_b_eval,
                     _ => unreachable!("reduce_matmul_layer_simd_gpu returns MatMul"),
                 };
-                let sumcheck_challenges = &claim.point[log_m..];
-                let mut weight_eval_point = r_j;
-                weight_eval_point.extend_from_slice(sumcheck_challenges);
-                weight_data.push((*weight_node_id, weight_eval_point, final_b_eval));
+                push_matmul_weight_data(
+                    *weight_node_id, *m, *n,
+                    &current_claim.point, &claim.point,
+                    final_b_eval, &mut weight_data,
+                );
 
                 (proof, claim)
             }
@@ -1936,39 +2005,9 @@ pub fn prove_gkr_simd_gpu(
                 let (proof, _claim) =
                     reduce_add_layer_gpu(&gpu, &current_claim, &lhs_vals, &rhs_vals, channel)?;
 
-                // Determine trunk vs skip (same logic as CPU path)
-                let LayerProof::Add {
-                    lhs_eval, rhs_eval, ..
-                } = &proof
-                else {
-                    unreachable!()
-                };
-                let (trunk_eval, skip_eval, skip_layer_idx, trunk_idx) =
-                    if layer.input_layers[1] > layer.input_layers[0] {
-                        (*rhs_eval, *lhs_eval, layer.input_layers[0], 1u8)
-                    } else {
-                        (*lhs_eval, *rhs_eval, layer.input_layers[1], 0u8)
-                    };
-
-                deferred_info.push((
-                    GKRClaim {
-                        point: current_claim.point.clone(),
-                        value: skip_eval,
-                    },
-                    skip_layer_idx,
-                ));
-
-                let claim = GKRClaim {
-                    point: current_claim.point.clone(),
-                    value: trunk_eval,
-                };
-                let proof = LayerProof::Add {
-                    lhs_eval: *lhs_eval,
-                    rhs_eval: *rhs_eval,
-                    trunk_idx,
-                };
-
-                (proof, claim)
+                process_add_deferred(
+                    proof, &current_claim, &layer.input_layers, &mut deferred_info,
+                )
             }
 
             LayerType::Mul { .. } => {
@@ -2106,48 +2145,42 @@ pub fn prove_gkr_simd_gpu(
     }
 
     // Generate MLE opening proofs for weight matrices (post-GKR-walk channel state),
-    // or use aggregated RLC weight binding (off-chain verification mode).
+    // or use aggregated RLC weight binding (off-chain verification mode),
+    // or use aggregated oracle sumcheck (production on-chain mode).
     let mut weight_openings = Vec::with_capacity(weight_data.len());
     let mut weight_claims = Vec::with_capacity(weight_data.len());
     let mut weight_opening_transcript_mode = WeightOpeningTranscriptMode::Sequential;
-    let aggregate_weight_binding_env = gkr_aggregate_weight_binding_enabled();
-    let trustless_mode3 = gkr_trustless_mode3_enabled();
-    let trustless_mode2 = gkr_trustless_mode2_enabled() && !trustless_mode3;
-    if trustless_mode3 && gkr_trustless_mode2_enabled() {
-        eprintln!("  [GKR] STWO_GKR_TRUSTLESS_MODE3=1 overrides STWO_GKR_TRUSTLESS_MODE2=1");
-    }
-    if (trustless_mode2 || trustless_mode3) && aggregate_weight_binding_env {
-        let mode = if trustless_mode3 { "MODE3" } else { "MODE2" };
-        eprintln!(
-            "  [GKR] STWO_GKR_TRUSTLESS_{mode}=1 overrides STWO_GKR_AGGREGATE_WEIGHT_BINDING=on (keeping opening proofs)"
-        );
-    }
-    let aggregate_weight_binding = aggregate_weight_binding_env
-        && !(trustless_mode2 || trustless_mode3)
+    let mut aggregated_binding_proof = None;
+    let flags = compute_weight_mode_flags();
+    let no_deferred: Vec<(usize, Vec<SecureField>, SecureField)> = Vec::new();
+
+    let use_aggregated_oracle_sumcheck = gkr_aggregated_oracle_sumcheck_enabled()
         && !weight_data.is_empty();
 
-    if aggregate_weight_binding {
+    let aggregate_weight_binding = flags.aggregate_weight_binding
+        && !weight_data.is_empty()
+        && !use_aggregated_oracle_sumcheck;
+
+    let mut weight_commitments_new;
+    if use_aggregated_oracle_sumcheck {
+        weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
+        let mut no_deferred_proofs = Vec::new();
+        let (wc, claims, proof) = apply_aggregated_oracle_sumcheck(
+            &weight_data, &no_deferred, &mut no_deferred_proofs,
+            weights, channel, "GKR-SIMD-GPU",
+        )?;
+        weight_commitments_new = wc;
+        weight_claims = claims;
+        aggregated_binding_proof = proof;
+    } else if aggregate_weight_binding {
         weight_opening_transcript_mode = WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1;
-        let rho = channel.draw_qm31();
-        let mut rho_pow = SecureField::one();
-        let mut combined_expected = SecureField::zero();
-        for (weight_node_id, eval_point, expected_value) in weight_data.iter() {
-            weight_claims.push(super::types::WeightClaim {
-                weight_node_id: *weight_node_id,
-                eval_point: eval_point.clone(),
-                expected_value: *expected_value,
-            });
-            combined_expected = combined_expected + rho_pow * *expected_value;
-            rho_pow = rho_pow * rho;
-        }
-        mix_secure_field(channel, combined_expected);
-        eprintln!(
-            "  [GKR] aggregated weight binding enabled (RLC): {} claims, {} openings eliminated",
-            weight_data.len(),
-            weight_data.len()
+        weight_claims = apply_aggregated_rlc_binding(
+            &weight_data, &no_deferred, channel,
         );
+        weight_commitments_new = Vec::new();
     } else {
-        let opening_seed = if (trustless_mode2 || trustless_mode3) && !weight_data.is_empty() {
+        weight_commitments_new = Vec::new();
+        let opening_seed = if (flags.trustless_mode2 || flags.trustless_mode3) && !weight_data.is_empty() {
             Some(channel.draw_felt252())
         } else {
             None
@@ -2210,19 +2243,10 @@ pub fn prove_gkr_simd_gpu(
         }
     }
 
-    if (trustless_mode2 || trustless_mode3) && !aggregate_weight_binding {
-        if trustless_mode3 {
-            weight_opening_transcript_mode =
-                WeightOpeningTranscriptMode::AggregatedOpeningsV4Experimental;
-            eprintln!(
-                "  [GKR] aggregated trustless mode v4 (experimental) enabled: opening proofs retained with mode-3 binding metadata"
-            );
-        } else {
-            weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedTrustlessV2;
-            eprintln!(
-                "  [GKR] aggregated trustless mode v2 enabled: opening proofs retained with mode-2 binding metadata"
-            );
-        }
+    weight_commitments.extend(weight_commitments_new);
+
+    if let Some(mode) = finalize_weight_transcript_mode(&flags, aggregate_weight_binding) {
+        weight_opening_transcript_mode = mode;
     }
 
     // IO commitment from first block's input and combined output
@@ -2252,6 +2276,7 @@ pub fn prove_gkr_simd_gpu(
         weight_opening_transcript_mode,
         io_commitment,
         deferred_proofs: vec![],
+        aggregated_binding: aggregated_binding_proof,
     })
 }
 
@@ -2853,13 +2878,8 @@ struct MatMulReduction {
     final_b_eval: SecureField,
 }
 
-/// Reduce a MatMul layer via sumcheck over the inner dimension.
-///
-/// Given claim: Ṽ_C(r_i, r_j) = v where C = A × B
-/// Runs sumcheck on: v = Σ_k Ṽ_A(r_i, k) · Ṽ_B(k, r_j)
-///
-/// Returns the MatMul proof and a new claim on the input layer.
-fn reduce_matmul_layer(
+/// Backend-dispatched MatMul reduction used for phased CPU/GPU unification.
+fn reduce_matmul_layer_with_backend<B: crate::backend::ZkmlOps>(
     output_claim: &GKRClaim,
     a: &M31Matrix,
     b: &M31Matrix,
@@ -2868,23 +2888,16 @@ fn reduce_matmul_layer(
     n: usize,
     channel: &mut PoseidonChannel,
 ) -> Result<(MatMulReduction, GKRClaim), GKRError> {
-    use crate::components::matmul::RoundPoly;
-    use stwo::core::fields::FieldExpOps;
-
-    // Pad to power of 2
-    let a_padded = pad_matrix_pow2(a);
-    let b_padded = pad_matrix_pow2(b);
-
-    let pm = a_padded.rows;
-    let pk = a_padded.cols;
-    let pn = b_padded.cols;
+    // Preserve CPU reducer semantics: derive variable counts from actual
+    // matrix shapes (after conceptual pow2 padding), while keeping the
+    // original layer dims for transcript mixing.
+    let pm = a.rows.next_power_of_two();
+    let pk = a.cols.next_power_of_two();
+    let pn = b.cols.next_power_of_two();
 
     let log_m = pm.ilog2() as usize;
-    let log_k = pk.ilog2() as usize;
     let log_n = pn.ilog2() as usize;
 
-    // Split output claim point into (r_i, r_j)
-    // Output MLE has (log_m + log_n) variables: first log_m for rows, last log_n for cols
     let total_out_vars = log_m + log_n;
     if output_claim.point.len() < total_out_vars {
         return Err(GKRError::ReductionError {
@@ -2902,92 +2915,58 @@ fn reduce_matmul_layer(
     let r_i = &output_claim.point[..log_m];
     let r_j = &output_claim.point[log_m..log_m + log_n];
 
-    // Build MLEs
-    let mle_a = matrix_to_mle(&a_padded); // row-major: (row_bits, col_bits)
-    let mle_b_t = matrix_to_mle_col_major(&b_padded); // col-major: (col_bits, row_bits)
-
-    // Restrict to get 1D polynomials over k-dimension
-    // f_a(x) = Ṽ_A(r_i, x) for x ∈ {0,1}^{log k}
-    let mut f_a = restrict_mle(&mle_a, r_i);
-    // f_b(x) = Ṽ_B(x, r_j) — using transposed layout, fix first log_n vars
-    let mut f_b = restrict_mle(&mle_b_t, r_j);
-
-    assert_eq!(f_a.len(), pk);
-    assert_eq!(f_b.len(), pk);
-
-    // Mix matmul dims into channel
+    // Mix matmul dims and claimed sum into transcript.
     channel.mix_u64(m as u64);
     channel.mix_u64(k as u64);
     channel.mix_u64(n as u64);
-
-    // Mix the claimed sum
     mix_secure_field(channel, output_claim.value);
 
-    // Run sumcheck: v = Σ_k f_a(k) · f_b(k)
-    let mut round_polys = Vec::with_capacity(log_k);
-    let mut cur_n = pk;
-    let mut sumcheck_challenges = Vec::with_capacity(log_k);
+    let reduction = B::reduce_matmul_layer(a, b, r_i, r_j, pk, channel).map_err(|e| {
+        GKRError::ReductionError {
+            layer_idx: 0,
+            reason: format!("MatMul reduction backend failure: {e}"),
+        }
+    })?;
 
-    for _ in 0..log_k {
-        let mid = cur_n / 2;
+    // Bind final evaluations to transcript.
+    mix_secure_field(channel, reduction.final_a_eval);
+    mix_secure_field(channel, reduction.final_b_eval);
 
-        // Compute round polynomial at t=0, t=1, t=2 via Lagrange interpolation
-        let s0 = compute_sum_at_t(&f_a, &f_b, mid, SecureField::zero());
-        let s1 = compute_sum_at_t(&f_a, &f_b, mid, SecureField::one());
-        let two = SecureField::from(M31::from(2u32));
-        let s2 = compute_sum_at_t(&f_a, &f_b, mid, two);
-
-        // Lagrange interpolation: c0, c1, c2 from (0, s0), (1, s1), (2, s2)
-        let c0 = s0;
-        let c2 = (s2 - s1 - s1 + s0) * two.inverse();
-        let c1 = s1 - s0 - c2;
-
-        let rp = RoundPoly { c0, c1, c2 };
-        round_polys.push(rp);
-
-        // Fiat-Shamir: mix round poly, draw challenge
-        channel.mix_poly_coeffs(c0, c1, c2);
-        let r_k = channel.draw_qm31();
-        sumcheck_challenges.push(r_k);
-
-        // Fold f_a and f_b at challenge r_k
-        f_a = fold_mle(&f_a, r_k, mid);
-        f_b = fold_mle(&f_b, r_k, mid);
-        cur_n = mid;
-    }
-
-    // Final evaluations (each MLE reduced to single value)
-    assert_eq!(f_a.len(), 1);
-    assert_eq!(f_b.len(), 1);
-    let final_a_eval = f_a[0];
-    let final_b_eval = f_b[0];
-
-    // Mix final evals into channel
-    mix_secure_field(channel, final_a_eval);
-    mix_secure_field(channel, final_b_eval);
-
-    // The input claim: Ṽ_A evaluated at (r_i, r_k_challenges)
-    // This becomes the claim for the previous layer
-    let mut input_point = Vec::with_capacity(log_m + log_k);
+    let mut input_point = Vec::with_capacity(log_m + reduction.challenges.len());
     input_point.extend_from_slice(r_i);
-    input_point.extend_from_slice(&sumcheck_challenges);
-
-    let input_claim = GKRClaim {
-        point: input_point,
-        value: final_a_eval,
-    };
+    input_point.extend_from_slice(&reduction.challenges);
 
     Ok((
         MatMulReduction {
-            round_polys,
-            final_a_eval,
-            final_b_eval,
+            round_polys: reduction.round_polys,
+            final_a_eval: reduction.final_a_eval,
+            final_b_eval: reduction.final_b_eval,
         },
-        input_claim,
+        GKRClaim {
+            point: input_point,
+            value: reduction.final_a_eval,
+        },
     ))
 }
 
-/// Reduce an Add layer: c[i] = a[i] + b[i].
+/// Reduce a MatMul layer via sumcheck over the inner dimension (CPU path).
+///
+/// Delegates to `reduce_matmul_layer_with_backend::<SimdBackend>`.
+fn reduce_matmul_layer(
+    output_claim: &GKRClaim,
+    a: &M31Matrix,
+    b: &M31Matrix,
+    m: usize,
+    k: usize,
+    n: usize,
+    channel: &mut PoseidonChannel,
+) -> Result<(MatMulReduction, GKRClaim), GKRError> {
+    reduce_matmul_layer_with_backend::<stwo::prover::backend::simd::SimdBackend>(
+        output_claim, a, b, m, k, n, channel,
+    )
+}
+
+/// Reduce an Add layer using a backend-generic MLE evaluator.
 ///
 /// By linearity of MLE: Ṽ_c(r) = Ṽ_a(r) + Ṽ_b(r).
 /// Prover sends (a_eval, b_eval), verifier checks a_eval + b_eval == claimed.
@@ -2995,14 +2974,22 @@ fn reduce_matmul_layer(
 /// For DAG circuits (residual connections), the main walk follows the lhs
 /// branch. The rhs branch gets a deferred proof. Alpha is still drawn for
 /// Fiat-Shamir transcript binding but is NOT used to combine claims.
-fn reduce_add_layer(
+fn reduce_add_layer_with_backend<B: crate::backend::ZkmlOps>(
     output_claim: &GKRClaim,
     lhs_vals: &[SecureField],
     rhs_vals: &[SecureField],
     channel: &mut PoseidonChannel,
 ) -> Result<(LayerProof, GKRClaim), GKRError> {
-    let lhs_eval = evaluate_mle(lhs_vals, &output_claim.point);
-    let rhs_eval = evaluate_mle(rhs_vals, &output_claim.point);
+    let lhs_eval = B::evaluate_mle_at_point(lhs_vals, &output_claim.point)
+        .map_err(|e| GKRError::ReductionError {
+            layer_idx: 0,
+            reason: format!("Add lhs MLE eval: {e}"),
+        })?;
+    let rhs_eval = B::evaluate_mle_at_point(rhs_vals, &output_claim.point)
+        .map_err(|e| GKRError::ReductionError {
+            layer_idx: 0,
+            reason: format!("Add rhs MLE eval: {e}"),
+        })?;
 
     // Mix evaluations into channel for Fiat-Shamir binding
     mix_secure_field(channel, lhs_eval);
@@ -3027,6 +3014,18 @@ fn reduce_add_layer(
         },
         claim,
     ))
+}
+
+/// Reduce an Add layer (CPU path via SimdBackend).
+fn reduce_add_layer(
+    output_claim: &GKRClaim,
+    lhs_vals: &[SecureField],
+    rhs_vals: &[SecureField],
+    channel: &mut PoseidonChannel,
+) -> Result<(LayerProof, GKRClaim), GKRError> {
+    reduce_add_layer_with_backend::<stwo::prover::backend::simd::SimdBackend>(
+        output_claim, lhs_vals, rhs_vals, channel,
+    )
 }
 
 /// Reduce a Mul layer via eq-sumcheck: c[i] = a[i] * b[i].
@@ -5074,6 +5073,7 @@ fn compute_mul_eq_sum_at_t(
 
 /// Compute Σ_{i=0..mid-1} f_a_t(i) · f_b_t(i) where
 /// f_a_t(i) = (1-t)*f_a[i] + t*f_a[mid+i] and similarly for f_b.
+#[cfg(test)]
 fn compute_sum_at_t(
     f_a: &[SecureField],
     f_b: &[SecureField],
@@ -5800,6 +5800,79 @@ mod tests {
             SecureField::zero(),
             "product should be non-trivial"
         );
+    }
+
+    #[test]
+    fn test_reduce_matmul_backend_hook_matches_legacy() {
+        // 2x4 x 4x2 matmul
+        let mut a = M31Matrix::new(2, 4);
+        let mut b = M31Matrix::new(4, 2);
+        for i in 0..2 {
+            for j in 0..4 {
+                a.set(i, j, M31::from((i * 4 + j + 1) as u32));
+            }
+        }
+        for i in 0..4 {
+            for j in 0..2 {
+                b.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
+        let c = matmul_forward(&a, &b);
+        let c_padded = pad_matrix_pow2(&c);
+        let c_mle = matrix_to_mle(&c_padded);
+
+        let log_m = c_padded.rows.ilog2() as usize;
+        let log_n = c_padded.cols.ilog2() as usize;
+
+        // Build identical output claim and transcript pre-state.
+        let mut channel_seed = PoseidonChannel::new();
+        channel_seed.mix_u64(4242);
+        let r_out = channel_seed.draw_qm31s(log_m + log_n);
+        let claimed = evaluate_mle(&c_mle, &r_out);
+        let output_claim = GKRClaim {
+            point: r_out.clone(),
+            value: claimed,
+        };
+
+        // Legacy reducer path.
+        let mut channel_legacy = PoseidonChannel::new();
+        channel_legacy.mix_u64(4242);
+        let r_out_legacy = channel_legacy.draw_qm31s(log_m + log_n);
+        assert_eq!(r_out_legacy, r_out, "legacy and hook transcripts diverged");
+        let (legacy_reduction, legacy_claim) =
+            reduce_matmul_layer(&output_claim, &a, &b, 2, 4, 2, &mut channel_legacy).unwrap();
+
+        // New backend hook path with SimdBackend implementation.
+        let mut channel_hook = PoseidonChannel::new();
+        channel_hook.mix_u64(4242);
+        let r_out_hook = channel_hook.draw_qm31s(log_m + log_n);
+        assert_eq!(r_out_hook, r_out, "legacy and hook transcripts diverged");
+        let (hook_reduction, hook_claim) =
+            reduce_matmul_layer_with_backend::<stwo::prover::backend::simd::SimdBackend>(
+                &output_claim,
+                &a,
+                &b,
+                2,
+                4,
+                2,
+                &mut channel_hook,
+            )
+            .unwrap();
+
+        assert_eq!(legacy_reduction.round_polys.len(), hook_reduction.round_polys.len());
+        for (legacy_rp, hook_rp) in legacy_reduction
+            .round_polys
+            .iter()
+            .zip(hook_reduction.round_polys.iter())
+        {
+            assert_eq!(legacy_rp.c0, hook_rp.c0);
+            assert_eq!(legacy_rp.c1, hook_rp.c1);
+            assert_eq!(legacy_rp.c2, hook_rp.c2);
+        }
+        assert_eq!(legacy_reduction.final_a_eval, hook_reduction.final_a_eval);
+        assert_eq!(legacy_reduction.final_b_eval, hook_reduction.final_b_eval);
+        assert_eq!(legacy_claim.point, hook_claim.point);
+        assert_eq!(legacy_claim.value, hook_claim.value);
     }
 
     #[test]
@@ -7137,7 +7210,6 @@ mod tests {
         fn test_gpu_cpu_activation_proof_match() {
             // Cross-validate: GPU and CPU activation reduction must produce
             // byte-identical LogUp proofs given the same inputs.
-            use super::super::types::LogUpProof;
             use crate::gpu_sumcheck::GpuSumcheckExecutor;
 
             let gpu = std::sync::Arc::new(GpuSumcheckExecutor::new().unwrap());
@@ -7164,7 +7236,7 @@ mod tests {
 
             // Create a claim at a random point
             let mut setup_channel = PoseidonChannel::new();
-            setup_channel.mix_u64(0xACT1 as u64);
+            setup_channel.mix_u64(0xAC71u64);
             let claim_point = setup_channel.draw_qm31s(num_vars);
             let claimed_value = evaluate_mle(&output_mle, &claim_point);
             let output_claim = GKRClaim {

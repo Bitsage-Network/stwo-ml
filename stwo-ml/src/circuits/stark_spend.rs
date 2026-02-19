@@ -37,10 +37,11 @@ use stwo::core::proof::StarkProof;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
 use stwo::core::verifier::verify as stwo_verify;
 use stwo::prover::backend::simd::SimdBackend;
-use stwo::prover::backend::{Col, Column};
+use stwo::prover::backend::{BackendForChannel, Col, Column, ColumnOps};
 use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
 use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::CommitmentSchemeProver;
+use stwo::prover::ComponentProver;
 use stwo::prover::prove;
 
 use stwo_constraint_framework::{
@@ -438,6 +439,25 @@ pub struct SpendStarkProof {
 pub fn prove_spend_stark(
     witness: &SpendWitness,
 ) -> Result<SpendStarkProof, SpendStarkError> {
+    #[cfg(feature = "cuda-runtime")]
+    {
+        if crate::backend::force_gpu() || crate::backend::gpu_is_available() {
+            use stwo::prover::backend::gpu::GpuBackend;
+            return prove_spend_stark_with::<GpuBackend>(witness);
+        }
+    }
+    prove_spend_stark_with::<SimdBackend>(witness)
+}
+
+fn prove_spend_stark_with<B>(
+    witness: &SpendWitness,
+) -> Result<SpendStarkProof, SpendStarkError>
+where
+    B: BackendForChannel<Blake2sMerkleChannel> + PolyOps + ColumnOps<M31>,
+    Col<B, M31>: Column<M31>,
+    <B as ColumnOps<M31>>::Column: 'static,
+    FrameworkComponent<SpendStarkEval>: ComponentProver<B>,
+{
     let (execution, public_inputs) = execute_spend(witness)
         .map_err(|e| SpendStarkError::Execution(format!("{e}")))?;
 
@@ -456,12 +476,12 @@ pub fn prove_spend_stark(
     let merkle_padding = compute_merkle_chain_padding(&dummy_hash, merkle_levels);
 
     let domain = CanonicCoset::new(LOG_SIZE).circle_domain();
-    let mut exec_cols: Vec<Col<SimdBackend, M31>> = (0..TOTAL_EXEC_COLS)
-        .map(|_| Col::<SimdBackend, M31>::zeros(table_size))
+    let mut exec_cols: Vec<Col<B, M31>> = (0..TOTAL_EXEC_COLS)
+        .map(|_| Col::<B, M31>::zeros(table_size))
         .collect();
 
     for (p, trace) in perm_traces.iter().enumerate() {
-        write_permutation_to_trace(trace, &mut exec_cols, p * COLS_PER_PERM, 0);
+        write_permutation_to_trace::<B>(trace, &mut exec_cols, p * COLS_PER_PERM, 0);
     }
     // Padding rows: Merkle perms use chained traces, others use dummy
     for row in 1..table_size {
@@ -473,7 +493,7 @@ pub fn prove_spend_stark(
                 let mrk_end = input_merkle_end(inp_idx);
                 if p >= mrk_start && p < mrk_end {
                     let merkle_idx = p - mrk_start;
-                    write_permutation_to_trace(
+                    write_permutation_to_trace::<B>(
                         &merkle_padding[merkle_idx],
                         &mut exec_cols,
                         p * COLS_PER_PERM,
@@ -484,7 +504,7 @@ pub fn prove_spend_stark(
                 }
             }
             if !is_merkle {
-                write_permutation_to_trace(&dummy, &mut exec_cols, p * COLS_PER_PERM, row);
+                write_permutation_to_trace::<B>(&dummy, &mut exec_cols, p * COLS_PER_PERM, row);
             }
         }
     }
@@ -521,33 +541,32 @@ pub fn prove_spend_stark(
     exec_cols[carry_offset + 2].set(0, M31::from_u32_unchecked(if carry_val < 0 { 1 } else { 0 }));
     // Padding rows: carry=0, carry_pos=0, carry_neg=0 (already zeroed by Col::zeros)
 
-    let mut is_real_col = Col::<SimdBackend, M31>::zeros(table_size);
+    let mut is_real_col = Col::<B, M31>::zeros(table_size);
     is_real_col.set(0, M31::from_u32_unchecked(1));
-    let preprocessed = vec![CircleEvaluation::<SimdBackend, M31, BitReversedOrder>::new(
+    let preprocessed = vec![CircleEvaluation::<B, M31, BitReversedOrder>::new(
         domain, is_real_col,
     )];
-    let execution_evals: Vec<CircleEvaluation<SimdBackend, M31, BitReversedOrder>> = exec_cols
+    let execution_evals: Vec<CircleEvaluation<B, M31, BitReversedOrder>> = exec_cols
         .into_iter()
         .map(|col| CircleEvaluation::new(domain, col))
         .collect();
 
     let pcs_config = PcsConfig::default();
-    let twiddles = SimdBackend::precompute_twiddles(
+    let twiddles = B::precompute_twiddles(
         CanonicCoset::new(LOG_SIZE + 1 + pcs_config.fri_config.log_blowup_factor)
             .circle_domain()
             .half_coset,
     );
     let channel = &mut <Blake2sMerkleChannel as MerkleChannel>::C::default();
     let mut commitment_scheme =
-        CommitmentSchemeProver::<SimdBackend, Blake2sMerkleChannel>::new(pcs_config, &twiddles);
+        CommitmentSchemeProver::<B, Blake2sMerkleChannel>::new(pcs_config, &twiddles);
 
     let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder
-        .extend_evals(convert_evaluations::<SimdBackend, SimdBackend, M31>(preprocessed));
+    tree_builder.extend_evals(convert_evaluations::<B, B, M31>(preprocessed));
     tree_builder.commit(channel);
 
     let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(convert_evaluations::<SimdBackend, SimdBackend, M31>(
+    tree_builder.extend_evals(convert_evaluations::<B, B, M31>(
         execution_evals,
     ));
     tree_builder.commit(channel);
@@ -564,7 +583,7 @@ pub fn prove_spend_stark(
         SecureField::zero(),
     );
 
-    let stark_proof = prove::<SimdBackend, Blake2sMerkleChannel>(
+    let stark_proof = prove::<B, Blake2sMerkleChannel>(
         &[&component],
         channel,
         commitment_scheme,

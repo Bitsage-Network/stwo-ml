@@ -112,12 +112,10 @@ while [[ $# -gt 0 ]]; do
             echo "  --gpu / --no-gpu     Enable/disable GPU (default: on)"
             echo "  --multi-gpu          Use all GPUs"
             echo "  --gpu-only           Fail if any critical proving path falls back to CPU"
-            echo "                       (submit path auto-forces --starknet-ready in step 6)"
-            echo "  --gkr-v2             Use verify_model_gkr_v2 calldata"
-            echo "  --gkr-v3             Use verify_model_gkr_v3 calldata (v3 envelope)"
-            echo "  --gkr-v4             Use verify_model_gkr_v4 calldata (latest mode-3 envelope)"
-            echo "  --gkr-v2-mode MODE   v2/v3/v4 weight-binding profile: auto|sequential|batched|mode2|mode3"
-            echo "                       auto(default): submit path defaults to v4 mode3 (latest), mode2 on v3"
+            echo "  --gkr-v2             (Legacy) Use verify_model_gkr_v2 calldata"
+            echo "  --gkr-v3             (Legacy) Use verify_model_gkr_v3 calldata"
+            echo "  --gkr-v4             (Legacy) Use verify_model_gkr_v4 mode3 calldata"
+            echo "  --gkr-v2-mode MODE   (Legacy) auto|sequential|batched|mode2|mode3"
             echo "  --legacy-gkr-v1      Keep legacy verify_model_gkr (v1 sequential openings)"
             echo "  --hf-token TOKEN     HuggingFace API token"
             echo "  --max-fee ETH        Max TX fee (default: 0.05)"
@@ -178,6 +176,17 @@ if [[ "$GKR_V4" == "true" && "$GKR_V2" == "true" ]]; then
     GKR_V2=false
 fi
 
+if [[ "$DO_SUBMIT" == "true" ]] && [[ "$LEGACY_GKR_V1" != "true" ]]; then
+    if [[ "$GKR_V2" == "true" || "$GKR_V3" == "true" || "$GKR_V4" == "true" || "${GKR_V2_MODE,,}" != "auto" ]]; then
+        err "--submit uses verify_model_gkr_v4 mode4 (aggregated oracle sumcheck) by default."
+        err "The following flags conflict with --submit: --gkr-v2, --gkr-v3, --gkr-v4, --gkr-v2-mode"
+        err ""
+        err "To use a legacy entrypoint with --submit, add --legacy-gkr-v1:"
+        err "  $0 --submit --legacy-gkr-v1 --gkr-v2"
+        exit 1
+    fi
+fi
+
 if [[ "${GKR_V2_MODE,,}" != "auto" ]] && [[ "$GKR_V2" != "true" ]] && [[ "$GKR_V3" != "true" ]] && [[ "$GKR_V4" != "true" ]]; then
     err "--gkr-v2-mode requires --gkr-v2, --gkr-v3, or --gkr-v4"
     exit 1
@@ -205,25 +214,27 @@ if [[ "$DO_SUBMIT" == "false" ]] && [[ "$DO_DRY_RUN" == "false" ]]; then
     DO_DRY_RUN=true
 fi
 
-if [[ "$DO_SUBMIT" == "true" ]] && [[ "$MODE" == "gkr" ]] && [[ "$GKR_V2" != "true" ]] && [[ "$GKR_V3" != "true" ]] && [[ "$GKR_V4" != "true" ]]; then
+# --submit defaults to aggregated oracle sumcheck (mode 4) unless --legacy-gkr-v1 is set.
+USE_AGGREGATED_SUBMIT=false
+if [[ "$DO_SUBMIT" == "true" ]] && [[ "$MODE" == "gkr" ]]; then
     if [[ "$LEGACY_GKR_V1" == "true" ]]; then
         warn "--submit + --legacy-gkr-v1: keeping verify_model_gkr (v1 sequential openings)."
     else
-        warn "--submit requested without --gkr-v2/--gkr-v3/--gkr-v4; defaulting to verify_model_gkr_v4 mode3 (latest submit-ready path)."
-        GKR_V4=true
-        if [[ "${GKR_V2_MODE,,}" == "auto" ]]; then
-            GKR_V2_MODE="mode3"
-        fi
+        USE_AGGREGATED_SUBMIT=true
+        log "--submit: using verify_model_gkr_v4 mode4 aggregated oracle sumcheck (~17K felts calldata)"
     fi
 fi
 
-if [[ "$DO_SUBMIT" == "true" ]] && [[ "$GKR_V3" == "true" ]] && [[ "${GKR_V2_MODE,,}" == "auto" ]] && [[ "$LEGACY_GKR_V1" != "true" ]]; then
-    warn "--submit + --gkr-v3 with auto mode: defaulting to mode2 trustless binding."
-    GKR_V2_MODE="mode2"
-fi
-if [[ "$DO_SUBMIT" == "true" ]] && [[ "$GKR_V4" == "true" ]] && [[ "${GKR_V2_MODE,,}" == "auto" ]] && [[ "$LEGACY_GKR_V1" != "true" ]]; then
-    warn "--submit + --gkr-v4 with auto mode: defaulting to mode3 (latest binding envelope)."
-    GKR_V2_MODE="mode3"
+# Legacy v2/v3/v4 flag compatibility
+if [[ "$USE_AGGREGATED_SUBMIT" != "true" ]]; then
+    if [[ "$DO_SUBMIT" == "true" ]] && [[ "$GKR_V3" == "true" ]] && [[ "${GKR_V2_MODE,,}" == "auto" ]] && [[ "$LEGACY_GKR_V1" != "true" ]]; then
+        warn "--submit + --gkr-v3 with auto mode: defaulting to mode2 trustless binding."
+        GKR_V2_MODE="mode2"
+    fi
+    if [[ "$DO_SUBMIT" == "true" ]] && [[ "$GKR_V4" == "true" ]] && [[ "${GKR_V2_MODE,,}" == "auto" ]] && [[ "$LEGACY_GKR_V1" != "true" ]]; then
+        warn "--submit + --gkr-v4 with auto mode: defaulting to mode3 (latest binding envelope)."
+        GKR_V2_MODE="mode3"
+    fi
 fi
 
 # ─── Start ───────────────────────────────────────────────────────────
@@ -245,6 +256,7 @@ log "Model:       ${PRESET:-${HF_MODEL}}"
 log "Mode:        ${MODE}"
 log "GPU:         ${DO_GPU} (multi: ${DO_MULTI_GPU})"
 log "GPU only:    ${DO_GPU_ONLY}"
+log "Aggregated:  ${USE_AGGREGATED_SUBMIT:-false}"
 log "GKR v2:      ${GKR_V2}"
 log "GKR v3:      ${GKR_V3}"
 log "GKR v4:      ${GKR_V4}"
@@ -400,35 +412,40 @@ if (( START_IDX <= 5 )); then
     [[ "$DO_GPU" == "true" ]] && _PROVE_ARGS+=("--gpu")
     [[ "$DO_MULTI_GPU" == "true" ]] && _PROVE_ARGS+=("--multi-gpu")
     [[ "$DO_GPU_ONLY" == "true" ]] && _PROVE_ARGS+=("--gpu-only")
-    [[ "$DO_SUBMIT" == "true" ]] && _PROVE_ARGS+=("--starknet-ready")
-    [[ "$GKR_V2" == "true" ]] && _PROVE_ARGS+=("--gkr-v2")
-    [[ "$GKR_V3" == "true" ]] && _PROVE_ARGS+=("--gkr-v3")
-    [[ "$GKR_V4" == "true" ]] && _PROVE_ARGS+=("--gkr-v4")
-    [[ "$LEGACY_GKR_V1" == "true" ]] && _PROVE_ARGS+=("--legacy-gkr-v1")
 
     _PROVE_ENV=()
-    if [[ "$GKR_V2" == "true" || "$GKR_V3" == "true" || "$GKR_V4" == "true" ]]; then
-        case "${GKR_V2_MODE,,}" in
-            sequential)
-                _PROVE_ENV+=("STWO_GKR_BATCH_WEIGHT_OPENINGS=off")
-                ;;
-            batched)
-                _PROVE_ENV+=("STWO_GKR_BATCH_WEIGHT_OPENINGS=on")
-                ;;
-            mode2)
-                _PROVE_ARGS+=("--gkr-v3-mode2")
-                _PROVE_ENV+=("STWO_GKR_BATCH_WEIGHT_OPENINGS=on")
-                ;;
-            mode3)
-                _PROVE_ARGS+=("--gkr-v4-mode3")
-                _PROVE_ENV+=("STWO_GKR_BATCH_WEIGHT_OPENINGS=on")
-                ;;
-            auto)
-                # Keep 03_prove.sh defaults:
-                # - on for --starknet-ready --gkr-v2/--gkr-v3/--gkr-v4 --gpu
-                # - off otherwise
-                ;;
-        esac
+
+    if [[ "$USE_AGGREGATED_SUBMIT" == "true" ]]; then
+        # New path: aggregated oracle sumcheck (mode 4)
+        _PROVE_ARGS+=("--submit")
+    else
+        # Legacy paths: explicit version/mode flag passthrough
+        [[ "$DO_SUBMIT" == "true" ]] && _PROVE_ARGS+=("--starknet-ready")
+        [[ "$GKR_V2" == "true" ]] && _PROVE_ARGS+=("--gkr-v2")
+        [[ "$GKR_V3" == "true" ]] && _PROVE_ARGS+=("--gkr-v3")
+        [[ "$GKR_V4" == "true" ]] && _PROVE_ARGS+=("--gkr-v4")
+        [[ "$LEGACY_GKR_V1" == "true" ]] && _PROVE_ARGS+=("--legacy-gkr-v1")
+
+        if [[ "$GKR_V2" == "true" || "$GKR_V3" == "true" || "$GKR_V4" == "true" ]]; then
+            case "${GKR_V2_MODE,,}" in
+                sequential)
+                    _PROVE_ENV+=("STWO_GKR_BATCH_WEIGHT_OPENINGS=off")
+                    ;;
+                batched)
+                    _PROVE_ENV+=("STWO_GKR_BATCH_WEIGHT_OPENINGS=on")
+                    ;;
+                mode2)
+                    _PROVE_ARGS+=("--gkr-v3-mode2")
+                    _PROVE_ENV+=("STWO_GKR_BATCH_WEIGHT_OPENINGS=on")
+                    ;;
+                mode3)
+                    _PROVE_ARGS+=("--gkr-v4-mode3")
+                    _PROVE_ENV+=("STWO_GKR_BATCH_WEIGHT_OPENINGS=on")
+                    ;;
+                auto)
+                    ;;
+            esac
+        fi
     fi
 
     run_step "Proof Generation" "$CURRENT" "$TOTAL_STEPS" \

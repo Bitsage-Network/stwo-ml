@@ -28,29 +28,27 @@
 //!
 //! For 2 heads (test): 9 proofs. For 32 heads (production): 69 proofs.
 
-use stwo::core::fields::m31::M31;
-use stwo::core::pcs::PcsConfig;
 use stwo::core::channel::MerkleChannel;
+use stwo::core::fields::m31::{BaseField, M31};
+use stwo::core::pcs::PcsConfig;
 use stwo::core::proof::StarkProof;
-use stwo::core::vcs_lifted::MerkleHasherLifted;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
+use stwo::core::vcs_lifted::MerkleHasherLifted;
 use stwo::prover::backend::simd::SimdBackend;
-use stwo::prover::backend::BackendForChannel;
+use stwo::prover::backend::{BackendForChannel, ColumnOps};
 use stwo::prover::poly::circle::PolyOps;
 use stwo_constraint_framework::FrameworkComponent;
 
 type Blake2sHash = <Blake2sMerkleChannel as MerkleChannel>::H;
 
+use crate::compiler::prove::prove_activation_layer;
 use crate::components::activation::{ActivationEval, ActivationType};
 use crate::components::matmul::{
-    M31Matrix, MatMulError, MatMulSumcheckProof,
-    MatMulSumcheckProofOnChain,
-    matmul_m31, prove_matmul_sumcheck_auto,
-    prove_matmul_sumcheck_onchain_auto,
+    matmul_m31, prove_matmul_sumcheck_auto, prove_matmul_sumcheck_onchain_auto, M31Matrix,
+    MatMulError, MatMulSumcheckProof, MatMulSumcheckProofOnChain,
 };
-use crate::compiler::prove::prove_activation_layer;
-use crate::gadgets::lookup_table::PrecomputedTable;
 use crate::gadgets::lookup_table::activations::softmax_exp;
+use crate::gadgets::lookup_table::PrecomputedTable;
 
 /// Configuration for a single attention head.
 #[derive(Debug, Clone, Copy)]
@@ -85,14 +83,34 @@ pub struct MultiHeadAttentionConfig {
 
 impl MultiHeadAttentionConfig {
     pub fn new(num_heads: usize, d_model: usize, seq_len: usize) -> Self {
-        assert_eq!(d_model % num_heads, 0, "d_model must be divisible by num_heads");
-        Self { num_heads, num_kv_heads: num_heads, d_model, seq_len, causal: false }
+        assert_eq!(
+            d_model % num_heads,
+            0,
+            "d_model must be divisible by num_heads"
+        );
+        Self {
+            num_heads,
+            num_kv_heads: num_heads,
+            d_model,
+            seq_len,
+            causal: false,
+        }
     }
 
     /// Create a causal (autoregressive) attention config for decoder models.
     pub fn new_causal(num_heads: usize, d_model: usize, seq_len: usize) -> Self {
-        assert_eq!(d_model % num_heads, 0, "d_model must be divisible by num_heads");
-        Self { num_heads, num_kv_heads: num_heads, d_model, seq_len, causal: true }
+        assert_eq!(
+            d_model % num_heads,
+            0,
+            "d_model must be divisible by num_heads"
+        );
+        Self {
+            num_heads,
+            num_kv_heads: num_heads,
+            d_model,
+            seq_len,
+            causal: true,
+        }
     }
 
     /// Create a GQA config: `num_heads` query heads, `num_kv_heads` key/value heads.
@@ -103,11 +121,28 @@ impl MultiHeadAttentionConfig {
         seq_len: usize,
         causal: bool,
     ) -> Self {
-        assert_eq!(d_model % num_heads, 0, "d_model must be divisible by num_heads");
+        assert_eq!(
+            d_model % num_heads,
+            0,
+            "d_model must be divisible by num_heads"
+        );
         assert!(num_kv_heads > 0, "must have at least 1 KV head");
-        assert!(num_kv_heads <= num_heads, "num_kv_heads must be ≤ num_heads");
-        assert_eq!(num_heads % num_kv_heads, 0, "num_heads must be divisible by num_kv_heads");
-        Self { num_heads, num_kv_heads, d_model, seq_len, causal }
+        assert!(
+            num_kv_heads <= num_heads,
+            "num_kv_heads must be ≤ num_heads"
+        );
+        assert_eq!(
+            num_heads % num_kv_heads,
+            0,
+            "num_heads must be divisible by num_kv_heads"
+        );
+        Self {
+            num_heads,
+            num_kv_heads,
+            d_model,
+            seq_len,
+            causal,
+        }
     }
 
     /// Create MQA config: all Q heads share a single K/V head.
@@ -317,12 +352,20 @@ pub struct ModelKVCache {
 
 impl ModelKVCache {
     pub fn new() -> Self {
-        Self { layers: std::collections::HashMap::new() }
+        Self {
+            layers: std::collections::HashMap::new(),
+        }
     }
 
     /// Get or create a cache for a given layer.
-    pub fn get_or_create(&mut self, layer_id: usize, config: &MultiHeadAttentionConfig) -> &mut KVCache {
-        self.layers.entry(layer_id).or_insert_with(|| KVCache::new(config))
+    pub fn get_or_create(
+        &mut self,
+        layer_id: usize,
+        config: &MultiHeadAttentionConfig,
+    ) -> &mut KVCache {
+        self.layers
+            .entry(layer_id)
+            .or_insert_with(|| KVCache::new(config))
     }
 
     /// Get an existing cache (read-only).
@@ -332,7 +375,11 @@ impl ModelKVCache {
 
     /// Total cached length across all layers (should be uniform).
     pub fn cached_len(&self) -> usize {
-        self.layers.values().next().map(|c| c.cached_len).unwrap_or(0)
+        self.layers
+            .values()
+            .next()
+            .map(|c| c.cached_len)
+            .unwrap_or(0)
     }
 }
 
@@ -536,7 +583,11 @@ pub fn pad_to_pow2(matrix: &M31Matrix) -> M31Matrix {
 /// Split a (seq_len, d_model) matrix into num_heads matrices of (seq_len, d_k).
 pub fn split_heads(matrix: &M31Matrix, num_heads: usize) -> Vec<M31Matrix> {
     let d_k = matrix.cols / num_heads;
-    assert_eq!(matrix.cols, num_heads * d_k, "cols must be divisible by num_heads");
+    assert_eq!(
+        matrix.cols,
+        num_heads * d_k,
+        "cols must be divisible by num_heads"
+    );
     let mut heads = Vec::with_capacity(num_heads);
     for h in 0..num_heads {
         let mut head = M31Matrix::new(matrix.rows, d_k);
@@ -769,7 +820,8 @@ pub fn prove_attention_with<B, MC>(
     causal: bool,
 ) -> Result<AttentionProof<<MC as MerkleChannel>::H>, AttentionError>
 where
-    B: BackendForChannel<MC> + PolyOps,
+    B: BackendForChannel<MC> + PolyOps + ColumnOps<BaseField>,
+    <B as ColumnOps<BaseField>>::Column: 'static,
     MC: MerkleChannel,
     FrameworkComponent<ActivationEval>: stwo::prover::ComponentProver<B>,
 {
@@ -787,16 +839,25 @@ where
     let v_p = pad_to_pow2(&intermediates.v);
 
     // 1. Q projection proof
-    let q_proof = prove_matmul_sumcheck_auto(&input_p, &wq_p, &q_p)
-        .map_err(|e| AttentionError::MatMul { stage: "Q_projection".into(), source: e })?;
+    let q_proof =
+        prove_matmul_sumcheck_auto(&input_p, &wq_p, &q_p).map_err(|e| AttentionError::MatMul {
+            stage: "Q_projection".into(),
+            source: e,
+        })?;
 
     // 2. K projection proof
-    let k_proof = prove_matmul_sumcheck_auto(&input_p, &wk_p, &k_p)
-        .map_err(|e| AttentionError::MatMul { stage: "K_projection".into(), source: e })?;
+    let k_proof =
+        prove_matmul_sumcheck_auto(&input_p, &wk_p, &k_p).map_err(|e| AttentionError::MatMul {
+            stage: "K_projection".into(),
+            source: e,
+        })?;
 
     // 3. V projection proof
-    let v_proof = prove_matmul_sumcheck_auto(&input_p, &wv_p, &v_p)
-        .map_err(|e| AttentionError::MatMul { stage: "V_projection".into(), source: e })?;
+    let v_proof =
+        prove_matmul_sumcheck_auto(&input_p, &wv_p, &v_p).map_err(|e| AttentionError::MatMul {
+            stage: "V_projection".into(),
+            source: e,
+        })?;
 
     // Split for per-head proofs: Q into num_heads, K/V into num_kv_heads
     let q_heads = split_heads(&intermediates.q, config.num_heads);
@@ -818,10 +879,12 @@ where
 
         // We need the padded score matrix that matches q_h_p × k_t_p
         let scores_p_raw = matmul_m31(&q_h_p, &k_t_p);
-        let score_proof = prove_matmul_sumcheck_auto(&q_h_p, &k_t_p, &scores_p_raw)
-            .map_err(|e| AttentionError::MatMul {
-                stage: format!("score_head_{h}"),
-                source: e,
+        let score_proof =
+            prove_matmul_sumcheck_auto(&q_h_p, &k_t_p, &scores_p_raw).map_err(|e| {
+                AttentionError::MatMul {
+                    stage: format!("score_head_{h}"),
+                    source: e,
+                }
             })?;
         score_proofs.push(score_proof);
 
@@ -836,10 +899,12 @@ where
         let soft_p = pad_to_pow2(&intermediates.softmax_outputs[h]);
         let v_h_p = pad_to_pow2(&kv_heads_v[kv_idx]);
         let context_p = matmul_m31(&soft_p, &v_h_p);
-        let attn_v_proof = prove_matmul_sumcheck_auto(&soft_p, &v_h_p, &context_p)
-            .map_err(|e| AttentionError::MatMul {
-                stage: format!("attn_v_head_{h}"),
-                source: e,
+        let attn_v_proof =
+            prove_matmul_sumcheck_auto(&soft_p, &v_h_p, &context_p).map_err(|e| {
+                AttentionError::MatMul {
+                    stage: format!("attn_v_head_{h}"),
+                    source: e,
+                }
             })?;
         attn_v_proofs.push(attn_v_proof);
     }
@@ -847,18 +912,26 @@ where
     // Output projection proof
     let concat_p = pad_to_pow2(&intermediates.concat);
     let out_p = pad_to_pow2(&intermediates.final_output);
-    let output_proof = prove_matmul_sumcheck_auto(&concat_p, &wo_p, &out_p)
-        .map_err(|e| AttentionError::MatMul { stage: "output_projection".into(), source: e })?;
+    let output_proof = prove_matmul_sumcheck_auto(&concat_p, &wo_p, &out_p).map_err(|e| {
+        AttentionError::MatMul {
+            stage: "output_projection".into(),
+            source: e,
+        }
+    })?;
 
     // Batched softmax exp STARK proof (all heads in one proof)
-    let table = PrecomputedTable::build_parallel(softmax_exp, ActivationType::Softmax.production_log_size());
+    let table = PrecomputedTable::build_parallel(
+        softmax_exp,
+        ActivationType::Softmax.production_log_size(),
+    );
     let pcs_config = PcsConfig::default();
     let (component, softmax_exp_proof) = prove_activation_layer::<B, MC>(
         &all_softmax_inputs,
         &all_softmax_outputs,
         &table,
         pcs_config,
-    ).map_err(|e| AttentionError::Activation(format!("softmax exp STARK: {e}")))?;
+    )
+    .map_err(|e| AttentionError::Activation(format!("softmax exp STARK: {e}")))?;
 
     // Extract metadata needed for verification.
     // Must match prove_activation_layer's log_size = table.log_size.max(4).
@@ -896,12 +969,24 @@ pub fn prove_attention_onchain(
     let k_p = pad_to_pow2(&intermediates.k);
     let v_p = pad_to_pow2(&intermediates.v);
 
-    let q_proof = prove_matmul_sumcheck_onchain_auto(&input_p, &wq_p, &q_p)
-        .map_err(|e| AttentionError::MatMul { stage: "Q_projection".into(), source: e })?;
-    let k_proof = prove_matmul_sumcheck_onchain_auto(&input_p, &wk_p, &k_p)
-        .map_err(|e| AttentionError::MatMul { stage: "K_projection".into(), source: e })?;
-    let v_proof = prove_matmul_sumcheck_onchain_auto(&input_p, &wv_p, &v_p)
-        .map_err(|e| AttentionError::MatMul { stage: "V_projection".into(), source: e })?;
+    let q_proof = prove_matmul_sumcheck_onchain_auto(&input_p, &wq_p, &q_p).map_err(|e| {
+        AttentionError::MatMul {
+            stage: "Q_projection".into(),
+            source: e,
+        }
+    })?;
+    let k_proof = prove_matmul_sumcheck_onchain_auto(&input_p, &wk_p, &k_p).map_err(|e| {
+        AttentionError::MatMul {
+            stage: "K_projection".into(),
+            source: e,
+        }
+    })?;
+    let v_proof = prove_matmul_sumcheck_onchain_auto(&input_p, &wv_p, &v_p).map_err(|e| {
+        AttentionError::MatMul {
+            stage: "V_projection".into(),
+            source: e,
+        }
+    })?;
 
     let q_heads = split_heads(&intermediates.q, config.num_heads);
     let kv_heads_k = split_heads(&intermediates.k, config.num_kv_heads);
@@ -919,8 +1004,12 @@ pub fn prove_attention_onchain(
         let q_h_p = pad_to_pow2(&q_heads[h]);
         let k_t_p = pad_to_pow2(&k_t);
         let scores_p = matmul_m31(&q_h_p, &k_t_p);
-        let sp = prove_matmul_sumcheck_onchain_auto(&q_h_p, &k_t_p, &scores_p)
-            .map_err(|e| AttentionError::MatMul { stage: format!("score_head_{h}"), source: e })?;
+        let sp = prove_matmul_sumcheck_onchain_auto(&q_h_p, &k_t_p, &scores_p).map_err(|e| {
+            AttentionError::MatMul {
+                stage: format!("score_head_{h}"),
+                source: e,
+            }
+        })?;
         score_proofs.push(sp);
 
         // Collect softmax exp inputs/outputs for batched STARK
@@ -933,27 +1022,39 @@ pub fn prove_attention_onchain(
         let soft_p = pad_to_pow2(&intermediates.softmax_outputs[h]);
         let v_h_p = pad_to_pow2(&kv_heads_v[kv_idx]);
         let context_p = matmul_m31(&soft_p, &v_h_p);
-        let avp = prove_matmul_sumcheck_onchain_auto(&soft_p, &v_h_p, &context_p)
-            .map_err(|e| AttentionError::MatMul { stage: format!("attn_v_head_{h}"), source: e })?;
+        let avp = prove_matmul_sumcheck_onchain_auto(&soft_p, &v_h_p, &context_p).map_err(|e| {
+            AttentionError::MatMul {
+                stage: format!("attn_v_head_{h}"),
+                source: e,
+            }
+        })?;
         attn_v_proofs.push(avp);
     }
 
     let concat_p = pad_to_pow2(&intermediates.concat);
     let out_p = pad_to_pow2(&intermediates.final_output);
-    let output_proof = prove_matmul_sumcheck_onchain_auto(&concat_p, &wo_p, &out_p)
-        .map_err(|e| AttentionError::MatMul { stage: "output_projection".into(), source: e })?;
+    let output_proof =
+        prove_matmul_sumcheck_onchain_auto(&concat_p, &wo_p, &out_p).map_err(|e| {
+            AttentionError::MatMul {
+                stage: "output_projection".into(),
+                source: e,
+            }
+        })?;
 
     // Batched softmax exp STARK proof (all heads in one proof, Blake2s channel)
     let table = PrecomputedTable::build_parallel(
-        softmax_exp, ActivationType::Softmax.production_log_size(),
+        softmax_exp,
+        ActivationType::Softmax.production_log_size(),
     );
     let pcs_config = PcsConfig::default();
-    let (component, softmax_exp_proof) = prove_activation_layer::<SimdBackend, Blake2sMerkleChannel>(
-        &all_softmax_inputs,
-        &all_softmax_outputs,
-        &table,
-        pcs_config,
-    ).map_err(|e| AttentionError::Activation(format!("softmax exp STARK: {e}")))?;
+    let (component, softmax_exp_proof) =
+        prove_activation_layer::<SimdBackend, Blake2sMerkleChannel>(
+            &all_softmax_inputs,
+            &all_softmax_outputs,
+            &table,
+            pcs_config,
+        )
+        .map_err(|e| AttentionError::Activation(format!("softmax exp STARK: {e}")))?;
     let softmax_log_size = table.log_size.max(4);
 
     Ok(AttentionProofOnChain {
@@ -972,7 +1073,7 @@ pub fn prove_attention_onchain(
 
 // ===== Float32 Attention =====
 
-use crate::components::f32_ops::{F32Matrix, matmul_f32, softmax_f32};
+use crate::components::f32_ops::{matmul_f32, softmax_f32, F32Matrix};
 
 /// Float32 weight matrices for multi-head attention.
 #[derive(Debug, Clone)]
@@ -1106,7 +1207,9 @@ mod tests {
             let mut state = seed;
             for i in 0..rows {
                 for j in 0..cols {
-                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
                     let val = ((state >> 33) % 9 + 1) as u32;
                     m.set(i, j, M31::from(val));
                 }
@@ -1165,8 +1268,12 @@ mod tests {
     #[test]
     fn test_transpose() {
         let mut m = M31Matrix::new(2, 3);
-        m.set(0, 0, M31::from(1)); m.set(0, 1, M31::from(2)); m.set(0, 2, M31::from(3));
-        m.set(1, 0, M31::from(4)); m.set(1, 1, M31::from(5)); m.set(1, 2, M31::from(6));
+        m.set(0, 0, M31::from(1));
+        m.set(0, 1, M31::from(2));
+        m.set(0, 2, M31::from(3));
+        m.set(1, 0, M31::from(4));
+        m.set(1, 1, M31::from(5));
+        m.set(1, 2, M31::from(6));
 
         let t = transpose_m31(&m);
         assert_eq!(t.rows, 3);
@@ -1226,8 +1333,12 @@ mod tests {
     #[test]
     fn test_split_heads_values() {
         let mut m = M31Matrix::new(2, 4);
-        for j in 0..4 { m.set(0, j, M31::from((j + 1) as u32)); }
-        for j in 0..4 { m.set(1, j, M31::from((j + 5) as u32)); }
+        for j in 0..4 {
+            m.set(0, j, M31::from((j + 1) as u32));
+        }
+        for j in 0..4 {
+            m.set(1, j, M31::from((j + 5) as u32));
+        }
 
         let heads = split_heads(&m, 2);
         // Head 0: cols 0-1, Head 1: cols 2-3
@@ -1319,8 +1430,7 @@ mod tests {
 
         // Causal and non-causal should produce different outputs
         assert_ne!(
-            inter_causal.final_output.data,
-            inter_no_causal.final_output.data,
+            inter_causal.final_output.data, inter_no_causal.final_output.data,
             "causal mask should change the output"
         );
     }
@@ -1349,7 +1459,11 @@ mod tests {
         let result = prove_attention_with::<SimdBackend, Blake2sMerkleChannel>(
             &input, &weights, &config, false,
         );
-        assert!(result.is_ok(), "Single-head attention proving failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Single-head attention proving failed: {:?}",
+            result.err()
+        );
 
         let proof = result.unwrap();
         // 3 projections + 1 score + 1 attn_v + 1 output = 6 matmul proofs
@@ -1369,7 +1483,11 @@ mod tests {
         let result = prove_attention_with::<SimdBackend, Blake2sMerkleChannel>(
             &input, &weights, &config, false,
         );
-        assert!(result.is_ok(), "Multi-head attention proving failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Multi-head attention proving failed: {:?}",
+            result.err()
+        );
 
         let proof = result.unwrap();
         assert_eq!(proof.score_proofs.len(), 2);
@@ -1385,7 +1503,11 @@ mod tests {
         let result = prove_attention_with::<SimdBackend, Blake2sMerkleChannel>(
             &input, &weights, &config, true,
         );
-        assert!(result.is_ok(), "Causal attention proving failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Causal attention proving failed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -1395,7 +1517,11 @@ mod tests {
         let weights = make_test_weights(4, 42);
 
         let result = prove_attention_onchain(&input, &weights, &config, false);
-        assert!(result.is_ok(), "On-chain attention proving failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "On-chain attention proving failed: {:?}",
+            result.err()
+        );
 
         let proof = result.unwrap();
         // Verify Poseidon commitments are non-zero
@@ -1413,12 +1539,13 @@ mod tests {
 
         let proof = prove_attention_with::<SimdBackend, Blake2sMerkleChannel>(
             &input, &weights, &config, false,
-        ).unwrap();
+        )
+        .unwrap();
 
         let matmul_count = 1 + 1 + 1 // Q, K, V projections
             + proof.score_proofs.len()   // per-head scores
             + proof.attn_v_proofs.len()  // per-head attn×V
-            + 1;                         // output projection
+            + 1; // output projection
         let stark_count = 1; // softmax exp
 
         assert_eq!(matmul_count, 4 + 2 * config.num_heads);
@@ -1433,7 +1560,9 @@ mod tests {
             let mut data = vec![0.0f32; rows * cols];
             let mut state = seed;
             for v in data.iter_mut() {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 *v = ((state >> 33) % 10) as f32 * 0.1 - 0.5;
             }
             F32Matrix::from_data(rows, cols, data)
@@ -1524,7 +1653,11 @@ mod tests {
 
         // Verify constraint: weight * sum_exp - exp_val = 0
         let constraint_val = weight * sum_exp - exp_val;
-        assert_eq!(constraint_val, M31::from(0), "Softmax norm constraint should hold");
+        assert_eq!(
+            constraint_val,
+            M31::from(0),
+            "Softmax norm constraint should hold"
+        );
     }
 
     // --- GQA tests ---
@@ -1535,7 +1668,9 @@ mod tests {
             let mut state = seed;
             for i in 0..rows {
                 for j in 0..cols {
-                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
                     let val = ((state >> 33) % 9 + 1) as u32;
                     m.set(i, j, M31::from(val));
                 }
@@ -1556,7 +1691,9 @@ mod tests {
             let mut data = vec![0.0f32; rows * cols];
             let mut state = seed;
             for v in data.iter_mut() {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 *v = ((state >> 33) % 10) as f32 * 0.1 - 0.5;
             }
             F32Matrix::from_data(rows, cols, data)
@@ -1651,8 +1788,10 @@ mod tests {
         let out_mha = attention_forward(&input, &weights, &config_mha, false);
         let out_gqa = attention_forward(&input, &weights, &config_gqa, false);
 
-        assert_eq!(out_mha.final_output.data, out_gqa.final_output.data,
-            "GQA with num_kv_heads==num_heads should match MHA");
+        assert_eq!(
+            out_mha.final_output.data, out_gqa.final_output.data,
+            "GQA with num_kv_heads==num_heads should match MHA"
+        );
     }
 
     #[test]
@@ -1697,7 +1836,11 @@ mod tests {
         let result = prove_attention_with::<SimdBackend, Blake2sMerkleChannel>(
             &input, &weights, &config, false,
         );
-        assert!(result.is_ok(), "GQA attention proving failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "GQA attention proving failed: {:?}",
+            result.err()
+        );
 
         let proof = result.unwrap();
         // 4 score proofs (one per Q head) and 4 attn_v proofs
@@ -1713,7 +1856,11 @@ mod tests {
         let weights = make_gqa_weights(&config, 42);
 
         let result = prove_attention_onchain(&input, &weights, &config, false);
-        assert!(result.is_ok(), "MQA on-chain proving failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "MQA on-chain proving failed: {:?}",
+            result.err()
+        );
 
         let proof = result.unwrap();
         assert_eq!(proof.score_proofs.len(), 2);
@@ -1729,7 +1876,7 @@ mod tests {
         assert_eq!(cache.cached_len, 0);
         assert!(cache.is_empty());
         assert_eq!(cache.k_cache.len(), 4); // num_kv_heads = num_heads = 4
-        assert_eq!(cache.d_k, 2);           // d_model/num_heads = 8/4 = 2
+        assert_eq!(cache.d_k, 2); // d_model/num_heads = 8/4 = 2
     }
 
     #[test]
@@ -1739,7 +1886,11 @@ mod tests {
 
         // Simulate projecting 3 tokens: K = (3, 4)
         let mut k_new = M31Matrix::new(3, 4);
-        for i in 0..3 { for j in 0..4 { k_new.set(i, j, M31::from((i * 4 + j + 1) as u32)); } }
+        for i in 0..3 {
+            for j in 0..4 {
+                k_new.set(i, j, M31::from((i * 4 + j + 1) as u32));
+            }
+        }
         let v_new = k_new.clone();
 
         cache.append(&k_new, &v_new);
@@ -1750,7 +1901,11 @@ mod tests {
 
         // Append 2 more tokens
         let mut k_new2 = M31Matrix::new(2, 4);
-        for i in 0..2 { for j in 0..4 { k_new2.set(i, j, M31::from((100 + i * 4 + j) as u32)); } }
+        for i in 0..2 {
+            for j in 0..4 {
+                k_new2.set(i, j, M31::from((100 + i * 4 + j) as u32));
+            }
+        }
         cache.append(&k_new2, &k_new2);
         assert_eq!(cache.len(), 5);
         assert_eq!(cache.get_k(0).rows, 5);
@@ -1765,7 +1920,9 @@ mod tests {
 
         // K projection output is (seq_len, kv_dim) = (_, 4) for GQA
         let mut k_new = M31Matrix::new(1, 4);
-        for j in 0..4 { k_new.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            k_new.set(0, j, M31::from((j + 1) as u32));
+        }
         cache.append(&k_new, &k_new);
 
         assert_eq!(cache.len(), 1);
@@ -1777,11 +1934,17 @@ mod tests {
     #[test]
     fn test_vstack() {
         let mut top = M31Matrix::new(2, 3);
-        top.set(0, 0, M31::from(1)); top.set(0, 1, M31::from(2)); top.set(0, 2, M31::from(3));
-        top.set(1, 0, M31::from(4)); top.set(1, 1, M31::from(5)); top.set(1, 2, M31::from(6));
+        top.set(0, 0, M31::from(1));
+        top.set(0, 1, M31::from(2));
+        top.set(0, 2, M31::from(3));
+        top.set(1, 0, M31::from(4));
+        top.set(1, 1, M31::from(5));
+        top.set(1, 2, M31::from(6));
 
         let mut bottom = M31Matrix::new(1, 3);
-        bottom.set(0, 0, M31::from(7)); bottom.set(0, 1, M31::from(8)); bottom.set(0, 2, M31::from(9));
+        bottom.set(0, 0, M31::from(7));
+        bottom.set(0, 1, M31::from(8));
+        bottom.set(0, 2, M31::from(9));
 
         let result = vstack(&top, &bottom);
         assert_eq!(result.rows, 3);
@@ -1795,7 +1958,11 @@ mod tests {
     fn test_vstack_empty_top() {
         let top = M31Matrix::new(0, 3);
         let mut bottom = M31Matrix::new(2, 3);
-        for i in 0..2 { for j in 0..3 { bottom.set(i, j, M31::from((i * 3 + j) as u32)); } }
+        for i in 0..2 {
+            for j in 0..3 {
+                bottom.set(i, j, M31::from((i * 3 + j) as u32));
+            }
+        }
 
         let result = vstack(&top, &bottom);
         assert_eq!(result.rows, 2);
@@ -1828,18 +1995,16 @@ mod tests {
 
         // Prefill with 4 tokens
         let input_prefill = make_test_input(4, 4);
-        let inter_prefill = attention_forward_cached(
-            &input_prefill, &weights, &config, &mut cache, false,
-        );
+        let inter_prefill =
+            attention_forward_cached(&input_prefill, &weights, &config, &mut cache, false);
         assert_eq!(cache.len(), 4);
         assert_eq!(inter_prefill.final_output.rows, 4);
         assert_eq!(inter_prefill.final_output.cols, 4);
 
         // Decode 1 token
         let input_decode = make_test_input(1, 4);
-        let inter_decode = attention_forward_cached(
-            &input_decode, &weights, &config, &mut cache, false,
-        );
+        let inter_decode =
+            attention_forward_cached(&input_decode, &weights, &config, &mut cache, false);
         assert_eq!(cache.len(), 5);
         assert_eq!(inter_decode.final_output.rows, 1);
         assert_eq!(inter_decode.final_output.cols, 4);
@@ -1861,13 +2026,10 @@ mod tests {
 
         // Cached (prefill in one shot)
         let mut cache = KVCache::new(&config);
-        let inter_cached = attention_forward_cached(
-            &input, &weights, &config, &mut cache, false,
-        );
+        let inter_cached = attention_forward_cached(&input, &weights, &config, &mut cache, false);
 
         assert_eq!(
-            inter_full.final_output.data,
-            inter_cached.final_output.data,
+            inter_full.final_output.data, inter_cached.final_output.data,
             "Cached prefill should match non-cached forward pass"
         );
     }
@@ -1880,16 +2042,12 @@ mod tests {
 
         // Prefill 3 tokens with causal masking
         let input = make_test_input(3, 4);
-        let inter = attention_forward_cached(
-            &input, &weights, &config, &mut cache, true,
-        );
+        let inter = attention_forward_cached(&input, &weights, &config, &mut cache, true);
         assert_eq!(inter.final_output.rows, 3);
 
         // Decode 1 token — should attend to positions 0..3 only
         let decode_input = make_test_input(1, 4);
-        let inter2 = attention_forward_cached(
-            &decode_input, &weights, &config, &mut cache, true,
-        );
+        let inter2 = attention_forward_cached(&decode_input, &weights, &config, &mut cache, true);
         assert_eq!(inter2.final_output.rows, 1);
         assert_eq!(inter2.score_matrices[0].cols, 4); // attends to 4 total positions
     }
@@ -1905,18 +2063,14 @@ mod tests {
 
         // Prefill 4 tokens
         let input = make_test_input(4, 8);
-        let inter = attention_forward_cached(
-            &input, &weights, &config, &mut cache, true,
-        );
+        let inter = attention_forward_cached(&input, &weights, &config, &mut cache, true);
         assert_eq!(cache.len(), 4);
         assert_eq!(inter.score_matrices.len(), 4); // 4 Q heads
         assert_eq!(inter.final_output.rows, 4);
 
         // Decode 1 token
         let decode = make_test_input(1, 8);
-        let inter2 = attention_forward_cached(
-            &decode, &weights, &config, &mut cache, true,
-        );
+        let inter2 = attention_forward_cached(&decode, &weights, &config, &mut cache, true);
         assert_eq!(cache.len(), 5);
         assert_eq!(inter2.score_matrices[0].rows, 1);
         assert_eq!(inter2.score_matrices[0].cols, 5);

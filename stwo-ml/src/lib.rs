@@ -74,7 +74,7 @@ pub mod prelude {
         GkrBatchData,
     };
     pub use crate::receipt::{prove_receipt, prove_receipt_batch, prove_receipt_batch_auto};
-    pub use crate::backend::BackendInfo;
+    pub use crate::backend::{BackendInfo, ZkmlOps, MatMulReduction};
     pub use crate::gpu::GpuModelProver;
     pub use crate::crypto::poseidon_channel::PoseidonChannel;
     pub use crate::crypto::mle_opening::{MleOpeningProof, commit_mle, commit_mle_root_only, prove_mle_opening};

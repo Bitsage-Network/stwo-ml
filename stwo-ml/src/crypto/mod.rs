@@ -11,3 +11,4 @@ pub mod poseidon2_m31;
 pub mod commitment;
 pub mod merkle_m31;
 pub mod encryption;
+pub mod aggregated_opening;

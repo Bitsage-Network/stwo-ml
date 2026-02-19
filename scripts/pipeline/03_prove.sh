@@ -41,6 +41,7 @@ GKR_V3_MODE2=false
 GKR_V4=false
 GKR_V4_MODE3=false
 LEGACY_GKR_V1=false
+SUBMIT=false
 
 # ─── Parse Arguments ─────────────────────────────────────────────────
 
@@ -69,6 +70,7 @@ while [[ $# -gt 0 ]]; do
         --gkr-v4)           GKR_V4=true; shift ;;
         --gkr-v4-mode3)     GKR_V4_MODE3=true; GKR_V4=true; shift ;;
         --legacy-gkr-v1)    LEGACY_GKR_V1=true; shift ;;
+        --submit)           SUBMIT=true; shift ;;
         --salt)             SALT="$2"; shift 2 ;;
         --server)           SERVER_URL="$2"; shift 2 ;;
         -h|--help)
@@ -98,13 +100,14 @@ while [[ $# -gt 0 ]]; do
             echo "  --skip-build         Skip building binaries"
             echo "  --skip-commitment    Skip weight commitment (faster, can't submit on-chain)"
             echo "  --gkr                Enable GKR for LogUp verification"
-            echo "  --starknet-ready     Enable submit-ready artifact gates (defaults to latest v4 mode3 unless legacy)"
-            echo "  --gkr-v2             Emit verify_model_gkr_v2 calldata (mode-aware v2 path)"
-            echo "  --gkr-v3             Emit verify_model_gkr_v3 calldata (v3 envelope, mode-aware)"
-            echo "  --gkr-v3-mode2       Enable verify_model_gkr_v3 mode=2 (trustless payload + opening checks)"
-            echo "  --gkr-v4             Emit verify_model_gkr_v4 calldata (v4 envelope)"
-            echo "  --gkr-v4-mode3       Enable verify_model_gkr_v4 mode=3 (latest aggregated openings envelope)"
-            echo "  --legacy-gkr-v1      Keep legacy verify_model_gkr v1 sequential-opening submit path"
+            echo "  --submit             Enable on-chain submission mode (aggregated oracle sumcheck, ~17K felts)"
+            echo "  --starknet-ready     (Deprecated) Legacy submit-ready gate mode"
+            echo "  --gkr-v2             (Legacy) Emit verify_model_gkr_v2 calldata"
+            echo "  --gkr-v3             (Legacy) Emit verify_model_gkr_v3 calldata"
+            echo "  --gkr-v3-mode2       (Legacy) Enable verify_model_gkr_v3 mode=2"
+            echo "  --gkr-v4             (Legacy) Emit verify_model_gkr_v4 calldata"
+            echo "  --gkr-v4-mode3       (Legacy) Enable verify_model_gkr_v4 mode=3"
+            echo "  --legacy-gkr-v1      (Legacy) Keep verify_model_gkr v1 sequential-opening submit path"
             echo "  --salt N             Fiat-Shamir channel salt"
             echo "  --server URL         Submit to remote prove-server instead of local binary"
             echo "  -h, --help           Show this help"
@@ -119,6 +122,36 @@ if [[ "$MODE" != "gkr" ]]; then
     err "Only --mode gkr is supported in the hardened pipeline (got: ${MODE})"
     err "Use GKR mode for full on-chain cryptographic verification."
     exit 1
+fi
+
+# Deprecation path: bare --starknet-ready now maps to --submit (mode 4 aggregated).
+# Legacy selectors still work when explicitly requested.
+if [[ "$STARKNET_READY" == "true" ]] && [[ "$SUBMIT" != "true" ]]; then
+    if [[ "$LEGACY_GKR_V1" != "true" ]] && [[ "$GKR_V2" != "true" ]] && [[ "$GKR_V3" != "true" ]] && [[ "$GKR_V3_MODE2" != "true" ]] && [[ "$GKR_V4" != "true" ]] && [[ "$GKR_V4_MODE3" != "true" ]]; then
+        warn "--starknet-ready is deprecated; using --submit (verify_model_gkr_v4 mode 4, aggregated oracle sumcheck)."
+        SUBMIT=true
+    else
+        warn "--starknet-ready is deprecated. Prefer --submit for the default path; legacy selectors remain opt-in."
+    fi
+fi
+
+# ─── --submit: Aggregated Oracle Sumcheck (mode 4) ──────────────────
+# --submit is the recommended path for on-chain submission.
+# Forces aggregated weight binding (unified oracle mismatch sumcheck),
+# producing ~17K felts calldata instead of ~2.4M (160 separate openings).
+if [[ "$SUBMIT" == "true" ]]; then
+    STARKNET_READY=true
+    GKR_V4=true
+    export STWO_WEIGHT_BINDING=aggregated
+    export STWO_STARKNET_GKR_V4=1
+    # Disable legacy modes that conflict with aggregated oracle sumcheck
+    GKR_V2=false
+    GKR_V3=false
+    GKR_V3_MODE2=false
+    GKR_V4_MODE3=false
+    LEGACY_GKR_V1=false
+    log "Aggregated oracle sumcheck mode enabled (--submit)"
+    log "Estimated calldata: ~17K felts (vs ~2.4M for legacy per-opening mode)"
 fi
 
 # Safety: v2/v3 submission paths require Starknet-ready artifact gating.
@@ -161,10 +194,9 @@ if [[ "$STARKNET_READY" == "true" ]] && [[ "$GKR_V2" != "true" ]] && [[ "$GKR_V3
     if [[ "${LEGACY_GKR_V1}" == "true" ]]; then
         warn "--starknet-ready + --legacy-gkr-v1: using verify_model_gkr (v1 sequential openings)."
     else
-        warn "--starknet-ready requested without v2/v3/v4 selector; defaulting to verify_model_gkr_v4 mode3 (latest submit-ready path)."
-        warn "Use --legacy-gkr-v1 to force verify_model_gkr (v1 sequential openings)."
-        GKR_V4=true
-        GKR_V4_MODE3=true
+        err "--starknet-ready requested without explicit legacy selector."
+        err "Use --submit for the default mode-4 aggregated path, or pass a legacy selector explicitly."
+        exit 1
     fi
 fi
 
@@ -220,23 +252,31 @@ case "${PURE_GKR_SKIP_UNIFIED_STARK,,}" in
 esac
 
 # Default to fast aggregated weight binding for off-chain proving.
-# For submit-ready Starknet calldata, caller can pass --starknet-ready.
-GKR_AGG_WEIGHT_BINDING_DEFAULT="on"
-if [[ "$STARKNET_READY" == "true" ]]; then
-    GKR_AGG_WEIGHT_BINDING_DEFAULT="off"
-fi
-GKR_AGG_WEIGHT_BINDING="${STWO_GKR_AGGREGATE_WEIGHT_BINDING:-${GKR_AGG_WEIGHT_BINDING_DEFAULT}}"
-
-case "${GKR_AGG_WEIGHT_BINDING,,}" in
-    1|true|on|yes) GKR_AGG_WEIGHT_BINDING="on" ;;
-    *) GKR_AGG_WEIGHT_BINDING="off" ;;
-esac
-
-if [[ "$STARKNET_READY" == "true" ]] && [[ "${GKR_AGG_WEIGHT_BINDING}" == "on" ]]; then
-    warn "Overriding STWO_GKR_AGGREGATE_WEIGHT_BINDING=on -> off (--starknet-ready requested)"
+# For submit-ready Starknet calldata, caller can pass --starknet-ready or --submit.
+# --submit uses aggregated oracle sumcheck (mode 4) which IS submit-ready.
+if [[ "$SUBMIT" == "true" ]]; then
+    # Aggregated oracle sumcheck handles weight binding via unified oracle.
+    # Disable old RLC mode — it conflicts with the new protocol.
     GKR_AGG_WEIGHT_BINDING="off"
+    export STWO_GKR_AGGREGATE_WEIGHT_BINDING="off"
+else
+    GKR_AGG_WEIGHT_BINDING_DEFAULT="on"
+    if [[ "$STARKNET_READY" == "true" ]]; then
+        GKR_AGG_WEIGHT_BINDING_DEFAULT="off"
+    fi
+    GKR_AGG_WEIGHT_BINDING="${STWO_GKR_AGGREGATE_WEIGHT_BINDING:-${GKR_AGG_WEIGHT_BINDING_DEFAULT}}"
+
+    case "${GKR_AGG_WEIGHT_BINDING,,}" in
+        1|true|on|yes) GKR_AGG_WEIGHT_BINDING="on" ;;
+        *) GKR_AGG_WEIGHT_BINDING="off" ;;
+    esac
+
+    if [[ "$STARKNET_READY" == "true" ]] && [[ "${GKR_AGG_WEIGHT_BINDING}" == "on" ]]; then
+        warn "Overriding STWO_GKR_AGGREGATE_WEIGHT_BINDING=on -> off (--starknet-ready requested)"
+        GKR_AGG_WEIGHT_BINDING="off"
+    fi
+    export STWO_GKR_AGGREGATE_WEIGHT_BINDING="${GKR_AGG_WEIGHT_BINDING}"
 fi
-export STWO_GKR_AGGREGATE_WEIGHT_BINDING="${GKR_AGG_WEIGHT_BINDING}"
 
 if [[ "$GKR_V2" == "true" ]]; then
     export STWO_STARKNET_GKR_V2=1
@@ -403,7 +443,11 @@ log "GPU:            ${USE_GPU} (multi: ${MULTI_GPU})"
 log "Output:         ${OUTPUT_DIR}"
 log "prove-model:    ${PROVE_BIN}"
 log "Threads:        RAYON=${RAYON_NUM_THREADS} OMP=${OMP_NUM_THREADS}"
+log "Submit mode:    ${SUBMIT}"
 log "Starknet ready: ${STARKNET_READY}"
+if [[ "$SUBMIT" == "true" ]]; then
+    log "Weight binding: aggregated_oracle_sumcheck (mode 4)"
+fi
 if [[ "$GKR_V4" == "true" ]]; then
     _GKR_ENTRYPOINT="verify_model_gkr_v4"
 elif [[ "$GKR_V3" == "true" ]]; then
@@ -557,7 +601,19 @@ echo ""
 
 # Run with progress monitoring
 if [[ "$DRY_RUN" == "1" ]]; then
-    run_cmd "${PROVE_CMD[@]}"
+    log "[DRY RUN] Would execute: ${PROVE_CMD[*]}"
+    log "[DRY RUN] Skipping actual proof generation."
+    # Create a minimal placeholder so downstream steps know dry-run happened
+    mkdir -p "$OUTPUT_DIR"
+    python3 -c "
+import json, sys
+json.dump({
+    'dry_run': True,
+    'command': sys.argv[1:],
+    'verify_calldata': None,
+}, open('${OUTPUT_DIR}/ml_proof.json', 'w'), indent=2)
+" "${PROVE_CMD[@]}"
+    ok "[DRY RUN] Placeholder proof written to ${OUTPUT_DIR}/ml_proof.json"
 else
     RAW_LOG="${OUTPUT_DIR}/prove_model.raw.log"
     log "Raw prover log: ${RAW_LOG}"
@@ -660,35 +716,6 @@ case "$MODE" in
         fi
         ;;
 
-    # ─── Direct: verify structure ────────────────────────────────────
-    direct)
-        header "Phase 2: Direct Mode — Verify Structure"
-        log "Checking direct proof structure..."
-
-        if python3 -c "
-import json, sys
-with open('${ML_PROOF}') as f:
-    proof = json.load(f)
-vc = proof.get('verify_calldata')
-assert isinstance(vc, dict), 'Missing verify_calldata object'
-assert vc.get('schema_version') == 1, 'verify_calldata.schema_version must be 1'
-assert vc.get('entrypoint') == 'verify_model_direct', 'verify_calldata.entrypoint must be verify_model_direct'
-calldata = vc.get('calldata')
-chunks = vc.get('upload_chunks', [])
-assert isinstance(calldata, list) and len(calldata) > 0, 'verify_calldata.calldata must be non-empty array'
-assert isinstance(chunks, list), 'verify_calldata.upload_chunks must be an array'
-assert any(str(v) == '__SESSION_ID__' for v in calldata), 'verify_model_direct calldata must contain __SESSION_ID__ placeholder'
-print(f'  verify_calldata parts: {len(calldata)}', file=sys.stderr)
-print(f'  upload_chunks: {len(chunks)}', file=sys.stderr)
-" 2>&1; then
-            ok "Direct proof structure valid"
-        else
-            err "Direct proof structure invalid"
-            exit 1
-        fi
-        ok "Direct proof ready"
-        ;;
-
     # ─── GKR: proof ready as-is + local verification ────────────────
     gkr)
         header "Phase 2: GKR Mode — Local Verification"
@@ -743,8 +770,9 @@ if entrypoint in ('verify_model_gkr', 'verify_model_gkr_v2', 'verify_model_gkr_v
                 f'{entrypoint} requires weight_opening_mode in (Sequential, BatchedSubchannelV1) (got {mode})'
     elif entrypoint == 'verify_model_gkr_v4':
         if mode_s is not None:
-            assert mode_s == 'AggregatedOpeningsV4Experimental', \
-                f'{entrypoint} requires weight_opening_mode=AggregatedOpeningsV4Experimental (got {mode})'
+            allowed_v4 = ('AggregatedOpeningsV4Experimental', 'AggregatedOracleSumcheck')
+            assert mode_s in allowed_v4, \
+                f'{entrypoint} requires weight_opening_mode in {allowed_v4} (got {mode})'
     if entrypoint in ('verify_model_gkr_v2', 'verify_model_gkr_v3', 'verify_model_gkr_v4'):
         # v2/v3 calldata inserts weight_binding_mode after weight_commitments array.
         idx = 0
@@ -771,8 +799,8 @@ if entrypoint in ('verify_model_gkr', 'verify_model_gkr_v2', 'verify_model_gkr_v
             assert wb_mode in (0, 1), \
                 f'{entrypoint} requires weight_binding_mode in (0,1) (got {wb_mode})'
         if entrypoint == 'verify_model_gkr_v4':
-            assert wb_mode == 3, \
-                f'{entrypoint} requires weight_binding_mode=3 (got {wb_mode})'
+            assert wb_mode in (3, 4), \
+                f'{entrypoint} requires weight_binding_mode in (3, 4) (got {wb_mode})'
         expected_mode = None
         if mode_s == 'Sequential':
             expected_mode = 0
@@ -782,11 +810,13 @@ if entrypoint in ('verify_model_gkr', 'verify_model_gkr_v2', 'verify_model_gkr_v
             expected_mode = 2
         elif mode_s == 'AggregatedOpeningsV4Experimental':
             expected_mode = 3
+        elif mode_s == 'AggregatedOracleSumcheck':
+            expected_mode = 4
         if expected_mode is not None:
             assert wb_mode == expected_mode, \
                 f'{entrypoint} expected weight_binding_mode={expected_mode} for weight_opening_mode={mode_s} (got {wb_mode})'
         else:
-            allowed_modes = (0, 1, 2) if entrypoint == 'verify_model_gkr_v3' else (3,) if entrypoint == 'verify_model_gkr_v4' else (0, 1)
+            allowed_modes = (0, 1, 2) if entrypoint == 'verify_model_gkr_v3' else (3, 4) if entrypoint == 'verify_model_gkr_v4' else (0, 1)
             assert wb_mode in allowed_modes, \
                 f'{entrypoint} requires weight_binding_mode in {allowed_modes} (got {wb_mode})'
         artifact_mode_id = proof.get('weight_binding_mode_id')
@@ -808,6 +838,9 @@ if entrypoint in ('verify_model_gkr', 'verify_model_gkr_v2', 'verify_model_gkr_v
             elif wb_mode == 3:
                 assert binding_data_len > 0, \
                     f'{entrypoint} mode 3 requires non-empty weight_binding_data'
+            elif wb_mode == 4:
+                assert binding_data_len > 0, \
+                    f'{entrypoint} mode 4 (aggregated oracle sumcheck) requires non-empty weight_binding_data'
             artifact_binding_data = proof.get('weight_binding_data_calldata')
             if isinstance(artifact_binding_data, list):
                 assert len(artifact_binding_data) == binding_data_len, \
@@ -857,6 +890,8 @@ cat > "${OUTPUT_DIR}/metadata.json" << METAEOF
     "gkr_v4": ${GKR_V4},
     "gkr_v4_mode3": ${GKR_V4_MODE3},
     "legacy_gkr_v1": ${LEGACY_GKR_V1},
+    "submit": ${SUBMIT},
+    "weight_binding": "${STWO_WEIGHT_BINDING:-legacy}",
     "security": "${SECURITY}",
     "phase1_seconds": ${PHASE1_SEC},
     "phase2_seconds": ${PHASE2_SEC},

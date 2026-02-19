@@ -22,7 +22,7 @@ use stwo::core::proof::StarkProof;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
 use stwo::core::verifier::verify as stwo_verify;
 use stwo::prover::backend::simd::SimdBackend;
-use stwo::prover::backend::{Col, Column};
+use stwo::prover::backend::{BackendForChannel, Col, Column, ColumnOps};
 use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
 use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::CommitmentSchemeProver;
@@ -34,7 +34,6 @@ use stwo_constraint_framework::{
 };
 use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 
-use crate::backend::convert_evaluations;
 use crate::circuits::deposit::{DepositPublicInputs, DepositWitness, execute_deposit};
 use crate::circuits::withdraw::{WithdrawPublicInputs, WithdrawWitness, execute_withdraw, MERKLE_DEPTH};
 use crate::circuits::spend::{
@@ -184,22 +183,6 @@ fn mix_public_inputs_into_channel(
         .map(|&m| SecureField::from(m))
         .collect();
     channel.mix_felts(&felts);
-}
-
-// ──────────────────────── ComponentProverErased ──────────────────────
-
-trait ComponentProverErased {
-    fn as_component_prover(&self) -> &dyn ComponentProver<SimdBackend>;
-}
-
-impl<E> ComponentProverErased for FrameworkComponent<E>
-where
-    E: FrameworkEval,
-    FrameworkComponent<E>: ComponentProver<SimdBackend>,
-{
-    fn as_component_prover(&self) -> &dyn ComponentProver<SimdBackend> {
-        self
-    }
 }
 
 // ──────────────────────── Batched Deposit Eval ──────────────────────
@@ -435,28 +418,32 @@ impl FrameworkEval for BatchedSpendEval {
 // ──────────────────────── Trace builders ─────────────────────────────
 
 /// Build deposit batch traces (preprocessed + execution) for N deposits.
-fn build_deposit_batch_traces(
+fn build_deposit_batch_traces<B>(
     witnesses: &[DepositWitness],
     public_inputs: &[DepositPublicInputs],
     log_size: u32,
 ) -> Result<
     (
-        Vec<CircleEvaluation<SimdBackend, M31, BitReversedOrder>>,
-        Vec<CircleEvaluation<SimdBackend, M31, BitReversedOrder>>,
+        Vec<CircleEvaluation<B, M31, BitReversedOrder>>,
+        Vec<CircleEvaluation<B, M31, BitReversedOrder>>,
     ),
     BatchError,
-> {
+>
+where
+    B: ColumnOps<M31>,
+    Col<B, M31>: Column<M31>,
+{
     let table_size = 1usize << log_size;
     let domain = CanonicCoset::new(log_size).circle_domain();
 
     // Preprocessed columns: is_real, commitment[8], amount_lo, amount_hi, asset_id
-    let mut preproc_cols: Vec<Col<SimdBackend, M31>> = (0..DEP_PREPROC_COLS)
-        .map(|_| Col::<SimdBackend, M31>::zeros(table_size))
+    let mut preproc_cols: Vec<Col<B, M31>> = (0..DEP_PREPROC_COLS)
+        .map(|_| Col::<B, M31>::zeros(table_size))
         .collect();
 
     // Execution columns
-    let mut exec_cols: Vec<Col<SimdBackend, M31>> = (0..DEP_EXEC_COLS)
-        .map(|_| Col::<SimdBackend, M31>::zeros(table_size))
+    let mut exec_cols: Vec<Col<B, M31>> = (0..DEP_EXEC_COLS)
+        .map(|_| Col::<B, M31>::zeros(table_size))
         .collect();
 
     let dummy = dummy_permutation_trace();
@@ -483,7 +470,7 @@ fn build_deposit_batch_traces(
             .map(compute_permutation_trace)
             .collect();
         for (p, trace) in perm_traces.iter().enumerate() {
-            write_permutation_to_trace(trace, &mut exec_cols, p * COLS_PER_PERM, row);
+            write_permutation_to_trace::<B>(trace, &mut exec_cols, p * COLS_PER_PERM, row);
         }
 
         // Sub-limbs
@@ -506,7 +493,7 @@ fn build_deposit_batch_traces(
     // Padding rows: dummy permutation traces (all values zero → constraints satisfied)
     for row in witnesses.len()..table_size {
         for p in 0..DEP_NUM_PERMS {
-            write_permutation_to_trace(&dummy, &mut exec_cols, p * COLS_PER_PERM, row);
+            write_permutation_to_trace::<B>(&dummy, &mut exec_cols, p * COLS_PER_PERM, row);
         }
     }
 
@@ -523,28 +510,32 @@ fn build_deposit_batch_traces(
 }
 
 /// Build withdraw batch traces.
-fn build_withdraw_batch_traces(
+fn build_withdraw_batch_traces<B>(
     witnesses: &[WithdrawWitness],
     public_inputs: &[WithdrawPublicInputs],
     log_size: u32,
 ) -> Result<
     (
-        Vec<CircleEvaluation<SimdBackend, M31, BitReversedOrder>>,
-        Vec<CircleEvaluation<SimdBackend, M31, BitReversedOrder>>,
+        Vec<CircleEvaluation<B, M31, BitReversedOrder>>,
+        Vec<CircleEvaluation<B, M31, BitReversedOrder>>,
     ),
     BatchError,
-> {
+>
+where
+    B: ColumnOps<M31>,
+    Col<B, M31>: Column<M31>,
+{
     use crate::circuits::stark_withdraw::{MERKLE_PERM_START, MERKLE_PERM_END};
 
     let table_size = 1usize << log_size;
     let domain = CanonicCoset::new(log_size).circle_domain();
 
-    let mut preproc_cols: Vec<Col<SimdBackend, M31>> = (0..WDR_PREPROC_COLS)
-        .map(|_| Col::<SimdBackend, M31>::zeros(table_size))
+    let mut preproc_cols: Vec<Col<B, M31>> = (0..WDR_PREPROC_COLS)
+        .map(|_| Col::<B, M31>::zeros(table_size))
         .collect();
 
-    let mut exec_cols: Vec<Col<SimdBackend, M31>> = (0..WDR_EXEC_COLS)
-        .map(|_| Col::<SimdBackend, M31>::zeros(table_size))
+    let mut exec_cols: Vec<Col<B, M31>> = (0..WDR_EXEC_COLS)
+        .map(|_| Col::<B, M31>::zeros(table_size))
         .collect();
 
     let dummy = dummy_permutation_trace();
@@ -575,7 +566,7 @@ fn build_withdraw_batch_traces(
             .map(compute_permutation_trace)
             .collect();
         for (p, trace) in perm_traces.iter().enumerate() {
-            write_permutation_to_trace(trace, &mut exec_cols, p * COLS_PER_PERM, row);
+            write_permutation_to_trace::<B>(trace, &mut exec_cols, p * COLS_PER_PERM, row);
         }
 
         let sub_offset = WDR_NUM_PERMS * COLS_PER_PERM;
@@ -597,14 +588,14 @@ fn build_withdraw_batch_traces(
         for p in 0..WDR_NUM_PERMS {
             if p >= MERKLE_PERM_START && p < MERKLE_PERM_END {
                 let merkle_idx = p - MERKLE_PERM_START;
-                write_permutation_to_trace(
+                write_permutation_to_trace::<B>(
                     &merkle_padding[merkle_idx],
                     &mut exec_cols,
                     p * COLS_PER_PERM,
                     row,
                 );
             } else {
-                write_permutation_to_trace(&dummy, &mut exec_cols, p * COLS_PER_PERM, row);
+                write_permutation_to_trace::<B>(&dummy, &mut exec_cols, p * COLS_PER_PERM, row);
             }
         }
     }
@@ -622,26 +613,30 @@ fn build_withdraw_batch_traces(
 }
 
 /// Build spend batch traces.
-fn build_spend_batch_traces(
+fn build_spend_batch_traces<B>(
     witnesses: &[SpendWitness],
     public_inputs: &[SpendPublicInputs],
     log_size: u32,
 ) -> Result<
     (
-        Vec<CircleEvaluation<SimdBackend, M31, BitReversedOrder>>,
-        Vec<CircleEvaluation<SimdBackend, M31, BitReversedOrder>>,
+        Vec<CircleEvaluation<B, M31, BitReversedOrder>>,
+        Vec<CircleEvaluation<B, M31, BitReversedOrder>>,
     ),
     BatchError,
-> {
+>
+where
+    B: ColumnOps<M31>,
+    Col<B, M31>: Column<M31>,
+{
     let table_size = 1usize << log_size;
     let domain = CanonicCoset::new(log_size).circle_domain();
 
-    let mut preproc_cols: Vec<Col<SimdBackend, M31>> = (0..SPD_PREPROC_COLS)
-        .map(|_| Col::<SimdBackend, M31>::zeros(table_size))
+    let mut preproc_cols: Vec<Col<B, M31>> = (0..SPD_PREPROC_COLS)
+        .map(|_| Col::<B, M31>::zeros(table_size))
         .collect();
 
-    let mut exec_cols: Vec<Col<SimdBackend, M31>> = (0..SPD_EXEC_COLS)
-        .map(|_| Col::<SimdBackend, M31>::zeros(table_size))
+    let mut exec_cols: Vec<Col<B, M31>> = (0..SPD_EXEC_COLS)
+        .map(|_| Col::<B, M31>::zeros(table_size))
         .collect();
 
     let dummy = dummy_permutation_trace();
@@ -678,7 +673,7 @@ fn build_spend_batch_traces(
             .map(compute_permutation_trace)
             .collect();
         for (p, trace) in perm_traces.iter().enumerate() {
-            write_permutation_to_trace(trace, &mut exec_cols, p * COLS_PER_PERM, row);
+            write_permutation_to_trace::<B>(trace, &mut exec_cols, p * COLS_PER_PERM, row);
         }
 
         let sub_offset = SPD_NUM_PERMS * COLS_PER_PERM;
@@ -729,7 +724,7 @@ fn build_spend_batch_traces(
                 let mrk_end = crate::circuits::stark_spend::input_merkle_end(inp_idx);
                 if p_idx >= mrk_start && p_idx < mrk_end {
                     let merkle_idx = p_idx - mrk_start;
-                    write_permutation_to_trace(
+                    write_permutation_to_trace::<B>(
                         &merkle_padding[merkle_idx],
                         &mut exec_cols,
                         p_idx * COLS_PER_PERM,
@@ -740,7 +735,7 @@ fn build_spend_batch_traces(
                 }
             }
             if !is_merkle {
-                write_permutation_to_trace(&dummy, &mut exec_cols, p_idx * COLS_PER_PERM, row);
+                write_permutation_to_trace::<B>(&dummy, &mut exec_cols, p_idx * COLS_PER_PERM, row);
             }
         }
     }
@@ -763,6 +758,27 @@ fn build_spend_batch_traces(
 pub fn prove_privacy_batch(
     batch: &PrivacyBatch,
 ) -> Result<PrivacyBatchProof, BatchError> {
+    #[cfg(feature = "cuda-runtime")]
+    {
+        if crate::backend::force_gpu() || crate::backend::gpu_is_available() {
+            use stwo::prover::backend::gpu::GpuBackend;
+            return prove_privacy_batch_with::<GpuBackend>(batch);
+        }
+    }
+    prove_privacy_batch_with::<SimdBackend>(batch)
+}
+
+fn prove_privacy_batch_with<B>(
+    batch: &PrivacyBatch,
+) -> Result<PrivacyBatchProof, BatchError>
+where
+    B: BackendForChannel<Blake2sMerkleChannel> + PolyOps + ColumnOps<M31>,
+    Col<B, M31>: Column<M31>,
+    <B as ColumnOps<M31>>::Column: 'static,
+    FrameworkComponent<BatchedDepositEval>: ComponentProver<B>,
+    FrameworkComponent<BatchedWithdrawEval>: ComponentProver<B>,
+    FrameworkComponent<BatchedSpendEval>: ComponentProver<B>,
+{
     if batch.deposits.is_empty() && batch.withdrawals.is_empty() && batch.spends.is_empty() {
         return Err(BatchError::EmptyBatch);
     }
@@ -819,7 +835,7 @@ pub fn prove_privacy_batch(
 
     // PCS setup
     let pcs_config = PcsConfig::default();
-    let twiddles = SimdBackend::precompute_twiddles(
+    let twiddles = B::precompute_twiddles(
         CanonicCoset::new(max_log + 1 + pcs_config.fri_config.log_blowup_factor)
             .circle_domain()
             .half_coset,
@@ -830,73 +846,71 @@ pub fn prove_privacy_batch(
     mix_public_inputs_into_channel(channel, &public_inputs);
 
     let mut commitment_scheme =
-        CommitmentSchemeProver::<SimdBackend, Blake2sMerkleChannel>::new(pcs_config, &twiddles);
+        CommitmentSchemeProver::<B, Blake2sMerkleChannel>::new(pcs_config, &twiddles);
 
     // Build traces for each non-empty type
-    let mut all_preprocessed: Vec<CircleEvaluation<SimdBackend, M31, BitReversedOrder>> =
+    let mut all_preprocessed: Vec<CircleEvaluation<B, M31, BitReversedOrder>> =
         Vec::new();
-    let mut all_execution: Vec<CircleEvaluation<SimdBackend, M31, BitReversedOrder>> =
+    let mut all_execution: Vec<CircleEvaluation<B, M31, BitReversedOrder>> =
         Vec::new();
 
     if let Some(log) = dep_log {
         let (prep, exec) =
-            build_deposit_batch_traces(&batch.deposits, &dep_pub, log)?;
+            build_deposit_batch_traces::<B>(&batch.deposits, &dep_pub, log)?;
         all_preprocessed.extend(prep);
         all_execution.extend(exec);
     }
     if let Some(log) = wdr_log {
         let (prep, exec) =
-            build_withdraw_batch_traces(&batch.withdrawals, &wdr_pub, log)?;
+            build_withdraw_batch_traces::<B>(&batch.withdrawals, &wdr_pub, log)?;
         all_preprocessed.extend(prep);
         all_execution.extend(exec);
     }
     if let Some(log) = spd_log {
         let (prep, exec) =
-            build_spend_batch_traces(&batch.spends, &spd_pub, log)?;
+            build_spend_batch_traces::<B>(&batch.spends, &spd_pub, log)?;
         all_preprocessed.extend(prep);
         all_execution.extend(exec);
     }
 
     // Tree 0: Preprocessed
     let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(convert_evaluations::<SimdBackend, SimdBackend, M31>(
-        all_preprocessed,
-    ));
+    tree_builder.extend_evals(all_preprocessed);
     tree_builder.commit(channel);
 
     // Tree 1: Execution
     let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(convert_evaluations::<SimdBackend, SimdBackend, M31>(
-        all_execution,
-    ));
+    tree_builder.extend_evals(all_execution);
     tree_builder.commit(channel);
 
     // Build components with shared allocator (same order as traces)
     let mut allocator = TraceLocationAllocator::default();
-    let mut comp_storage: Vec<Box<dyn ComponentProverErased>> = Vec::new();
+    let mut typed_deps: Vec<FrameworkComponent<BatchedDepositEval>> = Vec::new();
+    let mut typed_wdrs: Vec<FrameworkComponent<BatchedWithdrawEval>> = Vec::new();
+    let mut typed_spds: Vec<FrameworkComponent<BatchedSpendEval>> = Vec::new();
 
     if let Some(log) = dep_log {
         let eval = BatchedDepositEval { log_n_rows: log };
         let comp = FrameworkComponent::new(&mut allocator, eval, SecureField::zero());
-        comp_storage.push(Box::new(comp));
+        typed_deps.push(comp);
     }
     if let Some(log) = wdr_log {
         let eval = BatchedWithdrawEval { log_n_rows: log };
         let comp = FrameworkComponent::new(&mut allocator, eval, SecureField::zero());
-        comp_storage.push(Box::new(comp));
+        typed_wdrs.push(comp);
     }
     if let Some(log) = spd_log {
         let eval = BatchedSpendEval { log_n_rows: log };
         let comp = FrameworkComponent::new(&mut allocator, eval, SecureField::zero());
-        comp_storage.push(Box::new(comp));
+        typed_spds.push(comp);
     }
 
-    let component_refs: Vec<&dyn ComponentProver<SimdBackend>> = comp_storage
-        .iter()
-        .map(|c| c.as_component_prover())
-        .collect();
+    let mut component_refs: Vec<&dyn ComponentProver<B>> = Vec::new();
+    for c in &typed_deps { component_refs.push(c); }
+    for c in &typed_wdrs { component_refs.push(c); }
+    for c in &typed_spds { component_refs.push(c); }
 
-    let stark_proof = prove::<SimdBackend, Blake2sMerkleChannel>(
+    let stark_proof = prove::<B, Blake2sMerkleChannel>(
         &component_refs,
         channel,
         commitment_scheme,

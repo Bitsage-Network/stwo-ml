@@ -3,43 +3,38 @@
 //! Takes a `ComputationGraph`, input data, and weights, then generates
 //! STARK proofs for each layer using the appropriate component.
 
+use stwo::core::channel::MerkleChannel;
 use stwo::core::fields::m31::{BaseField, M31};
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::pcs::PcsConfig;
 use stwo::core::poly::circle::CanonicCoset;
-use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
-use stwo::core::channel::MerkleChannel;
 use stwo::core::proof::StarkProof;
+use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
 use stwo::core::vcs_lifted::MerkleHasherLifted;
-use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::simd::qm31::PackedSecureField;
-use stwo::prover::backend::{Col, Column, BackendForChannel};
+use stwo::prover::backend::simd::SimdBackend;
+use stwo::prover::backend::{BackendForChannel, Col, Column, ColumnOps};
 use stwo::prover::poly::circle::CircleEvaluation;
-use stwo::prover::poly::BitReversedOrder;
-use stwo::prover::CommitmentSchemeProver;
 use stwo::prover::poly::circle::PolyOps;
+use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::prove;
+use stwo::prover::CommitmentSchemeProver;
 
-use stwo_constraint_framework::{
-    FrameworkComponent, TraceLocationAllocator,
-    LogupTraceGenerator,
-};
+use stwo_constraint_framework::{FrameworkComponent, LogupTraceGenerator, TraceLocationAllocator};
 
-use tracing::info;
 use crate::backend::convert_evaluations;
+use tracing::info;
 
 use std::collections::HashMap;
 
 use crate::compiler::graph::{ComputationGraph, GraphOp, GraphWeights};
-use crate::components::activation::{
-    ActivationEval, ActivationRelation,
-    compute_multiplicities,
-};
+use crate::components::activation::{compute_multiplicities, ActivationEval, ActivationRelation};
 use crate::components::elementwise::{ElementwiseAddEval, ElementwiseMulEval};
-use crate::components::layernorm::{LayerNormConfig, LayerNormEval, LayerNormRelation, build_rsqrt_table};
+use crate::components::layernorm::{
+    build_rsqrt_table, LayerNormConfig, LayerNormEval, LayerNormRelation,
+};
 use crate::components::matmul::{
-    M31Matrix, matmul_m31,
-    MatMulSumcheckProof, prove_matmul_sumcheck_auto,
+    matmul_m31, prove_matmul_sumcheck_auto, M31Matrix, MatMulSumcheckProof,
 };
 use crate::gadgets::lookup_table::PrecomputedTable;
 
@@ -136,9 +131,16 @@ pub fn prove_activation_layer<B, MC>(
     outputs: &[M31],
     table: &PrecomputedTable,
     config: PcsConfig,
-) -> Result<(FrameworkComponent<ActivationEval>, StarkProof<<MC as MerkleChannel>::H>), ModelError>
+) -> Result<
+    (
+        FrameworkComponent<ActivationEval>,
+        StarkProof<<MC as MerkleChannel>::H>,
+    ),
+    ModelError,
+>
 where
-    B: BackendForChannel<MC> + PolyOps,
+    B: BackendForChannel<MC> + PolyOps + ColumnOps<BaseField>,
+    <B as ColumnOps<BaseField>>::Column: 'static,
     MC: MerkleChannel,
     FrameworkComponent<ActivationEval>: stwo::prover::ComponentProver<B>,
 {
@@ -158,12 +160,16 @@ where
 
     // Tree 0: Preprocessed columns
     let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(cols.preprocessed));
+    tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(
+        cols.preprocessed,
+    ));
     tree_builder.commit(channel);
 
     // Tree 1: Execution trace
     let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(cols.execution));
+    tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(
+        cols.execution,
+    ));
     tree_builder.commit(channel);
 
     // --- Phase C: Draw lookup elements from REAL MC::C channel ---
@@ -186,7 +192,9 @@ where
 
     // Tree 2: LogUp interaction trace
     let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(interaction_simd));
+    tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(
+        interaction_simd,
+    ));
     tree_builder.commit(channel);
 
     // --- Phase E: Build component and prove ---
@@ -202,13 +210,11 @@ where
         claimed_sum,
     );
 
-    let proof = prove::<B, MC>(
-        &[&component],
-        channel,
-        commitment_scheme,
-    ).map_err(|e| ModelError::ProvingError {
-        layer: 0,
-        message: format!("{e:?}"),
+    let proof = prove::<B, MC>(&[&component], channel, commitment_scheme).map_err(|e| {
+        ModelError::ProvingError {
+            layer: 0,
+            message: format!("{e:?}"),
+        }
     })?;
 
     Ok((component, proof))
@@ -259,7 +265,13 @@ fn build_activation_columns_simd(
     // Build packed columns for the preprocessed table
     let mut table_input_col = Col::<SimdBackend, BaseField>::zeros(size);
     let mut table_output_col = Col::<SimdBackend, BaseField>::zeros(size);
-    for (i, (&inp, &out)) in table.inputs.iter().zip(table.outputs.iter()).enumerate().take(size) {
+    for (i, (&inp, &out)) in table
+        .inputs
+        .iter()
+        .zip(table.outputs.iter())
+        .enumerate()
+        .take(size)
+    {
         table_input_col.set(i, inp);
         table_output_col.set(i, out);
     }
@@ -299,8 +311,11 @@ fn compute_activation_logup_simd(
     multiplicities: &[M31],
     log_size: u32,
     lookup_elements: &ActivationRelation,
-) -> (Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>, SecureField) {
-    use stwo::prover::backend::simd::m31::{LOG_N_LANES, PackedBaseField};
+) -> (
+    Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
+    SecureField,
+) {
+    use stwo::prover::backend::simd::m31::{PackedBaseField, LOG_N_LANES};
 
     let size = 1usize << log_size;
     let vec_size = size >> LOG_N_LANES;
@@ -312,16 +327,18 @@ fn compute_activation_logup_simd(
     let tag_packed = PackedBaseField::broadcast(M31::from(0u32));
 
     for vec_row in 0..vec_size {
-        let q_table: PackedSecureField = lookup_elements.lookup_elements().combine(
-            &[tag_packed, table_input_col.data[vec_row], table_output_col.data[vec_row]],
-        );
-        let q_trace: PackedSecureField = lookup_elements.lookup_elements().combine(
-            &[tag_packed, trace_input_col.data[vec_row], trace_output_col.data[vec_row]],
-        );
+        let q_table: PackedSecureField = lookup_elements.lookup_elements().combine(&[
+            tag_packed,
+            table_input_col.data[vec_row],
+            table_output_col.data[vec_row],
+        ]);
+        let q_trace: PackedSecureField = lookup_elements.lookup_elements().combine(&[
+            tag_packed,
+            trace_input_col.data[vec_row],
+            trace_output_col.data[vec_row],
+        ]);
 
-        let mult_packed: PackedSecureField = mult_col_data_at(
-            multiplicities, vec_row, log_size,
-        );
+        let mult_packed: PackedSecureField = mult_col_data_at(multiplicities, vec_row, log_size);
 
         let numerator = q_table - mult_packed * q_trace;
         let denominator = q_table * q_trace;
@@ -334,11 +351,7 @@ fn compute_activation_logup_simd(
 }
 
 /// Helper: get packed multiplicity values at a given vec_row.
-fn mult_col_data_at(
-    multiplicities: &[M31],
-    vec_row: usize,
-    _log_size: u32,
-) -> PackedSecureField {
+fn mult_col_data_at(multiplicities: &[M31], vec_row: usize, _log_size: u32) -> PackedSecureField {
     use stwo::prover::backend::simd::m31::PackedBaseField;
 
     let n_lanes = 16usize; // N_LANES = 2^LOG_N_LANES = 2^4 = 16
@@ -364,9 +377,16 @@ pub fn prove_elementwise_add_layer<B, MC>(
     rhs: &[M31],
     output: &[M31],
     config: PcsConfig,
-) -> Result<(FrameworkComponent<ElementwiseAddEval>, StarkProof<<MC as MerkleChannel>::H>), ModelError>
+) -> Result<
+    (
+        FrameworkComponent<ElementwiseAddEval>,
+        StarkProof<<MC as MerkleChannel>::H>,
+    ),
+    ModelError,
+>
 where
-    B: BackendForChannel<MC> + PolyOps,
+    B: BackendForChannel<MC> + PolyOps + ColumnOps<BaseField>,
+    <B as ColumnOps<BaseField>>::Column: 'static,
     MC: MerkleChannel,
     FrameworkComponent<ElementwiseAddEval>: stwo::prover::ComponentProver<B>,
 {
@@ -417,17 +437,17 @@ where
     // Build component — no LogUp, claimed_sum = 0
     let component = FrameworkComponent::new(
         &mut TraceLocationAllocator::default(),
-        ElementwiseAddEval { log_n_rows: log_size },
+        ElementwiseAddEval {
+            log_n_rows: log_size,
+        },
         SecureField::from(M31::from(0)),
     );
 
-    let proof = prove::<B, MC>(
-        &[&component],
-        channel,
-        commitment_scheme,
-    ).map_err(|e| ModelError::ProvingError {
-        layer: 0,
-        message: format!("ElementwiseAdd STARK: {e:?}"),
+    let proof = prove::<B, MC>(&[&component], channel, commitment_scheme).map_err(|e| {
+        ModelError::ProvingError {
+            layer: 0,
+            message: format!("ElementwiseAdd STARK: {e:?}"),
+        }
     })?;
 
     Ok((component, proof))
@@ -441,9 +461,16 @@ pub fn prove_elementwise_mul_layer<B, MC>(
     rhs: &[M31],
     output: &[M31],
     config: PcsConfig,
-) -> Result<(FrameworkComponent<ElementwiseMulEval>, StarkProof<<MC as MerkleChannel>::H>), ModelError>
+) -> Result<
+    (
+        FrameworkComponent<ElementwiseMulEval>,
+        StarkProof<<MC as MerkleChannel>::H>,
+    ),
+    ModelError,
+>
 where
-    B: BackendForChannel<MC> + PolyOps,
+    B: BackendForChannel<MC> + PolyOps + ColumnOps<BaseField>,
+    <B as ColumnOps<BaseField>>::Column: 'static,
     MC: MerkleChannel,
     FrameworkComponent<ElementwiseMulEval>: stwo::prover::ComponentProver<B>,
 {
@@ -489,17 +516,17 @@ where
 
     let component = FrameworkComponent::new(
         &mut TraceLocationAllocator::default(),
-        ElementwiseMulEval { log_n_rows: log_size },
+        ElementwiseMulEval {
+            log_n_rows: log_size,
+        },
         SecureField::from(M31::from(0)),
     );
 
-    let proof = prove::<B, MC>(
-        &[&component],
-        channel,
-        commitment_scheme,
-    ).map_err(|e| ModelError::ProvingError {
-        layer: 0,
-        message: format!("ElementwiseMul STARK: {e:?}"),
+    let proof = prove::<B, MC>(&[&component], channel, commitment_scheme).map_err(|e| {
+        ModelError::ProvingError {
+            layer: 0,
+            message: format!("ElementwiseMul STARK: {e:?}"),
+        }
     })?;
 
     Ok((component, proof))
@@ -522,9 +549,16 @@ pub fn prove_layernorm_layer<B, MC>(
     outputs: &[M31],
     rsqrt_table: &PrecomputedTable,
     config: PcsConfig,
-) -> Result<(FrameworkComponent<LayerNormEval>, StarkProof<<MC as MerkleChannel>::H>), ModelError>
+) -> Result<
+    (
+        FrameworkComponent<LayerNormEval>,
+        StarkProof<<MC as MerkleChannel>::H>,
+    ),
+    ModelError,
+>
 where
-    B: BackendForChannel<MC> + PolyOps,
+    B: BackendForChannel<MC> + PolyOps + ColumnOps<BaseField>,
+    <B as ColumnOps<BaseField>>::Column: 'static,
     MC: MerkleChannel,
     FrameworkComponent<LayerNormEval>: stwo::prover::ComponentProver<B>,
 {
@@ -542,7 +576,13 @@ where
     // Build preprocessed columns (rsqrt table)
     let mut table_var_col = Col::<SimdBackend, BaseField>::zeros(size);
     let mut table_rsqrt_col = Col::<SimdBackend, BaseField>::zeros(size);
-    for (i, (&inp, &out)) in rsqrt_table.inputs.iter().zip(rsqrt_table.outputs.iter()).enumerate().take(size) {
+    for (i, (&inp, &out)) in rsqrt_table
+        .inputs
+        .iter()
+        .zip(rsqrt_table.outputs.iter())
+        .enumerate()
+        .take(size)
+    {
         table_var_col.set(i, inp);
         table_rsqrt_col.set(i, out);
     }
@@ -600,7 +640,9 @@ where
 
     // Tree 0: Preprocessed rsqrt table
     let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(preprocessed));
+    tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(
+        preprocessed,
+    ));
     tree_builder.commit(channel);
 
     // Tree 1: Execution trace
@@ -619,12 +661,12 @@ where
     let mut col_gen = logup_gen.new_col();
 
     for vec_row in 0..vec_size {
-        let q_table: PackedSecureField = lookup_elements.lookup_elements().combine(
-            &[table_var_col.data[vec_row], table_rsqrt_col.data[vec_row]],
-        );
-        let q_trace: PackedSecureField = lookup_elements.lookup_elements().combine(
-            &[var_col.data[vec_row], rsqrt_col.data[vec_row]],
-        );
+        let q_table: PackedSecureField = lookup_elements
+            .lookup_elements()
+            .combine(&[table_var_col.data[vec_row], table_rsqrt_col.data[vec_row]]);
+        let q_trace: PackedSecureField = lookup_elements
+            .lookup_elements()
+            .combine(&[var_col.data[vec_row], rsqrt_col.data[vec_row]]);
 
         let mult_packed = mult_col_data_at(&multiplicities, vec_row, log_size);
 
@@ -639,7 +681,9 @@ where
 
     // Tree 2: LogUp interaction trace
     let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(interaction_trace));
+    tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(
+        interaction_trace,
+    ));
     tree_builder.commit(channel);
 
     // Build component and prove
@@ -654,13 +698,11 @@ where
         claimed_sum,
     );
 
-    let proof = prove::<B, MC>(
-        &[&component],
-        channel,
-        commitment_scheme,
-    ).map_err(|e| ModelError::ProvingError {
-        layer: 0,
-        message: format!("LayerNorm STARK: {e:?}"),
+    let proof = prove::<B, MC>(&[&component], channel, commitment_scheme).map_err(|e| {
+        ModelError::ProvingError {
+            layer: 0,
+            message: format!("LayerNorm STARK: {e:?}"),
+        }
     })?;
 
     Ok((component, proof))
@@ -676,9 +718,16 @@ pub fn prove_rmsnorm_layer<B, MC>(
     outputs: &[M31],
     rsqrt_table: &PrecomputedTable,
     config: PcsConfig,
-) -> Result<(FrameworkComponent<crate::components::rmsnorm::RMSNormEval>, StarkProof<<MC as MerkleChannel>::H>), ModelError>
+) -> Result<
+    (
+        FrameworkComponent<crate::components::rmsnorm::RMSNormEval>,
+        StarkProof<<MC as MerkleChannel>::H>,
+    ),
+    ModelError,
+>
 where
-    B: BackendForChannel<MC> + PolyOps,
+    B: BackendForChannel<MC> + PolyOps + ColumnOps<BaseField>,
+    <B as ColumnOps<BaseField>>::Column: 'static,
     MC: MerkleChannel,
     FrameworkComponent<crate::components::rmsnorm::RMSNormEval>: stwo::prover::ComponentProver<B>,
 {
@@ -696,7 +745,13 @@ where
     // Preprocessed columns (rsqrt table)
     let mut table_rms_col = Col::<SimdBackend, BaseField>::zeros(size);
     let mut table_rsqrt_col = Col::<SimdBackend, BaseField>::zeros(size);
-    for (i, (&inp, &out)) in rsqrt_table.inputs.iter().zip(rsqrt_table.outputs.iter()).enumerate().take(size) {
+    for (i, (&inp, &out)) in rsqrt_table
+        .inputs
+        .iter()
+        .zip(rsqrt_table.outputs.iter())
+        .enumerate()
+        .take(size)
+    {
         table_rms_col.set(i, inp);
         table_rsqrt_col.set(i, out);
     }
@@ -748,7 +803,9 @@ where
     let mut commitment_scheme = CommitmentSchemeProver::<B, MC>::new(config, &twiddles);
 
     let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(preprocessed));
+    tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(
+        preprocessed,
+    ));
     tree_builder.commit(channel);
 
     let mut tree_builder = commitment_scheme.tree_builder();
@@ -765,12 +822,12 @@ where
     let mut col_gen = logup_gen.new_col();
 
     for vec_row in 0..vec_size {
-        let q_table: PackedSecureField = lookup_elements.lookup_elements().combine(
-            &[table_rms_col.data[vec_row], table_rsqrt_col.data[vec_row]],
-        );
-        let q_trace: PackedSecureField = lookup_elements.lookup_elements().combine(
-            &[rms_col.data[vec_row], rsqrt_col.data[vec_row]],
-        );
+        let q_table: PackedSecureField = lookup_elements
+            .lookup_elements()
+            .combine(&[table_rms_col.data[vec_row], table_rsqrt_col.data[vec_row]]);
+        let q_trace: PackedSecureField = lookup_elements
+            .lookup_elements()
+            .combine(&[rms_col.data[vec_row], rsqrt_col.data[vec_row]]);
 
         let mult_packed = mult_col_data_at(&multiplicities, vec_row, log_size);
 
@@ -784,7 +841,9 @@ where
     let (interaction_trace, claimed_sum) = logup_gen.finalize_last();
 
     let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(interaction_trace));
+    tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(
+        interaction_trace,
+    ));
     tree_builder.commit(channel);
 
     let component = FrameworkComponent::new(
@@ -798,13 +857,11 @@ where
         claimed_sum,
     );
 
-    let proof = prove::<B, MC>(
-        &[&component],
-        channel,
-        commitment_scheme,
-    ).map_err(|e| ModelError::ProvingError {
-        layer: 0,
-        message: format!("RMSNorm STARK: {e:?}"),
+    let proof = prove::<B, MC>(&[&component], channel, commitment_scheme).map_err(|e| {
+        ModelError::ProvingError {
+            layer: 0,
+            message: format!("RMSNorm STARK: {e:?}"),
+        }
     })?;
 
     Ok((component, proof))
@@ -820,12 +877,15 @@ pub fn elementwise_add(lhs: &M31Matrix, rhs: &M31Matrix) -> M31Matrix {
     let len = lhs.data.len().min(rhs.data.len());
 
     let mut data = if len >= 4096 {
-        lhs.data[..len].par_iter()
+        lhs.data[..len]
+            .par_iter()
             .zip(rhs.data[..len].par_iter())
             .map(|(&a, &b)| a + b)
             .collect::<Vec<_>>()
     } else {
-        (0..len).map(|i| lhs.data[i] + rhs.data[i]).collect::<Vec<_>>()
+        (0..len)
+            .map(|i| lhs.data[i] + rhs.data[i])
+            .collect::<Vec<_>>()
     };
 
     // Pad to full output size + copy remaining from lhs
@@ -847,12 +907,15 @@ pub fn elementwise_mul(lhs: &M31Matrix, rhs: &M31Matrix) -> M31Matrix {
     let len = lhs.data.len().min(rhs.data.len());
 
     let mut data = if len >= 4096 {
-        lhs.data[..len].par_iter()
+        lhs.data[..len]
+            .par_iter()
             .zip(rhs.data[..len].par_iter())
             .map(|(&a, &b)| a * b)
             .collect::<Vec<_>>()
     } else {
-        (0..len).map(|i| lhs.data[i] * rhs.data[i]).collect::<Vec<_>>()
+        (0..len)
+            .map(|i| lhs.data[i] * rhs.data[i])
+            .collect::<Vec<_>>()
     };
 
     data.resize(rows * cols, M31::from(0));
@@ -880,7 +943,11 @@ fn apply_activation(input: &M31Matrix, f: &(dyn Fn(M31) -> M31 + Sync)) -> M31Ma
         input.data.iter().map(|&v| f(v)).collect()
     };
 
-    M31Matrix { rows: input.rows, cols: input.cols, data }
+    M31Matrix {
+        rows: input.rows,
+        cols: input.cols,
+        data,
+    }
 }
 
 /// LayerNorm intermediates for proving.
@@ -963,7 +1030,14 @@ pub(crate) fn apply_layernorm_detailed(input: &M31Matrix, dim: usize) -> LayerNo
             row_outputs.push(x);
         }
 
-        (row_out, row_inputs, row_means, row_vars, row_rsqrt, row_outputs)
+        (
+            row_out,
+            row_inputs,
+            row_means,
+            row_vars,
+            row_rsqrt,
+            row_outputs,
+        )
     };
 
     let row_results: Vec<_> = if input.rows >= 64 {
@@ -995,7 +1069,11 @@ pub(crate) fn apply_layernorm_detailed(input: &M31Matrix, dim: usize) -> LayerNo
         variances: all_variances,
         rsqrt_vals: all_rsqrt,
         outputs: all_outputs,
-        output_matrix: M31Matrix { rows: input.rows, cols, data: out_data },
+        output_matrix: M31Matrix {
+            rows: input.rows,
+            cols,
+            data: out_data,
+        },
     }
 }
 
@@ -1022,8 +1100,8 @@ pub(crate) struct RMSNormIntermediates {
 /// 2. rsqrt = lookup_table(rms²)
 /// 3. output = input × rsqrt
 pub(crate) fn apply_rmsnorm_detailed(input: &M31Matrix, dim: usize) -> RMSNormIntermediates {
-    use rayon::prelude::*;
     use crate::components::rmsnorm::{build_rsqrt_table, RMSNormConfig};
+    use rayon::prelude::*;
 
     let rsqrt_table = build_rsqrt_table(RMSNormConfig::new(dim).rsqrt_table_log_size);
     let n = dim.min(input.cols);
@@ -1100,7 +1178,11 @@ pub(crate) fn apply_rmsnorm_detailed(input: &M31Matrix, dim: usize) -> RMSNormIn
         rms_sq_vals: all_rms_sq,
         rsqrt_vals: all_rsqrt,
         outputs: all_outputs,
-        output_matrix: M31Matrix { rows: input.rows, cols, data: out_data },
+        output_matrix: M31Matrix {
+            rows: input.rows,
+            cols,
+            data: out_data,
+        },
     }
 }
 
@@ -1135,7 +1217,8 @@ pub fn prove_model_with<B, MC>(
     weights: &GraphWeights,
 ) -> Result<ModelProofResultFor<<MC as MerkleChannel>::H>, ModelError>
 where
-    B: BackendForChannel<MC> + PolyOps,
+    B: BackendForChannel<MC> + PolyOps + ColumnOps<BaseField>,
+    <B as ColumnOps<BaseField>>::Column: 'static,
     MC: MerkleChannel,
     FrameworkComponent<ActivationEval>: stwo::prover::ComponentProver<B>,
     FrameworkComponent<ElementwiseAddEval>: stwo::prover::ComponentProver<B>,
@@ -1175,19 +1258,20 @@ where
                 let (_m, _k, _n) = *dims;
 
                 // Get weight matrix for this layer
-                let weight = weights.get_weight(node.id).ok_or(
-                    ModelError::MissingWeight(node.id)
-                )?;
+                let weight = weights
+                    .get_weight(node.id)
+                    .ok_or(ModelError::MissingWeight(node.id))?;
 
                 // Forward pass: C = current × weight
                 let output = matmul_m31(&current, weight);
 
                 // Generate sumcheck proof
-                let proof = prove_matmul_sumcheck_auto(&current, weight, &output)
-                    .map_err(|e| ModelError::ProvingError {
+                let proof = prove_matmul_sumcheck_auto(&current, weight, &output).map_err(|e| {
+                    ModelError::ProvingError {
                         layer: node.id,
                         message: format!("MatMul sumcheck: {e}"),
-                    })?;
+                    }
+                })?;
 
                 let claimed_sum = proof.claimed_sum;
                 intermediates.push((node.id, current.clone()));
@@ -1201,16 +1285,16 @@ where
                 });
             }
 
-            GraphOp::Activation { activation_type, size: _ } => {
+            GraphOp::Activation {
+                activation_type,
+                size: _,
+            } => {
                 let f = activation_type.as_fn();
                 let output = apply_activation(&current, &*f);
 
                 // Build lookup table — use production size
                 let log_size = activation_type.recommended_table_log_size();
-                let table = PrecomputedTable::build(
-                    |x| (*f)(x),
-                    log_size,
-                );
+                let table = PrecomputedTable::build(|x| (*f)(x), log_size);
                 let config = PcsConfig::default();
 
                 // Flatten current matrix to input/output slices
@@ -1218,15 +1302,12 @@ where
                 let flat_outputs: Vec<M31> = output.data.clone();
 
                 // Generate real STARK proof via LogUp
-                let (_component, proof) = prove_activation_layer::<B, MC>(
-                    &flat_inputs,
-                    &flat_outputs,
-                    &table,
-                    config,
-                ).map_err(|e| ModelError::ProvingError {
-                    layer: node.id,
-                    message: format!("Activation STARK: {e}"),
-                })?;
+                let (_component, proof) =
+                    prove_activation_layer::<B, MC>(&flat_inputs, &flat_outputs, &table, config)
+                        .map_err(|e| ModelError::ProvingError {
+                            layer: node.id,
+                            message: format!("Activation STARK: {e}"),
+                        })?;
 
                 let claimed_sum = SecureField::from(M31::from(0));
                 intermediates.push((node.id, current.clone()));
@@ -1242,7 +1323,8 @@ where
 
             GraphOp::LayerNorm { dim } => {
                 let ln = apply_layernorm_detailed(&current, *dim);
-                let rsqrt_table = build_rsqrt_table(LayerNormConfig::new(*dim).rsqrt_table_log_size);
+                let rsqrt_table =
+                    build_rsqrt_table(LayerNormConfig::new(*dim).rsqrt_table_log_size);
                 let config = PcsConfig::default();
 
                 let (_component, proof) = prove_layernorm_layer::<B, MC>(
@@ -1253,7 +1335,8 @@ where
                     &ln.outputs,
                     &rsqrt_table,
                     config,
-                ).map_err(|e| ModelError::ProvingError {
+                )
+                .map_err(|e| ModelError::ProvingError {
                     layer: node.id,
                     message: format!("LayerNorm STARK: {e}"),
                 })?;
@@ -1283,7 +1366,8 @@ where
                     &rn.outputs,
                     &rsqrt_table,
                     config,
-                ).map_err(|e| ModelError::ProvingError {
+                )
+                .map_err(|e| ModelError::ProvingError {
                     layer: node.id,
                     message: format!("RMSNorm STARK: {e}"),
                 })?;
@@ -1301,11 +1385,15 @@ where
 
             GraphOp::Add { size: _ } => {
                 // Resolve both inputs
-                let lhs = node.inputs.get(0)
+                let lhs = node
+                    .inputs
+                    .get(0)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
-                let rhs = node.inputs.get(1)
+                let rhs = node
+                    .inputs
+                    .get(1)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
@@ -1316,8 +1404,12 @@ where
                 // Generate real STARK proof
                 let config = PcsConfig::default();
                 let (_component, proof) = prove_elementwise_add_layer::<B, MC>(
-                    &lhs.data, &rhs.data, &output.data, config,
-                ).map_err(|e| ModelError::ProvingError {
+                    &lhs.data,
+                    &rhs.data,
+                    &output.data,
+                    config,
+                )
+                .map_err(|e| ModelError::ProvingError {
                     layer: node.id,
                     message: format!("Add STARK: {e}"),
                 })?;
@@ -1335,11 +1427,15 @@ where
 
             GraphOp::Mul { size: _ } => {
                 // Resolve both inputs
-                let lhs = node.inputs.get(0)
+                let lhs = node
+                    .inputs
+                    .get(0)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
-                let rhs = node.inputs.get(1)
+                let rhs = node
+                    .inputs
+                    .get(1)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
@@ -1350,8 +1446,12 @@ where
                 // Generate real STARK proof
                 let config = PcsConfig::default();
                 let (_component, proof) = prove_elementwise_mul_layer::<B, MC>(
-                    &lhs.data, &rhs.data, &output.data, config,
-                ).map_err(|e| ModelError::ProvingError {
+                    &lhs.data,
+                    &rhs.data,
+                    &output.data,
+                    config,
+                )
+                .map_err(|e| ModelError::ProvingError {
                     layer: node.id,
                     message: format!("Mul STARK: {e}"),
                 })?;
@@ -1375,7 +1475,7 @@ where
                 let w_o = weights.get_named_weight(node.id, "w_o");
 
                 if let (Some(wq), Some(wk), Some(wv), Some(wo)) = (w_q, w_k, w_v, w_o) {
-                    use crate::components::attention::{AttentionWeights, prove_attention_with};
+                    use crate::components::attention::{prove_attention_with, AttentionWeights};
 
                     let attn_weights = AttentionWeights {
                         w_q: wq.clone(),
@@ -1384,12 +1484,12 @@ where
                         w_o: wo.clone(),
                     };
 
-                    let attn_proof = prove_attention_with::<B, MC>(
-                        &current, &attn_weights, config, false,
-                    ).map_err(|e| ModelError::ProvingError {
-                        layer: node.id,
-                        message: format!("Attention: {e}"),
-                    })?;
+                    let attn_proof =
+                        prove_attention_with::<B, MC>(&current, &attn_weights, config, false)
+                            .map_err(|e| ModelError::ProvingError {
+                                layer: node.id,
+                                message: format!("Attention: {e}"),
+                            })?;
 
                     let output = attn_proof.intermediates.final_output.clone();
                     intermediates.push((node.id, current.clone()));
@@ -1475,7 +1575,8 @@ pub fn prove_model_streaming_with<B, MC>(
     weights: &GraphWeights,
 ) -> Result<ModelProofResultFor<<MC as MerkleChannel>::H>, ModelError>
 where
-    B: BackendForChannel<MC> + PolyOps,
+    B: BackendForChannel<MC> + PolyOps + ColumnOps<BaseField>,
+    <B as ColumnOps<BaseField>>::Column: 'static,
     MC: MerkleChannel,
     FrameworkComponent<ActivationEval>: stwo::prover::ComponentProver<B>,
     FrameworkComponent<ElementwiseAddEval>: stwo::prover::ComponentProver<B>,
@@ -1516,15 +1617,16 @@ where
 
         match &node.op {
             GraphOp::MatMul { dims: _ } => {
-                let weight = weights.get_weight(node.id).ok_or(
-                    ModelError::MissingWeight(node.id)
-                )?;
+                let weight = weights
+                    .get_weight(node.id)
+                    .ok_or(ModelError::MissingWeight(node.id))?;
                 let output = matmul_m31(&current, weight);
-                let proof = prove_matmul_sumcheck_auto(&current, weight, &output)
-                    .map_err(|e| ModelError::ProvingError {
+                let proof = prove_matmul_sumcheck_auto(&current, weight, &output).map_err(|e| {
+                    ModelError::ProvingError {
                         layer: node.id,
                         message: format!("MatMul sumcheck: {e}"),
-                    })?;
+                    }
+                })?;
                 let claimed_sum = proof.claimed_sum;
                 node_outputs.insert(node.id, output.clone());
                 current = output;
@@ -1534,7 +1636,10 @@ where
                     layer_index: node.id,
                 });
             }
-            GraphOp::Activation { activation_type, size: _ } => {
+            GraphOp::Activation {
+                activation_type,
+                size: _,
+            } => {
                 let f = activation_type.as_fn();
                 let output = apply_activation(&current, &*f);
                 let log_size = activation_type.recommended_table_log_size();
@@ -1542,12 +1647,12 @@ where
                 let config = PcsConfig::default();
                 let flat_inputs: Vec<M31> = current.data.clone();
                 let flat_outputs: Vec<M31> = output.data.clone();
-                let (_component, proof) = prove_activation_layer::<B, MC>(
-                    &flat_inputs, &flat_outputs, &table, config,
-                ).map_err(|e| ModelError::ProvingError {
-                    layer: node.id,
-                    message: format!("Activation STARK: {e}"),
-                })?;
+                let (_component, proof) =
+                    prove_activation_layer::<B, MC>(&flat_inputs, &flat_outputs, &table, config)
+                        .map_err(|e| ModelError::ProvingError {
+                            layer: node.id,
+                            message: format!("Activation STARK: {e}"),
+                        })?;
                 node_outputs.insert(node.id, output.clone());
                 current = output;
                 layer_proofs.push(LayerProof {
@@ -1557,19 +1662,27 @@ where
                 });
             }
             GraphOp::Add { .. } => {
-                let lhs = node.inputs.get(0)
+                let lhs = node
+                    .inputs
+                    .get(0)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
-                let rhs = node.inputs.get(1)
+                let rhs = node
+                    .inputs
+                    .get(1)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
                 let output = elementwise_add(&lhs, &rhs);
                 let config = PcsConfig::default();
                 let (_component, proof) = prove_elementwise_add_layer::<B, MC>(
-                    &lhs.data, &rhs.data, &output.data, config,
-                ).map_err(|e| ModelError::ProvingError {
+                    &lhs.data,
+                    &rhs.data,
+                    &output.data,
+                    config,
+                )
+                .map_err(|e| ModelError::ProvingError {
                     layer: node.id,
                     message: format!("Add STARK: {e}"),
                 })?;
@@ -1582,19 +1695,27 @@ where
                 });
             }
             GraphOp::Mul { .. } => {
-                let lhs = node.inputs.get(0)
+                let lhs = node
+                    .inputs
+                    .get(0)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
-                let rhs = node.inputs.get(1)
+                let rhs = node
+                    .inputs
+                    .get(1)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
                 let output = elementwise_mul(&lhs, &rhs);
                 let config = PcsConfig::default();
                 let (_component, proof) = prove_elementwise_mul_layer::<B, MC>(
-                    &lhs.data, &rhs.data, &output.data, config,
-                ).map_err(|e| ModelError::ProvingError {
+                    &lhs.data,
+                    &rhs.data,
+                    &output.data,
+                    config,
+                )
+                .map_err(|e| ModelError::ProvingError {
                     layer: node.id,
                     message: format!("Mul STARK: {e}"),
                 })?;
@@ -1608,12 +1729,19 @@ where
             }
             GraphOp::LayerNorm { dim } => {
                 let ln = apply_layernorm_detailed(&current, *dim);
-                let rsqrt_table = build_rsqrt_table(LayerNormConfig::new(*dim).rsqrt_table_log_size);
+                let rsqrt_table =
+                    build_rsqrt_table(LayerNormConfig::new(*dim).rsqrt_table_log_size);
                 let config = PcsConfig::default();
                 let (_component, proof) = prove_layernorm_layer::<B, MC>(
-                    &ln.inputs, &ln.means, &ln.variances, &ln.rsqrt_vals,
-                    &ln.outputs, &rsqrt_table, config,
-                ).map_err(|e| ModelError::ProvingError {
+                    &ln.inputs,
+                    &ln.means,
+                    &ln.variances,
+                    &ln.rsqrt_vals,
+                    &ln.outputs,
+                    &rsqrt_table,
+                    config,
+                )
+                .map_err(|e| ModelError::ProvingError {
                     layer: node.id,
                     message: format!("LayerNorm STARK: {e}"),
                 })?;
@@ -1632,9 +1760,14 @@ where
                 );
                 let config = PcsConfig::default();
                 let (_component, proof) = prove_rmsnorm_layer::<B, MC>(
-                    &rn.inputs, &rn.rms_sq_vals, &rn.rsqrt_vals,
-                    &rn.outputs, &rsqrt_table, config,
-                ).map_err(|e| ModelError::ProvingError {
+                    &rn.inputs,
+                    &rn.rms_sq_vals,
+                    &rn.rsqrt_vals,
+                    &rn.outputs,
+                    &rsqrt_table,
+                    config,
+                )
+                .map_err(|e| ModelError::ProvingError {
                     layer: node.id,
                     message: format!("RMSNorm STARK: {e}"),
                 })?;
@@ -1718,26 +1851,29 @@ pub fn verify_model_matmuls<H: MerkleHasherLifted>(
 
         match &node.op {
             GraphOp::MatMul { .. } => {
-                let weight = weights.get_weight(node.id).ok_or(
-                    ModelError::MissingWeight(node.id)
-                )?;
+                let weight = weights
+                    .get_weight(node.id)
+                    .ok_or(ModelError::MissingWeight(node.id))?;
 
                 let c = matmul_m31(&current, weight);
 
                 if let Some(p) = proof {
                     if let LayerProofKind::Sumcheck(matmul_proof) = &p.kind {
-                        verify_matmul_sumcheck(matmul_proof, &current, weight, &c)
-                            .map_err(|e| ModelError::VerificationError {
+                        verify_matmul_sumcheck(matmul_proof, &current, weight, &c).map_err(
+                            |e| ModelError::VerificationError {
                                 layer: node.id,
                                 message: format!("MatMul verification failed: {e}"),
-                            })?;
+                            },
+                        )?;
                     }
                 }
 
                 node_outputs.insert(node.id, c.clone());
                 current = c;
             }
-            GraphOp::Activation { activation_type, .. } => {
+            GraphOp::Activation {
+                activation_type, ..
+            } => {
                 let f = activation_type.as_fn();
                 let output = apply_activation(&current, &*f);
                 node_outputs.insert(node.id, output.clone());
@@ -1754,11 +1890,15 @@ pub fn verify_model_matmuls<H: MerkleHasherLifted>(
                 current = rn.output_matrix;
             }
             GraphOp::Add { .. } => {
-                let lhs = node.inputs.get(0)
+                let lhs = node
+                    .inputs
+                    .get(0)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
-                let rhs = node.inputs.get(1)
+                let rhs = node
+                    .inputs
+                    .get(1)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
@@ -1767,11 +1907,15 @@ pub fn verify_model_matmuls<H: MerkleHasherLifted>(
                 current = output;
             }
             GraphOp::Mul { .. } => {
-                let lhs = node.inputs.get(0)
+                let lhs = node
+                    .inputs
+                    .get(0)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
-                let rhs = node.inputs.get(1)
+                let rhs = node
+                    .inputs
+                    .get(1)
                     .and_then(|id| node_outputs.get(id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
@@ -1869,8 +2013,8 @@ mod tests {
         }
         weights.add_weight(0, w);
 
-        let (proofs, execution) = prove_model(&graph, &input, &weights)
-            .expect("model proving should succeed");
+        let (proofs, execution) =
+            prove_model(&graph, &input, &weights).expect("model proving should succeed");
 
         assert_eq!(proofs.len(), 1);
         assert!(matches!(proofs[0].kind, LayerProofKind::Sumcheck(_)));
@@ -1882,34 +2026,50 @@ mod tests {
     fn test_prove_model_mlp_matmul_activation_matmul() {
         // 2-layer MLP: input(1×4) → linear(4→4) → ReLU → linear(4→2)
         let mut builder = GraphBuilder::new((1, 4));
-        builder
-            .linear(4)
-            .activation(ActivationType::ReLU)
-            .linear(2);
+        builder.linear(4).activation(ActivationType::ReLU).linear(2);
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
 
         // Layer 0: 4×4 weight
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
 
         // Layer 2: 4×2 weight (node 1 is activation, node 2 is second linear)
         let mut w2 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w2.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
 
-        let (proofs, execution) = prove_model(&graph, &input, &weights)
-            .expect("MLP proving should succeed");
+        let (proofs, execution) =
+            prove_model(&graph, &input, &weights).expect("MLP proving should succeed");
 
         assert_eq!(proofs.len(), 3, "3 layers: matmul, activation, matmul");
-        assert!(matches!(proofs[0].kind, LayerProofKind::Sumcheck(_)), "layer 0 = matmul");
-        assert!(matches!(proofs[1].kind, LayerProofKind::Stark(_)), "layer 1 = activation (STARK proof)");
-        assert!(matches!(proofs[2].kind, LayerProofKind::Sumcheck(_)), "layer 2 = matmul");
+        assert!(
+            matches!(proofs[0].kind, LayerProofKind::Sumcheck(_)),
+            "layer 0 = matmul"
+        );
+        assert!(
+            matches!(proofs[1].kind, LayerProofKind::Stark(_)),
+            "layer 1 = activation (STARK proof)"
+        );
+        assert!(
+            matches!(proofs[2].kind, LayerProofKind::Sumcheck(_)),
+            "layer 2 = matmul"
+        );
         assert_eq!(execution.output.rows, 1);
         assert_eq!(execution.output.cols, 2);
     }
@@ -1932,43 +2092,70 @@ mod tests {
 
         // Input: [1, 2, 3, 4]
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         // Weights for each linear layer
         let mut weights = GraphWeights::new();
 
         // Layer 0 (node 0): 4×4 weight
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 {
-            w0.set(i, j, M31::from(((i * 4 + j) % 5 + 1) as u32));
-        }}
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i * 4 + j) % 5 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
 
         // Layer 2 (node 2): 4×4 weight
         let mut w2 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 {
-            w2.set(i, j, M31::from(((i + j * 3) % 7 + 1) as u32));
-        }}
+        for i in 0..4 {
+            for j in 0..4 {
+                w2.set(i, j, M31::from(((i + j * 3) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
 
         // Layer 4 (node 4): 4×2 weight
         let mut w4 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 {
-            w4.set(i, j, M31::from((i * 2 + j + 1) as u32));
-        }}
+        for i in 0..4 {
+            for j in 0..2 {
+                w4.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
         weights.add_weight(4, w4);
 
         // === PROVE ===
-        let (proofs, execution) = prove_model(&graph, &input, &weights)
-            .expect("End-to-end proving should succeed");
+        let (proofs, execution) =
+            prove_model(&graph, &input, &weights).expect("End-to-end proving should succeed");
 
         // Check proof structure: matmul=sumcheck, relu=STARK, matmul, relu, matmul
-        assert_eq!(proofs.len(), 5, "5 layers: matmul, relu, matmul, relu, matmul");
-        assert!(matches!(proofs[0].kind, LayerProofKind::Sumcheck(_)), "layer 0 = matmul sumcheck");
-        assert!(matches!(proofs[1].kind, LayerProofKind::Stark(_)), "layer 1 = ReLU STARK");
-        assert!(matches!(proofs[2].kind, LayerProofKind::Sumcheck(_)), "layer 2 = matmul sumcheck");
-        assert!(matches!(proofs[3].kind, LayerProofKind::Stark(_)), "layer 3 = ReLU STARK");
-        assert!(matches!(proofs[4].kind, LayerProofKind::Sumcheck(_)), "layer 4 = matmul sumcheck");
+        assert_eq!(
+            proofs.len(),
+            5,
+            "5 layers: matmul, relu, matmul, relu, matmul"
+        );
+        assert!(
+            matches!(proofs[0].kind, LayerProofKind::Sumcheck(_)),
+            "layer 0 = matmul sumcheck"
+        );
+        assert!(
+            matches!(proofs[1].kind, LayerProofKind::Stark(_)),
+            "layer 1 = ReLU STARK"
+        );
+        assert!(
+            matches!(proofs[2].kind, LayerProofKind::Sumcheck(_)),
+            "layer 2 = matmul sumcheck"
+        );
+        assert!(
+            matches!(proofs[3].kind, LayerProofKind::Stark(_)),
+            "layer 3 = ReLU STARK"
+        );
+        assert!(
+            matches!(proofs[4].kind, LayerProofKind::Sumcheck(_)),
+            "layer 4 = matmul sumcheck"
+        );
 
         // Check output shape
         assert_eq!(execution.output.rows, 1);
@@ -1987,25 +2174,37 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w.set(i, j, M31::from((i * 2 + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
         weights.add_weight(0, w);
 
         // Prove with correct weights
-        let (proofs, _) = prove_model(&graph, &input, &weights)
-            .expect("proving should succeed");
+        let (proofs, _) = prove_model(&graph, &input, &weights).expect("proving should succeed");
 
         // Tamper with weights and try to verify
         let mut tampered_weights = GraphWeights::new();
         let mut w_bad = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w_bad.set(i, j, M31::from(99)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w_bad.set(i, j, M31::from(99));
+            }
+        }
         tampered_weights.add_weight(0, w_bad);
 
         let result = verify_model_matmuls(&proofs, &graph, &input, &tampered_weights);
-        assert!(result.is_err(), "Verification with tampered weights should fail");
+        assert!(
+            result.is_err(),
+            "Verification with tampered weights should fail"
+        );
     }
 
     #[test]
@@ -2013,20 +2212,24 @@ mod tests {
         use crate::gadgets::lookup_table::PrecomputedTable;
 
         // Build a ReLU table with log_size=4 (16 entries)
-        let table = PrecomputedTable::build(
-            crate::gadgets::lookup_table::activations::relu,
-            4,
-        );
+        let table = PrecomputedTable::build(crate::gadgets::lookup_table::activations::relu, 4);
 
         // 4 inputs, all in-range for the table
         let inputs = vec![M31::from(0), M31::from(1), M31::from(3), M31::from(5)];
-        let outputs: Vec<M31> = inputs.iter().map(|&x| {
-            crate::gadgets::lookup_table::activations::relu(x)
-        }).collect();
+        let outputs: Vec<M31> = inputs
+            .iter()
+            .map(|&x| crate::gadgets::lookup_table::activations::relu(x))
+            .collect();
 
         let config = PcsConfig::default();
-        let result = prove_activation_layer::<SimdBackend, Blake2sMerkleChannel>(&inputs, &outputs, &table, config);
-        assert!(result.is_ok(), "Standalone activation proving failed: {:?}", result.err());
+        let result = prove_activation_layer::<SimdBackend, Blake2sMerkleChannel>(
+            &inputs, &outputs, &table, config,
+        );
+        assert!(
+            result.is_ok(),
+            "Standalone activation proving failed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -2041,40 +2244,59 @@ mod tests {
         // variance reduced to table range (log_size=4 → [0,15])
         let var = M31::from(125u32 & ((1u32 << 4) - 1)); // 125 & 0xF = 13
         let variances = vec![var; 4];
-        let rsqrt = rsqrt_table.lookup(var).expect("variance reduced to table range");
+        let rsqrt = rsqrt_table
+            .lookup(var)
+            .expect("variance reduced to table range");
         let rsqrt_vals = vec![rsqrt; 4];
         let outputs: Vec<M31> = inputs.iter().map(|&x| (x - mean) * rsqrt).collect();
 
         let config = PcsConfig::default();
         let result = prove_layernorm_layer::<SimdBackend, Blake2sMerkleChannel>(
-            &inputs, &means, &variances, &rsqrt_vals, &outputs, &rsqrt_table, config,
+            &inputs,
+            &means,
+            &variances,
+            &rsqrt_vals,
+            &outputs,
+            &rsqrt_table,
+            config,
         );
-        assert!(result.is_ok(), "Standalone LayerNorm proving failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Standalone LayerNorm proving failed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
     fn test_prove_model_auto() {
         // prove_model_auto should produce identical results to prove_model
         let mut builder = GraphBuilder::new((1, 4));
-        builder
-            .linear(4)
-            .activation(ActivationType::ReLU)
-            .linear(2);
+        builder.linear(4).activation(ActivationType::ReLU).linear(2);
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w2.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
 
-        let (proofs, execution) = prove_model_auto(&graph, &input, &weights)
-            .expect("prove_model_auto should succeed");
+        let (proofs, execution) =
+            prove_model_auto(&graph, &input, &weights).expect("prove_model_auto should succeed");
 
         assert_eq!(proofs.len(), 3);
         assert_eq!(execution.output.rows, 1);
@@ -2088,27 +2310,34 @@ mod tests {
         use stwo::prover::backend::gpu::GpuBackend;
 
         let mut builder = GraphBuilder::new((1, 4));
-        builder
-            .linear(4)
-            .activation(ActivationType::ReLU)
-            .linear(2);
+        builder.linear(4).activation(ActivationType::ReLU).linear(2);
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w2.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
 
         // Use GpuBackend explicitly
-        let (proofs, execution) = prove_model_with::<GpuBackend, Blake2sMerkleChannel>(
-            &graph, &input, &weights,
-        ).expect("GPU proving should succeed");
+        let (proofs, execution) =
+            prove_model_with::<GpuBackend, Blake2sMerkleChannel>(&graph, &input, &weights)
+                .expect("GPU proving should succeed");
 
         assert_eq!(proofs.len(), 3);
         assert_eq!(execution.output.cols, 2);
@@ -2133,10 +2362,12 @@ mod tests {
         let weights = crate::compiler::onnx::generate_weights_for_graph(&graph, 42);
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
-        let (proofs, execution) = prove_model(&graph, &input, &weights)
-            .expect("Add residual proving should succeed");
+        let (proofs, execution) =
+            prove_model(&graph, &input, &weights).expect("Add residual proving should succeed");
 
         assert_eq!(proofs.len(), 3, "3 layers: matmul, relu, add");
 
@@ -2165,10 +2396,12 @@ mod tests {
         let weights = crate::compiler::onnx::generate_weights_for_graph(&graph, 42);
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
-        let (proofs, _execution) = prove_model(&graph, &input, &weights)
-            .expect("Mul elementwise proving should succeed");
+        let (proofs, _execution) =
+            prove_model(&graph, &input, &weights).expect("Mul elementwise proving should succeed");
 
         assert_eq!(proofs.len(), 3, "3 layers: matmul, matmul, mul");
 
@@ -2193,7 +2426,8 @@ mod tests {
         // The third node should be Add, NOT Identity
         assert!(
             matches!(graph.nodes[2].op, GraphOp::Add { .. }),
-            "Add op should be GraphOp::Add, got: {:?}", graph.nodes[2].op
+            "Add op should be GraphOp::Add, got: {:?}",
+            graph.nodes[2].op
         );
     }
 
@@ -2233,21 +2467,28 @@ mod tests {
     fn test_prove_model_streaming_basic() {
         // Same MLP as test_prove_model_mlp_matmul_activation_matmul
         let mut builder = GraphBuilder::new((1, 4));
-        builder
-            .linear(4)
-            .activation(ActivationType::ReLU)
-            .linear(2);
+        builder.linear(4).activation(ActivationType::ReLU).linear(2);
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w2.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
 
         // Streaming prover
@@ -2255,8 +2496,8 @@ mod tests {
             .expect("streaming proving should succeed");
 
         // Standard prover
-        let (standard_proofs, standard_exec) = prove_model(&graph, &input, &weights)
-            .expect("standard proving should succeed");
+        let (standard_proofs, standard_exec) =
+            prove_model(&graph, &input, &weights).expect("standard proving should succeed");
 
         // Same number of proofs
         assert_eq!(streaming_proofs.len(), standard_proofs.len());
@@ -2281,7 +2522,9 @@ mod tests {
         let weights = crate::compiler::onnx::generate_weights_for_graph(&graph, 42);
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let (streaming_proofs, streaming_exec) = prove_model_streaming(&graph, &input, &weights)
             .expect("streaming residual proving should succeed");

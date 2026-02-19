@@ -1,46 +1,204 @@
 //! Backend selection and GPU runtime dispatch.
 
+use std::any::TypeId;
+
 use stwo::core::fields::m31::BaseField;
+use stwo::core::fields::qm31::SecureField;
 use stwo::core::fields::ExtensionOf;
 use stwo::prover::backend::{Col, Column, ColumnOps};
 use stwo::prover::poly::circle::CircleEvaluation;
 use stwo::prover::poly::BitReversedOrder;
 
+use crate::components::matmul::{M31Matrix, RoundPoly};
+use crate::crypto::poseidon_channel::PoseidonChannel;
+
 /// Convert a `CircleEvaluation` from one backend to another.
 ///
-/// Extracts column data to CPU via `to_cpu()`, then reconstructs
-/// the column for the destination backend via `FromIterator`.
+/// When `Col<Src, F>` and `Col<Dst, F>` are the same concrete type
+/// (e.g., SimdBackend ↔ GpuBackend where both use `BaseColumn`),
+/// this performs a zero-copy transmute — no `to_cpu()` round-trip.
 ///
-/// When `Src == Dst` (e.g., both `SimdBackend`), the compiler will
-/// optimize this to a simple clone. For `SimdBackend → GpuBackend`,
-/// this uploads the trace data to the GPU.
+/// Otherwise falls back to the safe `to_cpu()` + `FromIterator` path.
 pub fn convert_evaluation<Src, Dst, F>(
     eval: CircleEvaluation<Src, F, BitReversedOrder>,
 ) -> CircleEvaluation<Dst, F, BitReversedOrder>
 where
     Src: ColumnOps<F>,
     Dst: ColumnOps<F>,
-    F: ExtensionOf<BaseField> + Clone,
-    Col<Src, F>: Column<F>,
-    Col<Dst, F>: Column<F>,
+    F: ExtensionOf<BaseField> + Clone + 'static,
+    Col<Src, F>: Column<F> + 'static,
+    Col<Dst, F>: Column<F> + 'static,
 {
-    let cpu_vals = eval.values.to_cpu();
-    let new_col: Col<Dst, F> = cpu_vals.into_iter().collect();
-    CircleEvaluation::new(eval.domain, new_col)
+    if TypeId::of::<Col<Src, F>>() == TypeId::of::<Col<Dst, F>>() {
+        // SAFETY: Col<Src, F> and Col<Dst, F> are the same concrete type.
+        // CircleEvaluation<B, F, O> differs only in zero-sized PhantomData<B>.
+        // Both structs have identical layout: (CircleDomain, Col<_, F>).
+        debug_assert_eq!(
+            std::mem::size_of::<CircleEvaluation<Src, F, BitReversedOrder>>(),
+            std::mem::size_of::<CircleEvaluation<Dst, F, BitReversedOrder>>(),
+            "CircleEvaluation size mismatch between backends"
+        );
+        unsafe { std::mem::transmute_copy(&std::mem::ManuallyDrop::new(eval)) }
+    } else {
+        let cpu_vals = eval.values.to_cpu();
+        let new_col: Col<Dst, F> = cpu_vals.into_iter().collect();
+        CircleEvaluation::new(eval.domain, new_col)
+    }
 }
 
 /// Convert a batch of `CircleEvaluation`s from one backend to another.
+///
+/// Uses zero-copy when column types match (see [`convert_evaluation`]).
 pub fn convert_evaluations<Src, Dst, F>(
     evals: Vec<CircleEvaluation<Src, F, BitReversedOrder>>,
 ) -> Vec<CircleEvaluation<Dst, F, BitReversedOrder>>
 where
     Src: ColumnOps<F>,
     Dst: ColumnOps<F>,
-    F: ExtensionOf<BaseField> + Clone,
-    Col<Src, F>: Column<F>,
-    Col<Dst, F>: Column<F>,
+    F: ExtensionOf<BaseField> + Clone + 'static,
+    Col<Src, F>: Column<F> + 'static,
+    Col<Dst, F>: Column<F> + 'static,
 {
     evals.into_iter().map(convert_evaluation::<Src, Dst, F>).collect()
+}
+
+// =============================================================================
+// ZkmlOps trait — ML-specific GPU operations
+// =============================================================================
+
+/// Result of a matmul layer reduction (sumcheck rounds + final evaluations).
+#[derive(Debug, Clone)]
+pub struct MatMulReduction {
+    pub round_polys: Vec<RoundPoly>,
+    pub challenges: Vec<SecureField>,
+    pub final_a_eval: SecureField,
+    pub final_b_eval: SecureField,
+}
+
+/// Extension trait for ML-specific operations not covered by stwo's `GkrOps`.
+///
+/// stwo's `GkrOps` handles LogUp lookup arguments. `ZkmlOps` covers matmul
+/// sumcheck, MLE evaluation, and MLE restriction — the hot paths in ZKML proving.
+pub trait ZkmlOps {
+    /// Full matmul layer reduction: restrict, sumcheck rounds, fold.
+    fn reduce_matmul_layer(
+        a: &M31Matrix,
+        b: &M31Matrix,
+        r_i: &[SecureField],
+        r_j: &[SecureField],
+        pk: usize,
+        channel: &mut PoseidonChannel,
+    ) -> Result<MatMulReduction, String>;
+
+    /// Evaluate a multilinear extension at a point.
+    fn evaluate_mle_at_point(
+        mle: &[SecureField],
+        point: &[SecureField],
+    ) -> Result<SecureField, String>;
+
+    /// Restrict (partially evaluate) an MLE by fixing the first variables.
+    fn restrict_mle(
+        mle: &[SecureField],
+        assignments: &[SecureField],
+    ) -> Result<Vec<SecureField>, String>;
+}
+
+/// `ZkmlOps` implementation for `SimdBackend` — wraps existing CPU functions.
+impl ZkmlOps for stwo::prover::backend::simd::SimdBackend {
+    fn reduce_matmul_layer(
+        a: &M31Matrix,
+        b: &M31Matrix,
+        r_i: &[SecureField],
+        r_j: &[SecureField],
+        pk: usize,
+        channel: &mut PoseidonChannel,
+    ) -> Result<MatMulReduction, String> {
+        use num_traits::Zero;
+        use stwo::core::fields::m31::M31;
+        use stwo::core::fields::FieldExpOps;
+
+        use crate::components::matmul::{
+            matrix_to_mle_pub, matrix_to_mle_col_major_pub,
+            restrict_mle_pub, pad_matrix_pow2,
+        };
+
+        let a_padded = pad_matrix_pow2(a);
+        let b_padded = pad_matrix_pow2(b);
+
+        // Restrict A rows by r_i and B cols by r_j to get 1D MLEs over k
+        let a_mle = matrix_to_mle_pub(&a_padded);
+        let b_mle = matrix_to_mle_col_major_pub(&b_padded);
+        let f_a = restrict_mle_pub(&a_mle, r_i);
+        let f_b = restrict_mle_pub(&b_mle, r_j);
+
+        let two = SecureField::from(M31::from(2u32));
+        let inv2 = two.inverse();
+
+        let mut f_a_cur = f_a;
+        let mut f_b_cur = f_b;
+        let mut round_polys = Vec::new();
+        let mut challenges = Vec::new();
+        let log_k = pk.ilog2() as usize;
+
+        for _ in 0..log_k {
+            let mid = f_a_cur.len() / 2;
+            let mut s0 = SecureField::zero();
+            let mut s1 = SecureField::zero();
+            let mut s2 = SecureField::zero();
+
+            for i in 0..mid {
+                s0 += f_a_cur[i] * f_b_cur[i];
+                s1 += f_a_cur[mid + i] * f_b_cur[mid + i];
+                let a2 = f_a_cur[mid + i] + f_a_cur[mid + i] - f_a_cur[i];
+                let b2 = f_b_cur[mid + i] + f_b_cur[mid + i] - f_b_cur[i];
+                s2 += a2 * b2;
+            }
+
+            let c0 = s0;
+            let c2 = (s2 - s1 - s1 + s0) * inv2;
+            let c1 = s1 - s0 - c2;
+            let rp = RoundPoly { c0, c1, c2 };
+            round_polys.push(rp);
+
+            channel.mix_poly_coeffs(c0, c1, c2);
+            let alpha = channel.draw_qm31();
+            challenges.push(alpha);
+
+            // Fold
+            let mut new_fa = vec![SecureField::zero(); mid];
+            let mut new_fb = vec![SecureField::zero(); mid];
+            for i in 0..mid {
+                new_fa[i] = f_a_cur[i] + alpha * (f_a_cur[mid + i] - f_a_cur[i]);
+                new_fb[i] = f_b_cur[i] + alpha * (f_b_cur[mid + i] - f_b_cur[i]);
+            }
+            f_a_cur = new_fa;
+            f_b_cur = new_fb;
+        }
+
+        let final_a_eval = if f_a_cur.is_empty() { SecureField::zero() } else { f_a_cur[0] };
+        let final_b_eval = if f_b_cur.is_empty() { SecureField::zero() } else { f_b_cur[0] };
+
+        Ok(MatMulReduction {
+            round_polys,
+            challenges,
+            final_a_eval,
+            final_b_eval,
+        })
+    }
+
+    fn evaluate_mle_at_point(
+        mle: &[SecureField],
+        point: &[SecureField],
+    ) -> Result<SecureField, String> {
+        Ok(crate::components::matmul::evaluate_mle_pub(mle, point))
+    }
+
+    fn restrict_mle(
+        mle: &[SecureField],
+        assignments: &[SecureField],
+    ) -> Result<Vec<SecureField>, String> {
+        Ok(crate::components::matmul::restrict_mle_pub(mle, assignments))
+    }
 }
 
 /// Minimum problem sizes (log2) where GPU acceleration is beneficial.
@@ -237,10 +395,21 @@ pub fn should_use_gpu(log_size: u32) -> bool {
     gpu_is_available() && log_size >= GpuThresholds::fft_fri()
 }
 
+/// Returns `true` if `OBELYSK_FORCE_GPU=1` is set.
+///
+/// On datacenter machines (H200, A100, B300) this skips detection heuristics
+/// and always selects GpuBackend when CUDA is compiled in.
+pub fn force_gpu() -> bool {
+    std::env::var("OBELYSK_FORCE_GPU")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// Execute a closure with the best available backend.
 ///
-/// Calls `f_gpu` if CUDA runtime is available and the GPU is detected,
-/// otherwise falls back to `f_simd`.
+/// Checks `OBELYSK_FORCE_GPU=1` first (skips detection heuristics),
+/// then falls back to runtime GPU detection.
 ///
 /// # Example
 /// ```ignore
@@ -258,7 +427,7 @@ pub fn with_best_backend<R>(
 ) -> R {
     #[cfg(feature = "cuda-runtime")]
     {
-        if gpu_is_available() {
+        if force_gpu() || gpu_is_available() {
             return f_gpu();
         }
     }

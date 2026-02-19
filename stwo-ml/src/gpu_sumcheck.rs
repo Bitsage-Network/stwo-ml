@@ -3372,6 +3372,52 @@ pub fn prepare_batch_entry_cached(
 }
 
 // =============================================================================
+// ZkmlOps impl for GpuBackend
+// =============================================================================
+
+#[cfg(feature = "cuda-runtime")]
+impl crate::backend::ZkmlOps for stwo::prover::backend::gpu::GpuBackend {
+    fn reduce_matmul_layer(
+        a: &M31Matrix,
+        b: &M31Matrix,
+        r_i: &[SecureField],
+        r_j: &[SecureField],
+        pk: usize,
+        channel: &mut crate::crypto::poseidon_channel::PoseidonChannel,
+    ) -> Result<crate::backend::MatMulReduction, String> {
+        let gpu = GpuSumcheckExecutor::cached()
+            .map_err(|e| format!("GPU init failed: {:?}", e))?;
+        let result = gpu.reduce_matmul_layer_gpu(a, b, r_i, r_j, pk, channel)
+            .map_err(|e| format!("GPU reduce_matmul: {:?}", e))?;
+        Ok(crate::backend::MatMulReduction {
+            round_polys: result.round_polys,
+            challenges: result.challenges,
+            final_a_eval: result.final_a_eval,
+            final_b_eval: result.final_b_eval,
+        })
+    }
+
+    fn evaluate_mle_at_point(
+        mle: &[SecureField],
+        point: &[SecureField],
+    ) -> Result<SecureField, String> {
+        let gpu = GpuSumcheckExecutor::cached()
+            .map_err(|e| format!("GPU init failed: {:?}", e))?;
+        gpu.evaluate_mle_gpu(mle, point)
+            .map_err(|e| format!("GPU evaluate_mle: {:?}", e))
+    }
+
+    fn restrict_mle(
+        mle: &[SecureField],
+        assignments: &[SecureField],
+    ) -> Result<Vec<SecureField>, String> {
+        // GPU restrict operates on matrices; for generic MLE restriction
+        // fall back to CPU which is efficient for small MLEs.
+        Ok(crate::components::matmul::restrict_mle_pub(mle, assignments))
+    }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 

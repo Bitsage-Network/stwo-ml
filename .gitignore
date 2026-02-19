@@ -20,5 +20,11 @@ findingscore.md
 scripts/pipeline/configs/.secrets.env
 secrets.env
 
+# Node
+node_modules/
+
+# Python
+__pycache__/
+
 # OS
 .DS_Store

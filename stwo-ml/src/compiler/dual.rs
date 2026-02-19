@@ -5,23 +5,20 @@
 //! tracks share the same computation graph and weight structure.
 
 use stwo::core::channel::MerkleChannel;
-use stwo::core::vcs_lifted::MerkleHasherLifted;
+use stwo::core::fields::m31::BaseField;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
+use stwo::core::vcs_lifted::MerkleHasherLifted;
 use stwo::prover::backend::simd::SimdBackend;
-use stwo::prover::backend::BackendForChannel;
+use stwo::prover::backend::{BackendForChannel, ColumnOps};
 use stwo::prover::poly::circle::PolyOps;
 use stwo_constraint_framework::FrameworkComponent;
 
-use crate::components::activation::ActivationEval;
-use crate::components::attention::{AttentionWeightsF32, attention_forward_f32};
-use crate::components::f32_ops::{
-    F32Matrix, matmul_f32, apply_activation_f32, layernorm_f32,
-};
 use crate::compiler::graph::{ComputationGraph, GraphOp, GraphWeights};
-use crate::compiler::prove::{ModelError, ModelProofResultFor, prove_model_with};
-use crate::gadgets::quantize::{
-    QuantParams, QuantStrategy, dequantize_value,
-};
+use crate::compiler::prove::{prove_model_with, ModelError, ModelProofResultFor};
+use crate::components::activation::ActivationEval;
+use crate::components::attention::{attention_forward_f32, AttentionWeightsF32};
+use crate::components::f32_ops::{apply_activation_f32, layernorm_f32, matmul_f32, F32Matrix};
+use crate::gadgets::quantize::{dequantize_value, QuantParams, QuantStrategy};
 
 // ===== DualWeights =====
 
@@ -45,10 +42,7 @@ impl DualWeights {
     ///
     /// Each entry: (node_id, name, f32_data). Quantizes to M31 using the
     /// given strategy and stores both representations.
-    pub fn from_f32(
-        entries: Vec<(usize, String, F32Matrix)>,
-        strategy: QuantStrategy,
-    ) -> Self {
+    pub fn from_f32(entries: Vec<(usize, String, F32Matrix)>, strategy: QuantStrategy) -> Self {
         let mut m31 = GraphWeights::new();
         let mut quant_params = Vec::with_capacity(entries.len());
 
@@ -135,13 +129,15 @@ pub fn f32_forward(
     for node in &graph.nodes {
         match &node.op {
             GraphOp::MatMul { .. } => {
-                let weight = weights.get_f32_weight(node.id).ok_or(
-                    ModelError::MissingWeight(node.id),
-                )?;
+                let weight = weights
+                    .get_f32_weight(node.id)
+                    .ok_or(ModelError::MissingWeight(node.id))?;
                 current = matmul_f32(&current, weight);
             }
 
-            GraphOp::Activation { activation_type, .. } => {
+            GraphOp::Activation {
+                activation_type, ..
+            } => {
                 current = apply_activation_f32(&current, *activation_type);
             }
 
@@ -225,12 +221,16 @@ pub fn prove_model_dual<B, MC>(
     weights: &DualWeights,
 ) -> Result<DualOutput<<MC as MerkleChannel>::H>, ModelError>
 where
-    B: BackendForChannel<MC> + PolyOps,
+    B: BackendForChannel<MC> + PolyOps + ColumnOps<BaseField>,
+    <B as ColumnOps<BaseField>>::Column: 'static,
     MC: MerkleChannel,
     FrameworkComponent<ActivationEval>: stwo::prover::ComponentProver<B>,
-    FrameworkComponent<crate::components::elementwise::ElementwiseAddEval>: stwo::prover::ComponentProver<B>,
-    FrameworkComponent<crate::components::elementwise::ElementwiseMulEval>: stwo::prover::ComponentProver<B>,
-    FrameworkComponent<crate::components::layernorm::LayerNormEval>: stwo::prover::ComponentProver<B>,
+    FrameworkComponent<crate::components::elementwise::ElementwiseAddEval>:
+        stwo::prover::ComponentProver<B>,
+    FrameworkComponent<crate::components::elementwise::ElementwiseMulEval>:
+        stwo::prover::ComponentProver<B>,
+    FrameworkComponent<crate::components::layernorm::LayerNormEval>:
+        stwo::prover::ComponentProver<B>,
     FrameworkComponent<crate::components::rmsnorm::RMSNormEval>: stwo::prover::ComponentProver<B>,
 {
     // 1. Quantize input for M31 pipeline
@@ -249,8 +249,16 @@ where
 
     // Use Direct strategy params for output comparison
     let output_params = QuantParams::from_range(
-        f32_output.data.iter().cloned().fold(f32::INFINITY, f32::min) as f64,
-        f32_output.data.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64,
+        f32_output
+            .data
+            .iter()
+            .cloned()
+            .fold(f32::INFINITY, f32::min) as f64,
+        f32_output
+            .data
+            .iter()
+            .cloned()
+            .fold(f32::NEG_INFINITY, f32::max) as f64,
         QuantStrategy::Direct,
     );
 
@@ -304,10 +312,7 @@ mod tests {
         let w2 = F32Matrix::from_data(8, 4, w2_data);
 
         DualWeights::from_f32(
-            vec![
-                (0, String::new(), w0),
-                (2, String::new(), w2),
-            ],
+            vec![(0, String::new(), w0), (2, String::new(), w2)],
             QuantStrategy::Symmetric8,
         )
     }
@@ -345,23 +350,22 @@ mod tests {
         builder.linear(4).layer_norm().linear(4);
         let graph = builder.build();
 
-        let w0 = F32Matrix::from_data(4, 4, vec![
-            0.5, 0.1, -0.2, 0.3,
-            0.1, 0.4, 0.2, -0.1,
-            -0.3, 0.2, 0.6, 0.1,
-            0.2, -0.1, 0.1, 0.5,
-        ]);
-        let w2 = F32Matrix::from_data(4, 4, vec![
-            0.3, -0.1, 0.2, 0.4,
-            -0.2, 0.5, 0.1, -0.3,
-            0.1, 0.2, -0.4, 0.2,
-            0.4, -0.3, 0.3, 0.1,
-        ]);
-        let weights = DualWeights::from_f32(
+        let w0 = F32Matrix::from_data(
+            4,
+            4,
             vec![
-                (0, String::new(), w0),
-                (2, String::new(), w2),
+                0.5, 0.1, -0.2, 0.3, 0.1, 0.4, 0.2, -0.1, -0.3, 0.2, 0.6, 0.1, 0.2, -0.1, 0.1, 0.5,
             ],
+        );
+        let w2 = F32Matrix::from_data(
+            4,
+            4,
+            vec![
+                0.3, -0.1, 0.2, 0.4, -0.2, 0.5, 0.1, -0.3, 0.1, 0.2, -0.4, 0.2, 0.4, -0.3, 0.3, 0.1,
+            ],
+        );
+        let weights = DualWeights::from_f32(
+            vec![(0, String::new(), w0), (2, String::new(), w2)],
             QuantStrategy::Symmetric8,
         );
 
@@ -411,10 +415,7 @@ mod tests {
     #[test]
     fn test_dual_weights_from_graph_weights() {
         let original = make_mlp_weights();
-        let reconstructed = DualWeights::from_graph_weights(
-            &original.m31,
-            &original.quant_params,
-        );
+        let reconstructed = DualWeights::from_graph_weights(&original.m31, &original.quant_params);
         assert!(reconstructed.get_f32_weight(0).is_some());
         assert!(reconstructed.get_f32_weight(2).is_some());
         assert_eq!(reconstructed.f32_weights.len(), original.f32_weights.len());
@@ -432,10 +433,7 @@ mod tests {
         let w2 = F32Matrix::from_data(8, 4, w2_data);
 
         let weights = DualWeights::from_f32(
-            vec![
-                (0, String::new(), w0),
-                (2, String::new(), w2),
-            ],
+            vec![(0, String::new(), w0), (2, String::new(), w2)],
             QuantStrategy::Symmetric8,
         );
 
@@ -477,10 +475,7 @@ mod tests {
             QuantStrategy::Symmetric8,
         );
 
-        let input = F32Matrix::from_data(
-            4, 4,
-            (0..16).map(|i| i as f32 * 0.1 - 0.8).collect(),
-        );
+        let input = F32Matrix::from_data(4, 4, (0..16).map(|i| i as f32 * 0.1 - 0.8).collect());
         let output = f32_forward(&graph, &input, &weights).unwrap();
         assert_eq!(output.rows, 4);
         assert_eq!(output.cols, 4);

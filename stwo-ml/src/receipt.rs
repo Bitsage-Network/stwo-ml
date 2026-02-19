@@ -29,6 +29,7 @@ use starknet_ff::FieldElement;
 
 use num_traits::Zero;
 
+use stwo::core::channel::MerkleChannel;
 use stwo::core::fields::m31::{BaseField, M31};
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::pcs::PcsConfig;
@@ -36,21 +37,20 @@ use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::proof::StarkProof;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
 use stwo::core::vcs_lifted::MerkleHasherLifted;
-use stwo::core::channel::MerkleChannel;
-use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::simd::m31::LOG_N_LANES;
-use stwo::prover::backend::{Col, Column, BackendForChannel};
+use stwo::prover::backend::simd::SimdBackend;
+use stwo::prover::backend::{BackendForChannel, Col, Column, ColumnOps};
 use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
 use stwo::prover::poly::BitReversedOrder;
-use stwo::prover::CommitmentSchemeProver;
 use stwo::prover::prove;
+use stwo::prover::CommitmentSchemeProver;
 
 use stwo_constraint_framework::{
-    FrameworkEval, FrameworkComponent, EvalAtRow, TraceLocationAllocator,
+    EvalAtRow, FrameworkComponent, FrameworkEval, TraceLocationAllocator,
 };
 
-use tracing::info;
 use crate::backend::convert_evaluations;
+use tracing::info;
 
 /// The lifted Merkle hasher type for Blake2s channel.
 type Hasher = <Blake2sMerkleChannel as MerkleChannel>::H;
@@ -243,19 +243,13 @@ impl FrameworkEval for ReceiptEval {
         // Constraint 1: time_billing * 1000 == gpu_time_ms * rate_per_sec
         // This avoids division: time_billing = floor(gpu_time * rate / 1000)
         // Expressed as: time_billing * 1000 - gpu_time_ms * rate_per_sec == 0
-        eval.add_constraint(
-            time_billing.clone() * thousand - gpu_time_ms * rate_per_sec,
-        );
+        eval.add_constraint(time_billing.clone() * thousand - gpu_time_ms * rate_per_sec);
 
         // Constraint 2: token_billing == token_count * rate_per_token
-        eval.add_constraint(
-            token_billing.clone() - token_count * rate_per_token,
-        );
+        eval.add_constraint(token_billing.clone() - token_count * rate_per_token);
 
         // Constraint 3: billing_total == time_billing + token_billing
-        eval.add_constraint(
-            billing_total - time_billing - token_billing,
-        );
+        eval.add_constraint(billing_total - time_billing - token_billing);
 
         eval
     }
@@ -314,9 +308,7 @@ pub fn prove_receipt_batch(receipts: &[ComputeReceipt]) -> Result<ReceiptProof, 
 /// Prove a receipt batch using the best available backend.
 ///
 /// Uses `GpuBackend` when CUDA is available, otherwise `SimdBackend`.
-pub fn prove_receipt_batch_auto(
-    receipts: &[ComputeReceipt],
-) -> Result<ReceiptProof, ReceiptError> {
+pub fn prove_receipt_batch_auto(receipts: &[ComputeReceipt]) -> Result<ReceiptProof, ReceiptError> {
     let gpu_available = crate::backend::gpu_is_available();
     info!(
         gpu_available,
@@ -336,9 +328,7 @@ pub fn prove_receipt_batch_auto(
 }
 
 /// GPU receipt proving path.
-fn prove_receipt_batch_gpu(
-    receipts: &[ComputeReceipt],
-) -> Result<ReceiptProof, ReceiptError> {
+fn prove_receipt_batch_gpu(receipts: &[ComputeReceipt]) -> Result<ReceiptProof, ReceiptError> {
     #[cfg(feature = "cuda-runtime")]
     {
         use stwo::prover::backend::gpu::GpuBackend;
@@ -361,7 +351,8 @@ pub fn prove_receipt_batch_with<B, MC>(
     receipts: &[ComputeReceipt],
 ) -> Result<ReceiptProofFor<<MC as MerkleChannel>::H>, ReceiptError>
 where
-    B: BackendForChannel<MC> + PolyOps,
+    B: BackendForChannel<MC> + PolyOps + ColumnOps<BaseField>,
+    <B as ColumnOps<BaseField>>::Column: 'static,
     MC: MerkleChannel,
     FrameworkComponent<ReceiptEval>: stwo::prover::ComponentProver<B>,
 {
@@ -430,11 +421,15 @@ where
 
     // Tree 1: Execution trace (7 receipt columns), converted to backend B
     let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(trace_evals));
+    tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(
+        trace_evals,
+    ));
     tree_builder.commit(channel);
 
     // Build receipt component
-    let eval = ReceiptEval { log_n_rows: log_size };
+    let eval = ReceiptEval {
+        log_n_rows: log_size,
+    };
     let component = FrameworkComponent::new(
         &mut TraceLocationAllocator::default(),
         eval,
@@ -442,12 +437,8 @@ where
     );
 
     // Prove using backend B
-    let stark_proof = prove::<B, MC>(
-        &[&component],
-        channel,
-        commitment_scheme,
-    )
-    .map_err(|e| ReceiptError::ProvingError(format!("{e:?}")))?;
+    let stark_proof = prove::<B, MC>(&[&component], channel, commitment_scheme)
+        .map_err(|e| ReceiptError::ProvingError(format!("{e:?}")))?;
 
     // Compute receipt hashes
     let receipt_hashes: Vec<FieldElement> = receipts.iter().map(|r| r.receipt_hash()).collect();
@@ -621,7 +612,10 @@ mod tests {
 
         let result = prove_receipt(&r);
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ReceiptError::InvalidBilling { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            ReceiptError::InvalidBilling { .. }
+        ));
     }
 
     #[test]
@@ -641,7 +635,10 @@ mod tests {
 
         let result = verify_receipt_chain(&[r0, r1_bad]);
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ReceiptError::BrokenChain { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            ReceiptError::BrokenChain { .. }
+        ));
     }
 
     #[test]
@@ -674,8 +671,7 @@ mod tests {
         let r0 = test_receipt(1000, 100, 100, 10, 0, FieldElement::ZERO);
         let r1 = test_receipt(2000, 200, 200, 20, 1, r0.receipt_hash());
 
-        let proof = prove_receipt_batch_auto(&[r0, r1])
-            .expect("auto batch proving should succeed");
+        let proof = prove_receipt_batch_auto(&[r0, r1]).expect("auto batch proving should succeed");
 
         assert_eq!(proof.batch_size, 2);
         assert_eq!(proof.receipt_hashes.len(), 2);

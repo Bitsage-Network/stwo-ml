@@ -5,6 +5,7 @@ use stwo::core::fields::qm31::QM31;
 
 use crate::components::activation::ActivationType;
 use crate::components::matmul::RoundPoly;
+use crate::crypto::aggregated_opening::AggregatedWeightBindingProof;
 use crate::crypto::mle_opening::MleOpeningProof;
 use crate::crypto::poseidon_channel::{securefield_to_felt, PoseidonChannel};
 
@@ -272,6 +273,9 @@ pub struct WeightClaim {
 /// - `AggregatedOpeningsV4Experimental`: experimental mode-3 envelope for
 ///   Starknet v4 integration scaffolding. Current implementation still uses
 ///   full opening proofs and emits mode-3 binding metadata.
+/// - `AggregatedOracleSumcheck`: unified oracle mismatch sumcheck — all M
+///   weight claims aggregated into one sumcheck + one MLE opening. Produces
+///   ~17K felts calldata instead of ~2.4M. This is the production submit mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WeightOpeningTranscriptMode {
     Sequential,
@@ -279,6 +283,7 @@ pub enum WeightOpeningTranscriptMode {
     BatchedRlcDirectEvalV1,
     AggregatedTrustlessV2,
     AggregatedOpeningsV4Experimental,
+    AggregatedOracleSumcheck,
 }
 
 /// Deterministically derive a per-opening sub-channel from a master seed.
@@ -334,6 +339,11 @@ pub struct GKRProof {
     /// When Add inputs come from different paths, the main walk follows the lhs
     /// branch and each rhs branch gets a separate deferred proof.
     pub deferred_proofs: Vec<DeferredProof>,
+
+    /// Aggregated weight binding proof (mode = AggregatedOracleSumcheck).
+    /// When present, `weight_openings` is empty — all claims are proven
+    /// in one shot via a mismatch sumcheck + single MLE opening.
+    pub aggregated_binding: Option<AggregatedWeightBindingProof>,
 }
 
 /// Deferred proof for the rhs branch of a DAG Add layer.

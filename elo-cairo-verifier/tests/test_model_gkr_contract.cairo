@@ -300,10 +300,15 @@ fn test_verify_model_gkr_short_io_data() {
 
 // ============================================================================
 // Test 11: Circuit hash mismatch rejected (proof tags/depth must match registration)
+//
+// With v11 input validation, zero layers are rejected before reaching the
+// circuit hash check. This test now verifies the ZERO_LAYERS guard fires.
+// Circuit hash mismatch is still tested by the full GKR model tests that
+// send well-formed proofs with mismatched descriptors.
 // ============================================================================
 
 #[test]
-#[should_panic(expected: "CIRCUIT_HASH_MISMATCH")]
+#[should_panic(expected: "ZERO_LAYERS")]
 fn test_verify_model_gkr_circuit_hash_mismatch() {
     let dispatcher = deploy_verifier();
     let owner: ContractAddress = 0x1234_felt252.try_into().unwrap();
@@ -314,15 +319,15 @@ fn test_verify_model_gkr_circuit_hash_mismatch() {
     // Register with descriptor [1]
     dispatcher.register_model_gkr(model_id, array![], array![1]);
 
-    // Verify with a mismatched circuit_depth so descriptor hash diverges.
+    // num_layers=0 now triggers early ZERO_LAYERS validation.
     dispatcher.verify_model_gkr(
         model_id,
         build_raw_io_data(),
         2,              // wrong circuit_depth
-        0,              // no layer proofs
+        0,              // zero layers — triggers ZERO_LAYERS guard
         array![],
         array![],
-        array![0],     // proof_data: num_deferred = 0 (well-formed minimal payload)
+        array![0],     // proof_data: num_deferred = 0
         array![],
         array![],
     );

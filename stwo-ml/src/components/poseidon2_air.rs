@@ -12,8 +12,7 @@
 use std::ops::{Add, AddAssign};
 
 use stwo::core::fields::m31::BaseField as M31;
-use stwo::prover::backend::simd::SimdBackend;
-use stwo::prover::backend::{Col, Column};
+use stwo::prover::backend::{Col, Column, ColumnOps};
 use stwo_constraint_framework::EvalAtRow;
 
 use crate::crypto::poseidon2_m31::{
@@ -148,12 +147,14 @@ pub fn compute_merkle_chain_padding(
 ///
 /// Column layout: states (368) → full_sq (128) → full_quad (128) →
 ///   partial_sq (14) → partial_quad (14) = 652 total.
-pub fn write_permutation_to_trace(
+pub fn write_permutation_to_trace<B: ColumnOps<M31>>(
     trace: &PermutationTrace,
-    cols: &mut [Col<SimdBackend, M31>],
+    cols: &mut [Col<B, M31>],
     col_offset: usize,
     row: usize,
-) {
+) where
+    Col<B, M31>: Column<M31>,
+{
     let mut idx = col_offset;
 
     // States: 23 × 16

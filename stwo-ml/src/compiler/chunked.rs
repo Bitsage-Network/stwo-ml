@@ -16,11 +16,11 @@ use std::path::{Path, PathBuf};
 
 use tracing::info;
 
-use starknet_crypto::FieldElement;
 use crate::aggregation::{AggregatedModelProofOnChain, AggregationError};
 use crate::compiler::checkpoint::ExecutionCheckpoint;
 use crate::compiler::graph::{ComputationGraph, GraphOp, GraphWeights};
 use crate::components::matmul::M31Matrix;
+use starknet_crypto::FieldElement;
 
 /// Result from proving a single chunk.
 pub struct ChunkProofResult {
@@ -136,10 +136,7 @@ pub fn prove_model_chunked(
         current_input = output;
     }
 
-    info!(
-        num_chunks = results.len(),
-        "Chunked proving complete"
-    );
+    info!(num_chunks = results.len(), "Chunked proving complete");
 
     Ok(results)
 }
@@ -151,10 +148,7 @@ fn checkpoint_path(dir: &Path, chunk_idx: usize) -> PathBuf {
 
 /// Get the total number of matmul proofs across all chunks.
 pub fn total_matmul_proofs(results: &[ChunkProofResult]) -> usize {
-    results
-        .iter()
-        .map(|r| r.proof.matmul_proofs.len())
-        .sum()
+    results.iter().map(|r| r.proof.matmul_proofs.len()).sum()
 }
 
 /// Get the total number of activation claims across all chunks.
@@ -193,7 +187,10 @@ pub fn prove_model_chunked_parallel(
     let blocks = graph.find_block_boundaries();
     let num_chunks = blocks.len();
 
-    info!(num_chunks, memory_budget, "Starting parallel chunked proving");
+    info!(
+        num_chunks,
+        memory_budget, "Starting parallel chunked proving"
+    );
 
     // Phase 1: Sequential forward pass to precompute all chunk inputs.
     // Each chunk needs the output of the previous chunk as input.
@@ -207,12 +204,13 @@ pub fn prove_model_chunked_parallel(
         let sub_graph = graph.subgraph(block_range.start..block_range.end);
         let sub_weights = weights.subset(block_range.start..block_range.end);
 
-        let forward_result = crate::compiler::prove::prove_model(
-            &sub_graph, &current_input, &sub_weights,
-        ).map_err(|e| ChunkedProvingError::ChunkFailed {
-            chunk: 0,
-            message: format!("Forward pass failed: {e}"),
-        })?;
+        let forward_result =
+            crate::compiler::prove::prove_model(&sub_graph, &current_input, &sub_weights).map_err(
+                |e| ChunkedProvingError::ChunkFailed {
+                    chunk: 0,
+                    message: format!("Forward pass failed: {e}"),
+                },
+            )?;
 
         current_input = forward_result.1.output;
     }
@@ -290,7 +288,10 @@ pub fn prove_model_chunked_auto(
     let blocks = graph.find_block_boundaries();
     let num_chunks = blocks.len();
 
-    info!(num_chunks, memory_budget, "Starting chunked proving (auto backend)");
+    info!(
+        num_chunks,
+        memory_budget, "Starting chunked proving (auto backend)"
+    );
 
     let mut results = Vec::with_capacity(num_chunks);
     let mut current_input = input.clone();
@@ -299,7 +300,13 @@ pub fn prove_model_chunked_auto(
         let start = block_range.start;
         let end = block_range.end;
 
-        info!(chunk_idx, start, end, num_nodes = end - start, "Proving chunk (auto)");
+        info!(
+            chunk_idx,
+            start,
+            end,
+            num_nodes = end - start,
+            "Proving chunk (auto)"
+        );
 
         let ckpt_path = checkpoint_path(checkpoint_dir, chunk_idx);
         if let Ok(ckpt) = ExecutionCheckpoint::load(&ckpt_path) {
@@ -337,7 +344,10 @@ pub fn prove_model_chunked_auto(
         current_input = output;
     }
 
-    info!(num_chunks = results.len(), "Chunked proving complete (auto backend)");
+    info!(
+        num_chunks = results.len(),
+        "Chunked proving complete (auto backend)"
+    );
     Ok(results)
 }
 
@@ -360,7 +370,10 @@ pub fn prove_model_chunked_parallel_auto(
     let blocks = graph.find_block_boundaries();
     let num_chunks = blocks.len();
 
-    info!(num_chunks, memory_budget, "Starting parallel chunked proving (auto backend)");
+    info!(
+        num_chunks,
+        memory_budget, "Starting parallel chunked proving (auto backend)"
+    );
 
     // Phase 1: Sequential forward pass to precompute all chunk inputs.
     let mut chunk_inputs: Vec<M31Matrix> = Vec::with_capacity(num_chunks);
@@ -372,12 +385,13 @@ pub fn prove_model_chunked_parallel_auto(
         let sub_graph = graph.subgraph(block_range.start..block_range.end);
         let sub_weights = weights.subset(block_range.start..block_range.end);
 
-        let forward_result = crate::compiler::prove::prove_model(
-            &sub_graph, &current_input, &sub_weights,
-        ).map_err(|e| ChunkedProvingError::ChunkFailed {
-            chunk: 0,
-            message: format!("Forward pass failed: {e}"),
-        })?;
+        let forward_result =
+            crate::compiler::prove::prove_model(&sub_graph, &current_input, &sub_weights).map_err(
+                |e| ChunkedProvingError::ChunkFailed {
+                    chunk: 0,
+                    message: format!("Forward pass failed: {e}"),
+                },
+            )?;
 
         current_input = forward_result.1.output;
     }
@@ -427,14 +441,20 @@ pub fn prove_model_chunked_parallel_auto(
     let mut results = results?;
     results.sort_by_key(|r| r.chunk_index);
 
-    info!(num_chunks = results.len(), "Parallel chunked proving complete (auto backend)");
+    info!(
+        num_chunks = results.len(),
+        "Parallel chunked proving complete (auto backend)"
+    );
     Ok(results)
 }
 
 /// Collect all chunk proofs into a combined set of matmul proofs and activation claims.
 pub fn collect_chunk_proofs(
     results: &[ChunkProofResult],
-) -> (Vec<(usize, crate::components::matmul::MatMulSumcheckProofOnChain)>, Vec<crate::aggregation::LayerClaim>) {
+) -> (
+    Vec<(usize, crate::components::matmul::MatMulSumcheckProofOnChain)>,
+    Vec<crate::aggregation::LayerClaim>,
+) {
     let mut all_matmul = Vec::new();
     let mut all_claims = Vec::new();
 
@@ -506,14 +526,19 @@ fn compose_chunk_proofs_inner<B>(
     weights: &GraphWeights,
 ) -> Result<AggregatedModelProofOnChain, ChunkedProvingError>
 where
-    B: stwo::prover::backend::BackendForChannel<stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel>
-        + stwo::prover::poly::circle::PolyOps,
+    B: stwo::prover::backend::BackendForChannel<
+            stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel,
+        > + stwo::prover::poly::circle::PolyOps
+        + stwo::prover::backend::ColumnOps<stwo::core::fields::m31::BaseField>,
+    <B as stwo::prover::backend::ColumnOps<stwo::core::fields::m31::BaseField>>::Column: 'static,
     stwo_constraint_framework::FrameworkComponent<crate::components::activation::ActivationEval>:
         stwo::prover::ComponentProver<B>,
-    stwo_constraint_framework::FrameworkComponent<crate::components::elementwise::ElementwiseAddEval>:
-        stwo::prover::ComponentProver<B>,
-    stwo_constraint_framework::FrameworkComponent<crate::components::elementwise::ElementwiseMulEval>:
-        stwo::prover::ComponentProver<B>,
+    stwo_constraint_framework::FrameworkComponent<
+        crate::components::elementwise::ElementwiseAddEval,
+    >: stwo::prover::ComponentProver<B>,
+    stwo_constraint_framework::FrameworkComponent<
+        crate::components::elementwise::ElementwiseMulEval,
+    >: stwo::prover::ComponentProver<B>,
     stwo_constraint_framework::FrameworkComponent<crate::components::layernorm::LayerNormEval>:
         stwo::prover::ComponentProver<B>,
     stwo_constraint_framework::FrameworkComponent<crate::components::embedding::EmbeddingEval>:
@@ -526,8 +551,8 @@ where
         stwo::prover::ComponentProver<B>,
 {
     use crate::aggregation::{
-        build_unified_stark, collect_forward_pass_layer_data,
-        compute_layer_chain_commitment, compute_io_commitment,
+        build_unified_stark, collect_forward_pass_layer_data, compute_io_commitment,
+        compute_layer_chain_commitment,
     };
     use crate::compiler::prove::GraphExecution;
 
@@ -595,9 +620,8 @@ where
     let fwd = collect_forward_pass_layer_data(graph, input, weights)?;
 
     // Step 3: Compute commitments from the full forward pass data.
-    let layer_chain_commitment = compute_layer_chain_commitment(
-        input, &fwd.intermediates, &fwd.final_output,
-    );
+    let layer_chain_commitment =
+        compute_layer_chain_commitment(input, &fwd.intermediates, &fwd.final_output);
     let io_commitment = compute_io_commitment(input, &fwd.final_output);
 
     let execution = GraphExecution {
@@ -675,7 +699,9 @@ where
         layer_chain_commitment,
         io_commitment,
         layernorm_mean_var_commitments: fwd.layernorm_mean_var_commitments,
-        quantize_params_commitment: crate::aggregation::compute_quantize_params_commitment(&fwd.quantize_layers),
+        quantize_params_commitment: crate::aggregation::compute_quantize_params_commitment(
+            &fwd.quantize_layers,
+        ),
         tiled_matmul_proofs: Vec::new(),
         gkr_proof: None,
         gkr_batch_data: None,
@@ -718,7 +744,10 @@ pub fn prove_model_chunked_streaming(
     let blocks = graph.find_block_boundaries();
     let num_chunks = blocks.len();
 
-    info!(num_chunks, memory_budget, "Starting streaming chunked proving");
+    info!(
+        num_chunks,
+        memory_budget, "Starting streaming chunked proving"
+    );
 
     // Phase 1: Sequential forward pass with per-chunk weight loading.
     // Load weights on demand, run forward pass, drop weights, prefetch next.
@@ -736,12 +765,13 @@ pub fn prove_model_chunked_streaming(
                 message: format!("Weight loading failed: {e}"),
             })?;
 
-        let forward_result = crate::compiler::prove::prove_model(
-            &sub_graph, &current_input, &sub_weights,
-        ).map_err(|e| ChunkedProvingError::ChunkFailed {
-            chunk: i,
-            message: format!("Forward pass failed: {e}"),
-        })?;
+        let forward_result =
+            crate::compiler::prove::prove_model(&sub_graph, &current_input, &sub_weights).map_err(
+                |e| ChunkedProvingError::ChunkFailed {
+                    chunk: i,
+                    message: format!("Forward pass failed: {e}"),
+                },
+            )?;
 
         current_input = forward_result.1.output;
         drop(sub_weights); // free this chunk's weights
@@ -773,12 +803,12 @@ pub fn prove_model_chunked_streaming(
             let chunk_input = &chunk_inputs[chunk_idx];
 
             let sub_graph = graph.subgraph(start..end);
-            let sub_weights = pipeline
-                .load_chunk_weights(start..end)
-                .map_err(|e| ChunkedProvingError::ChunkFailed {
+            let sub_weights = pipeline.load_chunk_weights(start..end).map_err(|e| {
+                ChunkedProvingError::ChunkFailed {
                     chunk: chunk_idx,
                     message: format!("Weight loading failed: {e}"),
-                })?;
+                }
+            })?;
 
             let proof = crate::aggregation::prove_model_aggregated_onchain(
                 &sub_graph,
@@ -892,7 +922,9 @@ pub fn prove_model_chunked_streaming_tiled(
                     matmul_data.push((global_id, a_matrix, c_matrix.clone()));
                     current = c_matrix;
                 }
-                GraphOp::Activation { activation_type, .. } => {
+                GraphOp::Activation {
+                    activation_type, ..
+                } => {
                     let f = activation_type.as_fn();
                     current = crate::compiler::prove::apply_activation_pub(&current, &*f);
                 }
@@ -935,11 +967,9 @@ pub fn prove_model_chunked_streaming_tiled(
                 })?;
 
             // Verify the tiled proof
-            verify_tiled_matmul(&tiled_proof).map_err(|e| {
-                ChunkedProvingError::ChunkFailed {
-                    chunk: chunk_idx,
-                    message: format!("Tiled verification node {node_id}: {e}"),
-                }
+            verify_tiled_matmul(&tiled_proof).map_err(|e| ChunkedProvingError::ChunkFailed {
+                chunk: chunk_idx,
+                message: format!("Tiled verification node {node_id}: {e}"),
             })?;
 
             tiled_proofs.push((*node_id, tiled_proof));
@@ -1031,8 +1061,14 @@ pub fn prove_model_chunked_multi_gpu_with_metrics(
     input: &M31Matrix,
     weights: &GraphWeights,
     memory_budget: usize,
-) -> Result<(Vec<ChunkProofResult>, crate::multi_gpu::MultiGpuProvingResult), ChunkedProvingError> {
-    use crate::multi_gpu::{MultiGpuExecutor, ChunkWorkload, DeviceGuard};
+) -> Result<
+    (
+        Vec<ChunkProofResult>,
+        crate::multi_gpu::MultiGpuProvingResult,
+    ),
+    ChunkedProvingError,
+> {
+    use crate::multi_gpu::{ChunkWorkload, DeviceGuard, MultiGpuExecutor};
 
     if graph.nodes.is_empty() {
         return Err(ChunkedProvingError::EmptyGraph);
@@ -1041,7 +1077,10 @@ pub fn prove_model_chunked_multi_gpu_with_metrics(
     let blocks = graph.find_block_boundaries();
     let num_chunks = blocks.len();
 
-    info!(num_chunks, memory_budget, "Starting multi-GPU chunked proving");
+    info!(
+        num_chunks,
+        memory_budget, "Starting multi-GPU chunked proving"
+    );
 
     // Phase 1: Sequential forward pass to precompute all chunk inputs.
     let mut chunk_inputs: Vec<M31Matrix> = Vec::with_capacity(num_chunks);
@@ -1053,12 +1092,13 @@ pub fn prove_model_chunked_multi_gpu_with_metrics(
         let sub_graph = graph.subgraph(block_range.start..block_range.end);
         let sub_weights = weights.subset(block_range.start..block_range.end);
 
-        let forward_result = crate::compiler::prove::prove_model(
-            &sub_graph, &current_input, &sub_weights,
-        ).map_err(|e| ChunkedProvingError::ChunkFailed {
-            chunk: 0,
-            message: format!("Forward pass failed: {e}"),
-        })?;
+        let forward_result =
+            crate::compiler::prove::prove_model(&sub_graph, &current_input, &sub_weights).map_err(
+                |e| ChunkedProvingError::ChunkFailed {
+                    chunk: 0,
+                    message: format!("Forward pass failed: {e}"),
+                },
+            )?;
 
         current_input = forward_result.1.output;
     }
@@ -1077,9 +1117,11 @@ pub fn prove_model_chunked_multi_gpu_with_metrics(
         .map(|(idx, block_range)| {
             let sub_graph = graph.subgraph(block_range.start..block_range.end);
             let estimated_memory = sub_graph.estimate_peak_memory();
-            let num_matmuls = sub_graph.nodes.iter().filter(|n| {
-                matches!(n.op, crate::compiler::graph::GraphOp::MatMul { .. })
-            }).count();
+            let num_matmuls = sub_graph
+                .nodes
+                .iter()
+                .filter(|n| matches!(n.op, crate::compiler::graph::GraphOp::MatMul { .. }))
+                .count();
             ChunkWorkload {
                 chunk_index: idx,
                 estimated_memory,
@@ -1095,12 +1137,16 @@ pub fn prove_model_chunked_multi_gpu_with_metrics(
         num_gpus = executor.num_devices(),
         num_chunks = assignments.len(),
         "Partition: {:?}",
-        assignments.iter().map(|a| (a.chunk_index, a.device_id)).collect::<Vec<_>>()
+        assignments
+            .iter()
+            .map(|a| (a.chunk_index, a.device_id))
+            .collect::<Vec<_>>()
     );
 
     // Phase 3: Prove chunks in parallel, one thread per chunk with device affinity.
     let errors: std::sync::Mutex<Vec<(usize, usize, String)>> = std::sync::Mutex::new(Vec::new());
-    let results: std::sync::Mutex<Vec<ChunkProofResult>> = std::sync::Mutex::new(Vec::with_capacity(num_chunks));
+    let results: std::sync::Mutex<Vec<ChunkProofResult>> =
+        std::sync::Mutex::new(Vec::with_capacity(num_chunks));
     let t_start = std::time::Instant::now();
 
     // Per-device timing for metrics
@@ -1163,7 +1209,10 @@ pub fn prove_model_chunked_multi_gpu_with_metrics(
                     }
                     Err(e) => {
                         tracing::error!(chunk_idx, device_id, error = %e, "Chunk proving failed");
-                        errors_ref.lock().unwrap().push((chunk_idx, device_id, format!("{e}")));
+                        errors_ref
+                            .lock()
+                            .unwrap()
+                            .push((chunk_idx, device_id, format!("{e}")));
                     }
                 }
                 // _device_guard dropped here, restoring previous device state
@@ -1178,7 +1227,10 @@ pub fn prove_model_chunked_multi_gpu_with_metrics(
     if !errs.is_empty() {
         if errs.len() == 1 {
             let (chunk, _device, msg) = errs.into_iter().next().unwrap();
-            return Err(ChunkedProvingError::ChunkFailed { chunk, message: msg });
+            return Err(ChunkedProvingError::ChunkFailed {
+                chunk,
+                message: msg,
+            });
         }
         // Multiple failures: aggregate into a single error message
         let details: Vec<String> = errs
@@ -1201,9 +1253,9 @@ pub fn prove_model_chunked_multi_gpu_with_metrics(
     let mut device_map: std::collections::HashMap<usize, (Vec<usize>, std::time::Duration, usize)> =
         std::collections::HashMap::new();
     for (device_id, chunks, elapsed, matmuls) in raw_timings {
-        let entry = device_map.entry(device_id).or_insert_with(|| {
-            (Vec::new(), std::time::Duration::ZERO, 0)
-        });
+        let entry = device_map
+            .entry(device_id)
+            .or_insert_with(|| (Vec::new(), std::time::Duration::ZERO, 0));
         entry.0.extend(chunks);
         entry.1 = entry.1.max(elapsed); // wall-clock = max across chunks on same device
         entry.2 += matmuls;
@@ -1268,10 +1320,7 @@ mod tests {
     fn test_prove_model_chunked_simple() {
         // 3-layer MLP: matmul → relu → matmul
         let mut builder = GraphBuilder::new((1, 4));
-        builder
-            .linear(4)
-            .activation(ActivationType::ReLU)
-            .linear(2);
+        builder.linear(4).activation(ActivationType::ReLU).linear(2);
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
@@ -1323,10 +1372,7 @@ mod tests {
     fn test_prove_model_chunked_parallel() {
         // Same MLP as the sequential test
         let mut builder = GraphBuilder::new((1, 4));
-        builder
-            .linear(4)
-            .activation(ActivationType::ReLU)
-            .linear(2);
+        builder.linear(4).activation(ActivationType::ReLU).linear(2);
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
@@ -1350,13 +1396,8 @@ mod tests {
         }
         weights.add_weight(2, w2);
 
-        let results = prove_model_chunked_parallel(
-            &graph,
-            &input,
-            &weights,
-            100_000_000,
-        )
-        .expect("parallel chunked proving should succeed");
+        let results = prove_model_chunked_parallel(&graph, &input, &weights, 100_000_000)
+            .expect("parallel chunked proving should succeed");
 
         assert!(!results.is_empty());
 
@@ -1370,10 +1411,7 @@ mod tests {
     #[test]
     fn test_collect_chunk_proofs() {
         let mut builder = GraphBuilder::new((1, 4));
-        builder
-            .linear(4)
-            .activation(ActivationType::ReLU)
-            .linear(2);
+        builder.linear(4).activation(ActivationType::ReLU).linear(2);
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
@@ -1447,10 +1485,7 @@ mod tests {
     fn test_compose_single_chunk() {
         // MLP with no block boundaries → 1 chunk → compose → verify
         let mut builder = GraphBuilder::new((1, 4));
-        builder
-            .linear(4)
-            .activation(ActivationType::ReLU)
-            .linear(2);
+        builder.linear(4).activation(ActivationType::ReLU).linear(2);
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
@@ -1498,9 +1533,7 @@ mod tests {
     fn test_compose_matmul_only() {
         // 2 matmuls, no non-matmul ops → compose → verify unified_stark is None
         let mut builder = GraphBuilder::new((1, 4));
-        builder
-            .linear(4)
-            .linear(2);
+        builder.linear(4).linear(2);
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
@@ -1533,9 +1566,13 @@ mod tests {
         let composed = compose_chunk_proofs(&chunks, &graph, &input, &weights)
             .expect("composition should succeed");
 
-        assert!(composed.unified_stark.is_none(), "no non-matmul ops → no unified STARK");
+        assert!(
+            composed.unified_stark.is_none(),
+            "no non-matmul ops → no unified STARK"
+        );
         assert_eq!(
-            composed.matmul_proofs.len(), 2,
+            composed.matmul_proofs.len(),
+            2,
             "should have 2 matmul proofs"
         );
 
@@ -1580,9 +1617,16 @@ mod tests {
         let composed = compose_chunk_proofs(&chunks, &graph, &input, &weights)
             .expect("composition should succeed");
 
-        assert!(composed.unified_stark.is_some(), "should have unified STARK for activation + add");
+        assert!(
+            composed.unified_stark.is_some(),
+            "should have unified STARK for activation + add"
+        );
         assert_eq!(composed.add_claims.len(), 1, "should have 1 add claim");
-        assert_eq!(composed.activation_claims.len(), 1, "should have 1 activation claim");
+        assert_eq!(
+            composed.activation_claims.len(),
+            1,
+            "should have 1 activation claim"
+        );
 
         crate::aggregation::verify_aggregated_model_proof_onchain(
             composed, &graph, &input, &weights,
@@ -1601,13 +1645,13 @@ mod tests {
         // linear(4→4) → relu → layernorm → linear(4→4) → relu → layernorm → linear(4→2)
         let mut builder = GraphBuilder::new((1, 4));
         builder
-            .linear(4)       // node 0: matmul
+            .linear(4) // node 0: matmul
             .activation(ActivationType::ReLU) // node 1: relu
-            .layer_norm()    // node 2: layernorm
-            .linear(4)       // node 3: matmul
+            .layer_norm() // node 2: layernorm
+            .linear(4) // node 3: matmul
             .activation(ActivationType::ReLU) // node 4: relu
-            .layer_norm()    // node 5: layernorm
-            .linear(2);      // node 6: matmul
+            .layer_norm() // node 5: layernorm
+            .linear(2); // node 6: matmul
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
@@ -1658,13 +1702,8 @@ mod tests {
         assert_eq!(blocks[1], 2..5);
         assert_eq!(blocks[2], 5..7);
 
-        let results = prove_model_chunked_parallel(
-            &graph,
-            &input,
-            &weights,
-            100_000_000,
-        )
-        .expect("multi-chunk parallel proving should succeed");
+        let results = prove_model_chunked_parallel(&graph, &input, &weights, 100_000_000)
+            .expect("multi-chunk parallel proving should succeed");
 
         assert_eq!(results.len(), 3, "should produce 3 chunk results");
 
@@ -1675,9 +1714,8 @@ mod tests {
         assert_eq!(total_act, 2, "should have 2 activation claims total");
 
         // Verify forward pass output matches direct execution
-        let direct_result = crate::compiler::prove::prove_model(
-            &graph, &input, &weights,
-        ).expect("direct prove should succeed");
+        let direct_result = crate::compiler::prove::prove_model(&graph, &input, &weights)
+            .expect("direct prove should succeed");
         let direct_output = &direct_result.1.output;
         let chunked_output = &results.last().unwrap().output;
         assert_eq!(
@@ -1697,14 +1735,8 @@ mod tests {
         let dir = std::env::temp_dir().join("stwo_ml_multi_chunk_collect_test");
         let _ = std::fs::remove_dir_all(&dir);
 
-        let chunks = prove_model_chunked(
-            &graph,
-            &input,
-            &weights,
-            100_000_000,
-            &dir,
-        )
-        .expect("chunked proving should succeed");
+        let chunks = prove_model_chunked(&graph, &input, &weights, 100_000_000, &dir)
+            .expect("chunked proving should succeed");
 
         assert!(chunks.len() >= 2, "should have multiple chunks");
 
@@ -1715,15 +1747,24 @@ mod tests {
 
         // Verify global node IDs are unique and within range
         let matmul_ids: Vec<usize> = all_matmul.iter().map(|(id, _)| *id).collect();
-        assert!(matmul_ids.iter().all(|&id| id < graph.nodes.len()),
-            "all matmul IDs should be valid global node IDs");
+        assert!(
+            matmul_ids.iter().all(|&id| id < graph.nodes.len()),
+            "all matmul IDs should be valid global node IDs"
+        );
         let unique_ids: std::collections::HashSet<usize> = matmul_ids.iter().copied().collect();
-        assert_eq!(unique_ids.len(), matmul_ids.len(), "matmul IDs should be unique");
+        assert_eq!(
+            unique_ids.len(),
+            matmul_ids.len(),
+            "matmul IDs should be unique"
+        );
 
         // Verify chunk ranges are contiguous and cover the graph
         let mut covered = 0;
         for chunk in &chunks {
-            assert_eq!(chunk.node_range.start, covered, "chunks should be contiguous");
+            assert_eq!(
+                chunk.node_range.start, covered,
+                "chunks should be contiguous"
+            );
             covered = chunk.node_range.end;
         }
         assert_eq!(covered, graph.nodes.len(), "chunks should cover all nodes");
@@ -1735,10 +1776,7 @@ mod tests {
     fn test_multi_chunk_single_chunk_equivalence() {
         // No LayerNorm → 1 chunk. Verify chunked path matches direct path.
         let mut builder = GraphBuilder::new((1, 4));
-        builder
-            .linear(4)
-            .activation(ActivationType::ReLU)
-            .linear(2);
+        builder.linear(4).activation(ActivationType::ReLU).linear(2);
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
@@ -1763,16 +1801,15 @@ mod tests {
         weights.add_weight(2, w2);
 
         // Chunked path
-        let chunked_results = prove_model_chunked_parallel(
-            &graph, &input, &weights, 100_000_000,
-        ).expect("chunked proving should succeed");
+        let chunked_results = prove_model_chunked_parallel(&graph, &input, &weights, 100_000_000)
+            .expect("chunked proving should succeed");
 
         assert_eq!(chunked_results.len(), 1, "no LayerNorm → single chunk");
 
         // Direct path
-        let direct_proof = crate::aggregation::prove_model_aggregated_onchain(
-            &graph, &input, &weights,
-        ).expect("direct proving should succeed");
+        let direct_proof =
+            crate::aggregation::prove_model_aggregated_onchain(&graph, &input, &weights)
+                .expect("direct proving should succeed");
 
         // Same number of matmul proofs
         assert_eq!(
@@ -1823,12 +1860,12 @@ mod tests {
         {
             let mut builder = GraphBuilder::new((1, 4));
             builder
-                .linear(4)         // 0
+                .linear(4) // 0
                 .activation(ActivationType::ReLU) // 1
-                .layer_norm()      // 2
-                .linear(4)         // 3
-                .layer_norm()      // 4
-                .linear(2);        // 5
+                .layer_norm() // 2
+                .linear(4) // 3
+                .layer_norm() // 4
+                .linear(2); // 5
             let graph = builder.build();
             let blocks = graph.find_block_boundaries();
             assert_eq!(blocks.len(), 3, "2 LNs with prefix → 3 blocks");
@@ -1845,13 +1882,13 @@ mod tests {
         {
             let mut builder = GraphBuilder::new((1, 4));
             builder
-                .linear(4)         // 0
-                .layer_norm()      // 1
-                .linear(4)         // 2
-                .layer_norm()      // 3
-                .linear(4)         // 4
-                .layer_norm()      // 5
-                .linear(2);        // 6
+                .linear(4) // 0
+                .layer_norm() // 1
+                .linear(4) // 2
+                .layer_norm() // 3
+                .linear(4) // 4
+                .layer_norm() // 5
+                .linear(2); // 6
             let graph = builder.build();
             let blocks = graph.find_block_boundaries();
             assert_eq!(blocks.len(), 4, "3 LNs with prefix → 4 blocks");
@@ -1868,10 +1905,10 @@ mod tests {
         {
             let mut builder = GraphBuilder::new((1, 4));
             builder
-                .layer_norm()      // 0
-                .linear(4)         // 1
-                .layer_norm()      // 2
-                .linear(2);        // 3
+                .layer_norm() // 0
+                .linear(4) // 1
+                .layer_norm() // 2
+                .linear(2); // 3
             let graph = builder.build();
             let blocks = graph.find_block_boundaries();
             assert_eq!(blocks.len(), 2, "2 LNs at start → 2 blocks (no prefix)");
