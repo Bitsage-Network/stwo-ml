@@ -73,7 +73,7 @@ use crate::components::layernorm::{
     build_rsqrt_table, LayerNormConfig, LayerNormEval, LayerNormRelation,
 };
 use crate::components::matmul::{
-    estimate_sumcheck_memory, matmul_m31, prove_matmul_sumcheck_auto,
+    estimate_sumcheck_memory, matmul_m31_auto, prove_matmul_sumcheck_auto,
     prove_matmul_sumcheck_onchain_auto, M31Matrix, MatMulSumcheckProof, MatMulSumcheckProofOnChain,
 };
 use crate::components::quantize::{build_quantize_table, QuantizeEval, QuantizeRelation};
@@ -661,12 +661,7 @@ where
                     .get_weight(node.id)
                     .ok_or(ModelError::MissingWeight(node.id))?;
 
-                // GPU GEMM for all matrix sizes, CPU fallback
-                #[cfg(feature = "cuda-runtime")]
-                let output = crate::gpu_sumcheck::gpu_matmul_m31_full(&current, weight)
-                    .unwrap_or_else(|_| matmul_m31(&current, weight));
-                #[cfg(not(feature = "cuda-runtime"))]
-                let output = matmul_m31(&current, weight);
+                let output = matmul_m31_auto(&current, weight);
 
                 let proof = prove_matmul_sumcheck_auto(&current, weight, &output).map_err(|e| {
                     ModelError::ProvingError {
@@ -2270,23 +2265,13 @@ where
                         let weight = weights
                             .get_weight(node.id)
                             .ok_or(ModelError::MissingWeight(node.id))?;
-                        #[cfg(feature = "cuda-runtime")]
-                        let out = crate::gpu_sumcheck::gpu_matmul_m31_full(&current, weight)
-                            .unwrap_or_else(|_| matmul_m31(&current, weight));
-                        #[cfg(not(feature = "cuda-runtime"))]
-                        let out = matmul_m31(&current, weight);
-                        out
+                        matmul_m31_auto(&current, weight)
                     }
                 } else {
                     let weight = weights
                         .get_weight(node.id)
                         .ok_or(ModelError::MissingWeight(node.id))?;
-                    #[cfg(feature = "cuda-runtime")]
-                    let out = crate::gpu_sumcheck::gpu_matmul_m31_full(&current, weight)
-                        .unwrap_or_else(|_| matmul_m31(&current, weight));
-                    #[cfg(not(feature = "cuda-runtime"))]
-                    let out = matmul_m31(&current, weight);
-                    out
+                    matmul_m31_auto(&current, weight)
                 };
 
                 // Collect for deferred proving (Phase 2) — skipped if precomputed has proofs
@@ -4448,11 +4433,7 @@ where
                     .get_weight(node.id)
                     .ok_or(ModelError::MissingWeight(node.id))?;
 
-                #[cfg(feature = "cuda-runtime")]
-                let output = crate::gpu_sumcheck::gpu_matmul_m31_full(&current, weight)
-                    .unwrap_or_else(|_| matmul_m31(&current, weight));
-                #[cfg(not(feature = "cuda-runtime"))]
-                let output = matmul_m31(&current, weight);
+                let output = matmul_m31_auto(&current, weight);
 
                 eprintln!(
                     "  [{}/{}] Node {} MatMul {}x{}x{} — forward only (GKR deferred)",
@@ -5227,7 +5208,7 @@ pub(crate) fn collect_forward_pass_layer_data(
                 let weight = weights
                     .get_weight(node.id)
                     .ok_or(ModelError::MissingWeight(node.id))?;
-                let output = matmul_m31(&current, weight);
+                let output = matmul_m31_auto(&current, weight);
                 intermediates.push((node.id, current.clone()));
                 node_outputs.insert(node.id, output.clone());
                 current = output;
@@ -6739,7 +6720,7 @@ pub fn verify_aggregated_model_proof(
                 let weight = weights
                     .get_weight(node.id)
                     .ok_or(ModelError::MissingWeight(node.id))?;
-                let output = matmul_m31(&current, weight);
+                let output = matmul_m31_auto(&current, weight);
                 matmul_matrices.insert(node.id, (current.clone(), weight.clone(), output.clone()));
                 node_outputs.insert(node.id, output.clone());
                 current = output;
@@ -7054,7 +7035,7 @@ pub fn verify_aggregated_model_proof_onchain(
                 let weight = weights
                     .get_weight(node.id)
                     .ok_or(ModelError::MissingWeight(node.id))?;
-                let output = matmul_m31(&current, weight);
+                let output = matmul_m31_auto(&current, weight);
                 node_outputs.insert(node.id, output.clone());
                 current = output;
             }
@@ -8045,7 +8026,7 @@ fn verify_attention_proof_blake2s(
         let k_t = transpose_m31(&kv_heads_k[kv_idx]);
         let q_h_p = pad_to_pow2(&q_heads[h]);
         let k_t_p = pad_to_pow2(&k_t);
-        let scores_p = matmul_m31(&q_h_p, &k_t_p);
+        let scores_p = matmul_m31_auto(&q_h_p, &k_t_p);
 
         verify_matmul_sumcheck(&proof.score_proofs[h], &q_h_p, &k_t_p, &scores_p).map_err(|e| {
             AggregationError::VerificationFailed(format!("Attention score head {h}: {e}"))
@@ -8054,7 +8035,7 @@ fn verify_attention_proof_blake2s(
         // Per-head: context = softmax × V_kv (padded)
         let soft_p = pad_to_pow2(&inter.softmax_outputs[h]);
         let v_h_p = pad_to_pow2(&kv_heads_v[kv_idx]);
-        let context_p = matmul_m31(&soft_p, &v_h_p);
+        let context_p = matmul_m31_auto(&soft_p, &v_h_p);
 
         verify_matmul_sumcheck(&proof.attn_v_proofs[h], &soft_p, &v_h_p, &context_p).map_err(
             |e| AggregationError::VerificationFailed(format!("Attention attn_v head {h}: {e}")),
@@ -9790,7 +9771,7 @@ mod tests {
         );
 
         // Independently recompute and verify the commitment matches
-        let matmul_output = matmul_m31(&input, weights.get_weight(0).unwrap());
+        let matmul_output = matmul_m31_auto(&input, weights.get_weight(0).unwrap());
         let ln = apply_layernorm_detailed(&matmul_output, 4);
         let expected = compute_layernorm_mean_var_commitment(&ln.means, &ln.variances);
         assert_eq!(

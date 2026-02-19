@@ -34,7 +34,7 @@ use crate::components::layernorm::{
     build_rsqrt_table, LayerNormConfig, LayerNormEval, LayerNormRelation,
 };
 use crate::components::matmul::{
-    matmul_m31, prove_matmul_sumcheck_auto, M31Matrix, MatMulSumcheckProof,
+    matmul_m31_auto, prove_matmul_sumcheck_auto, M31Matrix, MatMulSumcheckProof,
 };
 use crate::gadgets::lookup_table::PrecomputedTable;
 
@@ -1263,7 +1263,7 @@ where
                     .ok_or(ModelError::MissingWeight(node.id))?;
 
                 // Forward pass: C = current × weight
-                let output = matmul_m31(&current, weight);
+                let output = matmul_m31_auto(&current, weight);
 
                 // Generate sumcheck proof
                 let proof = prove_matmul_sumcheck_auto(&current, weight, &output).map_err(|e| {
@@ -1620,7 +1620,7 @@ where
                 let weight = weights
                     .get_weight(node.id)
                     .ok_or(ModelError::MissingWeight(node.id))?;
-                let output = matmul_m31(&current, weight);
+                let output = matmul_m31_auto(&current, weight);
                 let proof = prove_matmul_sumcheck_auto(&current, weight, &output).map_err(|e| {
                     ModelError::ProvingError {
                         layer: node.id,
@@ -1855,7 +1855,7 @@ pub fn verify_model_matmuls<H: MerkleHasherLifted>(
                     .get_weight(node.id)
                     .ok_or(ModelError::MissingWeight(node.id))?;
 
-                let c = matmul_m31(&current, weight);
+                let c = matmul_m31_auto(&current, weight);
 
                 if let Some(p) = proof {
                     if let LayerProofKind::Sumcheck(matmul_proof) = &p.kind {

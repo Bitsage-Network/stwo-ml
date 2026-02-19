@@ -31,7 +31,7 @@ use crate::compiler::graph::{ComputationGraph, GraphOp, GraphWeights};
 use crate::compiler::quantize_weights::{quantize_weight_matrix, quantize_weight_tile, WeightError};
 use crate::compiler::safetensors::{tensor_to_f32, dtype_byte_size, bytes_to_f32_single};
 use crate::components::matmul::{
-    M31Matrix, matmul_m31, pad_matrix_pow2, prove_matmul_sumcheck_onchain_auto,
+    M31Matrix, matmul_m31_auto, pad_matrix_pow2, prove_matmul_sumcheck_onchain_auto,
 };
 use crate::components::tiled_matmul::{
     TiledMatMulConfig, TiledMatMulProof, TileProof, TiledMatMulError,
@@ -491,12 +491,12 @@ impl StreamingWeightPipeline {
                     let loader = s.spawn(|| {
                         self.load_weight_tile(node_id, next_k_start, next_k_end, &params)
                     });
-                    let c_tile = matmul_m31(&a_tile, &b_tile);
+                    let c_tile = matmul_m31_auto(&a_tile, &b_tile);
                     let next = loader.join().expect("loader thread panicked");
                     (c_tile, Some(next))
                 })
             } else {
-                (matmul_m31(&a_tile, &b_tile), None)
+                (matmul_m31_auto(&a_tile, &b_tile), None)
             };
 
             // Accumulate: C[i][j] += C_tile[i][j]
@@ -587,7 +587,7 @@ impl StreamingWeightPipeline {
             // Prepare this tile's inputs from the pre-loaded B tile.
             let b_tile = current_b_tile;
             let a_tile = extract_col_slice(a, k_start, k_end);
-            let c_tile = matmul_m31(&a_tile, &b_tile);
+            let c_tile = matmul_m31_auto(&a_tile, &b_tile);
             let a_padded = pad_matrix_pow2(&a_tile);
             let b_padded = pad_matrix_pow2(&b_tile);
             let c_padded = pad_matrix_pow2(&c_tile);
@@ -680,7 +680,7 @@ impl StreamingWeightPipeline {
                 })?;
 
             let a_tile = extract_col_slice(a, k_start, k_end);
-            let c_tile = matmul_m31(&a_tile, &b_tile);
+            let c_tile = matmul_m31_auto(&a_tile, &b_tile);
             let a_padded = pad_matrix_pow2(&a_tile);
             let b_padded = pad_matrix_pow2(&b_tile);
             let c_padded = pad_matrix_pow2(&c_tile);

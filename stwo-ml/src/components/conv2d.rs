@@ -5,7 +5,7 @@
 //! the existing sumcheck infrastructure.
 
 use stwo::core::fields::m31::M31;
-use crate::components::matmul::{M31Matrix, matmul_m31};
+use crate::components::matmul::{M31Matrix, matmul_m31_auto};
 
 /// im2col configuration.
 #[derive(Debug, Clone, Copy)]
@@ -139,7 +139,7 @@ pub fn conv2d_forward(
 ) -> (M31Matrix, M31Matrix, M31Matrix) {
     let im2col_mat = im2col(input, config);
     let kernel_mat = reshape_kernel(kernel, out_channels, config.in_channels, config.kernel_size);
-    let output = matmul_m31(&im2col_mat, &kernel_mat);
+    let output = matmul_m31_auto(&im2col_mat, &kernel_mat);
     (im2col_mat, kernel_mat, output)
 }
 
@@ -223,7 +223,7 @@ mod tests {
         assert_eq!(output.cols, 2);
 
         // Verify output matches manual im2col × kernel
-        let manual_output = matmul_m31(&im2col_mat, &kernel_mat);
+        let manual_output = matmul_m31_auto(&im2col_mat, &kernel_mat);
         assert_eq!(output.data, manual_output.data, "conv2d_forward should match manual im2col + matmul");
     }
 }

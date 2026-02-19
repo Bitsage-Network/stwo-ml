@@ -17,7 +17,7 @@ use crate::compiler::prove::{
     apply_activation_pub, apply_layernorm_pub, apply_rmsnorm_detailed,
     elementwise_add, elementwise_mul,
 };
-use crate::components::matmul::{matmul_m31, M31Matrix};
+use crate::components::matmul::{matmul_m31_auto, M31Matrix};
 
 use stwo::core::fields::m31::M31;
 
@@ -63,7 +63,7 @@ pub fn execute_forward_pass(
                 let weight = weights.get_weight(node.id).ok_or_else(|| {
                     AuditError::ProvingFailed(format!("missing weight for node {}", node.id))
                 })?;
-                matmul_m31(&current, weight)
+                matmul_m31_auto(&current, weight)
             }
             GraphOp::Activation { activation_type, .. } => {
                 let f = activation_type.as_fn();

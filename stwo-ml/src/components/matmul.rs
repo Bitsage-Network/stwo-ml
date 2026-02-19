@@ -620,6 +620,28 @@ pub fn matmul_m31(a: &M31Matrix, b: &M31Matrix) -> M31Matrix {
     }
 }
 
+/// GPU-accelerated M31 matrix multiply with automatic CPU fallback.
+///
+/// When the `cuda-runtime` feature is enabled and a GPU is available,
+/// dispatches to the CUDA GEMM kernel (`gpu_matmul_m31_full`).
+/// Falls back to CPU `matmul_m31` if GPU init fails or if CUDA is
+/// not compiled in.
+///
+/// This should be the default entry point for all forward-pass matmuls.
+pub fn matmul_m31_auto(a: &M31Matrix, b: &M31Matrix) -> M31Matrix {
+    #[cfg(feature = "cuda-runtime")]
+    {
+        match crate::gpu_sumcheck::gpu_matmul_m31_full(a, b) {
+            Ok(result) => return result,
+            Err(e) => {
+                // Log once and fall back to CPU
+                eprintln!("[matmul] GPU dispatch failed, falling back to CPU: {e}");
+            }
+        }
+    }
+    matmul_m31(a, b)
+}
+
 /// Pad a matrix to the next power-of-2 dimensions (zero-padding).
 ///
 /// Required by sumcheck protocol which operates on boolean hypercubes.

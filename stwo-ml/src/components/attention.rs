@@ -44,7 +44,7 @@ type Blake2sHash = <Blake2sMerkleChannel as MerkleChannel>::H;
 use crate::compiler::prove::prove_activation_layer;
 use crate::components::activation::{ActivationEval, ActivationType};
 use crate::components::matmul::{
-    matmul_m31, prove_matmul_sumcheck_auto, prove_matmul_sumcheck_onchain_auto, M31Matrix,
+    matmul_m31_auto, prove_matmul_sumcheck_auto, prove_matmul_sumcheck_onchain_auto, M31Matrix,
     MatMulError, MatMulSumcheckProof, MatMulSumcheckProofOnChain,
 };
 use crate::gadgets::lookup_table::activations::softmax_exp;
@@ -399,9 +399,9 @@ pub fn attention_forward_cached(
     let new_tokens = input.rows;
 
     // Project new tokens: Q, K_new, V_new
-    let q = matmul_m31(input, &weights.w_q);
-    let k_new = matmul_m31(input, &weights.w_k);
-    let v_new = matmul_m31(input, &weights.w_v);
+    let q = matmul_m31_auto(input, &weights.w_q);
+    let k_new = matmul_m31_auto(input, &weights.w_k);
+    let v_new = matmul_m31_auto(input, &weights.w_v);
 
     // Append new K/V to cache
     cache.append(&k_new, &v_new);
@@ -423,7 +423,7 @@ pub fn attention_forward_cached(
         // Score: Q_new × K_full^T → (new_tokens, total_len)
         let k_full = cache.get_k(kv_idx);
         let k_t = transpose_m31(k_full);
-        let mut scores = matmul_m31(&q_heads[h], &k_t);
+        let mut scores = matmul_m31_auto(&q_heads[h], &k_t);
 
         // Scale
         for val in scores.data.iter_mut() {
@@ -449,12 +449,12 @@ pub fn attention_forward_cached(
 
         // Context: softmax × V_full → (new_tokens, d_k)
         let v_full = cache.get_v(kv_idx);
-        let context = matmul_m31(&soft, v_full);
+        let context = matmul_m31_auto(&soft, v_full);
         head_outputs.push(context);
     }
 
     let concat = concat_heads(&head_outputs);
-    let final_output = matmul_m31(&concat, &weights.w_o);
+    let final_output = matmul_m31_auto(&concat, &weights.w_o);
 
     // Build full K/V from cache for intermediates
     let k_full_mat = {
@@ -702,9 +702,9 @@ pub fn attention_forward(
 
     // Projections: Q = input × W_Q, K = input × W_K, V = input × W_V
     // For GQA: W_K is (d_model, num_kv_heads * d_k), W_V likewise
-    let q = matmul_m31(input, &weights.w_q);
-    let k = matmul_m31(input, &weights.w_k);
-    let v = matmul_m31(input, &weights.w_v);
+    let q = matmul_m31_auto(input, &weights.w_q);
+    let k = matmul_m31_auto(input, &weights.w_k);
+    let v = matmul_m31_auto(input, &weights.w_v);
 
     // Split Q into num_heads heads, K/V into num_kv_heads heads
     let q_heads = split_heads(&q, config.num_heads);
@@ -724,7 +724,7 @@ pub fn attention_forward(
 
         // Score: Q_h × K_kv^T
         let k_t = transpose_m31(&kv_heads_k[kv_idx]);
-        let mut scores = matmul_m31(&q_heads[h], &k_t);
+        let mut scores = matmul_m31_auto(&q_heads[h], &k_t);
 
         // Scale by 1/√d_k
         for val in scores.data.iter_mut() {
@@ -743,7 +743,7 @@ pub fn attention_forward(
         softmax_outputs.push(soft.clone());
 
         // Context: softmax × V_kv
-        let context = matmul_m31(&soft, &kv_heads_v[kv_idx]);
+        let context = matmul_m31_auto(&soft, &kv_heads_v[kv_idx]);
         head_outputs.push(context);
     }
 
@@ -751,7 +751,7 @@ pub fn attention_forward(
     let concat = concat_heads(&head_outputs);
 
     // Output projection
-    let final_output = matmul_m31(&concat, &weights.w_o);
+    let final_output = matmul_m31_auto(&concat, &weights.w_o);
 
     AttentionIntermediates {
         q,
@@ -878,7 +878,7 @@ where
         let k_t_p = pad_to_pow2(&k_t);
 
         // We need the padded score matrix that matches q_h_p × k_t_p
-        let scores_p_raw = matmul_m31(&q_h_p, &k_t_p);
+        let scores_p_raw = matmul_m31_auto(&q_h_p, &k_t_p);
         let score_proof =
             prove_matmul_sumcheck_auto(&q_h_p, &k_t_p, &scores_p_raw).map_err(|e| {
                 AttentionError::MatMul {
@@ -898,7 +898,7 @@ where
         // Per-head: context = softmax × V_kv
         let soft_p = pad_to_pow2(&intermediates.softmax_outputs[h]);
         let v_h_p = pad_to_pow2(&kv_heads_v[kv_idx]);
-        let context_p = matmul_m31(&soft_p, &v_h_p);
+        let context_p = matmul_m31_auto(&soft_p, &v_h_p);
         let attn_v_proof =
             prove_matmul_sumcheck_auto(&soft_p, &v_h_p, &context_p).map_err(|e| {
                 AttentionError::MatMul {
@@ -1003,7 +1003,7 @@ pub fn prove_attention_onchain(
         let k_t = transpose_m31(&kv_heads_k[kv_idx]);
         let q_h_p = pad_to_pow2(&q_heads[h]);
         let k_t_p = pad_to_pow2(&k_t);
-        let scores_p = matmul_m31(&q_h_p, &k_t_p);
+        let scores_p = matmul_m31_auto(&q_h_p, &k_t_p);
         let sp = prove_matmul_sumcheck_onchain_auto(&q_h_p, &k_t_p, &scores_p).map_err(|e| {
             AttentionError::MatMul {
                 stage: format!("score_head_{h}"),
@@ -1021,7 +1021,7 @@ pub fn prove_attention_onchain(
 
         let soft_p = pad_to_pow2(&intermediates.softmax_outputs[h]);
         let v_h_p = pad_to_pow2(&kv_heads_v[kv_idx]);
-        let context_p = matmul_m31(&soft_p, &v_h_p);
+        let context_p = matmul_m31_auto(&soft_p, &v_h_p);
         let avp = prove_matmul_sumcheck_onchain_auto(&soft_p, &v_h_p, &context_p).map_err(|e| {
             AttentionError::MatMul {
                 stage: format!("attn_v_head_{h}"),

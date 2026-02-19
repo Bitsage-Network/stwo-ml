@@ -16,16 +16,16 @@ use crate::compiler::graph::{GraphExecution, GraphWeights};
 use crate::components::attention::{
     attention_forward, split_heads, transpose_m31, AttentionWeights, MultiHeadAttentionConfig,
 };
-#[cfg(feature = "cuda-runtime")]
-use crate::components::matmul::matmul_m31;
+use crate::components::matmul::matmul_m31_auto;
 use crate::components::matmul::matrix_to_mle_col_major_padded_pub as matrix_to_mle_col_major_padded;
 #[cfg(feature = "cuda-runtime")]
 use crate::components::matmul::matrix_to_mle_col_major_u32_padded_pub as matrix_to_mle_col_major_u32_padded;
 use crate::components::matmul::{
-    evaluate_mle_pub as evaluate_mle, matrix_to_mle_col_major_pub as matrix_to_mle_col_major,
-    matrix_to_mle_pub as matrix_to_mle, pad_matrix_pow2, M31Matrix,
+    evaluate_mle_pub as evaluate_mle,
+    matrix_to_mle_col_major_pub as matrix_to_mle_col_major,
+    matrix_to_mle_pub as matrix_to_mle, pad_matrix_pow2,
+    restrict_mle_pub as restrict_mle, M31Matrix,
 };
-use crate::components::matmul::restrict_mle_pub as restrict_mle;
 use crate::crypto::aggregated_opening::{
     prove_aggregated_binding, AggregatedWeightClaim,
 };
@@ -5351,7 +5351,7 @@ fn reduce_attention_layer_simd_gpu(
         let block_k_h_t_refs: Vec<&M31Matrix> = block_k_h_t.iter().collect();
 
         let block_raw_scores: Vec<M31Matrix> = (0..n_blocks)
-            .map(|b| matmul_m31(block_q_h[b], &block_k_h_t[b]))
+            .map(|b| matmul_m31_auto(block_q_h[b], &block_k_h_t[b]))
             .collect();
         let block_score_mles: Vec<Vec<SecureField>> = block_raw_scores
             .iter()
@@ -5568,8 +5568,7 @@ fn reduce_attention_layer(
                             channel: &mut PoseidonChannel|
      -> Result<(LayerProof, GKRClaim, SecureField), GKRError> {
         // Build output MLE
-        use crate::components::matmul::matmul_m31;
-        let c = matmul_m31(a, b);
+        let c = matmul_m31_auto(a, b);
         let c_padded = pad_matrix_pow2(&c);
         let c_mle = matrix_to_mle(&c_padded);
 
@@ -5674,7 +5673,7 @@ fn reduce_attention_layer(
     sub_claim_values.push(k_value);
 
     // Q projection — this one determines the final input claim
-    let q = crate::components::matmul::matmul_m31(input_matrix, &attn_weights.w_q);
+    let q = matmul_m31_auto(input_matrix, &attn_weights.w_q);
     let q_padded = pad_matrix_pow2(&q);
     let q_mle = matrix_to_mle(&q_padded);
     let log_rows = q_padded.rows.ilog2() as usize;

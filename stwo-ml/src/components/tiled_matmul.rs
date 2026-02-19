@@ -18,7 +18,7 @@ use stwo::core::fields::qm31::SecureField;
 
 use super::matmul::{
     M31Matrix, MatMulSumcheckProofOnChain,
-    estimate_sumcheck_memory, matmul_m31, pad_matrix_pow2,
+    estimate_sumcheck_memory, matmul_m31_auto, pad_matrix_pow2,
     prove_matmul_sumcheck_onchain_auto,
 };
 
@@ -189,7 +189,7 @@ pub fn prove_tiled_matmul(
         let b_tile = extract_row_slice(b, k_start, k_end);
 
         // Compute partial product for this tile: C_tile = A_tile × B_tile
-        let c_tile = matmul_m31(&a_tile, &b_tile);
+        let c_tile = matmul_m31_auto(&a_tile, &b_tile);
 
         // Pad to power-of-2 dimensions for sumcheck
         let a_padded = pad_matrix_pow2(&a_tile);
@@ -359,7 +359,7 @@ mod tests {
         b.set(1, 0, M31::from(7));
         b.set(1, 1, M31::from(8));
 
-        let c = matmul_m31(&a, &b);
+        let c = matmul_m31_auto(&a, &b);
 
         let config = TiledMatMulConfig::new(2);
         let proof = prove_tiled_matmul(&a, &b, &c, &config)
@@ -378,7 +378,7 @@ mod tests {
         // 2×4 × 4×2 with tile_k=2 → 2 tiles
         let a = make_matrix(2, 4, 3);
         let b = make_matrix(4, 2, 7);
-        let c = matmul_m31(&a, &b);
+        let c = matmul_m31_auto(&a, &b);
 
         let config = TiledMatMulConfig::new(2);
         let proof = prove_tiled_matmul(&a, &b, &c, &config)
@@ -414,7 +414,7 @@ mod tests {
         // Single-tile composition is trivially sound
         let a = make_matrix(2, 2, 3);
         let b = make_matrix(2, 2, 7);
-        let c = matmul_m31(&a, &b);
+        let c = matmul_m31_auto(&a, &b);
 
         let config = TiledMatMulConfig::new(2); // tile_k=2 == k=2 → single tile
         let tiled_proof = prove_tiled_matmul(&a, &b, &c, &config)
@@ -434,7 +434,7 @@ mod tests {
         // Multi-tile composition is unsound and must be rejected
         let a = make_matrix(2, 4, 3);
         let b = make_matrix(4, 2, 7);
-        let c = matmul_m31(&a, &b);
+        let c = matmul_m31_auto(&a, &b);
 
         let config = TiledMatMulConfig::new(2); // tile_k=2 < k=4 → 2 tiles
         let tiled_proof = prove_tiled_matmul(&a, &b, &c, &config)
