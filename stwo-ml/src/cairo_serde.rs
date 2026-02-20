@@ -1609,7 +1609,7 @@ pub fn serialize_gkr_proof_data_only(
         // Claim value (the skip_eval from the Add reduction)
         serialize_qm31(deferred.claim.value, output);
         // MatMul dimensions
-        let (m, k, n) = deferred.dims;
+        let (m, k, n) = deferred.dims().unwrap_or((0, 0, 0));
         serialize_u32(m as u32, output);
         serialize_u32(k as u32, output);
         serialize_u32(n as u32, output);
@@ -1625,7 +1625,7 @@ pub fn serialize_gkr_proof_data_only(
             serialize_qm31(*final_b_eval, output);
         }
         // Weight commitment
-        output.push(deferred.weight_commitment);
+        output.push(deferred.weight_commitment().unwrap_or(starknet_ff::FieldElement::ZERO));
     }
 }
 

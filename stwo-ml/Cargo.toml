@@ -22,6 +22,8 @@ aes-fallback = ["audit", "dep:aes-gcm", "dep:sha2"]
 cli = ["model-loading", "dep:clap", "dep:serde_json", "serde", "dep:getrandom"]
 server = ["model-loading", "dep:axum", "dep:tower-http", "dep:uuid", "dep:tokio", "dep:serde_json", "serde", "dep:getrandom"]
 server-audit = ["server", "audit"]
+proof-stream = ["dep:proof-stream"]
+proof-stream-rerun = ["proof-stream", "proof-stream/rerun"]
 
 [dependencies]
 stwo = { path = "../stwo/crates/stwo", features = ["prover"] }
@@ -49,6 +51,7 @@ sha2 = { version = "0.10", optional = true }
 ureq = { version = "3", optional = true }
 sha3 = { version = "0.10", optional = true }
 getrandom = { version = "0.2", optional = true }
+proof-stream = { path = "../proof-stream", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -73,6 +76,10 @@ required-features = ["cli"]
 name = "prove-server"
 path = "src/bin/prove_server.rs"
 required-features = ["server"]
+
+[[example]]
+name = "rerun_demo"
+required-features = ["proof-stream-rerun"]
 
 [[bench]]
 name = "matmul"

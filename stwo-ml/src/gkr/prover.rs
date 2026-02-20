@@ -572,6 +572,7 @@ pub fn prove_gkr(
                 #[cfg(feature = "proof-stream")]
                 {
                     let total_rounds = reduction.round_polys.len();
+                    let initial_claim = sf_to_f32(current_claim.value);
                     for (round, rp) in reduction.round_polys.iter().enumerate() {
                         let c0 = proof_stream::SecureFieldMirror {
                             a: rp.c0.0.0.0,
@@ -591,7 +592,8 @@ pub fn prove_gkr(
                             c: rp.c2.1.0.0,
                             d: rp.c2.1.1.0,
                         };
-                        let claim_approx = c0.as_f32() + c1.as_f32() + c2.as_f32();
+                        // Geometric decrease: each round halves the claim (one hypercube variable fixed)
+                        let claim_approx = initial_claim / (1u32 << round.min(30)) as f32;
                         emit_proof_event!(|| proof_stream::ProofEvent::SumcheckRound {
                             layer_idx,
                             round,
@@ -719,6 +721,37 @@ pub fn prove_gkr(
             duration_ms: _ps_layer_t.elapsed().as_millis() as u64,
             rounds_completed: 0,
         });
+        #[cfg(feature = "proof-stream")]
+        {
+            let layers_total = circuit.layers.len();
+            emit_proof_event!(|| {
+                #[cfg(not(feature = "cuda-runtime"))]
+                let devices = vec![proof_stream::GpuSnapshot {
+                    device_id: 0,
+                    device_name: "CPU (SIMD)".to_string(),
+                    utilization: (layer_idx + 1) as f32 / layers_total as f32,
+                    free_memory_bytes: None,
+                }];
+                #[cfg(feature = "cuda-runtime")]
+                let devices: Vec<proof_stream::GpuSnapshot> =
+                    crate::multi_gpu::discover_devices()
+                        .iter()
+                        .map(|d| proof_stream::GpuSnapshot {
+                            device_id: d.ordinal,
+                            device_name: d.name.clone(),
+                            utilization: (layer_idx + 1) as f32 / layers_total as f32,
+                            free_memory_bytes: Some(d.total_memory),
+                        })
+                        .collect();
+                proof_stream::ProofEvent::GpuStatus {
+                    devices,
+                    matmul_done: layer_proofs.len(),
+                    matmul_total: layers_total,
+                    layers_done: layer_idx + 1,
+                    layers_total,
+                }
+            });
+        }
     }
 
     let flags = compute_weight_mode_flags();

@@ -597,6 +597,25 @@ impl std::fmt::Debug for GkrBatchData {
     }
 }
 
+/// Map a `GraphOp` to the corresponding `proof_stream::LayerKind` for visualization.
+#[cfg(feature = "proof-stream")]
+fn graph_op_to_layer_kind(op: &crate::compiler::graph::GraphOp) -> proof_stream::LayerKind {
+    use crate::compiler::graph::GraphOp;
+    match op {
+        GraphOp::MatMul { .. }      => proof_stream::LayerKind::MatMul,
+        GraphOp::Activation { .. }  => proof_stream::LayerKind::Activation,
+        GraphOp::Add { .. }         => proof_stream::LayerKind::Add,
+        GraphOp::Mul { .. }         => proof_stream::LayerKind::Mul,
+        GraphOp::LayerNorm { .. }   => proof_stream::LayerKind::LayerNorm,
+        GraphOp::RMSNorm { .. }     => proof_stream::LayerKind::RMSNorm,
+        GraphOp::Attention { .. }   => proof_stream::LayerKind::Attention,
+        GraphOp::Embedding { .. }   => proof_stream::LayerKind::Embedding,
+        GraphOp::Quantize { .. }    => proof_stream::LayerKind::Quantize,
+        GraphOp::Dequantize { .. }  => proof_stream::LayerKind::Dequantize,
+        _                           => proof_stream::LayerKind::MatMul,
+    }
+}
+
 /// Prove an entire computation graph with aggregated STARK proof,
 /// generic over backend and Merkle channel.
 ///
@@ -1058,7 +1077,9 @@ where
                     sink.emit(proof_stream::ProofEvent::LayerActivation {
                         layer_idx: idx,
                         node_id: *node_id,
-                        kind: proof_stream::LayerKind::Add,
+                        kind: graph.nodes.iter().find(|n| n.id == *node_id)
+                            .map(|n| graph_op_to_layer_kind(&n.op))
+                            .unwrap_or(proof_stream::LayerKind::MatMul),
                         output_shape: (matrix.rows, matrix.cols),
                         output_sample: sample,
                         stats: proof_stream::ActivationStats {
@@ -4848,6 +4869,52 @@ where
         "  Forward pass complete in {:.2}s",
         t_start.elapsed().as_secs_f64()
     );
+
+    // ── proof-stream: emit LayerActivation for all forward-pass intermediates ─
+    #[cfg(feature = "proof-stream")]
+    {
+        use crate::gkr::prover::PROOF_SINK;
+        PROOF_SINK.with(|s| {
+            if let Some(sink) = s.borrow().as_ref() {
+                for (idx, (node_id, matrix)) in intermediates.iter().enumerate() {
+                    let sample: Vec<u32> = matrix.data
+                        .iter()
+                        .step_by((matrix.data.len() / 128).max(1))
+                        .take(128)
+                        .map(|v| v.0)
+                        .collect();
+                    let n = matrix.data.len() as f64;
+                    let mean = matrix.data.iter().map(|v| v.0 as f64).sum::<f64>() / n.max(1.0);
+                    let std = if n > 1.0 {
+                        (matrix.data.iter()
+                            .map(|v| (v.0 as f64 - mean).powi(2))
+                            .sum::<f64>() / (n - 1.0)).sqrt()
+                    } else { 0.0 };
+                    let min = matrix.data.iter().map(|v| v.0).min().unwrap_or(0);
+                    let max = matrix.data.iter().map(|v| v.0).max().unwrap_or(0);
+                    let zeros = matrix.data.iter().filter(|v| v.0 == 0).count();
+                    let kind = graph.nodes.iter().find(|n| n.id == *node_id)
+                        .map(|n| graph_op_to_layer_kind(&n.op))
+                        .unwrap_or(proof_stream::LayerKind::MatMul);
+                    sink.emit(proof_stream::ProofEvent::LayerActivation {
+                        layer_idx: idx,
+                        node_id: *node_id,
+                        kind,
+                        output_shape: (matrix.rows, matrix.cols),
+                        output_sample: sample,
+                        stats: proof_stream::ActivationStats {
+                            mean: mean as f32,
+                            std_dev: std as f32,
+                            min: min as f32,
+                            max: max as f32,
+                            sparsity: zeros as f32 / n.max(1.0) as f32,
+                        },
+                    });
+                }
+            }
+        });
+    }
+    // ── end proof-stream ──────────────────────────────────────────────────────
 
     // Phase 2: GKR proof (replaces per-matmul sumcheck)
     let t_gkr = std::time::Instant::now();

@@ -1891,7 +1891,11 @@ fn run_deposit_command(cmd: &DepositCmd) {
     eprintln!("  Proving batch (1 deposit, 0 withdrawals, 0 spends)...");
 
     let mut builder = TxBuilder::new();
-    builder.deposit(cmd.amount, cmd.asset, recipient_pk, recipient_vk);
+    builder.deposit(cmd.amount, cmd.asset, recipient_pk, recipient_vk)
+        .unwrap_or_else(|e| {
+            eprintln!("Error: invalid deposit parameters: {e}");
+            process::exit(1);
+        });
 
     let result = builder.prove().unwrap_or_else(|e| {
         eprintln!("Error: proving failed: {e}");
@@ -2076,7 +2080,7 @@ fn run_withdraw_command(cmd: &WithdrawCmd) {
 
         // Local verification before proving
         use stwo_ml::crypto::merkle_m31::verify_merkle_proof;
-        if !verify_merkle_proof(&root, &commitment, &path) {
+        if !verify_merkle_proof(&root, &commitment, &path, 20) {
             eprintln!("Error: local Merkle proof verification failed");
             eprintln!("Hint: delete ~/.vm31/tree_cache.json and re-sync");
             process::exit(1);
@@ -2092,7 +2096,7 @@ fn run_withdraw_command(cmd: &WithdrawCmd) {
         eprintln!("  Warning: no audit-http feature, using ephemeral tree");
         let mut tree = PoseidonMerkleTreeM31::new(20);
         tree.append(commitment);
-        let path = tree.prove(0);
+        let path = tree.prove(0).unwrap();
         let root = tree.root();
         (path, root)
     };
@@ -2112,7 +2116,10 @@ fn run_withdraw_command(cmd: &WithdrawCmd) {
         path,
         root,
         withdrawal_binding,
-    );
+    ).unwrap_or_else(|e| {
+        eprintln!("Error: invalid withdraw parameters: {e}");
+        process::exit(1);
+    });
 
     let result = builder.prove().unwrap_or_else(|e| {
         eprintln!("Error: proving failed: {e}");
@@ -2254,12 +2261,12 @@ fn run_transfer_command(cmd: &TransferCmd) {
 
         // Local verification before proving
         use stwo_ml::crypto::merkle_m31::verify_merkle_proof;
-        if !verify_merkle_proof(&root, &note1.commitment(), &p1) {
+        if !verify_merkle_proof(&root, &note1.commitment(), &p1, 20) {
             eprintln!("Error: local Merkle proof verification failed for note 1");
             eprintln!("Hint: delete ~/.vm31/tree_cache.json and re-sync");
             process::exit(1);
         }
-        if !verify_merkle_proof(&root, &note2.commitment(), &p2) {
+        if !verify_merkle_proof(&root, &note2.commitment(), &p2, 20) {
             eprintln!("Error: local Merkle proof verification failed for note 2");
             eprintln!("Hint: delete ~/.vm31/tree_cache.json and re-sync");
             process::exit(1);
@@ -2277,8 +2284,8 @@ fn run_transfer_command(cmd: &TransferCmd) {
         tree.append(note1.commitment());
         tree.append(note2.commitment());
         let root = tree.root();
-        let path1 = tree.prove(0);
-        let path2 = tree.prove(1);
+        let path1 = tree.prove(0).unwrap();
+        let path2 = tree.prove(1).unwrap();
         (path1, path2, root)
     };
 
@@ -2298,7 +2305,10 @@ fn run_transfer_command(cmd: &TransferCmd) {
             (note2, wallet.spending_key, path2),
         ],
         root,
-    );
+    ).unwrap_or_else(|e| {
+        eprintln!("Error: invalid transfer parameters: {e}");
+        process::exit(1);
+    });
 
     let result = builder.prove().unwrap_or_else(|e| {
         eprintln!("Error: proving failed: {e}");
@@ -2387,7 +2397,11 @@ fn run_batch_command(cmd: &BatchCmd) {
                     .unwrap_or(wallet.public_key);
                 // Batch deposits use wallet's viewing key (self-deposit).
                 // External deposits in batch mode not yet supported.
-                builder.deposit(entry.amount, entry.asset_id, pk, wallet.viewing_key);
+                builder.deposit(entry.amount, entry.asset_id, pk, wallet.viewing_key)
+                    .unwrap_or_else(|e| {
+                        eprintln!("Error: tx[{i}] invalid deposit: {e}");
+                        process::exit(1);
+                    });
             }
             "withdraw" | "transfer" => {
                 eprintln!(
