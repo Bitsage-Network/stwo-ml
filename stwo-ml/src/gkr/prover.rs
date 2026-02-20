@@ -1603,15 +1603,29 @@ fn reduce_activation_layer_gpu(
 
     let activation_fn = activation_type.as_fn();
 
-    // Pad input matrix and build MLEs
+    // Pad input matrix, reduce to table range, and build MLEs
     let input_padded = pad_matrix_pow2(input_matrix);
     let n = input_padded.rows * input_padded.cols;
     let num_vars = n.ilog2() as usize;
 
-    let input_mle = matrix_to_mle(&input_padded);
+    // Mask inputs to table range for LogUp consistency (matches aggregation path)
+    let table_log_size = activation_type.recommended_table_log_size();
+    let table_mask = (1u32 << table_log_size) - 1;
+    let reduced_data: Vec<M31> = input_padded
+        .data
+        .iter()
+        .map(|&x| M31::from(x.0 & table_mask))
+        .collect();
+    let reduced_padded = M31Matrix {
+        rows: input_padded.rows,
+        cols: input_padded.cols,
+        data: reduced_data,
+    };
 
-    // Compute output by applying activation to each input element
-    let output_mle: Vec<SecureField> = input_padded
+    let input_mle = matrix_to_mle(&reduced_padded);
+
+    // Compute output by applying activation to each reduced input element
+    let output_mle: Vec<SecureField> = reduced_padded
         .data
         .iter()
         .take(n)
@@ -1633,11 +1647,10 @@ fn reduce_activation_layer_gpu(
         })?;
 
     // Build activation table
-    let table_log_size = activation_type.recommended_table_log_size();
     let table = PrecomputedTable::build_parallel(|x| activation_fn(x), table_log_size);
 
     // Compute multiplicities (uses hash index for O(1) lookup)
-    let trace_inputs_m31: Vec<M31> = input_padded.data[..n].to_vec();
+    let trace_inputs_m31: Vec<M31> = reduced_padded.data[..n].to_vec();
     let multiplicities_m31 =
         crate::components::activation::compute_multiplicities(&trace_inputs_m31, &table);
     let multiplicities: Vec<u32> = multiplicities_m31.iter().map(|m| m.0).collect();
@@ -3170,15 +3183,29 @@ fn reduce_activation_layer(
 
     let activation_fn = activation_type.as_fn();
 
-    // Pad input matrix and build MLEs
+    // Pad input matrix, reduce to table range, and build MLEs
     let input_padded = pad_matrix_pow2(input_matrix);
     let n = input_padded.rows * input_padded.cols;
     let num_vars = n.ilog2() as usize;
 
-    let input_mle = matrix_to_mle(&input_padded);
+    // Mask inputs to table range for LogUp consistency (matches aggregation path)
+    let table_log_size = activation_type.recommended_table_log_size();
+    let table_mask = (1u32 << table_log_size) - 1;
+    let reduced_data: Vec<M31> = input_padded
+        .data
+        .iter()
+        .map(|&x| M31::from(x.0 & table_mask))
+        .collect();
+    let reduced_padded = M31Matrix {
+        rows: input_padded.rows,
+        cols: input_padded.cols,
+        data: reduced_data,
+    };
 
-    // Compute output by applying activation to each input element
-    let output_mle: Vec<SecureField> = input_padded
+    let input_mle = matrix_to_mle(&reduced_padded);
+
+    // Compute output by applying activation to each reduced input element
+    let output_mle: Vec<SecureField> = reduced_padded
         .data
         .iter()
         .take(n)
@@ -3190,11 +3217,10 @@ fn reduce_activation_layer(
     let output_eval = evaluate_mle(&output_mle, &output_claim.point);
 
     // Build activation table (deterministic from activation type + log size)
-    let table_log_size = activation_type.recommended_table_log_size();
     let table = PrecomputedTable::build_parallel(|x| activation_fn(x), table_log_size);
 
     // Compute multiplicities (how many trace entries use each table row)
-    let trace_inputs_m31: Vec<M31> = input_padded.data[..n].to_vec();
+    let trace_inputs_m31: Vec<M31> = reduced_padded.data[..n].to_vec();
     let multiplicities_m31 =
         crate::components::activation::compute_multiplicities(&trace_inputs_m31, &table);
     let multiplicities: Vec<u32> = multiplicities_m31.iter().map(|m| m.0).collect();
