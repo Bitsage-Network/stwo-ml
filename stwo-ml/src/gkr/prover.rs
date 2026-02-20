@@ -937,15 +937,13 @@ pub fn prove_gkr_gpu(
             }
 
             LayerType::LayerNorm { dim, .. } => {
-                // CPU fallback — LayerNorm is memory-bound, not compute-bound
                 let input_matrix = get_intermediate(execution, layer.node_id)?;
-                reduce_layernorm_layer(&current_claim, input_matrix, *dim, channel)?
+                reduce_layernorm_layer_gpu(&gpu, &current_claim, input_matrix, *dim, channel)?
             }
 
             LayerType::RMSNorm { dim, .. } => {
-                // CPU fallback — RMSNorm is memory-bound, not compute-bound
                 let input_matrix = get_intermediate(execution, layer.node_id)?;
-                reduce_rmsnorm_layer(&current_claim, input_matrix, *dim, channel)?
+                reduce_rmsnorm_layer_gpu(&gpu, &current_claim, input_matrix, *dim, channel)?
             }
 
             LayerType::Quantize { params, .. } => {
@@ -1858,6 +1856,704 @@ fn reduce_activation_layer_gpu(
             table_commitment,
         },
         claim,
+    ))
+}
+
+// =============================================================================
+// GPU LayerNorm / RMSNorm GKR Reductions
+// =============================================================================
+
+/// GPU-accelerated LayerNorm GKR reduction.
+///
+/// Two-phase proof:
+/// 1. Linear eq-sumcheck: output = centered × rsqrt (GPU 3-way rounds + fold)
+/// 2. LogUp eq-sumcheck: (variance, rsqrt) ∈ rsqrt_table (GPU 3-way rounds + fold)
+#[cfg(feature = "cuda-runtime")]
+fn reduce_layernorm_layer_gpu(
+    gpu: &std::sync::Arc<crate::gpu_sumcheck::GpuSumcheckExecutor>,
+    output_claim: &GKRClaim,
+    input_matrix: &M31Matrix,
+    dim: usize,
+    channel: &mut PoseidonChannel,
+) -> Result<(LayerProof, GKRClaim), GKRError> {
+    use super::types::{LogUpProof, RoundPolyDeg3};
+    use crate::components::layernorm::{build_rsqrt_table, LayerNormConfig};
+    use crate::gpu_sumcheck::{secure_field_to_u32s, u32s_to_secure_field};
+    use stwo::core::fields::FieldExpOps;
+
+    let config = LayerNormConfig::new(dim);
+    let rsqrt_table = build_rsqrt_table(config.rsqrt_table_log_size);
+
+    // Pad input matrix and build MLE
+    let input_padded = pad_matrix_pow2(input_matrix);
+    let n = input_padded.rows * input_padded.cols;
+    let num_vars = n.ilog2() as usize;
+    let cols = input_padded.cols;
+
+    let input_mle = matrix_to_mle(&input_padded);
+
+    // Compute LayerNorm forward pass on CPU (per-row stats are cheap)
+    let n_active = dim.min(input_padded.cols);
+    let inv_n = m31_mod_inverse(n_active as u32);
+
+    let mut mean_mle = vec![SecureField::zero(); n];
+    let mut rsqrt_mle = vec![SecureField::zero(); n];
+    let mut var_mle = vec![SecureField::zero(); n];
+    let mut output_mle = vec![SecureField::zero(); n];
+    let mut centered_mle = vec![SecureField::zero(); n];
+
+    for row in 0..input_padded.rows {
+        let mut sum = M31::from(0u32);
+        for col in 0..n_active {
+            sum = sum + input_padded.get(row, col);
+        }
+        let mean = sum * inv_n;
+        let mean_sf = SecureField::from(mean);
+
+        let mut var_sum = M31::from(0u32);
+        for col in 0..n_active {
+            let diff = input_padded.get(row, col) - mean;
+            var_sum = var_sum + diff * diff;
+        }
+        let variance_raw = var_sum * inv_n;
+        let variance = M31::from(variance_raw.0 & ((1u32 << config.rsqrt_table_log_size) - 1));
+        let variance_sf = SecureField::from(variance);
+
+        let rsqrt = rsqrt_table
+            .lookup(variance)
+            .expect("variance reduced to table range");
+        let rsqrt_sf = SecureField::from(rsqrt);
+
+        for col in 0..cols {
+            let idx = row * cols + col;
+            mean_mle[idx] = mean_sf;
+            var_mle[idx] = variance_sf;
+            rsqrt_mle[idx] = rsqrt_sf;
+
+            if col < n_active {
+                let x = input_padded.get(row, col);
+                let centered = x - mean;
+                let out_val = centered * rsqrt;
+                centered_mle[idx] = SecureField::from(centered);
+                output_mle[idx] = SecureField::from(out_val);
+            } else {
+                let x = input_padded.get(row, col);
+                centered_mle[idx] = SecureField::from(x);
+                output_mle[idx] = SecureField::from(x);
+            }
+        }
+    }
+
+    // GPU MLE evaluations at claim point
+    let input_eval = gpu
+        .evaluate_mle_gpu(&input_mle, &output_claim.point)
+        .map_err(|e| GKRError::ReductionError {
+            layer_idx: 0,
+            reason: format!("GPU eval_mle LN input: {e}"),
+        })?;
+    let output_eval = gpu
+        .evaluate_mle_gpu(&output_mle, &output_claim.point)
+        .map_err(|e| GKRError::ReductionError {
+            layer_idx: 0,
+            reason: format!("GPU eval_mle LN output: {e}"),
+        })?;
+    let mean_eval = gpu
+        .evaluate_mle_gpu(&mean_mle, &output_claim.point)
+        .map_err(|e| GKRError::ReductionError {
+            layer_idx: 0,
+            reason: format!("GPU eval_mle LN mean: {e}"),
+        })?;
+    let rsqrt_eval = gpu
+        .evaluate_mle_gpu(&rsqrt_mle, &output_claim.point)
+        .map_err(|e| GKRError::ReductionError {
+            layer_idx: 0,
+            reason: format!("GPU eval_mle LN rsqrt: {e}"),
+        })?;
+
+    // ===== Part 1: Linear transform eq-sumcheck (GPU) =====
+    channel.mix_u64(0x4C4E as u64); // "LN" tag
+    mix_secure_field(channel, mean_eval);
+    mix_secure_field(channel, rsqrt_eval);
+    mix_secure_field(channel, output_claim.value);
+
+    // Upload centered and rsqrt MLEs to GPU for 3-way eq-sumcheck
+    let r = &output_claim.point[..num_vars];
+    let eq_evals = build_eq_evals(r);
+
+    let eq_flat: Vec<u32> = eq_evals.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
+    let centered_flat: Vec<u32> = centered_mle.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
+    let rsqrt_flat: Vec<u32> = rsqrt_mle.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
+
+    let mut d_eq = gpu.device.htod_sync_copy(&eq_flat).map_err(|e| GKRError::ReductionError {
+        layer_idx: 0, reason: format!("GPU upload eq: {:?}", e),
+    })?;
+    let mut d_centered = gpu.device.htod_sync_copy(&centered_flat).map_err(|e| GKRError::ReductionError {
+        layer_idx: 0, reason: format!("GPU upload centered: {:?}", e),
+    })?;
+    let mut d_rsqrt = gpu.device.htod_sync_copy(&rsqrt_flat).map_err(|e| GKRError::ReductionError {
+        layer_idx: 0, reason: format!("GPU upload rsqrt: {:?}", e),
+    })?;
+
+    let mut linear_round_polys = Vec::with_capacity(num_vars);
+    let mut linear_challenges = Vec::with_capacity(num_vars);
+    let mut cur_n = n;
+
+    for _ in 0..num_vars {
+        let mid = cur_n / 2;
+
+        let (s0_u32, s1_u32, s2_u32, s3_u32) = gpu
+            .compute_logup_round_poly_3way(&d_eq, &d_centered, &d_rsqrt, mid)
+            .map_err(|e| GKRError::ReductionError {
+                layer_idx: 0, reason: format!("GPU LN linear round: {e}"),
+            })?;
+
+        let s0 = u32s_to_secure_field(&s0_u32);
+        let s1 = u32s_to_secure_field(&s1_u32);
+        let s2 = u32s_to_secure_field(&s2_u32);
+        let s3 = u32s_to_secure_field(&s3_u32);
+
+        let two = SecureField::from(M31::from(2u32));
+        let three = SecureField::from(M31::from(3u32));
+        let inv2 = two.inverse();
+        let inv6 = (SecureField::from(M31::from(6u32))).inverse();
+
+        let dd1 = s1 - s0;
+        let dd2 = (s2 - s1 - s1 + s0) * inv2;
+        let dd3 = (s3 - s0 - three * (s2 - s1)) * inv6;
+
+        let c0 = s0;
+        let c1 = dd1 - dd2 + two * dd3;
+        let c2 = dd2 - three * dd3;
+        let c3 = dd3;
+
+        linear_round_polys.push(RoundPolyDeg3 { c0, c1, c2, c3 });
+
+        channel.mix_poly_coeffs_deg3(c0, c1, c2, c3);
+        let challenge = channel.draw_qm31();
+        linear_challenges.push(challenge);
+
+        let challenge_u32 = secure_field_to_u32s(challenge);
+        let (new_eq, new_centered, new_rsqrt) = gpu
+            .logup_3way_fold(&d_eq, &d_centered, &d_rsqrt, cur_n, &challenge_u32)
+            .map_err(|e| GKRError::ReductionError {
+                layer_idx: 0, reason: format!("GPU LN linear fold: {e}"),
+            })?;
+        d_eq = new_eq;
+        d_centered = new_centered;
+        d_rsqrt = new_rsqrt;
+        cur_n = mid;
+    }
+
+    // Download final evaluations (1 QM31 each)
+    let mut centered_final_u32 = [0u32; 4];
+    let mut rsqrt_final_u32 = [0u32; 4];
+    gpu.device.dtoh_sync_copy_into(&d_centered, &mut centered_final_u32).map_err(|e| GKRError::ReductionError {
+        layer_idx: 0, reason: format!("GPU download centered_final: {:?}", e),
+    })?;
+    gpu.device.dtoh_sync_copy_into(&d_rsqrt, &mut rsqrt_final_u32).map_err(|e| GKRError::ReductionError {
+        layer_idx: 0, reason: format!("GPU download rsqrt_final: {:?}", e),
+    })?;
+    let centered_final = u32s_to_secure_field(&centered_final_u32);
+    let rsqrt_final = u32s_to_secure_field(&rsqrt_final_u32);
+    let linear_final_evals = (centered_final, rsqrt_final);
+
+    mix_secure_field(channel, centered_final);
+    mix_secure_field(channel, rsqrt_final);
+
+    // ===== Part 2: rsqrt LogUp eq-sumcheck (GPU) =====
+    let table = &rsqrt_table;
+    let var_m31: Vec<M31> = var_mle.iter().map(|v| M31::from(v.0 .0 .0)).collect();
+    let multiplicities_m31 = crate::components::activation::compute_multiplicities(&var_m31, table);
+    let multiplicities: Vec<u32> = multiplicities_m31.iter().map(|m| m.0).collect();
+
+    channel.mix_u64(0x4C4F47 as u64); // "LOG" tag
+    channel.mix_u64(0x5253 as u64); // "RS" (rsqrt)
+    let gamma = channel.draw_qm31();
+    let beta = channel.draw_qm31();
+
+    // GPU denominator computation
+    let d_vals_device = gpu
+        .compute_logup_denominators_gpu(&var_mle, &rsqrt_mle, gamma, beta)
+        .map_err(|e| GKRError::ReductionError {
+            layer_idx: 0, reason: format!("GPU LN logup denominators: {e}"),
+        })?;
+
+    // Download for CPU batch inverse + sum check
+    let mut d_vals_flat = vec![0u32; n * 4];
+    gpu.device.dtoh_sync_copy_into(&d_vals_device, &mut d_vals_flat).map_err(|e| GKRError::ReductionError {
+        layer_idx: 0, reason: format!("GPU download LN denoms: {:?}", e),
+    })?;
+    let d_vals: Vec<SecureField> = d_vals_flat
+        .chunks_exact(4)
+        .map(|c| u32s_to_secure_field(&[c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    let w_vals = SecureField::batch_inverse(&d_vals);
+    let trace_sum: SecureField = w_vals.iter().copied().fold(SecureField::zero(), |acc, w| acc + w);
+
+    // Table-side sum
+    let nonzero_entries: Vec<(usize, SecureField)> = table
+        .inputs.iter().zip(&table.outputs).enumerate()
+        .filter(|(j, _)| multiplicities[*j] > 0)
+        .map(|(j, (&t_in, &t_out))| {
+            (j, gamma - SecureField::from(t_in) - beta * SecureField::from(t_out))
+        })
+        .collect();
+    let table_denoms: Vec<SecureField> = nonzero_entries.iter().map(|(_, d)| *d).collect();
+    let table_inv = SecureField::batch_inverse(&table_denoms);
+    let table_sum: SecureField = nonzero_entries.iter().zip(&table_inv)
+        .map(|((j, _), &inv)| SecureField::from(M31::from(multiplicities[*j])) * inv)
+        .fold(SecureField::zero(), |acc, v| acc + v);
+
+    if trace_sum != table_sum {
+        return Err(GKRError::LogUpError(format!(
+            "LayerNorm LogUp sum mismatch: trace={}, table={}", trace_sum, table_sum,
+        )));
+    }
+    mix_secure_field(channel, trace_sum);
+
+    // Upload eq, w, d to GPU for LogUp eq-sumcheck
+    let r_logup = &output_claim.point[..num_vars];
+    let eq_evals_logup = build_eq_evals(r_logup);
+
+    let eq_logup_flat: Vec<u32> = eq_evals_logup.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
+    let w_flat: Vec<u32> = w_vals.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
+
+    let mut d_eq_l = gpu.device.htod_sync_copy(&eq_logup_flat).map_err(|e| GKRError::ReductionError {
+        layer_idx: 0, reason: format!("GPU upload eq_logup: {:?}", e),
+    })?;
+    let mut d_w = gpu.device.htod_sync_copy(&w_flat).map_err(|e| GKRError::ReductionError {
+        layer_idx: 0, reason: format!("GPU upload w: {:?}", e),
+    })?;
+    let mut d_d = d_vals_device;
+
+    let mut logup_round_polys = Vec::with_capacity(num_vars);
+    let mut logup_challenges = Vec::with_capacity(num_vars);
+    let mut cur_n_logup = n;
+
+    for _ in 0..num_vars {
+        let mid = cur_n_logup / 2;
+
+        let (s0_u32, s1_u32, s2_u32, s3_u32) = gpu
+            .compute_logup_round_poly_3way(&d_eq_l, &d_w, &d_d, mid)
+            .map_err(|e| GKRError::ReductionError {
+                layer_idx: 0, reason: format!("GPU LN logup round: {e}"),
+            })?;
+
+        let s0 = u32s_to_secure_field(&s0_u32);
+        let s1 = u32s_to_secure_field(&s1_u32);
+        let s2 = u32s_to_secure_field(&s2_u32);
+        let s3 = u32s_to_secure_field(&s3_u32);
+
+        let two = SecureField::from(M31::from(2u32));
+        let three = SecureField::from(M31::from(3u32));
+        let inv2 = two.inverse();
+        let inv6 = (SecureField::from(M31::from(6u32))).inverse();
+
+        let dd1 = s1 - s0;
+        let dd2 = (s2 - s1 - s1 + s0) * inv2;
+        let dd3 = (s3 - s0 - three * (s2 - s1)) * inv6;
+
+        let c0 = s0;
+        let c1 = dd1 - dd2 + two * dd3;
+        let c2 = dd2 - three * dd3;
+        let c3 = dd3;
+
+        logup_round_polys.push(RoundPolyDeg3 { c0, c1, c2, c3 });
+
+        channel.mix_poly_coeffs_deg3(c0, c1, c2, c3);
+        let challenge = channel.draw_qm31();
+        logup_challenges.push(challenge);
+
+        let challenge_u32 = secure_field_to_u32s(challenge);
+        let (new_eq, new_w, new_d) = gpu
+            .logup_3way_fold(&d_eq_l, &d_w, &d_d, cur_n_logup, &challenge_u32)
+            .map_err(|e| GKRError::ReductionError {
+                layer_idx: 0, reason: format!("GPU LN logup fold: {e}"),
+            })?;
+        d_eq_l = new_eq;
+        d_w = new_w;
+        d_d = new_d;
+        cur_n_logup = mid;
+    }
+
+    // Download final w_eval
+    let mut w_eval_u32 = [0u32; 4];
+    gpu.device.dtoh_sync_copy_into(&d_w, &mut w_eval_u32).map_err(|e| GKRError::ReductionError {
+        layer_idx: 0, reason: format!("GPU download LN w_eval: {:?}", e),
+    })?;
+    let w_eval = u32s_to_secure_field(&w_eval_u32);
+
+    // Final MLE evaluations at LogUp challenge point (GPU)
+    let var_eval_s = gpu
+        .evaluate_mle_gpu(&var_mle, &logup_challenges)
+        .map_err(|e| GKRError::ReductionError {
+            layer_idx: 0, reason: format!("GPU eval_mle LN var final: {e}"),
+        })?;
+    let rsqrt_eval_s = gpu
+        .evaluate_mle_gpu(&rsqrt_mle, &logup_challenges)
+        .map_err(|e| GKRError::ReductionError {
+            layer_idx: 0, reason: format!("GPU eval_mle LN rsqrt final: {e}"),
+        })?;
+
+    let logup_proof = LogUpProof {
+        eq_round_polys: logup_round_polys,
+        final_evals: (w_eval, var_eval_s, rsqrt_eval_s),
+        claimed_sum: trace_sum,
+        multiplicities,
+    };
+
+    let rsqrt_table_commitment = compute_rsqrt_table_commitment(config.rsqrt_table_log_size);
+
+    mix_secure_field(channel, input_eval);
+    mix_secure_field(channel, output_eval);
+
+    let claim = GKRClaim {
+        point: output_claim.point.clone(),
+        value: input_eval,
+    };
+
+    Ok((
+        LayerProof::LayerNorm {
+            logup_proof: Some(logup_proof),
+            linear_round_polys,
+            linear_final_evals,
+            input_eval,
+            output_eval,
+            mean: mean_eval,
+            rsqrt_var: rsqrt_eval,
+            rsqrt_table_commitment,
+            simd_combined: false,
+        },
+        claim,
+    ))
+}
+
+/// GPU-accelerated RMSNorm GKR reduction.
+///
+/// Two-phase proof:
+/// 1. Linear eq-sumcheck: output = input × rsqrt (GPU 3-way rounds + fold)
+/// 2. LogUp eq-sumcheck: (rms², rsqrt) ∈ rsqrt_table (GPU 3-way rounds + fold)
+#[cfg(feature = "cuda-runtime")]
+fn reduce_rmsnorm_layer_gpu(
+    gpu: &std::sync::Arc<crate::gpu_sumcheck::GpuSumcheckExecutor>,
+    output_claim: &GKRClaim,
+    input_matrix: &M31Matrix,
+    dim: usize,
+    channel: &mut PoseidonChannel,
+) -> Result<(LayerProof, GKRClaim), GKRError> {
+    use super::types::{LogUpProof, RoundPolyDeg3};
+    use crate::components::rmsnorm::{build_rsqrt_table, RMSNormConfig};
+    use crate::gpu_sumcheck::{secure_field_to_u32s, u32s_to_secure_field};
+    use stwo::core::fields::FieldExpOps;
+
+    let config = RMSNormConfig::new(dim);
+    let rsqrt_table = build_rsqrt_table(config.rsqrt_table_log_size);
+
+    let input_padded = pad_matrix_pow2(input_matrix);
+    let n = input_padded.rows * input_padded.cols;
+    let num_vars = n.ilog2() as usize;
+    let cols = input_padded.cols;
+    let input_mle = matrix_to_mle(&input_padded);
+    let n_active = dim.min(input_padded.cols);
+    let inv_n = m31_mod_inverse(n_active as u32);
+
+    // Compute RMSNorm forward pass on CPU (per-row stats are cheap)
+    let mut rsqrt_mle = vec![SecureField::zero(); n];
+    let mut rms_sq_mle = vec![SecureField::zero(); n];
+    let mut output_mle = vec![SecureField::zero(); n];
+
+    for row in 0..input_padded.rows {
+        let mut sq_sum = M31::from(0u32);
+        for col in 0..n_active {
+            let x = input_padded.get(row, col);
+            sq_sum = sq_sum + x * x;
+        }
+        let rms_sq_raw = sq_sum * inv_n;
+        let rms_sq = M31::from(rms_sq_raw.0 & ((1u32 << config.rsqrt_table_log_size) - 1));
+        let rsqrt = rsqrt_table
+            .lookup(rms_sq)
+            .expect("rms_sq reduced to table range");
+
+        for col in 0..cols {
+            let idx = row * cols + col;
+            rms_sq_mle[idx] = SecureField::from(rms_sq);
+            rsqrt_mle[idx] = SecureField::from(rsqrt);
+            let x = input_padded.get(row, col);
+            output_mle[idx] = if col < n_active {
+                SecureField::from(x * rsqrt)
+            } else {
+                SecureField::from(x)
+            };
+        }
+    }
+
+    // GPU MLE evaluations at claim point
+    let input_eval = gpu
+        .evaluate_mle_gpu(&input_mle, &output_claim.point)
+        .map_err(|e| GKRError::ReductionError {
+            layer_idx: 0, reason: format!("GPU eval_mle RN input: {e}"),
+        })?;
+    let output_eval = gpu
+        .evaluate_mle_gpu(&output_mle, &output_claim.point)
+        .map_err(|e| GKRError::ReductionError {
+            layer_idx: 0, reason: format!("GPU eval_mle RN output: {e}"),
+        })?;
+    let rsqrt_eval = gpu
+        .evaluate_mle_gpu(&rsqrt_mle, &output_claim.point)
+        .map_err(|e| GKRError::ReductionError {
+            layer_idx: 0, reason: format!("GPU eval_mle RN rsqrt: {e}"),
+        })?;
+    let rms_sq_eval = gpu
+        .evaluate_mle_gpu(&rms_sq_mle, &output_claim.point)
+        .map_err(|e| GKRError::ReductionError {
+            layer_idx: 0, reason: format!("GPU eval_mle RN rms_sq: {e}"),
+        })?;
+
+    // ===== Part 1: Linear eq-sumcheck: output = input × rsqrt (GPU) =====
+    channel.mix_u64(0x524E as u64); // "RN" tag
+    mix_secure_field(channel, rms_sq_eval);
+    mix_secure_field(channel, rsqrt_eval);
+    mix_secure_field(channel, output_claim.value);
+
+    let r = &output_claim.point[..num_vars];
+    let eq_evals = build_eq_evals(r);
+
+    let eq_flat: Vec<u32> = eq_evals.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
+    let input_flat: Vec<u32> = input_mle.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
+    let rsqrt_flat: Vec<u32> = rsqrt_mle.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
+
+    let mut d_eq = gpu.device.htod_sync_copy(&eq_flat).map_err(|e| GKRError::ReductionError {
+        layer_idx: 0, reason: format!("GPU upload eq: {:?}", e),
+    })?;
+    let mut d_input = gpu.device.htod_sync_copy(&input_flat).map_err(|e| GKRError::ReductionError {
+        layer_idx: 0, reason: format!("GPU upload input: {:?}", e),
+    })?;
+    let mut d_rsqrt = gpu.device.htod_sync_copy(&rsqrt_flat).map_err(|e| GKRError::ReductionError {
+        layer_idx: 0, reason: format!("GPU upload rsqrt: {:?}", e),
+    })?;
+
+    let mut linear_round_polys = Vec::with_capacity(num_vars);
+    let mut linear_challenges = Vec::with_capacity(num_vars);
+    let mut cur_n = n;
+
+    for _ in 0..num_vars {
+        let mid = cur_n / 2;
+
+        let (s0_u32, s1_u32, s2_u32, s3_u32) = gpu
+            .compute_logup_round_poly_3way(&d_eq, &d_input, &d_rsqrt, mid)
+            .map_err(|e| GKRError::ReductionError {
+                layer_idx: 0, reason: format!("GPU RN linear round: {e}"),
+            })?;
+
+        let s0 = u32s_to_secure_field(&s0_u32);
+        let s1 = u32s_to_secure_field(&s1_u32);
+        let s2 = u32s_to_secure_field(&s2_u32);
+        let s3 = u32s_to_secure_field(&s3_u32);
+
+        let two = SecureField::from(M31::from(2u32));
+        let three = SecureField::from(M31::from(3u32));
+        let inv2 = two.inverse();
+        let inv6 = (SecureField::from(M31::from(6u32))).inverse();
+
+        let dd1 = s1 - s0;
+        let dd2 = (s2 - s1 - s1 + s0) * inv2;
+        let dd3 = (s3 - s0 - three * (s2 - s1)) * inv6;
+
+        let c0 = s0;
+        let c1 = dd1 - dd2 + two * dd3;
+        let c2 = dd2 - three * dd3;
+        let c3 = dd3;
+        linear_round_polys.push(RoundPolyDeg3 { c0, c1, c2, c3 });
+
+        channel.mix_poly_coeffs_deg3(c0, c1, c2, c3);
+        let challenge = channel.draw_qm31();
+        linear_challenges.push(challenge);
+
+        let challenge_u32 = secure_field_to_u32s(challenge);
+        let (new_eq, new_input, new_rsqrt) = gpu
+            .logup_3way_fold(&d_eq, &d_input, &d_rsqrt, cur_n, &challenge_u32)
+            .map_err(|e| GKRError::ReductionError {
+                layer_idx: 0, reason: format!("GPU RN linear fold: {e}"),
+            })?;
+        d_eq = new_eq;
+        d_input = new_input;
+        d_rsqrt = new_rsqrt;
+        cur_n = mid;
+    }
+
+    // Download final evaluations
+    let mut input_final_u32 = [0u32; 4];
+    let mut rsqrt_final_u32 = [0u32; 4];
+    gpu.device.dtoh_sync_copy_into(&d_input, &mut input_final_u32).map_err(|e| GKRError::ReductionError {
+        layer_idx: 0, reason: format!("GPU download input_final: {:?}", e),
+    })?;
+    gpu.device.dtoh_sync_copy_into(&d_rsqrt, &mut rsqrt_final_u32).map_err(|e| GKRError::ReductionError {
+        layer_idx: 0, reason: format!("GPU download rsqrt_final: {:?}", e),
+    })?;
+    let input_final = u32s_to_secure_field(&input_final_u32);
+    let rsqrt_final = u32s_to_secure_field(&rsqrt_final_u32);
+
+    mix_secure_field(channel, input_final);
+    mix_secure_field(channel, rsqrt_final);
+
+    // ===== Part 2: rsqrt LogUp eq-sumcheck (GPU) =====
+    let rms_sq_m31: Vec<M31> = rms_sq_mle.iter().map(|v| M31::from(v.0 .0 .0)).collect();
+    let mults_m31 = crate::components::activation::compute_multiplicities(&rms_sq_m31, &rsqrt_table);
+    let multiplicities: Vec<u32> = mults_m31.iter().map(|m| m.0).collect();
+
+    channel.mix_u64(0x4C4F47 as u64); // "LOG"
+    channel.mix_u64(0x524E as u64); // "RN"
+    let gamma = channel.draw_qm31();
+    let beta = channel.draw_qm31();
+
+    // GPU denominator computation
+    let d_vals_device = gpu
+        .compute_logup_denominators_gpu(&rms_sq_mle, &rsqrt_mle, gamma, beta)
+        .map_err(|e| GKRError::ReductionError {
+            layer_idx: 0, reason: format!("GPU RN logup denominators: {e}"),
+        })?;
+
+    let mut d_vals_flat = vec![0u32; n * 4];
+    gpu.device.dtoh_sync_copy_into(&d_vals_device, &mut d_vals_flat).map_err(|e| GKRError::ReductionError {
+        layer_idx: 0, reason: format!("GPU download RN denoms: {:?}", e),
+    })?;
+    let d_vals: Vec<SecureField> = d_vals_flat
+        .chunks_exact(4)
+        .map(|c| u32s_to_secure_field(&[c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    let w_vals = SecureField::batch_inverse(&d_vals);
+    let trace_sum: SecureField = w_vals.iter().copied().sum();
+
+    let nonzero: Vec<(usize, SecureField)> = rsqrt_table
+        .inputs.iter().zip(&rsqrt_table.outputs).enumerate()
+        .filter(|(j, _)| multiplicities[*j] > 0)
+        .map(|(j, (&ti, &to))| {
+            (j, gamma - SecureField::from(ti) - beta * SecureField::from(to))
+        })
+        .collect();
+    let tbl_inv = SecureField::batch_inverse(&nonzero.iter().map(|(_, d)| *d).collect::<Vec<_>>());
+    let table_sum: SecureField = nonzero.iter().zip(&tbl_inv)
+        .map(|((j, _), &inv)| SecureField::from(M31::from(multiplicities[*j])) * inv)
+        .sum();
+
+    if trace_sum != table_sum {
+        return Err(GKRError::LogUpError(format!(
+            "RMSNorm LogUp sum mismatch: trace={}, table={}", trace_sum, table_sum,
+        )));
+    }
+    mix_secure_field(channel, trace_sum);
+
+    // Upload eq, w, d to GPU for LogUp eq-sumcheck
+    let r_logup = &output_claim.point[..num_vars];
+    let eq_logup = build_eq_evals(r_logup);
+
+    let eq_logup_flat: Vec<u32> = eq_logup.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
+    let w_flat: Vec<u32> = w_vals.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
+
+    let mut d_eq_l = gpu.device.htod_sync_copy(&eq_logup_flat).map_err(|e| GKRError::ReductionError {
+        layer_idx: 0, reason: format!("GPU upload eq_logup: {:?}", e),
+    })?;
+    let mut d_w = gpu.device.htod_sync_copy(&w_flat).map_err(|e| GKRError::ReductionError {
+        layer_idx: 0, reason: format!("GPU upload w: {:?}", e),
+    })?;
+    let mut d_d = d_vals_device;
+
+    let mut logup_rps = Vec::with_capacity(num_vars);
+    let mut logup_chals = Vec::with_capacity(num_vars);
+    let mut cur_n2 = n;
+
+    for _ in 0..num_vars {
+        let mid = cur_n2 / 2;
+
+        let (s0_u32, s1_u32, s2_u32, s3_u32) = gpu
+            .compute_logup_round_poly_3way(&d_eq_l, &d_w, &d_d, mid)
+            .map_err(|e| GKRError::ReductionError {
+                layer_idx: 0, reason: format!("GPU RN logup round: {e}"),
+            })?;
+
+        let s0 = u32s_to_secure_field(&s0_u32);
+        let s1 = u32s_to_secure_field(&s1_u32);
+        let s2 = u32s_to_secure_field(&s2_u32);
+        let s3 = u32s_to_secure_field(&s3_u32);
+
+        let two = SecureField::from(M31::from(2u32));
+        let three = SecureField::from(M31::from(3u32));
+        let inv2 = two.inverse();
+        let inv6 = (SecureField::from(M31::from(6u32))).inverse();
+
+        let dd1 = s1 - s0;
+        let dd2 = (s2 - s1 - s1 + s0) * inv2;
+        let dd3 = (s3 - s0 - three * (s2 - s1)) * inv6;
+
+        let c0 = s0;
+        let c1 = dd1 - dd2 + two * dd3;
+        let c2 = dd2 - three * dd3;
+        let c3 = dd3;
+        logup_rps.push(RoundPolyDeg3 { c0, c1, c2, c3 });
+
+        channel.mix_poly_coeffs_deg3(c0, c1, c2, c3);
+        let ch = channel.draw_qm31();
+        logup_chals.push(ch);
+
+        let ch_u32 = secure_field_to_u32s(ch);
+        let (new_eq, new_w, new_d) = gpu
+            .logup_3way_fold(&d_eq_l, &d_w, &d_d, cur_n2, &ch_u32)
+            .map_err(|e| GKRError::ReductionError {
+                layer_idx: 0, reason: format!("GPU RN logup fold: {e}"),
+            })?;
+        d_eq_l = new_eq;
+        d_w = new_w;
+        d_d = new_d;
+        cur_n2 = mid;
+    }
+
+    let mut w_eval_u32 = [0u32; 4];
+    gpu.device.dtoh_sync_copy_into(&d_w, &mut w_eval_u32).map_err(|e| GKRError::ReductionError {
+        layer_idx: 0, reason: format!("GPU download RN w_eval: {:?}", e),
+    })?;
+    let w_eval = u32s_to_secure_field(&w_eval_u32);
+
+    let rms_eval_s = gpu
+        .evaluate_mle_gpu(&rms_sq_mle, &logup_chals)
+        .map_err(|e| GKRError::ReductionError {
+            layer_idx: 0, reason: format!("GPU eval_mle RN rms final: {e}"),
+        })?;
+    let rsqrt_eval_s = gpu
+        .evaluate_mle_gpu(&rsqrt_mle, &logup_chals)
+        .map_err(|e| GKRError::ReductionError {
+            layer_idx: 0, reason: format!("GPU eval_mle RN rsqrt final: {e}"),
+        })?;
+
+    let logup_proof = LogUpProof {
+        eq_round_polys: logup_rps,
+        final_evals: (w_eval, rms_eval_s, rsqrt_eval_s),
+        claimed_sum: trace_sum,
+        multiplicities,
+    };
+
+    let rsqrt_table_commitment = compute_rsqrt_table_commitment(config.rsqrt_table_log_size);
+
+    mix_secure_field(channel, input_eval);
+    mix_secure_field(channel, output_eval);
+
+    Ok((
+        LayerProof::RMSNorm {
+            logup_proof: Some(logup_proof),
+            linear_round_polys,
+            linear_final_evals: (input_final, rsqrt_final),
+            input_eval,
+            output_eval,
+            rms_sq_eval,
+            rsqrt_eval,
+            rsqrt_table_commitment,
+            simd_combined: false,
+        },
+        GKRClaim {
+            point: output_claim.point.clone(),
+            value: input_eval,
+        },
     ))
 }
 
