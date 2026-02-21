@@ -11,7 +11,7 @@ pub mod tree_sync;
 pub mod tx_builder;
 pub mod wallet;
 
-use stwo_prover::core::fields::m31::M31;
+use stwo::core::fields::m31::BaseField as M31;
 
 /// M31 prime modulus P = 2^31 - 1.
 const M31_P: u32 = 0x7FFFFFFF;
