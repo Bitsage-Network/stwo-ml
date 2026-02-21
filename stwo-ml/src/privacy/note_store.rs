@@ -35,6 +35,9 @@ impl FileLockGuard {
             .write(true)
             .truncate(false)
             .open(lock_path)?;
+        // SAFETY: `file` is a valid open File; `as_raw_fd()` returns its fd which
+        // remains valid for the lifetime of `file` held by the guard. `flock(2)` is
+        // async-signal-safe and the lock is released when the fd is closed (Drop).
         let ret =
             unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::LOCK_SH) };
         if ret != 0 {
@@ -50,6 +53,7 @@ impl FileLockGuard {
             .write(true)
             .truncate(false)
             .open(lock_path)?;
+        // SAFETY: same as `shared()` above — valid fd, flock is safe, released on drop.
         let ret =
             unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) };
         if ret != 0 {
@@ -549,29 +553,13 @@ fn parse_4_m31_hex(hex: &str) -> Result<[M31; 4], NoteStoreError> {
         let chunk = &hex[i * 8..(i + 1) * 8];
         let val = u32::from_str_radix(chunk, 16)
             .map_err(|e| NoteStoreError::Json(format!("invalid hex '{chunk}': {e}")))?;
-        result[i] = M31::from_u32_unchecked(val % 0x7FFFFFFF);
+        result[i] = super::reduce_u32_to_m31(val);
     }
     Ok(result)
 }
 
 fn generate_nonce() -> Result<[M31; 4], NoteStoreError> {
-    let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes)
-        .map_err(|e| NoteStoreError::Json(format!("getrandom failed: {e}")))?;
-    Ok([
-        M31::from_u32_unchecked(
-            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) % 0x7FFFFFFF,
-        ),
-        M31::from_u32_unchecked(
-            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) % 0x7FFFFFFF,
-        ),
-        M31::from_u32_unchecked(
-            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) % 0x7FFFFFFF,
-        ),
-        M31::from_u32_unchecked(
-            u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) % 0x7FFFFFFF,
-        ),
-    ])
+    super::random_m31_quad().map_err(|e| NoteStoreError::Json(e))
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────

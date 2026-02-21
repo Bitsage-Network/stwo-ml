@@ -366,8 +366,9 @@ impl CrossVerifyResult {
         if !self.cross_verified {
             return true; // no verify RPCs configured, primary-only
         }
-        // At least one reachable verification RPC must agree
-        self.verify_confirmed > 0
+        // Require majority of reachable verification RPCs to agree.
+        let reachable = self.verify_total - self.verify_unreachable;
+        reachable == 0 || self.verify_confirmed * 2 > reachable
     }
 }
 

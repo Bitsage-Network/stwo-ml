@@ -540,22 +540,7 @@ fn build_encrypted_memo(
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
 fn generate_random_blinding() -> Result<[M31; 4], TxBuilderError> {
-    let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes).map_err(|e| TxBuilderError::Rng(format!("{e}")))?;
-    Ok([
-        M31::from_u32_unchecked(
-            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) % 0x7FFFFFFF,
-        ),
-        M31::from_u32_unchecked(
-            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) % 0x7FFFFFFF,
-        ),
-        M31::from_u32_unchecked(
-            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) % 0x7FFFFFFF,
-        ),
-        M31::from_u32_unchecked(
-            u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) % 0x7FFFFFFF,
-        ),
-    ])
+    super::random_m31_quad().map_err(|e| TxBuilderError::Rng(e))
 }
 
 fn generate_random_nonce() -> Result<[M31; 4], TxBuilderError> {

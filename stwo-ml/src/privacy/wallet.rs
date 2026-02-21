@@ -56,7 +56,9 @@ pub struct Wallet {
 impl Drop for Wallet {
     fn drop(&mut self) {
         // Zeroize all key material to prevent secret residue in memory.
-        // Uses volatile writes to prevent compiler from optimizing out the zeroing.
+        // SAFETY: Each `v` is a valid mutable reference to an initialized M31 in
+        // a live Vec. `write_volatile` prevents the compiler from eliding the
+        // zeroing (a plain `*v = 0` can be optimized out as a dead store).
         for v in self.spending_key.iter_mut() {
             unsafe {
                 std::ptr::write_volatile(v, M31::from_u32_unchecked(0));
@@ -84,25 +86,8 @@ impl Drop for Wallet {
 impl Wallet {
     /// Generate a new wallet with a random spending key.
     pub fn generate() -> Result<Self, WalletError> {
-        let mut bytes = [0u8; 16];
-        getrandom::getrandom(&mut bytes)
-            .map_err(|e| WalletError::Crypto(format!("getrandom failed: {e}")))?;
-
-        let spending_key: SpendingKey = [
-            M31::from_u32_unchecked(
-                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) % 0x7FFFFFFF,
-            ),
-            M31::from_u32_unchecked(
-                u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) % 0x7FFFFFFF,
-            ),
-            M31::from_u32_unchecked(
-                u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) % 0x7FFFFFFF,
-            ),
-            M31::from_u32_unchecked(
-                u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) % 0x7FFFFFFF,
-            ),
-        ];
-
+        let spending_key: SpendingKey =
+            super::random_m31_quad().map_err(|e| WalletError::Crypto(e))?;
         Self::from_spending_key(spending_key)
     }
 
@@ -356,7 +341,7 @@ fn password_to_key_with_iterations(pw: &str, salt: &[M31; 4], iterations: u32) -
         .map(|chunk| {
             let mut bytes = [0u8; 4];
             bytes[..chunk.len()].copy_from_slice(chunk);
-            M31::from_u32_unchecked(u32::from_le_bytes(bytes) % 0x7FFFFFFF)
+            super::reduce_u32_to_m31(u32::from_le_bytes(bytes))
         })
         .collect();
 
@@ -432,7 +417,7 @@ fn password_to_key_argon2id_with_params(
             output[i * 4 + 2],
             output[i * 4 + 3],
         ]);
-        key[i] = M31::from_u32_unchecked(val % 0x7FFFFFFF);
+        key[i] = super::reduce_u32_to_m31(val);
     }
     Ok(key)
 }
@@ -446,50 +431,18 @@ fn password_to_key_v1(pw: &str) -> [M31; RATE] {
         .map(|chunk| {
             let mut bytes = [0u8; 4];
             bytes[..chunk.len()].copy_from_slice(chunk);
-            M31::from_u32_unchecked(u32::from_le_bytes(bytes) % 0x7FFFFFFF)
+            super::reduce_u32_to_m31(u32::from_le_bytes(bytes))
         })
         .collect();
     derive_key(&pw_m31)
 }
 
 fn generate_salt() -> Result<[M31; 4], WalletError> {
-    let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes)
-        .map_err(|e| WalletError::Crypto(format!("getrandom failed: {e}")))?;
-    Ok([
-        M31::from_u32_unchecked(
-            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) % 0x7FFFFFFF,
-        ),
-        M31::from_u32_unchecked(
-            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) % 0x7FFFFFFF,
-        ),
-        M31::from_u32_unchecked(
-            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) % 0x7FFFFFFF,
-        ),
-        M31::from_u32_unchecked(
-            u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) % 0x7FFFFFFF,
-        ),
-    ])
+    super::random_m31_quad().map_err(|e| WalletError::Crypto(e))
 }
 
 fn generate_nonce() -> Result<[M31; 4], WalletError> {
-    let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes)
-        .map_err(|e| WalletError::Crypto(format!("getrandom failed: {e}")))?;
-    Ok([
-        M31::from_u32_unchecked(
-            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) % 0x7FFFFFFF,
-        ),
-        M31::from_u32_unchecked(
-            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) % 0x7FFFFFFF,
-        ),
-        M31::from_u32_unchecked(
-            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) % 0x7FFFFFFF,
-        ),
-        M31::from_u32_unchecked(
-            u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) % 0x7FFFFFFF,
-        ),
-    ])
+    super::random_m31_quad().map_err(|e| WalletError::Crypto(e))
 }
 
 fn parse_spending_key_hex(hex: &str) -> Result<SpendingKey, WalletError> {
@@ -510,7 +463,7 @@ fn parse_4_m31_hex(hex: &str) -> Result<[M31; 4], WalletError> {
         let chunk = &hex[i * 8..(i + 1) * 8];
         let val = u32::from_str_radix(chunk, 16)
             .map_err(|e| WalletError::HexParse(format!("invalid hex '{chunk}': {e}")))?;
-        result[i] = M31::from_u32_unchecked(val % 0x7FFFFFFF);
+        result[i] = super::reduce_u32_to_m31(val);
     }
     Ok(result)
 }
