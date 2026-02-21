@@ -56,13 +56,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust (nightly with rustfmt)
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2025-07-14
           components: rustfmt
 
       - name: Check formatting
-        run: cargo fmt --check
+        run: cargo +nightly-2025-07-14 fmt --check
 
   test:
     name: Core Tests
