@@ -487,7 +487,7 @@ fn gpu_merkle_required() -> bool {
 /// so limbs[2] and limbs[3] are always 0.
 #[cfg(feature = "cuda-runtime")]
 #[inline]
-fn securefield_to_u64_limbs_direct(sf: SecureField) -> [u64; 4] {
+pub(crate) fn securefield_to_u64_limbs_direct(sf: SecureField) -> [u64; 4] {
     let QM31(CM31(a, b), CM31(c, d)) = sf;
     let packed = (1u128 << 124)
         | ((a.0 as u128) << 93)
@@ -527,7 +527,7 @@ fn field_element_to_u64_limbs(fe: &FieldElement) -> [u64; 4] {
 }
 
 #[cfg(feature = "cuda-runtime")]
-fn u64_limbs_to_field_element(limbs: &[u64]) -> Option<FieldElement> {
+pub(crate) fn u64_limbs_to_field_element(limbs: &[u64]) -> Option<FieldElement> {
     if limbs.len() != 4 {
         return None;
     }

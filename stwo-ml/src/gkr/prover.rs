@@ -276,16 +276,19 @@ fn apply_aggregated_oracle_sumcheck(
         });
     }
 
-    // Collect aggregated claims with MLEs — parallelized for performance.
-    // Each weight matrix needs: MLE conversion + Merkle root commitment.
+    // Collect aggregated claims with MLEs + Merkle root commitments.
+    // Each weight matrix needs: MLE conversion + Poseidon Merkle root.
     // For 160 matrices of size 5120x17408, this is the dominant cost.
+    //
+    // GPU path: sequential per-matrix GPU Poseidon Merkle (~200ms each, ~32s total).
+    // CPU fallback: 4-thread parallel pool (~3-5s each, ~5-10min total).
     let total_claims = weight_data.len() + deferred_weight_claims_data.len();
     eprintln!(
-        "  [{log_tag}] aggregated oracle sumcheck: preparing {total_claims} weight commitments (parallel)..."
+        "  [{log_tag}] aggregated oracle sumcheck: preparing {total_claims} weight commitments..."
     );
     let t_commit = std::time::Instant::now();
 
-    // Combine main + deferred into a single list for parallel processing
+    // Combine main + deferred into a single list for ordered processing
     struct WeightPrepInput<'a> {
         weight_node_id: usize,
         eval_point: &'a [SecureField],
@@ -318,11 +321,6 @@ fn apply_aggregated_oracle_sumcheck(
         });
     }
 
-    // Parallel: compute MLE + commitment for each weight matrix
-    use rayon::prelude::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let done_count = AtomicUsize::new(0);
-
     struct WeightPrepResult {
         matrix_index: usize,
         n_vars: usize,
@@ -336,53 +334,271 @@ fn apply_aggregated_oracle_sumcheck(
         deferred_idx: usize,
     }
 
-    let prep_results: Vec<Result<WeightPrepResult, GKRError>> = prep_inputs
-        .par_iter()
-        .map(|input| {
-            let b_matrix = weights
-                .get_weight(input.weight_node_id)
-                .ok_or(GKRError::MissingWeight {
-                    node_id: input.weight_node_id,
+    // --- GPU path: sequential per-matrix, GPU Poseidon Merkle root ---
+    // Controlled by STWO_GPU_MLE_COMMITMENT (default ON for cuda-runtime builds).
+    // Per-matrix GPU failure falls back to CPU for that matrix and continues.
+    // STWO_GPU_MLE_COMMITMENT_REQUIRE / STWO_GPU_ONLY → panic on GPU failure.
+    #[cfg(feature = "cuda-runtime")]
+    let prep_results: Vec<Result<WeightPrepResult, GKRError>> = {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+        use stwo::prover::backend::gpu::cuda_executor::{
+            get_cuda_executor, is_cuda_available, upload_poseidon252_round_constants,
+        };
+        use crate::crypto::mle_opening::{gpu_mle_commitment_enabled, gpu_mle_commitment_required};
+
+        static GPU_COMMITMENT_LOGGED: AtomicBool = AtomicBool::new(false);
+        static GPU_COMMITMENT_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
+
+        let gpu_strict = gpu_mle_commitment_required();
+        let gpu_enabled = gpu_mle_commitment_enabled();
+        let gpu_available = gpu_enabled && is_cuda_available() && get_cuda_executor().is_ok();
+
+        if gpu_strict && !gpu_available {
+            if !gpu_enabled {
+                return Err(GKRError::ReductionError {
+                    layer_idx: 0,
+                    reason: "GPU MLE commitment strict mode enabled, but STWO_GPU_MLE_COMMITMENT is disabled".to_string(),
+                });
+            }
+            return Err(GKRError::ReductionError {
+                layer_idx: 0,
+                reason: format!(
+                    "GPU MLE commitment strict mode enabled, but GPU unavailable (cuda_available={}, executor_ok={})",
+                    is_cuda_available(),
+                    get_cuda_executor().is_ok(),
+                ),
+            });
+        }
+
+        if gpu_available {
+            let executor = get_cuda_executor().map_err(|e| GKRError::ReductionError {
+                layer_idx: 0,
+                reason: format!("cuda init for weight commitments: {e}"),
+            })?;
+            let d_rc = upload_poseidon252_round_constants(&executor.device)
+                .map_err(|e| GKRError::ReductionError {
+                    layer_idx: 0,
+                    reason: format!("upload poseidon round constants: {e}"),
                 })?;
-            let b_mle = matrix_to_mle_col_major_padded(b_matrix);
-            let n_vars = b_mle.len().trailing_zeros() as usize;
-            let commitment = crate::crypto::mle_opening::commit_mle_root_only(&b_mle);
 
-            #[cfg(feature = "cuda-runtime")]
-            let mle_u32 = {
-                let u32_mle = matrix_to_mle_col_major_u32_padded(b_matrix);
-                debug_assert_eq!(
-                    n_vars,
-                    (u32_mle.len() / 4).trailing_zeros() as usize,
-                    "n_vars mismatch: SecureField MLE has {n_vars} vars, u32 MLE has {} vars (weight node {})",
-                    (u32_mle.len() / 4).trailing_zeros(),
-                    input.weight_node_id,
-                );
-                u32_mle
-            };
-
-            let finished = done_count.fetch_add(1, Ordering::Relaxed) + 1;
-            if finished % 10 == 0 || finished == total_claims {
+            if !GPU_COMMITMENT_LOGGED.swap(true, AtomicOrdering::Relaxed) {
                 eprintln!(
-                    "  [{log_tag}] weight commitments: {finished}/{total_claims} done ({:.1}s)",
-                    t_commit.elapsed().as_secs_f64(),
+                    "  [{log_tag}] weight commitment backend: GPU Poseidon Merkle",
                 );
             }
 
-            Ok(WeightPrepResult {
-                matrix_index: input.matrix_index,
-                n_vars,
-                commitment,
-                eval_point: input.eval_point.to_vec(),
-                expected_value: input.expected_value,
-                mle: b_mle,
-                #[cfg(feature = "cuda-runtime")]
-                mle_u32,
-                is_deferred: input.is_deferred,
-                deferred_idx: input.deferred_idx,
+            let mut results = Vec::with_capacity(total_claims);
+            let mut gpu_count = 0usize;
+            let mut cpu_fallback_count = 0usize;
+            for (idx, input) in prep_inputs.iter().enumerate() {
+                let b_matrix = weights
+                    .get_weight(input.weight_node_id)
+                    .ok_or(GKRError::MissingWeight {
+                        node_id: input.weight_node_id,
+                    })?;
+                let b_mle = matrix_to_mle_col_major_padded(b_matrix);
+                let n_vars = b_mle.len().trailing_zeros() as usize;
+
+                // Try GPU Poseidon Merkle root (~100-200ms per matrix vs ~3-5s CPU).
+                // On failure, fall back to CPU for this matrix unless strict mode.
+                let commitment = match crate::crypto::mle_opening::commit_mle_root_only_gpu(
+                    &b_mle, executor, &d_rc,
+                ) {
+                    Ok(root) => {
+                        gpu_count += 1;
+                        root
+                    }
+                    Err(e) => {
+                        if gpu_strict {
+                            return Err(GKRError::ReductionError {
+                                layer_idx: 0,
+                                reason: format!(
+                                    "GPU MLE commitment strict mode: GPU failed for matrix {}: {e}",
+                                    idx
+                                ),
+                            });
+                        }
+                        if !GPU_COMMITMENT_FALLBACK_LOGGED.swap(true, AtomicOrdering::Relaxed) {
+                            eprintln!(
+                                "  [{log_tag}] weight commitment: GPU failed for matrix {}, falling back to CPU ({e})",
+                                idx
+                            );
+                        }
+                        cpu_fallback_count += 1;
+                        crate::crypto::mle_opening::commit_mle_root_only(&b_mle)
+                    }
+                };
+
+                let mle_u32 = {
+                    let u32_mle = matrix_to_mle_col_major_u32_padded(b_matrix);
+                    debug_assert_eq!(
+                        n_vars,
+                        (u32_mle.len() / 4).trailing_zeros() as usize,
+                        "n_vars mismatch: SecureField MLE has {n_vars} vars, u32 MLE has {} vars (weight node {})",
+                        (u32_mle.len() / 4).trailing_zeros(),
+                        input.weight_node_id,
+                    );
+                    u32_mle
+                };
+
+                let finished = idx + 1;
+                if finished % 10 == 0 || finished == total_claims {
+                    eprintln!(
+                        "  [{log_tag}] weight commitments: {finished}/{total_claims} done ({:.1}s, gpu={gpu_count} cpu={cpu_fallback_count})",
+                        t_commit.elapsed().as_secs_f64(),
+                    );
+                }
+
+                results.push(Ok(WeightPrepResult {
+                    matrix_index: input.matrix_index,
+                    n_vars,
+                    commitment,
+                    eval_point: input.eval_point.to_vec(),
+                    expected_value: input.expected_value,
+                    mle: b_mle,
+                    mle_u32,
+                    is_deferred: input.is_deferred,
+                    deferred_idx: input.deferred_idx,
+                }));
+            }
+            results
+        } else {
+            // GPU unavailable or disabled — use CPU parallel path
+            if !GPU_COMMITMENT_FALLBACK_LOGGED.swap(true, AtomicOrdering::Relaxed) {
+                eprintln!(
+                    "  [{log_tag}] weight commitment backend: CPU parallel (GPU {})",
+                    if !gpu_enabled { "disabled" } else { "unavailable" },
+                );
+            }
+            use std::sync::atomic::AtomicUsize;
+            let done_count = AtomicUsize::new(0);
+            let max_parallel_commitments = std::env::var("STWO_GKR_PARALLEL_COMMITMENTS")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|&v| v > 0)
+                .unwrap_or(4);
+
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(max_parallel_commitments)
+                .build()
+                .map_err(|e| GKRError::ReductionError {
+                    layer_idx: 0,
+                    reason: format!("failed to build weight-commitment thread pool: {e}"),
+                })?;
+
+            eprintln!(
+                "  [{log_tag}] using {max_parallel_commitments} parallel CPU threads for commitments",
+            );
+
+            pool.install(|| {
+                prep_inputs
+                .par_iter()
+                .map(|input| {
+                    let b_matrix = weights
+                        .get_weight(input.weight_node_id)
+                        .ok_or(GKRError::MissingWeight {
+                            node_id: input.weight_node_id,
+                        })?;
+                    let b_mle = matrix_to_mle_col_major_padded(b_matrix);
+                    let n_vars = b_mle.len().trailing_zeros() as usize;
+                    let commitment = crate::crypto::mle_opening::commit_mle_root_only(&b_mle);
+
+                    let mle_u32 = {
+                        let u32_mle = matrix_to_mle_col_major_u32_padded(b_matrix);
+                        debug_assert_eq!(
+                            n_vars,
+                            (u32_mle.len() / 4).trailing_zeros() as usize,
+                            "n_vars mismatch: SecureField MLE has {n_vars} vars, u32 MLE has {} vars (weight node {})",
+                            (u32_mle.len() / 4).trailing_zeros(),
+                            input.weight_node_id,
+                        );
+                        u32_mle
+                    };
+
+                    let finished = done_count.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+                    if finished % 10 == 0 || finished == total_claims {
+                        eprintln!(
+                            "  [{log_tag}] weight commitments: {finished}/{total_claims} done ({:.1}s)",
+                            t_commit.elapsed().as_secs_f64(),
+                        );
+                    }
+
+                    Ok(WeightPrepResult {
+                        matrix_index: input.matrix_index,
+                        n_vars,
+                        commitment,
+                        eval_point: input.eval_point.to_vec(),
+                        expected_value: input.expected_value,
+                        mle: b_mle,
+                        mle_u32,
+                        is_deferred: input.is_deferred,
+                        deferred_idx: input.deferred_idx,
+                    })
+                })
+                .collect()
             })
+        }
+    };
+
+    // --- CPU-only path (no cuda-runtime feature) ---
+    #[cfg(not(feature = "cuda-runtime"))]
+    let prep_results: Vec<Result<WeightPrepResult, GKRError>> = {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        let done_count = AtomicUsize::new(0);
+        let max_parallel_commitments = std::env::var("STWO_GKR_PARALLEL_COMMITMENTS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(4);
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(max_parallel_commitments)
+            .build()
+            .map_err(|e| GKRError::ReductionError {
+                layer_idx: 0,
+                reason: format!("failed to build weight-commitment thread pool: {e}"),
+            })?;
+
+        eprintln!(
+            "  [{log_tag}] using {max_parallel_commitments} parallel CPU threads for commitments",
+        );
+
+        pool.install(|| {
+            use rayon::prelude::*;
+            prep_inputs
+            .par_iter()
+            .map(|input| {
+                let b_matrix = weights
+                    .get_weight(input.weight_node_id)
+                    .ok_or(GKRError::MissingWeight {
+                        node_id: input.weight_node_id,
+                    })?;
+                let b_mle = matrix_to_mle_col_major_padded(b_matrix);
+                let n_vars = b_mle.len().trailing_zeros() as usize;
+                let commitment = crate::crypto::mle_opening::commit_mle_root_only(&b_mle);
+
+                let finished = done_count.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+                if finished % 10 == 0 || finished == total_claims {
+                    eprintln!(
+                        "  [{log_tag}] weight commitments: {finished}/{total_claims} done ({:.1}s)",
+                        t_commit.elapsed().as_secs_f64(),
+                    );
+                }
+
+                Ok(WeightPrepResult {
+                    matrix_index: input.matrix_index,
+                    n_vars,
+                    commitment,
+                    eval_point: input.eval_point.to_vec(),
+                    expected_value: input.expected_value,
+                    mle: b_mle,
+                    is_deferred: input.is_deferred,
+                    deferred_idx: input.deferred_idx,
+                })
+            })
+            .collect()
         })
-        .collect();
+    };
 
     // Unpack results in order
     let mut agg_claims = Vec::with_capacity(total_claims);

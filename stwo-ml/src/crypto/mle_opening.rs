@@ -11,6 +11,8 @@
 use crate::crypto::poseidon_channel::{securefield_to_felt, PoseidonChannel};
 use crate::crypto::poseidon_merkle::{MerkleAuthPath, PoseidonMerkleTree};
 #[cfg(feature = "cuda-runtime")]
+use crate::crypto::poseidon_merkle::{securefield_to_u64_limbs_direct, u64_limbs_to_field_element};
+#[cfg(feature = "cuda-runtime")]
 use crate::gpu_sumcheck::u32s_to_secure_field;
 #[cfg(feature = "cuda-runtime")]
 use crate::gpu_sumcheck::GpuSumcheckExecutor;
@@ -45,6 +47,10 @@ static GPU_MLE_FOLD_BACKEND_LOGGED: AtomicBool = AtomicBool::new(false);
 static GPU_MLE_OPENING_TREE_BACKEND_LOGGED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "cuda-runtime")]
 static GPU_MLE_OPENING_TREE_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "cuda-runtime")]
+static GPU_MLE_COMMITMENT_BACKEND_LOGGED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "cuda-runtime")]
+static GPU_MLE_COMMITMENT_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(feature = "cuda-runtime")]
 #[derive(Debug, Clone)]
@@ -124,6 +130,39 @@ fn gpu_mle_opening_tree_enabled() -> bool {
 #[cfg(feature = "cuda-runtime")]
 fn gpu_mle_opening_tree_required() -> bool {
     let explicit = match std::env::var("STWO_GPU_MLE_OPENING_TREE_REQUIRE") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false" && v != "off"
+        }
+        Err(_) => false,
+    };
+    if explicit {
+        return true;
+    }
+    match std::env::var("STWO_GPU_ONLY") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false" && v != "off"
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(feature = "cuda-runtime")]
+pub(crate) fn gpu_mle_commitment_enabled() -> bool {
+    match std::env::var("STWO_GPU_MLE_COMMITMENT") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false" && v != "off"
+        }
+        // Default ON when CUDA runtime is built in.
+        Err(_) => true,
+    }
+}
+
+#[cfg(feature = "cuda-runtime")]
+pub(crate) fn gpu_mle_commitment_required() -> bool {
+    let explicit = match std::env::var("STWO_GPU_MLE_COMMITMENT_REQUIRE") {
         Ok(v) => {
             let v = v.trim().to_ascii_lowercase();
             !v.is_empty() && v != "0" && v != "false" && v != "off"
@@ -382,6 +421,87 @@ pub fn commit_mle_root_only(evals: &[SecureField]) -> FieldElement {
         evals.iter().map(|&sf| securefield_to_felt(sf)).collect()
     };
     PoseidonMerkleTree::root_only_parallel(leaves)
+}
+
+/// Compute only the MLE commitment root using the GPU Poseidon Merkle kernel.
+///
+/// Converts SecureField evaluations to u64 limbs, uploads to GPU, runs the
+/// full Poseidon252 Merkle tree kernel, and extracts only the root.
+/// All intermediate GPU buffers are dropped after root extraction.
+///
+/// ~20-50x faster than CPU `commit_mle_root_only` for large matrices
+/// (e.g., 134M elements: ~200ms GPU vs ~3-5s CPU).
+#[cfg(feature = "cuda-runtime")]
+pub fn commit_mle_root_only_gpu(
+    evals: &[SecureField],
+    executor: &CudaFftExecutor,
+    d_round_constants: &CudaSlice<u64>,
+) -> Result<FieldElement, String> {
+    assert!(!evals.is_empty(), "cannot commit empty evals");
+    let n = evals.len().next_power_of_two().max(2);
+    let n_leaf_hashes = n / 2;
+
+    // Convert SecureField → u64 limbs (parallel on CPU)
+    let mut leaf_limbs = vec![0u64; n * 4];
+    leaf_limbs[..evals.len() * 4]
+        .par_chunks_mut(4)
+        .zip(evals.par_iter())
+        .for_each(|(dst, sf)| {
+            dst.copy_from_slice(&securefield_to_u64_limbs_direct(*sf));
+        });
+    // Padding elements remain zero (matching FieldElement::ZERO encoding)
+
+    // Upload leaf limbs to GPU
+    let d_prev_leaf = executor
+        .device
+        .htod_sync_copy(&leaf_limbs)
+        .map_err(|e| format!("H2D leaf limbs: {:?}", e))?;
+    drop(leaf_limbs); // Free ~4GB host allocation immediately
+    let d_dummy_columns = executor
+        .device
+        .htod_sync_copy(&[0u32])
+        .map_err(|e| format!("H2D dummy columns: {:?}", e))?;
+
+    // Run GPU Poseidon Merkle tree — keep layers on GPU, download only root.
+    // Using gpu_layers variant avoids ~4GB bulk D2H of all intermediate layers.
+    let gpu_tree = executor
+        .execute_poseidon252_merkle_full_tree_gpu_layers(
+            &d_dummy_columns,
+            0,
+            Some(&d_prev_leaf),
+            n_leaf_hashes,
+            d_round_constants,
+        )
+        .map_err(|e| format!("execute full-tree: {e}"))?;
+
+    // Download only the root (32 bytes D2H vs ~4GB for full tree)
+    let root_limbs = gpu_tree
+        .root_u64()
+        .map_err(|e| format!("download GPU root: {e}"))?;
+    let root = u64_limbs_to_field_element(&root_limbs)
+        .ok_or_else(|| "invalid root limbs from GPU Merkle tree".to_string())?;
+    // gpu_tree dropped here — frees all GPU intermediate layer buffers
+
+    // Opt-in cross-check: verify GPU root matches CPU root.
+    // Expensive (~5s per matrix), so only enabled via env var, not debug_assertions.
+    if std::env::var("STWO_GPU_COMMITMENT_VERIFY")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false" && v != "off"
+        })
+        .unwrap_or(false)
+    {
+        let cpu_root = commit_mle_root_only(evals);
+        if cpu_root != root {
+            return Err(format!(
+                "GPU and CPU Poseidon Merkle roots differ! GPU={:?} CPU={:?}",
+                root, cpu_root,
+            ));
+        }
+    }
+
+    Ok(root)
 }
 
 /// Generate an MLE opening proof.
