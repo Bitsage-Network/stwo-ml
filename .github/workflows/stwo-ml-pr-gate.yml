@@ -34,17 +34,17 @@ jobs:
       - name: Manifest Validation
         run: cargo metadata --no-deps --format-version 1 > /dev/null
 
-      - name: Check (default features)
-        run: cargo check
+      - name: Check lib (default features)
+        run: cargo check --lib
 
-      - name: Check (audit)
-        run: cargo check --features audit
+      - name: Check lib (audit)
+        run: cargo check --lib --features audit
 
-      - name: Check (cli)
-        run: cargo check --features cli
+      - name: Check lib (cli + audit)
+        run: cargo check --lib --features "cli,audit"
 
-      - name: Check (server)
-        run: cargo check --features server
+      - name: Check lib (server + cli + audit)
+        run: cargo check --lib --features "server,cli,audit"
 
   fmt:
     name: Formatting
