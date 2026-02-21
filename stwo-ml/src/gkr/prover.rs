@@ -276,86 +276,147 @@ fn apply_aggregated_oracle_sumcheck(
         });
     }
 
-    // Collect aggregated claims with MLEs
-    let mut agg_claims = Vec::new();
-    let mut all_mles: Vec<Vec<SecureField>> = Vec::new();
-    #[cfg(feature = "cuda-runtime")]
-    let mut all_mles_u32: Vec<Vec<u32>> = Vec::new();
+    // Collect aggregated claims with MLEs — parallelized for performance.
+    // Each weight matrix needs: MLE conversion + Merkle root commitment.
+    // For 160 matrices of size 5120x17408, this is the dominant cost.
+    let total_claims = weight_data.len() + deferred_weight_claims_data.len();
+    eprintln!(
+        "  [{log_tag}] aggregated oracle sumcheck: preparing {total_claims} weight commitments (parallel)..."
+    );
+    let t_commit = std::time::Instant::now();
 
-    // Main walk claims
-    for (idx, (weight_node_id, eval_point, expected_value)) in weight_data.iter().enumerate() {
-        let b_matrix = weights
-            .get_weight(*weight_node_id)
-            .ok_or(GKRError::MissingWeight {
-                node_id: *weight_node_id,
-            })?;
-        let b_mle = matrix_to_mle_col_major_padded(b_matrix);
-        let n_vars = b_mle.len().trailing_zeros() as usize;
-        let commitment = crate::crypto::mle_opening::commit_mle_root_only(&b_mle);
-        weight_commitments.push(commitment);
-
-        agg_claims.push(AggregatedWeightClaim {
-            matrix_index: idx,
-            local_n_vars: n_vars,
-            eval_point: eval_point.clone(),
-            expected_value: *expected_value,
-            commitment,
-        });
-        all_mles.push(b_mle);
-        #[cfg(feature = "cuda-runtime")]
-        {
-            let b_mle_u32 = matrix_to_mle_col_major_u32_padded(b_matrix);
-            debug_assert_eq!(
-                n_vars,
-                (b_mle_u32.len() / 4).trailing_zeros() as usize,
-                "n_vars mismatch: SecureField MLE has {n_vars} vars, u32 MLE has {} vars (weight node {weight_node_id})",
-                (b_mle_u32.len() / 4).trailing_zeros(),
-            );
-            all_mles_u32.push(b_mle_u32);
-        }
+    // Combine main + deferred into a single list for parallel processing
+    struct WeightPrepInput<'a> {
+        weight_node_id: usize,
+        eval_point: &'a [SecureField],
+        expected_value: SecureField,
+        matrix_index: usize,
+        is_deferred: bool,
+        deferred_idx: usize,
     }
-
-    // Deferred claims
+    let mut prep_inputs: Vec<WeightPrepInput<'_>> = Vec::with_capacity(total_claims);
+    for (idx, (weight_node_id, eval_point, expected_value)) in weight_data.iter().enumerate() {
+        prep_inputs.push(WeightPrepInput {
+            weight_node_id: *weight_node_id,
+            eval_point,
+            expected_value: *expected_value,
+            matrix_index: idx,
+            is_deferred: false,
+            deferred_idx: 0,
+        });
+    }
     for (deferred_idx, (weight_node_id, eval_point, expected_value)) in
         deferred_weight_claims_data.iter().enumerate()
     {
-        let b_matrix = weights
-            .get_weight(*weight_node_id)
-            .ok_or(GKRError::MissingWeight {
-                node_id: *weight_node_id,
-            })?;
-        let b_mle = matrix_to_mle_col_major_padded(b_matrix);
-        let n_vars = b_mle.len().trailing_zeros() as usize;
-        let commitment = crate::crypto::mle_opening::commit_mle_root_only(&b_mle);
+        prep_inputs.push(WeightPrepInput {
+            weight_node_id: *weight_node_id,
+            eval_point,
+            expected_value: *expected_value,
+            matrix_index: weight_data.len() + deferred_idx,
+            is_deferred: true,
+            deferred_idx,
+        });
+    }
 
-        // Update deferred proof's weight commitment (only for MatMul kind)
-        if let Some(dp) = deferred_proofs.get_mut(deferred_idx) {
-            if let Some(wc) = dp.weight_commitment_mut() {
-                *wc = commitment;
+    // Parallel: compute MLE + commitment for each weight matrix
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let done_count = AtomicUsize::new(0);
+
+    struct WeightPrepResult {
+        matrix_index: usize,
+        n_vars: usize,
+        commitment: starknet_ff::FieldElement,
+        eval_point: Vec<SecureField>,
+        expected_value: SecureField,
+        mle: Vec<SecureField>,
+        #[cfg(feature = "cuda-runtime")]
+        mle_u32: Vec<u32>,
+        is_deferred: bool,
+        deferred_idx: usize,
+    }
+
+    let prep_results: Vec<Result<WeightPrepResult, GKRError>> = prep_inputs
+        .par_iter()
+        .map(|input| {
+            let b_matrix = weights
+                .get_weight(input.weight_node_id)
+                .ok_or(GKRError::MissingWeight {
+                    node_id: input.weight_node_id,
+                })?;
+            let b_mle = matrix_to_mle_col_major_padded(b_matrix);
+            let n_vars = b_mle.len().trailing_zeros() as usize;
+            let commitment = crate::crypto::mle_opening::commit_mle_root_only(&b_mle);
+
+            #[cfg(feature = "cuda-runtime")]
+            let mle_u32 = {
+                let u32_mle = matrix_to_mle_col_major_u32_padded(b_matrix);
+                debug_assert_eq!(
+                    n_vars,
+                    (u32_mle.len() / 4).trailing_zeros() as usize,
+                    "n_vars mismatch: SecureField MLE has {n_vars} vars, u32 MLE has {} vars (weight node {})",
+                    (u32_mle.len() / 4).trailing_zeros(),
+                    input.weight_node_id,
+                );
+                u32_mle
+            };
+
+            let finished = done_count.fetch_add(1, Ordering::Relaxed) + 1;
+            if finished % 10 == 0 || finished == total_claims {
+                eprintln!(
+                    "  [{log_tag}] weight commitments: {finished}/{total_claims} done ({:.1}s)",
+                    t_commit.elapsed().as_secs_f64(),
+                );
+            }
+
+            Ok(WeightPrepResult {
+                matrix_index: input.matrix_index,
+                n_vars,
+                commitment,
+                eval_point: input.eval_point.to_vec(),
+                expected_value: input.expected_value,
+                mle: b_mle,
+                #[cfg(feature = "cuda-runtime")]
+                mle_u32,
+                is_deferred: input.is_deferred,
+                deferred_idx: input.deferred_idx,
+            })
+        })
+        .collect();
+
+    // Unpack results in order
+    let mut agg_claims = Vec::with_capacity(total_claims);
+    let mut all_mles: Vec<Vec<SecureField>> = Vec::with_capacity(total_claims);
+    #[cfg(feature = "cuda-runtime")]
+    let mut all_mles_u32: Vec<Vec<u32>> = Vec::with_capacity(total_claims);
+
+    for result in prep_results {
+        let r = result?;
+        if !r.is_deferred {
+            weight_commitments.push(r.commitment);
+        } else {
+            // Update deferred proof's weight commitment (only for MatMul kind)
+            if let Some(dp) = deferred_proofs.get_mut(r.deferred_idx) {
+                if let Some(wc) = dp.weight_commitment_mut() {
+                    *wc = r.commitment;
+                }
             }
         }
-
-        let claim_idx = weight_data.len() + deferred_idx;
         agg_claims.push(AggregatedWeightClaim {
-            matrix_index: claim_idx,
-            local_n_vars: n_vars,
-            eval_point: eval_point.clone(),
-            expected_value: *expected_value,
-            commitment,
+            matrix_index: r.matrix_index,
+            local_n_vars: r.n_vars,
+            eval_point: r.eval_point,
+            expected_value: r.expected_value,
+            commitment: r.commitment,
         });
-        all_mles.push(b_mle);
+        all_mles.push(r.mle);
         #[cfg(feature = "cuda-runtime")]
-        {
-            let b_mle_u32 = matrix_to_mle_col_major_u32_padded(b_matrix);
-            debug_assert_eq!(
-                n_vars,
-                (b_mle_u32.len() / 4).trailing_zeros() as usize,
-                "n_vars mismatch (deferred): SecureField MLE has {n_vars} vars, u32 MLE has {} vars (weight node {weight_node_id})",
-                (b_mle_u32.len() / 4).trailing_zeros(),
-            );
-            all_mles_u32.push(b_mle_u32);
-        }
+        all_mles_u32.push(r.mle_u32);
     }
+    eprintln!(
+        "  [{log_tag}] all {total_claims} weight commitments ready in {:.1}s",
+        t_commit.elapsed().as_secs_f64(),
+    );
 
     let binding_proof = if !agg_claims.is_empty() {
         let mle_refs: Vec<&[SecureField]> = all_mles.iter().map(|m| m.as_slice()).collect();
