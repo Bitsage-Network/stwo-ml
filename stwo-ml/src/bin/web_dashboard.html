@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ZKML GKR Proof Stream</title>
+<style>
+  :root {
+    --bg: #0a0a12; --bg2: #12121e; --border: rgba(255,255,255,0.07);
+    --neon: #429bf5; --green: #00e676; --orange: #f5a542;
+    --text: #e0e0e0; --muted: #666;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: 'Courier New', monospace; height: 100vh; overflow: hidden; }
+  #grid {
+    display: grid;
+    grid-template-columns: 60fr 40fr;
+    grid-template-rows: 65vh 35vh;
+    gap: 1px;
+    height: 100vh;
+    background: var(--border);
+  }
+  .panel {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    position: relative;
+    overflow: hidden;
+  }
+  .panel-title {
+    position: absolute; top: 8px; left: 12px; z-index: 10;
+    font-size: 11px; letter-spacing: 2px; text-transform: uppercase;
+    color: var(--muted); pointer-events: none;
+  }
+  #canvas-3d { width: 100%; height: 100%; display: block; }
+  #gpu-panel { grid-column: 2; grid-row: 1; display: flex; flex-direction: column; }
+  #gpu-rings { flex: 0 0 auto; padding: 32px 16px 8px; }
+  #log-panel { flex: 1 1 auto; overflow-y: auto; padding: 8px 12px; }
+  .log-entry { font-size: 11px; color: var(--muted); margin-bottom: 2px; }
+  .log-entry.info { color: var(--neon); }
+  .log-entry.event { color: #888; }
+  #chart-panel { grid-column: 1; grid-row: 2; }
+  #phase-panel { grid-column: 2; grid-row: 2; overflow-y: auto; padding: 32px 12px 8px; }
+  canvas#claim-chart { width: 100%; height: 100%; }
+  .phase-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 11px; }
+  .phase-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .phase-bar-bg { flex: 1; height: 4px; background: #1a1a2a; border-radius: 2px; }
+  .phase-bar { height: 100%; border-radius: 2px; transition: width 0.3s; }
+  .banner {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.8);
+    display: none; align-items: center; justify-content: center; z-index: 999;
+  }
+  .banner-inner { text-align: center; }
+  .banner-inner h2 { font-size: 48px; color: var(--green); letter-spacing: 8px; }
+  .banner-inner p { color: var(--muted); margin-top: 8px; }
+  .ws-indicator {
+    position: fixed; bottom: 8px; right: 8px; font-size: 10px;
+    color: var(--muted); z-index: 100;
+  }
+  .ws-indicator.connected { color: var(--green); }
+  .ws-indicator.error { color: #f44; }
+  /* GPU ring SVGs */
+  .gpu-device { margin-bottom: 12px; }
+  .gpu-device-name { font-size: 10px; color: var(--muted); margin-bottom: 4px; }
+  .gpu-ring-row { display: flex; align-items: center; gap: 8px; }
+  .gpu-ring-row span { font-size: 11px; color: var(--neon); min-width: 36px; }
+  svg.ring { transform: rotate(-90deg); }
+</style>
+</head>
+<body>
+<div id="grid">
+  <div class="panel" id="helix-panel">
+    <div class="panel-title">GKR Proof Walk — 3D Helix</div>
+    <canvas id="canvas-3d"></canvas>
+  </div>
+  <div class="panel" id="gpu-panel">
+    <div class="panel-title">GPU Status</div>
+    <div id="gpu-rings"></div>
+    <div id="log-panel"></div>
+  </div>
+  <div class="panel" id="chart-panel">
+    <div class="panel-title">Claim Descent (log scale)</div>
+    <canvas id="claim-chart"></canvas>
+  </div>
+  <div class="panel" id="phase-panel">
+    <div class="panel-title">Phase Timeline</div>
+    <div id="phase-list"></div>
+  </div>
+</div>
+<div class="banner" id="done-banner">
+  <div class="banner-inner">
+    <h2>PROOF COMPLETE</h2>
+    <p id="banner-stats"></p>
+    <button onclick="document.getElementById('done-banner').style.display='none'"
+      style="margin-top:16px;padding:8px 24px;background:var(--green);color:#000;border:none;cursor:pointer;font-family:inherit;">
+      DISMISS
+    </button>
+  </div>
+</div>
+<div class="ws-indicator" id="ws-indicator">● CONNECTING</div>
+
+<!-- Three.js from CDN -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.1/build/three.module.js"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+
+// ── Utilities ────────────────────────────────────────────────────────────────
+// Escape HTML to prevent XSS when inserting untrusted strings into innerHTML.
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// ── Constants (mirrors rerun_sink.rs geometry) ──────────────────────────────
+const X_STEP = 3.0, HELIX_R = 1.8;
+function helixPos(i) {
+  const angle = i * 0.9;
+  return new THREE.Vector3(i * X_STEP, Math.sin(angle) * HELIX_R, Math.cos(angle) * HELIX_R);
+}
+const KIND_COLOR = {
+  MatMul:0x429bf5, Activation:0xf5a542, LayerNorm:0x4cc671,
+  RMSNorm:0x38b2ac, Add:0xa0a0a0, Mul:0xa855d4,
+  Attention:0xf5d042, Embedding:0xec6ead, Dequantize:0xff8c00,
+  Quantize:0xff4c4c, Input:0x8080ff, Unknown:0x606060
+};
+
+// ── Three.js scene setup ────────────────────────────────────────────────────
+const canvas = document.getElementById('canvas-3d');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x0a0a12, 0.025);
+const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 500);
+camera.position.set(0, 4, 14);
+camera.lookAt(0, 0, 0);
+scene.add(new THREE.AmbientLight(0xffffff, 0.4));
+const dirLight = new THREE.DirectionalLight(0x6699ff, 0.8);
+dirLight.position.set(5, 10, 5);
+scene.add(dirLight);
+
+// ── Proof state ─────────────────────────────────────────────────────────────
+let nodes = [];     // THREE.Mesh per layer
+let rail = null;    // backbone TubeGeometry
+let trail = null;   // proof trail line
+let trailPts = [];
+let cursorRing = null;
+let numLayers = 0;
+let claimDatasets = {};   // layer_idx → [{x, y}]
+let chartDirty = false;   // true when claimDatasets has unseen data
+let phaseMap = {};        // layer_idx → DOM row
+const claimCanvas = document.getElementById('claim-chart');
+const claimCtx = claimCanvas.getContext('2d');
+let claimChart = null;
+
+function initScene(n) {
+  numLayers = n;
+  // Clear previous
+  for (const m of nodes) scene.remove(m);
+  nodes = [];
+  if (rail) { scene.remove(rail); rail = null; }
+  if (trail) { scene.remove(trail); trail = null; }
+  if (cursorRing) { scene.remove(cursorRing); cursorRing = null; }
+  trailPts = [];
+  claimDatasets = {};
+  chartDirty = true;
+  document.getElementById('phase-list').innerHTML = '';
+  phaseMap = {};
+
+  // Backbone rail
+  const pts = Array.from({length: n}, (_, i) => helixPos(i));
+  if (n > 1) {
+    const curve = new THREE.CatmullRomCurve3(pts);
+    const tg = new THREE.TubeGeometry(curve, n * 3, 0.06, 8, false);
+    rail = new THREE.Mesh(tg, new THREE.MeshStandardMaterial({
+      color: 0x222244, transparent: true, opacity: 0.4, roughness: 0.8
+    }));
+    scene.add(rail);
+  }
+
+  // Layer nodes
+  for (let i = 0; i < n; i++) {
+    const geo = new THREE.SphereGeometry(0.35, 16, 12);
+    const mat = new THREE.MeshStandardMaterial({
+      color: 0x333355, roughness: 0.6, metalness: 0.3,
+      transparent: true, opacity: 0.7
+    });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.copy(helixPos(i));
+    scene.add(mesh);
+    nodes.push(mesh);
+  }
+
+  // Cursor ring
+  const ringGeo = new THREE.TorusGeometry(0.55, 0.04, 8, 32);
+  cursorRing = new THREE.Mesh(ringGeo, new THREE.MeshStandardMaterial({
+    color: 0x00e5ff, emissive: 0x004455, transparent: true, opacity: 0.6
+  }));
+  scene.add(cursorRing);
+
+  // Camera position
+  const mid = helixPos(Math.floor(n / 2));
+  camera.position.set(mid.x, mid.y + 5, mid.z + 14);
+  camera.lookAt(mid);
+
+  // Chart
+  initChart(n);
+  // Phases
+  for (let i = 0; i < n; i++) addPhaseRow(i);
+}
+
+function initChart(n) {
+  if (claimChart) { claimChart = null; }
+  claimCtx.clearRect(0, 0, claimCanvas.width, claimCanvas.height);
+  claimDatasets = {};
+  drawChart();
+}
+
+function addPhaseRow(i) {
+  const row = document.createElement('div');
+  row.className = 'phase-row';
+  const color = `#${(KIND_COLOR.Unknown).toString(16).padStart(6,'0')}`;
+  row.innerHTML = `
+    <div class="phase-dot" style="background:${color}" id="pdot-${i}"></div>
+    <span style="color:#555;min-width:32px;font-size:10px">L${i}</span>
+    <div class="phase-bar-bg"><div class="phase-bar" id="pbar-${i}" style="width:0%;background:${color}"></div></div>
+    <span id="ptime-${i}" style="color:#444;min-width:40px;text-align:right">-</span>
+  `;
+  document.getElementById('phase-list').appendChild(row);
+  phaseMap[i] = row;
+}
+
+function layerStart(idx, kind, claim) {
+  if (!nodes[idx]) return;
+  const col = KIND_COLOR[kind] || KIND_COLOR.Unknown;
+  nodes[idx].material.color.setHex(col);
+  nodes[idx].material.opacity = 1.0;
+  nodes[idx].scale.setScalar(1.3);
+  if (cursorRing) cursorRing.position.copy(nodes[idx].position);
+  const dot = document.getElementById(`pdot-${idx}`);
+  if (dot) dot.style.background = `#${col.toString(16).padStart(6,'0')}`;
+}
+
+function layerEnd(idx, duration_ms) {
+  if (!nodes[idx]) return;
+  nodes[idx].material.color.setHex(0x00e676);
+  nodes[idx].scale.setScalar(1.0);
+  // Update trail
+  trailPts.push(nodes[idx].position.clone());
+  if (trailPts.length > 1) {
+    if (trail) scene.remove(trail);
+    const trailGeo = new THREE.BufferGeometry().setFromPoints(trailPts);
+    trail = new THREE.Line(trailGeo, new THREE.LineBasicMaterial({ color: 0x00e676, opacity: 0.7, transparent: true }));
+    scene.add(trail);
+  }
+  const bar = document.getElementById(`pbar-${idx}`);
+  const time = document.getElementById(`ptime-${idx}`);
+  if (bar) { bar.style.width = '100%'; bar.style.background = '#00e676'; }
+  if (time) time.textContent = `${duration_ms}ms`;
+}
+
+function sumcheckRound(layer_idx, round, total_rounds, claim) {
+  // Update phase bar
+  const bar = document.getElementById(`pbar-${layer_idx}`);
+  if (bar) {
+    const pct = total_rounds > 0 ? (round / total_rounds * 100).toFixed(0) : 0;
+    bar.style.width = `${pct}%`;
+    const col = KIND_COLOR.MatMul;
+    bar.style.background = `#${col.toString(16).padStart(6,'0')}`;
+  }
+  // Add to claim chart data; actual redraw is deferred to the rAF animate() loop
+  // so rapid bursts of rounds don't redraw the canvas more than once per frame.
+  if (!claimDatasets[layer_idx]) claimDatasets[layer_idx] = [];
+  claimDatasets[layer_idx].push({ x: round, y: Math.max(claim, 1e-8) });
+  chartDirty = true;
+}
+
+function drawChart() {
+  const W = claimCanvas.width, H = claimCanvas.height;
+  claimCtx.clearRect(0, 0, W, H);
+  claimCtx.fillStyle = '#0a0a12';
+  claimCtx.fillRect(0, 0, W, H);
+
+  const datasets = Object.entries(claimDatasets);
+  if (datasets.length === 0) return;
+
+  // Log scale Y
+  let minY = Infinity, maxY = -Infinity, maxX = 0;
+  for (const [, pts] of datasets) {
+    for (const p of pts) {
+      if (p.y > 0) { minY = Math.min(minY, Math.log10(p.y)); maxY = Math.max(maxY, Math.log10(p.y)); }
+      maxX = Math.max(maxX, p.x);
+    }
+  }
+  if (!isFinite(minY)) return;
+  const pad = { l: 36, r: 8, t: 8, b: 20 };
+  const w = W - pad.l - pad.r, h = H - pad.t - pad.b;
+  const toX = x => pad.l + (maxX > 0 ? x / maxX : 0) * w;
+  const toY = y => pad.t + h - (maxY > minY ? (Math.log10(Math.max(y, 1e-8)) - minY) / (maxY - minY) : 0.5) * h;
+
+  // Grid
+  claimCtx.strokeStyle = 'rgba(255,255,255,0.05)';
+  claimCtx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const yy = pad.t + (h / 4) * i;
+    claimCtx.beginPath(); claimCtx.moveTo(pad.l, yy); claimCtx.lineTo(pad.l + w, yy); claimCtx.stroke();
+  }
+
+  const palette = [0x429bf5, 0xf5a542, 0x4cc671, 0xa855d4, 0xf5d042, 0xec6ead, 0x38b2ac, 0xff8c00];
+  datasets.forEach(([idx, pts], di) => {
+    if (pts.length < 2) return;
+    const col = palette[di % palette.length];
+    const r = (col >> 16) & 0xff, g = (col >> 8) & 0xff, b = col & 0xff;
+    claimCtx.strokeStyle = `rgba(${r},${g},${b},0.85)`;
+    claimCtx.lineWidth = 1.5;
+    claimCtx.beginPath();
+    pts.forEach((p, pi) => {
+      const x = toX(p.x), y = toY(p.y);
+      pi === 0 ? claimCtx.moveTo(x, y) : claimCtx.lineTo(x, y);
+    });
+    claimCtx.stroke();
+  });
+}
+
+function gpuStatus(devices, layers_done, layers_total) {
+  const el = document.getElementById('gpu-rings');
+  // Rebuild each device
+  el.innerHTML = '';
+  for (const dev of devices) {
+    const pct = Math.round(dev.utilization * 100);
+    const mem = dev.free_memory_bytes ? `${(dev.free_memory_bytes/1e9).toFixed(1)}GB` : '';
+    const circumference = 2 * Math.PI * 20;
+    const offset = circumference * (1 - dev.utilization);
+    el.innerHTML += `
+      <div class="gpu-device">
+        <div class="gpu-device-name">GPU ${escHtml(dev.device_id)} — ${escHtml(dev.device_name)} ${escHtml(mem)}</div>
+        <div class="gpu-ring-row">
+          <svg class="ring" width="52" height="52" viewBox="0 0 52 52">
+            <circle cx="26" cy="26" r="20" fill="none" stroke="#1a1a2a" stroke-width="5"/>
+            <circle cx="26" cy="26" r="20" fill="none" stroke="#429bf5" stroke-width="5"
+              stroke-dasharray="${circumference}" stroke-dashoffset="${offset}"
+              stroke-linecap="round" style="transition:stroke-dashoffset 0.5s"/>
+          </svg>
+          <span>${pct}%</span>
+          <span style="color:#555;font-size:10px">${layers_done}/${layers_total} layers</span>
+        </div>
+      </div>
+    `;
+  }
+}
+
+function proofComplete(duration_ms, num_proofs) {
+  // Flash all nodes
+  for (const n of nodes) { n.material.color.setHex(0x00e676); n.material.emissive.setHex(0x003300); }
+  if (cursorRing) scene.remove(cursorRing);
+  const banner = document.getElementById('done-banner');
+  document.getElementById('banner-stats').textContent =
+    `${num_proofs} layer proofs · ${(duration_ms/1000).toFixed(2)}s`;
+  banner.style.display = 'flex';
+}
+
+function addLog(msg, cls = 'event') {
+  const el = document.getElementById('log-panel');
+  const div = document.createElement('div');
+  div.className = `log-entry ${cls}`;
+  div.textContent = `[${new Date().toISOString().substr(11,8)}] ${msg}`;
+  el.appendChild(div);
+  if (el.children.length > 200) el.removeChild(el.firstChild);
+  el.scrollTop = el.scrollHeight;
+}
+
+// ── Animation loop ───────────────────────────────────────────────────────────
+let t0 = performance.now();
+function animate() {
+  requestAnimationFrame(animate);
+  const t = (performance.now() - t0) / 1000;
+  // Slow camera orbit
+  camera.position.x += (Math.sin(t * 0.05) * 2 - camera.position.x + (numLayers > 0 ? helixPos(Math.floor(numLayers/2)).x : 0)) * 0.002;
+  // Pulse active cursor ring
+  if (cursorRing) {
+    cursorRing.scale.setScalar(1.0 + 0.1 * Math.sin(t * 4));
+  }
+  camera.lookAt(numLayers > 0 ? helixPos(Math.floor(numLayers/2)) : new THREE.Vector3(0,0,0));
+  renderer.render(scene, camera);
+  // Only redraw the canvas chart when new data arrived; avoids 60 fps clear+repaint.
+  if (chartDirty) {
+    drawChart();
+    chartDirty = false;
+  }
+}
+
+function resize() {
+  const panel = document.getElementById('helix-panel');
+  const w = panel.clientWidth, h = panel.clientHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  const cc = document.getElementById('claim-chart');
+  cc.width = cc.clientWidth;
+  cc.height = cc.clientHeight;
+}
+let _resizeTimer;
+window.addEventListener('resize', () => {
+  clearTimeout(_resizeTimer);
+  _resizeTimer = setTimeout(resize, 120);
+});
+resize();
+animate();
+
+// ── WebSocket ────────────────────────────────────────────────────────────────
+const PROTO = location.protocol === 'https:' ? 'wss:' : 'ws:';
+const WS_URL = `${PROTO}//${location.host}/ws`;
+let ws, backoff = 1000;
+const indicator = document.getElementById('ws-indicator');
+
+function connect() {
+  indicator.textContent = '● CONNECTING'; indicator.className = 'ws-indicator';
+  ws = new WebSocket(WS_URL);
+  ws.onopen = () => {
+    backoff = 1000;
+    indicator.textContent = '● LIVE'; indicator.className = 'ws-indicator connected';
+    addLog('WebSocket connected', 'info');
+  };
+  ws.onclose = () => {
+    indicator.textContent = '● RECONNECTING'; indicator.className = 'ws-indicator error';
+    setTimeout(connect, backoff = Math.min(backoff * 1.5, 30000));
+  };
+  ws.onerror = () => { ws.close(); };
+  ws.onmessage = ({ data }) => {
+    let ev;
+    try { ev = JSON.parse(data); } catch { return; }
+    const kind = Object.keys(ev)[0];
+    const payload = ev[kind];
+    dispatch(kind, payload);
+  };
+}
+
+function dispatch(kind, p) {
+  switch (kind) {
+    case 'ProofStart':
+      addLog(`ProofStart: ${p.backend} · ${p.num_layers} layers`, 'info');
+      initScene(p.num_layers);
+      break;
+    case 'LayerStart':
+      layerStart(p.layer_idx, p.kind, p.claim_value_approx);
+      addLog(`L${p.layer_idx} START: ${p.kind} claim=${p.claim_value_approx?.toFixed(4)}`);
+      break;
+    case 'SumcheckRound':
+      sumcheckRound(p.layer_idx, p.round, p.total_rounds, p.claim_value_approx);
+      break;
+    case 'LayerEnd':
+      layerEnd(p.layer_idx, p.duration_ms);
+      addLog(`L${p.layer_idx} END: ${p.duration_ms}ms claim=${p.final_claim_value_approx?.toFixed(4)}`);
+      break;
+    case 'GpuStatus':
+      gpuStatus(p.devices || [], p.layers_done, p.layers_total);
+      break;
+    case 'ProofComplete':
+      proofComplete(p.duration_ms, p.num_layer_proofs);
+      addLog(`PROOF COMPLETE: ${p.num_layer_proofs} proofs · ${p.duration_ms}ms`, 'info');
+      break;
+    case 'StarkProofStart':
+      addLog(`STARK: ${p.num_activation_layers}act + ${p.num_layernorm_layers}ln`, 'info');
+      break;
+    case 'StarkProofEnd':
+      addLog(`STARK done: ${p.duration_ms}ms`, 'info');
+      break;
+    case 'Log':
+      addLog(`[${p.level}] ${p.message}`, p.level === 'Info' ? 'info' : 'event');
+      break;
+  }
+}
+
+connect();
+</script>
+</body>
+</html>
