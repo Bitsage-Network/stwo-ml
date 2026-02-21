@@ -400,8 +400,9 @@ fn apply_aggregated_oracle_sumcheck(
             }).max().unwrap_or(0);
             let limb_buf_size = max_padded_n * 4;
 
-            let mut limb_buf_a = vec![0u64; limb_buf_size];
-            let mut limb_buf_b = vec![0u64; limb_buf_size];
+            // Double-buffer: [0] and [1] swapped each iteration.
+            // Using array indexing avoids borrow-checker conflicts with named vars.
+            let mut limb_bufs = [vec![0u64; limb_buf_size], vec![0u64; limb_buf_size]];
 
             // Pipelined processing: while GPU commits matrix N, CPU prepares matrix N+1.
             //
@@ -425,10 +426,9 @@ fn apply_aggregated_oracle_sumcheck(
                 })?;
             let first_n = first_matrix.rows.next_power_of_two()
                 * first_matrix.cols.next_power_of_two();
-            // Zero the active region for the first matrix
-            limb_buf_a[..first_n * 4].fill(0);
+            limb_bufs[0][..first_n * 4].fill(0);
             let (first_mle, first_u32) =
-                matrix_to_mle_col_major_all_padded(first_matrix, &mut limb_buf_a);
+                matrix_to_mle_col_major_all_padded(first_matrix, &mut limb_bufs[0]);
             let mut current_prep = PreparedMatrix {
                 n_vars: first_mle.len().trailing_zeros() as usize,
                 n_elements: first_n,
@@ -439,16 +439,12 @@ fn apply_aggregated_oracle_sumcheck(
             let mut results = Vec::with_capacity(total_claims);
             let mut gpu_count = 0usize;
             let mut cpu_fallback_count = 0usize;
-            // Track which buffer has current limbs (true = A, false = B)
-            let mut current_is_a = true;
+            let mut cur_buf_idx: usize = 0; // 0 or 1
 
             for idx in 0..total_claims {
                 let input = &prep_inputs[idx];
-
-                // GPU: commit current matrix from the active limb buffer.
-                // CPU (parallel thread): prepare next matrix into the OTHER buffer.
-                let current_limb_buf = if current_is_a { &limb_buf_a } else { &limb_buf_b };
                 let cur_n_elements = current_prep.n_elements;
+                let next_buf_idx = 1 - cur_buf_idx;
 
                 // If there's a next matrix, prepare it in parallel with GPU work.
                 let next_prep = if idx + 1 < total_claims {
@@ -460,11 +456,16 @@ fn apply_aggregated_oracle_sumcheck(
                         })?;
                     let next_n = next_matrix.rows.next_power_of_two()
                         * next_matrix.cols.next_power_of_two();
-                    let next_buf = if current_is_a { &mut limb_buf_b } else { &mut limb_buf_a };
-                    // Zero the active region before fused write
+
+                    // split_at_mut gives us independent &mut to each buffer
+                    let (buf_lo, buf_hi) = limb_bufs.split_at_mut(1);
+                    let (cur_buf, next_buf) = if cur_buf_idx == 0 {
+                        (&buf_lo[0][..], &mut buf_hi[0][..])
+                    } else {
+                        (&buf_hi[0][..], &mut buf_lo[0][..])
+                    };
                     next_buf[..next_n * 4].fill(0);
-                    // Spawn CPU prep in a scoped thread — runs concurrently with GPU below.
-                    // Using Option to move result out of the scope.
+
                     let mut next_result: Option<PreparedMatrix> = None;
                     std::thread::scope(|s| {
                         let cpu_handle = s.spawn(|| {
@@ -480,7 +481,7 @@ fn apply_aggregated_oracle_sumcheck(
 
                         // GPU: commit current matrix (runs while CPU thread prepares next)
                         let commitment = match crate::crypto::mle_opening::commit_mle_root_only_gpu_from_limbs(
-                            current_limb_buf, cur_n_elements, executor, &d_rc,
+                            cur_buf, cur_n_elements, executor, &d_rc,
                         ) {
                             Ok(root) => {
                                 gpu_count += 1;
@@ -488,7 +489,6 @@ fn apply_aggregated_oracle_sumcheck(
                             }
                             Err(e) => {
                                 if gpu_strict {
-                                    // Can't return Err from scope, so we push Err result
                                     results.push(Err(GKRError::ReductionError {
                                         layer_idx: 0,
                                         reason: format!(
@@ -496,7 +496,6 @@ fn apply_aggregated_oracle_sumcheck(
                                             idx
                                         ),
                                     }));
-                                    // Still need to join the CPU thread
                                     next_result = Some(cpu_handle.join().expect("CPU prep thread panicked"));
                                     return;
                                 }
@@ -511,8 +510,11 @@ fn apply_aggregated_oracle_sumcheck(
                             }
                         };
 
-                        // Wait for CPU prep to finish
                         next_result = Some(cpu_handle.join().expect("CPU prep thread panicked"));
+
+                        if results.last().map(|r| r.is_err()).unwrap_or(false) {
+                            return;
+                        }
 
                         let finished = idx + 1;
                         if finished % 10 == 0 || finished == total_claims {
@@ -520,11 +522,6 @@ fn apply_aggregated_oracle_sumcheck(
                                 "  [{log_tag}] weight commitments: {finished}/{total_claims} done ({:.1}s, gpu={gpu_count} cpu={cpu_fallback_count})",
                                 t_commit.elapsed().as_secs_f64(),
                             );
-                        }
-
-                        // Check if we pushed an error (strict mode GPU failure)
-                        if results.last().map(|r| r.is_err()).unwrap_or(false) {
-                            return;
                         }
 
                         results.push(Ok(WeightPrepResult {
@@ -538,9 +535,8 @@ fn apply_aggregated_oracle_sumcheck(
                             is_deferred: input.is_deferred,
                             deferred_idx: input.deferred_idx,
                         }));
-                    }); // end thread::scope
+                    });
 
-                    // Propagate strict-mode errors
                     if results.last().map(|r| r.is_err()).unwrap_or(false) {
                         break;
                     }
@@ -549,7 +545,7 @@ fn apply_aggregated_oracle_sumcheck(
                 } else {
                     // Last matrix — no next to prefetch, just GPU commit.
                     let commitment = match crate::crypto::mle_opening::commit_mle_root_only_gpu_from_limbs(
-                        current_limb_buf, cur_n_elements, executor, &d_rc,
+                        &limb_bufs[cur_buf_idx], cur_n_elements, executor, &d_rc,
                     ) {
                         Ok(root) => {
                             gpu_count += 1;
@@ -597,10 +593,9 @@ fn apply_aggregated_oracle_sumcheck(
                     None
                 };
 
-                // Swap buffers + advance prepared data for next iteration
                 if let Some(next) = next_prep {
                     current_prep = next;
-                    current_is_a = !current_is_a;
+                    cur_buf_idx = next_buf_idx;
                 }
             }
             results
