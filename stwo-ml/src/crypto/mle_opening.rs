@@ -802,6 +802,30 @@ pub fn prove_mle_opening_with_commitment_qm31_u32(
     };
 
     for &r in challenges.iter() {
+        // Fast path: in-place fold for CPU secure layer (avoids Vec allocation)
+        if gpu_fold_session.is_none() {
+            if let Some(ref mut cur_secure) = current_secure_layer {
+                let mid = cur_secure.len() / 2;
+                if mid >= 1 << 16 {
+                    let (lo, hi) = cur_secure.split_at_mut(mid);
+                    lo.par_iter_mut().zip(hi.par_iter()).for_each(|(l, h)| {
+                        *l = *l + r * (*h - *l);
+                    });
+                } else {
+                    for j in 0..mid {
+                        cur_secure[j] = cur_secure[j] + r * (cur_secure[mid + j] - cur_secure[j]);
+                    }
+                }
+                cur_secure.truncate(mid);
+                if cur_secure.len() > 1 {
+                    let (root, tree) = commit_mle(cur_secure);
+                    channel.mix_felt(root);
+                    intermediate_roots.push(root);
+                    layer_trees.push(tree);
+                }
+                continue;
+            }
+        }
         let next_layer = if gpu_fold_session.is_some() {
             let gpu_folded = {
                 let (gpu, session) = gpu_fold_session.as_mut().expect("checked is_some");

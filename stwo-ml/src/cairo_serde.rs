@@ -279,13 +279,24 @@ fn serialize_commitment_scheme_proof(
 
 // === MatMul Sumcheck + MLE Proof Serialization ===
 
-use crate::components::matmul::{MatMulSumcheckProofOnChain, RoundPoly};
+use crate::components::matmul::{CompressedRoundPoly, MatMulSumcheckProofOnChain, RoundPoly};
 use crate::crypto::mle_opening::MleOpeningProof;
 
 /// Serialize a `RoundPoly` (3 QM31 values = 12 felt252s).
 fn serialize_round_poly(rp: &RoundPoly, output: &mut Vec<FieldElement>) {
     serialize_qm31(rp.c0, output);
     serialize_qm31(rp.c1, output);
+    serialize_qm31(rp.c2, output);
+}
+
+/// Serialize a compressed `RoundPoly` (2 QM31 values = 8 felt252s).
+///
+/// Omits c1 — the verifier reconstructs it via:
+/// `c1 = current_sum - 2*c0 - c2`
+///
+/// Saves 4 felts (33%) per sumcheck round.
+pub fn serialize_round_poly_compressed(rp: &CompressedRoundPoly, output: &mut Vec<FieldElement>) {
+    serialize_qm31(rp.c0, output);
     serialize_qm31(rp.c2, output);
 }
 
@@ -320,50 +331,6 @@ pub fn serialize_mle_opening_proof(proof: &MleOpeningProof, output: &mut Vec<Fie
     serialize_qm31(proof.final_value, output);
 }
 
-/// Serialize an `AggregatedWeightBindingProof` for Cairo deserialization.
-///
-/// Layout:
-/// 1. config: selector_bits, n_max, m_padded, n_global, n_claims (5 u32s)
-/// 2. sumcheck_round_polys: Array<(QM31, QM31, QM31)> — len + n_global * 12 felts
-/// 3. oracle_eval_at_s: QM31 (4 felts)
-/// 4. super_root: felt252
-/// 5. subtree_roots: Array<felt252> — len + m_padded roots
-/// 6. opening_proof: MleOpeningProof (reuses serialize_mle_opening_proof)
-pub fn serialize_aggregated_binding_proof(
-    proof: &crate::crypto::aggregated_opening::AggregatedWeightBindingProof,
-    output: &mut Vec<FieldElement>,
-) {
-    // Config
-    serialize_u32(proof.config.selector_bits as u32, output);
-    serialize_u32(proof.config.n_max as u32, output);
-    serialize_u32(proof.config.m_padded as u32, output);
-    serialize_u32(proof.config.n_global as u32, output);
-    serialize_u32(proof.config.n_claims as u32, output);
-
-    // Sumcheck round polynomials
-    serialize_u32(proof.sumcheck_round_polys.len() as u32, output);
-    for &(c0, c1, c2) in &proof.sumcheck_round_polys {
-        serialize_qm31(c0, output);
-        serialize_qm31(c1, output);
-        serialize_qm31(c2, output);
-    }
-
-    // Oracle eval at challenge point
-    serialize_qm31(proof.oracle_eval_at_s, output);
-
-    // Super root
-    output.push(proof.super_root.root);
-
-    // Subtree roots
-    serialize_u32(proof.super_root.subtree_roots.len() as u32, output);
-    for root in &proof.super_root.subtree_roots {
-        output.push(*root);
-    }
-
-    // Single MLE opening proof
-    serialize_mle_opening_proof(&proof.opening_proof, output);
-}
-
 /// Serialize a `MatMulSumcheckProofOnChain` matching the Cairo verifier's
 /// 12-field `MatMulSumcheckProof` layout.
 ///
@@ -393,6 +360,35 @@ pub fn serialize_matmul_sumcheck_proof(
     serialize_u32(proof.round_polys.len() as u32, output);
     for rp in &proof.round_polys {
         serialize_round_poly(rp, output);
+    }
+    serialize_qm31(proof.final_a_eval, output);
+    serialize_qm31(proof.final_b_eval, output);
+    output.push(proof.a_commitment);
+    output.push(proof.b_commitment);
+    serialize_mle_opening_proof(&proof.a_opening, output);
+    serialize_mle_opening_proof(&proof.b_opening, output);
+}
+
+/// Serialize a `MatMulSumcheckProofOnChain` with **compressed** round polys.
+///
+/// Same as `serialize_matmul_sumcheck_proof` but round polys use 8 felts (c0, c2)
+/// instead of 12 felts (c0, c1, c2). The verifier reconstructs c1 via:
+/// `c1 = current_sum - 2*c0 - c2` at each round.
+///
+/// Savings: `num_rounds × 4` felts per proof (~33% round poly reduction).
+pub fn serialize_matmul_sumcheck_proof_compressed(
+    proof: &MatMulSumcheckProofOnChain,
+    output: &mut Vec<FieldElement>,
+) {
+    serialize_u32(proof.m, output);
+    serialize_u32(proof.k, output);
+    serialize_u32(proof.n, output);
+    serialize_u32(proof.num_rounds, output);
+    serialize_qm31(proof.claimed_sum, output);
+    // round_polys: Array<CompressedRoundPoly> (8 felts each instead of 12)
+    serialize_u32(proof.round_polys.len() as u32, output);
+    for rp in &proof.round_polys {
+        serialize_round_poly_compressed(&rp.compress(), output);
     }
     serialize_qm31(proof.final_a_eval, output);
     serialize_qm31(proof.final_b_eval, output);
@@ -662,6 +658,52 @@ fn serialize_batched_matmul_for_recursive(
         serialize_round_poly(rp, output);
     }
     // entries
+    serialize_u32(batch.entries.len() as u32, output);
+    for entry in &batch.entries {
+        serialize_u32(entry.node_id as u32, output);
+        serialize_u32(entry.m, output);
+        serialize_u32(entry.n, output);
+        serialize_qm31(entry.claimed_sum, output);
+        serialize_qm31(entry.final_a_eval, output);
+        serialize_qm31(entry.final_b_eval, output);
+        output.push(entry.a_commitment);
+        output.push(entry.b_commitment);
+    }
+}
+
+/// Compressed variant: round polys use 8 felts (c0, c2) instead of 12.
+fn serialize_matmul_for_recursive_compressed(
+    proof: &MatMulSumcheckProofOnChain,
+    output: &mut Vec<FieldElement>,
+) {
+    serialize_u32(proof.m, output);
+    serialize_u32(proof.k, output);
+    serialize_u32(proof.n, output);
+    serialize_u32(proof.num_rounds, output);
+    serialize_qm31(proof.claimed_sum, output);
+    serialize_u32(proof.round_polys.len() as u32, output);
+    for rp in &proof.round_polys {
+        serialize_round_poly_compressed(&rp.compress(), output);
+    }
+    serialize_qm31(proof.final_a_eval, output);
+    serialize_qm31(proof.final_b_eval, output);
+    output.push(proof.a_commitment);
+    output.push(proof.b_commitment);
+}
+
+/// Compressed variant: round polys use 8 felts (c0, c2) instead of 12.
+fn serialize_batched_matmul_for_recursive_compressed(
+    batch: &BatchedMatMulProofOnChain,
+    output: &mut Vec<FieldElement>,
+) {
+    serialize_u32(batch.k, output);
+    serialize_u32(batch.num_rounds, output);
+    serialize_qm31(batch.lambda, output);
+    serialize_qm31(batch.combined_claimed_sum, output);
+    serialize_u32(batch.round_polys.len() as u32, output);
+    for rp in &batch.round_polys {
+        serialize_round_poly_compressed(&rp.compress(), output);
+    }
     serialize_u32(batch.entries.len() as u32, output);
     for entry in &batch.entries {
         serialize_u32(entry.node_id as u32, output);
@@ -1664,7 +1706,7 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
         // Claim value (the skip_eval from the Add reduction)
         serialize_qm31(deferred.claim.value, output);
         // MatMul dimensions
-        let (m, k, n) = deferred.dims().unwrap_or((0, 0, 0));
+        let (m, k, n) = deferred.dims().unwrap();
         serialize_u32(m as u32, output);
         serialize_u32(k as u32, output);
         serialize_u32(n as u32, output);
@@ -1685,11 +1727,7 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
             serialize_qm31(*final_b_eval, output);
         }
         // Weight commitment
-        output.push(
-            deferred
-                .weight_commitment()
-                .unwrap_or(starknet_ff::FieldElement::ZERO),
-        );
+        output.push(deferred.weight_commitment().unwrap());
     }
 }
 
@@ -1898,6 +1936,44 @@ pub fn serialize_weight_mle_openings(
     }
 }
 
+/// Serialize an aggregated weight binding proof into felt252 layout for Starknet.
+///
+/// TODO: Implement full serialization of mismatch sumcheck + MLE opening.
+pub fn serialize_aggregated_binding_proof(
+    proof: &crate::crypto::aggregated_opening::AggregatedWeightBindingProof,
+    output: &mut Vec<FieldElement>,
+) {
+    // config
+    serialize_usize(proof.config.selector_bits, output);
+    serialize_usize(proof.config.n_max, output);
+    serialize_usize(proof.config.m_padded, output);
+    serialize_usize(proof.config.n_global, output);
+    serialize_usize(proof.config.n_claims, output);
+
+    // sumcheck_round_polys: Vec<(QM31, QM31, QM31)>
+    serialize_u32(proof.sumcheck_round_polys.len() as u32, output);
+    for (c0, c1, c2) in &proof.sumcheck_round_polys {
+        serialize_qm31(*c0, output);
+        serialize_qm31(*c1, output);
+        serialize_qm31(*c2, output);
+    }
+
+    // oracle_eval_at_s: QM31
+    serialize_qm31(proof.oracle_eval_at_s, output);
+
+    // opening_proof: MleOpeningProof
+    serialize_mle_opening_proof(&proof.opening_proof, output);
+
+    // super_root
+    output.push(proof.super_root.root);
+    serialize_u32(proof.super_root.subtree_roots.len() as u32, output);
+    for root in &proof.super_root.subtree_roots {
+        output.push(*root);
+    }
+    output.push(proof.super_root.zero_tree_root);
+    serialize_usize(proof.super_root.top_levels, output);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2061,6 +2137,48 @@ mod tests {
         assert_eq!(out[0], FieldElement::from(1u64)); // c0.a
         assert_eq!(out[4], FieldElement::from(5u64)); // c1.a
         assert_eq!(out[8], FieldElement::from(9u64)); // c2.a
+    }
+
+    #[test]
+    fn test_compressed_round_poly_roundtrip() {
+        use stwo::core::fields::cm31::CM31;
+        use stwo::core::fields::qm31::QM31;
+
+        let rp = RoundPoly {
+            c0: QM31(
+                CM31(M31::from(1), M31::from(2)),
+                CM31(M31::from(3), M31::from(4)),
+            ),
+            c1: QM31(
+                CM31(M31::from(5), M31::from(6)),
+                CM31(M31::from(7), M31::from(8)),
+            ),
+            c2: QM31(
+                CM31(M31::from(9), M31::from(10)),
+                CM31(M31::from(11), M31::from(12)),
+            ),
+        };
+
+        // Compute the sum that would be the running sumcheck value:
+        // current_sum = p(0) + p(1) = c0 + (c0 + c1 + c2)
+        let p0 = rp.c0;
+        let p1 = rp.c0 + rp.c1 + rp.c2;
+        let current_sum = p0 + p1;
+
+        // Compress and decompress
+        let compressed = rp.compress();
+        let decompressed = compressed.decompress(current_sum);
+
+        assert_eq!(decompressed.c0, rp.c0, "c0 mismatch");
+        assert_eq!(decompressed.c1, rp.c1, "c1 mismatch after reconstruction");
+        assert_eq!(decompressed.c2, rp.c2, "c2 mismatch");
+
+        // Verify compressed serialization is 8 felts (vs 12 uncompressed)
+        let mut out_compressed = Vec::new();
+        serialize_round_poly_compressed(&compressed, &mut out_compressed);
+        assert_eq!(out_compressed.len(), 8, "compressed = 2 QM31s = 8 felt252s");
+        assert_eq!(out_compressed[0], FieldElement::from(1u64)); // c0.a
+        assert_eq!(out_compressed[4], FieldElement::from(9u64)); // c2.a (skipped c1)
     }
 
     #[test]

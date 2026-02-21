@@ -13,9 +13,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(feature = "proof-stream")]
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
+    response::{Html, IntoResponse},
     routing::{get, post},
     Json, Router,
 };
@@ -156,6 +159,9 @@ struct AppState {
     privacy_jobs: RwLock<HashMap<String, PrivacyJob>>,
     models: RwLock<HashMap<String, LoadedModel>>,
     started_at: Instant,
+    #[cfg(feature = "proof-stream")]
+    ws_sink: proof_stream::WsBroadcastSink,
+    validator_url: Option<String>,
 }
 
 // =============================================================================
@@ -637,7 +643,17 @@ async fn submit_prove(
         let prove_start = Instant::now();
 
         // Run CPU+GPU heavy proving on a blocking thread
+        #[cfg(feature = "proof-stream")]
+        let ws_clone = state_clone.ws_sink.clone();
+        let validator_url_clone = state_clone.validator_url.clone();
+        let jid_for_validator = jid.clone();
+
         let result = tokio::task::spawn_blocking(move || {
+            // Install proof-stream sink on the blocking thread (thread-local must
+            // live on the same thread that runs the prover).
+            #[cfg(feature = "proof-stream")]
+            let _sink_guard =
+                stwo_ml::gkr::prover::set_proof_sink(proof_stream::ProofSink::new(ws_clone));
             prove_for_starknet_onchain(&*graph, &input_matrix, &*weights)
         })
         .await;
@@ -670,6 +686,36 @@ async fn submit_prove(
                     j.progress_bps = 10000;
                     j.completed_at = Some(Instant::now());
                     j.result = Some(payload);
+                }
+
+                // Forward proof result to validator if configured
+                #[cfg(any(feature = "audit-http", feature = "server-stream"))]
+                if let Some(ref url) = validator_url_clone {
+                    let post_url = format!("{url}/api/v1/workers/job/{jid_for_validator}/result");
+                    let elapsed_ms = prove_elapsed.as_millis() as u64;
+                    let jid_v = jid_for_validator.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let body = format!(
+                            r#"{{"job_id":"{}","success":true,"generation_time_ms":{}}}"#,
+                            jid_v, elapsed_ms
+                        );
+                        match ureq::post(&post_url)
+                            .header("Content-Type", "application/json")
+                            .send(body.as_bytes())
+                        {
+                            Ok(resp) if resp.status() == 200 || resp.status() == 201 => {}
+                            Ok(resp) => eprintln!(
+                                "[prove-server] validator returned HTTP {} for job {}",
+                                resp.status(),
+                                jid_v
+                            ),
+                            Err(e) => eprintln!(
+                                "[prove-server] validator bridge error for job {}: {}",
+                                jid_v, e
+                            ),
+                        }
+                    })
+                    .await;
                 }
 
                 // Record inference for audit log
@@ -1362,6 +1408,52 @@ async fn build_privacy_submit_calldata(
     }
 }
 
+// =============================================================================
+// Dashboard + WebSocket
+// =============================================================================
+
+async fn dashboard() -> impl IntoResponse {
+    Html(include_str!("web_dashboard.html"))
+}
+
+#[cfg(feature = "proof-stream")]
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let rx = state.ws_sink.subscribe();
+    ws.on_upgrade(move |socket| async move {
+        ws_client_loop(socket, rx).await;
+    })
+}
+
+#[cfg(feature = "proof-stream")]
+async fn ws_client_loop(mut socket: WebSocket, mut rx: tokio::sync::broadcast::Receiver<String>) {
+    use tokio::sync::broadcast::error::RecvError;
+    loop {
+        tokio::select! {
+            msg = rx.recv() => match msg {
+                Ok(json) => {
+                    if socket.send(Message::Text(json.into())).await.is_err() {
+                        break;
+                    }
+                }
+                Err(RecvError::Lagged(n)) => {
+                    let warn = format!(r#"{{"Log":{{"level":"Warn","message":"lagged {} events"}}}}"#, n);
+                    if socket.send(Message::Text(warn.into())).await.is_err() {
+                        break;
+                    }
+                }
+                Err(RecvError::Closed) => break,
+            },
+            msg = socket.recv() => match msg {
+                Some(Ok(Message::Ping(p))) => {
+                    let _ = socket.send(Message::Pong(p)).await;
+                }
+                None | Some(Ok(Message::Close(_))) => break,
+                _ => {}
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::normalize_canonical_proof_hash;
@@ -1394,14 +1486,22 @@ mod tests {
 
 #[tokio::main]
 async fn main() {
+    #[cfg(feature = "proof-stream")]
+    let ws_sink = proof_stream::WsBroadcastSink::new(1024);
+    let validator_url = std::env::var("VALIDATOR_URL").ok();
+
     let state = Arc::new(AppState {
         jobs: RwLock::new(HashMap::new()),
         privacy_jobs: RwLock::new(HashMap::new()),
         models: RwLock::new(HashMap::new()),
         started_at: Instant::now(),
+        #[cfg(feature = "proof-stream")]
+        ws_sink,
+        validator_url,
     });
 
-    let app = Router::new()
+    let mut router: Router<Arc<AppState>> = Router::new()
+        .route("/", get(dashboard))
         .route("/health", get(health))
         .route("/api/v1/models", post(load_model))
         .route("/api/v1/models/hf", post(load_hf_model_handler))
@@ -1421,9 +1521,14 @@ async fn main() {
         .route(
             "/api/v1/privacy/batch/{job_id}/submit-calldata",
             post(build_privacy_submit_calldata),
-        )
-        .layer(CorsLayer::permissive())
-        .with_state(state);
+        );
+
+    #[cfg(feature = "proof-stream")]
+    {
+        router = router.route("/ws", get(ws_handler));
+    }
+
+    let app = router.layer(CorsLayer::permissive()).with_state(state);
 
     let bind = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
     eprintln!("prove-server listening on {bind}");

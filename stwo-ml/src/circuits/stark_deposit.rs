@@ -22,12 +22,11 @@ use stwo::core::proof::StarkProof;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
 use stwo::core::verifier::verify as stwo_verify;
 use stwo::prover::backend::simd::SimdBackend;
-use stwo::prover::backend::{BackendForChannel, Col, Column, ColumnOps};
+use stwo::prover::backend::{Col, Column};
 use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
 use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::prove;
 use stwo::prover::CommitmentSchemeProver;
-use stwo::prover::ComponentProver;
 
 use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 use stwo_constraint_framework::{
@@ -221,25 +220,6 @@ pub struct DepositStarkProof {
 pub fn prove_deposit_stark(
     witness: &DepositWitness,
 ) -> Result<DepositStarkProof, DepositStarkError> {
-    #[cfg(feature = "cuda-runtime")]
-    {
-        if crate::backend::force_gpu() || crate::backend::gpu_is_available() {
-            use stwo::prover::backend::gpu::GpuBackend;
-            return prove_deposit_stark_with::<GpuBackend>(witness);
-        }
-    }
-    prove_deposit_stark_with::<SimdBackend>(witness)
-}
-
-fn prove_deposit_stark_with<B>(
-    witness: &DepositWitness,
-) -> Result<DepositStarkProof, DepositStarkError>
-where
-    B: BackendForChannel<Blake2sMerkleChannel> + PolyOps + ColumnOps<M31>,
-    Col<B, M31>: Column<M31>,
-    <B as ColumnOps<M31>>::Column: 'static,
-    FrameworkComponent<DepositStarkEval>: ComponentProver<B>,
-{
     let (execution, public_inputs) =
         execute_deposit(witness).map_err(|e| DepositStarkError::Execution(format!("{e}")))?;
 
@@ -257,17 +237,22 @@ where
 
     // Build execution columns
     let domain = CanonicCoset::new(LOG_SIZE).circle_domain();
-    let mut exec_cols: Vec<Col<B, M31>> = (0..TOTAL_EXEC_COLS)
-        .map(|_| Col::<B, M31>::zeros(table_size))
+    let mut exec_cols: Vec<Col<SimdBackend, M31>> = (0..TOTAL_EXEC_COLS)
+        .map(|_| Col::<SimdBackend, M31>::zeros(table_size))
         .collect();
 
     // Write permutation traces
     for (p, trace) in perm_traces.iter().enumerate() {
-        write_permutation_to_trace::<B>(trace, &mut exec_cols, p * COLS_PER_PERM, 0);
+        write_permutation_to_trace::<SimdBackend>(trace, &mut exec_cols, p * COLS_PER_PERM, 0);
     }
     for row in 1..table_size {
         for p in 0..NUM_PERMS {
-            write_permutation_to_trace::<B>(&dummy, &mut exec_cols, p * COLS_PER_PERM, row);
+            write_permutation_to_trace::<SimdBackend>(
+                &dummy,
+                &mut exec_cols,
+                p * COLS_PER_PERM,
+                row,
+            );
         }
     }
 
@@ -287,37 +272,41 @@ where
     }
 
     // Build preprocessed column (is_real)
-    let mut is_real_col = Col::<B, M31>::zeros(table_size);
+    let mut is_real_col = Col::<SimdBackend, M31>::zeros(table_size);
     is_real_col.set(0, M31::from_u32_unchecked(1));
 
-    let preprocessed = vec![CircleEvaluation::<B, M31, BitReversedOrder>::new(
+    let preprocessed = vec![CircleEvaluation::<SimdBackend, M31, BitReversedOrder>::new(
         domain,
         is_real_col,
     )];
-    let execution_evals: Vec<CircleEvaluation<B, M31, BitReversedOrder>> = exec_cols
+    let execution_evals: Vec<CircleEvaluation<SimdBackend, M31, BitReversedOrder>> = exec_cols
         .into_iter()
         .map(|col| CircleEvaluation::new(domain, col))
         .collect();
 
     // PCS setup
     let pcs_config = PcsConfig::default();
-    let twiddles = B::precompute_twiddles(
+    let twiddles = SimdBackend::precompute_twiddles(
         CanonicCoset::new(LOG_SIZE + 1 + pcs_config.fri_config.log_blowup_factor)
             .circle_domain()
             .half_coset,
     );
     let channel = &mut <Blake2sMerkleChannel as MerkleChannel>::C::default();
     let mut commitment_scheme =
-        CommitmentSchemeProver::<B, Blake2sMerkleChannel>::new(pcs_config, &twiddles);
+        CommitmentSchemeProver::<SimdBackend, Blake2sMerkleChannel>::new(pcs_config, &twiddles);
 
     // Tree 0: Preprocessed (is_real)
     let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(convert_evaluations::<B, B, M31>(preprocessed));
+    tree_builder.extend_evals(convert_evaluations::<SimdBackend, SimdBackend, M31>(
+        preprocessed,
+    ));
     tree_builder.commit(channel);
 
     // Tree 1: Execution trace
     let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(convert_evaluations::<B, B, M31>(execution_evals));
+    tree_builder.extend_evals(convert_evaluations::<SimdBackend, SimdBackend, M31>(
+        execution_evals,
+    ));
     tree_builder.commit(channel);
 
     // Build component (no LogUp → claimed_sum = 0)
@@ -334,8 +323,9 @@ where
         SecureField::zero(),
     );
 
-    let stark_proof = prove::<B, Blake2sMerkleChannel>(&[&component], channel, commitment_scheme)
-        .map_err(|e| DepositStarkError::Proving(format!("{e:?}")))?;
+    let stark_proof =
+        prove::<SimdBackend, Blake2sMerkleChannel>(&[&component], channel, commitment_scheme)
+            .map_err(|e| DepositStarkError::Proving(format!("{e:?}")))?;
 
     Ok(DepositStarkProof {
         stark_proof,
@@ -454,8 +444,8 @@ mod tests {
         let witness = make_deposit_witness(500);
 
         // Phase 3 proof
-        let phase3_proof = prove_deposit(&witness).expect("phase3 prove");
-        verify_deposit(&phase3_proof).expect("phase3 verify");
+        let (phase3_proof, phase3_exec) = prove_deposit(&witness).expect("phase3 prove");
+        verify_deposit(&phase3_proof, &phase3_exec).expect("phase3 verify");
 
         // Phase 4 STARK proof
         let stark_proof = prove_deposit_stark(&witness).expect("stark prove");
@@ -473,10 +463,10 @@ mod tests {
     }
 
     #[test]
-    fn test_deposit_stark_zero_amount() {
+    fn test_deposit_stark_zero_amount_rejected() {
         let witness = make_deposit_witness(0);
-        let proof = prove_deposit_stark(&witness).expect("proving should succeed");
-        verify_deposit_stark(&proof, &proof.public_inputs).expect("verification should succeed");
+        let result = prove_deposit_stark(&witness);
+        assert!(result.is_err(), "zero-amount deposit should be rejected");
     }
 
     #[test]

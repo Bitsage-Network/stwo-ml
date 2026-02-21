@@ -51,6 +51,8 @@ pub enum DepositError {
     RangeCheckError(String),
     #[error("cross-wiring verification failed: {0}")]
     CrossWiringFailed(String),
+    #[error("zero amount deposit not allowed")]
+    ZeroAmount,
 }
 
 /// Witness for a deposit transaction (all private to the prover).
@@ -69,8 +71,11 @@ pub struct DepositPublicInputs {
     pub asset_id: M31,
 }
 
-/// Execution trace for the deposit circuit.
-#[derive(Clone, Debug)]
+/// Execution trace for the deposit circuit (prover-private, NEVER share).
+///
+/// Contains full Poseidon2 permutation I/O including note preimages
+/// (owner pubkey, blinding factors). Zeroized on drop.
+#[derive(Clone)]
 pub struct DepositExecution {
     pub commitment: NoteCommitment,
     pub all_permutation_inputs: Vec<[M31; STATE_WIDTH]>,
@@ -79,12 +84,40 @@ pub struct DepositExecution {
     pub range_check_limbs: Vec<M31>,
 }
 
-/// Complete deposit proof.
+impl std::fmt::Debug for DepositExecution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DepositExecution")
+            .field("commitment", &self.commitment)
+            .field("num_perms", &self.all_permutation_inputs.len())
+            .field("range_check_limbs", &self.range_check_limbs.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for DepositExecution {
+    fn drop(&mut self) {
+        // Zeroize permutation I/O to prevent secret residue in memory.
+        for perm in &mut self.all_permutation_inputs {
+            for v in perm.iter_mut() {
+                *v = M31::from_u32_unchecked(0);
+            }
+        }
+        for perm in &mut self.all_permutation_outputs {
+            for v in perm.iter_mut() {
+                *v = M31::from_u32_unchecked(0);
+            }
+        }
+    }
+}
+
+/// Complete deposit proof. Does NOT contain the execution trace.
+///
+/// Safe to serialize, log, or transmit — contains only cryptographic
+/// commitments and public inputs, no witness secrets.
 #[derive(Debug)]
 pub struct DepositProof {
     pub poseidon_proof: Poseidon2BatchProof,
     pub range_check_proof: RangeCheckProof<Blake2sHash>,
-    pub execution: DepositExecution,
     pub public_inputs: DepositPublicInputs,
 }
 
@@ -92,6 +125,11 @@ pub struct DepositProof {
 pub fn execute_deposit(
     witness: &DepositWitness,
 ) -> Result<(DepositExecution, DepositPublicInputs), DepositError> {
+    // Reject zero-amount deposits (dust notes bloat pool state)
+    if witness.amount == 0 {
+        return Err(DepositError::ZeroAmount);
+    }
+
     // Check amount consistency: lo + hi * 2^31 == amount
     let lo = witness.note.amount_lo.0 as u64;
     let hi = witness.note.amount_hi.0 as u64;
@@ -160,7 +198,13 @@ pub fn execute_deposit(
 }
 
 /// Prove a deposit transaction.
-pub fn prove_deposit(witness: &DepositWitness) -> Result<DepositProof, DepositError> {
+///
+/// Returns `(proof, execution)` separately. The `execution` contains witness
+/// secrets (note preimage) and MUST NOT be shared — it is zeroized on drop.
+/// The `proof` is safe to transmit to verifiers.
+pub fn prove_deposit(
+    witness: &DepositWitness,
+) -> Result<(DepositProof, DepositExecution), DepositError> {
     let (execution, public_inputs) = execute_deposit(witness)?;
 
     // Prove Poseidon2 batch (2 permutations)
@@ -172,17 +216,24 @@ pub fn prove_deposit(witness: &DepositWitness) -> Result<DepositProof, DepositEr
     let range_check_proof = prove_range_check(&execution.range_check_limbs, &config)
         .map_err(|e| DepositError::RangeCheckError(format!("{e}")))?;
 
-    Ok(DepositProof {
+    let proof = DepositProof {
         poseidon_proof,
         range_check_proof,
-        execution,
         public_inputs,
-    })
+    };
+    Ok((proof, execution))
 }
 
-/// Verify a deposit proof.
-pub fn verify_deposit(proof: &DepositProof) -> Result<(), DepositError> {
-    let exec = &proof.execution;
+/// Verify a deposit proof against its execution trace.
+///
+/// The `execution` is the prover-private trace needed for cross-wiring checks.
+/// In production, only the STARK proof path (stark_deposit.rs) should be used
+/// for third-party verification — it does not require the execution trace.
+pub fn verify_deposit(
+    proof: &DepositProof,
+    execution: &DepositExecution,
+) -> Result<(), DepositError> {
+    let exec = execution;
     let pub_in = &proof.public_inputs;
 
     // 1. Verify Poseidon2 batch proof
@@ -323,8 +374,8 @@ mod tests {
     #[test]
     fn test_deposit_prove_verify_basic() {
         let witness = make_deposit_witness(1000);
-        let proof = prove_deposit(&witness).expect("prove should succeed");
-        verify_deposit(&proof).expect("verify should succeed");
+        let (proof, exec) = prove_deposit(&witness).expect("prove should succeed");
+        verify_deposit(&proof, &exec).expect("verify should succeed");
     }
 
     #[test]
@@ -372,11 +423,10 @@ mod tests {
         let proof = DepositProof {
             poseidon_proof,
             range_check_proof,
-            execution: exec,
             public_inputs: pub_in,
         };
 
-        let result = verify_deposit(&proof);
+        let result = verify_deposit(&proof, &exec);
         assert!(result.is_err());
         match result.unwrap_err() {
             DepositError::CrossWiringFailed(msg) => {
@@ -387,18 +437,53 @@ mod tests {
     }
 
     #[test]
+    fn test_deposit_zero_amount_rejected() {
+        let witness = make_deposit_witness(0);
+        let result = prove_deposit(&witness);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            DepositError::ZeroAmount => {}
+            e => panic!("expected ZeroAmount, got: {e}"),
+        }
+    }
+
+    #[test]
     fn test_deposit_range_check() {
         // Large amount that uses both limbs
         let amount = (1u64 << 40) + 42;
         let witness = make_deposit_witness(amount);
-        let proof = prove_deposit(&witness).expect("prove should succeed");
-        verify_deposit(&proof).expect("verify should succeed");
+        let (proof, exec) = prove_deposit(&witness).expect("prove should succeed");
+        verify_deposit(&proof, &exec).expect("verify should succeed");
 
         // Verify the decomposition
-        assert_eq!(proof.execution.range_check_limbs.len(), 4);
+        assert_eq!(exec.range_check_limbs.len(), 4);
         // All sub-limbs should be in [0, 65535]
-        for limb in &proof.execution.range_check_limbs {
+        for limb in &exec.range_check_limbs {
             assert!(limb.0 <= 65535, "sub-limb {} out of uint16 range", limb.0);
         }
+    }
+
+    /// M3 regression: proof struct must NOT contain execution trace.
+    /// The execution (containing spending key, blinding) is returned separately
+    /// and zeroized on drop.
+    #[test]
+    fn test_m3_proof_does_not_contain_execution() {
+        let witness = make_deposit_witness(1000);
+        let (proof, _exec) = prove_deposit(&witness).expect("prove should succeed");
+
+        // The proof's Debug output should NOT contain permutation data
+        let debug_str = format!("{:?}", proof);
+        assert!(
+            !debug_str.contains("all_permutation"),
+            "proof Debug must not leak permutation I/O"
+        );
+
+        // Verify that the proof struct only has safe fields
+        // (this is a compile-time structural guarantee — if someone re-adds
+        // execution to DepositProof, this test documents the invariant)
+        let _poseidon = &proof.poseidon_proof;
+        let _range = &proof.range_check_proof;
+        let _pub = &proof.public_inputs;
+        // No proof.execution field — structurally prevented
     }
 }

@@ -819,15 +819,24 @@ mod poseidon2_impl {
             plaintext: &[u8],
             owner_pubkey: &[u8],
         ) -> Result<EncryptedBlob, EncryptionError> {
-            // Generate random DEK.
-            let mut rng_bytes = [0u8; 24];
+            // Generate random DEK and nonce independently.
+            // C4 fix: nonce must NOT be derived from DEK — if RNG fails and
+            // produces a repeated DEK, a deterministic nonce would also repeat,
+            // causing catastrophic keystream reuse in counter mode.
+            let mut rng_bytes = [0u8; 40]; // 24 DEK + 16 nonce
             getrandom::getrandom(&mut rng_bytes)
                 .map_err(|e| EncryptionError::EncryptionFailed(format!("RNG: {}", e)))?;
-            let dek = key_from_bytes(&rng_bytes);
-
-            // Derive nonce from DEK hash.
-            let key_hash = poseidon2_hash(&dek);
-            let nonce_m31: [M31; 4] = std::array::from_fn(|i| key_hash[i]);
+            let dek = key_from_bytes(&rng_bytes[..24]);
+            let nonce_m31: [M31; 4] = std::array::from_fn(|i| {
+                let off = 24 + i * 4;
+                let val = u32::from_le_bytes([
+                    rng_bytes[off],
+                    rng_bytes[off + 1],
+                    rng_bytes[off + 2],
+                    rng_bytes[off + 3],
+                ]);
+                M31::from_u32_unchecked(val % P)
+            });
 
             let m31_plaintext = bytes_to_m31(plaintext);
             let m31_ciphertext = poseidon2_encrypt(&dek, &nonce_m31, &m31_plaintext);
@@ -890,9 +899,23 @@ mod poseidon2_impl {
                 dek[i] = M31::from_u32_unchecked(val % P);
             }
 
-            // Reconstruct nonce from DEK hash.
-            let key_hash = poseidon2_hash(&dek);
-            let nonce_m31: [M31; 4] = std::array::from_fn(|i| key_hash[i]);
+            // C4 fix: read nonce from blob (not re-derived from DEK).
+            if blob.nonce.len() != 16 {
+                return Err(EncryptionError::DecryptionFailed(format!(
+                    "nonce must be 16 bytes, got {}",
+                    blob.nonce.len()
+                )));
+            }
+            let nonce_m31: [M31; 4] = std::array::from_fn(|i| {
+                let off = i * 4;
+                let val = u32::from_le_bytes([
+                    blob.nonce[off],
+                    blob.nonce[off + 1],
+                    blob.nonce[off + 2],
+                    blob.nonce[off + 3],
+                ]);
+                M31::from_u32_unchecked(val % P)
+            });
 
             let m31_ciphertext = bytes_to_ciphertext(&blob.ciphertext)?;
             let m31_plaintext = poseidon2_decrypt(&dek, &nonce_m31, &m31_ciphertext);
@@ -1256,5 +1279,69 @@ mod tests {
             result.is_err(),
             "view key alone must not decrypt (wrong size for secret key)"
         );
+    }
+
+    /// C4 regression: two encryptions of the same plaintext with the same key
+    /// must produce different nonces (since nonces are now independent random).
+    #[test]
+    fn test_c4_nonce_independent_of_dek() {
+        let enc = Poseidon2M31Encryption;
+        let (view_key, secret) = test_keypair();
+        let plaintext = b"C4 nonce independence test";
+
+        let blob1 = enc.encrypt(plaintext, &view_key).unwrap();
+        let blob2 = enc.encrypt(plaintext, &view_key).unwrap();
+
+        // Nonces must differ (independent random, not DEK-derived).
+        // With 128 bits of nonce entropy, collision probability is ~2^-64.
+        assert_ne!(
+            blob1.nonce, blob2.nonce,
+            "C4 REGRESSION: nonces are identical — still derived from DEK?"
+        );
+
+        // Both must still decrypt correctly.
+        let dec1 = enc.decrypt(&blob1, &view_key, &secret).unwrap();
+        let dec2 = enc.decrypt(&blob2, &view_key, &secret).unwrap();
+        assert_eq!(dec1, plaintext);
+        assert_eq!(dec2, plaintext);
+    }
+
+    /// C4 regression: nonce stored in blob must be used for decryption,
+    /// not re-derived from the DEK.
+    #[test]
+    fn test_c4_decrypt_uses_blob_nonce() {
+        let enc = Poseidon2M31Encryption;
+        let (view_key, secret) = test_keypair();
+
+        let blob = enc.encrypt(b"blob nonce test", &view_key).unwrap();
+
+        // Tamper with the nonce — decryption must fail (hash mismatch)
+        // because the wrong nonce produces wrong keystream → wrong plaintext.
+        let mut tampered = blob.clone();
+        tampered.nonce[0] ^= 0xFF;
+        let result = enc.decrypt(&tampered, &view_key, &secret);
+        assert!(
+            result.is_err(),
+            "C4 REGRESSION: tampered nonce still decrypts — nonce not read from blob"
+        );
+    }
+
+    /// C4 regression: nonce length validation in decrypt.
+    #[test]
+    fn test_c4_decrypt_rejects_bad_nonce_length() {
+        let enc = Poseidon2M31Encryption;
+        let (view_key, secret) = test_keypair();
+
+        let blob = enc.encrypt(b"nonce length test", &view_key).unwrap();
+
+        let mut short_nonce = blob.clone();
+        short_nonce.nonce = vec![0u8; 8]; // too short
+        let result = enc.decrypt(&short_nonce, &view_key, &secret);
+        assert!(result.is_err(), "should reject 8-byte nonce");
+
+        let mut long_nonce = blob.clone();
+        long_nonce.nonce = vec![0u8; 32]; // too long
+        let result = enc.decrypt(&long_nonce, &view_key, &secret);
+        assert!(result.is_err(), "should reject 32-byte nonce");
     }
 }

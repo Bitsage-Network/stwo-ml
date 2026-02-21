@@ -15,7 +15,7 @@
 
 use num_traits::Zero;
 use stwo::core::air::Component;
-use stwo::core::channel::MerkleChannel;
+use stwo::core::channel::{Channel, MerkleChannel};
 use stwo::core::fields::m31::BaseField as M31;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::pcs::{CommitmentSchemeVerifier, PcsConfig};
@@ -43,7 +43,7 @@ use crate::components::poseidon2_air::{
     decompose_to_bits, dummy_permutation_trace, write_permutation_to_trace, Poseidon2Columns,
     COLS_PER_PERM,
 };
-use crate::crypto::poseidon2_m31::{RATE, STATE_WIDTH};
+use crate::crypto::poseidon2_m31::{poseidon2_hash, DOMAIN_COMPRESS, RATE, STATE_WIDTH};
 
 type Blake2sHash = <Blake2sMerkleChannel as MerkleChannel>::H;
 
@@ -187,11 +187,19 @@ pub fn constrain_withdraw_wiring<E: EvalAtRow>(
     }
 
     // 5. Merkle path: degree 2 constraints (no is_real)
+    // C5: state[RATE+1] has DOMAIN_COMPRESS added in compress, so the
+    // right-child check at j=1 must subtract it to match the raw value.
+    let domain_tag = E::F::from(DOMAIN_COMPRESS);
     let commitment_perm = COMMITMENT_PERM_END - 1;
     for j in 0..RATE {
         let commit_out = perms[commitment_perm].output()[j].clone();
         let curr_left = perms[MERKLE_PERM_START].input()[j].clone();
-        let curr_right = perms[MERKLE_PERM_START].input()[j + RATE].clone();
+        let curr_right_raw = perms[MERKLE_PERM_START].input()[j + RATE].clone();
+        let curr_right = if j == 1 {
+            curr_right_raw - domain_tag.clone()
+        } else {
+            curr_right_raw
+        };
         eval.add_constraint((curr_left - commit_out.clone()) * (curr_right - commit_out));
     }
 
@@ -199,7 +207,12 @@ pub fn constrain_withdraw_wiring<E: EvalAtRow>(
         for j in 0..RATE {
             let prev_out = perms[i - 1].output()[j].clone();
             let curr_left = perms[i].input()[j].clone();
-            let curr_right = perms[i].input()[j + RATE].clone();
+            let curr_right_raw = perms[i].input()[j + RATE].clone();
+            let curr_right = if j == 1 {
+                curr_right_raw - domain_tag.clone()
+            } else {
+                curr_right_raw
+            };
             eval.add_constraint((curr_left - prev_out.clone()) * (curr_right - prev_out));
         }
     }
@@ -245,6 +258,7 @@ pub struct WithdrawStarkEval {
     pub amount_lo: M31,
     pub amount_hi: M31,
     pub asset_id: M31,
+    pub withdrawal_binding: [M31; RATE],
 }
 
 impl FrameworkEval for WithdrawStarkEval {
@@ -310,6 +324,25 @@ impl FrameworkEval for WithdrawStarkEval {
 }
 
 pub type WithdrawStarkComponent = FrameworkComponent<WithdrawStarkEval>;
+
+/// Mix standalone withdraw public inputs into the Fiat-Shamir channel.
+/// This binds the proof to a specific set of public inputs (including withdrawal_binding)
+/// so that modifying any public input after proving invalidates the proof.
+fn mix_withdraw_public_inputs(
+    channel: &mut <Blake2sMerkleChannel as MerkleChannel>::C,
+    pi: &WithdrawPublicInputs,
+) {
+    let mut data: Vec<M31> = Vec::with_capacity(20 + RATE);
+    data.extend_from_slice(&pi.merkle_root);
+    data.extend_from_slice(&pi.nullifier);
+    data.push(pi.amount_lo);
+    data.push(pi.amount_hi);
+    data.push(pi.asset_id);
+    data.extend_from_slice(&pi.withdrawal_binding);
+    let hash = poseidon2_hash(&data);
+    let felts: Vec<SecureField> = hash.iter().map(|&m| SecureField::from(m)).collect();
+    channel.mix_felts(&felts);
+}
 
 // ──────────────────────────── Proof type ───────────────────────────────
 
@@ -421,6 +454,10 @@ where
             .half_coset,
     );
     let channel = &mut <Blake2sMerkleChannel as MerkleChannel>::C::default();
+
+    // Fiat-Shamir: mix public inputs (including withdrawal_binding) before tree commitments
+    mix_withdraw_public_inputs(channel, &public_inputs);
+
     let mut commitment_scheme =
         CommitmentSchemeProver::<B, Blake2sMerkleChannel>::new(pcs_config, &twiddles);
 
@@ -439,6 +476,7 @@ where
         amount_lo: public_inputs.amount_lo,
         amount_hi: public_inputs.amount_hi,
         asset_id: public_inputs.asset_id,
+        withdrawal_binding: public_inputs.withdrawal_binding,
     };
     let component = FrameworkComponent::new(
         &mut TraceLocationAllocator::default(),
@@ -470,12 +508,17 @@ pub fn verify_withdraw_stark(
         amount_lo: public_inputs.amount_lo,
         amount_hi: public_inputs.amount_hi,
         asset_id: public_inputs.asset_id,
+        withdrawal_binding: public_inputs.withdrawal_binding,
     };
     let mut allocator = TraceLocationAllocator::default();
     let dummy_component = FrameworkComponent::new(&mut allocator, dummy_eval, SecureField::zero());
     let bounds = Component::trace_log_degree_bounds(&dummy_component);
 
     let channel = &mut <Blake2sMerkleChannel as MerkleChannel>::C::default();
+
+    // Fiat-Shamir: mix public inputs (including withdrawal_binding) — must match prover
+    mix_withdraw_public_inputs(channel, public_inputs);
+
     let mut commitment_scheme = CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(pcs_config);
 
     commitment_scheme.commit(proof.stark_proof.commitments[0], &bounds[0], channel);
@@ -488,6 +531,7 @@ pub fn verify_withdraw_stark(
         amount_lo: public_inputs.amount_lo,
         amount_hi: public_inputs.amount_hi,
         asset_id: public_inputs.asset_id,
+        withdrawal_binding: public_inputs.withdrawal_binding,
     };
     let mut allocator = TraceLocationAllocator::default();
     let component = FrameworkComponent::new(&mut allocator, real_eval, SecureField::zero());
@@ -521,7 +565,7 @@ mod tests {
         let commitment = note.commitment();
         let mut tree = PoseidonMerkleTreeM31::new(crate::circuits::withdraw::MERKLE_DEPTH);
         tree.append(commitment);
-        let merkle_path = tree.prove(0);
+        let merkle_path = tree.prove(0).unwrap();
         let merkle_root = tree.root();
 
         WithdrawWitness {
@@ -585,8 +629,8 @@ mod tests {
 
         let witness = make_withdraw_witness(500);
 
-        let phase3_proof = prove_withdraw(&witness).expect("phase3 prove");
-        verify_withdraw(&phase3_proof).expect("phase3 verify");
+        let (phase3_proof, phase3_exec) = prove_withdraw(&witness).expect("phase3 prove");
+        verify_withdraw(&phase3_proof, &phase3_exec).expect("phase3 verify");
 
         let stark_proof = prove_withdraw_stark(&witness).expect("stark prove");
         verify_withdraw_stark(&stark_proof, &stark_proof.public_inputs).expect("stark verify");
@@ -599,5 +643,40 @@ mod tests {
             phase3_proof.public_inputs.merkle_root,
             stark_proof.public_inputs.merkle_root
         );
+    }
+
+    // ── M4 regression: withdrawal_binding is now Fiat-Shamir bound ──
+
+    #[test]
+    fn test_withdraw_stark_m4_binding_tampering_rejected() {
+        let witness = make_withdraw_witness(1000);
+        let proof = prove_withdraw_stark(&witness).expect("proving should succeed");
+
+        // Tamper with withdrawal_binding in the public inputs
+        let mut bad_inputs = proof.public_inputs.clone();
+        bad_inputs.withdrawal_binding[0] = M31::from_u32_unchecked(999999);
+
+        let result = verify_withdraw_stark(&proof, &bad_inputs);
+        assert!(
+            result.is_err(),
+            "M4: modified withdrawal_binding must break verification"
+        );
+    }
+
+    #[test]
+    fn test_withdraw_stark_nonzero_binding_prove_verify() {
+        let mut witness = make_withdraw_witness(1000);
+        // Set a non-trivial withdrawal_binding
+        witness.withdrawal_binding = [11, 22, 33, 44, 55, 66, 77, 88].map(M31::from_u32_unchecked);
+
+        let proof = prove_withdraw_stark(&witness).expect("proving should succeed");
+        verify_withdraw_stark(&proof, &proof.public_inputs)
+            .expect("non-zero binding should verify");
+
+        // Tampering still fails
+        let mut bad_inputs = proof.public_inputs.clone();
+        bad_inputs.withdrawal_binding[7] = M31::from_u32_unchecked(0);
+        let result = verify_withdraw_stark(&proof, &bad_inputs);
+        assert!(result.is_err(), "M4: tampered binding must fail");
     }
 }

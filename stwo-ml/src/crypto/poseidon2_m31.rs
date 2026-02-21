@@ -10,8 +10,9 @@
 //!   - External matrix: circ(2*M4, M4, M4, M4) from HorizenLabs
 //!   - Internal diagonal: Plonky3 DiffusionMatrixMersenne31 (validated)
 //!
-//! Round constant generation: xorshift64 PRNG seeded with "Poseidon2-M31"
-//! (nothing-up-my-sleeve, deterministic, reproducible).
+//! Round constant generation: SHA-256 counter mode with domain "Poseidon2-M31-rc"
+//! (cryptographic nothing-up-my-sleeve, deterministic, reproducible).
+//! H3 fix: replaced xorshift64 PRNG which lacks cryptographic guarantees.
 
 use std::sync::OnceLock;
 
@@ -35,10 +36,9 @@ pub const INTERNAL_DIAG_U32: [u32; STATE_WIDTH] = [
     1, 2, 4, 8, 16, 32, 64, 128, 256, 1024, 4096, 8192, 16384, 32768, 65536,
 ];
 
-/// PRNG seed: "Poseidon2-M31" as big-endian ASCII bytes packed into u64s.
-/// 0x506F736569646F6E = "Poseidon", 0x322D4D3331 = "2-M31"
-const SEED_HI: u64 = 0x506F736569646F6E;
-const SEED_LO: u64 = 0x322D4D3331_000000;
+/// Domain separator for SHA-256 counter-mode round constant generation.
+/// "Poseidon2-M31-rc" — public, deterministic, nothing-up-my-sleeve.
+const RC_DOMAIN: &[u8] = b"Poseidon2-M31-rc";
 
 // ──────────────────────────── Round constants ──────────────────────
 
@@ -54,17 +54,27 @@ pub fn get_round_constants() -> &'static RoundConstants {
 }
 
 fn generate_round_constants() -> RoundConstants {
-    let p = (1u64 << 31) - 1;
-    let mut state = SEED_HI ^ SEED_LO;
+    use sha2::{Digest, Sha256};
 
+    let p = (1u64 << 31) - 1;
+    let mut counter: u32 = 0;
+
+    // SHA-256 counter mode: hash(domain || counter_le) → first 4 bytes → mod p.
+    // Reject zero (zero constants weaken the S-box layer).
     let mut next_m31 = || -> M31 {
-        // xorshift64
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        let val = (state % p) as u32;
-        // Ensure non-zero (zero constants weaken the hash)
-        M31::from_u32_unchecked(if val == 0 { 1 } else { val })
+        loop {
+            let mut hasher = Sha256::new();
+            hasher.update(RC_DOMAIN);
+            hasher.update(counter.to_le_bytes());
+            counter += 1;
+            let hash = hasher.finalize();
+            let raw = u32::from_le_bytes([hash[0], hash[1], hash[2], hash[3]]);
+            let val = (raw as u64 % p) as u32;
+            if val != 0 {
+                return M31::from_u32_unchecked(val);
+            }
+            // P(val == 0) ≈ 2^{-31} — retry with next counter
+        }
     };
 
     let mut external = [[M31::from_u32_unchecked(0); STATE_WIDTH]; N_FULL_ROUNDS];
@@ -250,17 +260,37 @@ pub fn poseidon2_hash_4(input: &[M31]) -> [M31; 4] {
     [full[0], full[1], full[2], full[3]]
 }
 
+/// Domain constant for Merkle compression — prevents cross-domain collisions
+/// with `poseidon2_hash`.
+///
+/// Without this, `compress(left, [len, 0, …, 0])` produces an identical
+/// pre-permutation state to `hash(left)` (for `|left| = RATE`), enabling
+/// Merkle second-preimage attacks (C5).
+///
+/// Added to `state[RATE + 1]` after loading data.  Since `poseidon2_hash`
+/// always has `state[RATE + 1] = 0`, the pre-permutation states can never
+/// collide (an attacker would need `right[1] ≡ −DOMAIN_COMPRESS (mod p)` AND
+/// all remaining capacity elements to match, which is infeasible for
+/// pseudorandom Merkle leaves).
+///
+/// Value: 0x4D524B4C = "MRKL" in ASCII.
+pub const DOMAIN_COMPRESS: M31 = M31::from_u32_unchecked(0x4D52_4B4C);
+
 /// 2-to-1 compression function for Merkle trees.
 ///
 /// Takes two 8-element digests, loads them into the full 16-element state,
+/// injects `DOMAIN_COMPRESS` for cross-function domain separation,
 /// applies one permutation, returns the rate portion.
-///
-/// This is the Jive/overwrite mode: secure for fixed-length 2-to-1 compression
-/// (standard construction used by Zcash Orchard, Mina, Plonky3).
 pub fn poseidon2_compress(left: &[M31; RATE], right: &[M31; RATE]) -> [M31; RATE] {
     let mut state = [M31::from_u32_unchecked(0); STATE_WIDTH];
     state[..RATE].copy_from_slice(left);
     state[RATE..].copy_from_slice(right);
+
+    // C5 fix: domain separation — poseidon2_hash always has state[RATE+1] = 0,
+    // so adding DOMAIN_COMPRESS here makes the pre-permutation states disjoint
+    // for any input where right[1] ≠ −DOMAIN_COMPRESS mod p.
+    state[RATE + 1] += DOMAIN_COMPRESS;
+
     poseidon2_permutation(&mut state);
 
     let mut output = [M31::from_u32_unchecked(0); RATE];
@@ -590,5 +620,121 @@ mod tests {
         let h1 = poseidon2_hash_pair(a, b);
         let h2 = poseidon2_hash(&[a, b]);
         assert_eq!(h1, h2);
+    }
+
+    /// H3 regression: round constants are generated via SHA-256 counter mode,
+    /// not the old xorshift64 PRNG. Golden values pin the exact SHA-256 derivation.
+    #[test]
+    fn test_h3_sha256_golden_constants() {
+        let rc = get_round_constants();
+        assert_eq!(rc.external[0][0], M31::from_u32_unchecked(702361895));
+        assert_eq!(rc.external[0][1], M31::from_u32_unchecked(293075274));
+        assert_eq!(rc.external[0][2], M31::from_u32_unchecked(189603410));
+        assert_eq!(rc.external[0][3], M31::from_u32_unchecked(1327409956));
+        assert_eq!(rc.internal[0], M31::from_u32_unchecked(655384352));
+    }
+
+    /// H3 regression: the old xorshift64 PRNG constants must NOT be present.
+    /// This reproduces the old algorithm and verifies the new constants differ.
+    #[test]
+    fn test_h3_not_xorshift64() {
+        let p = (1u64 << 31) - 1;
+        let seed_hi: u64 = 0x506F736569646F6E;
+        let seed_lo: u64 = 0x322D4D3331_000000;
+        let mut state = seed_hi ^ seed_lo;
+
+        // Reproduce first xorshift64 output
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let old_first = M31::from_u32_unchecked(((state % p) as u32).max(1));
+
+        let rc = get_round_constants();
+        assert_ne!(
+            rc.external[0][0], old_first,
+            "H3 REGRESSION: first constant still matches xorshift64 output"
+        );
+    }
+
+    /// H3: verify SHA-256 counter mode is reproducible from the domain string.
+    #[test]
+    fn test_h3_sha256_counter_mode_reproducible() {
+        use sha2::{Digest, Sha256};
+
+        let p = (1u64 << 31) - 1;
+        let domain = b"Poseidon2-M31-rc";
+
+        // Manually compute first constant: SHA-256(domain || 0u32_le)
+        let mut hasher = Sha256::new();
+        hasher.update(domain);
+        hasher.update(0u32.to_le_bytes());
+        let hash = hasher.finalize();
+        let raw = u32::from_le_bytes([hash[0], hash[1], hash[2], hash[3]]);
+        let expected = M31::from_u32_unchecked((raw as u64 % p) as u32);
+
+        let rc = get_round_constants();
+        assert_eq!(
+            rc.external[0][0], expected,
+            "First constant must match SHA-256(domain || 0)"
+        );
+    }
+
+    /// C5 regression: `hash(left)` must never equal `compress(left, crafted_right)`
+    /// where `crafted_right[0] = len(left)` and the rest zero — the exact attack
+    /// vector that existed before domain separation was added.
+    #[test]
+    fn test_c5_hash_vs_compress_domain_separation() {
+        // Construct the exact collision that was possible pre-fix:
+        // hash(left) uses state = [left[0..8], 8, 0, ..., 0] then permutes.
+        // compress(left, right) with right = [8, 0, ..., 0] used the same state.
+        let left: [M31; RATE] = [
+            M31::from_u32_unchecked(1),
+            M31::from_u32_unchecked(2),
+            M31::from_u32_unchecked(3),
+            M31::from_u32_unchecked(4),
+            M31::from_u32_unchecked(5),
+            M31::from_u32_unchecked(6),
+            M31::from_u32_unchecked(7),
+            M31::from_u32_unchecked(8),
+        ];
+
+        // right is crafted so right[0] = 8 (= RATE = len(left))
+        let mut crafted_right = [M31::from_u32_unchecked(0); RATE];
+        crafted_right[0] = M31::from_u32_unchecked(RATE as u32);
+
+        let hash_result = poseidon2_hash(&left);
+        let compress_result = poseidon2_compress(&left, &crafted_right);
+
+        // With domain separation, these MUST differ
+        assert_ne!(
+            hash_result, compress_result,
+            "C5 REGRESSION: hash(left) == compress(left, [len,0,...,0]) — domain separation broken!"
+        );
+    }
+
+    /// C5 regression: domain separation must hold for ALL input lengths,
+    /// not just RATE-sized inputs.
+    #[test]
+    fn test_c5_domain_separation_various_lengths() {
+        for len in [1, 4, 8, 16, 24] {
+            let input: Vec<M31> = (0..len)
+                .map(|i| M31::from_u32_unchecked(i as u32 + 100))
+                .collect();
+            let hash_result = poseidon2_hash(&input);
+
+            // Try compress with left = first 8 elements (padded), right crafted
+            let mut left = [M31::from_u32_unchecked(0); RATE];
+            for (i, &v) in input.iter().take(RATE).enumerate() {
+                left[i] = v;
+            }
+            let mut right = [M31::from_u32_unchecked(0); RATE];
+            right[0] = M31::from_u32_unchecked(len as u32);
+
+            let compress_result = poseidon2_compress(&left, &right);
+            assert_ne!(
+                hash_result, compress_result,
+                "C5 REGRESSION at len={len}: hash and compress collide"
+            );
+        }
     }
 }

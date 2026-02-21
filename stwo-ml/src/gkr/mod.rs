@@ -53,7 +53,4 @@ pub use types::{
     DeferredProof, EmbeddingLogUpProof, GKRClaim, GKRError, GKRProof, LayerProof, LogUpProof,
     ReductionOutput, RoundPolyDeg3, WeightOpeningTranscriptMode,
 };
-pub use verifier::{
-    verify_gkr, verify_gkr_simd, verify_gkr_simd_with_weights, verify_gkr_with_execution,
-    verify_gkr_with_weights,
-};
+pub use verifier::verify_gkr_with_weights;

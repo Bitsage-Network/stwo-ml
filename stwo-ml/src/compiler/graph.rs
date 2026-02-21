@@ -739,8 +739,8 @@ impl GraphBuilder {
 /// Result of executing a computation graph.
 #[derive(Debug, Clone)]
 pub struct GraphExecution {
-    /// Per-node intermediate results (input to each node).
-    pub intermediates: Vec<(usize, M31Matrix)>,
+    /// Per-node intermediate results (input to each node), keyed by node_id.
+    pub intermediates: std::collections::HashMap<usize, M31Matrix>,
     /// Per-node output results. Used by `get_binary_op_intermediates` to
     /// look up the OUTPUT of input layers (Add/Mul need outputs, not inputs).
     pub node_outputs: std::collections::HashMap<usize, M31Matrix>,

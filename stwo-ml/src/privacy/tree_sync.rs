@@ -12,7 +12,7 @@ use crate::crypto::merkle_m31::{verify_merkle_proof, Digest, MerklePath, Poseido
 use crate::crypto::poseidon2_m31::RATE;
 
 #[cfg(feature = "audit-http")]
-use super::pool_client::PoolClient;
+use super::pool_client::{CrossVerifyResult, PoolClient};
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -38,6 +38,12 @@ pub struct SyncResult {
     pub total_leaves: usize,
     pub events_added: usize,
     pub root_verified: bool,
+    /// C6: cross-RPC verification was performed (verify RPCs were configured).
+    pub cross_verified: bool,
+    /// C6: number of independent RPCs that confirmed the root.
+    pub verify_confirmed: u32,
+    /// C6: total number of independent RPCs queried.
+    pub verify_total: u32,
 }
 
 /// Merkle tree synced from the on-chain pool.
@@ -116,10 +122,14 @@ impl TreeSync {
     /// Sync the tree from the pool contract.
     ///
     /// 1. Query on-chain tree size
-    /// 2. If local tree is up-to-date, verify root and return
+    /// 2. If local tree is up-to-date, cross-verify root and return
     /// 3. Otherwise, fetch NoteInserted events and append new leaves
-    /// 4. Verify root matches on-chain root
+    /// 4. Cross-verify root (C6: primary RPC + independent verification RPCs)
     /// 5. Save cache
+    ///
+    /// C6: The root is verified against independent RPCs (if configured via
+    /// `STARKNET_VERIFY_RPC`) to prevent a malicious primary RPC from feeding
+    /// fake events AND confirming a fake root from the same source.
     #[cfg(feature = "audit-http")]
     pub fn sync(&mut self, pool: &PoolClient) -> Result<SyncResult, TreeSyncError> {
         let on_chain_size = pool
@@ -129,20 +139,20 @@ impl TreeSync {
         let local_size = self.tree.size();
 
         if local_size == on_chain_size {
-            // Verify root matches
-            let on_chain_root = pool
-                .get_merkle_root()
-                .map_err(|e| TreeSyncError::Pool(e.to_string()))?;
-            let root_verified = self.tree.root() == on_chain_root;
-            if !root_verified {
+            let local_root = self.tree.root();
+            let cv = Self::verify_root_cross_rpc(pool, &local_root)?;
+            if !cv.is_confirmed() {
                 return Err(TreeSyncError::Sync(
-                    "local root doesn't match on-chain root (tree may be corrupt)".into(),
+                    "local root is not a known pool root (tree may be corrupt)".into(),
                 ));
             }
             return Ok(SyncResult {
                 total_leaves: on_chain_size,
                 events_added: 0,
                 root_verified: true,
+                cross_verified: cv.cross_verified,
+                verify_confirmed: cv.verify_confirmed,
+                verify_total: cv.verify_total,
             });
         }
 
@@ -185,22 +195,21 @@ impl TreeSync {
             }
         }
 
-        // Verify we reached the expected size
-        if self.tree.size() != on_chain_size {
+        // After sync, our tree may have fewer or more leaves than on_chain_size
+        // if events arrived during the sync. Check that our root is known.
+        if self.tree.size() < on_chain_size {
             return Err(TreeSyncError::Sync(format!(
-                "after sync: local size {} != on-chain size {on_chain_size}",
+                "after sync: local size {} < on-chain size {on_chain_size} (missing events?)",
                 self.tree.size()
             )));
         }
 
-        // Verify root
-        let on_chain_root = pool
-            .get_merkle_root()
-            .map_err(|e| TreeSyncError::Pool(e.to_string()))?;
-        let root_verified = self.tree.root() == on_chain_root;
-        if !root_verified {
+        // C6: Cross-verify root against independent RPCs
+        let local_root = self.tree.root();
+        let cv = Self::verify_root_cross_rpc(pool, &local_root)?;
+        if !cv.is_confirmed() {
             return Err(TreeSyncError::Sync(
-                "root mismatch after sync — events may be out of order".into(),
+                "root mismatch after sync — root not confirmed by independent RPCs".into(),
             ));
         }
 
@@ -208,10 +217,27 @@ impl TreeSync {
         self.save_cache()?;
 
         Ok(SyncResult {
-            total_leaves: on_chain_size,
+            total_leaves: self.tree.size(),
             events_added,
             root_verified: true,
+            cross_verified: cv.cross_verified,
+            verify_confirmed: cv.verify_confirmed,
+            verify_total: cv.verify_total,
         })
+    }
+
+    /// C6: Verify a root via cross-RPC verification.
+    ///
+    /// If verify RPCs are configured, the root must be confirmed by the primary
+    /// AND at least one independent RPC. If no verify RPCs are configured,
+    /// falls back to primary-only (backward compatible).
+    #[cfg(feature = "audit-http")]
+    fn verify_root_cross_rpc(
+        pool: &PoolClient,
+        root: &Digest,
+    ) -> Result<CrossVerifyResult, TreeSyncError> {
+        pool.cross_verify_root(root)
+            .map_err(|e| TreeSyncError::Pool(e.to_string()))
     }
 
     /// Generate a Merkle proof for the leaf at `leaf_index`.
@@ -222,7 +248,10 @@ impl TreeSync {
                 self.tree.size()
             )));
         }
-        Ok(self.tree.prove(leaf_index))
+        Ok(self
+            .tree
+            .prove(leaf_index)
+            .map_err(|e| TreeSyncError::Proof(e.to_string()))?)
     }
 
     /// Get the current tree root.
@@ -274,7 +303,7 @@ impl TreeSync {
 
     /// Verify a proof locally against the current root.
     pub fn verify_proof(&self, leaf: &Digest, path: &MerklePath) -> bool {
-        verify_merkle_proof(&self.tree.root(), leaf, path)
+        verify_merkle_proof(&self.tree.root(), leaf, path, self.tree.depth())
     }
 }
 
@@ -450,7 +479,7 @@ mod tests {
         // Verify proof for leaf 7
         let leaf = make_commitment(8);
         let path = sync.prove(7).unwrap();
-        assert!(verify_merkle_proof(&sync.root(), &leaf, &path));
+        assert!(verify_merkle_proof(&sync.root(), &leaf, &path, 20));
     }
 
     #[test]

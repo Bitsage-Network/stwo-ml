@@ -23,7 +23,7 @@ use crate::circuits::poseidon_circuit::{
 use crate::components::range_check::{prove_range_check, verify_range_check, RangeCheckProof};
 use crate::crypto::commitment::{Note, NoteCommitment, Nullifier, PublicKey, SpendingKey};
 use crate::crypto::merkle_m31::{Digest, MerklePath};
-use crate::crypto::poseidon2_m31::{poseidon2_permutation, RATE, STATE_WIDTH};
+use crate::crypto::poseidon2_m31::{poseidon2_permutation, DOMAIN_COMPRESS, RATE, STATE_WIDTH};
 use crate::crypto::poseidon_channel::PoseidonChannel;
 use crate::gadgets::range_check::RangeCheckConfig;
 
@@ -78,6 +78,8 @@ pub enum SpendError {
     TamperedExecution(String),
     #[error("cross-wiring verification failed: {0}")]
     CrossWiringFailed(String),
+    #[error("zero amount in output {index} (recipient output must be non-zero)")]
+    ZeroAmountOutput { index: usize },
 }
 
 /// Witness for a single input note.
@@ -125,8 +127,11 @@ pub struct OutputPermRanges {
     pub commitment: (usize, usize),
 }
 
-/// Execution trace for the spend circuit.
-#[derive(Clone, Debug)]
+/// Execution trace for the spend circuit (prover-private, NEVER share).
+///
+/// Contains full Poseidon2 permutation I/O including spending keys,
+/// blinding factors, and Merkle path siblings. Zeroized on drop.
+#[derive(Clone)]
 pub struct SpendExecution {
     pub input_commitments: [NoteCommitment; SPEND_NUM_INPUTS],
     pub input_nullifiers: [Nullifier; SPEND_NUM_INPUTS],
@@ -140,12 +145,39 @@ pub struct SpendExecution {
     pub range_check_limbs: Vec<M31>,
 }
 
-/// Complete spend proof.
+impl std::fmt::Debug for SpendExecution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpendExecution")
+            .field("input_nullifiers", &self.input_nullifiers)
+            .field("output_commitments", &self.output_commitments)
+            .field("num_perms", &self.all_permutation_inputs.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for SpendExecution {
+    fn drop(&mut self) {
+        for perm in &mut self.all_permutation_inputs {
+            for v in perm.iter_mut() {
+                *v = M31::from_u32_unchecked(0);
+            }
+        }
+        for perm in &mut self.all_permutation_outputs {
+            for v in perm.iter_mut() {
+                *v = M31::from_u32_unchecked(0);
+            }
+        }
+    }
+}
+
+/// Complete spend proof. Does NOT contain the execution trace.
+///
+/// Safe to serialize, log, or transmit — contains only cryptographic
+/// commitments and public inputs, no witness secrets.
 #[derive(Debug)]
 pub struct SpendProof {
     pub poseidon_proof: Poseidon2BatchProof,
     pub range_check_proof: RangeCheckProof<Blake2sHash>,
-    pub execution: SpendExecution,
     pub public_inputs: SpendPublicInputs,
 }
 
@@ -181,6 +213,17 @@ pub fn execute_spend(
                 got: out.note.asset_id.0,
                 expected: asset_id.0,
             });
+        }
+    }
+
+    // Reject zero-amount recipient output (output 0).
+    // Zero change (output 1) is allowed for exact-amount transfers.
+    {
+        let recipient = &witness.outputs[0];
+        let recipient_amount =
+            recipient.note.amount_lo.0 as u64 + (recipient.note.amount_hi.0 as u64) * (1u64 << 31);
+        if recipient_amount == 0 {
+            return Err(SpendError::ZeroAmountOutput { index: 0 });
         }
     }
 
@@ -378,7 +421,11 @@ pub fn execute_spend(
 }
 
 /// Prove a 2-in/2-out spend transaction.
-pub fn prove_spend(witness: &SpendWitness) -> Result<SpendProof, SpendError> {
+///
+/// Returns `(proof, execution)` separately. The `execution` contains witness
+/// secrets (spending keys, blinding, Merkle siblings) and MUST NOT be shared —
+/// it is zeroized on drop.
+pub fn prove_spend(witness: &SpendWitness) -> Result<(SpendProof, SpendExecution), SpendError> {
     let (execution, public_inputs) = execute_spend(witness)?;
 
     // Prove Poseidon2 batch (64 permutations)
@@ -390,17 +437,21 @@ pub fn prove_spend(witness: &SpendWitness) -> Result<SpendProof, SpendError> {
     let range_check_proof = prove_range_check(&execution.range_check_limbs, &config)
         .map_err(|e| SpendError::RangeCheckError(format!("{e}")))?;
 
-    Ok(SpendProof {
+    let proof = SpendProof {
         poseidon_proof,
         range_check_proof,
-        execution,
         public_inputs,
-    })
+    };
+    Ok((proof, execution))
 }
 
-/// Verify a spend proof.
-pub fn verify_spend(proof: &SpendProof) -> Result<(), SpendError> {
-    let exec = &proof.execution;
+/// Verify a spend proof against its execution trace.
+///
+/// The `execution` is the prover-private trace needed for cross-wiring checks.
+/// In production, only the STARK proof path (stark_spend.rs) should be used
+/// for third-party verification — it does not require the execution trace.
+pub fn verify_spend(proof: &SpendProof, execution: &SpendExecution) -> Result<(), SpendError> {
+    let exec = execution;
     let pub_in = &proof.public_inputs;
 
     // 1. Verify Poseidon2 batch proof
@@ -490,9 +541,18 @@ pub fn verify_spend(proof: &SpendProof) -> Result<(), SpendError> {
         }
 
         // P5: Merkle leaf = commitment
+        // Note: after C5 domain separation, state[RATE+1] in compress inputs
+        // has DOMAIN_COMPRESS added, so the right-child check must account for it.
         let merkle_input = &exec.all_permutation_inputs[merkle_start];
         let left_matches = (0..RATE).all(|j| merkle_input[j] == actual_commitment_out[j]);
-        let right_matches = (0..RATE).all(|j| merkle_input[RATE + j] == actual_commitment_out[j]);
+        let right_matches = (0..RATE).all(|j| {
+            let expected = if j == 1 {
+                actual_commitment_out[j] + DOMAIN_COMPRESS
+            } else {
+                actual_commitment_out[j]
+            };
+            merkle_input[RATE + j] == expected
+        });
         if !left_matches && !right_matches {
             return Err(SpendError::CrossWiringFailed(format!(
                 "P5 input {i}: commitment not found in Merkle leaf compress input",
@@ -719,8 +779,8 @@ mod tests {
         tree.append(commitment1);
         tree.append(commitment2);
         let merkle_root = tree.root();
-        let path1 = tree.prove(0);
-        let path2 = tree.prove(1);
+        let path1 = tree.prove(0).unwrap();
+        let path2 = tree.prove(1).unwrap();
 
         // Create output notes (new recipients)
         let out_sk1 = [100, 200, 300, 400].map(M31::from_u32_unchecked);
@@ -767,8 +827,8 @@ mod tests {
     #[test]
     fn test_spend_prove_verify_basic() {
         let witness = make_spend_witness([1000, 2000], [1500, 1500]);
-        let proof = prove_spend(&witness).expect("prove should succeed");
-        verify_spend(&proof).expect("verify should succeed");
+        let (proof, exec) = prove_spend(&witness).expect("prove should succeed");
+        verify_spend(&proof, &exec).expect("verify should succeed");
     }
 
     #[test]
@@ -863,19 +923,19 @@ mod tests {
         // Use amounts that require both lo and hi limbs
         let large = (1u64 << 40) + 42;
         let witness = make_spend_witness([large, 100], [large - 50, 150]);
-        let proof = prove_spend(&witness).expect("prove should succeed");
-        verify_spend(&proof).expect("verify should succeed");
+        let (proof, exec) = prove_spend(&witness).expect("prove should succeed");
+        verify_spend(&proof, &exec).expect("verify should succeed");
     }
 
     #[test]
     fn test_spend_tampered_proof_rejected() {
         let witness = make_spend_witness([1000, 2000], [1500, 1500]);
-        let mut proof = prove_spend(&witness).expect("prove should succeed");
+        let (proof, mut exec) = prove_spend(&witness).expect("prove should succeed");
 
         // Tamper with a commitment in the execution
-        proof.execution.input_commitments[0][0] = M31::from_u32_unchecked(999999);
+        exec.input_commitments[0][0] = M31::from_u32_unchecked(999999);
 
-        let result = verify_spend(&proof);
+        let result = verify_spend(&proof, &exec);
         assert!(result.is_err(), "tampered proof should fail verification");
     }
 
@@ -883,8 +943,37 @@ mod tests {
     fn test_spend_zero_amount() {
         // One zero-amount output is valid (dust/change)
         let witness = make_spend_witness([1000, 0], [1000, 0]);
-        let proof = prove_spend(&witness).expect("prove should succeed");
-        verify_spend(&proof).expect("verify should succeed");
+        let (proof, exec) = prove_spend(&witness).expect("prove should succeed");
+        verify_spend(&proof, &exec).expect("verify should succeed");
+    }
+
+    #[test]
+    fn test_spend_zero_recipient_output_rejected() {
+        // Output[0] = 0 (recipient), output[1] = 3000 (change). Zero recipient is rejected.
+        let witness = make_spend_witness([1000, 2000], [0, 3000]);
+        let result = prove_spend(&witness);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SpendError::ZeroAmountOutput { index: 0 } => {}
+            e => panic!("expected ZeroAmountOutput index=0, got: {e}"),
+        }
+    }
+
+    /// M3 regression: proof struct must NOT contain execution trace.
+    #[test]
+    fn test_m3_proof_does_not_contain_execution() {
+        let witness = make_spend_witness([1000, 2000], [1500, 1500]);
+        let (proof, _exec) = prove_spend(&witness).expect("prove should succeed");
+
+        let debug_str = format!("{:?}", proof);
+        assert!(
+            !debug_str.contains("all_permutation"),
+            "proof Debug must not leak permutation I/O"
+        );
+        assert!(
+            !debug_str.contains("spending_key"),
+            "proof Debug must not leak spending keys"
+        );
     }
 
     // --- Cross-wiring property tests ---
@@ -906,10 +995,9 @@ mod tests {
         let proof = SpendProof {
             poseidon_proof,
             range_check_proof,
-            execution: exec,
             public_inputs: pub_in,
         };
-        verify_spend(&proof)
+        verify_spend(&proof, &exec)
     }
 
     fn tamper_perm(exec: &mut SpendExecution, perm_idx: usize, pos: usize, val: u32) {
@@ -1108,10 +1196,10 @@ mod tests {
             amount: 2000,
             asset_id,
         };
-        let dp1 = prove_deposit(&dep1).expect("deposit 1 prove");
-        verify_deposit(&dp1).expect("deposit 1 verify");
-        let dp2 = prove_deposit(&dep2).expect("deposit 2 prove");
-        verify_deposit(&dp2).expect("deposit 2 verify");
+        let (dp1, dp1_exec) = prove_deposit(&dep1).expect("deposit 1 prove");
+        verify_deposit(&dp1, &dp1_exec).expect("deposit 1 verify");
+        let (dp2, dp2_exec) = prove_deposit(&dep2).expect("deposit 2 prove");
+        verify_deposit(&dp2, &dp2_exec).expect("deposit 2 verify");
 
         // Build Merkle tree from deposited commitments
         let c1 = note1.commitment();
@@ -1120,8 +1208,8 @@ mod tests {
         tree.append(c1);
         tree.append(c2);
         let root = tree.root();
-        let path1 = tree.prove(0);
-        let path2 = tree.prove(1);
+        let path1 = tree.prove(0).unwrap();
+        let path2 = tree.prove(1).unwrap();
 
         // Spend into 2 new outputs
         let out_pk1 = derive_pubkey(&[100, 200, 300, 400].map(M31::from_u32_unchecked));
@@ -1161,8 +1249,8 @@ mod tests {
             merkle_root: root,
         };
 
-        let spend_proof = prove_spend(&spend_witness).expect("spend prove");
-        verify_spend(&spend_proof).expect("spend verify");
+        let (spend_proof, spend_exec) = prove_spend(&spend_witness).expect("spend prove");
+        verify_spend(&spend_proof, &spend_exec).expect("spend verify");
     }
 
     #[test]
@@ -1187,8 +1275,8 @@ mod tests {
             amount: 5000,
             asset_id,
         };
-        let dp = prove_deposit(&dep).expect("deposit prove");
-        verify_deposit(&dp).expect("deposit verify");
+        let (dp, dp_exec) = prove_deposit(&dep).expect("deposit prove");
+        verify_deposit(&dp, &dp_exec).expect("deposit verify");
 
         // Build Merkle tree
         let commitment = note.commitment();
@@ -1199,12 +1287,12 @@ mod tests {
         let withdraw_witness = WithdrawWitness {
             note: note.clone(),
             spending_key: sk,
-            merkle_path: tree.prove(0),
+            merkle_path: tree.prove(0).unwrap(),
             merkle_root: tree.root(),
             withdrawal_binding: [M31::from_u32_unchecked(0); RATE],
         };
-        let wp = prove_withdraw(&withdraw_witness).expect("withdraw prove");
-        verify_withdraw(&wp).expect("withdraw verify");
+        let (wp, wp_exec) = prove_withdraw(&withdraw_witness).expect("withdraw prove");
+        verify_withdraw(&wp, &wp_exec).expect("withdraw verify");
 
         // Verify public inputs match
         assert_eq!(wp.public_inputs.amount_lo, note.amount_lo);

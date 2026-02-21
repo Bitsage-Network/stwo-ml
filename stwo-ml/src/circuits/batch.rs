@@ -72,15 +72,17 @@ const WDR_NUM_SUB_LIMBS: usize = 4;
 const WDR_BITS_PER_LIMB: usize = 16;
 const WDR_NUM_BIT_COLS: usize = WDR_NUM_SUB_LIMBS * WDR_BITS_PER_LIMB;
 const WDR_EXEC_COLS: usize = WDR_NUM_PERMS * COLS_PER_PERM + WDR_NUM_SUB_LIMBS + WDR_NUM_BIT_COLS;
-// Preprocessed: is_real(1) + merkle_root(8) + nullifier(8) + amount_lo(1) + amount_hi(1) + asset(1) = 20
-const WDR_PREPROC_COLS: usize = 20;
+// Preprocessed: is_real(1) + merkle_root(8) + nullifier(8) + amount_lo(1) + amount_hi(1) + asset(1) + withdrawal_binding(8) = 28
+const WDR_PREPROC_COLS: usize = 28;
 
 // Spend constants
 const SPD_NUM_PERMS: usize = 64;
-const SPD_NUM_SUB_LIMBS: usize = SPEND_NUM_OUTPUTS * 4; // 8
+const SPD_NUM_SUB_LIMBS: usize = (SPEND_NUM_INPUTS + SPEND_NUM_OUTPUTS) * 4; // 16
 const SPD_BITS_PER_LIMB: usize = 16;
 const SPD_NUM_BIT_COLS: usize = SPD_NUM_SUB_LIMBS * SPD_BITS_PER_LIMB;
-const SPD_NUM_CARRY_COLS: usize = 3;
+const SPD_NUM_CARRIES: usize = 3;
+const SPD_COLS_PER_CARRY: usize = 5;
+const SPD_NUM_CARRY_COLS: usize = SPD_NUM_CARRIES * SPD_COLS_PER_CARRY; // 15
 const SPD_EXEC_COLS: usize =
     SPD_NUM_PERMS * COLS_PER_PERM + SPD_NUM_SUB_LIMBS + SPD_NUM_BIT_COLS + SPD_NUM_CARRY_COLS;
 // Preprocessed: is_real(1) + merkle_root(8) + nullifiers(2×8=16) + output_commitments(2×8=16) = 41
@@ -299,6 +301,14 @@ impl FrameworkEval for BatchedWithdrawEval {
         let asset_id = eval.get_preprocessed_column(PreProcessedColumnId {
             id: "batch_wdr_asset_id".into(),
         });
+        // withdrawal_binding is committed in Tree 0 preprocessed columns.
+        // No AIR constraint needed — Fiat-Shamir binding via hash_batch_public_inputs
+        // and preprocessed commitment bind the values cryptographically.
+        let _withdrawal_binding: [E::F; RATE] = std::array::from_fn(|j| {
+            eval.get_preprocessed_column(PreProcessedColumnId {
+                id: format!("batch_wdr_binding_{j}").into(),
+            })
+        });
 
         // Permutation round constraints (all rows)
         let perms: Vec<_> = (0..WDR_NUM_PERMS)
@@ -402,21 +412,41 @@ impl FrameworkEval for BatchedSpendEval {
             eval.add_constraint(reconstructed - sub_limb.clone());
         }
 
-        // Carry columns
-        let carry = eval.next_trace_mask();
-        let carry_pos = eval.next_trace_mask();
-        let carry_neg = eval.next_trace_mask();
-        eval.add_constraint(carry_pos.clone() * (carry_pos.clone() - E::F::from(one)));
-        eval.add_constraint(carry_neg.clone() * (carry_neg.clone() - E::F::from(one)));
-        eval.add_constraint(carry_neg.clone() * carry_pos.clone());
-        eval.add_constraint(carry.clone() - carry_pos + carry_neg);
+        // MSB-0 constraints for high sub-limbs (s1, s3 per note)
+        for k in 0..SPD_NUM_SUB_LIMBS {
+            if k % 2 == 1 {
+                eval.add_constraint(bits[k][SPD_BITS_PER_LIMB - 1].clone());
+            }
+        }
+
+        // Carry columns: 3 carries × 5 cols each
+        let two = M31::from_u32_unchecked(2);
+        let carries: [E::F; SPD_NUM_CARRIES] = std::array::from_fn(|_| {
+            let c_val = eval.next_trace_mask();
+            let pos_b0 = eval.next_trace_mask();
+            let pos_b1 = eval.next_trace_mask();
+            let neg_b0 = eval.next_trace_mask();
+            let neg_b1 = eval.next_trace_mask();
+
+            eval.add_constraint(pos_b0.clone() * (pos_b0.clone() - E::F::from(one)));
+            eval.add_constraint(pos_b1.clone() * (pos_b1.clone() - E::F::from(one)));
+            eval.add_constraint(neg_b0.clone() * (neg_b0.clone() - E::F::from(one)));
+            eval.add_constraint(neg_b1.clone() * (neg_b1.clone() - E::F::from(one)));
+            eval.add_constraint(pos_b0.clone() * pos_b1.clone());
+            eval.add_constraint(neg_b0.clone() * neg_b1.clone());
+            eval.add_constraint(
+                c_val.clone() - pos_b0 - pos_b1.clone() * two + neg_b0 + neg_b1.clone() * two,
+            );
+
+            c_val
+        });
 
         constrain_spend_wiring(
             &mut eval,
             &is_real,
             &perms,
             &sub_limbs,
-            &carry,
+            &carries,
             &merkle_root,
             &nullifiers,
             &output_commitments,
@@ -569,6 +599,9 @@ where
         preproc_cols[17].set(row, pub_in.amount_lo);
         preproc_cols[18].set(row, pub_in.amount_hi);
         preproc_cols[19].set(row, pub_in.asset_id);
+        for j in 0..RATE {
+            preproc_cols[20 + j].set(row, pub_in.withdrawal_binding[j]);
+        }
 
         // Execution
         let perm_traces: Vec<_> = execution
@@ -687,47 +720,78 @@ where
             write_permutation_to_trace::<B>(trace, &mut exec_cols, p * COLS_PER_PERM, row);
         }
 
+        // Sub-limb decomposition for ALL notes (inputs + outputs)
         let sub_offset = SPD_NUM_PERMS * COLS_PER_PERM;
-        for (k, &limb) in execution.range_check_limbs.iter().enumerate() {
-            exec_cols[sub_offset + k].set(row, limb);
+        let mut all_sub_limbs: Vec<u32> = Vec::with_capacity(SPD_NUM_SUB_LIMBS);
+        for inp in &witness.inputs {
+            let lo = inp.note.amount_lo.0;
+            let hi = inp.note.amount_hi.0;
+            all_sub_limbs.push(lo & 0xFFFF);
+            all_sub_limbs.push((lo >> 16) & 0x7FFF);
+            all_sub_limbs.push(hi & 0xFFFF);
+            all_sub_limbs.push((hi >> 16) & 0x7FFF);
+        }
+        for out in &witness.outputs {
+            let lo = out.note.amount_lo.0;
+            let hi = out.note.amount_hi.0;
+            all_sub_limbs.push(lo & 0xFFFF);
+            all_sub_limbs.push((lo >> 16) & 0x7FFF);
+            all_sub_limbs.push(hi & 0xFFFF);
+            all_sub_limbs.push((hi >> 16) & 0x7FFF);
+        }
+        for (k, &limb_val) in all_sub_limbs.iter().enumerate() {
+            exec_cols[sub_offset + k].set(row, M31::from_u32_unchecked(limb_val));
         }
         let bit_offset = sub_offset + SPD_NUM_SUB_LIMBS;
-        for (k, &limb) in execution.range_check_limbs.iter().enumerate() {
-            let bits = decompose_to_bits(limb.0);
+        for (k, &limb_val) in all_sub_limbs.iter().enumerate() {
+            let bits = decompose_to_bits(limb_val);
             for (i, &bit) in bits.iter().enumerate() {
                 exec_cols[bit_offset + k * SPD_BITS_PER_LIMB + i]
                     .set(row, M31::from_u32_unchecked(bit));
             }
         }
 
-        // Carry columns
+        // Carry columns: sub-limb ripple carry (3 carries × 5 cols each)
         let carry_offset = bit_offset + SPD_NUM_BIT_COLS;
-        let hi_in: i64 = witness
-            .inputs
-            .iter()
-            .map(|i| i.note.amount_hi.0 as i64)
-            .sum();
-        let hi_out: i64 = witness
-            .outputs
-            .iter()
-            .map(|o| o.note.amount_hi.0 as i64)
-            .sum();
-        let carry_val = hi_in - hi_out;
         let p = 0x7FFFFFFFu32;
-        let carry_m31 = if carry_val >= 0 {
-            M31::from_u32_unchecked(carry_val as u32)
+        let mut d = [0i64; 4];
+        for inp_idx in 0..SPEND_NUM_INPUTS {
+            let base = inp_idx * 4;
+            for k in 0..4 {
+                d[k] += all_sub_limbs[base + k] as i64;
+            }
+        }
+        for out_idx in 0..SPEND_NUM_OUTPUTS {
+            let base = (SPEND_NUM_INPUTS + out_idx) * 4;
+            for k in 0..4 {
+                d[k] -= all_sub_limbs[base + k] as i64;
+            }
+        }
+        let c0 = if d[0] == 0 { 0i64 } else { -d[0] / 65536 };
+        let c1 = if d[1] - c0 == 0 {
+            0i64
         } else {
-            M31::from_u32_unchecked(p - ((-carry_val) as u32))
+            -(d[1] - c0) / 32768
         };
-        exec_cols[carry_offset].set(row, carry_m31);
-        exec_cols[carry_offset + 1].set(
-            row,
-            M31::from_u32_unchecked(if carry_val > 0 { 1 } else { 0 }),
-        );
-        exec_cols[carry_offset + 2].set(
-            row,
-            M31::from_u32_unchecked(if carry_val < 0 { 1 } else { 0 }),
-        );
+        let c2 = d[3];
+        for (ci, &carry_val) in [c0, c1, c2].iter().enumerate() {
+            let (pos, neg) = if carry_val >= 0 {
+                (carry_val as u32, 0u32)
+            } else {
+                (0u32, (-carry_val) as u32)
+            };
+            let c_m31 = if carry_val >= 0 {
+                M31::from_u32_unchecked(carry_val as u32)
+            } else {
+                M31::from_u32_unchecked(p - ((-carry_val) as u32))
+            };
+            let base = carry_offset + ci * SPD_COLS_PER_CARRY;
+            exec_cols[base].set(row, c_m31);
+            exec_cols[base + 1].set(row, M31::from_u32_unchecked(pos & 1));
+            exec_cols[base + 2].set(row, M31::from_u32_unchecked((pos >> 1) & 1));
+            exec_cols[base + 3].set(row, M31::from_u32_unchecked(neg & 1));
+            exec_cols[base + 4].set(row, M31::from_u32_unchecked((neg >> 1) & 1));
+        }
     }
 
     // Padding rows
@@ -1137,7 +1201,7 @@ mod tests {
         let commitment = note.commitment();
         let mut tree = PoseidonMerkleTreeM31::new(MERKLE_DEPTH);
         tree.append(commitment);
-        let merkle_path = tree.prove(0);
+        let merkle_path = tree.prove(0).unwrap();
         let merkle_root = tree.root();
 
         WithdrawWitness {
@@ -1177,8 +1241,8 @@ mod tests {
         tree.append(c1);
         tree.append(c2);
         let merkle_root = tree.root();
-        let path1 = tree.prove(0);
-        let path2 = tree.prove(1);
+        let path1 = tree.prove(0).unwrap();
+        let path2 = tree.prove(1).unwrap();
 
         let out_pk1 = derive_pubkey(&[100, 200, 300, 400].map(M31::from_u32_unchecked));
         let out_pk2 = derive_pubkey(&[500, 600, 700, 800].map(M31::from_u32_unchecked));
@@ -1422,7 +1486,28 @@ mod tests {
             .expect("padding rows should satisfy constraints");
     }
 
-    // ── Test 13: Larger batch ──
+    // ── Test 13: M4 regression — withdrawal_binding tampering rejected ──
+
+    #[test]
+    fn test_batch_m4_withdrawal_binding_tampering_rejected() {
+        let batch = PrivacyBatch {
+            deposits: vec![],
+            withdrawals: vec![make_withdraw_witness(1000)],
+            spends: vec![],
+        };
+        let proof = prove_privacy_batch(&batch).expect("proving should succeed");
+
+        let mut bad_inputs = proof.public_inputs.clone();
+        bad_inputs.withdrawals[0].withdrawal_binding[0] = M31::from_u32_unchecked(999999);
+
+        let result = verify_privacy_batch(&proof, &bad_inputs);
+        assert!(
+            result.is_err(),
+            "M4: modified withdrawal_binding must break batch verification"
+        );
+    }
+
+    // ── Test 14: Larger batch ──
 
     #[test]
     fn test_batch_larger_batch() {

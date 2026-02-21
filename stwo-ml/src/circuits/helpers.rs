@@ -7,7 +7,7 @@
 use stwo::core::fields::m31::BaseField as M31;
 
 use crate::crypto::merkle_m31::{Digest, MerklePath};
-use crate::crypto::poseidon2_m31::{poseidon2_permutation, RATE, STATE_WIDTH};
+use crate::crypto::poseidon2_m31::{poseidon2_permutation, DOMAIN_COMPRESS, RATE, STATE_WIDTH};
 
 /// A recorded permutation: (input_state, output_state).
 pub type PermRecord = ([M31; STATE_WIDTH], [M31; STATE_WIDTH]);
@@ -60,6 +60,9 @@ pub fn record_compress_permutation(
     let mut state = [M31::from_u32_unchecked(0); STATE_WIDTH];
     state[..RATE].copy_from_slice(left);
     state[RATE..].copy_from_slice(right);
+
+    // C5 fix: domain separation — must match poseidon2_compress exactly
+    state[RATE + 1] += DOMAIN_COMPRESS;
 
     let input_snapshot = state;
     poseidon2_permutation(&mut state);
@@ -264,8 +267,8 @@ mod tests {
 
         // Verify each leaf's proof matches
         for (i, leaf) in leaves.iter().enumerate() {
-            let path = tree.prove(i);
-            assert!(verify_merkle_proof(&root, leaf, &path));
+            let path = tree.prove(i).unwrap();
+            assert!(verify_merkle_proof(&root, leaf, &path, 4));
 
             let (computed_root, perms) = record_merkle_permutations(leaf, &path);
             assert_eq!(computed_root, root, "Merkle root mismatch for leaf {i}");

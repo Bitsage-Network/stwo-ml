@@ -1002,6 +1002,42 @@ pub struct RoundPoly {
     pub c2: SecureField,
 }
 
+impl RoundPoly {
+    /// Compress by omitting c1 (reconstructible from the sumcheck consistency equation).
+    ///
+    /// Since `p(0) + p(1) = current_sum` and `p(0) = c0`, `p(1) = c0 + c1 + c2`,
+    /// we get: `c1 = current_sum - 2*c0 - c2`.
+    pub fn compress(&self) -> CompressedRoundPoly {
+        CompressedRoundPoly {
+            c0: self.c0,
+            c2: self.c2,
+        }
+    }
+}
+
+/// Compressed degree-2 round polynomial: omits c1 (verifier reconstructs it).
+///
+/// Saves 4 felt252s (1 QM31) per sumcheck round — 33% reduction in round poly calldata.
+/// Verifier reconstructs: `c1 = current_sum - 2*c0 - c2`.
+#[derive(Debug, Clone, Copy)]
+pub struct CompressedRoundPoly {
+    pub c0: SecureField,
+    pub c2: SecureField,
+}
+
+impl CompressedRoundPoly {
+    /// Reconstruct the full polynomial given the running sumcheck sum.
+    pub fn decompress(&self, current_sum: SecureField) -> RoundPoly {
+        let two = SecureField::from(M31::from(2));
+        let c1 = current_sum - two * self.c0 - self.c2;
+        RoundPoly {
+            c0: self.c0,
+            c1,
+            c2: self.c2,
+        }
+    }
+}
+
 /// MatMul proof formatted for on-chain Cairo verification.
 ///
 /// Matches Cairo's `MatMulSumcheckProof` with 12 fields, using Poseidon

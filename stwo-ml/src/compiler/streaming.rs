@@ -451,6 +451,19 @@ impl StreamingWeightPipeline {
             }
         };
 
+        if k_start >= k_end {
+            return Err(WeightError::IoError(format!(
+                "invalid tile range: k_start={} >= k_end={}",
+                k_start, k_end,
+            )));
+        }
+        if k_end > k {
+            return Err(WeightError::IoError(format!(
+                "tile range [{}..{}] exceeds matrix k={}",
+                k_start, k_end, k,
+            )));
+        }
+
         let (data, dtype, shape) = self.resolve_tensor(node_id)?;
         let layout = detect_layout(&shape, k, n);
         let tile_k = k_end - k_start;

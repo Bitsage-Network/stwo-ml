@@ -2081,6 +2081,97 @@ fn prove_model_gpu(
     }
 }
 
+/// Execute a forward pass through a computation graph without proving.
+///
+/// This is significantly cheaper than `prove_model` since it skips all
+/// sumcheck / STARK proof generation. Used by chunked proving to
+/// precompute intermediate activations before the parallel prove phase.
+pub fn forward_pass_only(
+    graph: &ComputationGraph,
+    input: &M31Matrix,
+    weights: &GraphWeights,
+) -> Result<M31Matrix, ModelError> {
+    let mut node_outputs: HashMap<usize, M31Matrix> = HashMap::new();
+    let mut current = input.clone();
+
+    let topo = graph.topological_order();
+    for &node_id in &topo {
+        let node = &graph.nodes[node_id];
+
+        if let Some(&first_input) = node.inputs.first() {
+            if let Some(inp) = node_outputs.get(&first_input) {
+                current = inp.clone();
+            }
+        }
+
+        let output = match &node.op {
+            GraphOp::MatMul { .. } => {
+                let weight = weights
+                    .get_weight(node.id)
+                    .ok_or(ModelError::MissingWeight(node.id))?;
+                matmul_m31_auto(&current, weight)
+            }
+            GraphOp::Activation {
+                activation_type, ..
+            } => {
+                let f = activation_type.as_fn();
+                apply_activation_pub(&current, &*f)
+            }
+            GraphOp::LayerNorm { dim } => apply_layernorm_pub(&current, *dim),
+            GraphOp::RMSNorm { dim } => apply_rmsnorm_detailed(&current, *dim).output_matrix,
+            GraphOp::Add { .. } => {
+                let lhs_id = node.inputs.get(0).copied().unwrap_or(0);
+                let rhs_id = node.inputs.get(1).copied().unwrap_or(0);
+                let lhs = node_outputs.get(&lhs_id).unwrap_or(&current);
+                let rhs = node_outputs.get(&rhs_id).unwrap_or(&current);
+                elementwise_add(lhs, rhs)
+            }
+            GraphOp::Mul { .. } => {
+                let lhs_id = node.inputs.get(0).copied().unwrap_or(0);
+                let rhs_id = node.inputs.get(1).copied().unwrap_or(0);
+                let lhs = node_outputs.get(&lhs_id).unwrap_or(&current);
+                let rhs = node_outputs.get(&rhs_id).unwrap_or(&current);
+                elementwise_mul(lhs, rhs)
+            }
+            GraphOp::Attention { config } => {
+                let w_q = weights.get_named_weight(node.id, "w_q");
+                let w_k = weights.get_named_weight(node.id, "w_k");
+                let w_v = weights.get_named_weight(node.id, "w_v");
+                let w_o = weights.get_named_weight(node.id, "w_o");
+                if let (Some(wq), Some(wk), Some(wv), Some(wo)) = (w_q, w_k, w_v, w_o) {
+                    let attn_weights = crate::components::attention::AttentionWeights {
+                        w_q: wq.clone(),
+                        w_k: wk.clone(),
+                        w_v: wv.clone(),
+                        w_o: wo.clone(),
+                    };
+                    crate::components::attention::attention_forward(
+                        &current,
+                        &attn_weights,
+                        config,
+                        false,
+                    )
+                    .final_output
+                } else {
+                    current.clone()
+                }
+            }
+            // Passthrough ops
+            GraphOp::Quantize { .. }
+            | GraphOp::Dequantize { .. }
+            | GraphOp::Embedding { .. }
+            | GraphOp::Conv2D { .. }
+            | GraphOp::Identity { .. }
+            | GraphOp::RoPE { .. } => current.clone(),
+        };
+
+        node_outputs.insert(node.id, output.clone());
+        current = output;
+    }
+
+    Ok(current)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

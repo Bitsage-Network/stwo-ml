@@ -1921,7 +1921,7 @@ fn run_deposit_command(cmd: &DepositCmd) {
 
     // Update note store
     let notes_path = NoteStore::default_path();
-    let mut note_store = NoteStore::load(&notes_path).unwrap_or_else(|e| {
+    let mut note_store = NoteStore::load(&notes_path, None).unwrap_or_else(|e| {
         eprintln!("Warning: could not load note store: {e}");
         NoteStore {
             notes: Vec::new(),
@@ -1938,7 +1938,7 @@ fn run_deposit_command(cmd: &DepositCmd) {
         );
         note_store.add_note(note, &hex, 0);
     }
-    note_store.save().ok();
+    note_store.save(None).ok();
 
     eprintln!();
     if !output.deposits.is_empty() {
@@ -1981,7 +1981,7 @@ fn run_withdraw_command(cmd: &WithdrawCmd) {
 
     // Load note store and find a spendable note
     let notes_path = NoteStore::default_path();
-    let note_store = NoteStore::load(&notes_path).unwrap_or_else(|e| {
+    let note_store = NoteStore::load(&notes_path, None).unwrap_or_else(|e| {
         eprintln!("Error: could not load note store: {e}");
         process::exit(1);
     });
@@ -2145,14 +2145,14 @@ fn run_withdraw_command(cmd: &WithdrawCmd) {
     });
 
     // Mark note as spent
-    let mut note_store = NoteStore::load(&notes_path).unwrap_or_else(|_| NoteStore {
+    let mut note_store = NoteStore::load(&notes_path, None).unwrap_or_else(|_| NoteStore {
         notes: Vec::new(),
         path: notes_path.clone(),
     });
     for c in &result.spent_commitments {
         note_store.mark_spent(c);
     }
-    note_store.save().ok();
+    note_store.save(None).ok();
 
     eprintln!("  proof saved: {}", cmd.output.display());
     if !output.withdrawals.is_empty() {
@@ -2191,7 +2191,7 @@ fn run_transfer_command(cmd: &TransferCmd) {
 
     // Load note store and select 2 input notes
     let notes_path = NoteStore::default_path();
-    let note_store = NoteStore::load(&notes_path).unwrap_or_else(|e| {
+    let note_store = NoteStore::load(&notes_path, None).unwrap_or_else(|e| {
         eprintln!("Error: could not load note store: {e}");
         process::exit(1);
     });
@@ -2336,7 +2336,7 @@ fn run_transfer_command(cmd: &TransferCmd) {
     });
 
     // Update note store
-    let mut note_store = NoteStore::load(&notes_path).unwrap_or_else(|_| NoteStore {
+    let mut note_store = NoteStore::load(&notes_path, None).unwrap_or_else(|_| NoteStore {
         notes: Vec::new(),
         path: notes_path.clone(),
     });
@@ -2353,7 +2353,7 @@ fn run_transfer_command(cmd: &TransferCmd) {
         );
         note_store.add_note_pending(note, &hex);
     }
-    note_store.save().ok();
+    note_store.save(None).ok();
 
     eprintln!("  proof saved: {}", cmd.output.display());
     println!(
@@ -2457,7 +2457,7 @@ fn run_batch_command(cmd: &BatchCmd) {
 
     // Update note store
     let notes_path = NoteStore::default_path();
-    let mut note_store = NoteStore::load(&notes_path).unwrap_or_else(|_| NoteStore {
+    let mut note_store = NoteStore::load(&notes_path, None).unwrap_or_else(|_| NoteStore {
         notes: Vec::new(),
         path: notes_path.clone(),
     });
@@ -2471,7 +2471,7 @@ fn run_batch_command(cmd: &BatchCmd) {
         );
         note_store.add_note(note, &hex, 0);
     }
-    note_store.save().ok();
+    note_store.save(None).ok();
 
     eprintln!("  proof saved: {}", cmd.output.display());
     println!(
@@ -2507,6 +2507,7 @@ fn run_pool_status_command(cmd: &PoolStatusCmd) {
             rpc_url: config.rpc_url.clone(),
             pool_address: pool_addr.to_string(),
             network: cmd.priv_network.clone(),
+            verify_rpc_urls: Vec::new(),
         };
         let client = PoolClient::new(client_config);
 
@@ -2582,7 +2583,7 @@ fn parse_m31_digest_hex(hex: &str) -> Result<[M31; 8], String> {
         let chunk = &hex[i * 8..(i + 1) * 8];
         let val =
             u32::from_str_radix(chunk, 16).map_err(|e| format!("invalid hex '{chunk}': {e}"))?;
-        result[i] = M31::from_u32_unchecked(val & 0x7FFFFFFF);
+        result[i] = M31::from_u32_unchecked(val % 0x7FFFFFFF);
     }
     Ok(result)
 }
@@ -2599,12 +2600,12 @@ fn run_scan_command(cmd: &ScanCmd) {
 
     let notes_path = NoteStore::default_path();
     #[cfg(feature = "audit-http")]
-    let mut note_store = NoteStore::load(&notes_path).unwrap_or_else(|_| NoteStore {
+    let mut note_store = NoteStore::load(&notes_path, None).unwrap_or_else(|_| NoteStore {
         notes: Vec::new(),
         path: notes_path.clone(),
     });
     #[cfg(not(feature = "audit-http"))]
-    let note_store = NoteStore::load(&notes_path).unwrap_or_else(|_| NoteStore {
+    let note_store = NoteStore::load(&notes_path, None).unwrap_or_else(|_| NoteStore {
         notes: Vec::new(),
         path: notes_path.clone(),
     });
@@ -2639,7 +2640,7 @@ fn run_scan_command(cmd: &ScanCmd) {
                     // Update pending notes with correct merkle indices
                     note_store
                         .update_merkle_indices(|commitment| tree_sync.find_commitment(commitment));
-                    note_store.save().ok();
+                    note_store.save(None).ok();
                 }
                 Err(e) => {
                     eprintln!("  Warning: tree sync failed: {e}");
@@ -2684,7 +2685,7 @@ fn parse_pubkey_hex(hex: &str) -> [M31; 4] {
             eprintln!("Error: invalid hex in pubkey '{}': {}", chunk, e);
             process::exit(1);
         });
-        result[i] = M31::from_u32_unchecked(val & 0x7FFFFFFF);
+        result[i] = M31::from_u32_unchecked(val % 0x7FFFFFFF);
     }
     result
 }

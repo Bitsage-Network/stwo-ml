@@ -31,7 +31,14 @@ pub fn embedding_lookup(
     let mut multiplicities = vec![M31::from(0); vocab_size * embed_dim];
 
     for (t, &tid) in token_ids.iter().enumerate() {
-        let row_idx = (tid as usize).min(vocab_size - 1);
+        let row_idx = tid as usize;
+        assert!(
+            row_idx < vocab_size,
+            "embedding_lookup: token_id {} at position {} exceeds vocab_size {}",
+            tid,
+            t,
+            vocab_size,
+        );
         for c in 0..embed_dim {
             let val = embedding_table.get(row_idx, c);
             output.set(t, c, val);

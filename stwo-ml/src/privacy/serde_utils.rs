@@ -230,6 +230,12 @@ pub fn batch_proof_to_json(output: &BatchProofOutput) -> String {
     serde_json::to_string_pretty(&json).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// Valid transaction types for tx-file entries.
+const VALID_TX_TYPES: &[&str] = &["deposit", "withdraw", "transfer"];
+
+/// Maximum number of transactions in a single batch file.
+const MAX_BATCH_SIZE: usize = 1024;
+
 /// Parse a tx-file JSON into entries.
 pub fn parse_tx_file(contents: &str) -> Result<Vec<TxFileEntry>, String> {
     let parsed: serde_json::Value =
@@ -239,15 +245,36 @@ pub fn parse_tx_file(contents: &str) -> Result<Vec<TxFileEntry>, String> {
         .as_array()
         .ok_or_else(|| "tx-file must be a JSON array".to_string())?;
 
+    if arr.is_empty() {
+        return Err("tx-file is empty".to_string());
+    }
+    if arr.len() > MAX_BATCH_SIZE {
+        return Err(format!(
+            "tx-file has {} entries (max {MAX_BATCH_SIZE})",
+            arr.len()
+        ));
+    }
+
     let mut entries = Vec::with_capacity(arr.len());
     for (i, item) in arr.iter().enumerate() {
         let tx_type = item["type"]
             .as_str()
             .ok_or_else(|| format!("tx[{i}]: missing 'type'"))?
             .to_string();
+
+        if !VALID_TX_TYPES.contains(&tx_type.as_str()) {
+            return Err(format!(
+                "tx[{i}]: unknown type '{tx_type}', valid: deposit, withdraw, transfer"
+            ));
+        }
+
         let amount = item["amount"]
             .as_u64()
-            .ok_or_else(|| format!("tx[{i}]: missing 'amount'"))?;
+            .ok_or_else(|| format!("tx[{i}]: missing or invalid 'amount'"))?;
+
+        if amount == 0 {
+            return Err(format!("tx[{i}]: amount must be > 0"));
+        }
         let asset_id = item["asset_id"].as_u64().unwrap_or(0) as u32;
         let recipient_pubkey = item["recipient_pubkey"].as_array().and_then(|a| {
             if a.len() >= 4 {
@@ -261,6 +288,10 @@ pub fn parse_tx_file(contents: &str) -> Result<Vec<TxFileEntry>, String> {
                 None
             }
         });
+
+        if tx_type == "transfer" && recipient_pubkey.is_none() {
+            return Err(format!("tx[{i}]: transfer requires 'recipient_pubkey'"));
+        }
 
         entries.push(TxFileEntry {
             tx_type,
@@ -330,5 +361,59 @@ mod tests {
         assert_eq!(entries[0].amount, 1000);
         assert_eq!(entries[1].tx_type, "transfer");
         assert!(entries[1].recipient_pubkey.is_some());
+    }
+
+    #[test]
+    fn test_parse_tx_file_unknown_type_rejected() {
+        let json = r#"[{"type": "burn", "amount": 100}]"#;
+        let err = parse_tx_file(json).unwrap_err();
+        assert!(err.contains("unknown type 'burn'"), "got: {err}");
+    }
+
+    #[test]
+    fn test_parse_tx_file_empty_array_rejected() {
+        let err = parse_tx_file("[]").unwrap_err();
+        assert!(err.contains("empty"), "got: {err}");
+    }
+
+    #[test]
+    fn test_parse_tx_file_zero_amount_rejected() {
+        let json = r#"[{"type": "deposit", "amount": 0}]"#;
+        let err = parse_tx_file(json).unwrap_err();
+        assert!(err.contains("amount must be > 0"), "got: {err}");
+    }
+
+    #[test]
+    fn test_parse_tx_file_oversized_rejected() {
+        let entries: Vec<String> = (0..1025)
+            .map(|_| r#"{"type": "deposit", "amount": 100}"#.to_string())
+            .collect();
+        let json = format!("[{}]", entries.join(","));
+        let err = parse_tx_file(&json).unwrap_err();
+        assert!(err.contains("1025") && err.contains("max"), "got: {err}");
+    }
+
+    #[test]
+    fn test_parse_tx_file_transfer_missing_recipient_rejected() {
+        let json = r#"[{"type": "transfer", "amount": 500}]"#;
+        let err = parse_tx_file(json).unwrap_err();
+        assert!(
+            err.contains("transfer requires 'recipient_pubkey'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_tx_file_missing_amount_rejected() {
+        let json = r#"[{"type": "deposit"}]"#;
+        let err = parse_tx_file(json).unwrap_err();
+        assert!(err.contains("missing or invalid 'amount'"), "got: {err}");
+    }
+
+    #[test]
+    fn test_parse_tx_file_negative_amount_rejected() {
+        let json = r#"[{"type": "deposit", "amount": -100}]"#;
+        let err = parse_tx_file(json).unwrap_err();
+        assert!(err.contains("amount"), "got: {err}");
     }
 }

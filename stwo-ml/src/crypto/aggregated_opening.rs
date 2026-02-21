@@ -166,7 +166,11 @@ pub fn build_super_root(
     claims: &[AggregatedWeightClaim],
     config: &AggregatedBindingConfig,
 ) -> SuperRoot {
-    let zero_tree_root = compute_zero_tree_root(config.n_max);
+    // Pre-compute all zero tree roots from 0..=n_max to avoid redundant
+    // O(n) Poseidon hash chains per claim.
+    let zero_tree_roots: Vec<FieldElement> =
+        (0..=config.n_max).map(compute_zero_tree_root).collect();
+    let zero_tree_root = zero_tree_roots[config.n_max];
 
     // Build padded subtree roots: actual commitments + zero-tree padding
     let mut subtree_roots = Vec::with_capacity(config.m_padded);
@@ -182,10 +186,8 @@ pub fn build_super_root(
             // from local_n_vars to n_max.
             let levels_to_extend = config.n_max - claim.local_n_vars;
             let mut extended = claim.commitment;
-            let mut zero_h = compute_zero_tree_root(claim.local_n_vars);
-            for _ in 0..levels_to_extend {
-                extended = poseidon_hash(extended, zero_h);
-                zero_h = poseidon_hash(zero_h, zero_h);
+            for k in 0..levels_to_extend {
+                extended = poseidon_hash(extended, zero_tree_roots[claim.local_n_vars + k]);
             }
             subtree_roots.push(extended);
         }

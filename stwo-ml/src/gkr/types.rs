@@ -37,6 +37,43 @@ impl RoundPolyDeg3 {
     pub fn eval(&self, t: SecureField) -> SecureField {
         self.c0 + self.c1 * t + self.c2 * t * t + self.c3 * t * t * t
     }
+
+    /// Compress by omitting c1 (reconstructible from the sumcheck consistency equation).
+    ///
+    /// Since `p(0) + p(1) = current_sum` and `p(1) = c0 + c1 + c2 + c3`,
+    /// we get: `c1 = current_sum - 2*c0 - c2 - c3`.
+    pub fn compress(&self) -> CompressedRoundPolyDeg3 {
+        CompressedRoundPolyDeg3 {
+            c0: self.c0,
+            c2: self.c2,
+            c3: self.c3,
+        }
+    }
+}
+
+/// Compressed degree-3 round polynomial: omits c1 (verifier reconstructs it).
+///
+/// Saves 4 felt252s (1 QM31) per sumcheck round — 25% reduction in round poly calldata.
+/// Verifier reconstructs: `c1 = current_sum - 2*c0 - c2 - c3`.
+#[derive(Debug, Clone, Copy)]
+pub struct CompressedRoundPolyDeg3 {
+    pub c0: SecureField,
+    pub c2: SecureField,
+    pub c3: SecureField,
+}
+
+impl CompressedRoundPolyDeg3 {
+    /// Reconstruct the full polynomial given the running sumcheck sum.
+    pub fn decompress(&self, current_sum: SecureField) -> RoundPolyDeg3 {
+        let two = SecureField::from(stwo::core::fields::m31::M31::from(2));
+        let c1 = current_sum - two * self.c0 - self.c2 - self.c3;
+        RoundPolyDeg3 {
+            c0: self.c0,
+            c1,
+            c2: self.c2,
+            c3: self.c3,
+        }
+    }
 }
 
 /// LogUp proof for activation/layernorm lookup arguments.
@@ -500,4 +537,76 @@ pub enum GKRError {
 
     #[error("lookup table error: {0}")]
     LookupTableError(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stwo::core::fields::cm31::CM31;
+    use stwo::core::fields::m31::M31;
+    use stwo::core::fields::qm31::QM31;
+
+    #[test]
+    fn test_compressed_round_poly_deg3_roundtrip() {
+        let rp = RoundPolyDeg3 {
+            c0: QM31(
+                CM31(M31::from(10), M31::from(20)),
+                CM31(M31::from(30), M31::from(40)),
+            ),
+            c1: QM31(
+                CM31(M31::from(50), M31::from(60)),
+                CM31(M31::from(70), M31::from(80)),
+            ),
+            c2: QM31(
+                CM31(M31::from(90), M31::from(100)),
+                CM31(M31::from(110), M31::from(120)),
+            ),
+            c3: QM31(
+                CM31(M31::from(130), M31::from(140)),
+                CM31(M31::from(150), M31::from(160)),
+            ),
+        };
+
+        // current_sum = p(0) + p(1) = c0 + (c0 + c1 + c2 + c3)
+        let p0 = rp.c0;
+        let p1 = rp.c0 + rp.c1 + rp.c2 + rp.c3;
+        let current_sum = p0 + p1;
+
+        let compressed = rp.compress();
+        let decompressed = compressed.decompress(current_sum);
+
+        assert_eq!(decompressed.c0, rp.c0, "c0 mismatch");
+        assert_eq!(decompressed.c1, rp.c1, "c1 mismatch after reconstruction");
+        assert_eq!(decompressed.c2, rp.c2, "c2 mismatch");
+        assert_eq!(decompressed.c3, rp.c3, "c3 mismatch");
+    }
+
+    #[test]
+    fn test_round_poly_deg3_eval() {
+        let rp = RoundPolyDeg3 {
+            c0: QM31(
+                CM31(M31::from(1), M31::from(0)),
+                CM31(M31::from(0), M31::from(0)),
+            ),
+            c1: QM31(
+                CM31(M31::from(2), M31::from(0)),
+                CM31(M31::from(0), M31::from(0)),
+            ),
+            c2: QM31(
+                CM31(M31::from(3), M31::from(0)),
+                CM31(M31::from(0), M31::from(0)),
+            ),
+            c3: QM31(
+                CM31(M31::from(4), M31::from(0)),
+                CM31(M31::from(0), M31::from(0)),
+            ),
+        };
+
+        // p(0) = 1, p(1) = 1+2+3+4 = 10
+        let t0 = SecureField::from(M31::from(0));
+        let t1 = SecureField::from(M31::from(1));
+        assert_eq!(rp.eval(t0), rp.c0);
+        let expected_p1 = rp.c0 + rp.c1 + rp.c2 + rp.c3;
+        assert_eq!(rp.eval(t1), expected_p1);
+    }
 }

@@ -1030,8 +1030,8 @@ pub fn verify_gkr_with_execution(
     // First run the standard verification — returns the verified input claim
     let input_claim = verify_gkr(circuit, proof, &execution.output, channel)?;
 
-    // Then verify the input claim against the actual input
-    if let Some((_, input_matrix)) = execution.intermediates.first() {
+    // Then verify the input claim against the actual input (node 0 = first computation node)
+    if let Some(input_matrix) = execution.intermediates.get(&0) {
         let input_padded = pad_matrix_pow2(input_matrix);
         let input_mle = matrix_to_mle(&input_padded);
 
@@ -3899,7 +3899,7 @@ mod tests {
         weights.add_weight(0, b.clone());
 
         let execution = GraphExecution {
-            intermediates: vec![(0, a.clone())],
+            intermediates: std::collections::HashMap::from([(0, a.clone())]),
             node_outputs: std::collections::HashMap::new(),
             output: c.clone(),
         };
@@ -3943,7 +3943,7 @@ mod tests {
         weights.add_weight(0, b.clone());
 
         let execution = GraphExecution {
-            intermediates: vec![(0, a.clone())],
+            intermediates: std::collections::HashMap::from([(0, a.clone())]),
             node_outputs: std::collections::HashMap::new(),
             output: c.clone(),
         };
@@ -4000,7 +4000,7 @@ mod tests {
         weights.add_weight(0, b.clone());
 
         let execution = GraphExecution {
-            intermediates: vec![(0, a.clone())],
+            intermediates: std::collections::HashMap::from([(0, a.clone())]),
             node_outputs: std::collections::HashMap::new(),
             output: c.clone(),
         };
@@ -4062,7 +4062,11 @@ mod tests {
 
         let execution = GraphExecution {
             // Input to each node: MatMul(0)=x, MatMul(1)=y0, Add(2)=y1
-            intermediates: vec![(0, x.clone()), (1, y0.clone()), (2, y1.clone())],
+            intermediates: std::collections::HashMap::from([
+                (0, x.clone()),
+                (1, y0.clone()),
+                (2, y1.clone()),
+            ]),
             node_outputs,
             output: out.clone(),
         };
@@ -4113,7 +4117,7 @@ mod tests {
         let mut weights = GraphWeights::new();
         weights.add_weight(0, b.clone());
         let execution = GraphExecution {
-            intermediates: vec![(0, a.clone())],
+            intermediates: std::collections::HashMap::from([(0, a.clone())]),
             node_outputs: std::collections::HashMap::new(),
             output: c.clone(),
         };
@@ -4154,7 +4158,7 @@ mod tests {
         let mut weights = GraphWeights::new();
         weights.add_weight(0, b.clone());
         let execution = GraphExecution {
-            intermediates: vec![(0, a.clone())],
+            intermediates: std::collections::HashMap::from([(0, a.clone())]),
             node_outputs: std::collections::HashMap::new(),
             output: c.clone(),
         };
@@ -4208,7 +4212,7 @@ mod tests {
         let mut weights = GraphWeights::new();
         weights.add_weight(0, b.clone());
         let execution = GraphExecution {
-            intermediates: vec![(0, a.clone())],
+            intermediates: std::collections::HashMap::from([(0, a.clone())]),
             node_outputs: std::collections::HashMap::new(),
             output: c.clone(),
         };
@@ -4256,7 +4260,7 @@ mod tests {
         weights.add_weight(0, b.clone());
 
         let execution = GraphExecution {
-            intermediates: vec![(0, a.clone())],
+            intermediates: std::collections::HashMap::from([(0, a.clone())]),
             node_outputs: std::collections::HashMap::new(),
             output: c.clone(),
         };
@@ -4315,11 +4319,11 @@ mod tests {
         // Node 1 (activation): input is hidden (pre-activation)
         // Node 2 (second matmul): input is activated (post-activation)
         let execution = GraphExecution {
-            intermediates: vec![
+            intermediates: std::collections::HashMap::from([
                 (0, input.clone()),
                 (1, hidden.clone()),
                 (2, activated.clone()),
-            ],
+            ]),
             node_outputs: std::collections::HashMap::new(),
             output: output.clone(),
         };
@@ -4355,7 +4359,7 @@ mod tests {
         weights.add_weight(0, b.clone());
 
         let execution = GraphExecution {
-            intermediates: vec![(0, a.clone())],
+            intermediates: std::collections::HashMap::from([(0, a.clone())]),
             node_outputs: std::collections::HashMap::new(),
             output: c.clone(),
         };
@@ -5999,7 +6003,10 @@ mod tests {
         weights.add_weight(1, w2);
 
         let execution = GraphExecution {
-            intermediates: vec![(0, input.clone()), (1, hidden.clone())],
+            intermediates: std::collections::HashMap::from([
+                (0, input.clone()),
+                (1, hidden.clone()),
+            ]),
             node_outputs: std::collections::HashMap::new(),
             output: output.clone(),
         };
@@ -6051,7 +6058,10 @@ mod tests {
         weights.add_weight(0, w1);
 
         let execution = GraphExecution {
-            intermediates: vec![(0, input.clone()), (1, hidden.clone())],
+            intermediates: std::collections::HashMap::from([
+                (0, input.clone()),
+                (1, hidden.clone()),
+            ]),
             node_outputs: std::collections::HashMap::new(),
             output: normed.clone(),
         };
@@ -6086,7 +6096,10 @@ mod tests {
 
         let weights = GraphWeights::new();
         let execution = GraphExecution {
-            intermediates: vec![(0, input.clone()), (1, after_relu.clone())],
+            intermediates: std::collections::HashMap::from([
+                (0, input.clone()),
+                (1, after_relu.clone()),
+            ]),
             node_outputs: std::collections::HashMap::new(),
             output: after_gelu.clone(),
         };
@@ -6127,7 +6140,10 @@ mod tests {
         weights.add_weight(1, w1);
 
         let execution = GraphExecution {
-            intermediates: vec![(0, input.clone()), (1, activated.clone())],
+            intermediates: std::collections::HashMap::from([
+                (0, input.clone()),
+                (1, activated.clone()),
+            ]),
             node_outputs: std::collections::HashMap::new(),
             output: output.clone(),
         };
@@ -6184,7 +6200,11 @@ mod tests {
         weights.add_weight(2, w3);
 
         let execution = GraphExecution {
-            intermediates: vec![(0, input.clone()), (1, h1.clone()), (2, h2.clone())],
+            intermediates: std::collections::HashMap::from([
+                (0, input.clone()),
+                (1, h1.clone()),
+                (2, h2.clone()),
+            ]),
             node_outputs: std::collections::HashMap::new(),
             output: output.clone(),
         };
@@ -6247,12 +6267,12 @@ mod tests {
         weights.add_weight(2, w2);
 
         let execution = GraphExecution {
-            intermediates: vec![
+            intermediates: std::collections::HashMap::from([
                 (0, input.clone()),
                 (1, hidden1.clone()),
                 (2, activated.clone()),
                 (3, hidden2.clone()),
-            ],
+            ]),
             node_outputs: std::collections::HashMap::new(),
             output: output.clone(),
         };
@@ -6762,11 +6782,11 @@ mod tests {
         node_outputs.insert(2usize, out.clone());
 
         let execution = GraphExecution {
-            intermediates: vec![
+            intermediates: std::collections::HashMap::from([
                 (0, x_quant.clone()), // input to Dequantize
                 (1, x_deq.clone()),   // input to MatMul
                 (2, y.clone()),       // input to Add (trunk = MatMul output)
-            ],
+            ]),
             node_outputs,
             output: out.clone(),
         };
@@ -6931,10 +6951,10 @@ mod tests {
         node_outputs_0.insert(0usize, a_out_0.clone());
         node_outputs_0.insert(1usize, b_out_0.clone());
         let exec_0 = GraphExecution {
-            intermediates: vec![
+            intermediates: std::collections::HashMap::from([
                 (0, input_0.clone()), // input to MatMul_A
                 (1, a_out_0.clone()), // input to MatMul_B = MatMul_A output
-            ],
+            ]),
             node_outputs: node_outputs_0,
             output: add_out_0.clone(),
         };
@@ -6943,10 +6963,10 @@ mod tests {
         node_outputs_1.insert(3usize, a_out_1.clone());
         node_outputs_1.insert(4usize, b_out_1.clone());
         let exec_1 = GraphExecution {
-            intermediates: vec![
+            intermediates: std::collections::HashMap::from([
                 (3, input_1.clone()), // input to MatMul_C
                 (4, a_out_1.clone()), // input to MatMul_D = MatMul_C output
-            ],
+            ]),
             node_outputs: node_outputs_1,
             output: add_out_1.clone(),
         };

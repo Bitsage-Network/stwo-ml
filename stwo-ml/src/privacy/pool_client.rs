@@ -19,6 +19,68 @@ pub enum PoolClientError {
     Parse(String),
     #[error("contract error: {0}")]
     Contract(String),
+    /// C7: plaintext HTTP rejected for RPC URLs.
+    #[error("insecure URL rejected: {0}")]
+    InsecureUrl(String),
+}
+
+/// C7: Validate that an RPC URL uses HTTPS (TLS).
+///
+/// Rejects `http://` URLs because pool state (commitments, nullifiers, roots)
+/// would be visible in cleartext to any network observer.
+///
+/// Exceptions:
+/// - `localhost`, `127.0.0.1`, `[::1]` — local dev/testing
+/// - `VM31_ALLOW_INSECURE_RPC=1` env var — explicit opt-out for CI
+///
+/// Returns `Ok(())` if the URL is safe, `Err(InsecureUrl)` otherwise.
+pub fn validate_rpc_url(url: &str) -> Result<(), PoolClientError> {
+    // Allow HTTPS always
+    if url.starts_with("https://") {
+        return Ok(());
+    }
+
+    // Reject non-http schemes (or missing scheme)
+    if !url.starts_with("http://") {
+        return Err(PoolClientError::InsecureUrl(format!(
+            "'{url}' — URL must start with https:// (or http:// for localhost only)"
+        )));
+    }
+
+    // http:// — check if it's localhost
+    let after_scheme = &url["http://".len()..];
+    let host_with_port = after_scheme.split('/').next().unwrap_or("");
+
+    // Handle IPv6 bracket notation: [::1]:5050
+    let host_no_port = if host_with_port.starts_with('[') {
+        // Extract content up to ']'
+        host_with_port
+            .split(']')
+            .next()
+            .unwrap_or(host_with_port)
+            .strip_prefix('[')
+            .unwrap_or(host_with_port)
+    } else {
+        // Strip port after last ':'
+        host_with_port.split(':').next().unwrap_or(host_with_port)
+    };
+
+    let is_local = matches!(host_no_port, "localhost" | "127.0.0.1" | "::1");
+
+    if is_local {
+        return Ok(());
+    }
+
+    // Check explicit opt-out
+    if std::env::var("VM31_ALLOW_INSECURE_RPC").as_deref() == Ok("1") {
+        eprintln!("WARNING: C7 TLS check bypassed via VM31_ALLOW_INSECURE_RPC=1 for '{url}'");
+        return Ok(());
+    }
+
+    Err(PoolClientError::InsecureUrl(format!(
+        "'{url}' — http:// rejected for non-localhost RPC (pool state visible in cleartext). \
+         Use https://, or set VM31_ALLOW_INSECURE_RPC=1 to override."
+    )))
 }
 
 /// Configuration for pool client.
@@ -27,10 +89,22 @@ pub struct PoolClientConfig {
     pub rpc_url: String,
     pub pool_address: String,
     pub network: String,
+    /// C6: independent RPC URLs for cross-verifying Merkle roots.
+    ///
+    /// Events are fetched from `rpc_url` (primary), but the final root
+    /// is verified against these independent RPCs. If a malicious primary
+    /// RPC feeds fake events, the verification RPCs will reject the root.
+    pub verify_rpc_urls: Vec<String>,
 }
 
 impl PoolClientConfig {
     /// Build config from env vars or defaults.
+    ///
+    /// Reads `STARKNET_VERIFY_RPC` as a comma-separated list of independent
+    /// RPC URLs for cross-verification (C6).
+    ///
+    /// C7: Warns at construction if any URL uses plaintext HTTP for a non-local
+    /// host. Enforcement happens at call time (`starknet_call_at` / events).
     pub fn from_env(network: &str) -> Self {
         let rpc_url = std::env::var("STARKNET_RPC").unwrap_or_else(|_| match network {
             "mainnet" => "https://free-rpc.nethermind.io/mainnet-juno/".to_string(),
@@ -42,11 +116,28 @@ impl PoolClientConfig {
             }
             _ => String::new(),
         });
+        let verify_rpc_urls: Vec<String> = std::env::var("STARKNET_VERIFY_RPC")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        // C7: early warning (enforcement at call time)
+        if let Err(e) = validate_rpc_url(&rpc_url) {
+            eprintln!("WARNING: primary RPC URL will be rejected at call time: {e}");
+        }
+        for url in &verify_rpc_urls {
+            if let Err(e) = validate_rpc_url(url) {
+                eprintln!("WARNING: verify RPC URL will be rejected at call time: {e}");
+            }
+        }
 
         Self {
             rpc_url,
             pool_address,
             network: network.to_string(),
+            verify_rpc_urls,
         }
     }
 }
@@ -61,13 +152,33 @@ impl PoolClient {
         Self { config }
     }
 
-    /// Call a read-only function on the pool contract.
+    /// Call a read-only function on the pool contract via the primary RPC.
     #[cfg(feature = "audit-http")]
     fn starknet_call(
         &self,
         function: &str,
         calldata: &[&str],
     ) -> Result<Vec<String>, PoolClientError> {
+        Self::starknet_call_at(
+            &self.config.rpc_url,
+            &self.config.pool_address,
+            function,
+            calldata,
+        )
+    }
+
+    /// Call a read-only function on the pool contract via a specific RPC URL.
+    ///
+    /// C7: Rejects plaintext HTTP for non-localhost URLs.
+    #[cfg(feature = "audit-http")]
+    fn starknet_call_at(
+        rpc_url: &str,
+        contract_address: &str,
+        function: &str,
+        calldata: &[&str],
+    ) -> Result<Vec<String>, PoolClientError> {
+        validate_rpc_url(rpc_url)?;
+
         let calldata_json: Vec<serde_json::Value> = calldata
             .iter()
             .map(|s| serde_json::Value::String(s.to_string()))
@@ -78,7 +189,7 @@ impl PoolClient {
             "id": 1,
             "method": "starknet_call",
             "params": [{
-                "contract_address": self.config.pool_address,
+                "contract_address": contract_address,
                 "entry_point_selector": function_selector(function),
                 "calldata": calldata_json,
             }, "latest"]
@@ -87,7 +198,7 @@ impl PoolClient {
         let body_bytes = serde_json::to_vec(&body)
             .map_err(|e| PoolClientError::Parse(format!("serialize: {e}")))?;
 
-        let mut resp = ureq::post(&self.config.rpc_url)
+        let mut resp = ureq::post(rpc_url)
             .header("Content-Type", "application/json")
             .send(&body_bytes)
             .map_err(|e| PoolClientError::Rpc(format!("{e}")))?;
@@ -160,6 +271,105 @@ impl PoolClient {
         let hex = result[0].strip_prefix("0x").unwrap_or(&result[0]);
         Ok(u8::from_str_radix(hex, 16).unwrap_or(0))
     }
+
+    /// C6: Cross-verify a Merkle root against independent RPCs.
+    ///
+    /// Checks the primary RPC first, then queries each verification RPC.
+    /// Returns a `CrossVerifyResult` with details about which RPCs agreed.
+    ///
+    /// If no verification RPCs are configured, `verified` is false (primary-only).
+    /// If verification RPCs are configured but ALL are unreachable, returns error.
+    #[cfg(feature = "audit-http")]
+    pub fn cross_verify_root(
+        &self,
+        root: &[M31; RATE],
+    ) -> Result<CrossVerifyResult, PoolClientError> {
+        let primary_ok = self.is_known_root(root)?;
+
+        if self.config.verify_rpc_urls.is_empty() {
+            return Ok(CrossVerifyResult {
+                primary_confirmed: primary_ok,
+                cross_verified: false,
+                verify_total: 0,
+                verify_confirmed: 0,
+                verify_unreachable: 0,
+            });
+        }
+
+        let calldata: Vec<String> = root.iter().map(|m| format!("0x{:x}", m.0)).collect();
+        let calldata_refs: Vec<&str> = calldata.iter().map(|s| s.as_str()).collect();
+
+        let mut confirmed = 0u32;
+        let mut unreachable = 0u32;
+
+        for url in &self.config.verify_rpc_urls {
+            match Self::starknet_call_at(
+                url,
+                &self.config.pool_address,
+                "is_known_root",
+                &calldata_refs,
+            ) {
+                Ok(result) => {
+                    if !result.is_empty() && result[0] != "0x0" {
+                        confirmed += 1;
+                    }
+                }
+                Err(_) => {
+                    unreachable += 1;
+                }
+            }
+        }
+
+        let total = self.config.verify_rpc_urls.len() as u32;
+
+        // If ALL verify RPCs were unreachable, that's an error — we can't
+        // degrade to primary-only when verification was explicitly configured.
+        if unreachable == total {
+            return Err(PoolClientError::Rpc(format!(
+                "C6: all {} verification RPCs unreachable — cannot verify root",
+                total
+            )));
+        }
+
+        Ok(CrossVerifyResult {
+            primary_confirmed: primary_ok,
+            cross_verified: true,
+            verify_total: total,
+            verify_confirmed: confirmed,
+            verify_unreachable: unreachable,
+        })
+    }
+}
+
+/// Result of cross-RPC root verification (C6).
+#[derive(Debug, Clone)]
+pub struct CrossVerifyResult {
+    /// Primary RPC confirmed the root.
+    pub primary_confirmed: bool,
+    /// Whether cross-verification was performed (false = no verify RPCs configured).
+    pub cross_verified: bool,
+    /// Total number of verification RPCs queried.
+    pub verify_total: u32,
+    /// Number of verification RPCs that confirmed the root.
+    pub verify_confirmed: u32,
+    /// Number of verification RPCs that were unreachable.
+    pub verify_unreachable: u32,
+}
+
+impl CrossVerifyResult {
+    /// True if root is confirmed: primary says yes AND (no cross-verify, or at least one
+    /// independent RPC agrees).
+    pub fn is_confirmed(&self) -> bool {
+        if !self.primary_confirmed {
+            return false;
+        }
+        if !self.cross_verified {
+            return true; // no verify RPCs configured, primary-only
+        }
+        // Require majority of reachable verification RPCs to agree.
+        let reachable = self.verify_total - self.verify_unreachable;
+        reachable == 0 || self.verify_confirmed * 2 > reachable
+    }
 }
 
 // ─── Event Types ─────────────────────────────────────────────────────────
@@ -186,10 +396,13 @@ impl PoolClient {
     ///   data[0] = leaf_index
     ///   data[1] = commitment.lo (packed felt252)
     ///   data[2] = commitment.hi (packed felt252)
+    /// C7: Rejects plaintext HTTP for non-localhost URLs.
     pub fn get_note_inserted_events(
         &self,
         from_block: u64,
     ) -> Result<Vec<NoteEvent>, PoolClientError> {
+        validate_rpc_url(&self.config.rpc_url)?;
+
         let note_inserted_key = event_key("NoteInserted");
         let mut all_events = Vec::new();
         let mut continuation_token: Option<String> = None;
@@ -500,6 +713,163 @@ mod tests {
                 M31::from_u32_unchecked(vals[i]),
                 "mismatch at index {i}"
             );
+        }
+    }
+
+    // ─── C6 Cross-RPC Verification Tests ─────────────────────────────────
+
+    #[test]
+    fn test_c6_config_parses_verify_rpcs() {
+        // Default config with no env var should have empty verify list
+        let config = PoolClientConfig::from_env("sepolia");
+        // (STARKNET_VERIFY_RPC not set in test env)
+        // Just verify the field exists and is a Vec
+        assert!(config.verify_rpc_urls.len() <= 10); // sanity
+    }
+
+    #[test]
+    fn test_c6_config_manual_verify_rpcs() {
+        let config = PoolClientConfig {
+            rpc_url: "https://primary.example.com".to_string(),
+            pool_address: "0x123".to_string(),
+            network: "sepolia".to_string(),
+            verify_rpc_urls: vec![
+                "https://verify1.example.com".to_string(),
+                "https://verify2.example.com".to_string(),
+            ],
+        };
+        assert_eq!(config.verify_rpc_urls.len(), 2);
+        assert_eq!(config.verify_rpc_urls[0], "https://verify1.example.com");
+    }
+
+    #[test]
+    fn test_c6_cross_verify_result_primary_only() {
+        // No verify RPCs configured → primary-only
+        let cv = CrossVerifyResult {
+            primary_confirmed: true,
+            cross_verified: false,
+            verify_total: 0,
+            verify_confirmed: 0,
+            verify_unreachable: 0,
+        };
+        assert!(
+            cv.is_confirmed(),
+            "primary-only should confirm when primary says yes"
+        );
+
+        let cv_fail = CrossVerifyResult {
+            primary_confirmed: false,
+            cross_verified: false,
+            verify_total: 0,
+            verify_confirmed: 0,
+            verify_unreachable: 0,
+        };
+        assert!(
+            !cv_fail.is_confirmed(),
+            "primary-only should reject when primary says no"
+        );
+    }
+
+    #[test]
+    fn test_c6_cross_verify_result_with_verify_rpcs() {
+        // Primary + 2 verify RPCs, both confirm
+        let cv = CrossVerifyResult {
+            primary_confirmed: true,
+            cross_verified: true,
+            verify_total: 2,
+            verify_confirmed: 2,
+            verify_unreachable: 0,
+        };
+        assert!(cv.is_confirmed());
+
+        // Primary yes, but all verify RPCs reject → NOT confirmed
+        let cv_reject = CrossVerifyResult {
+            primary_confirmed: true,
+            cross_verified: true,
+            verify_total: 2,
+            verify_confirmed: 0,
+            verify_unreachable: 0,
+        };
+        assert!(
+            !cv_reject.is_confirmed(),
+            "C6: primary-only confirmation must be rejected when verify RPCs disagree"
+        );
+
+        // Primary yes, 1 of 2 confirm → confirmed (at least one)
+        let cv_partial = CrossVerifyResult {
+            primary_confirmed: true,
+            cross_verified: true,
+            verify_total: 2,
+            verify_confirmed: 1,
+            verify_unreachable: 1,
+        };
+        assert!(cv_partial.is_confirmed());
+    }
+
+    #[test]
+    fn test_c6_cross_verify_primary_no_overrides_verify() {
+        // Even if verify RPCs say yes, primary must also confirm
+        let cv = CrossVerifyResult {
+            primary_confirmed: false,
+            cross_verified: true,
+            verify_total: 2,
+            verify_confirmed: 2,
+            verify_unreachable: 0,
+        };
+        assert!(
+            !cv.is_confirmed(),
+            "C6: primary rejection must override verify confirmations"
+        );
+    }
+
+    // ─── C7 TLS Enforcement Tests ────────────────────────────────────────
+
+    #[test]
+    fn test_c7_https_accepted() {
+        assert!(validate_rpc_url("https://rpc.example.com").is_ok());
+        assert!(validate_rpc_url("https://rpc.example.com:443/v1").is_ok());
+        assert!(validate_rpc_url("https://free-rpc.nethermind.io/sepolia-juno/").is_ok());
+    }
+
+    #[test]
+    fn test_c7_http_remote_rejected() {
+        let result = validate_rpc_url("http://rpc.example.com");
+        assert!(
+            result.is_err(),
+            "C7: http:// to remote host must be rejected"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("insecure"),
+            "error should mention insecure: {err}"
+        );
+    }
+
+    #[test]
+    fn test_c7_http_localhost_accepted() {
+        assert!(validate_rpc_url("http://localhost:5050").is_ok());
+        assert!(validate_rpc_url("http://localhost/rpc").is_ok());
+        assert!(validate_rpc_url("http://127.0.0.1:5050").is_ok());
+        assert!(validate_rpc_url("http://127.0.0.1").is_ok());
+        assert!(validate_rpc_url("http://[::1]:5050").is_ok());
+    }
+
+    #[test]
+    fn test_c7_missing_scheme_rejected() {
+        let result = validate_rpc_url("rpc.example.com");
+        assert!(result.is_err(), "C7: URL without scheme must be rejected");
+    }
+
+    #[test]
+    fn test_c7_http_various_remote_hosts_rejected() {
+        // Various non-localhost hosts that should all be rejected
+        for url in &[
+            "http://10.0.0.1:8545",
+            "http://192.168.1.100:8545",
+            "http://my-node.internal:8545",
+            "http://rpc.starknet.io",
+        ] {
+            assert!(validate_rpc_url(url).is_err(), "C7: should reject {url}");
         }
     }
 }

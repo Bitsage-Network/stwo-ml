@@ -26,7 +26,7 @@ pub mod checkpoint;
 pub mod chunked;
 pub mod dual;
 pub mod graph;
-#[cfg(feature = "cli")]
+#[cfg(any(feature = "cli", feature = "model-loading"))]
 pub mod hf_loader;
 pub mod inspect;
 pub mod onnx;

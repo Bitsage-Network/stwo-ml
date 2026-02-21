@@ -131,6 +131,28 @@ impl LayeredCircuit {
             ));
         }
 
+        // Verify topological order is a valid permutation (detect cycle fallback)
+        {
+            let n = graph.nodes.len();
+            let mut seen = vec![false; n];
+            for &node_id in &topo_order {
+                if node_id >= n || seen[node_id] {
+                    return Err(GKRError::CompilationError(format!(
+                        "invalid topological order: duplicate or out-of-range node {}",
+                        node_id,
+                    )));
+                }
+                seen[node_id] = true;
+            }
+            if topo_order.len() != n {
+                return Err(GKRError::CompilationError(format!(
+                    "topological order covers {} of {} nodes (graph may contain a cycle)",
+                    topo_order.len(),
+                    n,
+                )));
+            }
+        }
+
         // Build node_id → layer_index mapping
         let mut node_to_layer: Vec<Option<usize>> = vec![None; graph.nodes.len()];
         let mut layers: Vec<CircuitLayer> = Vec::with_capacity(topo_order.len());
@@ -140,18 +162,26 @@ impl LayeredCircuit {
             let layer_idx = layers.len();
             node_to_layer[node_id] = Some(layer_idx);
 
-            // Map input node IDs to layer indices
-            let input_layers: Vec<usize> = node
-                .inputs
-                .iter()
-                .filter_map(|&inp_id| {
-                    if inp_id < node_to_layer.len() {
-                        node_to_layer[inp_id]
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+            // Map input node IDs to layer indices — strict validation
+            let input_layers: Vec<usize> =
+                node.inputs
+                    .iter()
+                    .map(|&inp_id| {
+                        if inp_id >= node_to_layer.len() {
+                            return Err(GKRError::CompilationError(format!(
+                            "node {} references non-existent input node {} (graph has {} nodes)",
+                            node_id, inp_id, node_to_layer.len(),
+                        )));
+                        }
+                        node_to_layer[inp_id].ok_or_else(|| {
+                            GKRError::CompilationError(format!(
+                                "node {} references node {} which has not been compiled yet \
+                             (cycle or invalid topological order)",
+                                node_id, inp_id,
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<usize>, GKRError>>()?;
 
             // Determine input shape from predecessors
             let input_shape = if input_layers.is_empty() {
@@ -570,5 +600,43 @@ mod tests {
             &LayerType::Add { size: 64 },
             &LayerType::Mul { size: 64 },
         ));
+    }
+
+    #[test]
+    fn test_invalid_input_reference_rejected() {
+        // Manually create a graph with a node referencing a non-existent input
+        let mut graph = ComputationGraph::new((1, 64));
+        graph.add_node(
+            GraphOp::MatMul { dims: (1, 64, 128) },
+            vec![999], // invalid input node
+            (1, 128),
+        );
+
+        let result = LayeredCircuit::from_graph(&graph);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("non-existent"),
+            "expected 'non-existent' in error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_valid_dag_compiles_ok() {
+        // Simple valid DAG: Linear → ReLU → Linear
+        let mut builder = GraphBuilder::new((1, 32));
+        builder.linear(64);
+        builder.activation(ActivationType::ReLU);
+        builder.linear(16);
+        let graph = builder.build();
+
+        let circuit = LayeredCircuit::from_graph(&graph).unwrap();
+        assert_eq!(circuit.depth(), 3);
+        // All input layers should be valid indices
+        for (i, layer) in circuit.layers.iter().enumerate() {
+            for &inp in &layer.input_layers {
+                assert!(inp < i, "input layer {inp} >= current layer {i}");
+            }
+        }
     }
 }

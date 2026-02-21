@@ -4,9 +4,33 @@
 //! Leaves: 8 M31 elements (note commitments).
 //! Internal nodes: Poseidon2 compress(left, right) → 8 M31 elements.
 
+use std::fmt;
+
 use stwo::core::fields::m31::BaseField as M31;
 
 use super::poseidon2_m31::{poseidon2_compress, RATE};
+
+/// Errors returned by Merkle tree operations.
+#[derive(Debug, Clone)]
+pub enum MerkleError {
+    /// Leaf index is out of range (not yet inserted).
+    IndexOutOfRange { index: usize, size: usize },
+}
+
+impl fmt::Display for MerkleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MerkleError::IndexOutOfRange { index, size } => {
+                write!(
+                    f,
+                    "Merkle index {index} out of range (tree has {size} leaves)"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for MerkleError {}
 
 /// Digest type: 8 M31 elements.
 pub type Digest = [M31; RATE];
@@ -105,8 +129,15 @@ impl PoseidonMerkleTreeM31 {
     }
 
     /// Generate a Merkle proof for the leaf at the given index.
-    pub fn prove(&self, index: usize) -> MerklePath {
-        assert!(index < self.next_index, "Index {index} not yet inserted");
+    ///
+    /// Returns `Err(MerkleError::IndexOutOfRange)` if the index has not been inserted.
+    pub fn prove(&self, index: usize) -> Result<MerklePath, MerkleError> {
+        if index >= self.next_index {
+            return Err(MerkleError::IndexOutOfRange {
+                index,
+                size: self.next_index,
+            });
+        }
 
         let mut siblings = Vec::with_capacity(self.depth);
         let mut current_idx = index;
@@ -122,7 +153,7 @@ impl PoseidonMerkleTreeM31 {
             current_idx /= 2;
         }
 
-        MerklePath { siblings, index }
+        Ok(MerklePath { siblings, index })
     }
 
     /// Number of leaves inserted.
@@ -137,7 +168,19 @@ impl PoseidonMerkleTreeM31 {
 }
 
 /// Verify a Merkle proof against a root.
-pub fn verify_merkle_proof(root: &Digest, leaf: &Digest, path: &MerklePath) -> bool {
+///
+/// `expected_depth` is the tree depth; the proof must have exactly that many siblings.
+/// Returns `false` if the path length doesn't match or the root doesn't verify.
+pub fn verify_merkle_proof(
+    root: &Digest,
+    leaf: &Digest,
+    path: &MerklePath,
+    expected_depth: usize,
+) -> bool {
+    if path.siblings.len() != expected_depth {
+        return false;
+    }
+
     let mut current = *leaf;
     let mut index = path.index;
 
@@ -193,8 +236,8 @@ mod tests {
         let leaf = make_leaf(42);
         tree.append(leaf);
 
-        let proof = tree.prove(0);
-        assert!(verify_merkle_proof(&tree.root(), &leaf, &proof));
+        let proof = tree.prove(0).unwrap();
+        assert!(verify_merkle_proof(&tree.root(), &leaf, &proof, 4));
     }
 
     #[test]
@@ -209,9 +252,9 @@ mod tests {
         // Verify proof for each leaf
         let root = tree.root();
         for (i, leaf) in leaves.iter().enumerate() {
-            let proof = tree.prove(i);
+            let proof = tree.prove(i).unwrap();
             assert!(
-                verify_merkle_proof(&root, leaf, &proof),
+                verify_merkle_proof(&root, leaf, &proof, 4),
                 "Proof failed for leaf {i}"
             );
         }
@@ -222,10 +265,10 @@ mod tests {
         let mut tree = PoseidonMerkleTreeM31::new(4);
         tree.append(make_leaf(42));
 
-        let proof = tree.prove(0);
+        let proof = tree.prove(0).unwrap();
         let wrong_leaf = make_leaf(99);
         assert!(
-            !verify_merkle_proof(&tree.root(), &wrong_leaf, &proof),
+            !verify_merkle_proof(&tree.root(), &wrong_leaf, &proof, 4),
             "Wrong leaf should fail verification"
         );
     }
@@ -235,10 +278,10 @@ mod tests {
         let mut tree = PoseidonMerkleTreeM31::new(4);
         tree.append(make_leaf(42));
 
-        let proof = tree.prove(0);
+        let proof = tree.prove(0).unwrap();
         let wrong_root = make_leaf(99);
         assert!(
-            !verify_merkle_proof(&wrong_root, &make_leaf(42), &proof),
+            !verify_merkle_proof(&wrong_root, &make_leaf(42), &proof, 4),
             "Wrong root should fail verification"
         );
     }
@@ -276,7 +319,7 @@ mod tests {
         let mut tree = PoseidonMerkleTreeM31::new(depth);
         tree.append(make_leaf(1));
 
-        let proof = tree.prove(0);
+        let proof = tree.prove(0).unwrap();
         assert_eq!(proof.siblings.len(), depth);
     }
 
@@ -294,8 +337,8 @@ mod tests {
         // Verify all proofs
         let root = tree.root();
         for i in 0..n {
-            let proof = tree.prove(i as usize);
-            assert!(verify_merkle_proof(&root, &make_leaf(i + 1), &proof));
+            let proof = tree.prove(i as usize).unwrap();
+            assert!(verify_merkle_proof(&root, &make_leaf(i + 1), &proof, 8));
         }
     }
 
@@ -331,24 +374,83 @@ mod tests {
         tree.append(make_leaf(2));
 
         let root_after_2 = tree.root();
-        let proof_1 = tree.prove(0);
+        let proof_1 = tree.prove(0).unwrap();
 
         // Add more leaves
         tree.append(make_leaf(3));
         tree.append(make_leaf(4));
 
         // Proof against old root should still be valid
-        assert!(verify_merkle_proof(&root_after_2, &make_leaf(1), &proof_1));
+        assert!(verify_merkle_proof(
+            &root_after_2,
+            &make_leaf(1),
+            &proof_1,
+            4,
+        ));
 
         // But proof against new root should fail (path changed)
-        assert!(!verify_merkle_proof(&tree.root(), &make_leaf(1), &proof_1));
+        assert!(!verify_merkle_proof(
+            &tree.root(),
+            &make_leaf(1),
+            &proof_1,
+            4
+        ));
 
         // Fresh proof against new root should work
-        let fresh_proof = tree.prove(0);
+        let fresh_proof = tree.prove(0).unwrap();
         assert!(verify_merkle_proof(
             &tree.root(),
             &make_leaf(1),
-            &fresh_proof
+            &fresh_proof,
+            4,
         ));
+    }
+
+    #[test]
+    fn test_prove_out_of_range_returns_error() {
+        let tree = PoseidonMerkleTreeM31::new(4);
+        assert!(tree.prove(0).is_err());
+
+        let mut tree2 = PoseidonMerkleTreeM31::new(4);
+        tree2.append(make_leaf(1));
+        assert!(tree2.prove(1).is_err());
+        assert!(tree2.prove(0).is_ok());
+    }
+
+    #[test]
+    fn test_verify_wrong_depth_fails() {
+        let mut tree = PoseidonMerkleTreeM31::new(4);
+        tree.append(make_leaf(42));
+        let proof = tree.prove(0).unwrap();
+
+        // Correct depth passes
+        assert!(verify_merkle_proof(&tree.root(), &make_leaf(42), &proof, 4));
+        // Wrong depths fail
+        assert!(!verify_merkle_proof(
+            &tree.root(),
+            &make_leaf(42),
+            &proof,
+            3
+        ));
+        assert!(!verify_merkle_proof(
+            &tree.root(),
+            &make_leaf(42),
+            &proof,
+            5
+        ));
+    }
+
+    #[test]
+    fn test_verify_empty_path_fails() {
+        let mut tree = PoseidonMerkleTreeM31::new(4);
+        let leaf = make_leaf(42);
+        tree.append(leaf);
+        let root = tree.root();
+
+        let empty_path = MerklePath {
+            siblings: Vec::new(),
+            index: 0,
+        };
+        assert!(!verify_merkle_proof(&root, &leaf, &empty_path, 4));
     }
 }

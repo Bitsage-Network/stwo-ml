@@ -123,6 +123,55 @@ pub fn derive_viewing_key(spending_key: &SpendingKey) -> [M31; 4] {
     [h[0], h[1], h[2], h[3]]
 }
 
+/// M31 modulus: p = 2^31 − 1. Both `M31(0)` and `M31(P)` are field-zero.
+const M31_MODULUS: u32 = 0x7FFFFFFF;
+
+/// Returns true if an M31 element is zero in the field (either canonical 0 or
+/// the non-canonical representation P = 0x7FFFFFFF).
+#[inline]
+fn is_field_zero(m: &M31) -> bool {
+    m.0 == 0 || m.0 == M31_MODULUS
+}
+
+/// Validate that a spending key is not all-zero in the M31 field.
+///
+/// A zero spending key `[0,0,0,0]` means anyone can compute nullifiers,
+/// making the note trivially spendable by any observer.
+///
+/// Checks both canonical zero (0) and non-canonical zero (0x7FFFFFFF ≡ 0 mod p).
+pub fn validate_spending_key(sk: &SpendingKey) -> Result<(), &'static str> {
+    if sk.iter().all(is_field_zero) {
+        return Err("zero spending key: anyone could compute nullifiers");
+    }
+    Ok(())
+}
+
+/// Minimum non-zero M31 elements required in a blinding factor.
+///
+/// Each non-zero M31 element contributes ~31 bits of hiding.  Two non-zero
+/// elements give ≥62 bits — the minimum for computational security in a
+/// privacy pool where notes are ephemeral.
+///
+/// With `getrandom`-sourced blinding the probability of fewer than 2
+/// non-zero elements is ~4/2^31 ≈ 2×10⁻⁹, so legitimate blinding always
+/// passes.
+const MIN_NONZERO_BLINDING: usize = 2;
+
+/// Validate that a blinding factor has sufficient entropy for hiding.
+///
+/// Requires at least [`MIN_NONZERO_BLINDING`] (2) non-zero M31 elements,
+/// giving ≥62 bits of hiding.  A single non-zero element (~31 bits) is
+/// brute-forceable on modern hardware and is rejected (H5).
+///
+/// Checks both canonical zero (0) and non-canonical zero (0x7FFFFFFF ≡ 0 mod p).
+pub fn validate_blinding(blinding: &[M31; 4]) -> Result<(), &'static str> {
+    let nonzero_count = blinding.iter().filter(|m| !is_field_zero(m)).count();
+    if nonzero_count < MIN_NONZERO_BLINDING {
+        return Err("blinding has < 2 non-zero elements: insufficient hiding (need >= 62 bits)");
+    }
+    Ok(())
+}
+
 /// Compute nullifier directly from a spending key and note commitment.
 pub fn compute_nullifier(spending_key: &SpendingKey, commitment: &NoteCommitment) -> Nullifier {
     let mut input = [M31::from_u32_unchecked(0); 12];
@@ -332,5 +381,114 @@ mod tests {
             blinding,
         );
         assert_ne!(note_lo.commitment(), note_hi.commitment());
+    }
+
+    #[test]
+    fn test_validate_zero_spending_key_rejected() {
+        let zero_sk = [0, 0, 0, 0].map(M31::from_u32_unchecked);
+        assert!(validate_spending_key(&zero_sk).is_err());
+    }
+
+    #[test]
+    fn test_validate_zero_blinding_rejected() {
+        let zero_blinding = [0, 0, 0, 0].map(M31::from_u32_unchecked);
+        assert!(validate_blinding(&zero_blinding).is_err());
+    }
+
+    #[test]
+    fn test_validate_partial_zero_spending_key_ok() {
+        // Spending key: 1 non-zero element is sufficient (key ownership, not hiding)
+        let partial_sk = [0, 0, 0, 1].map(M31::from_u32_unchecked);
+        assert!(validate_spending_key(&partial_sk).is_ok());
+    }
+
+    /// H5: single non-zero blinding element (~31 bits) is now rejected.
+    #[test]
+    fn test_h5_single_nonzero_blinding_rejected() {
+        let single = [0, 0, 0, 1].map(M31::from_u32_unchecked);
+        assert!(validate_blinding(&single).is_err());
+    }
+
+    #[test]
+    fn test_validate_normal_key_ok() {
+        let sk = test_key();
+        assert!(validate_spending_key(&sk).is_ok());
+        let blinding = [1, 2, 3, 4].map(M31::from_u32_unchecked);
+        assert!(validate_blinding(&blinding).is_ok());
+    }
+
+    // ── M7 regression: non-canonical zero (0x7FFFFFFF ≡ 0 mod p) ─────────
+
+    #[test]
+    fn test_validate_m7_noncanonical_zero_spending_key_rejected() {
+        // M31(0x7FFFFFFF) is semantically zero in the field: p ≡ 0 mod p
+        let p_sk = [0x7FFFFFFF; 4].map(M31::from_u32_unchecked);
+        assert!(validate_spending_key(&p_sk).is_err());
+    }
+
+    #[test]
+    fn test_validate_m7_noncanonical_zero_blinding_rejected() {
+        let p_blinding = [0x7FFFFFFF; 4].map(M31::from_u32_unchecked);
+        assert!(validate_blinding(&p_blinding).is_err());
+    }
+
+    #[test]
+    fn test_validate_m7_mixed_canonical_noncanonical_zero_rejected() {
+        // Mix of 0 and 0x7FFFFFFF — all are field-zero, should be rejected
+        let mixed_sk: SpendingKey = [
+            M31::from_u32_unchecked(0),
+            M31::from_u32_unchecked(0x7FFFFFFF),
+            M31::from_u32_unchecked(0),
+            M31::from_u32_unchecked(0x7FFFFFFF),
+        ];
+        assert!(validate_spending_key(&mixed_sk).is_err());
+    }
+
+    #[test]
+    fn test_validate_m7_partial_noncanonical_zero_ok() {
+        // One element is non-zero in the field → overall key is non-zero
+        let partial: SpendingKey = [
+            M31::from_u32_unchecked(0x7FFFFFFF),
+            M31::from_u32_unchecked(0x7FFFFFFF),
+            M31::from_u32_unchecked(0x7FFFFFFF),
+            M31::from_u32_unchecked(1),
+        ];
+        assert!(validate_spending_key(&partial).is_ok());
+    }
+
+    // ── H5 regression: blinding entropy minimum ─────────────────────────
+
+    /// H5: two non-zero elements (≥62 bits) passes.
+    #[test]
+    fn test_h5_two_nonzero_blinding_ok() {
+        let blinding = [0, 0, 42, 99].map(M31::from_u32_unchecked);
+        assert!(validate_blinding(&blinding).is_ok());
+    }
+
+    /// H5: all-zero blinding still rejected.
+    #[test]
+    fn test_h5_all_zero_blinding_rejected() {
+        let blinding = [0, 0, 0, 0].map(M31::from_u32_unchecked);
+        assert!(validate_blinding(&blinding).is_err());
+    }
+
+    /// H5: single non-zero with non-canonical zeros still rejected.
+    #[test]
+    fn test_h5_single_nonzero_with_noncanonical_zeros_rejected() {
+        // Three 0x7FFFFFFF (field zero) + one real non-zero = only 1 non-zero
+        let blinding: [M31; 4] = [
+            M31::from_u32_unchecked(0x7FFFFFFF),
+            M31::from_u32_unchecked(0x7FFFFFFF),
+            M31::from_u32_unchecked(0x7FFFFFFF),
+            M31::from_u32_unchecked(42),
+        ];
+        assert!(validate_blinding(&blinding).is_err());
+    }
+
+    /// H5: four non-zero elements (full ~124 bits) passes.
+    #[test]
+    fn test_h5_full_blinding_ok() {
+        let blinding = [10, 20, 30, 40].map(M31::from_u32_unchecked);
+        assert!(validate_blinding(&blinding).is_ok());
     }
 }

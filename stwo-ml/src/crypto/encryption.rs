@@ -14,6 +14,7 @@ use super::poseidon2_m31::{poseidon2_hash, poseidon2_permutation, RATE, STATE_WI
 /// Domain separation constants.
 const DOMAIN_ENCRYPT: M31 = M31::from_u32_unchecked(0x656E6372); // "encr"
 const DOMAIN_KDF: M31 = M31::from_u32_unchecked(0x6B646600); // "kdf\0"
+const DOMAIN_MAC: M31 = M31::from_u32_unchecked(0x6D616300); // "mac\0"
 
 /// Derive an encryption key from a shared secret.
 /// key = Poseidon2("kdf" || secret[0..n])[0..8]
@@ -55,9 +56,15 @@ fn keystream_block(key: &[M31; RATE], nonce: &[M31; 4], counter: u32) -> [M31; R
 /// Ciphertext = plaintext + keystream (addition in M31 field).
 /// Returns ciphertext of same length as plaintext.
 ///
-/// The `nonce` MUST be unique per encryption with the same key.
-/// It is not secret and should be transmitted alongside the ciphertext.
+/// Callers MUST use a unique nonce per encryption with the same key;
+/// use `getrandom` for random nonces. Nonce reuse breaks counter-mode security.
+///
+/// # Panics
+///
+/// Panics if `plaintext` is empty. All legitimate callers pass fixed-size payloads
+/// (e.g., `encrypt_note_memo` always passes 8 elements).
 pub fn poseidon2_encrypt(key: &[M31; RATE], nonce: &[M31; 4], plaintext: &[M31]) -> Vec<M31> {
+    assert!(!plaintext.is_empty(), "BUG: encrypting empty plaintext");
     let mut ciphertext = Vec::with_capacity(plaintext.len());
     let mut counter = 0u32;
 
@@ -93,10 +100,40 @@ pub fn poseidon2_decrypt(key: &[M31; RATE], nonce: &[M31; 4], ciphertext: &[M31]
     plaintext
 }
 
-/// Encrypt a note memo: (asset_id, amount_lo, amount_hi, blinding[0..4]) = 7 M31 elements.
-/// Returns: encrypted_memo (7 M31 elements) + checksum (1 M31 element) = 8 elements total.
+/// Compute a MAC (Message Authentication Code) over ciphertext using Poseidon2.
 ///
-/// The checksum allows recipients to detect valid decryption during scanning.
+/// MAC = Poseidon2(DOMAIN_MAC || key || nonce || ciphertext)[0..4]
+///
+/// This provides ciphertext integrity: any bit-flip in the ciphertext will
+/// cause MAC verification to fail (IND-CCA2 security via Encrypt-then-MAC).
+pub fn compute_mac(key: &[M31; RATE], nonce: &[M31; 4], ciphertext: &[M31]) -> [M31; 4] {
+    let mut input = Vec::with_capacity(1 + RATE + 4 + ciphertext.len());
+    input.push(DOMAIN_MAC);
+    input.extend_from_slice(key);
+    input.extend_from_slice(nonce);
+    input.extend_from_slice(ciphertext);
+    let hash = poseidon2_hash(&input);
+    [hash[0], hash[1], hash[2], hash[3]]
+}
+
+/// Verify a MAC tag against the expected value (constant-time comparison).
+fn verify_mac(expected: &[M31; 4], actual: &[M31; 4]) -> bool {
+    // Use XOR accumulation to avoid early-exit timing side-channels.
+    let mut diff = 0u32;
+    for i in 0..4 {
+        diff |= expected[i].0 ^ actual[i].0;
+    }
+    diff == 0
+}
+
+/// Encrypt a note memo with Encrypt-then-MAC authentication.
+///
+/// Payload: (asset_id, amount_lo, amount_hi, blinding[0..4]) = 7 M31 elements.
+/// Returns: encrypted payload (8 M31) + MAC tag (4 M31) = 12 elements total.
+///
+/// The MAC provides ciphertext integrity: any tampering is detected by
+/// `decrypt_note_memo` before decryption is returned.
+///
 /// The `nonce` MUST be unique per encryption with the same key.
 pub fn encrypt_note_memo(
     key: &[M31; RATE],
@@ -105,20 +142,7 @@ pub fn encrypt_note_memo(
     amount_lo: M31,
     amount_hi: M31,
     blinding: &[M31; 4],
-) -> [M31; RATE] {
-    // Compute checksum: hash of all fields (enables scan-time validation)
-    let checksum_input = [
-        asset_id,
-        amount_lo,
-        amount_hi,
-        blinding[0],
-        blinding[1],
-        blinding[2],
-        blinding[3],
-    ];
-    let checksum_hash = poseidon2_hash(&checksum_input);
-    let checksum = checksum_hash[0]; // First element as checksum
-
+) -> Vec<M31> {
     let plaintext = [
         asset_id,
         amount_lo,
@@ -127,46 +151,79 @@ pub fn encrypt_note_memo(
         blinding[1],
         blinding[2],
         blinding[3],
-        checksum,
     ];
 
-    let encrypted = poseidon2_encrypt(key, nonce, &plaintext);
-    let mut result = [M31::from_u32_unchecked(0); RATE];
-    result.copy_from_slice(&encrypted);
+    let ciphertext = poseidon2_encrypt(key, nonce, &plaintext);
+    let mac = compute_mac(key, nonce, &ciphertext);
+
+    let mut result = Vec::with_capacity(ciphertext.len() + 4);
+    result.extend_from_slice(&ciphertext);
+    result.extend_from_slice(&mac);
     result
 }
 
-/// Decrypt a note memo. Returns Some((asset_id, amount_lo, amount_hi, blinding)) if
-/// the checksum validates, None otherwise (wrong key).
+/// Decrypt a note memo with MAC verification (Encrypt-then-MAC).
 ///
-/// The `nonce` must match the one used during encryption.
+/// Verifies the MAC tag BEFORE decrypting. Returns `None` if:
+/// - MAC verification fails (ciphertext was tampered with)
+/// - Wrong key was used
+///
+/// Accepts both the new 11-element format (7 ciphertext + 4 MAC) and the
+/// legacy 8-element format (7 payload + 1 checksum, encrypted together) for
+/// backward compatibility with existing on-chain memos.
 pub fn decrypt_note_memo(
     key: &[M31; RATE],
     nonce: &[M31; 4],
-    encrypted_memo: &[M31; RATE],
+    encrypted_memo: &[M31],
 ) -> Option<(M31, M31, M31, [M31; 4])> {
-    let decrypted = poseidon2_decrypt(key, nonce, encrypted_memo);
+    if encrypted_memo.len() == 11 {
+        // New authenticated format: 7 ciphertext + 4 MAC
+        let ciphertext = &encrypted_memo[..7];
+        let mac_tag = [
+            encrypted_memo[7],
+            encrypted_memo[8],
+            encrypted_memo[9],
+            encrypted_memo[10],
+        ];
 
-    let asset_id = decrypted[0];
-    let amount_lo = decrypted[1];
-    let amount_hi = decrypted[2];
-    let blinding = [decrypted[3], decrypted[4], decrypted[5], decrypted[6]];
-    let checksum = decrypted[7];
+        // Verify MAC BEFORE decryption (Encrypt-then-MAC)
+        let expected_mac = compute_mac(key, nonce, ciphertext);
+        if !verify_mac(&expected_mac, &mac_tag) {
+            return None;
+        }
 
-    // Verify checksum
-    let checksum_input = [
-        asset_id,
-        amount_lo,
-        amount_hi,
-        blinding[0],
-        blinding[1],
-        blinding[2],
-        blinding[3],
-    ];
-    let expected_checksum = poseidon2_hash(&checksum_input)[0];
-
-    if checksum == expected_checksum {
+        let decrypted = poseidon2_decrypt(key, nonce, ciphertext);
+        let asset_id = decrypted[0];
+        let amount_lo = decrypted[1];
+        let amount_hi = decrypted[2];
+        let blinding = [decrypted[3], decrypted[4], decrypted[5], decrypted[6]];
         Some((asset_id, amount_lo, amount_hi, blinding))
+    } else if encrypted_memo.len() == RATE {
+        // Legacy format: 8 encrypted elements (7 payload + 1 checksum)
+        let decrypted = poseidon2_decrypt(key, nonce, encrypted_memo);
+
+        let asset_id = decrypted[0];
+        let amount_lo = decrypted[1];
+        let amount_hi = decrypted[2];
+        let blinding = [decrypted[3], decrypted[4], decrypted[5], decrypted[6]];
+        let checksum = decrypted[7];
+
+        let checksum_input = [
+            asset_id,
+            amount_lo,
+            amount_hi,
+            blinding[0],
+            blinding[1],
+            blinding[2],
+            blinding[3],
+        ];
+        let expected_checksum = poseidon2_hash(&checksum_input)[0];
+
+        if checksum == expected_checksum {
+            Some((asset_id, amount_lo, amount_hi, blinding))
+        } else {
+            None
+        }
     } else {
         None
     }
@@ -274,11 +331,11 @@ mod tests {
     }
 
     #[test]
-    fn test_encrypt_empty() {
+    #[should_panic(expected = "BUG: encrypting empty plaintext")]
+    fn test_encrypt_empty_panics() {
         let key = test_key();
         let nonce = test_nonce();
-        let ciphertext = poseidon2_encrypt(&key, &nonce, &[]);
-        assert!(ciphertext.is_empty());
+        let _ = poseidon2_encrypt(&key, &nonce, &[]);
     }
 
     #[test]
@@ -304,6 +361,11 @@ mod tests {
         let blinding = [1, 2, 3, 4].map(M31::from_u32_unchecked);
 
         let encrypted = encrypt_note_memo(&key, &nonce, asset_id, amount_lo, amount_hi, &blinding);
+        assert_eq!(
+            encrypted.len(),
+            11,
+            "C4: new format should be 7 ciphertext + 4 MAC"
+        );
         let decrypted = decrypt_note_memo(&key, &nonce, &encrypted);
 
         assert!(decrypted.is_some(), "Valid key should decrypt");
@@ -332,8 +394,103 @@ mod tests {
         let decrypted = decrypt_note_memo(&key2, &nonce, &encrypted);
         assert!(
             decrypted.is_none(),
-            "Wrong key should fail checksum validation"
+            "Wrong key should fail MAC verification"
         );
+    }
+
+    #[test]
+    fn test_c4_mac_detects_ciphertext_tampering() {
+        let key = test_key();
+        let nonce = test_nonce();
+
+        let mut encrypted = encrypt_note_memo(
+            &key,
+            &nonce,
+            M31::from_u32_unchecked(0),
+            M31::from_u32_unchecked(1000),
+            M31::from_u32_unchecked(0),
+            &[1, 2, 3, 4].map(M31::from_u32_unchecked),
+        );
+
+        // Flip a single ciphertext element
+        encrypted[0] = encrypted[0] + M31::from_u32_unchecked(1);
+
+        let decrypted = decrypt_note_memo(&key, &nonce, &encrypted);
+        assert!(
+            decrypted.is_none(),
+            "C4: tampered ciphertext must fail MAC verification"
+        );
+    }
+
+    #[test]
+    fn test_c4_mac_detects_mac_tampering() {
+        let key = test_key();
+        let nonce = test_nonce();
+
+        let mut encrypted = encrypt_note_memo(
+            &key,
+            &nonce,
+            M31::from_u32_unchecked(0),
+            M31::from_u32_unchecked(500),
+            M31::from_u32_unchecked(0),
+            &[5, 6, 7, 8].map(M31::from_u32_unchecked),
+        );
+
+        // Flip a MAC element (last 4 elements)
+        let mac_idx = encrypted.len() - 1;
+        encrypted[mac_idx] = encrypted[mac_idx] + M31::from_u32_unchecked(1);
+
+        let decrypted = decrypt_note_memo(&key, &nonce, &encrypted);
+        assert!(
+            decrypted.is_none(),
+            "C4: tampered MAC must fail verification"
+        );
+    }
+
+    #[test]
+    fn test_c4_legacy_8_element_format_still_decrypts() {
+        // Test backward compatibility with old 8-element format
+        let key = test_key();
+        let nonce = test_nonce();
+        let asset_id = M31::from_u32_unchecked(0);
+        let amount_lo = M31::from_u32_unchecked(1000);
+        let amount_hi = M31::from_u32_unchecked(0);
+        let blinding = [1, 2, 3, 4].map(M31::from_u32_unchecked);
+
+        // Manually construct legacy format (7 payload + 1 checksum, encrypted)
+        let checksum_input = [
+            asset_id,
+            amount_lo,
+            amount_hi,
+            blinding[0],
+            blinding[1],
+            blinding[2],
+            blinding[3],
+        ];
+        let checksum = poseidon2_hash(&checksum_input)[0];
+        let plaintext = [
+            asset_id,
+            amount_lo,
+            amount_hi,
+            blinding[0],
+            blinding[1],
+            blinding[2],
+            blinding[3],
+            checksum,
+        ];
+        let legacy_encrypted = poseidon2_encrypt(&key, &nonce, &plaintext);
+        let legacy_array: [M31; RATE] = legacy_encrypted.try_into().unwrap();
+
+        let decrypted = decrypt_note_memo(&key, &nonce, &legacy_array);
+        assert!(
+            decrypted.is_some(),
+            "C4: legacy 8-element format must still decrypt"
+        );
+        let (a, lo, hi, b) = decrypted.unwrap();
+        assert_eq!(a, asset_id);
+        assert_eq!(lo, amount_lo);
+        assert_eq!(hi, amount_hi);
+        assert_eq!(b, blinding);
     }
 
     #[test]

@@ -21,7 +21,7 @@ use crate::circuits::poseidon_circuit::{
 use crate::components::range_check::{prove_range_check, verify_range_check, RangeCheckProof};
 use crate::crypto::commitment::{Note, NoteCommitment, Nullifier, PublicKey, SpendingKey};
 use crate::crypto::merkle_m31::{Digest, MerklePath};
-use crate::crypto::poseidon2_m31::{poseidon2_permutation, RATE, STATE_WIDTH};
+use crate::crypto::poseidon2_m31::{poseidon2_permutation, DOMAIN_COMPRESS, RATE, STATE_WIDTH};
 use crate::crypto::poseidon_channel::PoseidonChannel;
 use crate::gadgets::range_check::RangeCheckConfig;
 
@@ -56,6 +56,8 @@ pub enum WithdrawError {
     PublicInputMismatch(String),
     #[error("cross-wiring verification failed: {0}")]
     CrossWiringFailed(String),
+    #[error("Merkle path length mismatch: expected {expected}, got {got}")]
+    MerklePathLengthMismatch { expected: usize, got: usize },
 }
 
 /// Witness for a withdraw transaction.
@@ -91,8 +93,11 @@ pub struct WithdrawPermRanges {
     pub merkle: (usize, usize),     // 20 perms
 }
 
-/// Execution trace for the withdraw circuit.
-#[derive(Clone, Debug)]
+/// Execution trace for the withdraw circuit (prover-private, NEVER share).
+///
+/// Contains full Poseidon2 permutation I/O including spending key and
+/// blinding factors. Zeroized on drop.
+#[derive(Clone)]
 pub struct WithdrawExecution {
     pub commitment: NoteCommitment,
     pub nullifier: Nullifier,
@@ -104,12 +109,39 @@ pub struct WithdrawExecution {
     pub range_check_limbs: Vec<M31>,
 }
 
-/// Complete withdraw proof.
+impl std::fmt::Debug for WithdrawExecution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WithdrawExecution")
+            .field("commitment", &self.commitment)
+            .field("nullifier", &self.nullifier)
+            .field("num_perms", &self.all_permutation_inputs.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for WithdrawExecution {
+    fn drop(&mut self) {
+        for perm in &mut self.all_permutation_inputs {
+            for v in perm.iter_mut() {
+                *v = M31::from_u32_unchecked(0);
+            }
+        }
+        for perm in &mut self.all_permutation_outputs {
+            for v in perm.iter_mut() {
+                *v = M31::from_u32_unchecked(0);
+            }
+        }
+    }
+}
+
+/// Complete withdraw proof. Does NOT contain the execution trace.
+///
+/// Safe to serialize, log, or transmit — contains only cryptographic
+/// commitments and public inputs, no witness secrets.
 #[derive(Debug)]
 pub struct WithdrawProof {
     pub poseidon_proof: Poseidon2BatchProof,
     pub range_check_proof: RangeCheckProof<Blake2sHash>,
-    pub execution: WithdrawExecution,
     pub public_inputs: WithdrawPublicInputs,
 }
 
@@ -117,6 +149,14 @@ pub struct WithdrawProof {
 pub fn execute_withdraw(
     witness: &WithdrawWitness,
 ) -> Result<(WithdrawExecution, WithdrawPublicInputs), WithdrawError> {
+    // Validate Merkle path length before doing any work
+    if witness.merkle_path.siblings.len() != MERKLE_DEPTH {
+        return Err(WithdrawError::MerklePathLengthMismatch {
+            expected: MERKLE_DEPTH,
+            got: witness.merkle_path.siblings.len(),
+        });
+    }
+
     let mut all_inputs: Vec<[M31; STATE_WIDTH]> = Vec::with_capacity(BATCH_SIZE);
     let mut all_outputs: Vec<[M31; STATE_WIDTH]> = Vec::with_capacity(BATCH_SIZE);
     let mut offset = 0;
@@ -230,7 +270,12 @@ pub fn execute_withdraw(
 }
 
 /// Prove a withdraw transaction.
-pub fn prove_withdraw(witness: &WithdrawWitness) -> Result<WithdrawProof, WithdrawError> {
+///
+/// Returns `(proof, execution)` separately. The `execution` contains witness
+/// secrets (spending key, blinding) and MUST NOT be shared — it is zeroized on drop.
+pub fn prove_withdraw(
+    witness: &WithdrawWitness,
+) -> Result<(WithdrawProof, WithdrawExecution), WithdrawError> {
     let (execution, public_inputs) = execute_withdraw(witness)?;
 
     // Prove Poseidon2 batch
@@ -242,17 +287,24 @@ pub fn prove_withdraw(witness: &WithdrawWitness) -> Result<WithdrawProof, Withdr
     let range_check_proof = prove_range_check(&execution.range_check_limbs, &config)
         .map_err(|e| WithdrawError::RangeCheckError(format!("{e}")))?;
 
-    Ok(WithdrawProof {
+    let proof = WithdrawProof {
         poseidon_proof,
         range_check_proof,
-        execution,
         public_inputs,
-    })
+    };
+    Ok((proof, execution))
 }
 
-/// Verify a withdraw proof.
-pub fn verify_withdraw(proof: &WithdrawProof) -> Result<(), WithdrawError> {
-    let exec = &proof.execution;
+/// Verify a withdraw proof against its execution trace.
+///
+/// The `execution` is the prover-private trace needed for cross-wiring checks.
+/// In production, only the STARK proof path (stark_withdraw.rs) should be used
+/// for third-party verification — it does not require the execution trace.
+pub fn verify_withdraw(
+    proof: &WithdrawProof,
+    execution: &WithdrawExecution,
+) -> Result<(), WithdrawError> {
+    let exec = execution;
     let pub_in = &proof.public_inputs;
 
     // 1. Verify Poseidon2 batch proof
@@ -344,10 +396,19 @@ pub fn verify_withdraw(proof: &WithdrawProof) -> Result<(), WithdrawError> {
     }
 
     // P5: Merkle leaf = commitment
+    // Note: after C5 domain separation, state[RATE+1] in compress inputs
+    // has DOMAIN_COMPRESS added, so the right-child check must account for it.
     let merkle_start = exec.perm_ranges.merkle.0;
     let merkle_input = &exec.all_permutation_inputs[merkle_start];
     let left_matches = (0..RATE).all(|j| merkle_input[j] == actual_commitment_out[j]);
-    let right_matches = (0..RATE).all(|j| merkle_input[RATE + j] == actual_commitment_out[j]);
+    let right_matches = (0..RATE).all(|j| {
+        let expected = if j == 1 {
+            actual_commitment_out[j] + DOMAIN_COMPRESS
+        } else {
+            actual_commitment_out[j]
+        };
+        merkle_input[RATE + j] == expected
+    });
     if !left_matches && !right_matches {
         return Err(WithdrawError::CrossWiringFailed(
             "P5: commitment not found in Merkle leaf compress input (neither left nor right half)"
@@ -510,7 +571,7 @@ mod tests {
         let mut tree = PoseidonMerkleTreeM31::new(MERKLE_DEPTH);
         tree.append(commitment);
 
-        let merkle_path = tree.prove(0);
+        let merkle_path = tree.prove(0).unwrap();
         let merkle_root = tree.root();
 
         WithdrawWitness {
@@ -525,8 +586,8 @@ mod tests {
     #[test]
     fn test_withdraw_prove_verify_basic() {
         let witness = make_withdraw_witness(1000);
-        let proof = prove_withdraw(&witness).expect("prove should succeed");
-        verify_withdraw(&proof).expect("verify should succeed");
+        let (proof, exec) = prove_withdraw(&witness).expect("prove should succeed");
+        verify_withdraw(&proof, &exec).expect("verify should succeed");
     }
 
     #[test]
@@ -589,10 +650,9 @@ mod tests {
         let proof = WithdrawProof {
             poseidon_proof,
             range_check_proof,
-            execution: exec,
             public_inputs: pub_in,
         };
-        verify_withdraw(&proof)
+        verify_withdraw(&proof, &exec)
     }
 
     /// Tamper a permutation input at `perm_idx`, position `pos`, and recompute its output.
@@ -723,6 +783,22 @@ mod tests {
                 assert!(msg.contains("P5"), "expected P5 error, got: {msg}");
             }
             e => panic!("expected CrossWiringFailed, got: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_withdraw_wrong_path_length_rejected() {
+        let mut witness = make_withdraw_witness(1000);
+        // Truncate the Merkle path to 10 siblings (should be 20)
+        witness.merkle_path.siblings.truncate(10);
+        let result = prove_withdraw(&witness);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            WithdrawError::MerklePathLengthMismatch {
+                expected: 20,
+                got: 10,
+            } => {}
+            e => panic!("expected MerklePathLengthMismatch, got: {e}"),
         }
     }
 

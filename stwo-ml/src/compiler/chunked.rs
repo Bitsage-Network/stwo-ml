@@ -77,6 +77,7 @@ pub fn prove_model_chunked(
 
     // Find block boundaries
     let blocks = graph.find_block_boundaries();
+    validate_block_ranges(&blocks, graph.nodes.len())?;
     let num_chunks = blocks.len();
 
     info!(num_chunks, memory_budget, "Starting chunked proving");
@@ -187,6 +188,7 @@ pub fn prove_model_chunked_parallel(
     }
 
     let blocks = graph.find_block_boundaries();
+    validate_block_ranges(&blocks, graph.nodes.len())?;
     let num_chunks = blocks.len();
 
     info!(
@@ -202,24 +204,32 @@ pub fn prove_model_chunked_parallel(
     for block_range in &blocks {
         chunk_inputs.push(current_input.clone());
 
-        // Run forward pass for this chunk to get its output
+        // Run forward pass only (no proving) to get this chunk's output
         let sub_graph = graph.subgraph(block_range.start..block_range.end);
         let sub_weights = weights.subset(block_range.start..block_range.end);
 
-        let forward_result =
-            crate::compiler::prove::prove_model(&sub_graph, &current_input, &sub_weights).map_err(
-                |e| ChunkedProvingError::ChunkFailed {
+        current_input =
+            crate::compiler::prove::forward_pass_only(&sub_graph, &current_input, &sub_weights)
+                .map_err(|e| ChunkedProvingError::ChunkFailed {
                     chunk: 0,
                     message: format!("Forward pass failed: {e}"),
-                },
-            )?;
-
-        current_input = forward_result.1.output;
+                })?;
     }
 
     info!("Forward pass complete, starting parallel proving");
 
     // Phase 2: Prove all chunks in parallel.
+    // Pre-compute subgraphs and weight subsets before spawning workers
+    // to avoid redundant clones inside parallel threads.
+    let chunk_graphs: Vec<_> = blocks
+        .iter()
+        .map(|r| graph.subgraph(r.start..r.end))
+        .collect();
+    let chunk_weights: Vec<_> = blocks
+        .iter()
+        .map(|r| weights.subset(r.start..r.end))
+        .collect();
+
     // Capture parent thread's GPU device affinity for propagation to rayon workers.
     #[cfg(feature = "multi-gpu")]
     let _mgpu_device_id = crate::multi_gpu::get_thread_device();
@@ -236,13 +246,10 @@ pub fn prove_model_chunked_parallel(
             let end = block_range.end;
             let chunk_input = &chunk_inputs[chunk_idx];
 
-            let sub_graph = graph.subgraph(start..end);
-            let sub_weights = weights.subset(start..end);
-
             let proof = crate::aggregation::prove_model_aggregated_onchain(
-                &sub_graph,
+                &chunk_graphs[chunk_idx],
                 chunk_input,
-                &sub_weights,
+                &chunk_weights[chunk_idx],
             )
             .map_err(|e| ChunkedProvingError::ChunkFailed {
                 chunk: chunk_idx,
@@ -288,6 +295,7 @@ pub fn prove_model_chunked_auto(
     std::fs::create_dir_all(checkpoint_dir).map_err(ChunkedProvingError::CheckpointError)?;
 
     let blocks = graph.find_block_boundaries();
+    validate_block_ranges(&blocks, graph.nodes.len())?;
     let num_chunks = blocks.len();
 
     info!(
@@ -370,6 +378,7 @@ pub fn prove_model_chunked_parallel_auto(
     }
 
     let blocks = graph.find_block_boundaries();
+    validate_block_ranges(&blocks, graph.nodes.len())?;
     let num_chunks = blocks.len();
 
     info!(
@@ -387,20 +396,28 @@ pub fn prove_model_chunked_parallel_auto(
         let sub_graph = graph.subgraph(block_range.start..block_range.end);
         let sub_weights = weights.subset(block_range.start..block_range.end);
 
-        let forward_result =
-            crate::compiler::prove::prove_model(&sub_graph, &current_input, &sub_weights).map_err(
-                |e| ChunkedProvingError::ChunkFailed {
+        current_input =
+            crate::compiler::prove::forward_pass_only(&sub_graph, &current_input, &sub_weights)
+                .map_err(|e| ChunkedProvingError::ChunkFailed {
                     chunk: 0,
                     message: format!("Forward pass failed: {e}"),
-                },
-            )?;
-
-        current_input = forward_result.1.output;
+                })?;
     }
 
     info!("Forward pass complete, starting parallel proving (auto backend)");
 
     // Phase 2: Prove all chunks in parallel using auto backend dispatch.
+    // Pre-compute subgraphs and weight subsets before spawning workers
+    // to avoid redundant clones inside parallel threads.
+    let chunk_graphs: Vec<_> = blocks
+        .iter()
+        .map(|r| graph.subgraph(r.start..r.end))
+        .collect();
+    let chunk_weights: Vec<_> = blocks
+        .iter()
+        .map(|r| weights.subset(r.start..r.end))
+        .collect();
+
     // Capture parent thread's GPU device affinity for propagation to rayon workers.
     #[cfg(feature = "multi-gpu")]
     let _mgpu_device_id = crate::multi_gpu::get_thread_device();
@@ -417,13 +434,10 @@ pub fn prove_model_chunked_parallel_auto(
             let end = block_range.end;
             let chunk_input = &chunk_inputs[chunk_idx];
 
-            let sub_graph = graph.subgraph(start..end);
-            let sub_weights = weights.subset(start..end);
-
             let proof = crate::aggregation::prove_model_aggregated_onchain_auto(
-                &sub_graph,
+                &chunk_graphs[chunk_idx],
                 chunk_input,
-                &sub_weights,
+                &chunk_weights[chunk_idx],
             )
             .map_err(|e| ChunkedProvingError::ChunkFailed {
                 chunk: chunk_idx,
@@ -474,6 +488,131 @@ pub fn collect_chunk_proofs(
     }
 
     (all_matmul, all_claims)
+}
+
+/// Validate that chunk ranges are sorted, contiguous, non-overlapping, and cover `[0, graph_size)`.
+///
+/// This is strictly stronger than just checking total node count: it also rejects
+/// gaps, overlaps, out-of-order chunks, and empty/inverted ranges.
+fn validate_chunk_ranges(
+    chunks: &[ChunkProofResult],
+    graph_size: usize,
+) -> Result<(), ChunkedProvingError> {
+    if chunks.is_empty() {
+        return Err(ChunkedProvingError::EmptyGraph);
+    }
+
+    // Verify sorted by chunk_index
+    for w in chunks.windows(2) {
+        if w[0].chunk_index >= w[1].chunk_index {
+            return Err(ChunkedProvingError::ChunkFailed {
+                chunk: w[1].chunk_index,
+                message: format!(
+                    "chunks not sorted: chunk {} appears after chunk {}",
+                    w[1].chunk_index, w[0].chunk_index,
+                ),
+            });
+        }
+    }
+
+    // Verify each range is valid (start < end)
+    for chunk in chunks {
+        if chunk.node_range.start >= chunk.node_range.end {
+            return Err(ChunkedProvingError::ChunkFailed {
+                chunk: chunk.chunk_index,
+                message: format!(
+                    "empty or inverted range: {}..{}",
+                    chunk.node_range.start, chunk.node_range.end,
+                ),
+            });
+        }
+    }
+
+    // Verify first chunk starts at 0
+    if chunks[0].node_range.start != 0 {
+        return Err(ChunkedProvingError::ChunkFailed {
+            chunk: 0,
+            message: format!(
+                "first chunk starts at {} instead of 0",
+                chunks[0].node_range.start,
+            ),
+        });
+    }
+
+    // Verify contiguous, non-overlapping
+    for w in chunks.windows(2) {
+        if w[0].node_range.end != w[1].node_range.start {
+            return Err(ChunkedProvingError::ChunkFailed {
+                chunk: w[1].chunk_index,
+                message: format!(
+                    "gap or overlap: chunk {} ends at {}, chunk {} starts at {}",
+                    w[0].chunk_index, w[0].node_range.end, w[1].chunk_index, w[1].node_range.start,
+                ),
+            });
+        }
+    }
+
+    // Verify last chunk ends at graph_size
+    let last = chunks.last().unwrap();
+    if last.node_range.end != graph_size {
+        return Err(ChunkedProvingError::ChunkFailed {
+            chunk: last.chunk_index,
+            message: format!(
+                "last chunk ends at {} but graph has {} nodes",
+                last.node_range.end, graph_size,
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+/// Validate block ranges from `find_block_boundaries`: non-empty, non-inverted, contiguous,
+/// covering `[0, graph_size)`. Called at proving entry points to catch malformed partitions
+/// before they silently corrupt proofs.
+fn validate_block_ranges(
+    blocks: &[std::ops::Range<usize>],
+    graph_size: usize,
+) -> Result<(), ChunkedProvingError> {
+    if blocks.is_empty() {
+        return Err(ChunkedProvingError::EmptyGraph);
+    }
+    for (i, r) in blocks.iter().enumerate() {
+        if r.start >= r.end {
+            return Err(ChunkedProvingError::ChunkFailed {
+                chunk: i,
+                message: format!("empty or inverted block range: {}..{}", r.start, r.end),
+            });
+        }
+    }
+    if blocks[0].start != 0 {
+        return Err(ChunkedProvingError::ChunkFailed {
+            chunk: 0,
+            message: format!("first block starts at {} instead of 0", blocks[0].start),
+        });
+    }
+    for w in blocks.windows(2) {
+        if w[0].end != w[1].start {
+            return Err(ChunkedProvingError::ChunkFailed {
+                chunk: 0,
+                message: format!(
+                    "gap or overlap: block ends at {}, next starts at {}",
+                    w[0].end, w[1].start,
+                ),
+            });
+        }
+    }
+    let last = blocks.last().unwrap();
+    if last.end != graph_size {
+        return Err(ChunkedProvingError::ChunkFailed {
+            chunk: blocks.len() - 1,
+            message: format!(
+                "last block ends at {} but graph has {} nodes",
+                last.end, graph_size,
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Compose independently-proven chunk proofs into a single [`AggregatedModelProofOnChain`].
@@ -558,22 +697,9 @@ where
     };
     use crate::compiler::prove::GraphExecution;
 
-    if chunks.is_empty() {
-        return Err(ChunkedProvingError::EmptyGraph);
-    }
-
-    // Validate total node count matches the graph
-    let total_chunk_nodes: usize = chunks.iter().map(|c| c.node_range.len()).sum();
-    if total_chunk_nodes != graph.nodes.len() {
-        return Err(ChunkedProvingError::ChunkFailed {
-            chunk: 0,
-            message: format!(
-                "Total chunk nodes ({}) != graph nodes ({})",
-                total_chunk_nodes,
-                graph.nodes.len()
-            ),
-        });
-    }
+    // Validate chunk ranges: sorted, contiguous, non-overlapping, covering [0, graph_size).
+    // This is strictly stronger than the old total-count check.
+    validate_chunk_ranges(chunks, graph.nodes.len())?;
 
     info!(
         num_chunks = chunks.len(),
@@ -744,6 +870,7 @@ pub fn prove_model_chunked_streaming(
     }
 
     let blocks = graph.find_block_boundaries();
+    validate_block_ranges(&blocks, graph.nodes.len())?;
     let num_chunks = blocks.len();
 
     info!(
@@ -767,15 +894,12 @@ pub fn prove_model_chunked_streaming(
                 message: format!("Weight loading failed: {e}"),
             })?;
 
-        let forward_result =
-            crate::compiler::prove::prove_model(&sub_graph, &current_input, &sub_weights).map_err(
-                |e| ChunkedProvingError::ChunkFailed {
+        current_input =
+            crate::compiler::prove::forward_pass_only(&sub_graph, &current_input, &sub_weights)
+                .map_err(|e| ChunkedProvingError::ChunkFailed {
                     chunk: i,
                     message: format!("Forward pass failed: {e}"),
-                },
-            )?;
-
-        current_input = forward_result.1.output;
+                })?;
         drop(sub_weights); // free this chunk's weights
 
         // Prefetch next chunk's tensors while we still have time
@@ -884,6 +1008,7 @@ pub fn prove_model_chunked_streaming_tiled(
     }
 
     let blocks = graph.find_block_boundaries();
+    validate_block_ranges(&blocks, graph.nodes.len())?;
     let num_chunks = blocks.len();
 
     info!(
@@ -1077,6 +1202,7 @@ pub fn prove_model_chunked_multi_gpu_with_metrics(
     }
 
     let blocks = graph.find_block_boundaries();
+    validate_block_ranges(&blocks, graph.nodes.len())?;
     let num_chunks = blocks.len();
 
     info!(
@@ -1094,15 +1220,12 @@ pub fn prove_model_chunked_multi_gpu_with_metrics(
         let sub_graph = graph.subgraph(block_range.start..block_range.end);
         let sub_weights = weights.subset(block_range.start..block_range.end);
 
-        let forward_result =
-            crate::compiler::prove::prove_model(&sub_graph, &current_input, &sub_weights).map_err(
-                |e| ChunkedProvingError::ChunkFailed {
+        current_input =
+            crate::compiler::prove::forward_pass_only(&sub_graph, &current_input, &sub_weights)
+                .map_err(|e| ChunkedProvingError::ChunkFailed {
                     chunk: 0,
                     message: format!("Forward pass failed: {e}"),
-                },
-            )?;
-
-        current_input = forward_result.1.output;
+                })?;
     }
 
     info!("Forward pass complete, building multi-GPU partition");

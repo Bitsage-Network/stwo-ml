@@ -48,6 +48,7 @@ use stwo_constraint_framework::{FrameworkComponent, LogupTraceGenerator, TraceLo
 use num_traits::One;
 #[cfg(feature = "cuda-runtime")]
 use num_traits::Zero;
+use rayon::prelude::*;
 use starknet_ff::FieldElement;
 use std::collections::HashMap;
 
@@ -1042,7 +1043,14 @@ where
         }
     }
 
-    // Prove attention layers (separate from unified STARK)
+    // Prove attention layers (separate from unified STARK).
+    //
+    // NOTE: Attention weights (W_Q, W_K, W_V, W_O) do NOT need Poseidon Merkle
+    // commitments like MatMul weights because the verification path is different:
+    // - MatMul: verifier uses MLE openings against committed weights (no forward pass)
+    // - Attention: verifier re-runs attention_forward() with real weights and compares
+    //   output against the proof. Wrong weights → output mismatch → layer_chain_commitment
+    //   check fails. Weights are bound transitively via layer_chain_commitment.
     let mut attention_proofs = Vec::new();
     for layer in &attention_layers {
         let proof =
@@ -1108,14 +1116,15 @@ where
     }
     // ── end proof-stream ───────────────────────────────────────────────────────
 
-    // Compute layer chain commitment before consuming `intermediates`.
-    let layer_chain_commitment = compute_layer_chain_commitment(input, &intermediates, &current);
-    // Compute IO commitment binding this proof to specific input/output.
-    let io_commitment = compute_io_commitment(input, &current);
+    // Compute commitments in parallel (layer chain and IO are independent).
+    let (layer_chain_commitment, io_commitment) = rayon::join(
+        || compute_layer_chain_commitment(input, &intermediates, &current),
+        || compute_io_commitment(input, &current),
+    );
 
-    // Compute per-LayerNorm mean/variance commitments (defense-in-depth).
+    // Compute per-LayerNorm mean/variance commitments in parallel.
     let layernorm_mean_var_commitments: Vec<FieldElement> = layernorm_layers
-        .iter()
+        .par_iter()
         .map(|layer| compute_layernorm_mean_var_commitment(&layer.means, &layer.variances))
         .collect();
 
@@ -3202,14 +3211,15 @@ where
         attention_proofs.push((layer.node_id, proof));
     }
 
-    // Compute layer chain commitment before consuming `intermediates`.
-    let layer_chain_commitment = compute_layer_chain_commitment(input, &intermediates, &current);
-    // Compute IO commitment binding this proof to specific input/output.
-    let io_commitment = compute_io_commitment(input, &current);
+    // Compute commitments in parallel (layer chain and IO are independent).
+    let (layer_chain_commitment, io_commitment) = rayon::join(
+        || compute_layer_chain_commitment(input, &intermediates, &current),
+        || compute_io_commitment(input, &current),
+    );
 
-    // Compute per-LayerNorm mean/variance commitments (defense-in-depth).
+    // Compute per-LayerNorm mean/variance commitments in parallel.
     let layernorm_mean_var_commitments: Vec<FieldElement> = layernorm_layers
-        .iter()
+        .par_iter()
         .map(|layer| compute_layernorm_mean_var_commitment(&layer.means, &layer.variances))
         .collect();
 
@@ -4448,7 +4458,7 @@ where
 
     // Step 3: Convert execution trace for GKR (prove::GraphExecution → graph::GraphExecution)
     let gkr_execution = crate::compiler::graph::GraphExecution {
-        intermediates: proof.execution.intermediates.clone(),
+        intermediates: proof.execution.intermediates.iter().cloned().collect(),
         node_outputs: std::collections::HashMap::new(),
         output: proof.execution.output.clone(),
     };
@@ -4976,7 +4986,7 @@ where
         .map_err(|e| AggregationError::ProvingError(format!("GKR circuit compilation: {e}")))?;
 
     let gkr_execution = crate::compiler::graph::GraphExecution {
-        intermediates: intermediates.clone(),
+        intermediates: intermediates.iter().cloned().collect(),
         node_outputs: node_outputs.clone(),
         output: current.clone(),
     };
@@ -5034,11 +5044,13 @@ where
         attention_proofs.push((layer.node_id, proof));
     }
 
-    // Commitments
-    let layer_chain_commitment = compute_layer_chain_commitment(input, &intermediates, &current);
-    let io_commitment = compute_io_commitment(input, &current);
+    // Compute commitments in parallel (layer chain and IO are independent).
+    let (layer_chain_commitment, io_commitment) = rayon::join(
+        || compute_layer_chain_commitment(input, &intermediates, &current),
+        || compute_io_commitment(input, &current),
+    );
     let layernorm_mean_var_commitments: Vec<FieldElement> = layernorm_layers
-        .iter()
+        .par_iter()
         .map(|layer| compute_layernorm_mean_var_commitment(&layer.means, &layer.variances))
         .collect();
 
@@ -5205,11 +5217,12 @@ where
             let is_constraint_sanity = format!("{err}").contains("ConstraintsNotSatisfied");
 
             if is_gpu_backend && is_constraint_sanity && !gpu_only && !no_fallback {
-                eprintln!(
-                    "  [Unified STARK] GPU path hit ConstraintsNotSatisfied; retrying SIMD fallback for correctness."
+                tracing::warn!(
+                    error = %err,
+                    "Unified STARK GPU path hit ConstraintsNotSatisfied; retrying SIMD fallback"
                 );
-                eprintln!(
-                    "  [Unified STARK] Set STWO_GPU_ONLY=1 or STWO_UNIFIED_STARK_NO_FALLBACK=1 to fail closed instead."
+                tracing::warn!(
+                    "Set STWO_GPU_ONLY=1 or STWO_UNIFIED_STARK_NO_FALLBACK=1 to fail closed instead"
                 );
                 build_unified_stark::<SimdBackend>(
                     &activation_layers,
@@ -7130,14 +7143,19 @@ pub fn verify_aggregated_model_proof(
     }
 
     // 1d. Verify LayerNorm mean/variance commitments
+    if ln_verify_data.len() != proof.layernorm_mean_var_commitments.len() {
+        return Err(AggregationError::VerificationFailed(format!(
+            "LayerNorm commitment count mismatch: graph has {}, proof has {}",
+            ln_verify_data.len(),
+            proof.layernorm_mean_var_commitments.len(),
+        )));
+    }
     for (idx, (node_id, means, variances)) in ln_verify_data.iter().enumerate() {
-        if idx < proof.layernorm_mean_var_commitments.len() {
-            let expected = compute_layernorm_mean_var_commitment(means, variances);
-            if expected != proof.layernorm_mean_var_commitments[idx] {
-                return Err(AggregationError::VerificationFailed(format!(
-                    "LayerNorm mean/var commitment mismatch at node {node_id}"
-                )));
-            }
+        let expected = compute_layernorm_mean_var_commitment(means, variances);
+        if expected != proof.layernorm_mean_var_commitments[idx] {
+            return Err(AggregationError::VerificationFailed(format!(
+                "LayerNorm mean/var commitment mismatch at node {node_id}"
+            )));
         }
     }
 
@@ -7448,14 +7466,19 @@ pub fn verify_aggregated_model_proof_onchain(
     }
 
     // 1d. Verify LayerNorm mean/variance commitments
+    if ln_verify_data.len() != proof.layernorm_mean_var_commitments.len() {
+        return Err(AggregationError::VerificationFailed(format!(
+            "LayerNorm commitment count mismatch: graph has {}, proof has {}",
+            ln_verify_data.len(),
+            proof.layernorm_mean_var_commitments.len(),
+        )));
+    }
     for (idx, (node_id, means, variances)) in ln_verify_data.iter().enumerate() {
-        if idx < proof.layernorm_mean_var_commitments.len() {
-            let expected = compute_layernorm_mean_var_commitment(means, variances);
-            if expected != proof.layernorm_mean_var_commitments[idx] {
-                return Err(AggregationError::VerificationFailed(format!(
-                    "LayerNorm mean/var commitment mismatch at node {node_id}"
-                )));
-            }
+        let expected = compute_layernorm_mean_var_commitment(means, variances);
+        if expected != proof.layernorm_mean_var_commitments[idx] {
+            return Err(AggregationError::VerificationFailed(format!(
+                "LayerNorm mean/var commitment mismatch at node {node_id}"
+            )));
         }
     }
 
@@ -8027,7 +8050,19 @@ fn verify_unified_stark_blake2s(
                 Some(GraphOp::Activation {
                     activation_type, ..
                 }) => activation_type.type_tag(),
-                _ => 0, // fallback for malformed proofs (will fail LogUp anyway)
+                Some(other_op) => {
+                    return Err(AggregationError::VerificationFailed(format!(
+                        "activation claim at layer {} references non-activation op: {:?}",
+                        claim.layer_index, other_op,
+                    )));
+                }
+                None => {
+                    return Err(AggregationError::VerificationFailed(format!(
+                        "activation claim at layer {} is out of bounds (graph has {} nodes)",
+                        claim.layer_index,
+                        graph.nodes.len(),
+                    )));
+                }
             };
             let component = FrameworkComponent::new(
                 &mut allocator,
