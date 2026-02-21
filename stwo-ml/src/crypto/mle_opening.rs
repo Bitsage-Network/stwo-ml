@@ -48,11 +48,6 @@ static GPU_MLE_OPENING_TREE_BACKEND_LOGGED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "cuda-runtime")]
 static GPU_MLE_OPENING_TREE_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "cuda-runtime")]
-static GPU_MLE_COMMITMENT_BACKEND_LOGGED: AtomicBool = AtomicBool::new(false);
-#[cfg(feature = "cuda-runtime")]
-static GPU_MLE_COMMITMENT_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
-
-#[cfg(feature = "cuda-runtime")]
 #[derive(Debug, Clone)]
 enum MleLayerValues {
     Secure(Vec<SecureField>),
