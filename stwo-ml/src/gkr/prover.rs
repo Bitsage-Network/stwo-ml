@@ -18,7 +18,6 @@ use crate::components::attention::{
 };
 #[cfg(feature = "cuda-runtime")]
 use crate::components::matmul::matmul_m31;
-#[cfg(not(feature = "cuda-runtime"))]
 use crate::components::matmul::matrix_to_mle_col_major_padded_pub as matrix_to_mle_col_major_padded;
 #[cfg(feature = "cuda-runtime")]
 use crate::components::matmul::matrix_to_mle_col_major_u32_padded_pub as matrix_to_mle_col_major_u32_padded;
