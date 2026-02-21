@@ -146,6 +146,11 @@ fn gkr_batch_weight_openings_enabled() -> bool {
             let v = v.trim().to_ascii_lowercase();
             !v.is_empty() && v != "0" && v != "false" && v != "off"
         }
+        // Default ON for GPU builds — parallel weight openings are ~4-8x faster.
+        // Set STWO_GKR_BATCH_WEIGHT_OPENINGS=0 to disable.
+        #[cfg(feature = "cuda-runtime")]
+        Err(_) => true,
+        #[cfg(not(feature = "cuda-runtime"))]
         Err(_) => false,
     }
 }
@@ -156,7 +161,14 @@ fn gkr_batch_weight_opening_jobs() -> usize {
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&v| v > 0)
-        .unwrap_or(2)
+        .unwrap_or_else(|| {
+            // Use half of available cores (capped at 8) for weight openings.
+            // These are CPU-bound Merkle tree constructions that parallelize well.
+            let cpus = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4);
+            (cpus / 2).clamp(2, 8)
+        })
 }
 
 fn gkr_aggregate_weight_binding_enabled() -> bool {
