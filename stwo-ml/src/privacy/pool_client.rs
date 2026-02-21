@@ -32,17 +32,15 @@ pub struct PoolClientConfig {
 impl PoolClientConfig {
     /// Build config from env vars or defaults.
     pub fn from_env(network: &str) -> Self {
-        let rpc_url = std::env::var("STARKNET_RPC").unwrap_or_else(|_| {
-            match network {
-                "mainnet" => "https://free-rpc.nethermind.io/mainnet-juno/".to_string(),
-                _ => "https://free-rpc.nethermind.io/sepolia-juno/".to_string(),
-            }
+        let rpc_url = std::env::var("STARKNET_RPC").unwrap_or_else(|_| match network {
+            "mainnet" => "https://free-rpc.nethermind.io/mainnet-juno/".to_string(),
+            _ => "https://free-rpc.nethermind.io/sepolia-juno/".to_string(),
         });
-        let pool_address = std::env::var("VM31_POOL_ADDRESS").unwrap_or_else(|_| {
-            match network {
-                "sepolia" => "0x07cf94e27a60b94658ec908a00a9bb6dfff03358e952d9d48a8ed0be080ce1f9".to_string(),
-                _ => String::new(),
+        let pool_address = std::env::var("VM31_POOL_ADDRESS").unwrap_or_else(|_| match network {
+            "sepolia" => {
+                "0x07cf94e27a60b94658ec908a00a9bb6dfff03358e952d9d48a8ed0be080ce1f9".to_string()
             }
+            _ => String::new(),
         });
 
         Self {
@@ -94,7 +92,8 @@ impl PoolClient {
             .send(&body_bytes)
             .map_err(|e| PoolClientError::Rpc(format!("{e}")))?;
 
-        let resp_bytes = resp.body_mut()
+        let resp_bytes = resp
+            .body_mut()
             .read_to_vec()
             .map_err(|e| PoolClientError::Parse(format!("read body: {e}")))?;
 
@@ -136,10 +135,7 @@ impl PoolClient {
     /// Check if a nullifier has been spent.
     #[cfg(feature = "audit-http")]
     pub fn is_nullifier_spent(&self, nullifier: &[M31; RATE]) -> Result<bool, PoolClientError> {
-        let calldata: Vec<String> = nullifier
-            .iter()
-            .map(|m| format!("0x{:x}", m.0))
-            .collect();
+        let calldata: Vec<String> = nullifier.iter().map(|m| format!("0x{:x}", m.0)).collect();
         let calldata_refs: Vec<&str> = calldata.iter().map(|s| s.as_str()).collect();
         let result = self.starknet_call("is_nullifier_spent", &calldata_refs)?;
         Ok(!result.is_empty() && result[0] != "0x0")
@@ -148,10 +144,7 @@ impl PoolClient {
     /// Check if a root is a known historical root.
     #[cfg(feature = "audit-http")]
     pub fn is_known_root(&self, root: &[M31; RATE]) -> Result<bool, PoolClientError> {
-        let calldata: Vec<String> = root
-            .iter()
-            .map(|m| format!("0x{:x}", m.0))
-            .collect();
+        let calldata: Vec<String> = root.iter().map(|m| format!("0x{:x}", m.0)).collect();
         let calldata_refs: Vec<&str> = calldata.iter().map(|s| s.as_str()).collect();
         let result = self.starknet_call("is_known_root", &calldata_refs)?;
         Ok(!result.is_empty() && result[0] != "0x0")
@@ -230,7 +223,8 @@ impl PoolClient {
                 .send(&body_bytes)
                 .map_err(|e| PoolClientError::Rpc(format!("{e}")))?;
 
-            let resp_bytes = resp.body_mut()
+            let resp_bytes = resp
+                .body_mut()
                 .read_to_vec()
                 .map_err(|e| PoolClientError::Parse(format!("read body: {e}")))?;
 
@@ -241,15 +235,18 @@ impl PoolClient {
                 return Err(PoolClientError::Rpc(error.to_string()));
             }
 
-            let result = resp.get("result")
+            let result = resp
+                .get("result")
                 .ok_or_else(|| PoolClientError::Parse("missing result".into()))?;
 
-            let events = result.get("events")
+            let events = result
+                .get("events")
                 .and_then(|e| e.as_array())
                 .ok_or_else(|| PoolClientError::Parse("missing events array".into()))?;
 
             for event in events {
-                let data = event.get("data")
+                let data = event
+                    .get("data")
                     .and_then(|d| d.as_array())
                     .ok_or_else(|| PoolClientError::Parse("missing event data".into()))?;
 
@@ -350,12 +347,7 @@ pub fn build_submit_batch_calldata(
 }
 
 /// Build a pool status summary as JSON string.
-pub fn format_pool_status(
-    root: &str,
-    tree_size: u64,
-    network: &str,
-    pool_address: &str,
-) -> String {
+pub fn format_pool_status(root: &str, tree_size: u64, network: &str, pool_address: &str) -> String {
     serde_json::json!({
         "merkle_root": root,
         "tree_size": tree_size,
@@ -370,7 +362,7 @@ pub fn format_pool_status(
 /// Compute the Starknet function selector: sn_keccak(name) truncated to 250 bits.
 #[cfg(feature = "audit-http")]
 fn function_selector(name: &str) -> String {
-    use sha3::{Keccak256, Digest as Sha3Digest};
+    use sha3::{Digest as Sha3Digest, Keccak256};
 
     let hash = Keccak256::digest(name.as_bytes());
     let mut bytes = [0u8; 32];
@@ -422,12 +414,8 @@ mod tests {
 
     #[test]
     fn test_build_submit_batch_calldata() {
-        let calldata = build_submit_batch_calldata(
-            2,
-            1,
-            0,
-            &["0xaa".to_string(), "0xbb".to_string()],
-        );
+        let calldata =
+            build_submit_batch_calldata(2, 1, 0, &["0xaa".to_string(), "0xbb".to_string()]);
         assert_eq!(calldata[0], "0x2"); // deposits
         assert_eq!(calldata[1], "0x1"); // withdrawals
         assert_eq!(calldata[2], "0x0"); // spends
@@ -458,7 +446,10 @@ mod tests {
             let hex = sel.strip_prefix("0x").unwrap();
             let padded = format!("{:0>64}", hex);
             let first_byte = u8::from_str_radix(&padded[..2], 16).unwrap();
-            assert!(first_byte <= 0x03, "top 6 bits should be 0 (sn_keccak truncation)");
+            assert!(
+                first_byte <= 0x03,
+                "top 6 bits should be 0 (sn_keccak truncation)"
+            );
         }
     }
 
@@ -504,8 +495,11 @@ mod tests {
 
         let commitment = parse_lo_hi_commitment(&lo_hex, &hi_hex).unwrap();
         for i in 0..8 {
-            assert_eq!(commitment[i], M31::from_u32_unchecked(vals[i]),
-                "mismatch at index {i}");
+            assert_eq!(
+                commitment[i],
+                M31::from_u32_unchecked(vals[i]),
+                "mismatch at index {i}"
+            );
         }
     }
 }

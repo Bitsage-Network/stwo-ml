@@ -6,8 +6,8 @@
 
 use stwo::core::fields::m31::BaseField as M31;
 
-use crate::crypto::poseidon2_m31::{poseidon2_permutation, STATE_WIDTH, RATE};
 use crate::crypto::merkle_m31::{Digest, MerklePath};
+use crate::crypto::poseidon2_m31::{poseidon2_permutation, RATE, STATE_WIDTH};
 
 /// A recorded permutation: (input_state, output_state).
 pub type PermRecord = ([M31; STATE_WIDTH], [M31; STATE_WIDTH]);
@@ -74,10 +74,7 @@ pub fn record_compress_permutation(
 ///
 /// Matches `verify_merkle_proof` (merkle_m31.rs:143-158):
 /// `index & 1 == 0` → current is left child.
-pub fn record_merkle_permutations(
-    leaf: &Digest,
-    path: &MerklePath,
-) -> (Digest, Vec<PermRecord>) {
+pub fn record_merkle_permutations(leaf: &Digest, path: &MerklePath) -> (Digest, Vec<PermRecord>) {
     let mut current = *leaf;
     let mut index = path.index;
     let mut perms = Vec::with_capacity(path.siblings.len());
@@ -144,7 +141,11 @@ pub fn verify_sponge_chain(
             if perm_inputs[in_idx][j] != perm_outputs[out_idx][j] {
                 return Err(format!(
                     "sponge chain broken at perm {}→{}: rate position {} (got {}, expected {})",
-                    p, p + 1, j, perm_inputs[in_idx][j].0, perm_outputs[out_idx][j].0
+                    p,
+                    p + 1,
+                    j,
+                    perm_inputs[in_idx][j].0,
+                    perm_outputs[out_idx][j].0
                 ));
             }
         }
@@ -154,7 +155,11 @@ pub fn verify_sponge_chain(
             if perm_inputs[in_idx][j] != perm_outputs[out_idx][j] {
                 return Err(format!(
                     "sponge chain broken at perm {}→{}: capacity position {} (got {}, expected {})",
-                    p, p + 1, j, perm_inputs[in_idx][j].0, perm_outputs[out_idx][j].0
+                    p,
+                    p + 1,
+                    j,
+                    perm_inputs[in_idx][j].0,
+                    perm_outputs[out_idx][j].0
                 ));
             }
         }
@@ -166,9 +171,9 @@ pub fn verify_sponge_chain(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::poseidon2_m31::{poseidon2_hash, poseidon2_compress};
     use crate::crypto::commitment::derive_pubkey;
-    use crate::crypto::merkle_m31::{PoseidonMerkleTreeM31, verify_merkle_proof};
+    use crate::crypto::merkle_m31::{verify_merkle_proof, PoseidonMerkleTreeM31};
+    use crate::crypto::poseidon2_m31::{poseidon2_compress, poseidon2_hash};
 
     #[test]
     fn test_record_hash_matches_poseidon2_hash() {
@@ -185,7 +190,12 @@ mod tests {
         for input in &test_cases {
             let expected = poseidon2_hash(input);
             let (result, _perms) = record_hash_permutations(input);
-            assert_eq!(result, expected, "hash mismatch for input len {}", input.len());
+            assert_eq!(
+                result,
+                expected,
+                "hash mismatch for input len {}",
+                input.len()
+            );
         }
     }
 
@@ -197,14 +207,18 @@ mod tests {
 
         // 1..=8 → 1 perm (fits in one RATE chunk)
         for len in 1..=8 {
-            let input: Vec<M31> = (0..len).map(|i| M31::from_u32_unchecked(i as u32)).collect();
+            let input: Vec<M31> = (0..len)
+                .map(|i| M31::from_u32_unchecked(i as u32))
+                .collect();
             let (_, perms) = record_hash_permutations(&input);
             assert_eq!(perms.len(), 1, "expected 1 perm for len {len}");
         }
 
         // 9..=16 → 2 perms
         for len in 9..=16 {
-            let input: Vec<M31> = (0..len).map(|i| M31::from_u32_unchecked(i as u32)).collect();
+            let input: Vec<M31> = (0..len)
+                .map(|i| M31::from_u32_unchecked(i as u32))
+                .collect();
             let (_, perms) = record_hash_permutations(&input);
             assert_eq!(perms.len(), 2, "expected 2 perms for len {len}");
         }
@@ -234,11 +248,13 @@ mod tests {
     fn test_record_merkle_matches_verify_merkle_proof() {
         // Build a depth-4 tree with 8 leaves
         let mut tree = PoseidonMerkleTreeM31::new(4);
-        let leaves: Vec<Digest> = (1..=8).map(|v| {
-            let mut d = [M31::from_u32_unchecked(0); RATE];
-            d[0] = M31::from_u32_unchecked(v);
-            d
-        }).collect();
+        let leaves: Vec<Digest> = (1..=8)
+            .map(|v| {
+                let mut d = [M31::from_u32_unchecked(0); RATE];
+                d[0] = M31::from_u32_unchecked(v);
+                d
+            })
+            .collect();
 
         for leaf in &leaves {
             tree.append(*leaf);
@@ -276,8 +292,7 @@ mod tests {
         let inputs: Vec<[M31; STATE_WIDTH]> = perms.iter().map(|p| p.0).collect();
         let outputs: Vec<[M31; STATE_WIDTH]> = perms.iter().map(|p| p.1).collect();
 
-        verify_sponge_chain(&inputs, &outputs, 0, 2, 11)
-            .expect("valid sponge chain should pass");
+        verify_sponge_chain(&inputs, &outputs, 0, 2, 11).expect("valid sponge chain should pass");
     }
 
     #[test]

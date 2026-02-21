@@ -16,7 +16,7 @@ use std::sync::{Arc, RwLock};
 use starknet_ff::FieldElement;
 use stwo::core::fields::cm31::CM31;
 use stwo::core::fields::m31::M31;
-use stwo::core::fields::qm31::{QM31, SecureField};
+use stwo::core::fields::qm31::{SecureField, QM31};
 
 /// Binary format version. Bump on layout changes.
 const CACHE_VERSION: u32 = 1;
@@ -74,7 +74,12 @@ impl WeightCommitmentCache {
         k_padded: usize,
         n_padded: usize,
     ) -> Option<&CachedWeight> {
-        let key = CacheKey { node_id, m_padded, k_padded, n_padded };
+        let key = CacheKey {
+            node_id,
+            m_padded,
+            k_padded,
+            n_padded,
+        };
         self.entries.get(&key)
     }
 
@@ -87,7 +92,12 @@ impl WeightCommitmentCache {
         n_padded: usize,
         entry: CachedWeight,
     ) {
-        let key = CacheKey { node_id, m_padded, k_padded, n_padded };
+        let key = CacheKey {
+            node_id,
+            m_padded,
+            k_padded,
+            n_padded,
+        };
         self.entries.insert(key, entry);
         self.dirty = true;
     }
@@ -162,7 +172,10 @@ impl WeightCommitmentCache {
         let mut magic = [0u8; 4];
         r.read_exact(&mut magic)?;
         if magic != MAGIC {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "not a weight cache file"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not a weight cache file",
+            ));
         }
 
         // Version
@@ -195,11 +208,27 @@ impl WeightCommitmentCache {
             let b_commitment = read_fieldelement(&mut r)?;
             let r_j = read_securefield_vec(&mut r)?;
 
-            let key = CacheKey { node_id, m_padded, k_padded, n_padded };
-            entries.insert(key, CachedWeight { f_b, b_commitment, r_j });
+            let key = CacheKey {
+                node_id,
+                m_padded,
+                k_padded,
+                n_padded,
+            };
+            entries.insert(
+                key,
+                CachedWeight {
+                    f_b,
+                    b_commitment,
+                    r_j,
+                },
+            );
         }
 
-        Ok(Self { entries, model_id, dirty: false })
+        Ok(Self {
+            entries,
+            model_id,
+            dirty: false,
+        })
     }
 
     /// Load from file if it exists, otherwise create empty.
@@ -221,7 +250,9 @@ pub fn shared_cache(model_id: &str) -> SharedWeightCache {
 
 /// Load or create a thread-safe cache from disk.
 pub fn shared_cache_from_file(path: &Path, model_id: &str) -> SharedWeightCache {
-    Arc::new(RwLock::new(WeightCommitmentCache::load_or_new(path, model_id)))
+    Arc::new(RwLock::new(WeightCommitmentCache::load_or_new(
+        path, model_id,
+    )))
 }
 
 // ── Binary I/O helpers ──────────────────────────────────────────────────
@@ -281,7 +312,10 @@ mod tests {
     use std::io::Cursor;
 
     fn make_sf(val: u32) -> SecureField {
-        QM31(CM31(M31(val), M31(val + 1)), CM31(M31(val + 2), M31(val + 3)))
+        QM31(
+            CM31(M31(val), M31(val + 1)),
+            CM31(M31(val + 2), M31(val + 3)),
+        )
     }
 
     fn make_cached_weight(k: usize, n_challenges: usize) -> CachedWeight {

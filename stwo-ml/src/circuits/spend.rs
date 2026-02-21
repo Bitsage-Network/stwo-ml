@@ -9,20 +9,22 @@
 //!
 //! Composes `Poseidon2BatchProof` + `RangeCheckProof` into a single `SpendProof`.
 
+use stwo::core::channel::MerkleChannel;
 use stwo::core::fields::m31::BaseField as M31;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
-use stwo::core::channel::MerkleChannel;
 
-use crate::crypto::commitment::{Note, NoteCommitment, Nullifier, SpendingKey, PublicKey};
-use crate::crypto::poseidon2_m31::{poseidon2_permutation, STATE_WIDTH, RATE};
-use crate::crypto::merkle_m31::{Digest, MerklePath};
-use crate::crypto::poseidon_channel::PoseidonChannel;
-use crate::circuits::poseidon_circuit::{prove_poseidon2_batch, verify_poseidon2_batch, Poseidon2BatchProof};
 use crate::circuits::helpers::{
     record_hash_permutations, record_merkle_permutations, record_ownership_permutations,
     verify_sponge_chain,
 };
+use crate::circuits::poseidon_circuit::{
+    prove_poseidon2_batch, verify_poseidon2_batch, Poseidon2BatchProof,
+};
 use crate::components::range_check::{prove_range_check, verify_range_check, RangeCheckProof};
+use crate::crypto::commitment::{Note, NoteCommitment, Nullifier, PublicKey, SpendingKey};
+use crate::crypto::merkle_m31::{Digest, MerklePath};
+use crate::crypto::poseidon2_m31::{poseidon2_permutation, RATE, STATE_WIDTH};
+use crate::crypto::poseidon_channel::PoseidonChannel;
 use crate::gadgets::range_check::RangeCheckConfig;
 
 type Blake2sHash = <Blake2sMerkleChannel as MerkleChannel>::H;
@@ -32,19 +34,32 @@ pub const SPEND_NUM_OUTPUTS: usize = 2;
 pub const MERKLE_DEPTH: usize = 20;
 pub const PERMS_PER_INPUT: usize = 25; // 1 + 2 + 2 + 20
 pub const PERMS_PER_OUTPUT: usize = 2;
-pub const TOTAL_PERMS: usize = SPEND_NUM_INPUTS * PERMS_PER_INPUT + SPEND_NUM_OUTPUTS * PERMS_PER_OUTPUT; // 54
+pub const TOTAL_PERMS: usize =
+    SPEND_NUM_INPUTS * PERMS_PER_INPUT + SPEND_NUM_OUTPUTS * PERMS_PER_OUTPUT; // 54
 pub const BATCH_SIZE: usize = 64; // next power of 2
 
 #[derive(Debug, thiserror::Error)]
 pub enum SpendError {
     #[error("ownership failed for input {index}: derived pk {derived:?} != note pk {expected:?}")]
-    OwnershipFailed { index: usize, derived: PublicKey, expected: PublicKey },
+    OwnershipFailed {
+        index: usize,
+        derived: PublicKey,
+        expected: PublicKey,
+    },
     #[error("Merkle inclusion failed for input {index}: computed root {computed:?} != expected {expected:?}")]
-    MerkleInclusionFailed { index: usize, computed: Digest, expected: Digest },
+    MerkleInclusionFailed {
+        index: usize,
+        computed: Digest,
+        expected: Digest,
+    },
     #[error("balance check failed: input sum {input_sum} != output sum {output_sum}")]
     BalanceCheckFailed { input_sum: u64, output_sum: u64 },
     #[error("asset mismatch: input {index} has asset {got}, expected {expected}")]
-    AssetMismatch { index: usize, got: u32, expected: u32 },
+    AssetMismatch {
+        index: usize,
+        got: u32,
+        expected: u32,
+    },
     #[error("commitment wiring failed for {which}")]
     CommitmentWiringFailed { which: String },
     #[error("nullifier wiring failed for input {index}")]
@@ -228,7 +243,8 @@ pub fn execute_spend(
         let nullifier_end = offset;
 
         // 4. Merkle path verification (20 compress perms)
-        let (computed_root, merkle_perms) = record_merkle_permutations(&commitment, &inp.merkle_path);
+        let (computed_root, merkle_perms) =
+            record_merkle_permutations(&commitment, &inp.merkle_path);
         if computed_root != witness.merkle_root {
             return Err(SpendError::MerkleInclusionFailed {
                 index: i,
@@ -286,17 +302,27 @@ pub fn execute_spend(
         });
     }
 
-    assert_eq!(offset, TOTAL_PERMS, "expected {TOTAL_PERMS} perms, got {offset}");
+    assert_eq!(
+        offset, TOTAL_PERMS,
+        "expected {TOTAL_PERMS} perms, got {offset}"
+    );
 
     // Balance check: sum of input amounts == sum of output amounts (u64)
-    let input_sum: u64 = witness.inputs.iter().map(|inp| {
-        inp.note.amount_lo.0 as u64 + (inp.note.amount_hi.0 as u64) * (1u64 << 31)
-    }).sum();
-    let output_sum: u64 = witness.outputs.iter().map(|out| {
-        out.note.amount_lo.0 as u64 + (out.note.amount_hi.0 as u64) * (1u64 << 31)
-    }).sum();
+    let input_sum: u64 = witness
+        .inputs
+        .iter()
+        .map(|inp| inp.note.amount_lo.0 as u64 + (inp.note.amount_hi.0 as u64) * (1u64 << 31))
+        .sum();
+    let output_sum: u64 = witness
+        .outputs
+        .iter()
+        .map(|out| out.note.amount_lo.0 as u64 + (out.note.amount_hi.0 as u64) * (1u64 << 31))
+        .sum();
     if input_sum != output_sum {
-        return Err(SpendError::BalanceCheckFailed { input_sum, output_sum });
+        return Err(SpendError::BalanceCheckFailed {
+            input_sum,
+            output_sum,
+        });
     }
 
     // Pad to BATCH_SIZE
@@ -357,10 +383,7 @@ pub fn prove_spend(witness: &SpendWitness) -> Result<SpendProof, SpendError> {
 
     // Prove Poseidon2 batch (64 permutations)
     let mut channel = PoseidonChannel::default();
-    let poseidon_proof = prove_poseidon2_batch(
-        &execution.all_permutation_inputs,
-        &mut channel,
-    );
+    let poseidon_proof = prove_poseidon2_batch(&execution.all_permutation_inputs, &mut channel);
 
     // Prove range check on output amount sub-limbs
     let config = RangeCheckConfig::uint16();
@@ -387,12 +410,17 @@ pub fn verify_spend(proof: &SpendProof) -> Result<(), SpendError> {
         &exec.all_permutation_inputs,
         &exec.all_permutation_outputs,
         &mut channel,
-    ).map_err(|e| SpendError::PoseidonError(format!("{e}")))?;
+    )
+    .map_err(|e| SpendError::PoseidonError(format!("{e}")))?;
 
     // 2. Verify range check proof
     let config = RangeCheckConfig::uint16();
-    verify_range_check(&proof.range_check_proof, &config, exec.range_check_limbs.len())
-        .map_err(|e| SpendError::RangeCheckError(format!("{e}")))?;
+    verify_range_check(
+        &proof.range_check_proof,
+        &config,
+        exec.range_check_limbs.len(),
+    )
+    .map_err(|e| SpendError::RangeCheckError(format!("{e}")))?;
 
     // 3. Verify permutation count
     if exec.all_permutation_inputs.len() != BATCH_SIZE {
@@ -527,7 +555,8 @@ pub fn verify_spend(proof: &SpendProof) -> Result<(), SpendError> {
             ranges.commitment.0,
             ranges.commitment.1 - ranges.commitment.0,
             11,
-        ).map_err(|e| SpendError::CrossWiringFailed(format!("P1 input {i} commitment: {e}")))?;
+        )
+        .map_err(|e| SpendError::CrossWiringFailed(format!("P1 input {i} commitment: {e}")))?;
 
         verify_sponge_chain(
             &exec.all_permutation_inputs,
@@ -535,7 +564,8 @@ pub fn verify_spend(proof: &SpendProof) -> Result<(), SpendError> {
             ranges.nullifier.0,
             ranges.nullifier.1 - ranges.nullifier.0,
             12,
-        ).map_err(|e| SpendError::CrossWiringFailed(format!("P1 input {i} nullifier: {e}")))?;
+        )
+        .map_err(|e| SpendError::CrossWiringFailed(format!("P1 input {i} nullifier: {e}")))?;
     }
     for j in 0..SPEND_NUM_OUTPUTS {
         let ranges = &exec.output_perm_ranges[j];
@@ -545,7 +575,8 @@ pub fn verify_spend(proof: &SpendProof) -> Result<(), SpendError> {
             ranges.commitment.0,
             ranges.commitment.1 - ranges.commitment.0,
             11,
-        ).map_err(|e| SpendError::CrossWiringFailed(format!("P1 output {j} commitment: {e}")))?;
+        )
+        .map_err(|e| SpendError::CrossWiringFailed(format!("P1 output {j} commitment: {e}")))?;
     }
 
     // --- Existing output-value checks ---
@@ -556,7 +587,12 @@ pub fn verify_spend(proof: &SpendProof) -> Result<(), SpendError> {
 
         // Ownership output
         let ownership_out = &exec.all_permutation_outputs[ranges.ownership.1 - 1];
-        let ownership_pk = [ownership_out[0], ownership_out[1], ownership_out[2], ownership_out[3]];
+        let ownership_pk = [
+            ownership_out[0],
+            ownership_out[1],
+            ownership_out[2],
+            ownership_out[3],
+        ];
         if ownership_pk != exec.derived_pubkeys[i] {
             return Err(SpendError::OwnershipFailed {
                 index: i,
@@ -612,29 +648,31 @@ pub fn verify_spend(proof: &SpendProof) -> Result<(), SpendError> {
     // 6. Public input consistency
     for i in 0..SPEND_NUM_INPUTS {
         if exec.input_nullifiers[i] != pub_in.nullifiers[i] {
-            return Err(SpendError::PublicInputMismatch(
-                format!("nullifier {i} mismatch"),
-            ));
+            return Err(SpendError::PublicInputMismatch(format!(
+                "nullifier {i} mismatch"
+            )));
         }
         if exec.computed_merkle_roots[i] != pub_in.merkle_root {
-            return Err(SpendError::PublicInputMismatch(
-                format!("merkle root for input {i} doesn't match public root"),
-            ));
+            return Err(SpendError::PublicInputMismatch(format!(
+                "merkle root for input {i} doesn't match public root"
+            )));
         }
     }
     for j in 0..SPEND_NUM_OUTPUTS {
         if exec.output_commitments[j] != pub_in.output_commitments[j] {
-            return Err(SpendError::PublicInputMismatch(
-                format!("output commitment {j} mismatch"),
-            ));
+            return Err(SpendError::PublicInputMismatch(format!(
+                "output commitment {j} mismatch"
+            )));
         }
     }
 
     // 7. Range check limbs count
     if exec.range_check_limbs.len() != SPEND_NUM_OUTPUTS * 4 {
-        return Err(SpendError::RangeDecomposition(
-            format!("expected {} sub-limbs, got {}", SPEND_NUM_OUTPUTS * 4, exec.range_check_limbs.len()),
-        ));
+        return Err(SpendError::RangeDecomposition(format!(
+            "expected {} sub-limbs, got {}",
+            SPEND_NUM_OUTPUTS * 4,
+            exec.range_check_limbs.len()
+        )));
     }
 
     // Balance conservation (P6) and asset consistency (P7) are verified above
@@ -650,10 +688,7 @@ mod tests {
     use crate::crypto::commitment::derive_pubkey;
     use crate::crypto::merkle_m31::PoseidonMerkleTreeM31;
 
-    fn make_spend_witness(
-        amounts_in: [u64; 2],
-        amounts_out: [u64; 2],
-    ) -> SpendWitness {
+    fn make_spend_witness(amounts_in: [u64; 2], amounts_out: [u64; 2]) -> SpendWitness {
         let sk1 = [42, 99, 7, 13].map(M31::from_u32_unchecked);
         let sk2 = [50, 60, 70, 80].map(M31::from_u32_unchecked);
         let pk1 = derive_pubkey(&sk1);
@@ -663,13 +698,15 @@ mod tests {
 
         // Create input notes
         let note1 = Note::new(
-            pk1, asset_id,
+            pk1,
+            asset_id,
             M31::from_u32_unchecked((amounts_in[0] & 0x7FFFFFFF) as u32),
             M31::from_u32_unchecked((amounts_in[0] >> 31) as u32),
             [1, 2, 3, 4].map(M31::from_u32_unchecked),
         );
         let note2 = Note::new(
-            pk2, asset_id,
+            pk2,
+            asset_id,
             M31::from_u32_unchecked((amounts_in[1] & 0x7FFFFFFF) as u32),
             M31::from_u32_unchecked((amounts_in[1] >> 31) as u32),
             [5, 6, 7, 8].map(M31::from_u32_unchecked),
@@ -692,13 +729,15 @@ mod tests {
         let out_pk2 = derive_pubkey(&out_sk2);
 
         let out_note1 = Note::new(
-            out_pk1, asset_id,
+            out_pk1,
+            asset_id,
             M31::from_u32_unchecked((amounts_out[0] & 0x7FFFFFFF) as u32),
             M31::from_u32_unchecked((amounts_out[0] >> 31) as u32),
             [10, 20, 30, 40].map(M31::from_u32_unchecked),
         );
         let out_note2 = Note::new(
-            out_pk2, asset_id,
+            out_pk2,
+            asset_id,
             M31::from_u32_unchecked((amounts_out[1] & 0x7FFFFFFF) as u32),
             M31::from_u32_unchecked((amounts_out[1] >> 31) as u32),
             [50, 60, 70, 80].map(M31::from_u32_unchecked),
@@ -706,8 +745,16 @@ mod tests {
 
         SpendWitness {
             inputs: [
-                InputNoteWitness { note: note1, spending_key: sk1, merkle_path: path1 },
-                InputNoteWitness { note: note2, spending_key: sk2, merkle_path: path2 },
+                InputNoteWitness {
+                    note: note1,
+                    spending_key: sk1,
+                    merkle_path: path1,
+                },
+                InputNoteWitness {
+                    note: note2,
+                    spending_key: sk2,
+                    merkle_path: path2,
+                },
             ],
             outputs: [
                 OutputNoteWitness { note: out_note1 },
@@ -754,7 +801,10 @@ mod tests {
         let result = prove_spend(&witness);
         assert!(result.is_err());
         match result.unwrap_err() {
-            SpendError::BalanceCheckFailed { input_sum: 3000, output_sum: 3500 } => {}
+            SpendError::BalanceCheckFailed {
+                input_sum: 3000,
+                output_sum: 3500,
+            } => {}
             e => panic!("expected BalanceCheckFailed, got: {e}"),
         }
     }
@@ -790,7 +840,9 @@ mod tests {
 
         // Nullifiers match
         for i in 0..SPEND_NUM_INPUTS {
-            let expected_nullifier = witness.inputs[i].note.nullifier(&witness.inputs[i].spending_key);
+            let expected_nullifier = witness.inputs[i]
+                .note
+                .nullifier(&witness.inputs[i].spending_key);
             assert_eq!(pub_in.nullifiers[i], expected_nullifier);
             assert_eq!(exec.input_nullifiers[i], expected_nullifier);
         }
@@ -1032,18 +1084,30 @@ mod tests {
 
         // Deposit 2 notes
         let note1 = Note::new(
-            pk1, asset_id,
-            M31::from_u32_unchecked(1000), M31::from_u32_unchecked(0),
+            pk1,
+            asset_id,
+            M31::from_u32_unchecked(1000),
+            M31::from_u32_unchecked(0),
             [1, 2, 3, 4].map(M31::from_u32_unchecked),
         );
         let note2 = Note::new(
-            pk2, asset_id,
-            M31::from_u32_unchecked(2000), M31::from_u32_unchecked(0),
+            pk2,
+            asset_id,
+            M31::from_u32_unchecked(2000),
+            M31::from_u32_unchecked(0),
             [5, 6, 7, 8].map(M31::from_u32_unchecked),
         );
 
-        let dep1 = DepositWitness { note: note1.clone(), amount: 1000, asset_id };
-        let dep2 = DepositWitness { note: note2.clone(), amount: 2000, asset_id };
+        let dep1 = DepositWitness {
+            note: note1.clone(),
+            amount: 1000,
+            asset_id,
+        };
+        let dep2 = DepositWitness {
+            note: note2.clone(),
+            amount: 2000,
+            asset_id,
+        };
         let dp1 = prove_deposit(&dep1).expect("deposit 1 prove");
         verify_deposit(&dp1).expect("deposit 1 verify");
         let dp2 = prove_deposit(&dep2).expect("deposit 2 prove");
@@ -1063,20 +1127,32 @@ mod tests {
         let out_pk1 = derive_pubkey(&[100, 200, 300, 400].map(M31::from_u32_unchecked));
         let out_pk2 = derive_pubkey(&[500, 600, 700, 800].map(M31::from_u32_unchecked));
         let out_note1 = Note::new(
-            out_pk1, asset_id,
-            M31::from_u32_unchecked(1500), M31::from_u32_unchecked(0),
+            out_pk1,
+            asset_id,
+            M31::from_u32_unchecked(1500),
+            M31::from_u32_unchecked(0),
             [10, 20, 30, 40].map(M31::from_u32_unchecked),
         );
         let out_note2 = Note::new(
-            out_pk2, asset_id,
-            M31::from_u32_unchecked(1500), M31::from_u32_unchecked(0),
+            out_pk2,
+            asset_id,
+            M31::from_u32_unchecked(1500),
+            M31::from_u32_unchecked(0),
             [50, 60, 70, 80].map(M31::from_u32_unchecked),
         );
 
         let spend_witness = SpendWitness {
             inputs: [
-                InputNoteWitness { note: note1, spending_key: sk1, merkle_path: path1 },
-                InputNoteWitness { note: note2, spending_key: sk2, merkle_path: path2 },
+                InputNoteWitness {
+                    note: note1,
+                    spending_key: sk1,
+                    merkle_path: path1,
+                },
+                InputNoteWitness {
+                    note: note2,
+                    spending_key: sk2,
+                    merkle_path: path2,
+                },
             ],
             outputs: [
                 OutputNoteWitness { note: out_note1 },
@@ -1100,11 +1176,17 @@ mod tests {
 
         // Deposit
         let note = Note::new(
-            pk, asset_id,
-            M31::from_u32_unchecked(5000), M31::from_u32_unchecked(0),
+            pk,
+            asset_id,
+            M31::from_u32_unchecked(5000),
+            M31::from_u32_unchecked(0),
             [1, 2, 3, 4].map(M31::from_u32_unchecked),
         );
-        let dep = DepositWitness { note: note.clone(), amount: 5000, asset_id };
+        let dep = DepositWitness {
+            note: note.clone(),
+            amount: 5000,
+            asset_id,
+        };
         let dp = prove_deposit(&dep).expect("deposit prove");
         verify_deposit(&dp).expect("deposit verify");
 

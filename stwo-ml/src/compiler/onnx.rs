@@ -14,7 +14,7 @@
 
 use std::path::Path;
 
-use crate::compiler::graph::{ComputationGraph, GraphWeights, GraphBuilder};
+use crate::compiler::graph::{ComputationGraph, GraphBuilder, GraphWeights};
 use crate::components::activation::ActivationType;
 
 /// Metadata about a loaded model.
@@ -61,9 +61,9 @@ pub enum OnnxError {
 /// structure AND weight tensors, quantizing them to M31.
 #[cfg(feature = "onnx")]
 pub fn load_onnx(path: &Path) -> Result<OnnxModel, OnnxError> {
-    use tract_onnx::prelude::*;
-    use crate::compiler::quantize_weights::{quantize_weight_matrix, quantize_bias_vector};
+    use crate::compiler::quantize_weights::{quantize_bias_vector, quantize_weight_matrix};
     use crate::gadgets::quantize::QuantStrategy;
+    use tract_onnx::prelude::*;
 
     let model = tract_onnx::onnx()
         .model_for_path(path)
@@ -74,7 +74,9 @@ pub fn load_onnx(path: &Path) -> Result<OnnxModel, OnnxError> {
         .map_err(|e| OnnxError::ParseError(e.to_string()))?;
 
     // Extract input shape
-    let input_fact = model.model().input_fact(0)
+    let input_fact = model
+        .model()
+        .input_fact(0)
         .map_err(|e| OnnxError::ShapeError(e.to_string()))?;
     let input_shape = extract_shape_typed(input_fact);
 
@@ -112,10 +114,7 @@ pub fn load_onnx(path: &Path) -> Result<OnnxModel, OnnxError> {
                 // Extract bias for Gemm ops (third input)
                 if op_name.as_ref() == "Gemm" {
                     if let Some(bias_data) = extract_const_input(model.model(), node_idx, 2) {
-                        let (bias_vec, _) = quantize_bias_vector(
-                            &bias_data,
-                            QuantStrategy::Direct,
-                        );
+                        let (bias_vec, _) = quantize_bias_vector(&bias_data, QuantStrategy::Direct);
                         num_parameters += bias_data.len();
                         weights.add_bias(graph_node_id, bias_vec);
                     }
@@ -163,7 +162,7 @@ pub fn load_onnx(path: &Path) -> Result<OnnxModel, OnnxError> {
             }
             // Dequantization: map to quantize node
             "DequantizeLinear" => {
-                use crate::gadgets::quantize::{QuantStrategy, QuantParams};
+                use crate::gadgets::quantize::{QuantParams, QuantStrategy};
                 builder.quantize(QuantParams {
                     strategy: QuantStrategy::Direct,
                     scale: 1.0,
@@ -172,9 +171,8 @@ pub fn load_onnx(path: &Path) -> Result<OnnxModel, OnnxError> {
                 });
             }
             // Skip infrastructure ops that don't map to computation
-            "Source" | "Const" | "Reshape" | "Transpose" | "Flatten"
-            | "Squeeze" | "Unsqueeze" | "Cast" | "Gather" | "Concat"
-            | "Shape" | "Slice" | "Identity" | "Dropout" => {
+            "Source" | "Const" | "Reshape" | "Transpose" | "Flatten" | "Squeeze" | "Unsqueeze"
+            | "Cast" | "Gather" | "Concat" | "Shape" | "Slice" | "Identity" | "Dropout" => {
                 // These are structural ops, not computation ops
             }
             _ => {
@@ -185,7 +183,10 @@ pub fn load_onnx(path: &Path) -> Result<OnnxModel, OnnxError> {
 
     let graph = builder.build();
     let metadata = ModelMetadata {
-        name: model.model().properties.get("name")
+        name: model
+            .model()
+            .properties
+            .get("name")
             .and_then(|v| v.to_scalar::<String>().ok().cloned())
             .unwrap_or_else(|| "unnamed".to_string()),
         num_parameters,
@@ -229,8 +230,7 @@ fn extract_const_input(
 /// Get output shape of a node from its output facts.
 #[cfg(feature = "onnx")]
 fn get_node_output_shape(node: &tract_onnx::prelude::TypedNode) -> (usize, usize) {
-    let fact = node.outputs.first()
-        .map(|o| &o.fact);
+    let fact = node.outputs.first().map(|o| &o.fact);
     if let Some(f) = fact {
         let shape = f.shape.as_concrete().unwrap_or_default();
         match shape.len() {
@@ -418,26 +418,27 @@ pub fn build_transformer(
 /// Count the total number of MatMul parameters (k*n) across all MatMul nodes.
 pub fn count_matmul_params(graph: &ComputationGraph) -> usize {
     use crate::compiler::graph::GraphOp;
-    graph.nodes.iter().map(|node| {
-        if let GraphOp::MatMul { dims: (_m, k, n) } = &node.op {
-            k * n
-        } else {
-            0
-        }
-    }).sum()
+    graph
+        .nodes
+        .iter()
+        .map(|node| {
+            if let GraphOp::MatMul { dims: (_m, k, n) } = &node.op {
+                k * n
+            } else {
+                0
+            }
+        })
+        .sum()
 }
 
 /// Generate deterministic M31 weights for all MatMul nodes in a graph.
 ///
 /// Uses an LCG PRNG: `state = state * 6364136223846793005 + 1442695040888963407`.
 /// Values are `(state >> 33) % 9 + 1`, giving M31 values in [1, 9].
-pub fn generate_weights_for_graph(
-    graph: &ComputationGraph,
-    seed: u64,
-) -> GraphWeights {
-    use stwo::core::fields::m31::M31;
+pub fn generate_weights_for_graph(graph: &ComputationGraph, seed: u64) -> GraphWeights {
     use crate::compiler::graph::GraphOp;
     use crate::components::matmul::M31Matrix;
+    use stwo::core::fields::m31::M31;
 
     let mut weights = GraphWeights::new();
     let mut state = seed;
@@ -447,7 +448,9 @@ pub fn generate_weights_for_graph(
             let mut matrix = M31Matrix::new(*k, *n);
             for i in 0..*k {
                 for j in 0..*n {
-                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
                     let val = ((state >> 33) % 9 + 1) as u32;
                     matrix.set(i, j, M31::from(val));
                 }
@@ -555,16 +558,19 @@ mod tests {
         }
 
         let result = prove_model(&model.graph, &input, &model.weights);
-        assert!(result.is_ok(), "Transformer block should prove: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Transformer block should prove: {:?}",
+            result.err()
+        );
     }
 
     #[test]
     fn test_build_multi_layer_transformer() {
         let config = TransformerConfig::new(8, 2);
         let model = build_transformer(
-            &config,
-            2,     // 2 layers
-            16,    // vocab_size
+            &config, 2,  // 2 layers
+            16, // vocab_size
             42,
         );
 
@@ -611,7 +617,11 @@ mod tests {
         }
 
         let result = prove_model(&model.graph, &input, &model.weights);
-        assert!(result.is_ok(), "Auto-weighted MLP should prove: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Auto-weighted MLP should prove: {:?}",
+            result.err()
+        );
 
         let (proofs, execution) = result.unwrap();
         assert_eq!(proofs.len(), 3); // linear + relu + linear
@@ -639,13 +649,16 @@ mod tests {
         let w3 = generate_weights_for_graph(&graph, 99);
         let (_, m1) = &w1.weights[0];
         let (_, m3) = &w3.weights[0];
-        assert_ne!(m1.data, m3.data, "Different seeds should produce different weights");
+        assert_ne!(
+            m1.data, m3.data,
+            "Different seeds should produce different weights"
+        );
     }
 
     #[test]
     fn test_build_mlp_with_weights_and_prove() {
-        use stwo::core::fields::m31::M31;
         use crate::compiler::prove::prove_model;
+        use stwo::core::fields::m31::M31;
 
         let model = build_mlp(4, &[4], 2, ActivationType::ReLU);
 
@@ -653,18 +666,32 @@ mod tests {
         let mut weights = GraphWeights::new();
 
         let mut w0 = crate::components::matmul::M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 5 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 5 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
 
         let mut w2 = crate::components::matmul::M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w2.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
 
         let mut input = crate::components::matmul::M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let result = prove_model(&model.graph, &input, &weights);
-        assert!(result.is_ok(), "MLP from build_mlp should prove: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "MLP from build_mlp should prove: {:?}",
+            result.err()
+        );
     }
 
     /// Test that build_mlp_with_weights produces a model that goes through
@@ -696,8 +723,8 @@ mod tests {
     /// End-to-end: build model with identity/quantize ops → prove.
     #[test]
     fn test_load_onnx_and_prove_with_all_ops() {
-        use crate::compiler::prove::prove_model;
         use crate::compiler::graph::GraphBuilder;
+        use crate::compiler::prove::prove_model;
 
         // Build a graph that mimics what load_onnx would produce with
         // DequantizeLinear, Add, Mul ops
@@ -723,7 +750,11 @@ mod tests {
         }
 
         let result = prove_model(&graph, &input, &weights);
-        assert!(result.is_ok(), "Model with all op types should prove: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Model with all op types should prove: {:?}",
+            result.err()
+        );
 
         let (proofs, execution) = result.unwrap();
         assert_eq!(proofs.len(), 6); // quantize + linear + identity + relu + identity + linear

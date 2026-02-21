@@ -8,8 +8,10 @@ use std::path::Path;
 
 use stwo::core::fields::m31::M31;
 
-use crate::compiler::graph::{ComputationGraph, GraphWeights, GraphOp};
-use crate::compiler::quantize_weights::{quantize_weight_matrix, quantize_bias_vector, WeightError};
+use crate::compiler::graph::{ComputationGraph, GraphOp, GraphWeights};
+use crate::compiler::quantize_weights::{
+    quantize_bias_vector, quantize_weight_matrix, WeightError,
+};
 use crate::gadgets::quantize::QuantStrategy;
 
 /// Load weights from a SafeTensors file and quantize to M31.
@@ -20,11 +22,10 @@ pub fn load_weights(
     graph: &ComputationGraph,
     strategy: QuantStrategy,
 ) -> Result<GraphWeights, WeightError> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| WeightError::IoError(e.to_string()))?;
+    let file = std::fs::File::open(path).map_err(|e| WeightError::IoError(e.to_string()))?;
 
-    let mmap = unsafe { memmap2::Mmap::map(&file) }
-        .map_err(|e| WeightError::IoError(e.to_string()))?;
+    let mmap =
+        unsafe { memmap2::Mmap::map(&file) }.map_err(|e| WeightError::IoError(e.to_string()))?;
 
     let tensors = safetensors::SafeTensors::deserialize(&mmap)
         .map_err(|e| WeightError::IoError(e.to_string()))?;
@@ -44,19 +45,14 @@ pub fn load_weights(
             for name in &tensor_names {
                 if let Ok(tensor) = tensors.tensor(name) {
                     let data = tensor_to_f32(tensor.data(), tensor.dtype());
-                    let (matrix, _params) = quantize_weight_matrix(
-                        &data, *k, *n, strategy,
-                    );
+                    let (matrix, _params) = quantize_weight_matrix(&data, *k, *n, strategy);
                     weights.add_weight(idx, matrix);
                     break;
                 }
             }
 
             // Try bias
-            let bias_names = [
-                format!("bias.{idx}"),
-                format!("layers.{idx}.bias"),
-            ];
+            let bias_names = [format!("bias.{idx}"), format!("layers.{idx}.bias")];
             for name in &bias_names {
                 if let Ok(tensor) = tensors.tensor(name) {
                     let data = tensor_to_f32(tensor.data(), tensor.dtype());
@@ -74,11 +70,10 @@ pub fn load_weights(
 /// Convert raw tensor bytes to f32 based on dtype.
 pub fn tensor_to_f32(data: &[u8], dtype: safetensors::Dtype) -> Vec<f32> {
     match dtype {
-        safetensors::Dtype::F32 => {
-            data.chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect()
-        }
+        safetensors::Dtype::F32 => data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
         safetensors::Dtype::F16 => {
             // Convert f16 to f32
             data.chunks_exact(2)
@@ -88,20 +83,15 @@ pub fn tensor_to_f32(data: &[u8], dtype: safetensors::Dtype) -> Vec<f32> {
                 })
                 .collect()
         }
-        safetensors::Dtype::BF16 => {
-            data.chunks_exact(2)
-                .map(|c| {
-                    let bits = u16::from_le_bytes([c[0], c[1]]);
-                    bf16_to_f32(bits)
-                })
-                .collect()
-        }
-        safetensors::Dtype::I8 => {
-            data.iter().map(|&b| b as i8 as f32).collect()
-        }
-        safetensors::Dtype::U8 => {
-            data.iter().map(|&b| b as f32).collect()
-        }
+        safetensors::Dtype::BF16 => data
+            .chunks_exact(2)
+            .map(|c| {
+                let bits = u16::from_le_bytes([c[0], c[1]]);
+                bf16_to_f32(bits)
+            })
+            .collect(),
+        safetensors::Dtype::I8 => data.iter().map(|&b| b as i8 as f32).collect(),
+        safetensors::Dtype::U8 => data.iter().map(|&b| b as f32).collect(),
         _ => {
             // Fallback: treat as f32
             data.chunks_exact(4)
@@ -173,9 +163,7 @@ pub fn dtype_byte_size(dtype: safetensors::Dtype) -> usize {
 /// The `bytes` slice must have exactly `dtype_byte_size(dtype)` bytes.
 pub fn bytes_to_f32_single(bytes: &[u8], dtype: safetensors::Dtype) -> f32 {
     match dtype {
-        safetensors::Dtype::F32 => {
-            f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-        }
+        safetensors::Dtype::F32 => f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
         safetensors::Dtype::F16 => {
             let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
             half_to_f32(bits)
@@ -198,11 +186,10 @@ pub fn bytes_to_f32_single(bytes: &[u8], dtype: safetensors::Dtype) -> f32 {
 
 /// List all tensor names in a SafeTensors file.
 pub fn list_tensors(path: &Path) -> Result<Vec<String>, WeightError> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| WeightError::IoError(e.to_string()))?;
+    let file = std::fs::File::open(path).map_err(|e| WeightError::IoError(e.to_string()))?;
 
-    let mmap = unsafe { memmap2::Mmap::map(&file) }
-        .map_err(|e| WeightError::IoError(e.to_string()))?;
+    let mmap =
+        unsafe { memmap2::Mmap::map(&file) }.map_err(|e| WeightError::IoError(e.to_string()))?;
 
     let tensors = safetensors::SafeTensors::deserialize(&mmap)
         .map_err(|e| WeightError::IoError(e.to_string()))?;
@@ -219,11 +206,10 @@ pub fn load_weights_with_mapping(
     name_map: &std::collections::HashMap<usize, String>,
     strategy: QuantStrategy,
 ) -> Result<GraphWeights, WeightError> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| WeightError::IoError(e.to_string()))?;
+    let file = std::fs::File::open(path).map_err(|e| WeightError::IoError(e.to_string()))?;
 
-    let mmap = unsafe { memmap2::Mmap::map(&file) }
-        .map_err(|e| WeightError::IoError(e.to_string()))?;
+    let mmap =
+        unsafe { memmap2::Mmap::map(&file) }.map_err(|e| WeightError::IoError(e.to_string()))?;
 
     let tensors = safetensors::SafeTensors::deserialize(&mmap)
         .map_err(|e| WeightError::IoError(e.to_string()))?;
@@ -233,7 +219,8 @@ pub fn load_weights_with_mapping(
     for (idx, node) in graph.nodes.iter().enumerate() {
         if let GraphOp::MatMul { dims: (_m, k, n) } = &node.op {
             if let Some(tensor_name) = name_map.get(&idx) {
-                let tensor = tensors.tensor(tensor_name)
+                let tensor = tensors
+                    .tensor(tensor_name)
                     .map_err(|_| WeightError::MissingTensor(tensor_name.clone()))?;
                 let data = tensor_to_f32(tensor.data(), tensor.dtype());
                 let (matrix, _params) = quantize_weight_matrix(&data, *k, *n, strategy);
@@ -252,16 +239,13 @@ pub fn discover_shards(
     dir: &Path,
     base_pattern: &str,
 ) -> Result<Vec<std::path::PathBuf>, WeightError> {
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| WeightError::IoError(e.to_string()))?;
+    let entries = std::fs::read_dir(dir).map_err(|e| WeightError::IoError(e.to_string()))?;
 
     let mut shards: Vec<std::path::PathBuf> = entries
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| {
-            let name = p.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
             name.contains(base_pattern) && name.ends_with(".safetensors")
         })
         .collect();
@@ -275,23 +259,27 @@ pub fn discover_shards(
 /// GPTQ/AWQ models store quantized weights as packed INT4 — 2 values per byte.
 /// Returns f32 values in [0, 15].
 pub fn unpack_int4(data: &[u8]) -> Vec<f32> {
-    data.iter().flat_map(|&byte| {
-        let lo = (byte & 0x0F) as f32;
-        let hi = ((byte >> 4) & 0x0F) as f32;
-        [lo, hi]
-    }).collect()
+    data.iter()
+        .flat_map(|&byte| {
+            let lo = (byte & 0x0F) as f32;
+            let hi = ((byte >> 4) & 0x0F) as f32;
+            [lo, hi]
+        })
+        .collect()
 }
 
 /// Unpack packed INT4 data directly to M31 field elements.
 ///
 /// Each byte yields 2 M31 values in [0, 15]. No f32 intermediate.
 pub fn unpack_int4_to_m31(data: &[u8]) -> Vec<M31> {
-    data.iter().flat_map(|&byte| {
-        [
-            M31::from((byte & 0x0F) as u32),
-            M31::from(((byte >> 4) & 0x0F) as u32),
-        ]
-    }).collect()
+    data.iter()
+        .flat_map(|&byte| {
+            [
+                M31::from((byte & 0x0F) as u32),
+                M31::from(((byte >> 4) & 0x0F) as u32),
+            ]
+        })
+        .collect()
 }
 
 /// Load weights from a SafeTensors file, preserving native INT8/INT4 quantization.
@@ -306,14 +294,19 @@ pub fn unpack_int4_to_m31(data: &[u8]) -> Vec<M31> {
 pub fn load_weights_quantized(
     path: &Path,
     graph: &ComputationGraph,
-) -> Result<(GraphWeights, Vec<(usize, crate::gadgets::quantize::QuantParams)>), WeightError> {
+) -> Result<
+    (
+        GraphWeights,
+        Vec<(usize, crate::gadgets::quantize::QuantParams)>,
+    ),
+    WeightError,
+> {
     use crate::gadgets::quantize::{QuantParams, QuantStrategy};
 
-    let file = std::fs::File::open(path)
-        .map_err(|e| WeightError::IoError(e.to_string()))?;
+    let file = std::fs::File::open(path).map_err(|e| WeightError::IoError(e.to_string()))?;
 
-    let mmap = unsafe { memmap2::Mmap::map(&file) }
-        .map_err(|e| WeightError::IoError(e.to_string()))?;
+    let mmap =
+        unsafe { memmap2::Mmap::map(&file) }.map_err(|e| WeightError::IoError(e.to_string()))?;
 
     let tensors = safetensors::SafeTensors::deserialize(&mmap)
         .map_err(|e| WeightError::IoError(e.to_string()))?;
@@ -338,7 +331,11 @@ pub fn load_weights_quantized(
                         let matrix = crate::components::matmul::M31Matrix {
                             rows: *k,
                             cols: *n,
-                            data: if data.len() >= k * n { data[..k * n].to_vec() } else { data },
+                            data: if data.len() >= k * n {
+                                data[..k * n].to_vec()
+                            } else {
+                                data
+                            },
                         };
                         weights.add_weight(idx, matrix);
 
@@ -360,12 +357,15 @@ pub fn load_weights_quantized(
                             0
                         };
 
-                        quant_params.push((idx, QuantParams {
-                            strategy: QuantStrategy::Asymmetric4,
-                            scale,
-                            zero_point,
-                            bits: 4,
-                        }));
+                        quant_params.push((
+                            idx,
+                            QuantParams {
+                                strategy: QuantStrategy::Asymmetric4,
+                                scale,
+                                zero_point,
+                                bits: 4,
+                            },
+                        ));
                         break;
                     }
                 }
@@ -385,17 +385,21 @@ pub fn load_weights_quantized(
                         safetensors::Dtype::I8 | safetensors::Dtype::U8 => {
                             // Load as M31 directly (no f32 intermediate)
                             let data: Vec<M31> = match tensor.dtype() {
-                                safetensors::Dtype::I8 => tensor.data().iter()
+                                safetensors::Dtype::I8 => tensor
+                                    .data()
+                                    .iter()
                                     .map(|&b| M31::from((b as i8 as i32 + 128) as u32))
                                     .collect(),
-                                _ => tensor.data().iter()
-                                    .map(|&b| M31::from(b as u32))
-                                    .collect(),
+                                _ => tensor.data().iter().map(|&b| M31::from(b as u32)).collect(),
                             };
                             let matrix = crate::components::matmul::M31Matrix {
                                 rows: *k,
                                 cols: *n,
-                                data: if data.len() >= k * n { data[..k * n].to_vec() } else { data },
+                                data: if data.len() >= k * n {
+                                    data[..k * n].to_vec()
+                                } else {
+                                    data
+                                },
                             };
                             weights.add_weight(idx, matrix);
 
@@ -424,20 +428,27 @@ pub fn load_weights_quantized(
                                 (QuantStrategy::Asymmetric8, 8)
                             };
 
-                            quant_params.push((idx, QuantParams {
-                                strategy,
-                                scale,
-                                zero_point,
-                                bits,
-                            }));
+                            quant_params.push((
+                                idx,
+                                QuantParams {
+                                    strategy,
+                                    scale,
+                                    zero_point,
+                                    bits,
+                                },
+                            ));
                             break;
                         }
                         _ => {
                             // F32/F16/BF16 — load via f32 path with Direct quantization
                             let data = tensor_to_f32(tensor.data(), tensor.dtype());
-                            let (matrix, _) = crate::compiler::quantize_weights::quantize_weight_matrix(
-                                &data, *k, *n, QuantStrategy::Direct,
-                            );
+                            let (matrix, _) =
+                                crate::compiler::quantize_weights::quantize_weight_matrix(
+                                    &data,
+                                    *k,
+                                    *n,
+                                    QuantStrategy::Direct,
+                                );
                             weights.add_weight(idx, matrix);
                             break;
                         }
@@ -457,8 +468,7 @@ pub fn list_tensors_sharded(
     let mut result = Vec::new();
 
     for (shard_idx, path) in shard_paths.iter().enumerate() {
-        let file = std::fs::File::open(path)
-            .map_err(|e| WeightError::IoError(e.to_string()))?;
+        let file = std::fs::File::open(path).map_err(|e| WeightError::IoError(e.to_string()))?;
         let mmap = unsafe { memmap2::Mmap::map(&file) }
             .map_err(|e| WeightError::IoError(e.to_string()))?;
         let tensors = safetensors::SafeTensors::deserialize(&mmap)
@@ -483,8 +493,7 @@ pub fn load_weights_sharded(
     // Memory-map all shards
     let mut shard_data: Vec<(std::fs::File, memmap2::Mmap)> = Vec::new();
     for path in shard_paths {
-        let file = std::fs::File::open(path)
-            .map_err(|e| WeightError::IoError(e.to_string()))?;
+        let file = std::fs::File::open(path).map_err(|e| WeightError::IoError(e.to_string()))?;
         let mmap = unsafe { memmap2::Mmap::map(&file) }
             .map_err(|e| WeightError::IoError(e.to_string()))?;
         shard_data.push((file, mmap));
@@ -507,9 +516,7 @@ pub fn load_weights_sharded(
 
                     if let Ok(tensor) = tensors.tensor(name) {
                         let data = tensor_to_f32(tensor.data(), tensor.dtype());
-                        let (matrix, _params) = quantize_weight_matrix(
-                            &data, *k, *n, strategy,
-                        );
+                        let (matrix, _params) = quantize_weight_matrix(&data, *k, *n, strategy);
                         weights.add_weight(idx, matrix);
                         break 'outer;
                     }
@@ -517,10 +524,7 @@ pub fn load_weights_sharded(
             }
 
             // Try bias across shards
-            let bias_names = [
-                format!("bias.{idx}"),
-                format!("layers.{idx}.bias"),
-            ];
+            let bias_names = [format!("bias.{idx}"), format!("layers.{idx}.bias")];
             'bias_outer: for name in &bias_names {
                 for (_file, mmap) in &shard_data {
                     let tensors = safetensors::SafeTensors::deserialize(mmap)
@@ -580,11 +584,7 @@ mod tests {
 
         // Build a simple graph: input(1,4) → matmul → output(1,2)
         let mut graph = ComputationGraph::new((1, 4));
-        graph.add_node(
-            GraphOp::MatMul { dims: (1, 4, 2) },
-            vec![],
-            (1, 2),
-        );
+        graph.add_node(GraphOp::MatMul { dims: (1, 4, 2) }, vec![], (1, 2));
 
         // Create a safetensors file with the weight
         let weight_data: Vec<f32> = (0..8).map(|i| i as f32 * 0.1).collect();
@@ -597,7 +597,8 @@ mod tests {
                 safetensors::Dtype::F32,
                 vec![4, 2],
                 &weight_bytes,
-            ).unwrap(),
+            )
+            .unwrap(),
         );
 
         let serialized = safetensors::serialize(&tensors_map, &None).unwrap();
@@ -637,9 +638,8 @@ mod tests {
         let mut tensors0 = HashMap::new();
         tensors0.insert(
             "weight.0".to_string(),
-            safetensors::tensor::TensorView::new(
-                safetensors::Dtype::F32, vec![4, 2], &w0_bytes,
-            ).unwrap(),
+            safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![4, 2], &w0_bytes)
+                .unwrap(),
         );
         let shard0 = safetensors::serialize(&tensors0, &None).unwrap();
         let shard0_path = tmp_dir.join("model-00001-of-00002.safetensors");
@@ -651,9 +651,8 @@ mod tests {
         let mut tensors1 = HashMap::new();
         tensors1.insert(
             "weight.1".to_string(),
-            safetensors::tensor::TensorView::new(
-                safetensors::Dtype::F32, vec![2, 3], &w1_bytes,
-            ).unwrap(),
+            safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![2, 3], &w1_bytes)
+                .unwrap(),
         );
         let shard1 = safetensors::serialize(&tensors1, &None).unwrap();
         let shard1_path = tmp_dir.join("model-00002-of-00002.safetensors");
@@ -686,8 +685,8 @@ mod tests {
         assert_eq!(unpacked.len(), 4);
         assert_eq!(unpacked[0], 11.0); // 0xB
         assert_eq!(unpacked[1], 10.0); // 0xA
-        assert_eq!(unpacked[2], 4.0);  // 0x4
-        assert_eq!(unpacked[3], 3.0);  // 0x3
+        assert_eq!(unpacked[2], 4.0); // 0x4
+        assert_eq!(unpacked[3], 3.0); // 0x3
     }
 
     #[test]
@@ -695,8 +694,8 @@ mod tests {
         let data = vec![0x12, 0xFF];
         let unpacked = super::unpack_int4_to_m31(&data);
         assert_eq!(unpacked.len(), 4);
-        assert_eq!(unpacked[0], M31::from(2));  // 0x2
-        assert_eq!(unpacked[1], M31::from(1));  // 0x1
+        assert_eq!(unpacked[0], M31::from(2)); // 0x2
+        assert_eq!(unpacked[1], M31::from(1)); // 0x1
         assert_eq!(unpacked[2], M31::from(15)); // 0xF
         assert_eq!(unpacked[3], M31::from(15)); // 0xF
     }

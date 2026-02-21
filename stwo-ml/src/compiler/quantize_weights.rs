@@ -5,8 +5,10 @@
 
 use stwo::core::fields::m31::M31;
 
-use crate::gadgets::quantize::{QuantStrategy, QuantParams, quantize_tensor, quantize_tensor_with_params};
 use crate::components::matmul::M31Matrix;
+use crate::gadgets::quantize::{
+    quantize_tensor, quantize_tensor_with_params, QuantParams, QuantStrategy,
+};
 
 /// Quantize a weight matrix from f32 to M31Matrix.
 pub fn quantize_weight_matrix(
@@ -30,10 +32,7 @@ pub fn quantize_weight_matrix(
 }
 
 /// Quantize a bias vector from f32 to Vec<M31>.
-pub fn quantize_bias_vector(
-    data: &[f32],
-    strategy: QuantStrategy,
-) -> (Vec<M31>, QuantParams) {
+pub fn quantize_bias_vector(data: &[f32], strategy: QuantStrategy) -> (Vec<M31>, QuantParams) {
     quantize_tensor(data, strategy)
 }
 

@@ -59,7 +59,10 @@ where
     Col<Src, F>: Column<F> + 'static,
     Col<Dst, F>: Column<F> + 'static,
 {
-    evals.into_iter().map(convert_evaluation::<Src, Dst, F>).collect()
+    evals
+        .into_iter()
+        .map(convert_evaluation::<Src, Dst, F>)
+        .collect()
 }
 
 // =============================================================================
@@ -118,8 +121,7 @@ impl ZkmlOps for stwo::prover::backend::simd::SimdBackend {
         use stwo::core::fields::FieldExpOps;
 
         use crate::components::matmul::{
-            matrix_to_mle_pub, matrix_to_mle_col_major_pub,
-            restrict_mle_pub, pad_matrix_pow2,
+            matrix_to_mle_col_major_pub, matrix_to_mle_pub, pad_matrix_pow2, restrict_mle_pub,
         };
 
         let a_padded = pad_matrix_pow2(a);
@@ -175,8 +177,16 @@ impl ZkmlOps for stwo::prover::backend::simd::SimdBackend {
             f_b_cur = new_fb;
         }
 
-        let final_a_eval = if f_a_cur.is_empty() { SecureField::zero() } else { f_a_cur[0] };
-        let final_b_eval = if f_b_cur.is_empty() { SecureField::zero() } else { f_b_cur[0] };
+        let final_a_eval = if f_a_cur.is_empty() {
+            SecureField::zero()
+        } else {
+            f_a_cur[0]
+        };
+        let final_b_eval = if f_b_cur.is_empty() {
+            SecureField::zero()
+        } else {
+            f_b_cur[0]
+        };
 
         Ok(MatMulReduction {
             round_polys,
@@ -197,7 +207,10 @@ impl ZkmlOps for stwo::prover::backend::simd::SimdBackend {
         mle: &[SecureField],
         assignments: &[SecureField],
     ) -> Result<Vec<SecureField>, String> {
-        Ok(crate::components::matmul::restrict_mle_pub(mle, assignments))
+        Ok(crate::components::matmul::restrict_mle_pub(
+            mle,
+            assignments,
+        ))
     }
 }
 
@@ -222,11 +235,21 @@ impl GpuThresholds {
             .unwrap_or(default)
     }
 
-    pub fn fft_fri() -> u32 { Self::env_override(Self::DEFAULT_FFT_FRI) }
-    pub fn quotient() -> u32 { Self::env_override(Self::DEFAULT_QUOTIENT) }
-    pub fn column_ops() -> u32 { Self::env_override(Self::DEFAULT_COLUMN_OPS) }
-    pub fn merkle() -> u32 { Self::env_override(Self::DEFAULT_MERKLE) }
-    pub fn mle() -> u32 { Self::env_override(Self::DEFAULT_MLE) }
+    pub fn fft_fri() -> u32 {
+        Self::env_override(Self::DEFAULT_FFT_FRI)
+    }
+    pub fn quotient() -> u32 {
+        Self::env_override(Self::DEFAULT_QUOTIENT)
+    }
+    pub fn column_ops() -> u32 {
+        Self::env_override(Self::DEFAULT_COLUMN_OPS)
+    }
+    pub fn merkle() -> u32 {
+        Self::env_override(Self::DEFAULT_MERKLE)
+    }
+    pub fn mle() -> u32 {
+        Self::env_override(Self::DEFAULT_MLE)
+    }
 
     // Keep const values for backwards compatibility in tests
     pub const FFT_FRI: u32 = 12;
@@ -352,7 +375,11 @@ impl BackendInfo {
         let device_count = if gpu_is_available() { 1 } else { 0 };
 
         Self {
-            name: if gpu_is_available() { "GpuBackend" } else { "SimdBackend" },
+            name: if gpu_is_available() {
+                "GpuBackend"
+            } else {
+                "SimdBackend"
+            },
             gpu_available: gpu_is_available(),
             gpu_device: gpu_device_name(),
             gpu_memory_bytes: gpu_available_memory(),
@@ -375,7 +402,7 @@ pub fn estimate_proof_memory(log_size: u32, num_columns: usize) -> usize {
     let row_bytes = 4; // M31 = 4 bytes
     let rows = 1usize << log_size;
     let blowup = 2; // default blowup factor
-    // columns × rows × blowup × (data + Merkle + scratch)
+                    // columns × rows × blowup × (data + Merkle + scratch)
     num_columns * rows * row_bytes * blowup * 3
 }
 
@@ -422,8 +449,7 @@ pub fn force_gpu() -> bool {
 /// ```
 pub fn with_best_backend<R>(
     f_simd: impl FnOnce() -> R,
-    #[allow(unused_variables)]
-    f_gpu: impl FnOnce() -> R,
+    #[allow(unused_variables)] f_gpu: impl FnOnce() -> R,
 ) -> R {
     #[cfg(feature = "cuda-runtime")]
     {
@@ -464,7 +490,10 @@ mod tests {
         let mem = estimate_proof_memory(16, 10);
         assert!(mem > 0);
         // 10 cols × 2^16 rows × 4 bytes × 2 blowup × 3 overhead = 10 × 65536 × 24 = ~15MB
-        assert!(mem < 100_000_000, "estimate should be < 100MB for log_size=16");
+        assert!(
+            mem < 100_000_000,
+            "estimate should be < 100MB for log_size=16"
+        );
     }
 
     #[test]
@@ -526,10 +555,7 @@ mod tests {
     #[test]
     fn test_with_best_backend() {
         // Without cuda-runtime, always uses simd path
-        let result = with_best_backend(
-            || "simd",
-            || "gpu",
-        );
+        let result = with_best_backend(|| "simd", || "gpu");
         // In test environment (no CUDA), should always pick simd
         assert_eq!(result, "simd");
     }

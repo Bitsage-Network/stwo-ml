@@ -125,7 +125,9 @@ pub fn build_batch_proof_output(
     // Hash all public inputs
     let mut pi_data: Vec<M31> = Vec::new();
     pi_data.push(M31::from_u32_unchecked(public_inputs.deposits.len() as u32));
-    pi_data.push(M31::from_u32_unchecked(public_inputs.withdrawals.len() as u32));
+    pi_data.push(M31::from_u32_unchecked(
+        public_inputs.withdrawals.len() as u32
+    ));
     pi_data.push(M31::from_u32_unchecked(public_inputs.spends.len() as u32));
     for d in &public_inputs.deposits {
         pi_data.extend_from_slice(&d.commitment);
@@ -247,20 +249,18 @@ pub fn parse_tx_file(contents: &str) -> Result<Vec<TxFileEntry>, String> {
             .as_u64()
             .ok_or_else(|| format!("tx[{i}]: missing 'amount'"))?;
         let asset_id = item["asset_id"].as_u64().unwrap_or(0) as u32;
-        let recipient_pubkey = item["recipient_pubkey"]
-            .as_array()
-            .and_then(|a| {
-                if a.len() >= 4 {
-                    Some([
-                        a[0].as_u64()? as u32,
-                        a[1].as_u64()? as u32,
-                        a[2].as_u64()? as u32,
-                        a[3].as_u64()? as u32,
-                    ])
-                } else {
-                    None
-                }
-            });
+        let recipient_pubkey = item["recipient_pubkey"].as_array().and_then(|a| {
+            if a.len() >= 4 {
+                Some([
+                    a[0].as_u64()? as u32,
+                    a[1].as_u64()? as u32,
+                    a[2].as_u64()? as u32,
+                    a[3].as_u64()? as u32,
+                ])
+            } else {
+                None
+            }
+        });
 
         entries.push(TxFileEntry {
             tx_type,

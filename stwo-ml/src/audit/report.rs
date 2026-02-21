@@ -13,9 +13,9 @@ use crate::audit::digest::{
     digest_to_hex, hash_bytes_m31, hash_felt_hex_m31, u64_to_m31, M31Digest, ZERO_DIGEST,
 };
 use crate::audit::types::{
-    AuditCommitments, AuditError, AuditReport, AuditSemanticSummary, BatchAuditResult,
-    BillingInfo, InferenceEntry, InferenceLogEntry, InferenceSummary, InfrastructureInfo,
-    ModelInfo, PrivacyInfo, ProofInfo, ReportMetadata, TimeWindow,
+    AuditCommitments, AuditError, AuditReport, AuditSemanticSummary, BatchAuditResult, BillingInfo,
+    InferenceEntry, InferenceLogEntry, InferenceSummary, InfrastructureInfo, ModelInfo,
+    PrivacyInfo, ProofInfo, ReportMetadata, TimeWindow,
 };
 use crate::crypto::poseidon2_m31::poseidon2_hash;
 

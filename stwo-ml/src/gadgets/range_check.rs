@@ -1,11 +1,11 @@
 //! Range check gadgets for bounding ML values within valid ranges.
 
 use stwo::core::fields::m31::{BaseField, M31};
+use stwo::core::poly::circle::CanonicCoset;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::{Col, Column, ColumnOps};
 use stwo::prover::poly::circle::CircleEvaluation;
 use stwo::prover::poly::BitReversedOrder;
-use stwo::core::poly::circle::CanonicCoset;
 
 use super::lookup_table::PrecomputedTable;
 
@@ -19,15 +19,27 @@ pub struct RangeCheckConfig {
 
 impl RangeCheckConfig {
     pub fn uint8() -> Self {
-        Self { min: 0, max: 255, log_size: 8 }
+        Self {
+            min: 0,
+            max: 255,
+            log_size: 8,
+        }
     }
 
     pub fn int8_unsigned() -> Self {
-        Self { min: 0, max: 255, log_size: 8 }
+        Self {
+            min: 0,
+            max: 255,
+            log_size: 8,
+        }
     }
 
     pub fn uint16() -> Self {
-        Self { min: 0, max: 65535, log_size: 16 }
+        Self {
+            min: 0,
+            max: 65535,
+            log_size: 16,
+        }
     }
 
     pub fn custom(min: u32, max: u32) -> Self {
@@ -102,7 +114,12 @@ pub fn generate_range_execution_trace<B: ColumnOps<BaseField>>(
     log_size: u32,
 ) -> Vec<CircleEvaluation<B, BaseField, BitReversedOrder>> {
     let size = 1usize << log_size;
-    assert!(values.len() <= size, "values ({}) exceed trace size ({})", values.len(), size);
+    assert!(
+        values.len() <= size,
+        "values ({}) exceed trace size ({})",
+        values.len(),
+        size
+    );
     assert!(multiplicities.len() <= size);
 
     let domain = CanonicCoset::new(log_size).circle_domain();
@@ -175,8 +192,12 @@ mod tests {
     fn test_compute_range_multiplicities() {
         let config = RangeCheckConfig::custom(0, 7);
         let values = vec![
-            M31::from(0), M31::from(0), M31::from(3),
-            M31::from(7), M31::from(3), M31::from(5),
+            M31::from(0),
+            M31::from(0),
+            M31::from(3),
+            M31::from(7),
+            M31::from(3),
+            M31::from(5),
         ];
         let mults = compute_range_multiplicities(&values, &config);
         assert_eq!(mults.len(), 8);

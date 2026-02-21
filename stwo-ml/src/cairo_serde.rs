@@ -35,18 +35,18 @@
 
 use starknet_ff::FieldElement;
 
+use stwo::core::channel::MerkleChannel;
 use stwo::core::fields::m31::{BaseField, M31};
 use stwo::core::fields::qm31::SecureField;
+use stwo::core::fri::{FriConfig, FriLayerProof, FriProof};
+use stwo::core::pcs::quotients::CommitmentSchemeProof;
 use stwo::core::pcs::PcsConfig;
 use stwo::core::pcs::TreeVec;
-use stwo::core::pcs::quotients::CommitmentSchemeProof;
-use stwo::core::fri::{FriConfig, FriProof, FriLayerProof};
-use stwo::core::proof::StarkProof;
 use stwo::core::poly::line::LinePoly;
+use stwo::core::proof::StarkProof;
 use stwo::core::vcs::blake2_hash::Blake2sHash;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
 use stwo::core::vcs_lifted::verifier::MerkleDecommitmentLifted;
-use stwo::core::channel::MerkleChannel;
 use stwo::core::ColumnVec;
 
 /// The lifted Merkle hasher type for Blake2s channel.
@@ -121,7 +121,11 @@ fn serialize_blake2s_hash(hash: &Blake2sHash, output: &mut Vec<FieldElement>) {
 // === Span/Array serialization ===
 
 /// Serialize a `Vec<T>` as a Cairo `Span<T>`: length prefix + elements.
-fn serialize_span<T>(items: &[T], serialize_item: impl Fn(&T, &mut Vec<FieldElement>), output: &mut Vec<FieldElement>) {
+fn serialize_span<T>(
+    items: &[T],
+    serialize_item: impl Fn(&T, &mut Vec<FieldElement>),
+    output: &mut Vec<FieldElement>,
+) {
     serialize_u32(items.len() as u32, output);
     for item in items {
         serialize_item(item, output);
@@ -403,10 +407,7 @@ pub fn serialize_matmul_sumcheck_proof(
 // Serializes an AggregatedModelProofOnChain into the felt252[] layout
 // matching the Cairo `MLProof` struct's Serde deserialization.
 
-use crate::aggregation::{
-    AggregatedModelProofOnChain, LayerClaim,
-    BatchedMatMulProofOnChain,
-};
+use crate::aggregation::{AggregatedModelProofOnChain, BatchedMatMulProofOnChain, LayerClaim};
 use crate::components::attention::AttentionProofOnChain;
 
 /// Metadata about the ML model, needed to construct the Cairo MLClaim.
@@ -430,10 +431,7 @@ pub struct MLClaimMetadata {
 /// - `trace_rows` (u32, 1 felt)
 ///
 /// Add/Mul are pure AIR (no LogUp), verified inside the unified STARK.
-fn serialize_elementwise_claim(
-    claim: &LayerClaim,
-    output: &mut Vec<FieldElement>,
-) {
+fn serialize_elementwise_claim(claim: &LayerClaim, output: &mut Vec<FieldElement>) {
     serialize_u32(claim.layer_index as u32, output);
     serialize_u32(claim.trace_rows as u32, output);
 }
@@ -447,10 +445,7 @@ fn serialize_elementwise_claim(
 ///
 /// LayerNorm uses LogUp for range-checking rsqrt values, so we include
 /// the claimed_sum for the verifier to check the LogUp argument.
-fn serialize_layernorm_claim(
-    claim: &LayerClaim,
-    output: &mut Vec<FieldElement>,
-) {
+fn serialize_layernorm_claim(claim: &LayerClaim, output: &mut Vec<FieldElement>) {
     serialize_u32(claim.layer_index as u32, output);
     serialize_u32(claim.trace_rows as u32, output);
     serialize_qm31(claim.claimed_sum, output);
@@ -463,10 +458,7 @@ fn serialize_layernorm_claim(
 /// - `trace_rows` (u32, 1 felt)
 ///
 /// Embedding is verified inside the unified STARK (pure AIR, no LogUp).
-fn serialize_embedding_claim(
-    claim: &LayerClaim,
-    output: &mut Vec<FieldElement>,
-) {
+fn serialize_embedding_claim(claim: &LayerClaim, output: &mut Vec<FieldElement>) {
     serialize_u32(claim.layer_index as u32, output);
     serialize_u32(claim.trace_rows as u32, output);
 }
@@ -748,13 +740,19 @@ fn serialize_activation_claim(claim: &ActivationClaimForSerde, output: &mut Vec<
 }
 
 /// Serialize an `ElementwiseComponentClaim` (2 felt252s: layer_index, log_size).
-fn serialize_elementwise_component_claim(claim: &ElementwiseClaimForSerde, output: &mut Vec<FieldElement>) {
+fn serialize_elementwise_component_claim(
+    claim: &ElementwiseClaimForSerde,
+    output: &mut Vec<FieldElement>,
+) {
     serialize_u32(claim.layer_index, output);
     serialize_u32(claim.log_size, output);
 }
 
 /// Serialize a `LayerNormComponentClaim` (2 felt252s: layer_index, log_size).
-fn serialize_layernorm_component_claim(claim: &LayerNormClaimForSerde, output: &mut Vec<FieldElement>) {
+fn serialize_layernorm_component_claim(
+    claim: &LayerNormClaimForSerde,
+    output: &mut Vec<FieldElement>,
+) {
     serialize_u32(claim.layer_index, output);
     serialize_u32(claim.log_size, output);
 }
@@ -861,13 +859,8 @@ fn serialize_unified_stark_proof(
 
 /// Convert the serialized felt252[] to a JSON array of hex strings,
 /// suitable for cairo-prove's `--arguments-file`.
-pub fn serialize_ml_proof_to_arguments_file(
-    felts: &[FieldElement],
-) -> String {
-    let hex_strings: Vec<String> = felts
-        .iter()
-        .map(|f| format!("\"0x{:x}\"", f))
-        .collect();
+pub fn serialize_ml_proof_to_arguments_file(felts: &[FieldElement]) -> String {
+    let hex_strings: Vec<String> = felts.iter().map(|f| format!("\"0x{:x}\"", f)).collect();
     format!("[{}]", hex_strings.join(","))
 }
 
@@ -1016,10 +1009,7 @@ use crate::components::tiled_matmul::TiledMatMulProof;
 /// Each tile proof uses the standard `serialize_matmul_sumcheck_proof` format.
 /// This allows the Cairo verifier to deserialize and verify each tile independently,
 /// then check `sum(tile_claimed_sums) == total_claimed_sum`.
-pub fn serialize_tiled_matmul_proof(
-    proof: &TiledMatMulProof,
-    output: &mut Vec<FieldElement>,
-) {
+pub fn serialize_tiled_matmul_proof(proof: &TiledMatMulProof, output: &mut Vec<FieldElement>) {
     serialize_u32(proof.m as u32, output);
     serialize_u32(proof.k as u32, output);
     serialize_u32(proof.n as u32, output);
@@ -1045,10 +1035,7 @@ pub fn serialize_tiled_matmul_proof(
 /// Serialize a GKR LogUp proof (activation/layernorm lookup arguments).
 ///
 /// Layout: `claimed_sum, num_rounds, [c0,c1,c2,c3]×num_rounds, w_eval, in_eval, out_eval, num_mults, [mult]×num_mults`
-fn serialize_logup_proof(
-    lup: &crate::gkr::types::LogUpProof,
-    output: &mut Vec<FieldElement>,
-) {
+fn serialize_logup_proof(lup: &crate::gkr::types::LogUpProof, output: &mut Vec<FieldElement>) {
     serialize_logup_proof_inner(lup, output, true)
 }
 
@@ -1089,17 +1076,18 @@ fn serialize_logup_proof_inner(
 /// Layout: `num_layers, [layer_proof]×num_layers, input_claim, weight_commitments, io_commitment`
 ///
 /// Layer proof tags: 0=MatMul, 1=Add, 2=Mul, 3=Activation, 4=LayerNorm, 5=Attention.
-pub fn serialize_gkr_model_proof(
-    proof: &crate::gkr::GKRProof,
-    output: &mut Vec<FieldElement>,
-) {
+pub fn serialize_gkr_model_proof(proof: &crate::gkr::GKRProof, output: &mut Vec<FieldElement>) {
     use crate::gkr::types::LayerProof;
 
     serialize_u32(proof.layer_proofs.len() as u32, output);
 
     for layer_proof in &proof.layer_proofs {
         match layer_proof {
-            LayerProof::MatMul { round_polys, final_a_eval, final_b_eval } => {
+            LayerProof::MatMul {
+                round_polys,
+                final_a_eval,
+                final_b_eval,
+            } => {
                 serialize_u32(0, output); // tag: MatMul
                 serialize_u32(round_polys.len() as u32, output);
                 for rp in round_polys {
@@ -1110,13 +1098,21 @@ pub fn serialize_gkr_model_proof(
                 serialize_qm31(*final_a_eval, output);
                 serialize_qm31(*final_b_eval, output);
             }
-            LayerProof::Add { lhs_eval, rhs_eval, trunk_idx } => {
+            LayerProof::Add {
+                lhs_eval,
+                rhs_eval,
+                trunk_idx,
+            } => {
                 serialize_u32(1, output); // tag: Add
                 serialize_qm31(*lhs_eval, output);
                 serialize_qm31(*rhs_eval, output);
                 serialize_u32(*trunk_idx as u32, output);
             }
-            LayerProof::Mul { eq_round_polys, lhs_eval, rhs_eval } => {
+            LayerProof::Mul {
+                eq_round_polys,
+                lhs_eval,
+                rhs_eval,
+            } => {
                 serialize_u32(2, output); // tag: Mul
                 serialize_u32(eq_round_polys.len() as u32, output);
                 for rp in eq_round_polys {
@@ -1129,10 +1125,14 @@ pub fn serialize_gkr_model_proof(
                 serialize_qm31(*rhs_eval, output);
             }
             LayerProof::Activation {
-                activation_type, logup_proof, input_eval, output_eval, table_commitment,
+                activation_type,
+                logup_proof,
+                input_eval,
+                output_eval,
+                table_commitment,
             } => {
                 serialize_u32(3, output); // tag: Activation
-                // CRITICAL: use type_tag(), NOT enum discriminant — prover mixes type_tag()
+                                          // CRITICAL: use type_tag(), NOT enum discriminant — prover mixes type_tag()
                 serialize_u32(activation_type.type_tag(), output);
                 serialize_qm31(*input_eval, output);
                 serialize_qm31(*output_eval, output);
@@ -1148,8 +1148,14 @@ pub fn serialize_gkr_model_proof(
                 }
             }
             LayerProof::LayerNorm {
-                logup_proof, linear_round_polys, linear_final_evals,
-                input_eval, output_eval, mean, rsqrt_var, rsqrt_table_commitment,
+                logup_proof,
+                linear_round_polys,
+                linear_final_evals,
+                input_eval,
+                output_eval,
+                mean,
+                rsqrt_var,
+                rsqrt_table_commitment,
                 simd_combined,
             } => {
                 serialize_u32(4, output); // tag: LayerNorm
@@ -1180,7 +1186,10 @@ pub fn serialize_gkr_model_proof(
                     }
                 }
             }
-            LayerProof::Attention { sub_proofs, sub_claim_values } => {
+            LayerProof::Attention {
+                sub_proofs,
+                sub_claim_values,
+            } => {
                 serialize_u32(5, output); // tag: Attention
                 serialize_u32(sub_proofs.len() as u32, output);
                 // Serialize sub_claim_values
@@ -1208,7 +1217,10 @@ pub fn serialize_gkr_model_proof(
                 }
             }
             LayerProof::Dequantize {
-                logup_proof, input_eval, output_eval, table_commitment,
+                logup_proof,
+                input_eval,
+                output_eval,
+                table_commitment,
             } => {
                 serialize_u32(6, output); // tag: Dequantize
                 serialize_qm31(*input_eval, output);
@@ -1284,7 +1296,10 @@ pub fn serialize_gkr_model_proof(
                 }
             }
             LayerProof::MatMulDualSimd {
-                round_polys, final_a_eval, final_b_eval, n_block_vars,
+                round_polys,
+                final_a_eval,
+                final_b_eval,
+                n_block_vars,
             } => {
                 serialize_u32(7, output); // tag: MatMulDualSimd
                 serialize_u32(*n_block_vars as u32, output);
@@ -1300,9 +1315,15 @@ pub fn serialize_gkr_model_proof(
             }
 
             LayerProof::RMSNorm {
-                logup_proof, linear_round_polys, linear_final_evals,
-                input_eval, output_eval, rms_sq_eval, rsqrt_eval,
-                rsqrt_table_commitment, simd_combined,
+                logup_proof,
+                linear_round_polys,
+                linear_final_evals,
+                input_eval,
+                output_eval,
+                rms_sq_eval,
+                rsqrt_eval,
+                rsqrt_table_commitment,
+                simd_combined,
             } => {
                 serialize_u32(8, output); // tag: RMSNorm
                 serialize_qm31(*input_eval, output);
@@ -1371,15 +1392,16 @@ pub fn serialize_gkr_model_proof(
 /// This omits the header (num_layers) and footer (input_claim, weight_commitments,
 /// io_commitment) that `serialize_gkr_model_proof` includes. Used to produce
 /// the `proof_data: Array<felt252>` parameter for the contract's `verify_model_gkr()`.
-pub fn serialize_gkr_proof_data_only(
-    proof: &crate::gkr::GKRProof,
-    output: &mut Vec<FieldElement>,
-) {
+pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut Vec<FieldElement>) {
     use crate::gkr::types::LayerProof;
 
     for layer_proof in &proof.layer_proofs {
         match layer_proof {
-            LayerProof::MatMul { round_polys, final_a_eval, final_b_eval } => {
+            LayerProof::MatMul {
+                round_polys,
+                final_a_eval,
+                final_b_eval,
+            } => {
                 serialize_u32(0, output);
                 serialize_u32(round_polys.len() as u32, output);
                 for rp in round_polys {
@@ -1390,13 +1412,21 @@ pub fn serialize_gkr_proof_data_only(
                 serialize_qm31(*final_a_eval, output);
                 serialize_qm31(*final_b_eval, output);
             }
-            LayerProof::Add { lhs_eval, rhs_eval, trunk_idx } => {
+            LayerProof::Add {
+                lhs_eval,
+                rhs_eval,
+                trunk_idx,
+            } => {
                 serialize_u32(1, output);
                 serialize_qm31(*lhs_eval, output);
                 serialize_qm31(*rhs_eval, output);
                 serialize_u32(*trunk_idx as u32, output);
             }
-            LayerProof::Mul { eq_round_polys, lhs_eval, rhs_eval } => {
+            LayerProof::Mul {
+                eq_round_polys,
+                lhs_eval,
+                rhs_eval,
+            } => {
                 serialize_u32(2, output);
                 serialize_u32(eq_round_polys.len() as u32, output);
                 for rp in eq_round_polys {
@@ -1409,7 +1439,11 @@ pub fn serialize_gkr_proof_data_only(
                 serialize_qm31(*rhs_eval, output);
             }
             LayerProof::Activation {
-                activation_type, logup_proof, input_eval, output_eval, table_commitment,
+                activation_type,
+                logup_proof,
+                input_eval,
+                output_eval,
+                table_commitment,
             } => {
                 serialize_u32(3, output);
                 // CRITICAL: use type_tag(), NOT enum discriminant — prover mixes type_tag()
@@ -1427,8 +1461,14 @@ pub fn serialize_gkr_proof_data_only(
                 }
             }
             LayerProof::LayerNorm {
-                logup_proof, linear_round_polys, linear_final_evals,
-                input_eval, output_eval, mean, rsqrt_var, rsqrt_table_commitment,
+                logup_proof,
+                linear_round_polys,
+                linear_final_evals,
+                input_eval,
+                output_eval,
+                mean,
+                rsqrt_var,
+                rsqrt_table_commitment,
                 simd_combined,
             } => {
                 serialize_u32(4, output);
@@ -1456,7 +1496,10 @@ pub fn serialize_gkr_proof_data_only(
                     None => serialize_u32(0, output),
                 }
             }
-            LayerProof::Attention { sub_proofs, sub_claim_values } => {
+            LayerProof::Attention {
+                sub_proofs,
+                sub_claim_values,
+            } => {
                 serialize_u32(5, output);
                 serialize_u32(sub_proofs.len() as u32, output);
                 for val in sub_claim_values {
@@ -1482,7 +1525,10 @@ pub fn serialize_gkr_proof_data_only(
                 }
             }
             LayerProof::Dequantize {
-                logup_proof, input_eval, output_eval, table_commitment,
+                logup_proof,
+                input_eval,
+                output_eval,
+                table_commitment,
             } => {
                 serialize_u32(6, output);
                 serialize_qm31(*input_eval, output);
@@ -1556,7 +1602,10 @@ pub fn serialize_gkr_proof_data_only(
                 }
             }
             LayerProof::MatMulDualSimd {
-                round_polys, final_a_eval, final_b_eval, n_block_vars,
+                round_polys,
+                final_a_eval,
+                final_b_eval,
+                n_block_vars,
             } => {
                 serialize_u32(7, output);
                 serialize_u32(*n_block_vars as u32, output);
@@ -1571,9 +1620,15 @@ pub fn serialize_gkr_proof_data_only(
                 serialize_qm31(*final_b_eval, output);
             }
             LayerProof::RMSNorm {
-                logup_proof, linear_round_polys, linear_final_evals,
-                input_eval, output_eval, rms_sq_eval, rsqrt_eval,
-                rsqrt_table_commitment, simd_combined,
+                logup_proof,
+                linear_round_polys,
+                linear_final_evals,
+                input_eval,
+                output_eval,
+                rms_sq_eval,
+                rsqrt_eval,
+                rsqrt_table_commitment,
+                simd_combined,
             } => {
                 serialize_u32(8, output);
                 serialize_qm31(*input_eval, output);
@@ -1614,7 +1669,12 @@ pub fn serialize_gkr_proof_data_only(
         serialize_u32(k as u32, output);
         serialize_u32(n as u32, output);
         // MatMul sumcheck proof (same format as Tag 0 but without the tag)
-        if let LayerProof::MatMul { round_polys, final_a_eval, final_b_eval } = &deferred.layer_proof {
+        if let LayerProof::MatMul {
+            round_polys,
+            final_a_eval,
+            final_b_eval,
+        } = &deferred.layer_proof
+        {
             serialize_u32(round_polys.len() as u32, output);
             for rp in round_polys {
                 serialize_qm31(rp.c0, output);
@@ -1625,7 +1685,11 @@ pub fn serialize_gkr_proof_data_only(
             serialize_qm31(*final_b_eval, output);
         }
         // Weight commitment
-        output.push(deferred.weight_commitment().unwrap_or(starknet_ff::FieldElement::ZERO));
+        output.push(
+            deferred
+                .weight_commitment()
+                .unwrap_or(starknet_ff::FieldElement::ZERO),
+        );
     }
 }
 
@@ -1662,8 +1726,8 @@ pub fn serialize_stwo_gkr_batch_proof(
     n_variables: &[usize],
     output: &mut Vec<FieldElement>,
 ) {
-    use stwo::prover::lookups::gkr_verifier::Gate;
     use std::ops::Deref;
+    use stwo::prover::lookups::gkr_verifier::Gate;
 
     let n_instances = proof.output_claims_by_instance.len();
 
@@ -1702,10 +1766,26 @@ pub fn serialize_stwo_gkr_batch_proof(
             // UnivariatePoly implements Deref<Target=[SecureField]> for coefficients
             let coeffs: &[SecureField] = poly.deref();
             let num_coeffs = coeffs.len();
-            let c0 = if num_coeffs > 0 { coeffs[0] } else { SecureField::default() };
-            let c1 = if num_coeffs > 1 { coeffs[1] } else { SecureField::default() };
-            let c2 = if num_coeffs > 2 { coeffs[2] } else { SecureField::default() };
-            let c3 = if num_coeffs > 3 { coeffs[3] } else { SecureField::default() };
+            let c0 = if num_coeffs > 0 {
+                coeffs[0]
+            } else {
+                SecureField::default()
+            };
+            let c1 = if num_coeffs > 1 {
+                coeffs[1]
+            } else {
+                SecureField::default()
+            };
+            let c2 = if num_coeffs > 2 {
+                coeffs[2]
+            } else {
+                SecureField::default()
+            };
+            let c3 = if num_coeffs > 3 {
+                coeffs[3]
+            } else {
+                SecureField::default()
+            };
             serialize_qm31(c0, output);
             serialize_qm31(c1, output);
             serialize_qm31(c2, output);
@@ -1835,7 +1915,10 @@ mod tests {
         use stwo::core::fields::cm31::CM31;
         use stwo::core::fields::qm31::QM31;
 
-        let val = QM31(CM31(M31::from(1), M31::from(2)), CM31(M31::from(3), M31::from(4)));
+        let val = QM31(
+            CM31(M31::from(1), M31::from(2)),
+            CM31(M31::from(3), M31::from(4)),
+        );
         let mut out = Vec::new();
         serialize_qm31(val, &mut out);
         assert_eq!(out.len(), 4);
@@ -1916,26 +1999,34 @@ mod tests {
     #[test]
     fn test_serialize_real_proof_calldata() {
         // Generate a real proof using the activation layer prover
-        use stwo::prover::backend::simd::SimdBackend;
         use crate::compiler::prove::prove_activation_layer;
-        use crate::gadgets::lookup_table::PrecomputedTable;
         use crate::gadgets::lookup_table::activations;
+        use crate::gadgets::lookup_table::PrecomputedTable;
+        use stwo::prover::backend::simd::SimdBackend;
 
         let table = PrecomputedTable::build(activations::relu, 4);
         let inputs = vec![M31::from(0), M31::from(1), M31::from(3), M31::from(5)];
         let outputs: Vec<M31> = inputs.iter().map(|&x| activations::relu(x)).collect();
 
         let config = PcsConfig::default();
-        let (_component, proof) = prove_activation_layer::<SimdBackend, Blake2sMerkleChannel>(&inputs, &outputs, &table, config)
-            .expect("proving should succeed");
+        let (_component, proof) = prove_activation_layer::<SimdBackend, Blake2sMerkleChannel>(
+            &inputs, &outputs, &table, config,
+        )
+        .expect("proving should succeed");
 
         // Serialize the proof
         let calldata = serialize_proof(&proof);
 
         // Verify it's non-empty and reasonable size
         assert!(!calldata.is_empty(), "calldata should be non-empty");
-        assert!(calldata.len() > 20, "calldata should have meaningful content");
-        assert!(calldata.len() < 100_000, "calldata shouldn't be absurdly large");
+        assert!(
+            calldata.len() > 20,
+            "calldata should have meaningful content"
+        );
+        assert!(
+            calldata.len() < 100_000,
+            "calldata shouldn't be absurdly large"
+        );
 
         // Verify the first 4 felts are PcsConfig
         let estimated = estimate_calldata_size(&proof);
@@ -1950,9 +2041,18 @@ mod tests {
         use stwo::core::fields::qm31::QM31;
 
         let rp = RoundPoly {
-            c0: QM31(CM31(M31::from(1), M31::from(2)), CM31(M31::from(3), M31::from(4))),
-            c1: QM31(CM31(M31::from(5), M31::from(6)), CM31(M31::from(7), M31::from(8))),
-            c2: QM31(CM31(M31::from(9), M31::from(10)), CM31(M31::from(11), M31::from(12))),
+            c0: QM31(
+                CM31(M31::from(1), M31::from(2)),
+                CM31(M31::from(3), M31::from(4)),
+            ),
+            c1: QM31(
+                CM31(M31::from(5), M31::from(6)),
+                CM31(M31::from(7), M31::from(8)),
+            ),
+            c2: QM31(
+                CM31(M31::from(9), M31::from(10)),
+                CM31(M31::from(11), M31::from(12)),
+            ),
         };
 
         let mut out = Vec::new();
@@ -1965,15 +2065,19 @@ mod tests {
 
     #[test]
     fn test_serialize_matmul_sumcheck_field_order() {
-        use crate::components::matmul::{M31Matrix, matmul_m31, prove_matmul_sumcheck_onchain};
+        use crate::components::matmul::{matmul_m31, prove_matmul_sumcheck_onchain, M31Matrix};
 
         let mut a = M31Matrix::new(2, 2);
-        a.set(0, 0, M31::from(1)); a.set(0, 1, M31::from(2));
-        a.set(1, 0, M31::from(3)); a.set(1, 1, M31::from(4));
+        a.set(0, 0, M31::from(1));
+        a.set(0, 1, M31::from(2));
+        a.set(1, 0, M31::from(3));
+        a.set(1, 1, M31::from(4));
 
         let mut b = M31Matrix::new(2, 2);
-        b.set(0, 0, M31::from(5)); b.set(0, 1, M31::from(6));
-        b.set(1, 0, M31::from(7)); b.set(1, 1, M31::from(8));
+        b.set(0, 0, M31::from(5));
+        b.set(0, 1, M31::from(6));
+        b.set(1, 0, M31::from(7));
+        b.set(1, 1, M31::from(8));
 
         let c = matmul_m31(&a, &b);
         let proof = prove_matmul_sumcheck_onchain(&a, &b, &c).unwrap();
@@ -1986,10 +2090,14 @@ mod tests {
         assert_eq!(out[1], FieldElement::from(2u64)); // k
         assert_eq!(out[2], FieldElement::from(2u64)); // n
         assert_eq!(out[3], FieldElement::from(1u64)); // num_rounds (log2(2) = 1)
-        // out[4..8] = claimed_sum (4 felts for QM31)
+                                                      // out[4..8] = claimed_sum (4 felts for QM31)
 
         // Total should be non-trivially large
-        assert!(out.len() > 20, "serialized proof too small: {} felts", out.len());
+        assert!(
+            out.len() > 20,
+            "serialized proof too small: {} felts",
+            out.len()
+        );
     }
 
     #[test]
@@ -2014,7 +2122,11 @@ mod tests {
         serialize_mle_opening_proof(&proof, &mut out);
 
         // Should contain: intermediate_roots array, queries array, final_value
-        assert!(out.len() > 4, "serialized MLE proof too small: {} felts", out.len());
+        assert!(
+            out.len() > 4,
+            "serialized MLE proof too small: {} felts",
+            out.len()
+        );
 
         // Last 4 felts should be final_value (QM31)
         let fv_start = out.len() - 4;
@@ -2025,15 +2137,19 @@ mod tests {
 
     #[test]
     fn test_serialize_ml_proof_for_recursive_structure() {
-        use crate::components::matmul::{M31Matrix, matmul_m31, prove_matmul_sumcheck_onchain};
+        use crate::components::matmul::{matmul_m31, prove_matmul_sumcheck_onchain, M31Matrix};
 
         let mut a = M31Matrix::new(2, 2);
-        a.set(0, 0, M31::from(1)); a.set(0, 1, M31::from(2));
-        a.set(1, 0, M31::from(3)); a.set(1, 1, M31::from(4));
+        a.set(0, 0, M31::from(1));
+        a.set(0, 1, M31::from(2));
+        a.set(1, 0, M31::from(3));
+        a.set(1, 1, M31::from(4));
 
         let mut b = M31Matrix::new(2, 2);
-        b.set(0, 0, M31::from(5)); b.set(0, 1, M31::from(6));
-        b.set(1, 0, M31::from(7)); b.set(1, 1, M31::from(8));
+        b.set(0, 0, M31::from(5));
+        b.set(0, 1, M31::from(6));
+        b.set(1, 0, M31::from(7));
+        b.set(1, 1, M31::from(8));
 
         let c = matmul_m31(&a, &b);
         let matmul_proof = prove_matmul_sumcheck_onchain(&a, &b, &c).unwrap();
@@ -2079,7 +2195,11 @@ mod tests {
         // MLClaim: model_id(1) + num_layers(1) + activation_type(1) + io_commitment(1) + weight_commitment(1) = 5
         assert_eq!(felts[0], FieldElement::from(0x42u64), "model_id");
         assert_eq!(felts[1], FieldElement::from(1u64), "num_layers");
-        assert_eq!(felts[2], FieldElement::from(0u64), "activation_type (ReLU=0)");
+        assert_eq!(
+            felts[2],
+            FieldElement::from(0u64),
+            "activation_type (ReLU=0)"
+        );
         assert_eq!(felts[3], FieldElement::from(0xdeadbeefu64), "io_commitment");
         assert_eq!(felts[4], FieldElement::from(0xcafeu64), "weight_commitment");
 
@@ -2093,14 +2213,38 @@ mod tests {
         assert_eq!(felts[9], FieldElement::from(1u64), "num_rounds");
 
         // Total should be reasonable
-        assert!(felts.len() > 20, "serialized too small: {} felts", felts.len());
+        assert!(
+            felts.len() > 20,
+            "serialized too small: {} felts",
+            felts.len()
+        );
 
         // Trailing sections: unified_stark(0), add_claims(0), mul_claims(0), layernorm_claims(0), tee(0)
-        assert_eq!(felts[felts.len() - 5], FieldElement::ZERO, "unified_stark_proof = None");
-        assert_eq!(felts[felts.len() - 4], FieldElement::ZERO, "add_claims count = 0");
-        assert_eq!(felts[felts.len() - 3], FieldElement::ZERO, "mul_claims count = 0");
-        assert_eq!(felts[felts.len() - 2], FieldElement::ZERO, "layernorm_claims count = 0");
-        assert_eq!(felts[felts.len() - 1], FieldElement::ZERO, "tee_attestation_hash = None");
+        assert_eq!(
+            felts[felts.len() - 5],
+            FieldElement::ZERO,
+            "unified_stark_proof = None"
+        );
+        assert_eq!(
+            felts[felts.len() - 4],
+            FieldElement::ZERO,
+            "add_claims count = 0"
+        );
+        assert_eq!(
+            felts[felts.len() - 3],
+            FieldElement::ZERO,
+            "mul_claims count = 0"
+        );
+        assert_eq!(
+            felts[felts.len() - 2],
+            FieldElement::ZERO,
+            "layernorm_claims count = 0"
+        );
+        assert_eq!(
+            felts[felts.len() - 1],
+            FieldElement::ZERO,
+            "tee_attestation_hash = None"
+        );
 
         // Test arguments file generation
         let json = serialize_ml_proof_to_arguments_file(&felts);
@@ -2110,11 +2254,13 @@ mod tests {
 
     #[test]
     fn test_serialize_ml_proof_with_salt() {
-        use crate::components::matmul::{M31Matrix, matmul_m31, prove_matmul_sumcheck_onchain};
+        use crate::components::matmul::{matmul_m31, prove_matmul_sumcheck_onchain, M31Matrix};
 
         let mut a = M31Matrix::new(2, 2);
-        a.set(0, 0, M31::from(1)); a.set(0, 1, M31::from(0));
-        a.set(1, 0, M31::from(0)); a.set(1, 1, M31::from(1));
+        a.set(0, 0, M31::from(1));
+        a.set(0, 1, M31::from(0));
+        a.set(1, 0, M31::from(0));
+        a.set(1, 1, M31::from(1));
         let c = matmul_m31(&a, &a);
         let matmul_proof = prove_matmul_sumcheck_onchain(&a, &a, &c).unwrap();
 
@@ -2163,23 +2309,71 @@ mod tests {
 
         // Both end with: unified_stark(0), add_claims(0), mul_claims(0), layernorm_claims(0), embedding(0), attention(0), tee(0)
         assert_eq!(no_salt[no_salt.len() - 1], FieldElement::ZERO, "tee = None");
-        assert_eq!(no_salt[no_salt.len() - 2], FieldElement::ZERO, "attention_proofs = 0");
-        assert_eq!(no_salt[no_salt.len() - 3], FieldElement::ZERO, "embedding_claims = 0");
-        assert_eq!(no_salt[no_salt.len() - 4], FieldElement::ZERO, "layernorm_claims = 0");
-        assert_eq!(no_salt[no_salt.len() - 5], FieldElement::ZERO, "mul_claims = 0");
-        assert_eq!(no_salt[no_salt.len() - 6], FieldElement::ZERO, "add_claims = 0");
-        assert_eq!(no_salt[no_salt.len() - 7], FieldElement::ZERO, "unified_stark = None");
+        assert_eq!(
+            no_salt[no_salt.len() - 2],
+            FieldElement::ZERO,
+            "attention_proofs = 0"
+        );
+        assert_eq!(
+            no_salt[no_salt.len() - 3],
+            FieldElement::ZERO,
+            "embedding_claims = 0"
+        );
+        assert_eq!(
+            no_salt[no_salt.len() - 4],
+            FieldElement::ZERO,
+            "layernorm_claims = 0"
+        );
+        assert_eq!(
+            no_salt[no_salt.len() - 5],
+            FieldElement::ZERO,
+            "mul_claims = 0"
+        );
+        assert_eq!(
+            no_salt[no_salt.len() - 6],
+            FieldElement::ZERO,
+            "add_claims = 0"
+        );
+        assert_eq!(
+            no_salt[no_salt.len() - 7],
+            FieldElement::ZERO,
+            "unified_stark = None"
+        );
 
-        assert_eq!(with_salt[with_salt.len() - 1], FieldElement::ZERO, "tee = None");
-        assert_eq!(with_salt[with_salt.len() - 4], FieldElement::ZERO, "layernorm_claims = 0");
-        assert_eq!(with_salt[with_salt.len() - 7], FieldElement::ZERO, "unified_stark = None");
+        assert_eq!(
+            with_salt[with_salt.len() - 1],
+            FieldElement::ZERO,
+            "tee = None"
+        );
+        assert_eq!(
+            with_salt[with_salt.len() - 4],
+            FieldElement::ZERO,
+            "layernorm_claims = 0"
+        );
+        assert_eq!(
+            with_salt[with_salt.len() - 7],
+            FieldElement::ZERO,
+            "unified_stark = None"
+        );
 
         // no_salt layout ends: ..., channel_salt=None(0), unified_stark=None(0), add(0), mul(0), layernorm(0), embedding(0), attention(0), tee(0)
-        assert_eq!(no_salt[no_salt.len() - 8], FieldElement::ZERO, "channel_salt = None");
+        assert_eq!(
+            no_salt[no_salt.len() - 8],
+            FieldElement::ZERO,
+            "channel_salt = None"
+        );
 
         // with_salt layout ends: ..., channel_salt=Some(1), 12345, unified_stark=None(0), add(0), mul(0), layernorm(0), embedding(0), attention(0), tee(0)
-        assert_eq!(with_salt[with_salt.len() - 9], FieldElement::from(1u64), "channel_salt = Some");
-        assert_eq!(with_salt[with_salt.len() - 8], FieldElement::from(12345u64), "salt value");
+        assert_eq!(
+            with_salt[with_salt.len() - 9],
+            FieldElement::from(1u64),
+            "channel_salt = Some"
+        );
+        assert_eq!(
+            with_salt[with_salt.len() - 8],
+            FieldElement::from(12345u64),
+            "salt value"
+        );
     }
 
     #[test]
@@ -2222,19 +2416,23 @@ mod tests {
 
     #[test]
     fn test_serialize_ml_proof_activation_none_vs_some_size() {
-        use crate::components::matmul::{M31Matrix, matmul_m31, prove_matmul_sumcheck_onchain};
-        use stwo::prover::backend::simd::SimdBackend;
         use crate::compiler::prove::prove_activation_layer;
-        use crate::gadgets::lookup_table::PrecomputedTable;
+        use crate::components::matmul::{matmul_m31, prove_matmul_sumcheck_onchain, M31Matrix};
         use crate::gadgets::lookup_table::activations;
+        use crate::gadgets::lookup_table::PrecomputedTable;
+        use stwo::prover::backend::simd::SimdBackend;
 
         // Create a matmul proof for the base
         let mut a = M31Matrix::new(2, 2);
-        a.set(0, 0, M31::from(1)); a.set(0, 1, M31::from(2));
-        a.set(1, 0, M31::from(3)); a.set(1, 1, M31::from(4));
+        a.set(0, 0, M31::from(1));
+        a.set(0, 1, M31::from(2));
+        a.set(1, 0, M31::from(3));
+        a.set(1, 1, M31::from(4));
         let mut b = M31Matrix::new(2, 2);
-        b.set(0, 0, M31::from(5)); b.set(0, 1, M31::from(6));
-        b.set(1, 0, M31::from(7)); b.set(1, 1, M31::from(8));
+        b.set(0, 0, M31::from(5));
+        b.set(0, 1, M31::from(6));
+        b.set(1, 0, M31::from(7));
+        b.set(1, 1, M31::from(8));
         let c_mat = matmul_m31(&a, &b);
         let matmul_proof = prove_matmul_sumcheck_onchain(&a, &b, &c_mat).unwrap();
 
@@ -2243,9 +2441,11 @@ mod tests {
         let inputs = vec![M31::from(0), M31::from(1), M31::from(3), M31::from(5)];
         let outputs: Vec<M31> = inputs.iter().map(|&x| activations::relu(x)).collect();
         let config = PcsConfig::default();
-        let (_component, activation_proof) = prove_activation_layer::<SimdBackend, Blake2sMerkleChannel>(
-            &inputs, &outputs, &table, config,
-        ).expect("proving should succeed");
+        let (_component, activation_proof) = prove_activation_layer::<
+            SimdBackend,
+            Blake2sMerkleChannel,
+        >(&inputs, &outputs, &table, config)
+        .expect("proving should succeed");
 
         let metadata = MLClaimMetadata {
             model_id: FieldElement::from(0x42u64),
@@ -2326,35 +2526,63 @@ mod tests {
         );
 
         // None ends with: channel_salt=None(0), unified_stark=None(0), add(0), mul(0), layernorm(0), embedding(0), attention(0), tee(0)
-        assert_eq!(felts_none[felts_none.len() - 1], FieldElement::ZERO, "tee = None");
-        assert_eq!(felts_none[felts_none.len() - 4], FieldElement::ZERO, "layernorm_claims = 0");
-        assert_eq!(felts_none[felts_none.len() - 7], FieldElement::ZERO, "unified_stark = None");
-        assert_eq!(felts_none[felts_none.len() - 8], FieldElement::ZERO, "channel_salt = None");
+        assert_eq!(
+            felts_none[felts_none.len() - 1],
+            FieldElement::ZERO,
+            "tee = None"
+        );
+        assert_eq!(
+            felts_none[felts_none.len() - 4],
+            FieldElement::ZERO,
+            "layernorm_claims = 0"
+        );
+        assert_eq!(
+            felts_none[felts_none.len() - 7],
+            FieldElement::ZERO,
+            "unified_stark = None"
+        );
+        assert_eq!(
+            felts_none[felts_none.len() - 8],
+            FieldElement::ZERO,
+            "channel_salt = None"
+        );
 
         // Some path: both share the same prefix up to channel_salt
         // The None path is: [MLClaim(5) + matmul_array + batched(0) + channel_salt(1) + activation_none(1) + add(0) + mul(0) + layernorm(0) + embedding(0) + attention(0) + tee(0)]
         // The Some path is: [MLClaim(5) + matmul_array + batched(0) + channel_salt(1) + activation_some(1) + data... + add(0) + mul(0) + layernorm(0) + embedding(0) + attention(0) + tee(0)]
         // The divergence point is at felts_none.len() - 7 (activation discriminant)
         let diverge_idx = felts_none.len() - 7;
-        assert_eq!(felts_none[diverge_idx], FieldElement::ZERO, "None discriminant");
-        assert_eq!(felts_some[diverge_idx], FieldElement::from(1u64), "Some discriminant");
+        assert_eq!(
+            felts_none[diverge_idx],
+            FieldElement::ZERO,
+            "None discriminant"
+        );
+        assert_eq!(
+            felts_some[diverge_idx],
+            FieldElement::from(1u64),
+            "Some discriminant"
+        );
     }
 
     #[test]
     fn test_serialize_unified_stark_proof_with_real_proof() {
-        use crate::components::matmul::{M31Matrix, matmul_m31, prove_matmul_sumcheck_onchain};
-        use stwo::prover::backend::simd::SimdBackend;
         use crate::compiler::prove::prove_activation_layer;
-        use crate::gadgets::lookup_table::PrecomputedTable;
+        use crate::components::matmul::{matmul_m31, prove_matmul_sumcheck_onchain, M31Matrix};
         use crate::gadgets::lookup_table::activations;
+        use crate::gadgets::lookup_table::PrecomputedTable;
+        use stwo::prover::backend::simd::SimdBackend;
 
         // Create matmul proof
         let mut a = M31Matrix::new(2, 2);
-        a.set(0, 0, M31::from(1)); a.set(0, 1, M31::from(2));
-        a.set(1, 0, M31::from(3)); a.set(1, 1, M31::from(4));
+        a.set(0, 0, M31::from(1));
+        a.set(0, 1, M31::from(2));
+        a.set(1, 0, M31::from(3));
+        a.set(1, 1, M31::from(4));
         let mut b = M31Matrix::new(2, 2);
-        b.set(0, 0, M31::from(5)); b.set(0, 1, M31::from(6));
-        b.set(1, 0, M31::from(7)); b.set(1, 1, M31::from(8));
+        b.set(0, 0, M31::from(5));
+        b.set(0, 1, M31::from(6));
+        b.set(1, 0, M31::from(7));
+        b.set(1, 1, M31::from(8));
         let c_mat = matmul_m31(&a, &b);
         let matmul_proof = prove_matmul_sumcheck_onchain(&a, &b, &c_mat).unwrap();
 
@@ -2363,9 +2591,11 @@ mod tests {
         let inputs = vec![M31::from(0), M31::from(1), M31::from(3), M31::from(5)];
         let outputs: Vec<M31> = inputs.iter().map(|&x| activations::relu(x)).collect();
         let config = PcsConfig::default();
-        let (_component, activation_proof) = prove_activation_layer::<SimdBackend, Blake2sMerkleChannel>(
-            &inputs, &outputs, &table, config,
-        ).expect("proving should succeed");
+        let (_component, activation_proof) = prove_activation_layer::<
+            SimdBackend,
+            Blake2sMerkleChannel,
+        >(&inputs, &outputs, &table, config)
+        .expect("proving should succeed");
 
         let activation_claims = vec![LayerClaim {
             layer_index: 0,
@@ -2418,11 +2648,19 @@ mod tests {
         idx += 1;
         assert_eq!(felts[idx], FieldElement::from(1u64), "num_layers");
         idx += 1;
-        assert_eq!(felts[idx], FieldElement::from(0u64), "activation_type (ReLU=0)");
+        assert_eq!(
+            felts[idx],
+            FieldElement::from(0u64),
+            "activation_type (ReLU=0)"
+        );
         idx += 1;
         assert_eq!(felts[idx], FieldElement::from(0x111u64), "io_commitment");
         idx += 1;
-        assert_eq!(felts[idx], FieldElement::from(0x222u64), "weight_commitment");
+        assert_eq!(
+            felts[idx],
+            FieldElement::from(0x222u64),
+            "weight_commitment"
+        );
         idx += 1;
 
         // Field 2: matmul_proofs array (length=1)
@@ -2439,7 +2677,11 @@ mod tests {
         idx += matmul_felts;
 
         // Field 2b: batched_matmul_proofs array (length=0)
-        assert_eq!(felts[idx], FieldElement::ZERO, "batched_matmul_proofs length = 0");
+        assert_eq!(
+            felts[idx],
+            FieldElement::ZERO,
+            "batched_matmul_proofs length = 0"
+        );
         idx += 1;
 
         // Field 3: channel_salt = Option::None (1 felt = 0)
@@ -2452,22 +2694,42 @@ mod tests {
 
         // Inside UnifiedStarkProof:
         // 4.1: activation_claims array (length=1)
-        assert_eq!(felts[idx], FieldElement::from(1u64), "activation_claims length");
+        assert_eq!(
+            felts[idx],
+            FieldElement::from(1u64),
+            "activation_claims length"
+        );
         idx += 1;
         // Each ActivationClaim = 3 felts: layer_index(0), log_size(ilog2(4)=2), activation_type(0)
         assert_eq!(felts[idx], FieldElement::from(0u64), "claim.layer_index");
         idx += 1;
-        assert_eq!(felts[idx], FieldElement::from(2u64), "claim.log_size (ilog2(4))");
+        assert_eq!(
+            felts[idx],
+            FieldElement::from(2u64),
+            "claim.log_size (ilog2(4))"
+        );
         idx += 1;
-        assert_eq!(felts[idx], FieldElement::from(0u64), "claim.activation_type (ReLU)");
+        assert_eq!(
+            felts[idx],
+            FieldElement::from(0u64),
+            "claim.activation_type (ReLU)"
+        );
         idx += 1;
 
         // 4.2: activation_interaction_claims array (length=1)
-        assert_eq!(felts[idx], FieldElement::from(1u64), "activation_interaction_claims length");
+        assert_eq!(
+            felts[idx],
+            FieldElement::from(1u64),
+            "activation_interaction_claims length"
+        );
         idx += 1;
         // Each interaction claim = 4 felts (QM31 claimed_sum = default = 0,0,0,0)
         for i in 0..4 {
-            assert_eq!(felts[idx + i], FieldElement::ZERO, "activation_interaction_claim[{i}]");
+            assert_eq!(
+                felts[idx + i],
+                FieldElement::ZERO,
+                "activation_interaction_claim[{i}]"
+            );
         }
         idx += 4;
 
@@ -2480,32 +2742,64 @@ mod tests {
         idx += 1;
 
         // 4.5: layernorm_claims array (length=0, empty for this proof)
-        assert_eq!(felts[idx], FieldElement::ZERO, "layernorm_claims length = 0");
+        assert_eq!(
+            felts[idx],
+            FieldElement::ZERO,
+            "layernorm_claims length = 0"
+        );
         idx += 1;
 
         // 4.6: layernorm_interaction_claims array (length=0, empty for this proof)
-        assert_eq!(felts[idx], FieldElement::ZERO, "layernorm_interaction_claims length = 0");
+        assert_eq!(
+            felts[idx],
+            FieldElement::ZERO,
+            "layernorm_interaction_claims length = 0"
+        );
         idx += 1;
 
         // 4.7: embedding_claims array (length=0, empty for this proof)
-        assert_eq!(felts[idx], FieldElement::ZERO, "embedding_claims length = 0");
+        assert_eq!(
+            felts[idx],
+            FieldElement::ZERO,
+            "embedding_claims length = 0"
+        );
         idx += 1;
 
         // 4.8: interaction_claim: MLInteractionClaim = 4 felts (sum of all LogUp claimed_sums = 0)
         for i in 0..4 {
-            assert_eq!(felts[idx + i], FieldElement::ZERO, "ml_interaction_claim[{i}]");
+            assert_eq!(
+                felts[idx + i],
+                FieldElement::ZERO,
+                "ml_interaction_claim[{i}]"
+            );
         }
         idx += 4;
 
         // 4.9: pcs_config = 4 felts (pow_bits + fri_config)
         let default_config = PcsConfig::default();
-        assert_eq!(felts[idx], FieldElement::from(default_config.pow_bits as u64), "pcs_config.pow_bits");
+        assert_eq!(
+            felts[idx],
+            FieldElement::from(default_config.pow_bits as u64),
+            "pcs_config.pow_bits"
+        );
         idx += 1;
-        assert_eq!(felts[idx], FieldElement::from(default_config.fri_config.log_blowup_factor as u64), "fri_config.log_blowup_factor");
+        assert_eq!(
+            felts[idx],
+            FieldElement::from(default_config.fri_config.log_blowup_factor as u64),
+            "fri_config.log_blowup_factor"
+        );
         idx += 1;
-        assert_eq!(felts[idx], FieldElement::from(default_config.fri_config.log_last_layer_degree_bound as u64), "fri_config.log_last_layer_deg");
+        assert_eq!(
+            felts[idx],
+            FieldElement::from(default_config.fri_config.log_last_layer_degree_bound as u64),
+            "fri_config.log_last_layer_deg"
+        );
         idx += 1;
-        assert_eq!(felts[idx], FieldElement::from(default_config.fri_config.n_queries as u64), "fri_config.n_queries");
+        assert_eq!(
+            felts[idx],
+            FieldElement::from(default_config.fri_config.n_queries as u64),
+            "fri_config.n_queries"
+        );
         idx += 1;
 
         // 4.10: interaction_pow = 0 (u64)
@@ -2513,7 +2807,11 @@ mod tests {
         idx += 1;
 
         // 4.11: stark_proof (CommitmentSchemeProof) — starts with PcsConfig again
-        assert_eq!(felts[idx], FieldElement::from(default_config.pow_bits as u64), "stark_proof config.pow_bits");
+        assert_eq!(
+            felts[idx],
+            FieldElement::from(default_config.pow_bits as u64),
+            "stark_proof config.pow_bits"
+        );
         idx += 4; // skip past the 4 PcsConfig felts
 
         // Remaining felts are the rest of CommitmentSchemeProof (commitments, sampled_values, etc.)
@@ -2561,10 +2859,10 @@ mod tests {
 
     #[test]
     fn test_serialize_ml_proof_with_add() {
-        use crate::components::matmul::M31Matrix;
+        use crate::aggregation::prove_model_aggregated_onchain;
         use crate::compiler::graph::GraphBuilder;
         use crate::components::activation::ActivationType;
-        use crate::aggregation::prove_model_aggregated_onchain;
+        use crate::components::matmul::M31Matrix;
 
         // Build a model with a residual Add
         let mut builder = GraphBuilder::new((1, 8));
@@ -2577,17 +2875,31 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 8);
-        for j in 0..8 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..8 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = crate::compiler::graph::GraphWeights::new();
         let mut w0 = M31Matrix::new(8, 8);
-        for i in 0..8 { for j in 0..8 { w0.set(i, j, M31::from(((i + j) % 5 + 1) as u32)); } }
+        for i in 0..8 {
+            for j in 0..8 {
+                w0.set(i, j, M31::from(((i + j) % 5 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(8, 8);
-        for i in 0..8 { for j in 0..8 { w2.set(i, j, M31::from(((i * j) % 7 + 1) as u32)); } }
+        for i in 0..8 {
+            for j in 0..8 {
+                w2.set(i, j, M31::from(((i * j) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
         let mut w4 = M31Matrix::new(8, 4);
-        for i in 0..8 { for j in 0..4 { w4.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..8 {
+            for j in 0..4 {
+                w4.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(4, w4);
 
         let proof = prove_model_aggregated_onchain(&graph, &input, &weights)
@@ -2609,28 +2921,52 @@ mod tests {
         // Trailing sections: add_claims(1 claim), mul_claims(empty), layernorm_claims(empty), embedding(empty), attention(empty), tee(None)
         // Claims are lightweight: add_claim = layer_index(1) + trace_rows(1) = 2 felts per claim
         let last = felts.len() - 1;
-        assert_eq!(felts[last], FieldElement::ZERO, "tee_attestation_hash = None");
-        assert_eq!(felts[last - 1], FieldElement::ZERO, "attention_proofs count = 0");
-        assert_eq!(felts[last - 2], FieldElement::ZERO, "embedding_claims count = 0");
-        assert_eq!(felts[last - 3], FieldElement::ZERO, "layernorm_claims count = 0");
+        assert_eq!(
+            felts[last],
+            FieldElement::ZERO,
+            "tee_attestation_hash = None"
+        );
+        assert_eq!(
+            felts[last - 1],
+            FieldElement::ZERO,
+            "attention_proofs count = 0"
+        );
+        assert_eq!(
+            felts[last - 2],
+            FieldElement::ZERO,
+            "embedding_claims count = 0"
+        );
+        assert_eq!(
+            felts[last - 3],
+            FieldElement::ZERO,
+            "layernorm_claims count = 0"
+        );
         assert_eq!(felts[last - 4], FieldElement::ZERO, "mul_claims count = 0");
         // add_claims section: count(1) + 1 claim * 2 felts = 3 felts before mul_claims
         // add_claims count should be 1
-        assert_eq!(felts[last - 7], FieldElement::from(1u64), "add_claims count = 1");
+        assert_eq!(
+            felts[last - 7],
+            FieldElement::from(1u64),
+            "add_claims count = 1"
+        );
         assert!(felts.len() > 20, "should have data: {} felts", felts.len());
     }
 
     #[test]
     fn test_serialize_empty_add_mul_layernorm_backward_compat() {
-        use crate::components::matmul::{M31Matrix, matmul_m31, prove_matmul_sumcheck_onchain};
+        use crate::components::matmul::{matmul_m31, prove_matmul_sumcheck_onchain, M31Matrix};
 
         // Build a matmul-only proof (no add/mul/layernorm)
         let mut a = M31Matrix::new(2, 2);
-        a.set(0, 0, M31::from(1)); a.set(0, 1, M31::from(2));
-        a.set(1, 0, M31::from(3)); a.set(1, 1, M31::from(4));
+        a.set(0, 0, M31::from(1));
+        a.set(0, 1, M31::from(2));
+        a.set(1, 0, M31::from(3));
+        a.set(1, 1, M31::from(4));
         let mut b = M31Matrix::new(2, 2);
-        b.set(0, 0, M31::from(5)); b.set(0, 1, M31::from(6));
-        b.set(1, 0, M31::from(7)); b.set(1, 1, M31::from(8));
+        b.set(0, 0, M31::from(5));
+        b.set(0, 1, M31::from(6));
+        b.set(1, 0, M31::from(7));
+        b.set(1, 1, M31::from(8));
         let c = matmul_m31(&a, &b);
         let matmul_proof = prove_matmul_sumcheck_onchain(&a, &b, &c).unwrap();
 
@@ -2675,10 +3011,26 @@ mod tests {
         let len = felts.len();
         assert_eq!(felts[len - 6], FieldElement::ZERO, "add_claims count = 0");
         assert_eq!(felts[len - 5], FieldElement::ZERO, "mul_claims count = 0");
-        assert_eq!(felts[len - 4], FieldElement::ZERO, "layernorm_claims count = 0");
-        assert_eq!(felts[len - 3], FieldElement::ZERO, "embedding_claims count = 0");
-        assert_eq!(felts[len - 2], FieldElement::ZERO, "attention_proofs count = 0");
-        assert_eq!(felts[len - 1], FieldElement::ZERO, "tee_attestation_hash = None");
+        assert_eq!(
+            felts[len - 4],
+            FieldElement::ZERO,
+            "layernorm_claims count = 0"
+        );
+        assert_eq!(
+            felts[len - 3],
+            FieldElement::ZERO,
+            "embedding_claims count = 0"
+        );
+        assert_eq!(
+            felts[len - 2],
+            FieldElement::ZERO,
+            "attention_proofs count = 0"
+        );
+        assert_eq!(
+            felts[len - 1],
+            FieldElement::ZERO,
+            "tee_attestation_hash = None"
+        );
 
         // unified_stark=None(0), add(0), mul(0), layernorm(0), embedding(0), attention(0), tee(0)
         assert_eq!(felts[len - 7], FieldElement::ZERO, "unified_stark = None");
@@ -2686,19 +3038,23 @@ mod tests {
 
     #[test]
     fn test_serialize_unified_stark_with_add_claims() {
-        use stwo::prover::backend::simd::SimdBackend;
         use crate::compiler::prove::prove_activation_layer;
-        use crate::gadgets::lookup_table::PrecomputedTable;
+        use crate::components::matmul::{matmul_m31, prove_matmul_sumcheck_onchain, M31Matrix};
         use crate::gadgets::lookup_table::activations;
-        use crate::components::matmul::{M31Matrix, matmul_m31, prove_matmul_sumcheck_onchain};
+        use crate::gadgets::lookup_table::PrecomputedTable;
+        use stwo::prover::backend::simd::SimdBackend;
 
         // Create matmul proof
         let mut a = M31Matrix::new(2, 2);
-        a.set(0, 0, M31::from(1)); a.set(0, 1, M31::from(2));
-        a.set(1, 0, M31::from(3)); a.set(1, 1, M31::from(4));
+        a.set(0, 0, M31::from(1));
+        a.set(0, 1, M31::from(2));
+        a.set(1, 0, M31::from(3));
+        a.set(1, 1, M31::from(4));
         let mut b = M31Matrix::new(2, 2);
-        b.set(0, 0, M31::from(5)); b.set(0, 1, M31::from(6));
-        b.set(1, 0, M31::from(7)); b.set(1, 1, M31::from(8));
+        b.set(0, 0, M31::from(5));
+        b.set(0, 1, M31::from(6));
+        b.set(1, 0, M31::from(7));
+        b.set(1, 1, M31::from(8));
         let c_mat = matmul_m31(&a, &b);
         let matmul_proof = prove_matmul_sumcheck_onchain(&a, &b, &c_mat).unwrap();
 
@@ -2707,9 +3063,11 @@ mod tests {
         let inputs = vec![M31::from(0), M31::from(1), M31::from(3), M31::from(5)];
         let outputs: Vec<M31> = inputs.iter().map(|&x| activations::relu(x)).collect();
         let config = PcsConfig::default();
-        let (_component, activation_proof) = prove_activation_layer::<SimdBackend, Blake2sMerkleChannel>(
-            &inputs, &outputs, &table, config,
-        ).expect("proving should succeed");
+        let (_component, activation_proof) = prove_activation_layer::<
+            SimdBackend,
+            Blake2sMerkleChannel,
+        >(&inputs, &outputs, &table, config)
+        .expect("proving should succeed");
 
         let activation_claims = vec![LayerClaim {
             layer_index: 1,
@@ -2776,7 +3134,7 @@ mod tests {
         // After MLClaim(5), matmul_proofs(len+proof), channel_salt(1), discriminant(1)
         // we enter the unified STARK proof. Walk from the start:
         let mut idx = 5; // past MLClaim
-        // matmul_proofs: 1 + proof felts
+                         // matmul_proofs: 1 + proof felts
         idx += 1; // matmul array length
         let num_rounds = 1u32;
         let matmul_felts = 4 + 4 + 1 + (num_rounds as usize * 12) + 4 + 4 + 1 + 1;
@@ -2792,28 +3150,48 @@ mod tests {
         // === Inside UnifiedStarkProof ===
 
         // 1. activation_claims: length=1
-        assert_eq!(felts[idx], FieldElement::from(1u64), "activation_claims len");
+        assert_eq!(
+            felts[idx],
+            FieldElement::from(1u64),
+            "activation_claims len"
+        );
         idx += 1;
         // ActivationClaim: layer_index(1), log_size(ilog2(4)=2), activation_type(0)
-        assert_eq!(felts[idx], FieldElement::from(1u64), "act claim layer_index");
+        assert_eq!(
+            felts[idx],
+            FieldElement::from(1u64),
+            "act claim layer_index"
+        );
         idx += 1;
         assert_eq!(felts[idx], FieldElement::from(2u64), "act claim log_size");
         idx += 1;
-        assert_eq!(felts[idx], FieldElement::from(0u64), "act claim activation_type");
+        assert_eq!(
+            felts[idx],
+            FieldElement::from(0u64),
+            "act claim activation_type"
+        );
         idx += 1;
 
         // 2. activation_interaction_claims: length=1, 4 felts
         assert_eq!(felts[idx], FieldElement::from(1u64), "act interaction len");
         idx += 1;
         // claimed_sum = SecureField::from(M31::from(10)) = (10, 0, 0, 0)
-        assert_eq!(felts[idx], FieldElement::from(10u64), "act interaction sum[0]");
+        assert_eq!(
+            felts[idx],
+            FieldElement::from(10u64),
+            "act interaction sum[0]"
+        );
         idx += 4;
 
         // 3. add_claims: length=1
         assert_eq!(felts[idx], FieldElement::from(1u64), "add_claims len");
         idx += 1;
         // ElementwiseComponentClaim: layer_index(3), log_size(ilog2(8)=3)
-        assert_eq!(felts[idx], FieldElement::from(3u64), "add claim layer_index");
+        assert_eq!(
+            felts[idx],
+            FieldElement::from(3u64),
+            "add claim layer_index"
+        );
         idx += 1;
         assert_eq!(felts[idx], FieldElement::from(3u64), "add claim log_size");
         idx += 1;
@@ -2822,7 +3200,11 @@ mod tests {
         assert_eq!(felts[idx], FieldElement::from(1u64), "mul_claims len");
         idx += 1;
         // ElementwiseComponentClaim: layer_index(5), log_size(ilog2(16)=4)
-        assert_eq!(felts[idx], FieldElement::from(5u64), "mul claim layer_index");
+        assert_eq!(
+            felts[idx],
+            FieldElement::from(5u64),
+            "mul claim layer_index"
+        );
         idx += 1;
         assert_eq!(felts[idx], FieldElement::from(4u64), "mul claim log_size");
         idx += 1;
@@ -2840,7 +3222,11 @@ mod tests {
         assert_eq!(felts[idx], FieldElement::from(1u64), "ln interaction len");
         idx += 1;
         // claimed_sum = SecureField::from(M31::from(20)) = (20, 0, 0, 0)
-        assert_eq!(felts[idx], FieldElement::from(20u64), "ln interaction sum[0]");
+        assert_eq!(
+            felts[idx],
+            FieldElement::from(20u64),
+            "ln interaction sum[0]"
+        );
         idx += 4;
 
         // 7. embedding_claims: length=0 (empty for this proof)
@@ -2848,12 +3234,20 @@ mod tests {
         idx += 1;
 
         // 8. interaction_claim: total sum = activation(10) + layernorm(20) = 30
-        assert_eq!(felts[idx], FieldElement::from(30u64), "total interaction sum[0]");
+        assert_eq!(
+            felts[idx],
+            FieldElement::from(30u64),
+            "total interaction sum[0]"
+        );
         idx += 4;
 
         // 9. pcs_config
         let default_config = PcsConfig::default();
-        assert_eq!(felts[idx], FieldElement::from(default_config.pow_bits as u64), "pcs_config.pow_bits");
+        assert_eq!(
+            felts[idx],
+            FieldElement::from(default_config.pow_bits as u64),
+            "pcs_config.pow_bits"
+        );
         idx += 4;
 
         // 10. interaction_pow = 0
@@ -2861,23 +3255,46 @@ mod tests {
         idx += 1;
 
         // 11. stark_proof data follows
-        assert!(felts.len() > idx + 10, "STARK proof should have data after header");
+        assert!(
+            felts.len() > idx + 10,
+            "STARK proof should have data after header"
+        );
 
         // === Outer MLProof sections (graph-level metadata) ===
         // Trailing: add(count+claim) + mul(count+claim) + layernorm(count+claim+sum) + embedding(count) + attention(count) + tee(1)
         let len = felts.len();
         // tee_attestation_hash: None = 1 felt (0)
-        assert_eq!(felts[len - 1], FieldElement::ZERO, "tee_attestation_hash = None");
-        assert_eq!(felts[len - 2], FieldElement::ZERO, "attention_proofs count = 0");
-        assert_eq!(felts[len - 3], FieldElement::ZERO, "embedding_claims count = 0");
+        assert_eq!(
+            felts[len - 1],
+            FieldElement::ZERO,
+            "tee_attestation_hash = None"
+        );
+        assert_eq!(
+            felts[len - 2],
+            FieldElement::ZERO,
+            "attention_proofs count = 0"
+        );
+        assert_eq!(
+            felts[len - 3],
+            FieldElement::ZERO,
+            "embedding_claims count = 0"
+        );
         // layernorm_claims: count(1) + claim(layer_index + trace_rows + claimed_sum) = 1 + 6 = 7
         // mul_claims: count(1) + claim(layer_index + trace_rows) = 1 + 2 = 3
         // add_claims: count(1) + claim(layer_index + trace_rows) = 1 + 2 = 3
         // Total trailing before embedding = 7 + 3 + 3 = 13 felts
         let ln_end = len - 3; // skip tee + attention + embedding counts
         let ln_start = ln_end - 7; // 1 count + 1 claim * (1 + 1 + 4) = 7
-        assert_eq!(felts[ln_start], FieldElement::from(1u64), "outer layernorm count");
-        assert_eq!(felts[ln_start + 1], FieldElement::from(7u64), "outer ln layer_index");
+        assert_eq!(
+            felts[ln_start],
+            FieldElement::from(1u64),
+            "outer layernorm count"
+        );
+        assert_eq!(
+            felts[ln_start + 1],
+            FieldElement::from(7u64),
+            "outer ln layer_index"
+        );
     }
 
     #[test]
@@ -2923,7 +3340,9 @@ mod tests {
         use crate::components::matmul::M31Matrix;
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut output = M31Matrix::new(1, 2);
         output.set(0, 0, M31::from(10));
@@ -2932,7 +3351,11 @@ mod tests {
         let serialized = serialize_raw_io(&input, &output);
 
         // Layout: [1, 4, 4, 1,2,3,4, 1, 2, 2, 10,20]
-        assert_eq!(serialized.len(), 6 + 4 + 2, "6 header fields + 4 input + 2 output");
+        assert_eq!(
+            serialized.len(),
+            6 + 4 + 2,
+            "6 header fields + 4 input + 2 output"
+        );
         // Input header
         assert_eq!(serialized[0], FieldElement::from(1u64), "input rows");
         assert_eq!(serialized[1], FieldElement::from(4u64), "input cols");
@@ -2953,14 +3376,22 @@ mod tests {
 
     #[test]
     fn test_serialize_raw_io_matches_io_commitment() {
-        use crate::components::matmul::M31Matrix;
         use crate::aggregation::compute_io_commitment;
+        use crate::components::matmul::M31Matrix;
 
         let mut input = M31Matrix::new(2, 3);
-        for i in 0..2 { for j in 0..3 { input.set(i, j, M31::from((i * 3 + j + 1) as u32)); } }
+        for i in 0..2 {
+            for j in 0..3 {
+                input.set(i, j, M31::from((i * 3 + j + 1) as u32));
+            }
+        }
 
         let mut output = M31Matrix::new(2, 2);
-        for i in 0..2 { for j in 0..2 { output.set(i, j, M31::from((i * 2 + j + 10) as u32)); } }
+        for i in 0..2 {
+            for j in 0..2 {
+                output.set(i, j, M31::from((i * 2 + j + 10) as u32));
+            }
+        }
 
         // The serialized IO data should hash to the same IO commitment
         let serialized = serialize_raw_io(&input, &output);
@@ -2992,10 +3423,14 @@ mod tests {
 
         let opening = WeightMleOpening {
             layer_idx: 3,
-            point: vec![
-                QM31(CM31(M31::from(10), M31::from(20)), CM31(M31::from(30), M31::from(40))),
-            ],
-            value: QM31(CM31(M31::from(100), M31::from(200)), CM31(M31::from(300), M31::from(400))),
+            point: vec![QM31(
+                CM31(M31::from(10), M31::from(20)),
+                CM31(M31::from(30), M31::from(40)),
+            )],
+            value: QM31(
+                CM31(M31::from(100), M31::from(200)),
+                CM31(M31::from(300), M31::from(400)),
+            ),
             commitment: FieldElement::from(0x1234u64),
         };
 

@@ -184,11 +184,7 @@ fn print_test_vector(tv: &TranscriptTestVector) {
     eprintln!("  Output: {:?}", tv.output_data);
     eprintln!();
     for cp in &tv.checkpoints {
-        eprintln!(
-            "  [{}] digest = 0x{:064x}",
-            cp.label,
-            cp.digest,
-        );
+        eprintln!("  [{}] digest = 0x{:064x}", cp.label, cp.digest,);
     }
     eprintln!();
     eprintln!("  // Cairo test vector (felt252 hex for calldata):");
@@ -255,8 +251,17 @@ fn test_transcript_vector_matmul_only() {
 
     // Verify the GKR proof actually verifies
     let mut verify_channel = PoseidonChannel::new();
-    let result = stwo_ml::gkr::verify_gkr(&circuit, gkr_proof, &proof.execution.output, &mut verify_channel);
-    assert!(result.is_ok(), "GKR verification should pass: {:?}", result.err());
+    let result = stwo_ml::gkr::verify_gkr(
+        &circuit,
+        gkr_proof,
+        &proof.execution.output,
+        &mut verify_channel,
+    );
+    assert!(
+        result.is_ok(),
+        "GKR verification should pass: {:?}",
+        result.err()
+    );
 
     // Final digest from verification must match our checkpoint
     assert_eq!(
@@ -305,12 +310,24 @@ fn test_transcript_vector_mlp_relu() {
     assert_eq!(tv.num_layers, 3, "MLP should have 3 layer proofs");
 
     // Verify all checkpoints are present
-    assert!(tv.checkpoints.len() >= 4, "should have at least 4 checkpoints");
+    assert!(
+        tv.checkpoints.len() >= 4,
+        "should have at least 4 checkpoints"
+    );
 
     // Verify the GKR proof actually verifies
     let mut verify_channel = PoseidonChannel::new();
-    let result = stwo_ml::gkr::verify_gkr(&circuit, gkr_proof, &proof.execution.output, &mut verify_channel);
-    assert!(result.is_ok(), "GKR verification should pass: {:?}", result.err());
+    let result = stwo_ml::gkr::verify_gkr(
+        &circuit,
+        gkr_proof,
+        &proof.execution.output,
+        &mut verify_channel,
+    );
+    assert!(
+        result.is_ok(),
+        "GKR verification should pass: {:?}",
+        result.err()
+    );
 
     // Final digest must match
     let final_cp = tv.checkpoints.last().unwrap();
@@ -342,8 +359,7 @@ fn test_transcript_deterministic() {
     let proof2 = stwo_ml::aggregation::prove_model_pure_gkr(&graph, &input, &weights)
         .expect("proving should succeed");
 
-    let circuit = stwo_ml::gkr::LayeredCircuit::from_graph(&graph)
-        .expect("circuit should compile");
+    let circuit = stwo_ml::gkr::LayeredCircuit::from_graph(&graph).expect("circuit should compile");
 
     let gkr1 = proof1.gkr_proof.as_ref().unwrap();
     let gkr2 = proof2.gkr_proof.as_ref().unwrap();
@@ -359,7 +375,8 @@ fn test_transcript_deterministic() {
 
     // Transcripts must be identical (same model, same input → deterministic proof → same digest)
     assert_eq!(
-        ch1.digest(), ch2.digest(),
+        ch1.digest(),
+        ch2.digest(),
         "deterministic proofs must produce identical transcripts"
     );
 
@@ -368,7 +385,10 @@ fn test_transcript_deterministic() {
     let mut buf2 = Vec::new();
     stwo_ml::cairo_serde::serialize_gkr_model_proof(gkr1, &mut buf1);
     stwo_ml::cairo_serde::serialize_gkr_model_proof(gkr2, &mut buf2);
-    assert_eq!(buf1, buf2, "deterministic proofs must serialize identically");
+    assert_eq!(
+        buf1, buf2,
+        "deterministic proofs must serialize identically"
+    );
 }
 
 // ============================================================================
@@ -388,8 +408,7 @@ fn test_export_seed_digest_for_cairo() {
     // So d = 2 for a single matmul node (input layer + matmul layer)
     // But let's verify by actually building the circuit:
     let (graph, _input, _weights) = build_matmul_only();
-    let circuit = stwo_ml::gkr::LayeredCircuit::from_graph(&graph)
-        .expect("circuit should compile");
+    let circuit = stwo_ml::gkr::LayeredCircuit::from_graph(&graph).expect("circuit should compile");
 
     let d = circuit.layers.len();
     let (in_rows, in_cols) = circuit.input_shape;
@@ -405,11 +424,17 @@ fn test_export_seed_digest_for_cairo() {
 
     channel.mix_u64(in_rows as u64);
     let digest_after_rows = channel.digest();
-    eprintln!("  digest after mix_u64({}) = 0x{:064x}", in_rows, digest_after_rows);
+    eprintln!(
+        "  digest after mix_u64({}) = 0x{:064x}",
+        in_rows, digest_after_rows
+    );
 
     channel.mix_u64(in_cols as u64);
     let digest_after_cols = channel.digest();
-    eprintln!("  digest after mix_u64({}) = 0x{:064x}", in_cols, digest_after_cols);
+    eprintln!(
+        "  digest after mix_u64({}) = 0x{:064x}",
+        in_cols, digest_after_cols
+    );
     eprintln!("===");
 
     // The seed digest should be deterministic and non-zero

@@ -40,24 +40,24 @@ use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::{BackendForChannel, Col, Column, ColumnOps};
 use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
 use stwo::prover::poly::BitReversedOrder;
+use stwo::prover::prove;
 use stwo::prover::CommitmentSchemeProver;
 use stwo::prover::ComponentProver;
-use stwo::prover::prove;
 
+use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 use stwo_constraint_framework::{
     EvalAtRow, FrameworkComponent, FrameworkEval, TraceLocationAllocator,
 };
-use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 
 use crate::backend::convert_evaluations;
 use crate::circuits::spend::{
-    SpendPublicInputs, SpendWitness, execute_spend, MERKLE_DEPTH,
-    SPEND_NUM_INPUTS, SPEND_NUM_OUTPUTS,
+    execute_spend, SpendPublicInputs, SpendWitness, MERKLE_DEPTH, SPEND_NUM_INPUTS,
+    SPEND_NUM_OUTPUTS,
 };
 use crate::components::poseidon2_air::{
-    constrain_poseidon2_permutation, compute_merkle_chain_padding, compute_permutation_trace,
-    decompose_to_bits, dummy_permutation_trace, write_permutation_to_trace,
-    Poseidon2Columns, COLS_PER_PERM,
+    compute_merkle_chain_padding, compute_permutation_trace, constrain_poseidon2_permutation,
+    decompose_to_bits, dummy_permutation_trace, write_permutation_to_trace, Poseidon2Columns,
+    COLS_PER_PERM,
 };
 use crate::crypto::poseidon2_m31::{RATE, STATE_WIDTH};
 
@@ -70,7 +70,8 @@ const NUM_SUB_LIMBS: usize = SPEND_NUM_OUTPUTS * 4; // 8
 const BITS_PER_LIMB: usize = 16;
 const NUM_BIT_COLS: usize = NUM_SUB_LIMBS * BITS_PER_LIMB; // 128
 const NUM_CARRY_COLS: usize = 3; // carry, carry_pos, carry_neg
-const TOTAL_EXEC_COLS: usize = NUM_PERMS * COLS_PER_PERM + NUM_SUB_LIMBS + NUM_BIT_COLS + NUM_CARRY_COLS;
+const TOTAL_EXEC_COLS: usize =
+    NUM_PERMS * COLS_PER_PERM + NUM_SUB_LIMBS + NUM_BIT_COLS + NUM_CARRY_COLS;
 const LOG_SIZE: u32 = 4;
 
 // Permutation index offsets for each input
@@ -129,16 +130,14 @@ pub fn constrain_spend_wiring<E: EvalAtRow>(
         // Ownership: domain tag + padding
         eval.add_constraint(
             is_real.clone()
-                * (perms[own].input()[0].clone()
-                    - E::F::from(M31::from_u32_unchecked(0x766D3331))),
+                * (perms[own].input()[0].clone() - E::F::from(M31::from_u32_unchecked(0x766D3331))),
         );
         for j in 5..RATE {
             eval.add_constraint(is_real.clone() * perms[own].input()[j].clone());
         }
         eval.add_constraint(
             is_real.clone()
-                * (perms[own].input()[RATE].clone()
-                    - E::F::from(M31::from_u32_unchecked(5))),
+                * (perms[own].input()[RATE].clone() - E::F::from(M31::from_u32_unchecked(5))),
         );
         for j in (RATE + 1)..STATE_WIDTH {
             eval.add_constraint(is_real.clone() * perms[own].input()[j].clone());
@@ -151,15 +150,12 @@ pub fn constrain_spend_wiring<E: EvalAtRow>(
                     - E::F::from(M31::from_u32_unchecked(11))),
         );
         for j in (RATE + 1)..STATE_WIDTH {
-            eval.add_constraint(
-                is_real.clone() * perms[com_start].input()[j].clone(),
-            );
+            eval.add_constraint(is_real.clone() * perms[com_start].input()[j].clone());
         }
         for j in 0..4 {
             eval.add_constraint(
                 is_real.clone()
-                    * (perms[com_start].input()[j].clone()
-                        - perms[own].output()[j].clone()),
+                    * (perms[com_start].input()[j].clone() - perms[own].output()[j].clone()),
             );
         }
 
@@ -179,16 +175,13 @@ pub fn constrain_spend_wiring<E: EvalAtRow>(
                     - E::F::from(M31::from_u32_unchecked(12))),
         );
         for j in (RATE + 1)..STATE_WIDTH {
-            eval.add_constraint(
-                is_real.clone() * perms[nul_start].input()[j].clone(),
-            );
+            eval.add_constraint(is_real.clone() * perms[nul_start].input()[j].clone());
         }
         // S1: Nullifier sk must match ownership sk
         for j in 0..4 {
             eval.add_constraint(
                 is_real.clone()
-                    * (perms[nul_start].input()[j].clone()
-                        - perms[own].input()[j + 1].clone()),
+                    * (perms[nul_start].input()[j].clone() - perms[own].input()[j + 1].clone()),
             );
         }
         // Nullifier input[4..7] = commitment[0..3]
@@ -221,8 +214,7 @@ pub fn constrain_spend_wiring<E: EvalAtRow>(
         for j in 0..RATE {
             eval.add_constraint(
                 is_real.clone()
-                    * (perms[nul_end - 1].output()[j].clone()
-                        - nullifiers[inp_idx][j].clone()),
+                    * (perms[nul_end - 1].output()[j].clone() - nullifiers[inp_idx][j].clone()),
             );
         }
 
@@ -231,27 +223,21 @@ pub fn constrain_spend_wiring<E: EvalAtRow>(
             let commit_out = perms[com_end - 1].output()[j].clone();
             let curr_left = perms[mrk_start].input()[j].clone();
             let curr_right = perms[mrk_start].input()[j + RATE].clone();
-            eval.add_constraint(
-                (curr_left - commit_out.clone()) * (curr_right - commit_out),
-            );
+            eval.add_constraint((curr_left - commit_out.clone()) * (curr_right - commit_out));
         }
         for i in (mrk_start + 1)..mrk_end {
             for j in 0..RATE {
                 let prev_out = perms[i - 1].output()[j].clone();
                 let curr_left = perms[i].input()[j].clone();
                 let curr_right = perms[i].input()[j + RATE].clone();
-                eval.add_constraint(
-                    (curr_left - prev_out.clone()) * (curr_right - prev_out),
-                );
+                eval.add_constraint((curr_left - prev_out.clone()) * (curr_right - prev_out));
             }
         }
 
         // Merkle root = public root
         for j in 0..RATE {
             eval.add_constraint(
-                is_real.clone()
-                    * (perms[mrk_end - 1].output()[j].clone()
-                        - merkle_root[j].clone()),
+                is_real.clone() * (perms[mrk_end - 1].output()[j].clone() - merkle_root[j].clone()),
             );
         }
     }
@@ -267,9 +253,7 @@ pub fn constrain_spend_wiring<E: EvalAtRow>(
                     - E::F::from(M31::from_u32_unchecked(11))),
         );
         for j in (RATE + 1)..STATE_WIDTH {
-            eval.add_constraint(
-                is_real.clone() * perms[com_start].input()[j].clone(),
-            );
+            eval.add_constraint(is_real.clone() * perms[com_start].input()[j].clone());
         }
 
         // Sponge chain
@@ -295,14 +279,12 @@ pub fn constrain_spend_wiring<E: EvalAtRow>(
         let c65536 = M31::from_u32_unchecked(65536);
         eval.add_constraint(
             is_real.clone()
-                * (sub_limbs[sub_base].clone()
-                    + sub_limbs[sub_base + 1].clone() * c65536
+                * (sub_limbs[sub_base].clone() + sub_limbs[sub_base + 1].clone() * c65536
                     - perms[com_start].input()[5].clone()),
         );
         eval.add_constraint(
             is_real.clone()
-                * (sub_limbs[sub_base + 2].clone()
-                    + sub_limbs[sub_base + 3].clone() * c65536
+                * (sub_limbs[sub_base + 2].clone() + sub_limbs[sub_base + 3].clone() * c65536
                     - perms[com_start].input()[6].clone()),
         );
     }
@@ -332,15 +314,13 @@ pub fn constrain_spend_wiring<E: EvalAtRow>(
     for inp_idx in 1..SPEND_NUM_INPUTS {
         let com_start = input_commitment_start(inp_idx);
         eval.add_constraint(
-            is_real.clone()
-                * (perms[com_start].input()[4].clone() - reference_asset.clone()),
+            is_real.clone() * (perms[com_start].input()[4].clone() - reference_asset.clone()),
         );
     }
     for out_idx in 0..SPEND_NUM_OUTPUTS {
         let com_start = output_commitment_start(out_idx);
         eval.add_constraint(
-            is_real.clone()
-                * (perms[com_start].input()[4].clone() - reference_asset.clone()),
+            is_real.clone() * (perms[com_start].input()[4].clone() - reference_asset.clone()),
         );
     }
 }
@@ -375,8 +355,7 @@ impl FrameworkEval for SpendStarkEval {
             .collect();
 
         // ── Sub-limb & bit columns ──
-        let sub_limbs: [E::F; NUM_SUB_LIMBS] =
-            std::array::from_fn(|_| eval.next_trace_mask());
+        let sub_limbs: [E::F; NUM_SUB_LIMBS] = std::array::from_fn(|_| eval.next_trace_mask());
         let bits: [[E::F; BITS_PER_LIMB]; NUM_SUB_LIMBS] =
             std::array::from_fn(|_| std::array::from_fn(|_| eval.next_trace_mask()));
 
@@ -410,14 +389,19 @@ impl FrameworkEval for SpendStarkEval {
         let merkle_root: [E::F; RATE] = std::array::from_fn(|j| E::F::from(self.merkle_root[j]));
         let nullifiers: [[E::F; RATE]; SPEND_NUM_INPUTS] =
             std::array::from_fn(|i| std::array::from_fn(|j| E::F::from(self.nullifiers[i][j])));
-        let output_commitments: [[E::F; RATE]; SPEND_NUM_OUTPUTS] =
-            std::array::from_fn(|i| std::array::from_fn(|j| E::F::from(self.output_commitments[i][j])));
+        let output_commitments: [[E::F; RATE]; SPEND_NUM_OUTPUTS] = std::array::from_fn(|i| {
+            std::array::from_fn(|j| E::F::from(self.output_commitments[i][j]))
+        });
 
         constrain_spend_wiring(
-            &mut eval, &is_real,
-            &perms, &sub_limbs,
+            &mut eval,
+            &is_real,
+            &perms,
+            &sub_limbs,
             &carry,
-            &merkle_root, &nullifiers, &output_commitments,
+            &merkle_root,
+            &nullifiers,
+            &output_commitments,
         );
 
         eval
@@ -436,9 +420,7 @@ pub struct SpendStarkProof {
 
 // ──────────────────────────── Prover ──────────────────────────────────
 
-pub fn prove_spend_stark(
-    witness: &SpendWitness,
-) -> Result<SpendStarkProof, SpendStarkError> {
+pub fn prove_spend_stark(witness: &SpendWitness) -> Result<SpendStarkProof, SpendStarkError> {
     #[cfg(feature = "cuda-runtime")]
     {
         if crate::backend::force_gpu() || crate::backend::gpu_is_available() {
@@ -449,17 +431,15 @@ pub fn prove_spend_stark(
     prove_spend_stark_with::<SimdBackend>(witness)
 }
 
-fn prove_spend_stark_with<B>(
-    witness: &SpendWitness,
-) -> Result<SpendStarkProof, SpendStarkError>
+fn prove_spend_stark_with<B>(witness: &SpendWitness) -> Result<SpendStarkProof, SpendStarkError>
 where
     B: BackendForChannel<Blake2sMerkleChannel> + PolyOps + ColumnOps<M31>,
     Col<B, M31>: Column<M31>,
     <B as ColumnOps<M31>>::Column: 'static,
     FrameworkComponent<SpendStarkEval>: ComponentProver<B>,
 {
-    let (execution, public_inputs) = execute_spend(witness)
-        .map_err(|e| SpendStarkError::Execution(format!("{e}")))?;
+    let (execution, public_inputs) =
+        execute_spend(witness).map_err(|e| SpendStarkError::Execution(format!("{e}")))?;
 
     let table_size = 1usize << LOG_SIZE;
 
@@ -517,19 +497,27 @@ where
     for (k, &limb) in execution.range_check_limbs.iter().enumerate() {
         let bit_vals = decompose_to_bits(limb.0);
         for (i, &bit) in bit_vals.iter().enumerate() {
-            exec_cols[bit_offset + k * BITS_PER_LIMB + i]
-                .set(0, M31::from_u32_unchecked(bit));
+            exec_cols[bit_offset + k * BITS_PER_LIMB + i].set(0, M31::from_u32_unchecked(bit));
         }
     }
 
     // Carry computation from integer amounts
     let carry_offset = bit_offset + NUM_BIT_COLS;
-    let hi_in: i64 = witness.inputs.iter()
-        .map(|i| i.note.amount_hi.0 as i64).sum();
-    let hi_out: i64 = witness.outputs.iter()
-        .map(|o| o.note.amount_hi.0 as i64).sum();
+    let hi_in: i64 = witness
+        .inputs
+        .iter()
+        .map(|i| i.note.amount_hi.0 as i64)
+        .sum();
+    let hi_out: i64 = witness
+        .outputs
+        .iter()
+        .map(|o| o.note.amount_hi.0 as i64)
+        .sum();
     let carry_val = hi_in - hi_out; // must be -1, 0, or 1
-    debug_assert!((-1..=1).contains(&carry_val), "carry out of range: {carry_val}");
+    debug_assert!(
+        (-1..=1).contains(&carry_val),
+        "carry out of range: {carry_val}"
+    );
     let p = 0x7FFFFFFFu32;
     let carry_m31 = if carry_val >= 0 {
         M31::from_u32_unchecked(carry_val as u32)
@@ -537,14 +525,21 @@ where
         M31::from_u32_unchecked(p - ((-carry_val) as u32))
     };
     exec_cols[carry_offset].set(0, carry_m31);
-    exec_cols[carry_offset + 1].set(0, M31::from_u32_unchecked(if carry_val > 0 { 1 } else { 0 }));
-    exec_cols[carry_offset + 2].set(0, M31::from_u32_unchecked(if carry_val < 0 { 1 } else { 0 }));
+    exec_cols[carry_offset + 1].set(
+        0,
+        M31::from_u32_unchecked(if carry_val > 0 { 1 } else { 0 }),
+    );
+    exec_cols[carry_offset + 2].set(
+        0,
+        M31::from_u32_unchecked(if carry_val < 0 { 1 } else { 0 }),
+    );
     // Padding rows: carry=0, carry_pos=0, carry_neg=0 (already zeroed by Col::zeros)
 
     let mut is_real_col = Col::<B, M31>::zeros(table_size);
     is_real_col.set(0, M31::from_u32_unchecked(1));
     let preprocessed = vec![CircleEvaluation::<B, M31, BitReversedOrder>::new(
-        domain, is_real_col,
+        domain,
+        is_real_col,
     )];
     let execution_evals: Vec<CircleEvaluation<B, M31, BitReversedOrder>> = exec_cols
         .into_iter()
@@ -566,9 +561,7 @@ where
     tree_builder.commit(channel);
 
     let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(convert_evaluations::<B, B, M31>(
-        execution_evals,
-    ));
+    tree_builder.extend_evals(convert_evaluations::<B, B, M31>(execution_evals));
     tree_builder.commit(channel);
 
     let eval = SpendStarkEval {
@@ -583,12 +576,8 @@ where
         SecureField::zero(),
     );
 
-    let stark_proof = prove::<B, Blake2sMerkleChannel>(
-        &[&component],
-        channel,
-        commitment_scheme,
-    )
-    .map_err(|e| SpendStarkError::Proving(format!("{e:?}")))?;
+    let stark_proof = prove::<B, Blake2sMerkleChannel>(&[&component], channel, commitment_scheme)
+        .map_err(|e| SpendStarkError::Proving(format!("{e:?}")))?;
 
     Ok(SpendStarkProof {
         stark_proof,
@@ -611,13 +600,11 @@ pub fn verify_spend_stark(
         output_commitments: public_inputs.output_commitments,
     };
     let mut allocator = TraceLocationAllocator::default();
-    let dummy_component =
-        FrameworkComponent::new(&mut allocator, dummy_eval, SecureField::zero());
+    let dummy_component = FrameworkComponent::new(&mut allocator, dummy_eval, SecureField::zero());
     let bounds = Component::trace_log_degree_bounds(&dummy_component);
 
     let channel = &mut <Blake2sMerkleChannel as MerkleChannel>::C::default();
-    let mut commitment_scheme =
-        CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(pcs_config);
+    let mut commitment_scheme = CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(pcs_config);
 
     commitment_scheme.commit(proof.stark_proof.commitments[0], &bounds[0], channel);
     commitment_scheme.commit(proof.stark_proof.commitments[1], &bounds[1], channel);
@@ -629,8 +616,7 @@ pub fn verify_spend_stark(
         output_commitments: public_inputs.output_commitments,
     };
     let mut allocator = TraceLocationAllocator::default();
-    let component =
-        FrameworkComponent::new(&mut allocator, real_eval, SecureField::zero());
+    let component = FrameworkComponent::new(&mut allocator, real_eval, SecureField::zero());
 
     stwo_verify::<Blake2sMerkleChannel>(
         &[&component as &dyn Component],
@@ -723,8 +709,7 @@ mod tests {
     fn test_spend_stark_prove_verify() {
         let witness = make_spend_witness([1000, 2000], [1500, 1500]);
         let proof = prove_spend_stark(&witness).expect("proving should succeed");
-        verify_spend_stark(&proof, &proof.public_inputs)
-            .expect("verification should succeed");
+        verify_spend_stark(&proof, &proof.public_inputs).expect("verification should succeed");
     }
 
     #[test]
@@ -783,8 +768,7 @@ mod tests {
         let d = 1 * (1u64 << 31) + 200; // lo=200, hi=1
         let witness = make_spend_witness([a, b], [c, d]);
         let proof = prove_spend_stark(&witness).expect("proving should succeed");
-        verify_spend_stark(&proof, &proof.public_inputs)
-            .expect("verification should succeed");
+        verify_spend_stark(&proof, &proof.public_inputs).expect("verification should succeed");
     }
 
     #[test]
@@ -831,8 +815,7 @@ mod tests {
         verify_spend(&phase3_proof).expect("phase3 verify");
 
         let stark_proof = prove_spend_stark(&witness).expect("stark prove");
-        verify_spend_stark(&stark_proof, &stark_proof.public_inputs)
-            .expect("stark verify");
+        verify_spend_stark(&stark_proof, &stark_proof.public_inputs).expect("stark verify");
 
         assert_eq!(
             phase3_proof.public_inputs.nullifiers,

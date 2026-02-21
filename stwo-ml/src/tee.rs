@@ -34,18 +34,18 @@
 //! hardware with encrypted memory. Without TEE, the math is still provably correct;
 //! you just lose the hardware privacy guarantee.
 
-use crate::gpu::{GpuModelProver, GpuError};
 use crate::compiler::graph::{ComputationGraph, GraphWeights};
-use crate::compiler::prove::{ModelError, ModelProofResult};
 use crate::compiler::onnx::OnnxModel;
+use crate::compiler::prove::{ModelError, ModelProofResult};
 use crate::components::matmul::M31Matrix;
+use crate::gpu::{GpuError, GpuModelProver};
 
 use starknet_crypto::poseidon_hash_many;
 use starknet_ff::FieldElement;
 
-use std::time::SystemTime;
 #[cfg(feature = "tee")]
 use std::process::Command;
+use std::time::SystemTime;
 
 // ============================================================================
 // SecurityLevel System
@@ -157,7 +157,11 @@ impl std::fmt::Display for TeeCapability {
         if self.cc_active && self.nvattest_available {
             write!(f, "TEE Active ({}, CC-On, attested)", self.device_name)
         } else if self.cc_active {
-            write!(f, "TEE Active ({}, CC-On, nvattest missing)", self.device_name)
+            write!(
+                f,
+                "TEE Active ({}, CC-On, nvattest missing)",
+                self.device_name
+            )
         } else if self.cc_supported {
             write!(f, "TEE Available ({}, CC-Off)", self.device_name)
         } else if !self.device_name.is_empty() {
@@ -191,9 +195,15 @@ pub fn detect_tee_capability() -> TeeCapability {
         } else if cap.cc_active {
             format!("CC-On active on {}, nvattest NOT found", cap.device_name)
         } else if cap.cc_supported {
-            format!("{} supports CC but mode is Off — enable via: nvidia-smi conf-compute -scc on", cap.device_name)
+            format!(
+                "{} supports CC but mode is Off — enable via: nvidia-smi conf-compute -scc on",
+                cap.device_name
+            )
         } else if !cap.device_name.is_empty() {
-            format!("{} does not support Confidential Computing (need H100/H200/B200)", cap.device_name)
+            format!(
+                "{} does not support Confidential Computing (need H100/H200/B200)",
+                cap.device_name
+            )
         } else {
             "No GPU detected".to_string()
         };
@@ -374,23 +384,19 @@ fn generate_attestation_with_level(
     level: SecurityLevel,
 ) -> Result<TeeAttestation, TeeError> {
     match level.resolve() {
-        ResolvedSecurityLevel::ZkOnly => {
-            Ok(TeeAttestation {
-                report: Vec::new(),
-                measurement: [0u8; 32],
-                timestamp: SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-                device_id: prover.device_name.clone(),
-                hw_model: String::new(),
-                secure_boot: false,
-                debug_status: "zk-only".to_string(),
-            })
-        }
-        ResolvedSecurityLevel::ZkPlusTee => {
-            generate_attestation(prover)
-        }
+        ResolvedSecurityLevel::ZkOnly => Ok(TeeAttestation {
+            report: Vec::new(),
+            measurement: [0u8; 32],
+            timestamp: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            device_id: prover.device_name.clone(),
+            hw_model: String::new(),
+            secure_boot: false,
+            debug_status: "zk-only".to_string(),
+        }),
+        ResolvedSecurityLevel::ZkPlusTee => generate_attestation(prover),
     }
 }
 
@@ -465,11 +471,12 @@ fn parse_nvattest_output(output: &str) -> Result<NvatResult, TeeError> {
                 // Parse hex measurement into bytes
                 let hex = val.trim_start_matches("0x");
                 for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
-                    if i >= 32 { break; }
-                    if let Ok(byte) = u8::from_str_radix(
-                        std::str::from_utf8(chunk).unwrap_or("00"),
-                        16,
-                    ) {
+                    if i >= 32 {
+                        break;
+                    }
+                    if let Ok(byte) =
+                        u8::from_str_radix(std::str::from_utf8(chunk).unwrap_or("00"), 16)
+                    {
                         measurement[i] = byte;
                     }
                 }
@@ -573,17 +580,12 @@ impl TeeModelProver {
         model: &OnnxModel,
         input: &M31Matrix,
     ) -> Result<(ModelProofResult, TeeAttestation), TeeError> {
-        let result = self.gpu_prover.prove_model(
-            &model.graph,
-            input,
-            &model.weights,
-        )?;
+        let result = self
+            .gpu_prover
+            .prove_model(&model.graph, input, &model.weights)?;
 
         // Generate fresh attestation for this proof
-        let attestation = generate_attestation_with_level(
-            &self.gpu_prover,
-            self.security_level,
-        )?;
+        let attestation = generate_attestation_with_level(&self.gpu_prover, self.security_level)?;
 
         Ok((result, attestation))
     }
@@ -596,10 +598,7 @@ impl TeeModelProver {
         weights: &GraphWeights,
     ) -> Result<(ModelProofResult, TeeAttestation), TeeError> {
         let result = self.gpu_prover.prove_model(graph, input, weights)?;
-        let attestation = generate_attestation_with_level(
-            &self.gpu_prover,
-            self.security_level,
-        )?;
+        let attestation = generate_attestation_with_level(&self.gpu_prover, self.security_level)?;
         Ok((result, attestation))
     }
 }
@@ -653,11 +652,26 @@ mod tests {
 
     #[test]
     fn test_security_level_parsing() {
-        assert_eq!("auto".parse::<SecurityLevel>().unwrap(), SecurityLevel::Auto);
-        assert_eq!("tee".parse::<SecurityLevel>().unwrap(), SecurityLevel::ZkPlusTee);
-        assert_eq!("zk-only".parse::<SecurityLevel>().unwrap(), SecurityLevel::ZkOnly);
-        assert_eq!("zk".parse::<SecurityLevel>().unwrap(), SecurityLevel::ZkOnly);
-        assert_eq!("zk+tee".parse::<SecurityLevel>().unwrap(), SecurityLevel::ZkPlusTee);
+        assert_eq!(
+            "auto".parse::<SecurityLevel>().unwrap(),
+            SecurityLevel::Auto
+        );
+        assert_eq!(
+            "tee".parse::<SecurityLevel>().unwrap(),
+            SecurityLevel::ZkPlusTee
+        );
+        assert_eq!(
+            "zk-only".parse::<SecurityLevel>().unwrap(),
+            SecurityLevel::ZkOnly
+        );
+        assert_eq!(
+            "zk".parse::<SecurityLevel>().unwrap(),
+            SecurityLevel::ZkOnly
+        );
+        assert_eq!(
+            "zk+tee".parse::<SecurityLevel>().unwrap(),
+            SecurityLevel::ZkPlusTee
+        );
         assert!("invalid".parse::<SecurityLevel>().is_err());
     }
 
@@ -841,7 +855,10 @@ mod tests {
     fn test_tee_prove_matches_gpu() {
         let prover = TeeModelProver::new().unwrap();
         let model = crate::compiler::onnx::build_mlp(
-            16, &[8], 4, crate::components::activation::ActivationType::ReLU,
+            16,
+            &[8],
+            4,
+            crate::components::activation::ActivationType::ReLU,
         );
         let input = M31Matrix::new(1, 16);
 

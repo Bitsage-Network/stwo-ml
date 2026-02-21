@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use stwo::core::fields::m31::BaseField as M31;
 
-use crate::crypto::merkle_m31::{Digest, MerklePath, PoseidonMerkleTreeM31, verify_merkle_proof};
+use crate::crypto::merkle_m31::{verify_merkle_proof, Digest, MerklePath, PoseidonMerkleTreeM31};
 use crate::crypto::poseidon2_m31::RATE;
 
 #[cfg(feature = "audit-http")]
@@ -78,8 +78,8 @@ impl TreeSync {
         }
 
         let contents = std::fs::read_to_string(path)?;
-        let parsed: serde_json::Value = serde_json::from_str(&contents)
-            .map_err(|e| TreeSyncError::Json(e.to_string()))?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&contents).map_err(|e| TreeSyncError::Json(e.to_string()))?;
 
         let version = parsed["version"].as_u64().unwrap_or(0);
         if version != 1 {
@@ -122,19 +122,21 @@ impl TreeSync {
     /// 5. Save cache
     #[cfg(feature = "audit-http")]
     pub fn sync(&mut self, pool: &PoolClient) -> Result<SyncResult, TreeSyncError> {
-        let on_chain_size = pool.get_tree_size()
+        let on_chain_size = pool
+            .get_tree_size()
             .map_err(|e| TreeSyncError::Pool(e.to_string()))? as usize;
 
         let local_size = self.tree.size();
 
         if local_size == on_chain_size {
             // Verify root matches
-            let on_chain_root = pool.get_merkle_root()
+            let on_chain_root = pool
+                .get_merkle_root()
                 .map_err(|e| TreeSyncError::Pool(e.to_string()))?;
             let root_verified = self.tree.root() == on_chain_root;
             if !root_verified {
                 return Err(TreeSyncError::Sync(
-                    "local root doesn't match on-chain root (tree may be corrupt)".into()
+                    "local root doesn't match on-chain root (tree may be corrupt)".into(),
                 ));
             }
             return Ok(SyncResult {
@@ -151,7 +153,8 @@ impl TreeSync {
         }
 
         // Fetch new events starting from last synced block
-        let events = pool.get_note_inserted_events(self.last_synced_block)
+        let events = pool
+            .get_note_inserted_events(self.last_synced_block)
             .map_err(|e| TreeSyncError::Pool(e.to_string()))?;
 
         let mut events_added = 0;
@@ -191,12 +194,13 @@ impl TreeSync {
         }
 
         // Verify root
-        let on_chain_root = pool.get_merkle_root()
+        let on_chain_root = pool
+            .get_merkle_root()
             .map_err(|e| TreeSyncError::Pool(e.to_string()))?;
         let root_verified = self.tree.root() == on_chain_root;
         if !root_verified {
             return Err(TreeSyncError::Sync(
-                "root mismatch after sync — events may be out of order".into()
+                "root mismatch after sync — events may be out of order".into(),
             ));
         }
 
@@ -262,8 +266,8 @@ impl TreeSync {
             "leaves": leaf_hexes,
         });
 
-        let output = serde_json::to_string_pretty(&json)
-            .map_err(|e| TreeSyncError::Json(e.to_string()))?;
+        let output =
+            serde_json::to_string_pretty(&json).map_err(|e| TreeSyncError::Json(e.to_string()))?;
         std::fs::write(path, output)?;
         Ok(())
     }

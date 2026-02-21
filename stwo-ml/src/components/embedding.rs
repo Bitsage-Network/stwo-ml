@@ -5,8 +5,8 @@
 
 use stwo::core::fields::m31::{BaseField, M31};
 use stwo::core::fields::qm31::SecureField;
-use stwo_constraint_framework::{FrameworkEval, FrameworkComponent, EvalAtRow, RelationEntry};
 use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
+use stwo_constraint_framework::{EvalAtRow, FrameworkComponent, FrameworkEval, RelationEntry};
 
 use crate::components::matmul::M31Matrix;
 
@@ -45,7 +45,13 @@ pub fn embedding_lookup(
         }
     }
 
-    (output, flat_token_ids, flat_col_indices, flat_values, multiplicities)
+    (
+        output,
+        flat_token_ids,
+        flat_col_indices,
+        flat_values,
+        multiplicities,
+    )
 }
 
 /// Build the 3 preprocessed table columns for embedding LogUp:

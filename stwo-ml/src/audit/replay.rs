@@ -14,8 +14,8 @@ use crate::audit::log::InferenceLog;
 use crate::audit::types::{AuditError, InferenceLogEntry};
 use crate::compiler::graph::{ComputationGraph, GraphOp, GraphWeights};
 use crate::compiler::prove::{
-    apply_activation_pub, apply_layernorm_pub, apply_rmsnorm_detailed,
-    elementwise_add, elementwise_mul,
+    apply_activation_pub, apply_layernorm_pub, apply_rmsnorm_detailed, elementwise_add,
+    elementwise_mul,
 };
 use crate::components::matmul::{matmul_m31_auto, M31Matrix};
 
@@ -65,7 +65,9 @@ pub fn execute_forward_pass(
                 })?;
                 matmul_m31_auto(&current, weight)
             }
-            GraphOp::Activation { activation_type, .. } => {
+            GraphOp::Activation {
+                activation_type, ..
+            } => {
                 let f = activation_type.as_fn();
                 apply_activation_pub(&current, &*f)
             }
@@ -151,7 +153,10 @@ pub fn verify_replay(
     // Compute io_commitment from replayed data.
     let replayed_commitment = compute_io_commitment(&input, &output);
     let logged_commitment = FieldElement::from_hex_be(&entry.io_commitment).map_err(|_| {
-        AuditError::LogError(format!("invalid io_commitment hex: {}", entry.io_commitment))
+        AuditError::LogError(format!(
+            "invalid io_commitment hex: {}",
+            entry.io_commitment
+        ))
     })?;
 
     let matched = replayed_commitment == logged_commitment;
@@ -196,8 +201,8 @@ mod tests {
     use crate::audit::types::InferenceLogEntry;
     use crate::compiler::graph::{GraphBuilder, GraphWeights};
     use crate::components::activation::ActivationType;
-    use stwo::core::fields::m31::M31;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use stwo::core::fields::m31::M31;
 
     fn temp_dir() -> std::path::PathBuf {
         let d = SystemTime::now()
@@ -253,10 +258,7 @@ mod tests {
         // Build: linear(4->4) -> relu -> linear(4->2)
         // Node 0 = matmul, node 1 = relu, node 2 = matmul
         let mut builder = GraphBuilder::new((1, 4));
-        builder
-            .linear(4)
-            .activation(ActivationType::ReLU)
-            .linear(2);
+        builder.linear(4).activation(ActivationType::ReLU).linear(2);
         let graph = builder.build();
 
         let mut weights = GraphWeights::new();
@@ -301,9 +303,7 @@ mod tests {
 
         // Build: linear(4->4) -> relu
         let mut builder = GraphBuilder::new((1, 4));
-        builder
-            .linear(4)
-            .activation(ActivationType::ReLU);
+        builder.linear(4).activation(ActivationType::ReLU);
         let graph = builder.build();
 
         let mut weights = GraphWeights::new();
@@ -338,9 +338,7 @@ mod tests {
     #[test]
     fn test_forward_pass_deterministic() {
         let mut builder = GraphBuilder::new((1, 4));
-        builder
-            .linear(4)
-            .activation(ActivationType::ReLU);
+        builder.linear(4).activation(ActivationType::ReLU);
         let graph = builder.build();
 
         let mut weights = GraphWeights::new();

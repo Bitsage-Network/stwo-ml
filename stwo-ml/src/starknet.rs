@@ -814,7 +814,11 @@ fn serialize_weight_claims_for_artifact(proof: &crate::gkr::GKRProof) -> Vec<Fie
     // Order mirrors verifier-side claim walk:
     //   1) main walk MatMul claims
     //   2) deferred MatMul claims (weightless proofs are skipped)
-    let deferred_matmul_count = proof.deferred_proofs.iter().filter(|d| d.has_weights()).count();
+    let deferred_matmul_count = proof
+        .deferred_proofs
+        .iter()
+        .filter(|d| d.has_weights())
+        .count();
     let total_claims = proof.weight_claims.len() + deferred_matmul_count;
     let mut out = Vec::new();
     crate::cairo_serde::serialize_u32(total_claims as u32, &mut out);
@@ -834,7 +838,11 @@ fn mode_weight_binding_data_with_domain(
     domain_tag: u64,
     schema_version: u64,
 ) -> Vec<FieldElement> {
-    let deferred_matmul_count = proof.deferred_proofs.iter().filter(|d| d.has_weights()).count();
+    let deferred_matmul_count = proof
+        .deferred_proofs
+        .iter()
+        .filter(|d| d.has_weights())
+        .count();
     let total_claims = proof.weight_claims.len() + deferred_matmul_count;
     let mut commitments = proof.weight_commitments.clone();
     for deferred in &proof.deferred_proofs {
@@ -977,7 +985,11 @@ fn build_gkr_serialized_proof_inner(
     // Order must match Cairo verifier weight_claims:
     //   1) main walk matmul claims
     //   2) deferred matmul claims (DAG Add skip branches, weightless excluded)
-    let deferred_opening_count = gkr_proof.deferred_proofs.iter().filter(|d| d.has_weights()).count();
+    let deferred_opening_count = gkr_proof
+        .deferred_proofs
+        .iter()
+        .filter(|d| d.has_weights())
+        .count();
     let total_openings = gkr_proof.weight_openings.len() + deferred_opening_count;
     let mut weight_opening_calldata = Vec::new();
     crate::cairo_serde::serialize_u32(total_openings as u32, &mut weight_opening_calldata);
@@ -986,10 +998,7 @@ fn build_gkr_serialized_proof_inner(
     }
     for deferred in &gkr_proof.deferred_proofs {
         if let Some(wo) = deferred.weight_opening() {
-            crate::cairo_serde::serialize_mle_opening_proof(
-                wo,
-                &mut weight_opening_calldata,
-            );
+            crate::cairo_serde::serialize_mle_opening_proof(wo, &mut weight_opening_calldata);
         }
     }
 
@@ -1511,7 +1520,11 @@ fn build_verify_model_gkr_calldata_inner(
 
     // 8/9/10. weight_opening_proofs: Array<MleOpeningProof>
     // Order matches verifier weight_claims: main walk first, then deferred (weightless excluded).
-    let deferred_opening_count = proof.deferred_proofs.iter().filter(|d| d.has_weights()).count();
+    let deferred_opening_count = proof
+        .deferred_proofs
+        .iter()
+        .filter(|d| d.has_weights())
+        .count();
     let total_openings = proof.weight_openings.len() + deferred_opening_count;
     parts.push(format!("{}", total_openings));
 

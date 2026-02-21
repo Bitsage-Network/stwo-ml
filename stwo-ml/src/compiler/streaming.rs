@@ -28,16 +28,17 @@ use stwo::core::fields::m31::M31;
 use stwo::core::fields::qm31::SecureField;
 
 use crate::compiler::graph::{ComputationGraph, GraphOp, GraphWeights};
-use crate::compiler::quantize_weights::{quantize_weight_matrix, quantize_weight_tile, WeightError};
-use crate::compiler::safetensors::{tensor_to_f32, dtype_byte_size, bytes_to_f32_single};
+use crate::compiler::quantize_weights::{
+    quantize_weight_matrix, quantize_weight_tile, WeightError,
+};
+use crate::compiler::safetensors::{bytes_to_f32_single, dtype_byte_size, tensor_to_f32};
 use crate::components::matmul::{
-    M31Matrix, matmul_m31_auto, pad_matrix_pow2, prove_matmul_sumcheck_onchain_auto,
+    matmul_m31_auto, pad_matrix_pow2, prove_matmul_sumcheck_onchain_auto, M31Matrix,
 };
 use crate::components::tiled_matmul::{
-    TiledMatMulConfig, TiledMatMulProof, TileProof, TiledMatMulError,
-    extract_col_slice,
+    extract_col_slice, TileProof, TiledMatMulConfig, TiledMatMulError, TiledMatMulProof,
 };
-use crate::gadgets::quantize::{QuantStrategy, QuantParams};
+use crate::gadgets::quantize::{QuantParams, QuantStrategy};
 
 /// Handle to a memory-mapped SafeTensors shard file.
 struct ShardHandle {
@@ -95,8 +96,12 @@ fn scan_tensor_minmax(data: &[u8], dtype: safetensors::Dtype) -> (f64, f64) {
 
     for chunk in data.chunks_exact(elem_size) {
         let v = bytes_to_f32_single(chunk, dtype) as f64;
-        if v < min_val { min_val = v; }
-        if v > max_val { max_val = v; }
+        if v < min_val {
+            min_val = v;
+        }
+        if v > max_val {
+            max_val = v;
+        }
     }
 
     (min_val, max_val)
@@ -225,10 +230,7 @@ impl StreamingWeightPipeline {
     /// Returns [`GraphWeights`] with node IDs remapped to `[0..len)`, matching
     /// the semantics of [`GraphWeights::subset`]. Only touches mmap pages for
     /// tensors in this range.
-    pub fn load_chunk_weights(
-        &self,
-        range: Range<usize>,
-    ) -> Result<GraphWeights, WeightError> {
+    pub fn load_chunk_weights(&self, range: Range<usize>) -> Result<GraphWeights, WeightError> {
         use rayon::prelude::*;
 
         let start = range.start;
@@ -251,7 +253,10 @@ impl StreamingWeightPipeline {
         // Group by shard for sequential extraction
         let mut shard_to_work: HashMap<usize, Vec<(usize, usize, usize, &str)>> = HashMap::new();
         for &(idx, k, n, name, shard_idx) in &work_items {
-            shard_to_work.entry(shard_idx).or_default().push((idx, k, n, name));
+            shard_to_work
+                .entry(shard_idx)
+                .or_default()
+                .push((idx, k, n, name));
         }
 
         // Phase 1: Extract raw f32 from relevant shards
@@ -263,7 +268,8 @@ impl StreamingWeightPipeline {
                 .map_err(|e| WeightError::IoError(format!("shard {shard_idx}: {e}")))?;
 
             for &(idx, k, n, tensor_name) in weights_in_shard {
-                let tensor = tensors.tensor(tensor_name)
+                let tensor = tensors
+                    .tensor(tensor_name)
                     .map_err(|e| WeightError::IoError(format!("{tensor_name}: {e}")))?;
                 let data = tensor_to_f32(tensor.data(), tensor.dtype());
                 let shape = tensor.shape().to_vec();
@@ -367,14 +373,19 @@ impl StreamingWeightPipeline {
         &self,
         node_id: usize,
     ) -> Result<(&[u8], safetensors::Dtype, Vec<usize>), WeightError> {
-        let tensor_name = self.name_map.get(&node_id)
+        let tensor_name = self
+            .name_map
+            .get(&node_id)
             .ok_or_else(|| WeightError::MissingTensor(format!("node {node_id}")))?;
-        let &shard_idx = self.tensor_to_shard.get(tensor_name.as_str())
+        let &shard_idx = self
+            .tensor_to_shard
+            .get(tensor_name.as_str())
             .ok_or_else(|| WeightError::MissingTensor(tensor_name.clone()))?;
 
         let tensors = safetensors::SafeTensors::deserialize(&self.shards[shard_idx].mmap)
             .map_err(|e| WeightError::IoError(format!("shard {shard_idx}: {e}")))?;
-        let tensor = tensors.tensor(tensor_name)
+        let tensor = tensors
+            .tensor(tensor_name)
             .map_err(|e| WeightError::IoError(format!("{tensor_name}: {e}")))?;
 
         let dtype = tensor.dtype();
@@ -403,9 +414,11 @@ impl StreamingWeightPipeline {
     ) -> Result<(QuantParams, usize, usize), WeightError> {
         let (k, n) = match &self.graph.nodes[node_id].op {
             GraphOp::MatMul { dims: (_m, k, n) } => (*k, *n),
-            _ => return Err(WeightError::IoError(format!(
-                "node {node_id} is not a MatMul"
-            ))),
+            _ => {
+                return Err(WeightError::IoError(format!(
+                    "node {node_id} is not a MatMul"
+                )))
+            }
         };
 
         let (data, dtype, _shape) = self.resolve_tensor(node_id)?;
@@ -431,9 +444,11 @@ impl StreamingWeightPipeline {
     ) -> Result<M31Matrix, WeightError> {
         let (k, n) = match &self.graph.nodes[node_id].op {
             GraphOp::MatMul { dims: (_m, k, n) } => (*k, *n),
-            _ => return Err(WeightError::IoError(format!(
-                "node {node_id} is not a MatMul"
-            ))),
+            _ => {
+                return Err(WeightError::IoError(format!(
+                    "node {node_id} is not a MatMul"
+                )))
+            }
         };
 
         let (data, dtype, shape) = self.resolve_tensor(node_id)?;
@@ -502,8 +517,9 @@ impl StreamingWeightPipeline {
             // Accumulate: C[i][j] += C_tile[i][j]
             for i in 0..m {
                 for j in 0..n {
-                    let sum = M31::from(c.get(i, j).0.wrapping_add(c_tile.get(i, j).0)
-                        % ((1u32 << 31) - 1));
+                    let sum = M31::from(
+                        c.get(i, j).0.wrapping_add(c_tile.get(i, j).0) % ((1u32 << 31) - 1),
+                    );
                     c.set(i, j, sum);
                 }
             }
@@ -538,17 +554,25 @@ impl StreamingWeightPipeline {
         _c: &M31Matrix,
         tile_config: &TiledMatMulConfig,
     ) -> Result<TiledMatMulProof, TiledMatMulError> {
-        let (params, k, n) = self.scan_weight_params(node_id)
-            .map_err(|e| TiledMatMulError::TileProvingFailed {
-                tile: 0,
-                message: format!("scan params: {e}"),
-            })?;
+        let (params, k, n) =
+            self.scan_weight_params(node_id)
+                .map_err(|e| TiledMatMulError::TileProvingFailed {
+                    tile: 0,
+                    message: format!("scan params: {e}"),
+                })?;
 
         let m = a.rows;
         let tile_k = tile_config.max_tile_k.min(k);
         let num_tiles = tile_config.num_tiles(k);
 
-        tracing::info!(m, k, n, tile_k, num_tiles, "Streaming tiled matmul proving (double-buffered)");
+        tracing::info!(
+            m,
+            k,
+            n,
+            tile_k,
+            num_tiles,
+            "Streaming tiled matmul proving (double-buffered)"
+        );
 
         if num_tiles <= 1 {
             // Single tile — no pipelining benefit, use simple path.
@@ -571,7 +595,8 @@ impl StreamingWeightPipeline {
         // Load first tile synchronously (nothing to overlap with yet).
         let k_start_0 = 0;
         let k_end_0 = tile_k.min(k);
-        let mut current_b_tile = self.load_weight_tile(node_id, k_start_0, k_end_0, &params)
+        let mut current_b_tile = self
+            .load_weight_tile(node_id, k_start_0, k_end_0, &params)
             .map_err(|e| TiledMatMulError::TileProvingFailed {
                 tile: 0,
                 message: format!("load tile: {e}"),
@@ -582,7 +607,13 @@ impl StreamingWeightPipeline {
             let k_end = (k_start + tile_k).min(k);
             let actual_tile_k = k_end - k_start;
 
-            tracing::debug!(tile_idx, k_start, k_end, actual_tile_k, "Streaming tile (double-buffered)");
+            tracing::debug!(
+                tile_idx,
+                k_start,
+                k_end,
+                actual_tile_k,
+                "Streaming tile (double-buffered)"
+            );
 
             // Prepare this tile's inputs from the pre-loaded B tile.
             let b_tile = current_b_tile;
@@ -617,11 +648,10 @@ impl StreamingWeightPipeline {
                 (proof, next_tile)
             });
 
-            let proof = proof_result
-                .map_err(|e| TiledMatMulError::TileProvingFailed {
-                    tile: tile_idx,
-                    message: format!("{e}"),
-                })?;
+            let proof = proof_result.map_err(|e| TiledMatMulError::TileProvingFailed {
+                tile: tile_idx,
+                message: format!("{e}"),
+            })?;
 
             total_claimed_sum = total_claimed_sum + proof.claimed_sum;
 
@@ -633,11 +663,10 @@ impl StreamingWeightPipeline {
 
             // Advance the pre-loaded tile for the next iteration.
             if let Some(next_result) = next_tile_result {
-                current_b_tile = next_result
-                    .map_err(|e| TiledMatMulError::TileProvingFailed {
-                        tile: tile_idx + 1,
-                        message: format!("load tile: {e}"),
-                    })?;
+                current_b_tile = next_result.map_err(|e| TiledMatMulError::TileProvingFailed {
+                    tile: tile_idx + 1,
+                    message: format!("load tile: {e}"),
+                })?;
             } else {
                 // Last tile — set a dummy that won't be used.
                 current_b_tile = M31Matrix::new(0, 0);
@@ -673,7 +702,8 @@ impl StreamingWeightPipeline {
             let k_start = tile_idx * tile_k;
             let k_end = (k_start + tile_k).min(k);
 
-            let b_tile = self.load_weight_tile(node_id, k_start, k_end, params)
+            let b_tile = self
+                .load_weight_tile(node_id, k_start, k_end, params)
                 .map_err(|e| TiledMatMulError::TileProvingFailed {
                     tile: tile_idx,
                     message: format!("load tile: {e}"),
@@ -692,10 +722,21 @@ impl StreamingWeightPipeline {
                 })?;
 
             total_claimed_sum = total_claimed_sum + proof.claimed_sum;
-            tile_proofs.push(TileProof { proof, k_start, k_end });
+            tile_proofs.push(TileProof {
+                proof,
+                k_start,
+                k_end,
+            });
         }
 
-        Ok(TiledMatMulProof { m, k, n, tile_proofs, total_claimed_sum, tile_k })
+        Ok(TiledMatMulProof {
+            m,
+            k,
+            n,
+            tile_proofs,
+            total_claimed_sum,
+            tile_k,
+        })
     }
 
     /// Prefetch mmap pages for a specific tile's byte range within a tensor.
@@ -711,7 +752,9 @@ impl StreamingWeightPipeline {
     fn prefetch_tile_bytes(&self, node_id: usize, k_start: usize, k_end: usize) {
         #[cfg(unix)]
         {
-            let Ok((data, dtype, shape)) = self.resolve_tensor(node_id) else { return };
+            let Ok((data, dtype, shape)) = self.resolve_tensor(node_id) else {
+                return;
+            };
             let (k, n) = match &self.graph.nodes[node_id].op {
                 GraphOp::MatMul { dims: (_m, k, n) } => (*k, *n),
                 _ => return,
@@ -764,11 +807,7 @@ impl StreamingWeightPipeline {
     ///
     /// Returns `tile_k × n × 4` (M31 matrix) + `m × tile_k × 4` (A slice)
     /// + `m × n × 4` (C tile) + padding overhead.
-    pub fn estimate_tile_memory(
-        &self,
-        node_id: usize,
-        tile_config: &TiledMatMulConfig,
-    ) -> usize {
+    pub fn estimate_tile_memory(&self, node_id: usize, tile_config: &TiledMatMulConfig) -> usize {
         if let GraphOp::MatMul { dims: (m, k, n) } = &self.graph.nodes[node_id].op {
             let tile_k = tile_config.max_tile_k.min(*k);
             let m_pad = m.next_power_of_two();
@@ -946,7 +985,8 @@ mod tests {
             0x00, 0x40, // f16 2.0
             0x00, 0x42, // f16 3.0
             0x00, 0x44, // f16 4.0
-        ].to_vec();
+        ]
+        .to_vec();
 
         // 2×2 matrix (k=2, n=2), extract tile k_start=0, k_end=1 → first row
         let tile = extract_tile_kn(&f16_data, safetensors::Dtype::F16, 2, 0, 1);

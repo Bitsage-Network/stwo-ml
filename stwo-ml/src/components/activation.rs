@@ -7,15 +7,12 @@
 
 use stwo::core::fields::m31::{BaseField, M31};
 use stwo::core::fields::qm31::SecureField;
-use stwo::prover::poly::circle::CircleEvaluation;
-use stwo::prover::poly::BitReversedOrder;
 use stwo::core::poly::circle::CanonicCoset;
 use stwo::prover::backend::{Col, Column, ColumnOps};
-use stwo_constraint_framework::{
-    FrameworkEval, FrameworkComponent,
-    EvalAtRow, RelationEntry,
-};
+use stwo::prover::poly::circle::CircleEvaluation;
+use stwo::prover::poly::BitReversedOrder;
 use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
+use stwo_constraint_framework::{EvalAtRow, FrameworkComponent, FrameworkEval, RelationEntry};
 
 use crate::gadgets::lookup_table::PrecomputedTable;
 
@@ -243,10 +240,7 @@ mod tests {
     #[test]
     fn test_generate_activation_table() {
         use stwo::prover::backend::simd::SimdBackend;
-        let table = PrecomputedTable::build(
-            crate::gadgets::lookup_table::activations::relu,
-            4,
-        );
+        let table = PrecomputedTable::build(crate::gadgets::lookup_table::activations::relu, 4);
         let cols = generate_activation_table::<SimdBackend>(&table);
         assert_eq!(cols.len(), 2);
     }

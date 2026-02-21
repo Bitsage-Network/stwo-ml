@@ -11,16 +11,18 @@
 //! - Amount consistency: `lo + hi * 2^31 == amount`
 //! - Asset matches
 
+use stwo::core::channel::MerkleChannel;
 use stwo::core::fields::m31::BaseField as M31;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
-use stwo::core::channel::MerkleChannel;
 
-use crate::crypto::commitment::{Note, NoteCommitment};
-use crate::crypto::poseidon2_m31::{STATE_WIDTH, RATE};
-use crate::crypto::poseidon_channel::PoseidonChannel;
-use crate::circuits::poseidon_circuit::{prove_poseidon2_batch, verify_poseidon2_batch, Poseidon2BatchProof};
 use crate::circuits::helpers::{record_hash_permutations, verify_sponge_chain};
+use crate::circuits::poseidon_circuit::{
+    prove_poseidon2_batch, verify_poseidon2_batch, Poseidon2BatchProof,
+};
 use crate::components::range_check::{prove_range_check, verify_range_check, RangeCheckProof};
+use crate::crypto::commitment::{Note, NoteCommitment};
+use crate::crypto::poseidon2_m31::{RATE, STATE_WIDTH};
+use crate::crypto::poseidon_channel::PoseidonChannel;
 use crate::gadgets::range_check::RangeCheckConfig;
 
 type Blake2sHash = <Blake2sMerkleChannel as MerkleChannel>::H;
@@ -32,9 +34,15 @@ pub enum DepositError {
     #[error("amount mismatch: lo={lo} hi={hi} does not equal amount={amount}")]
     AmountMismatch { lo: u32, hi: u32, amount: u64 },
     #[error("asset mismatch: note has {note_asset}, expected {expected_asset}")]
-    AssetMismatch { note_asset: u32, expected_asset: u32 },
+    AssetMismatch {
+        note_asset: u32,
+        expected_asset: u32,
+    },
     #[error("commitment wiring failed: computed {computed:?} != expected {expected:?}")]
-    CommitmentWiringFailed { computed: NoteCommitment, expected: NoteCommitment },
+    CommitmentWiringFailed {
+        computed: NoteCommitment,
+        expected: NoteCommitment,
+    },
     #[error("range check decomposition failed: {0}")]
     RangeDecomposition(String),
     #[error("poseidon proof error: {0}")]
@@ -119,7 +127,11 @@ pub fn execute_deposit(
         witness.note.blinding[3],
     ];
     let (commitment, perms) = record_hash_permutations(&commitment_input);
-    assert_eq!(perms.len(), 2, "commitment hash of 11 elements should produce 2 permutations");
+    assert_eq!(
+        perms.len(),
+        2,
+        "commitment hash of 11 elements should produce 2 permutations"
+    );
 
     let mut all_inputs = Vec::with_capacity(BATCH_SIZE);
     let mut all_outputs = Vec::with_capacity(BATCH_SIZE);
@@ -129,10 +141,7 @@ pub fn execute_deposit(
     }
 
     // Decompose amount limbs into 16-bit sub-limbs for range checking
-    let range_check_limbs = decompose_amount_limbs(
-        witness.note.amount_lo,
-        witness.note.amount_hi,
-    )?;
+    let range_check_limbs = decompose_amount_limbs(witness.note.amount_lo, witness.note.amount_hi)?;
 
     let execution = DepositExecution {
         commitment,
@@ -156,10 +165,7 @@ pub fn prove_deposit(witness: &DepositWitness) -> Result<DepositProof, DepositEr
 
     // Prove Poseidon2 batch (2 permutations)
     let mut channel = PoseidonChannel::default();
-    let poseidon_proof = prove_poseidon2_batch(
-        &execution.all_permutation_inputs,
-        &mut channel,
-    );
+    let poseidon_proof = prove_poseidon2_batch(&execution.all_permutation_inputs, &mut channel);
 
     // Prove range check on decomposed limbs
     let config = RangeCheckConfig::uint16();
@@ -186,12 +192,17 @@ pub fn verify_deposit(proof: &DepositProof) -> Result<(), DepositError> {
         &exec.all_permutation_inputs,
         &exec.all_permutation_outputs,
         &mut channel,
-    ).map_err(|e| DepositError::PoseidonError(format!("{e}")))?;
+    )
+    .map_err(|e| DepositError::PoseidonError(format!("{e}")))?;
 
     // 2. Verify range check proof
     let config = RangeCheckConfig::uint16();
-    verify_range_check(&proof.range_check_proof, &config, exec.range_check_limbs.len())
-        .map_err(|e| DepositError::RangeCheckError(format!("{e}")))?;
+    verify_range_check(
+        &proof.range_check_proof,
+        &config,
+        exec.range_check_limbs.len(),
+    )
+    .map_err(|e| DepositError::RangeCheckError(format!("{e}")))?;
 
     // 3. P1: Sponge chain continuity for commitment hash (11 elements, 2 perms)
     verify_sponge_chain(
@@ -200,7 +211,8 @@ pub fn verify_deposit(proof: &DepositProof) -> Result<(), DepositError> {
         0,          // commitment starts at perm 0
         BATCH_SIZE, // 2 perms
         11,         // 11 elements
-    ).map_err(|e| DepositError::CrossWiringFailed(format!("P1 commitment: {e}")))?;
+    )
+    .map_err(|e| DepositError::CrossWiringFailed(format!("P1 commitment: {e}")))?;
 
     // 4. Wiring: commitment output from permutation chain matches claimed commitment
     // The final permutation's output state[..RATE] should be the commitment
@@ -224,10 +236,7 @@ pub fn verify_deposit(proof: &DepositProof) -> Result<(), DepositError> {
 
     // 5. Amount consistency: decomposed limbs reconstruct to the claimed amount
     // range_check_limbs = [lo_16_0, hi_16_0, lo_16_1, hi_16_1]
-    verify_amount_decomposition(
-        &exec.range_check_limbs,
-        pub_in.amount,
-    )?;
+    verify_amount_decomposition(&exec.range_check_limbs, pub_in.amount)?;
 
     Ok(())
 }
@@ -247,14 +256,16 @@ fn decompose_amount_limbs(amount_lo: M31, amount_hi: M31) -> Result<Vec<M31>, De
 
     // Verify reconstruction
     if lo_lo16 + lo_hi16 * 65536 != lo_val {
-        return Err(DepositError::RangeDecomposition(
-            format!("amount_lo decomposition: {} + {} * 65536 != {}", lo_lo16, lo_hi16, lo_val),
-        ));
+        return Err(DepositError::RangeDecomposition(format!(
+            "amount_lo decomposition: {} + {} * 65536 != {}",
+            lo_lo16, lo_hi16, lo_val
+        )));
     }
     if hi_lo16 + hi_hi16 * 65536 != hi_val {
-        return Err(DepositError::RangeDecomposition(
-            format!("amount_hi decomposition: {} + {} * 65536 != {}", hi_lo16, hi_hi16, hi_val),
-        ));
+        return Err(DepositError::RangeDecomposition(format!(
+            "amount_hi decomposition: {} + {} * 65536 != {}",
+            hi_lo16, hi_hi16, hi_val
+        )));
     }
 
     Ok(vec![
@@ -268,9 +279,10 @@ fn decompose_amount_limbs(amount_lo: M31, amount_hi: M31) -> Result<Vec<M31>, De
 /// Verify that the range-checked sub-limbs reconstruct to the claimed amount.
 fn verify_amount_decomposition(limbs: &[M31], amount: u64) -> Result<(), DepositError> {
     if limbs.len() != 4 {
-        return Err(DepositError::RangeDecomposition(
-            format!("expected 4 sub-limbs, got {}", limbs.len()),
-        ));
+        return Err(DepositError::RangeDecomposition(format!(
+            "expected 4 sub-limbs, got {}",
+            limbs.len()
+        )));
     }
 
     let amount_lo = limbs[0].0 as u64 + (limbs[1].0 as u64) * 65536;
@@ -301,7 +313,11 @@ mod tests {
         let asset_id = M31::from_u32_unchecked(0); // STRK
         let blinding = [1, 2, 3, 4].map(M31::from_u32_unchecked);
         let note = Note::new(pk, asset_id, amount_lo, amount_hi, blinding);
-        DepositWitness { note, amount, asset_id }
+        DepositWitness {
+            note,
+            amount,
+            asset_id,
+        }
     }
 
     #[test]

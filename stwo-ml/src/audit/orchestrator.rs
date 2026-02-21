@@ -28,8 +28,7 @@ use crate::audit::self_eval::{evaluate_batch, SelfEvalConfig};
 use crate::audit::storage::ArweaveClient;
 use crate::audit::submit::{serialize_audit_calldata, SubmitConfig};
 use crate::audit::types::{
-    AuditEncryption, AuditError, AuditReport, AuditRequest, ModelInfo,
-    PrivacyInfo,
+    AuditEncryption, AuditError, AuditReport, AuditRequest, ModelInfo, PrivacyInfo,
 };
 use crate::compiler::graph::{ComputationGraph, GraphWeights};
 
@@ -123,7 +122,10 @@ pub fn run_audit(
         });
     }
 
-    info!(entries = window.entries.len(), "Audit pipeline: log window queried");
+    info!(
+        entries = window.entries.len(),
+        "Audit pipeline: log window queried"
+    );
 
     // ── Step 2: Prove inferences ──────────────────────────────────────────
     let prover = AuditProver::new(graph, weights);
@@ -142,18 +144,9 @@ pub fn run_audit(
             prove_evaluations: config.prove_evaluations,
         };
 
-        let evaluations = evaluate_batch(
-            &window.entries,
-            Some(graph),
-            Some(weights),
-            &eval_config,
-        );
+        let evaluations = evaluate_batch(&window.entries, Some(graph), Some(weights), &eval_config);
 
-        let summary = aggregate_evaluations(
-            &evaluations,
-            "combined",
-            config.prove_evaluations,
-        );
+        let summary = aggregate_evaluations(&evaluations, "combined", config.prove_evaluations);
 
         info!(
             avg_score = summary.avg_quality_score,
@@ -198,12 +191,7 @@ pub fn run_audit(
     // ── Step 5: Encrypt + Store ───────────────────────────────────────────
     let storage_receipt = if config.privacy_tier != "public" {
         if let (Some(enc), Some(store)) = (encryption, storage) {
-            let (receipt, _blob) = encrypt_and_store(
-                &report,
-                &config.owner_pubkey,
-                enc,
-                store,
-            )?;
+            let (receipt, _blob) = encrypt_and_store(&report, &config.owner_pubkey, enc, store)?;
 
             // Update report with Arweave TX ID.
             report.proof.arweave_tx_id = Some(receipt.tx_id.clone());
@@ -211,7 +199,10 @@ pub fn run_audit(
                 privacy.arweave_tx_id = Some(receipt.tx_id.clone());
             }
 
-            info!(tx_id = receipt.tx_id, "Audit pipeline: encrypted and stored");
+            info!(
+                tx_id = receipt.tx_id,
+                "Audit pipeline: encrypted and stored"
+            );
 
             Some(receipt)
         } else {
@@ -244,11 +235,12 @@ pub fn run_audit(
         if cfg.report_hash.is_none() {
             // Parse the report's audit_report_hash (M31 digest hex) and pack
             // into (lo, hi) felt252 pair for the calldata.
-            let digest = hex_to_digest(&report.commitments.audit_report_hash)
-                .map_err(|e| AuditError::Serde(format!(
+            let digest = hex_to_digest(&report.commitments.audit_report_hash).map_err(|e| {
+                AuditError::Serde(format!(
                     "invalid report hash hex: {}: {}",
                     report.commitments.audit_report_hash, e
-                )))?;
+                ))
+            })?;
             let (lo_bytes, hi_bytes) = pack_digest_felt252(&digest);
             let lo = FieldElement::from_bytes_be(&lo_bytes)
                 .map_err(|_| AuditError::Serde("report hash lo overflow".to_string()))?;

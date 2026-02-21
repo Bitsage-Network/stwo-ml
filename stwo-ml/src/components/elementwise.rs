@@ -6,7 +6,7 @@
 //! # Mul constraint (degree 2):
 //!   output[i] - lhs[i] * rhs[i] = 0
 
-use stwo_constraint_framework::{FrameworkEval, FrameworkComponent, EvalAtRow};
+use stwo_constraint_framework::{EvalAtRow, FrameworkComponent, FrameworkEval};
 
 /// Evaluator for element-wise addition: output = lhs + rhs.
 #[derive(Debug, Clone)]

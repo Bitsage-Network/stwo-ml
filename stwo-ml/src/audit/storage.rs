@@ -11,12 +11,8 @@ use crate::audit::types::AuditError;
 /// HTTP transport trait — lets us swap reqwest, ureq, curl, or a mock.
 pub trait HttpTransport: Send + Sync {
     /// POST bytes to a URL with headers. Returns the response body.
-    fn post(
-        &self,
-        url: &str,
-        headers: &[(&str, &str)],
-        body: &[u8],
-    ) -> Result<Vec<u8>, AuditError>;
+    fn post(&self, url: &str, headers: &[(&str, &str)], body: &[u8])
+        -> Result<Vec<u8>, AuditError>;
 
     /// GET a URL. Returns the response body.
     fn get(&self, url: &str) -> Result<Vec<u8>, AuditError>;
@@ -95,11 +91,7 @@ impl ArweaveClient {
 
     /// Create with default gateways.
     pub fn with_defaults(transport: Box<dyn HttpTransport>) -> Self {
-        Self::new(
-            "https://arweave.net",
-            "https://node1.irys.xyz",
-            transport,
-        )
+        Self::new("https://arweave.net", "https://node1.irys.xyz", transport)
     }
 
     /// Set an Irys API auth token for authenticated uploads.
@@ -261,7 +253,10 @@ fn base64_decode(encoded: &str) -> Option<Vec<u8>> {
             _ => None,
         }
     }
-    let bytes: Vec<u8> = encoded.bytes().filter(|&b| b != b'\n' && b != b'\r').collect();
+    let bytes: Vec<u8> = encoded
+        .bytes()
+        .filter(|&b| b != b'\n' && b != b'\r')
+        .collect();
     if bytes.len() % 4 != 0 {
         return None;
     }
@@ -332,7 +327,12 @@ fn parse_upload_response(response: &[u8]) -> Result<String, AuditError> {
 
     // Fallback: treat entire response as tx_id if it looks like one.
     let trimmed = text.trim().trim_matches('"');
-    if !trimmed.is_empty() && trimmed.len() <= 64 && trimmed.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+    if !trimmed.is_empty()
+        && trimmed.len() <= 64
+        && trimmed
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
         return Ok(trimmed.to_string());
     }
 
@@ -382,10 +382,7 @@ impl RelayClient {
     pub const DEFAULT_RELAY_URL: &'static str = "https://relay.obelysk.xyz";
 
     /// Create a new relay client.
-    pub fn new(
-        relay_url: impl Into<String>,
-        transport: Box<dyn HttpTransport>,
-    ) -> Self {
+    pub fn new(relay_url: impl Into<String>, transport: Box<dyn HttpTransport>) -> Self {
         Self {
             relay_url: relay_url.into(),
             gateway: "https://arweave.net".to_string(),
@@ -470,7 +467,9 @@ impl RelayClient {
                 let text = String::from_utf8_lossy(&body);
                 if text.contains("confirmed") {
                     if let Some(height) = extract_block_height(&text) {
-                        Ok(TxStatus::Confirmed { block_height: height })
+                        Ok(TxStatus::Confirmed {
+                            block_height: height,
+                        })
                     } else {
                         Ok(TxStatus::Confirmed { block_height: 0 })
                     }
@@ -573,7 +572,8 @@ impl MarketplaceClient {
             data_b64,
             escape_json_string(audit_id),
             escape_json_string(model_name),
-            now, now,
+            now,
+            now,
             tags_json.join(",")
         );
 
@@ -608,7 +608,9 @@ impl MarketplaceClient {
             Ok(body) => {
                 let text = String::from_utf8_lossy(&body);
                 if let Some(height) = extract_block_height(&text) {
-                    Ok(TxStatus::Confirmed { block_height: height })
+                    Ok(TxStatus::Confirmed {
+                        block_height: height,
+                    })
                 } else {
                     Ok(TxStatus::Pending)
                 }
@@ -676,7 +678,16 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
     let month_days: [u64; 12] = [
         31,
         if leap { 29 } else { 28 },
-        31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
     ];
     let mut month = 0u64;
     for (i, &md) in month_days.iter().enumerate() {
@@ -749,11 +760,21 @@ struct ArweaveUploader(ArweaveClient);
 
 #[cfg(feature = "audit-http")]
 impl AuditUploader for ArweaveUploader {
-    fn upload(&self, data: &[u8], audit_id: &str, model_id: &str, extra_tags: &[ArweaveTag]) -> Result<StorageReceipt, AuditError> {
+    fn upload(
+        &self,
+        data: &[u8],
+        audit_id: &str,
+        model_id: &str,
+        extra_tags: &[ArweaveTag],
+    ) -> Result<StorageReceipt, AuditError> {
         self.0.upload(data, audit_id, model_id, extra_tags)
     }
-    fn download(&self, tx_id: &str) -> Result<Vec<u8>, AuditError> { self.0.download(tx_id) }
-    fn status(&self, tx_id: &str) -> Result<TxStatus, AuditError> { self.0.status(tx_id) }
+    fn download(&self, tx_id: &str) -> Result<Vec<u8>, AuditError> {
+        self.0.download(tx_id)
+    }
+    fn status(&self, tx_id: &str) -> Result<TxStatus, AuditError> {
+        self.0.status(tx_id)
+    }
 }
 
 #[cfg(feature = "audit-http")]
@@ -761,11 +782,21 @@ struct RelayUploader(RelayClient);
 
 #[cfg(feature = "audit-http")]
 impl AuditUploader for RelayUploader {
-    fn upload(&self, data: &[u8], audit_id: &str, model_id: &str, extra_tags: &[ArweaveTag]) -> Result<StorageReceipt, AuditError> {
+    fn upload(
+        &self,
+        data: &[u8],
+        audit_id: &str,
+        model_id: &str,
+        extra_tags: &[ArweaveTag],
+    ) -> Result<StorageReceipt, AuditError> {
         self.0.upload(data, audit_id, model_id, extra_tags)
     }
-    fn download(&self, tx_id: &str) -> Result<Vec<u8>, AuditError> { self.0.download(tx_id) }
-    fn status(&self, tx_id: &str) -> Result<TxStatus, AuditError> { self.0.status(tx_id) }
+    fn download(&self, tx_id: &str) -> Result<Vec<u8>, AuditError> {
+        self.0.download(tx_id)
+    }
+    fn status(&self, tx_id: &str) -> Result<TxStatus, AuditError> {
+        self.0.status(tx_id)
+    }
 }
 
 #[cfg(feature = "audit-http")]
@@ -773,11 +804,21 @@ struct MarketplaceUploader(MarketplaceClient);
 
 #[cfg(feature = "audit-http")]
 impl AuditUploader for MarketplaceUploader {
-    fn upload(&self, data: &[u8], audit_id: &str, model_id: &str, extra_tags: &[ArweaveTag]) -> Result<StorageReceipt, AuditError> {
+    fn upload(
+        &self,
+        data: &[u8],
+        audit_id: &str,
+        model_id: &str,
+        extra_tags: &[ArweaveTag],
+    ) -> Result<StorageReceipt, AuditError> {
         self.0.upload(data, audit_id, model_id, extra_tags)
     }
-    fn download(&self, tx_id: &str) -> Result<Vec<u8>, AuditError> { self.0.download(tx_id) }
-    fn status(&self, tx_id: &str) -> Result<TxStatus, AuditError> { self.0.status(tx_id) }
+    fn download(&self, tx_id: &str) -> Result<Vec<u8>, AuditError> {
+        self.0.download(tx_id)
+    }
+    fn status(&self, tx_id: &str) -> Result<TxStatus, AuditError> {
+        self.0.status(tx_id)
+    }
 }
 
 // ─── Ureq Transport (real HTTP, feature-gated) ──────────────────────────────
@@ -859,8 +900,7 @@ impl HttpTransport for MockTransport {
         let tx_id = format!("mock_tx_{}", id);
 
         // Extract data from JSON envelope if present, otherwise store raw body.
-        let data_to_store = extract_data_from_json_envelope(body)
-            .unwrap_or_else(|| body.to_vec());
+        let data_to_store = extract_data_from_json_envelope(body).unwrap_or_else(|| body.to_vec());
 
         self.store
             .lock()
@@ -916,9 +956,7 @@ mod tests {
         let client = ArweaveClient::with_defaults(transport);
 
         let data = vec![0u8; 1024];
-        let receipt = client
-            .upload(&data, "audit_0x1", "model_0x2", &[])
-            .unwrap();
+        let receipt = client.upload(&data, "audit_0x1", "model_0x2", &[]).unwrap();
 
         assert!(receipt.tx_id.starts_with("mock_tx_"));
         assert_eq!(receipt.size_bytes, 1024);
@@ -1027,7 +1065,12 @@ mod tests {
         // Wrap in a newtype that delegates HttpTransport.
         struct ArcTransport(Arc<MockTransport>);
         impl HttpTransport for ArcTransport {
-            fn post(&self, url: &str, headers: &[(&str, &str)], body: &[u8]) -> Result<Vec<u8>, AuditError> {
+            fn post(
+                &self,
+                url: &str,
+                headers: &[(&str, &str)],
+                body: &[u8],
+            ) -> Result<Vec<u8>, AuditError> {
                 self.0.post(url, headers, body)
             }
             fn get(&self, url: &str) -> Result<Vec<u8>, AuditError> {
@@ -1053,11 +1096,8 @@ mod tests {
     #[test]
     fn test_marketplace_upload_and_download() {
         let transport = Box::new(MockTransport::new());
-        let client = MarketplaceClient::new(
-            "https://marketplace.test",
-            "bsk_test_key_12345",
-            transport,
-        );
+        let client =
+            MarketplaceClient::new("https://marketplace.test", "bsk_test_key_12345", transport);
 
         let data = b"audit report data";
         let receipt = client.upload(data, "audit_0x42", "qwen3-14b", &[]).unwrap();
@@ -1076,7 +1116,12 @@ mod tests {
 
         struct ArcTransport(Arc<MockTransport>);
         impl HttpTransport for ArcTransport {
-            fn post(&self, url: &str, headers: &[(&str, &str)], body: &[u8]) -> Result<Vec<u8>, AuditError> {
+            fn post(
+                &self,
+                url: &str,
+                headers: &[(&str, &str)],
+                body: &[u8],
+            ) -> Result<Vec<u8>, AuditError> {
                 self.0.post(url, headers, body)
             }
             fn get(&self, url: &str) -> Result<Vec<u8>, AuditError> {
@@ -1122,7 +1167,12 @@ mod tests {
 
         struct ArcTransport(Arc<MockTransport>);
         impl HttpTransport for ArcTransport {
-            fn post(&self, url: &str, headers: &[(&str, &str)], body: &[u8]) -> Result<Vec<u8>, AuditError> {
+            fn post(
+                &self,
+                url: &str,
+                headers: &[(&str, &str)],
+                body: &[u8],
+            ) -> Result<Vec<u8>, AuditError> {
                 self.0.post(url, headers, body)
             }
             fn get(&self, url: &str) -> Result<Vec<u8>, AuditError> {
@@ -1142,6 +1192,9 @@ mod tests {
 
         let headers = mock.last_post_headers();
         let auth = headers.iter().find(|(k, _)| k == "Authorization");
-        assert!(auth.is_none(), "No Authorization header expected without auth token");
+        assert!(
+            auth.is_none(),
+            "No Authorization header expected without auth token"
+        );
     }
 }

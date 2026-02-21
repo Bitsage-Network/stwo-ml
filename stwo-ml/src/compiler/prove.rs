@@ -1209,7 +1209,10 @@ fn m31_mod_inverse(n: u32) -> M31 {
 ///
 /// Tries the GPU path first (cuda-runtime feature). On failure or when CUDA
 /// is unavailable, falls back to the CPU `apply_layernorm_detailed`.
-pub(crate) fn apply_layernorm_detailed_auto(input: &M31Matrix, dim: usize) -> LayerNormIntermediates {
+pub(crate) fn apply_layernorm_detailed_auto(
+    input: &M31Matrix,
+    dim: usize,
+) -> LayerNormIntermediates {
     #[cfg(feature = "cuda-runtime")]
     {
         let n = dim.min(input.cols);
@@ -1258,7 +1261,9 @@ pub(crate) fn apply_layernorm_detailed_auto(input: &M31Matrix, dim: usize) -> La
 pub(crate) fn apply_rmsnorm_detailed_auto(input: &M31Matrix, dim: usize) -> RMSNormIntermediates {
     #[cfg(feature = "cuda-runtime")]
     {
-        use crate::components::rmsnorm::{build_rsqrt_table as build_rmsnorm_rsqrt_table, RMSNormConfig};
+        use crate::components::rmsnorm::{
+            build_rsqrt_table as build_rmsnorm_rsqrt_table, RMSNormConfig,
+        };
 
         let n = dim.min(input.cols);
         let inv_n = m31_mod_inverse(n as u32);

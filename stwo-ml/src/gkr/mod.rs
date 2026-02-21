@@ -38,27 +38,22 @@
 //! when `gkr_proof` is present. It replays the Fiat-Shamir transcript and
 //! checks each layer proof against the circuit structure.
 
-pub mod types;
 pub mod circuit;
 pub mod prover;
+pub mod types;
 pub mod verifier;
 
-pub use types::{
-    DeferredProof,
-    EmbeddingLogUpProof,
-    GKRClaim,
-    GKRError,
-    GKRProof,
-    LayerProof,
-    LogUpProof,
-    ReductionOutput,
-    RoundPolyDeg3,
-    WeightOpeningTranscriptMode,
-};
-pub use circuit::{LayeredCircuit, CircuitLayer, LayerType, LayerCounts, SIMDBatchConfig};
+pub use circuit::{CircuitLayer, LayerCounts, LayerType, LayeredCircuit, SIMDBatchConfig};
 pub use prover::prove_gkr;
 #[cfg(feature = "cuda-runtime")]
 pub use prover::prove_gkr_gpu;
 #[cfg(feature = "cuda-runtime")]
 pub use prover::prove_gkr_simd_gpu;
-pub use verifier::{verify_gkr, verify_gkr_simd, verify_gkr_simd_with_weights, verify_gkr_with_execution, verify_gkr_with_weights};
+pub use types::{
+    DeferredProof, EmbeddingLogUpProof, GKRClaim, GKRError, GKRProof, LayerProof, LogUpProof,
+    ReductionOutput, RoundPolyDeg3, WeightOpeningTranscriptMode,
+};
+pub use verifier::{
+    verify_gkr, verify_gkr_simd, verify_gkr_simd_with_weights, verify_gkr_with_execution,
+    verify_gkr_with_weights,
+};

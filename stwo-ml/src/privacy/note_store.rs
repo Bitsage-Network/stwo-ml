@@ -121,10 +121,7 @@ impl NoteStore {
                     amount_hi: entry["amount_hi"].as_u64().unwrap_or(0) as u32,
                     blinding: parse_u32_array_4(entry, "blinding"),
                 };
-                let commitment = entry["commitment"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
+                let commitment = entry["commitment"].as_str().unwrap_or("").to_string();
                 let merkle_index = entry["merkle_index"].as_u64().unwrap_or(0) as usize;
                 let status = match entry["status"].as_str().unwrap_or("confirmed") {
                     "pending" => NoteStatus::Pending,
@@ -175,19 +172,14 @@ impl NoteStore {
             .collect();
 
         let json = serde_json::json!({ "version": 1, "notes": notes_json });
-        let output = serde_json::to_string_pretty(&json)
-            .map_err(|e| NoteStoreError::Json(e.to_string()))?;
+        let output =
+            serde_json::to_string_pretty(&json).map_err(|e| NoteStoreError::Json(e.to_string()))?;
         std::fs::write(&self.path, output)?;
         Ok(())
     }
 
     /// Add a new note to the store.
-    pub fn add_note(
-        &mut self,
-        note: &Note,
-        commitment_hex: &str,
-        merkle_index: usize,
-    ) {
+    pub fn add_note(&mut self, note: &Note, commitment_hex: &str, merkle_index: usize) {
         self.notes.push(TrackedNote {
             note: NoteData::from_note(note),
             commitment: commitment_hex.to_string(),
@@ -197,11 +189,7 @@ impl NoteStore {
     }
 
     /// Add a new note with Pending status (not yet confirmed on-chain).
-    pub fn add_note_pending(
-        &mut self,
-        note: &Note,
-        commitment_hex: &str,
-    ) {
+    pub fn add_note_pending(&mut self, note: &Note, commitment_hex: &str) {
         self.notes.push(TrackedNote {
             note: NoteData::from_note(note),
             commitment: commitment_hex.to_string(),
@@ -277,10 +265,7 @@ impl NoteStore {
         let mut notes: Vec<&TrackedNote> = self
             .notes
             .iter()
-            .filter(|n| {
-                n.status == NoteStatus::Confirmed
-                    && n.note.asset_id == asset_id
-            })
+            .filter(|n| n.status == NoteStatus::Confirmed && n.note.asset_id == asset_id)
             .collect();
         // Sort by amount descending (greedy selection)
         notes.sort_by(|a, b| b.note.amount().cmp(&a.note.amount()));
@@ -297,11 +282,7 @@ impl NoteStore {
 
     /// Select notes to cover a target amount (greedy largest-first).
     /// Returns selected notes and any change amount.
-    pub fn select_notes(
-        &self,
-        asset_id: u32,
-        target: u64,
-    ) -> Option<(Vec<&TrackedNote>, u64)> {
+    pub fn select_notes(&self, asset_id: u32, target: u64) -> Option<(Vec<&TrackedNote>, u64)> {
         let available = self.spendable_notes(asset_id);
         let mut selected = Vec::new();
         let mut total = 0u64;
@@ -427,7 +408,8 @@ mod tests {
         let amount_hi = M31::from_u32_unchecked(0);
         let blinding = [5, 6, 7, 8].map(M31::from_u32_unchecked);
 
-        let encrypted = encrypt_note_memo(&enc_key, &nonce, asset_id, amount_lo, amount_hi, &blinding);
+        let encrypted =
+            encrypt_note_memo(&enc_key, &nonce, asset_id, amount_lo, amount_hi, &blinding);
 
         let mut store = NoteStore {
             notes: Vec::new(),
@@ -456,13 +438,7 @@ mod tests {
         assert_eq!(store.notes[0].merkle_index, 0);
 
         // Simulate tree sync finding this commitment at index 5
-        store.update_merkle_indices(|c| {
-            if *c == commitment {
-                Some(5)
-            } else {
-                None
-            }
-        });
+        store.update_merkle_indices(|c| if *c == commitment { Some(5) } else { None });
 
         assert_eq!(store.notes[0].status, NoteStatus::Confirmed);
         assert_eq!(store.notes[0].merkle_index, 5);

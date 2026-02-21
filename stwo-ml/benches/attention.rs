@@ -12,12 +12,16 @@ fn bench_attention_cost_model(c: &mut Criterion) {
     ];
 
     for (name, heads, d_model, seq_len) in configs {
-        group.bench_with_input(BenchmarkId::new("sumcheck_rows", name), &name, |bench, _| {
-            bench.iter(|| {
-                let config = MultiHeadAttentionConfig::new(heads, d_model, seq_len);
-                config.sumcheck_trace_rows()
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("sumcheck_rows", name),
+            &name,
+            |bench, _| {
+                bench.iter(|| {
+                    let config = MultiHeadAttentionConfig::new(heads, d_model, seq_len);
+                    config.sumcheck_trace_rows()
+                });
+            },
+        );
 
         group.bench_with_input(BenchmarkId::new("speedup", name), &name, |bench, _| {
             bench.iter(|| {

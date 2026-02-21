@@ -6,11 +6,11 @@
 use std::collections::HashMap;
 
 use stwo::core::fields::m31::{BaseField, M31};
+use stwo::core::poly::circle::CanonicCoset;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::{Col, ColumnOps};
 use stwo::prover::poly::circle::CircleEvaluation;
 use stwo::prover::poly::BitReversedOrder;
-use stwo::core::poly::circle::CanonicCoset;
 
 /// A precomputed lookup table mapping input → output over M31.
 #[derive(Debug, Clone)]
@@ -40,7 +40,12 @@ impl PrecomputedTable {
         }
 
         let index = Self::maybe_build_index(&inputs, log_size);
-        Self { inputs, outputs, log_size, index }
+        Self {
+            inputs,
+            outputs,
+            log_size,
+            index,
+        }
     }
 
     /// Build a lookup table in parallel using rayon.
@@ -63,7 +68,12 @@ impl PrecomputedTable {
         let outputs: Vec<M31> = pairs.iter().map(|(_, o)| *o).collect();
         let index = Self::maybe_build_index(&inputs, log_size);
 
-        Self { inputs, outputs, log_size, index }
+        Self {
+            inputs,
+            outputs,
+            log_size,
+            index,
+        }
     }
 
     /// Build a lookup table from explicit (input, output) pairs.
@@ -90,7 +100,12 @@ impl PrecomputedTable {
         }
 
         let index = Self::maybe_build_index(&inputs, log_size);
-        Self { inputs, outputs, log_size, index }
+        Self {
+            inputs,
+            outputs,
+            log_size,
+            index,
+        }
     }
 
     /// Number of entries in the table.
@@ -182,7 +197,11 @@ pub mod activations {
     pub fn relu(x: M31) -> M31 {
         let val = x.0;
         let half_p = (1u32 << 30) - 1;
-        if val <= half_p { x } else { M31::from(0) }
+        if val <= half_p {
+            x
+        } else {
+            M31::from(0)
+        }
     }
 
     /// Fixed-point scale for GELU (and other scaled activations).
@@ -378,16 +397,22 @@ mod tests {
         let gelu_out = activations::gelu_approx(val_half);
         let relu_out = activations::relu(val_half);
         assert_ne!(
-            gelu_out, relu_out,
+            gelu_out,
+            relu_out,
             "GELU and ReLU must differ at x=0.5 (scale/2={}, gelu={}, relu={})",
-            scale / 2, gelu_out.0, relu_out.0,
+            scale / 2,
+            gelu_out.0,
+            relu_out.0,
         );
 
         // GELU output should be less than ReLU output for moderate positive values
         assert!(
             gelu_out.0 < relu_out.0,
             "GELU({}) = {} should be < ReLU({}) = {} for moderate x",
-            val_half.0, gelu_out.0, val_half.0, relu_out.0,
+            val_half.0,
+            gelu_out.0,
+            val_half.0,
+            relu_out.0,
         );
 
         // At x_real = 1.0 (val = scale), GELU ≈ 0.841, ReLU = 1.0
@@ -405,10 +430,10 @@ mod tests {
         // Test against reference gelu_f32 at known points
         let test_points: Vec<(f64, f64)> = vec![
             (0.0, 0.0),
-            (0.5, 0.3457),  // GELU(0.5) ≈ 0.3457
-            (1.0, 0.8412),  // GELU(1.0) ≈ 0.8412
-            (2.0, 1.9545),  // GELU(2.0) ≈ 1.9545
-            (3.0, 2.9964),  // GELU(3.0) ≈ 2.9964
+            (0.5, 0.3457), // GELU(0.5) ≈ 0.3457
+            (1.0, 0.8412), // GELU(1.0) ≈ 0.8412
+            (2.0, 1.9545), // GELU(2.0) ≈ 1.9545
+            (3.0, 2.9964), // GELU(3.0) ≈ 2.9964
         ];
 
         for (x_real, expected_gelu) in test_points {
@@ -425,7 +450,10 @@ mod tests {
             assert!(
                 diff <= tolerance,
                 "GELU({}) = {} (expected ~{}, diff={})",
-                x_real, output.0, expected_val, diff,
+                x_real,
+                output.0,
+                expected_val,
+                diff,
             );
         }
     }
@@ -448,7 +476,9 @@ mod tests {
         assert!(
             diff <= tolerance,
             "GELU(5.0) should be ≈ 5.0: got {} (expected ~{}, diff={})",
-            gelu_large.0, val_large, diff,
+            gelu_large.0,
+            val_large,
+            diff,
         );
     }
 
@@ -493,7 +523,9 @@ mod tests {
             assert!(
                 out.0 >= prev,
                 "GELU should be monotonic: GELU({}) = {} < prev = {}",
-                val, out.0, prev,
+                val,
+                out.0,
+                prev,
             );
             prev = out.0;
         }

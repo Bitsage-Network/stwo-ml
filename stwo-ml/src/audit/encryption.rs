@@ -23,8 +23,8 @@ use crate::audit::types::{
 /// Returns a hex-formatted string of the 8 M31 output elements.
 /// This is 100% M31-native — no felt252 involved.
 fn hash_plaintext(data: &[u8]) -> String {
-    use stwo::core::fields::m31::BaseField as M31;
     use crate::crypto::poseidon2_m31::poseidon2_hash;
+    use stwo::core::fields::m31::BaseField as M31;
 
     // Pack bytes into M31 elements with length prefix (prevents
     // zero-padded tails from colliding with shorter inputs).
@@ -40,7 +40,13 @@ fn hash_plaintext(data: &[u8]) -> String {
 
     let hash = poseidon2_hash(&m31s);
     let bytes: Vec<u8> = hash.iter().flat_map(|m| m.0.to_le_bytes()).collect();
-    format!("0x{}", bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>())
+    format!(
+        "0x{}",
+        bytes
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>()
+    )
 }
 
 // ─── Noop Encryption (always available, for testing) ───────────────────────
@@ -149,11 +155,11 @@ mod hex {
 
 #[cfg(feature = "aes-fallback")]
 mod aes_impl {
+    use aes_gcm::aead::rand_core::RngCore;
     use aes_gcm::{
         aead::{Aead, KeyInit, OsRng},
         Aes256Gcm, Key, Nonce,
     };
-    use aes_gcm::aead::rand_core::RngCore;
 
     use super::*;
 
@@ -221,11 +227,8 @@ mod aes_impl {
                 .ok_or(EncryptionError::AccessDenied)?;
 
             // M31-native unwrap DEK.
-            let dek_bytes = super::m31_keys::unwrap_dek(
-                &wrapped.encrypted_key,
-                privkey,
-                AES_DEK_BYTES,
-            )?;
+            let dek_bytes =
+                super::m31_keys::unwrap_dek(&wrapped.encrypted_key, privkey, AES_DEK_BYTES)?;
 
             if blob.nonce.len() != 12 {
                 return Err(EncryptionError::DecryptionFailed(
@@ -313,8 +316,7 @@ pub fn encrypt_and_store(
         .map_err(AuditError::Encryption)?;
 
     // Serialize blob for storage.
-    let blob_bytes =
-        serde_json::to_vec(&blob).map_err(|e| AuditError::Serde(e.to_string()))?;
+    let blob_bytes = serde_json::to_vec(&blob).map_err(|e| AuditError::Serde(e.to_string()))?;
 
     // Upload with metadata tags.
     let extra_tags = vec![
@@ -448,7 +450,7 @@ mod m31_keys {
     use stwo::core::fields::m31::BaseField as M31;
 
     use crate::audit::types::EncryptionError;
-    use crate::crypto::encryption::{poseidon2_encrypt, poseidon2_decrypt};
+    use crate::crypto::encryption::{poseidon2_decrypt, poseidon2_encrypt};
     use crate::crypto::poseidon2_m31::{poseidon2_hash, RATE};
 
     /// M31 field modulus.
@@ -549,10 +551,18 @@ mod m31_keys {
         getrandom::getrandom(&mut bytes)
             .map_err(|e| EncryptionError::EncryptionFailed(format!("RNG: {}", e)))?;
         Ok([
-            M31::from_u32_unchecked(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) % P),
-            M31::from_u32_unchecked(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) % P),
-            M31::from_u32_unchecked(u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) % P),
-            M31::from_u32_unchecked(u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) % P),
+            M31::from_u32_unchecked(
+                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) % P,
+            ),
+            M31::from_u32_unchecked(
+                u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) % P,
+            ),
+            M31::from_u32_unchecked(
+                u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) % P,
+            ),
+            M31::from_u32_unchecked(
+                u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) % P,
+            ),
         ])
     }
 
@@ -685,10 +695,18 @@ mod m31_keys {
             .map_err(|e| EncryptionError::EncryptionFailed(format!("RNG: {}", e)))?;
 
         let sk: [M31; 4] = [
-            M31::from_u32_unchecked(u32::from_le_bytes([sk_raw[0], sk_raw[1], sk_raw[2], sk_raw[3]]) % P),
-            M31::from_u32_unchecked(u32::from_le_bytes([sk_raw[4], sk_raw[5], sk_raw[6], sk_raw[7]]) % P),
-            M31::from_u32_unchecked(u32::from_le_bytes([sk_raw[8], sk_raw[9], sk_raw[10], sk_raw[11]]) % P),
-            M31::from_u32_unchecked(u32::from_le_bytes([sk_raw[12], sk_raw[13], sk_raw[14], sk_raw[15]]) % P),
+            M31::from_u32_unchecked(
+                u32::from_le_bytes([sk_raw[0], sk_raw[1], sk_raw[2], sk_raw[3]]) % P,
+            ),
+            M31::from_u32_unchecked(
+                u32::from_le_bytes([sk_raw[4], sk_raw[5], sk_raw[6], sk_raw[7]]) % P,
+            ),
+            M31::from_u32_unchecked(
+                u32::from_le_bytes([sk_raw[8], sk_raw[9], sk_raw[10], sk_raw[11]]) % P,
+            ),
+            M31::from_u32_unchecked(
+                u32::from_le_bytes([sk_raw[12], sk_raw[13], sk_raw[14], sk_raw[15]]) % P,
+            ),
         ];
 
         let vk = derive_view_key(&sk);
@@ -702,7 +720,7 @@ mod poseidon2_impl {
     use stwo::core::fields::m31::BaseField as M31;
 
     use super::*;
-    use crate::crypto::encryption::{derive_key, poseidon2_encrypt, poseidon2_decrypt};
+    use crate::crypto::encryption::{derive_key, poseidon2_decrypt, poseidon2_encrypt};
     use crate::crypto::poseidon2_m31::{poseidon2_hash, RATE};
 
     /// M31 field modulus: P = 2^31 - 1.
@@ -803,9 +821,8 @@ mod poseidon2_impl {
         ) -> Result<EncryptedBlob, EncryptionError> {
             // Generate random DEK.
             let mut rng_bytes = [0u8; 24];
-            getrandom::getrandom(&mut rng_bytes).map_err(|e| {
-                EncryptionError::EncryptionFailed(format!("RNG: {}", e))
-            })?;
+            getrandom::getrandom(&mut rng_bytes)
+                .map_err(|e| EncryptionError::EncryptionFailed(format!("RNG: {}", e)))?;
             let dek = key_from_bytes(&rng_bytes);
 
             // Derive nonce from DEK hash.
@@ -850,11 +867,8 @@ mod poseidon2_impl {
                 .ok_or(EncryptionError::AccessDenied)?;
 
             // Unwrap DEK: privkey is secret key (16 bytes) → derives view key internally.
-            let dek_bytes = super::m31_keys::unwrap_dek(
-                &wrapped.encrypted_key,
-                privkey,
-                DEK_BYTES,
-            )?;
+            let dek_bytes =
+                super::m31_keys::unwrap_dek(&wrapped.encrypted_key, privkey, DEK_BYTES)?;
 
             // Reconstruct DEK as M31 array.
             if dek_bytes.len() != DEK_BYTES {
@@ -868,7 +882,10 @@ mod poseidon2_impl {
             for i in 0..RATE {
                 let off = i * 4;
                 let val = u32::from_le_bytes([
-                    dek_bytes[off], dek_bytes[off + 1], dek_bytes[off + 2], dek_bytes[off + 3],
+                    dek_bytes[off],
+                    dek_bytes[off + 1],
+                    dek_bytes[off + 2],
+                    dek_bytes[off + 3],
                 ]);
                 dek[i] = M31::from_u32_unchecked(val % P);
             }
@@ -930,8 +947,8 @@ mod poseidon2_impl {
     }
 }
 
-pub use poseidon2_impl::Poseidon2M31Encryption;
 pub use m31_keys::generate_keypair as generate_audit_keypair;
+pub use poseidon2_impl::Poseidon2M31Encryption;
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
@@ -969,7 +986,13 @@ mod tests {
         let blob = enc.encrypt(b"report data", b"owner_pub").unwrap();
 
         let wrapped = enc
-            .wrap_key_for(&blob, b"owner_priv", b"owner_addr", b"grantee_pub", b"grantee_addr")
+            .wrap_key_for(
+                &blob,
+                b"owner_priv",
+                b"owner_addr",
+                b"grantee_pub",
+                b"grantee_addr",
+            )
             .unwrap();
         assert_eq!(wrapped.role, "auditor");
 
@@ -1229,6 +1252,9 @@ mod tests {
 
         // Attacker tries to use view_key as the "private key" — wrong size (32 vs 16).
         let result = enc.decrypt(&blob, &view_key, &view_key);
-        assert!(result.is_err(), "view key alone must not decrypt (wrong size for secret key)");
+        assert!(
+            result.is_err(),
+            "view key alone must not decrypt (wrong size for secret key)"
+        );
     }
 }

@@ -22,16 +22,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use stwo::core::fields::m31::M31;
 
-use stwo_ml::prelude::*;
 use stwo_ml::aggregation::compute_io_commitment;
 use stwo_ml::audit::capture::{CaptureHook, CaptureJob};
 use stwo_ml::audit::deterministic::evaluate_deterministic;
 use stwo_ml::audit::digest::{digest_to_hex, ZERO_DIGEST};
-use stwo_ml::audit::encryption::{encrypt_and_store, fetch_and_decrypt, Poseidon2M31Encryption, generate_audit_keypair};
-use stwo_ml::audit::log::InferenceLog;
-use stwo_ml::audit::orchestrator::{
-    run_audit, run_audit_dry, AuditPipelineConfig,
+use stwo_ml::audit::encryption::{
+    encrypt_and_store, fetch_and_decrypt, generate_audit_keypair, Poseidon2M31Encryption,
 };
+use stwo_ml::audit::log::InferenceLog;
+use stwo_ml::audit::orchestrator::{run_audit, run_audit_dry, AuditPipelineConfig};
 use stwo_ml::audit::prover::AuditProver;
 use stwo_ml::audit::replay::execute_forward_pass;
 use stwo_ml::audit::report::compute_report_hash;
@@ -39,9 +38,8 @@ use stwo_ml::audit::scoring::aggregate_evaluations;
 use stwo_ml::audit::self_eval::{evaluate_batch, SelfEvalConfig};
 use stwo_ml::audit::storage::{ArweaveClient, MockTransport};
 use stwo_ml::audit::submit::{serialize_audit_calldata, validate_calldata, SubmitConfig};
-use stwo_ml::audit::types::{
-    AuditError, AuditReport, AuditRequest, InferenceLogEntry, ModelInfo,
-};
+use stwo_ml::audit::types::{AuditError, AuditReport, AuditRequest, InferenceLogEntry, ModelInfo};
+use stwo_ml::prelude::*;
 
 // ============================================================================
 // Helpers
@@ -59,10 +57,7 @@ fn temp_dir(prefix: &str) -> PathBuf {
 /// Small enough to prove fast, complex enough to exercise the pipeline.
 fn build_audit_model() -> (ComputationGraph, GraphWeights, ModelInfo) {
     let mut builder = GraphBuilder::new((1, 4));
-    builder
-        .linear(4)
-        .activation(ActivationType::ReLU)
-        .linear(2);
+    builder.linear(4).activation(ActivationType::ReLU).linear(2);
     let graph = builder.build();
 
     let mut weights = GraphWeights::new();
@@ -190,8 +185,14 @@ fn test_e2e_audit_dry_run() {
 
     // Proof info
     assert!(report.proof.proving_time_seconds > 0 || report.inference_summary.total_inferences > 0);
-    assert!(report.proof.on_chain_tx.is_none(), "dry run should have no TX");
-    assert!(report.privacy.is_none(), "public audit should have no privacy info");
+    assert!(
+        report.proof.on_chain_tx.is_none(),
+        "dry run should have no TX"
+    );
+    assert!(
+        report.privacy.is_none(),
+        "public audit should have no privacy info"
+    );
 
     // Inferences recorded
     assert_eq!(report.inferences.len(), 3);
@@ -201,7 +202,10 @@ fn test_e2e_audit_dry_run() {
     }
 
     // Semantic evaluation should run (default in dry run)
-    assert!(report.semantic_evaluation.is_some(), "semantics should be evaluated");
+    assert!(
+        report.semantic_evaluation.is_some(),
+        "semantics should be evaluated"
+    );
     let sem = report.semantic_evaluation.as_ref().unwrap();
     assert_eq!(sem.evaluated_count, 3);
 
@@ -239,24 +243,40 @@ fn test_e2e_audit_full_pipeline() {
         billing: None,
     };
 
-    let result = run_audit(&log, &graph, &weights, &config, Some(&encryption), Some(&storage))
-        .unwrap();
+    let result = run_audit(
+        &log,
+        &graph,
+        &weights,
+        &config,
+        Some(&encryption),
+        Some(&storage),
+    )
+    .unwrap();
 
     // ── Report ──
     assert_eq!(result.report.inference_summary.total_inferences, 5);
-    assert!(result.report.privacy.is_some(), "private audit should have privacy info");
+    assert!(
+        result.report.privacy.is_some(),
+        "private audit should have privacy info"
+    );
     let privacy = result.report.privacy.as_ref().unwrap();
     assert_eq!(privacy.tier, "private");
 
     // ── Storage ──
-    assert!(result.storage_receipt.is_some(), "should have storage receipt");
+    assert!(
+        result.storage_receipt.is_some(),
+        "should have storage receipt"
+    );
     let receipt = result.storage_receipt.as_ref().unwrap();
     assert!(!receipt.tx_id.is_empty(), "Arweave TX should be non-empty");
 
     // ── Calldata ──
     assert!(result.calldata.is_some(), "should have serialized calldata");
     let calldata = result.calldata.as_ref().unwrap();
-    assert!(calldata.len() >= 12, "calldata should have at least 12 header fields");
+    assert!(
+        calldata.len() >= 12,
+        "calldata should have at least 12 header fields"
+    );
 
     // Validate the calldata structure
     let info = validate_calldata(calldata).unwrap();
@@ -279,13 +299,7 @@ fn test_e2e_capture_to_proof() {
 
     // ── Phase 1: Record inferences via capture hook ──
     {
-        let hook = CaptureHook::new(
-            &dir,
-            "0x2",
-            "0xabc",
-            "test-mlp",
-        )
-        .unwrap();
+        let hook = CaptureHook::new(&dir, "0x2", "0xabc", "test-mlp").unwrap();
 
         for i in 0..4 {
             let input = make_input(i);
@@ -314,7 +328,10 @@ fn test_e2e_capture_to_proof() {
 
     // ── Phase 2: Reload log and prove ──
     let log = InferenceLog::load(&dir).unwrap();
-    assert!(log.verify_chain().is_ok(), "chain should be intact after capture");
+    assert!(
+        log.verify_chain().is_ok(),
+        "chain should be intact after capture"
+    );
 
     let window = log.query_window(0, u64::MAX);
     assert_eq!(window.entries.len(), 4, "should have 4 captured entries");
@@ -367,8 +384,7 @@ fn test_e2e_audit_deterministic() {
 
     // Core commitments MUST match
     assert_eq!(
-        r1.commitments.io_merkle_root,
-        r2.commitments.io_merkle_root,
+        r1.commitments.io_merkle_root, r2.commitments.io_merkle_root,
         "io_merkle_root should be deterministic"
     );
     assert_eq!(
@@ -448,7 +464,10 @@ fn test_e2e_calldata_roundtrip() {
     // Validate structure (new layout: 12 header fields + proof)
     let info = validate_calldata(&calldata).unwrap();
     assert_eq!(info.inference_count, 3);
-    assert!(info.time_start > 0, "time_start should be > 0 (ns/1e9 = seconds)");
+    assert!(
+        info.time_start > 0,
+        "time_start should be > 0 (ns/1e9 = seconds)"
+    );
     assert!(info.time_end > info.time_start);
     assert_eq!(info.total_felts, calldata.len());
 
@@ -474,7 +493,10 @@ fn test_e2e_empty_window_error() {
 
     let result = run_audit_dry(&log, &graph, &weights, request, model_info);
     assert!(result.is_err());
-    assert!(matches!(result.unwrap_err(), AuditError::EmptyWindow { .. }));
+    assert!(matches!(
+        result.unwrap_err(),
+        AuditError::EmptyWindow { .. }
+    ));
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -504,8 +526,7 @@ fn test_e2e_encrypt_decrypt_report() {
     let transport = MockTransport::new();
     let storage = ArweaveClient::with_defaults(Box::new(transport));
 
-    let (receipt, _blob) = encrypt_and_store(&report, &view_key, &encryption, &storage)
-        .unwrap();
+    let (receipt, _blob) = encrypt_and_store(&report, &view_key, &encryption, &storage).unwrap();
 
     assert!(!receipt.tx_id.is_empty());
 
@@ -598,9 +619,17 @@ fn test_e2e_large_batch() {
     assert_eq!(report.inferences.len(), 10);
 
     // All io_commitments should be unique (different inputs)
-    let commitments: Vec<&str> = report.inferences.iter().map(|e| e.io_commitment.as_str()).collect();
+    let commitments: Vec<&str> = report
+        .inferences
+        .iter()
+        .map(|e| e.io_commitment.as_str())
+        .collect();
     let unique: std::collections::HashSet<&&str> = commitments.iter().collect();
-    assert_eq!(unique.len(), 10, "all io_commitments should be unique for different inputs");
+    assert_eq!(
+        unique.len(),
+        10,
+        "all io_commitments should be unique for different inputs"
+    );
 
     // Semantic evaluation should cover all 10
     let sem = report.semantic_evaluation.as_ref().unwrap();

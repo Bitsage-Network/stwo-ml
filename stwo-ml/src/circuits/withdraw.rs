@@ -7,32 +7,37 @@
 //!
 //! Composes `Poseidon2BatchProof` + `RangeCheckProof` into a single `WithdrawProof`.
 
+use stwo::core::channel::MerkleChannel;
 use stwo::core::fields::m31::BaseField as M31;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
-use stwo::core::channel::MerkleChannel;
 
-use crate::crypto::commitment::{Note, NoteCommitment, Nullifier, SpendingKey, PublicKey};
-use crate::crypto::poseidon2_m31::{poseidon2_permutation, STATE_WIDTH, RATE};
-use crate::crypto::merkle_m31::{Digest, MerklePath};
-use crate::crypto::poseidon_channel::PoseidonChannel;
-use crate::circuits::poseidon_circuit::{prove_poseidon2_batch, verify_poseidon2_batch, Poseidon2BatchProof};
 use crate::circuits::helpers::{
     record_hash_permutations, record_merkle_permutations, record_ownership_permutations,
     verify_sponge_chain,
 };
+use crate::circuits::poseidon_circuit::{
+    prove_poseidon2_batch, verify_poseidon2_batch, Poseidon2BatchProof,
+};
 use crate::components::range_check::{prove_range_check, verify_range_check, RangeCheckProof};
+use crate::crypto::commitment::{Note, NoteCommitment, Nullifier, PublicKey, SpendingKey};
+use crate::crypto::merkle_m31::{Digest, MerklePath};
+use crate::crypto::poseidon2_m31::{poseidon2_permutation, RATE, STATE_WIDTH};
+use crate::crypto::poseidon_channel::PoseidonChannel;
 use crate::gadgets::range_check::RangeCheckConfig;
 
 type Blake2sHash = <Blake2sMerkleChannel as MerkleChannel>::H;
 
 pub const MERKLE_DEPTH: usize = 20;
 pub const INPUT_PERMS: usize = 25; // 1 ownership + 2 commitment + 2 nullifier + 20 Merkle
-pub const BATCH_SIZE: usize = 32;  // next power of 2
+pub const BATCH_SIZE: usize = 32; // next power of 2
 
 #[derive(Debug, thiserror::Error)]
 pub enum WithdrawError {
     #[error("ownership verification failed: derived pk {derived:?} != note pk {expected:?}")]
-    OwnershipFailed { derived: PublicKey, expected: PublicKey },
+    OwnershipFailed {
+        derived: PublicKey,
+        expected: PublicKey,
+    },
     #[error("Merkle inclusion failed: computed root {computed:?} != expected {expected:?}")]
     MerkleInclusionFailed { computed: Digest, expected: Digest },
     #[error("commitment wiring failed")]
@@ -80,10 +85,10 @@ pub struct WithdrawPublicInputs {
 /// Permutation index ranges for wiring verification.
 #[derive(Clone, Debug)]
 pub struct WithdrawPermRanges {
-    pub ownership: (usize, usize),   // 1 perm
-    pub commitment: (usize, usize),  // 2 perms
-    pub nullifier: (usize, usize),   // 2 perms
-    pub merkle: (usize, usize),      // 20 perms
+    pub ownership: (usize, usize),  // 1 perm
+    pub commitment: (usize, usize), // 2 perms
+    pub nullifier: (usize, usize),  // 2 perms
+    pub merkle: (usize, usize),     // 20 perms
 }
 
 /// Execution trace for the withdraw circuit.
@@ -169,7 +174,8 @@ pub fn execute_withdraw(
     let nullifier_end = offset;
 
     // 4. Merkle path verification (20 compress perms)
-    let (computed_root, merkle_perms) = record_merkle_permutations(&commitment, &witness.merkle_path);
+    let (computed_root, merkle_perms) =
+        record_merkle_permutations(&commitment, &witness.merkle_path);
     if computed_root != witness.merkle_root {
         return Err(WithdrawError::MerkleInclusionFailed {
             computed: computed_root,
@@ -184,16 +190,16 @@ pub fn execute_withdraw(
     }
     let merkle_end = offset;
 
-    assert_eq!(offset, INPUT_PERMS, "expected {INPUT_PERMS} perms, got {offset}");
+    assert_eq!(
+        offset, INPUT_PERMS,
+        "expected {INPUT_PERMS} perms, got {offset}"
+    );
 
     // 5. Pad to BATCH_SIZE with identity permutations
     pad_permutations(&mut all_inputs, &mut all_outputs, BATCH_SIZE);
 
     // 6. Decompose amount limbs for range checking
-    let range_check_limbs = decompose_amount_limbs(
-        witness.note.amount_lo,
-        witness.note.amount_hi,
-    )?;
+    let range_check_limbs = decompose_amount_limbs(witness.note.amount_lo, witness.note.amount_hi)?;
 
     let execution = WithdrawExecution {
         commitment,
@@ -229,10 +235,7 @@ pub fn prove_withdraw(witness: &WithdrawWitness) -> Result<WithdrawProof, Withdr
 
     // Prove Poseidon2 batch
     let mut channel = PoseidonChannel::default();
-    let poseidon_proof = prove_poseidon2_batch(
-        &execution.all_permutation_inputs,
-        &mut channel,
-    );
+    let poseidon_proof = prove_poseidon2_batch(&execution.all_permutation_inputs, &mut channel);
 
     // Prove range check
     let config = RangeCheckConfig::uint16();
@@ -259,12 +262,17 @@ pub fn verify_withdraw(proof: &WithdrawProof) -> Result<(), WithdrawError> {
         &exec.all_permutation_inputs,
         &exec.all_permutation_outputs,
         &mut channel,
-    ).map_err(|e| WithdrawError::PoseidonError(format!("{e}")))?;
+    )
+    .map_err(|e| WithdrawError::PoseidonError(format!("{e}")))?;
 
     // 2. Verify range check proof
     let config = RangeCheckConfig::uint16();
-    verify_range_check(&proof.range_check_proof, &config, exec.range_check_limbs.len())
-        .map_err(|e| WithdrawError::RangeCheckError(format!("{e}")))?;
+    verify_range_check(
+        &proof.range_check_proof,
+        &config,
+        exec.range_check_limbs.len(),
+    )
+    .map_err(|e| WithdrawError::RangeCheckError(format!("{e}")))?;
 
     // 3. Verify permutation count
     if exec.all_permutation_inputs.len() != BATCH_SIZE {
@@ -328,7 +336,9 @@ pub fn verify_withdraw(proof: &WithdrawProof) -> Result<(), WithdrawError> {
         if delta != actual_commitment_out[4 + j] {
             return Err(WithdrawError::CrossWiringFailed(format!(
                 "P4: nullifier sponge absorption at position {j}: delta {} != commitment[{}] ({})",
-                delta.0, 4 + j, actual_commitment_out[4 + j].0,
+                delta.0,
+                4 + j,
+                actual_commitment_out[4 + j].0,
             )));
         }
     }
@@ -340,7 +350,8 @@ pub fn verify_withdraw(proof: &WithdrawProof) -> Result<(), WithdrawError> {
     let right_matches = (0..RATE).all(|j| merkle_input[RATE + j] == actual_commitment_out[j]);
     if !left_matches && !right_matches {
         return Err(WithdrawError::CrossWiringFailed(
-            "P5: commitment not found in Merkle leaf compress input (neither left nor right half)".into(),
+            "P5: commitment not found in Merkle leaf compress input (neither left nor right half)"
+                .into(),
         ));
     }
 
@@ -351,7 +362,8 @@ pub fn verify_withdraw(proof: &WithdrawProof) -> Result<(), WithdrawError> {
         exec.perm_ranges.commitment.0,
         exec.perm_ranges.commitment.1 - exec.perm_ranges.commitment.0,
         11, // commitment: 11 elements
-    ).map_err(|e| WithdrawError::CrossWiringFailed(format!("P1 commitment: {e}")))?;
+    )
+    .map_err(|e| WithdrawError::CrossWiringFailed(format!("P1 commitment: {e}")))?;
 
     verify_sponge_chain(
         &exec.all_permutation_inputs,
@@ -359,14 +371,20 @@ pub fn verify_withdraw(proof: &WithdrawProof) -> Result<(), WithdrawError> {
         exec.perm_ranges.nullifier.0,
         exec.perm_ranges.nullifier.1 - exec.perm_ranges.nullifier.0,
         12, // nullifier: 12 elements
-    ).map_err(|e| WithdrawError::CrossWiringFailed(format!("P1 nullifier: {e}")))?;
+    )
+    .map_err(|e| WithdrawError::CrossWiringFailed(format!("P1 nullifier: {e}")))?;
 
     // --- Existing output-value checks ---
 
     // 4. Wiring: ownership output matches derived pubkey
     let ownership_range = &exec.perm_ranges.ownership;
     let ownership_out = &exec.all_permutation_outputs[ownership_range.1 - 1];
-    let ownership_pk = [ownership_out[0], ownership_out[1], ownership_out[2], ownership_out[3]];
+    let ownership_pk = [
+        ownership_out[0],
+        ownership_out[1],
+        ownership_out[2],
+        ownership_out[3],
+    ];
     if ownership_pk != exec.derived_pubkey {
         return Err(WithdrawError::OwnershipFailed {
             derived: ownership_pk,
@@ -406,10 +424,14 @@ pub fn verify_withdraw(proof: &WithdrawProof) -> Result<(), WithdrawError> {
 
     // 8. Public input consistency
     if exec.nullifier != pub_in.nullifier {
-        return Err(WithdrawError::PublicInputMismatch("nullifier mismatch".into()));
+        return Err(WithdrawError::PublicInputMismatch(
+            "nullifier mismatch".into(),
+        ));
     }
     if exec.computed_merkle_root != pub_in.merkle_root {
-        return Err(WithdrawError::PublicInputMismatch("merkle root mismatch".into()));
+        return Err(WithdrawError::PublicInputMismatch(
+            "merkle root mismatch".into(),
+        ));
     }
 
     // 9. Amount decomposition verification
@@ -448,9 +470,10 @@ fn decompose_amount_limbs(amount_lo: M31, amount_hi: M31) -> Result<Vec<M31>, Wi
 
 fn verify_amount_decomposition(limbs: &[M31], amount: u64) -> Result<(), WithdrawError> {
     if limbs.len() != 4 {
-        return Err(WithdrawError::RangeDecomposition(
-            format!("expected 4 sub-limbs, got {}", limbs.len()),
-        ));
+        return Err(WithdrawError::RangeDecomposition(format!(
+            "expected 4 sub-limbs, got {}",
+            limbs.len()
+        )));
     }
 
     let amount_lo = limbs[0].0 as u64 + (limbs[1].0 as u64) * 65536;
@@ -458,9 +481,10 @@ fn verify_amount_decomposition(limbs: &[M31], amount: u64) -> Result<(), Withdra
     let reconstructed = amount_lo + amount_hi * (1u64 << 31);
 
     if reconstructed != amount {
-        return Err(WithdrawError::RangeDecomposition(
-            format!("reconstructed {} != amount {}", reconstructed, amount),
-        ));
+        return Err(WithdrawError::RangeDecomposition(format!(
+            "reconstructed {} != amount {}",
+            reconstructed, amount
+        )));
     }
 
     Ok(())
@@ -536,7 +560,10 @@ mod tests {
         let (_, pub_in) = execute_withdraw(&witness).expect("execute should succeed");
 
         assert_eq!(pub_in.merkle_root, witness.merkle_root);
-        assert_eq!(pub_in.nullifier, witness.note.nullifier(&witness.spending_key));
+        assert_eq!(
+            pub_in.nullifier,
+            witness.note.nullifier(&witness.spending_key)
+        );
         assert_eq!(pub_in.amount_lo, witness.note.amount_lo);
         assert_eq!(pub_in.amount_hi, witness.note.amount_hi);
         assert_eq!(pub_in.asset_id, witness.note.asset_id);
@@ -672,7 +699,10 @@ mod tests {
         match result.unwrap_err() {
             WithdrawError::CrossWiringFailed(msg) => {
                 assert!(msg.contains("P4"), "expected P4 error, got: {msg}");
-                assert!(msg.contains("absorption"), "expected absorption delta error, got: {msg}");
+                assert!(
+                    msg.contains("absorption"),
+                    "expected absorption delta error, got: {msg}"
+                );
             }
             e => panic!("expected CrossWiringFailed, got: {e}"),
         }

@@ -7,23 +7,24 @@
 use stwo::core::fields::m31::M31;
 use stwo_ml::prelude::*;
 
-use stwo_ml::aggregation::{
-    prove_model_aggregated, prove_model_aggregated_auto,
-    prove_model_aggregated_with, AggregatedModelProofFor,
-    prove_model_aggregated_onchain, prove_model_aggregated_onchain_auto,
-};
-use stwo_ml::receipt::{
-    ComputeReceipt, prove_receipt, prove_receipt_batch,
-    prove_receipt_batch_auto, prove_receipt_batch_with,
-};
-use stwo_ml::starknet::{prove_for_starknet, build_starknet_proof, build_starknet_proof_onchain, estimate_gas_from_proof};
 use stwo_ml::aggregation::compute_io_commitment;
+use stwo_ml::aggregation::{
+    prove_model_aggregated, prove_model_aggregated_auto, prove_model_aggregated_onchain,
+    prove_model_aggregated_onchain_auto, prove_model_aggregated_with, AggregatedModelProofFor,
+};
+use stwo_ml::backend::BackendInfo;
 use stwo_ml::cairo_serde::serialize_proof;
 use stwo_ml::compiler::prove::{
     prove_model, prove_model_auto, prove_model_with, verify_model_matmuls,
 };
 use stwo_ml::gpu::GpuModelProver;
-use stwo_ml::backend::BackendInfo;
+use stwo_ml::receipt::{
+    prove_receipt, prove_receipt_batch, prove_receipt_batch_auto, prove_receipt_batch_with,
+    ComputeReceipt,
+};
+use stwo_ml::starknet::{
+    build_starknet_proof, build_starknet_proof_onchain, estimate_gas_from_proof, prove_for_starknet,
+};
 
 use starknet_ff::FieldElement;
 
@@ -40,20 +41,34 @@ fn build_test_mlp() -> (ComputationGraph, M31Matrix, GraphWeights) {
     let graph = builder.build();
 
     let mut input = M31Matrix::new(1, 4);
-    for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+    for j in 0..4 {
+        input.set(0, j, M31::from((j + 1) as u32));
+    }
 
     let mut weights = GraphWeights::new();
 
     let mut w0 = M31Matrix::new(4, 4);
-    for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i * 4 + j) % 5 + 1) as u32)); } }
+    for i in 0..4 {
+        for j in 0..4 {
+            w0.set(i, j, M31::from(((i * 4 + j) % 5 + 1) as u32));
+        }
+    }
     weights.add_weight(0, w0);
 
     let mut w2 = M31Matrix::new(4, 4);
-    for i in 0..4 { for j in 0..4 { w2.set(i, j, M31::from(((i + j * 3) % 7 + 1) as u32)); } }
+    for i in 0..4 {
+        for j in 0..4 {
+            w2.set(i, j, M31::from(((i + j * 3) % 7 + 1) as u32));
+        }
+    }
     weights.add_weight(2, w2);
 
     let mut w4 = M31Matrix::new(4, 2);
-    for i in 0..4 { for j in 0..2 { w4.set(i, j, M31::from((i * 2 + j + 1) as u32)); } }
+    for i in 0..4 {
+        for j in 0..2 {
+            w4.set(i, j, M31::from((i * 2 + j + 1) as u32));
+        }
+    }
     weights.add_weight(4, w4);
 
     (graph, input, weights)
@@ -94,14 +109,13 @@ fn test_full_pipeline_prove_verify_serialize() {
     let (graph, input, weights) = build_test_mlp();
 
     // 1. Prove
-    let (proofs, execution) = prove_model(&graph, &input, &weights)
-        .expect("prove_model should succeed");
+    let (proofs, execution) =
+        prove_model(&graph, &input, &weights).expect("prove_model should succeed");
     assert_eq!(proofs.len(), 5);
     assert_eq!(execution.output.cols, 2);
 
     // 2. Verify
-    verify_model_matmuls(&proofs, &graph, &input, &weights)
-        .expect("verification should succeed");
+    verify_model_matmuls(&proofs, &graph, &input, &weights).expect("verification should succeed");
 }
 
 #[test]
@@ -118,7 +132,11 @@ fn test_full_pipeline_aggregated_to_calldata() {
     // 2. Serialize to felt252 calldata
     let calldata = serialize_proof(agg_proof.unified_stark.as_ref().unwrap());
     assert!(!calldata.is_empty());
-    assert!(calldata.len() < 5000, "calldata too large: {} felts", calldata.len());
+    assert!(
+        calldata.len() < 5000,
+        "calldata too large: {} felts",
+        calldata.len()
+    );
 
     // 3. Build starknet proof
     let starknet_proof = build_starknet_proof(&agg_proof);
@@ -134,8 +152,8 @@ fn test_full_pipeline_aggregated_to_calldata() {
 fn test_prove_for_starknet_end_to_end() {
     let (graph, input, weights) = build_test_mlp();
 
-    let starknet_proof = prove_for_starknet(&graph, &input, &weights)
-        .expect("prove_for_starknet should succeed");
+    let starknet_proof =
+        prove_for_starknet(&graph, &input, &weights).expect("prove_for_starknet should succeed");
 
     assert!(!starknet_proof.unified_calldata.is_empty());
     assert_eq!(starknet_proof.num_matmul_proofs, 3);
@@ -149,10 +167,10 @@ fn test_prove_for_starknet_end_to_end() {
 fn test_prove_model_auto_matches_prove_model() {
     let (graph, input, weights) = build_test_mlp();
 
-    let (proofs_auto, exec_auto) = prove_model_auto(&graph, &input, &weights)
-        .expect("prove_model_auto should succeed");
-    let (proofs_simd, exec_simd) = prove_model(&graph, &input, &weights)
-        .expect("prove_model should succeed");
+    let (proofs_auto, exec_auto) =
+        prove_model_auto(&graph, &input, &weights).expect("prove_model_auto should succeed");
+    let (proofs_simd, exec_simd) =
+        prove_model(&graph, &input, &weights).expect("prove_model should succeed");
 
     // Same structure
     assert_eq!(proofs_auto.len(), proofs_simd.len());
@@ -164,16 +182,24 @@ fn test_prove_model_auto_matches_prove_model() {
 fn test_prove_model_aggregated_auto_matches_simd() {
     let (graph, input, weights) = build_test_mlp();
 
-    let auto_proof = prove_model_aggregated_auto(&graph, &input, &weights)
-        .expect("auto should succeed");
-    let simd_proof = prove_model_aggregated(&graph, &input, &weights)
-        .expect("simd should succeed");
+    let auto_proof =
+        prove_model_aggregated_auto(&graph, &input, &weights).expect("auto should succeed");
+    let simd_proof = prove_model_aggregated(&graph, &input, &weights).expect("simd should succeed");
 
     // Same execution output
-    assert_eq!(auto_proof.execution.output.data, simd_proof.execution.output.data);
+    assert_eq!(
+        auto_proof.execution.output.data,
+        simd_proof.execution.output.data
+    );
     // Same structure
-    assert_eq!(auto_proof.matmul_proofs.len(), simd_proof.matmul_proofs.len());
-    assert_eq!(auto_proof.activation_claims.len(), simd_proof.activation_claims.len());
+    assert_eq!(
+        auto_proof.matmul_proofs.len(),
+        simd_proof.matmul_proofs.len()
+    );
+    assert_eq!(
+        auto_proof.activation_claims.len(),
+        simd_proof.activation_claims.len()
+    );
 }
 
 #[test]
@@ -181,10 +207,9 @@ fn test_prove_receipt_batch_auto_matches_simd() {
     let r0 = test_receipt(0, FieldElement::ZERO);
     let r1 = test_receipt(1, r0.receipt_hash());
 
-    let auto_proof = prove_receipt_batch_auto(&[r0.clone(), r1.clone()])
-        .expect("auto should succeed");
-    let simd_proof = prove_receipt_batch(&[r0, r1])
-        .expect("simd should succeed");
+    let auto_proof =
+        prove_receipt_batch_auto(&[r0.clone(), r1.clone()]).expect("auto should succeed");
+    let simd_proof = prove_receipt_batch(&[r0, r1]).expect("simd should succeed");
 
     assert_eq!(auto_proof.batch_size, simd_proof.batch_size);
     assert_eq!(auto_proof.receipt_hashes, simd_proof.receipt_hashes);
@@ -198,20 +223,23 @@ fn test_gpu_prover_full_pipeline() {
     let prover = GpuModelProver::default();
 
     // Per-layer proofs
-    let (proofs, execution) = prover.prove_model(&graph, &input, &weights)
+    let (proofs, execution) = prover
+        .prove_model(&graph, &input, &weights)
         .expect("GpuModelProver.prove_model should succeed");
     assert_eq!(proofs.len(), 5);
     assert_eq!(execution.output.cols, 2);
 
     // Aggregated proof
-    let agg_proof = prover.prove_model_aggregated(&graph, &input, &weights)
+    let agg_proof = prover
+        .prove_model_aggregated(&graph, &input, &weights)
         .expect("GpuModelProver.prove_model_aggregated should succeed");
     assert!(agg_proof.unified_stark.is_some());
     assert_eq!(agg_proof.execution.output.data, execution.output.data);
 
     // Receipt
     let r0 = test_receipt(0, FieldElement::ZERO);
-    let receipt_proof = prover.prove_receipt_batch(&[r0])
+    let receipt_proof = prover
+        .prove_receipt_batch(&[r0])
         .expect("GpuModelProver.prove_receipt_batch should succeed");
     assert_eq!(receipt_proof.batch_size, 1);
 }
@@ -237,9 +265,7 @@ fn test_backend_info_detection() {
 fn test_prove_model_with_explicit_simd() {
     let (graph, input, weights) = build_test_mlp();
 
-    let result = prove_model_with::<SimdBackend, Blake2sMerkleChannel>(
-        &graph, &input, &weights,
-    );
+    let result = prove_model_with::<SimdBackend, Blake2sMerkleChannel>(&graph, &input, &weights);
     assert!(result.is_ok());
 }
 
@@ -247,9 +273,8 @@ fn test_prove_model_with_explicit_simd() {
 fn test_prove_aggregated_with_explicit_simd() {
     let (graph, input, weights) = build_test_mlp();
 
-    let result = prove_model_aggregated_with::<SimdBackend, Blake2sMerkleChannel>(
-        &graph, &input, &weights,
-    );
+    let result =
+        prove_model_aggregated_with::<SimdBackend, Blake2sMerkleChannel>(&graph, &input, &weights);
     assert!(result.is_ok());
 }
 
@@ -257,9 +282,7 @@ fn test_prove_aggregated_with_explicit_simd() {
 fn test_prove_receipt_with_explicit_simd() {
     let r = test_receipt(0, FieldElement::ZERO);
 
-    let result = prove_receipt_batch_with::<SimdBackend, Blake2sMerkleChannel>(
-        &[r],
-    );
+    let result = prove_receipt_batch_with::<SimdBackend, Blake2sMerkleChannel>(&[r]);
     assert!(result.is_ok());
 }
 
@@ -282,25 +305,31 @@ fn test_receipt_chain_prove_and_serialize() {
     // Serialize to calldata
     let calldata = serialize_proof(&proof.stark_proof);
     assert!(!calldata.is_empty());
-    assert!(calldata.len() < 5000, "receipt calldata too large: {} felts", calldata.len());
+    assert!(
+        calldata.len() < 5000,
+        "receipt calldata too large: {} felts",
+        calldata.len()
+    );
 }
 
 // === Model loading pipeline tests ===
 
 #[test]
 fn test_build_mlp_with_weights_full_pipeline() {
-    use stwo_ml::compiler::onnx::build_mlp_with_weights;
     use stwo_ml::compiler::inspect::summarize_model;
+    use stwo_ml::compiler::onnx::build_mlp_with_weights;
 
     // Build auto-weighted MLP
     let model = build_mlp_with_weights(4, &[4], 2, ActivationType::ReLU, 42);
 
     let mut input = M31Matrix::new(1, 4);
-    for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+    for j in 0..4 {
+        input.set(0, j, M31::from((j + 1) as u32));
+    }
 
     // 1. Prove
-    let (proofs, execution) = prove_model(&model.graph, &input, &model.weights)
-        .expect("auto-weighted MLP should prove");
+    let (proofs, execution) =
+        prove_model(&model.graph, &input, &model.weights).expect("auto-weighted MLP should prove");
     assert_eq!(proofs.len(), 3);
     assert_eq!(execution.output.cols, 2);
 
@@ -332,11 +361,13 @@ fn test_transformer_block_full_pipeline() {
     let model = build_transformer_block(&config, 77);
 
     let mut input = M31Matrix::new(1, 4);
-    for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+    for j in 0..4 {
+        input.set(0, j, M31::from((j + 1) as u32));
+    }
 
     // Prove
-    let (proofs, execution) = prove_model(&model.graph, &input, &model.weights)
-        .expect("transformer block should prove");
+    let (proofs, execution) =
+        prove_model(&model.graph, &input, &model.weights).expect("transformer block should prove");
     assert_eq!(proofs.len(), 7); // LN + Q + O + LN + FFN_up + act + FFN_down
     assert_eq!(execution.output.cols, 4); // d_model preserved
 
@@ -349,10 +380,9 @@ fn test_transformer_block_full_pipeline() {
 fn test_prelude_exports_model_loading() {
     // Verify all model-loading types are accessible from prelude
     use stwo_ml::prelude::{
-        OnnxModel, ModelMetadata, OnnxError, build_mlp,
-        build_mlp_with_weights, generate_weights_for_graph,
-        TransformerConfig, build_transformer_block,
-        build_transformer, ModelSummary, summarize_model, summarize_graph,
+        build_mlp, build_mlp_with_weights, build_transformer, build_transformer_block,
+        generate_weights_for_graph, summarize_graph, summarize_model, ModelMetadata, ModelSummary,
+        OnnxError, OnnxModel, TransformerConfig,
     };
 
     // Use each type/function to verify they're properly exported
@@ -383,29 +413,36 @@ fn test_prelude_exports_model_loading() {
 
 #[test]
 fn test_matmul_onchain_proof_full_pipeline() {
-    use stwo_ml::components::matmul::{prove_matmul_sumcheck_onchain, verify_matmul_sumcheck_onchain};
     use stwo_ml::cairo_serde::serialize_matmul_sumcheck_proof;
+    use stwo_ml::components::matmul::{
+        prove_matmul_sumcheck_onchain, verify_matmul_sumcheck_onchain,
+    };
 
     // 2x2 matmul → on-chain proof → serialize → verify calldata structure
     let mut a = M31Matrix::new(2, 2);
-    a.set(0, 0, M31::from(1)); a.set(0, 1, M31::from(2));
-    a.set(1, 0, M31::from(3)); a.set(1, 1, M31::from(4));
+    a.set(0, 0, M31::from(1));
+    a.set(0, 1, M31::from(2));
+    a.set(1, 0, M31::from(3));
+    a.set(1, 1, M31::from(4));
 
     let mut b = M31Matrix::new(2, 2);
-    b.set(0, 0, M31::from(5)); b.set(0, 1, M31::from(6));
-    b.set(1, 0, M31::from(7)); b.set(1, 1, M31::from(8));
+    b.set(0, 0, M31::from(5));
+    b.set(0, 1, M31::from(6));
+    b.set(1, 0, M31::from(7));
+    b.set(1, 1, M31::from(8));
 
     // C = A * B
     let mut c = M31Matrix::new(2, 2);
-    c.set(0, 0, M31::from(19)); c.set(0, 1, M31::from(22));
-    c.set(1, 0, M31::from(43)); c.set(1, 1, M31::from(50));
+    c.set(0, 0, M31::from(19));
+    c.set(0, 1, M31::from(22));
+    c.set(1, 0, M31::from(43));
+    c.set(1, 1, M31::from(50));
 
-    let proof = prove_matmul_sumcheck_onchain(&a, &b, &c)
-        .expect("on-chain matmul proof should succeed");
+    let proof =
+        prove_matmul_sumcheck_onchain(&a, &b, &c).expect("on-chain matmul proof should succeed");
 
     // Verify locally
-    verify_matmul_sumcheck_onchain(&proof)
-        .expect("on-chain matmul verification should succeed");
+    verify_matmul_sumcheck_onchain(&proof).expect("on-chain matmul verification should succeed");
 
     // Serialize to calldata
     let mut calldata = Vec::new();
@@ -416,7 +453,10 @@ fn test_matmul_onchain_proof_full_pipeline() {
     assert_eq!(calldata[1], FieldElement::from(2u64)); // k
     assert_eq!(calldata[2], FieldElement::from(2u64)); // n
     assert!(!calldata.is_empty());
-    assert!(calldata.len() > 10, "calldata should have meaningful content");
+    assert!(
+        calldata.len() > 10,
+        "calldata should have meaningful content"
+    );
 }
 
 #[test]
@@ -425,7 +465,9 @@ fn test_mlp_full_onchain_pipeline() {
     let model = build_mlp_with_weights(4, &[4], 2, ActivationType::ReLU, 42);
 
     let mut input = M31Matrix::new(1, 4);
-    for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+    for j in 0..4 {
+        input.set(0, j, M31::from((j + 1) as u32));
+    }
 
     let agg_proof = prove_model_aggregated_onchain(&model.graph, &input, &model.weights)
         .expect("on-chain aggregated proving should succeed");
@@ -442,9 +484,8 @@ fn test_mlp_full_onchain_pipeline() {
     assert!(starknet_proof.combined_calldata.len() > 5);
     let raw_io_len: usize = u64::try_from(starknet_proof.combined_calldata[4]).unwrap() as usize;
     assert_eq!(raw_io_len, starknet_proof.raw_io_data.len());
-    let recomputed_io = starknet_crypto::poseidon_hash_many(
-        &starknet_proof.combined_calldata[5..5 + raw_io_len],
-    );
+    let recomputed_io =
+        starknet_crypto::poseidon_hash_many(&starknet_proof.combined_calldata[5..5 + raw_io_len]);
     assert_eq!(recomputed_io, starknet_proof.io_commitment);
 
     // IO commitment should be non-zero
@@ -463,10 +504,14 @@ fn test_io_commitment_binding() {
     let model = build_mlp_with_weights(4, &[4], 2, ActivationType::ReLU, 42);
 
     let mut input1 = M31Matrix::new(1, 4);
-    for j in 0..4 { input1.set(0, j, M31::from((j + 1) as u32)); }
+    for j in 0..4 {
+        input1.set(0, j, M31::from((j + 1) as u32));
+    }
 
     let mut input2 = M31Matrix::new(1, 4);
-    for j in 0..4 { input2.set(0, j, M31::from((j + 10) as u32)); }
+    for j in 0..4 {
+        input2.set(0, j, M31::from((j + 10) as u32));
+    }
 
     let proof1 = prove_model_aggregated_onchain(&model.graph, &input1, &model.weights)
         .expect("proof1 should succeed");
@@ -498,7 +543,9 @@ fn test_calldata_size_reasonable() {
     let model = build_mlp_with_weights(4, &[4], 2, ActivationType::ReLU, 42);
 
     let mut input = M31Matrix::new(1, 4);
-    for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+    for j in 0..4 {
+        input.set(0, j, M31::from((j + 1) as u32));
+    }
 
     let proof = prove_model_aggregated_onchain(&model.graph, &input, &model.weights)
         .expect("proving should succeed");
@@ -515,7 +562,8 @@ fn test_calldata_size_reasonable() {
         assert!(
             mc.len() < 10_000,
             "matmul {} calldata too large: {} felts",
-            i, mc.len()
+            i,
+            mc.len()
         );
     }
 
@@ -535,9 +583,9 @@ mod gpu_tests {
     fn test_prove_model_gpu_backend_explicit() {
         let (graph, input, weights) = build_test_mlp();
 
-        let (proofs, execution) = prove_model_with::<GpuBackend, Blake2sMerkleChannel>(
-            &graph, &input, &weights,
-        ).expect("GPU proving should succeed");
+        let (proofs, execution) =
+            prove_model_with::<GpuBackend, Blake2sMerkleChannel>(&graph, &input, &weights)
+                .expect("GPU proving should succeed");
 
         assert_eq!(proofs.len(), 5);
         assert_eq!(execution.output.cols, 2);
@@ -553,7 +601,8 @@ mod gpu_tests {
 
         let proof = prove_model_aggregated_with::<GpuBackend, Blake2sMerkleChannel>(
             &graph, &input, &weights,
-        ).expect("GPU aggregated proving should succeed");
+        )
+        .expect("GPU aggregated proving should succeed");
 
         assert!(proof.unified_stark.is_some());
         assert_eq!(proof.matmul_proofs.len(), 3);
@@ -563,17 +612,16 @@ mod gpu_tests {
     fn test_prove_receipt_gpu_backend_explicit() {
         let r = test_receipt(0, FieldElement::ZERO);
 
-        let proof = prove_receipt_batch_with::<GpuBackend, Blake2sMerkleChannel>(
-            &[r],
-        ).expect("GPU receipt proving should succeed");
+        let proof = prove_receipt_batch_with::<GpuBackend, Blake2sMerkleChannel>(&[r])
+            .expect("GPU receipt proving should succeed");
 
         assert_eq!(proof.batch_size, 1);
     }
 
     #[test]
     fn test_gpu_prover_require_gpu() {
-        let prover = GpuModelProver::require_gpu()
-            .expect("GPU should be available for cuda-runtime tests");
+        let prover =
+            GpuModelProver::require_gpu().expect("GPU should be available for cuda-runtime tests");
         assert!(prover.is_gpu);
         assert!(!prover.device_name.contains("CPU"));
     }
@@ -585,7 +633,8 @@ mod gpu_tests {
         // GPU aggregated prove → Starknet calldata
         let agg_proof = prove_model_aggregated_with::<GpuBackend, Blake2sMerkleChannel>(
             &graph, &input, &weights,
-        ).expect("GPU aggregated proving should succeed");
+        )
+        .expect("GPU aggregated proving should succeed");
 
         let starknet_proof = build_starknet_proof(&agg_proof);
         assert!(!starknet_proof.unified_calldata.is_empty());

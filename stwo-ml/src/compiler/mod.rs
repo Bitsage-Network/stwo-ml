@@ -22,17 +22,17 @@
 //! Proof Generation (prove.rs)
 //! ```
 
-pub mod onnx;
-pub mod graph;
-pub mod prove;
-pub mod inspect;
-#[cfg(feature = "safetensors")]
-pub mod safetensors;
-#[cfg(feature = "cli")]
-pub mod hf_loader;
-pub mod quantize_weights;
-pub mod dual;
 pub mod checkpoint;
 pub mod chunked;
+pub mod dual;
+pub mod graph;
+#[cfg(feature = "cli")]
+pub mod hf_loader;
+pub mod inspect;
+pub mod onnx;
+pub mod prove;
+pub mod quantize_weights;
+#[cfg(feature = "safetensors")]
+pub mod safetensors;
 #[cfg(feature = "safetensors")]
 pub mod streaming;

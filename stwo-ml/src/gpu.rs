@@ -21,15 +21,15 @@
 //! let result = prove_model_with::<GpuBackend, Blake2sMerkleChannel>(&graph, &input, &weights)?;
 //! ```
 
+use crate::aggregation::{AggregatedModelProof, AggregatedModelProofOnChain, AggregationError};
 use crate::backend::{
-    gpu_is_available, gpu_device_name, gpu_available_memory,
-    gpu_compute_capability, estimate_proof_memory, GpuThresholds,
+    estimate_proof_memory, gpu_available_memory, gpu_compute_capability, gpu_device_name,
+    gpu_is_available, GpuThresholds,
 };
 use crate::compiler::graph::{ComputationGraph, GraphWeights};
 use crate::compiler::prove::{ModelError, ModelProofResult};
 use crate::components::matmul::M31Matrix;
-use crate::aggregation::{AggregatedModelProof, AggregatedModelProofOnChain, AggregationError};
-use crate::receipt::{ComputeReceipt, ReceiptProof, ReceiptError};
+use crate::receipt::{ComputeReceipt, ReceiptError, ReceiptProof};
 use crate::tee::{SecurityLevel, TeeAttestation};
 
 /// GPU-accelerated model prover.
@@ -236,9 +236,10 @@ impl GpuModelProver {
         {
             use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
             use stwo::prover::backend::gpu::GpuBackend;
-            return crate::aggregation::prove_model_aggregated_with::<GpuBackend, Blake2sMerkleChannel>(
-                graph, input, weights,
-            );
+            return crate::aggregation::prove_model_aggregated_with::<
+                GpuBackend,
+                Blake2sMerkleChannel,
+            >(graph, input, weights);
         }
 
         #[cfg(not(feature = "cuda-runtime"))]
@@ -285,7 +286,7 @@ impl GpuModelProver {
         weights: &GraphWeights,
         memory_budget: usize,
     ) -> Result<AggregatedModelProofOnChain, GpuError> {
-        use crate::compiler::chunked::{prove_model_chunked_multi_gpu, compose_chunk_proofs_auto};
+        use crate::compiler::chunked::{compose_chunk_proofs_auto, prove_model_chunked_multi_gpu};
 
         let chunks = prove_model_chunked_multi_gpu(graph, input, weights, memory_budget)
             .map_err(|e| GpuError::ProvingError(format!("Multi-GPU chunked proving: {e}")))?;
@@ -404,7 +405,10 @@ mod tests {
     #[test]
     fn test_memory_estimation() {
         let mut builder = GraphBuilder::new((1, 128));
-        builder.linear(64).activation(ActivationType::ReLU).linear(10);
+        builder
+            .linear(64)
+            .activation(ActivationType::ReLU)
+            .linear(10);
         let graph = builder.build();
 
         let prover = GpuModelProver::default();
@@ -420,11 +424,17 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w.set(i, j, M31::from((i * 2 + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
         weights.add_weight(0, w);
 
         let prover = GpuModelProver::default();
@@ -450,28 +460,34 @@ mod tests {
     fn test_gpu_backend_real_proving() {
         use stwo::core::fields::m31::M31;
 
-        let prover = GpuModelProver::require_gpu()
-            .expect("GPU required for this test");
+        let prover = GpuModelProver::require_gpu().expect("GPU required for this test");
         assert!(prover.is_gpu);
         assert!(!prover.device_name.contains("CPU"));
 
         // Build a model large enough to exceed GPU threshold
         let mut builder = GraphBuilder::new((1, 4));
-        builder
-            .linear(4)
-            .activation(ActivationType::ReLU)
-            .linear(2);
+        builder.linear(4).activation(ActivationType::ReLU).linear(2);
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w2.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
 
         let result = prover.prove_model(&graph, &input, &weights);
@@ -482,21 +498,28 @@ mod tests {
     fn test_prove_model_aggregated_cpu_fallback() {
         use stwo::core::fields::m31::M31;
         let mut builder = GraphBuilder::new((1, 4));
-        builder
-            .linear(4)
-            .activation(ActivationType::ReLU)
-            .linear(2);
+        builder.linear(4).activation(ActivationType::ReLU).linear(2);
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w2.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
 
         let prover = GpuModelProver::default();
@@ -511,21 +534,28 @@ mod tests {
     fn test_prove_model_aggregated_onchain_cpu_fallback() {
         use stwo::core::fields::m31::M31;
         let mut builder = GraphBuilder::new((1, 4));
-        builder
-            .linear(4)
-            .activation(ActivationType::ReLU)
-            .linear(2);
+        builder.linear(4).activation(ActivationType::ReLU).linear(2);
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w2.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
 
         let prover = GpuModelProver::default();

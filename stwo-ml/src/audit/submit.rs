@@ -23,10 +23,10 @@ use starknet_ff::FieldElement;
 use crate::audit::digest::{
     hash_felt_hex_m31, hex_to_digest, pack_digest_felt252, u32_to_m31, u64_to_m31, M31Digest,
 };
-use crate::audit::types::{AuditError, BatchAuditResult, VerificationCalldata};
-use crate::crypto::poseidon2_m31::poseidon2_hash;
 #[cfg(test)]
 use crate::audit::types::GkrInferenceCalldata;
+use crate::audit::types::{AuditError, BatchAuditResult, VerificationCalldata};
+use crate::crypto::poseidon2_m31::poseidon2_hash;
 
 /// Receipt from an on-chain audit submission.
 #[derive(Debug, Clone)]
@@ -121,10 +121,7 @@ pub fn serialize_audit_calldata(
     calldata.push(FieldElement::from(result.inference_count as u64));
 
     // [9] tee_attestation_hash
-    let tee_hash = result
-        .tee_attestation_hash
-        .as_deref()
-        .unwrap_or("0x0");
+    let tee_hash = result.tee_attestation_hash.as_deref().unwrap_or("0x0");
     calldata.push(parse_felt(tee_hash, "tee_attestation_hash")?);
 
     // [10] privacy_tier
@@ -262,9 +259,7 @@ pub fn validate_calldata(calldata: &[FieldElement]) -> Result<CalldataInfo, Audi
         .map_err(|_| AuditError::Serde("inference_count doesn't fit u64".to_string()))?;
 
     if inference_count == 0 {
-        return Err(AuditError::Serde(
-            "inference_count is 0".to_string(),
-        ));
+        return Err(AuditError::Serde("inference_count is 0".to_string()));
     }
 
     let proof_len: u64 = calldata[11]
@@ -471,25 +466,18 @@ pub fn build_direct_verification_calldata(
 
 /// Parse a hex string into a FieldElement.
 fn parse_felt(hex: &str, field_name: &str) -> Result<FieldElement, AuditError> {
-    FieldElement::from_hex_be(hex).map_err(|_| {
-        AuditError::Serde(format!("invalid hex for {}: {}", field_name, hex))
-    })
+    FieldElement::from_hex_be(hex)
+        .map_err(|_| AuditError::Serde(format!("invalid hex for {}: {}", field_name, hex)))
 }
 
 /// Convert an M31 digest hex string to a (lo, hi) felt252 pair.
-fn digest_hex_to_felts(
-    hex: &str,
-    name: &str,
-) -> Result<(FieldElement, FieldElement), AuditError> {
-    let digest = hex_to_digest(hex)
-        .map_err(|e| AuditError::Serde(format!("{}: {}", name, e)))?;
+fn digest_hex_to_felts(hex: &str, name: &str) -> Result<(FieldElement, FieldElement), AuditError> {
+    let digest = hex_to_digest(hex).map_err(|e| AuditError::Serde(format!("{}: {}", name, e)))?;
     digest_to_felt_pair(&digest)
 }
 
 /// Pack an M31Digest into a (lo, hi) FieldElement pair.
-fn digest_to_felt_pair(
-    digest: &M31Digest,
-) -> Result<(FieldElement, FieldElement), AuditError> {
+fn digest_to_felt_pair(digest: &M31Digest) -> Result<(FieldElement, FieldElement), AuditError> {
     let (lo_bytes, hi_bytes) = pack_digest_felt252(digest);
     let lo = FieldElement::from_bytes_be(&lo_bytes)
         .map_err(|_| AuditError::Serde("packed digest lo overflow".to_string()))?;
@@ -628,10 +616,10 @@ mod tests {
     fn test_validate_rejects_invalid_time_window() {
         // Build calldata with end <= start (new layout: 12 fields min)
         let mut calldata = vec![FieldElement::ZERO; 12];
-        calldata[6] = FieldElement::from(2000u64);  // time_start
-        calldata[7] = FieldElement::from(1000u64);  // time_end (less than start)
-        calldata[8] = FieldElement::from(1u64);     // inference_count
-        calldata[11] = FieldElement::ZERO;            // proof_calldata_len = 0
+        calldata[6] = FieldElement::from(2000u64); // time_start
+        calldata[7] = FieldElement::from(1000u64); // time_end (less than start)
+        calldata[8] = FieldElement::from(1u64); // inference_count
+        calldata[11] = FieldElement::ZERO; // proof_calldata_len = 0
 
         assert!(validate_calldata(&calldata).is_err());
     }
@@ -708,15 +696,9 @@ mod tests {
                 format!("{:#066x}", FieldElement::from(0xA1u64)),
                 format!("{:#066x}", FieldElement::from(0xA2u64)),
             ],
-            io_calldata: vec![
-                format!("{:#066x}", FieldElement::from(0xB1u64)),
-            ],
-            weight_commitments: vec![
-                format!("{:#066x}", FieldElement::from(0xF1u64)),
-            ],
-            weight_opening_calldata: vec![
-                format!("{:#066x}", FieldElement::ZERO),
-            ],
+            io_calldata: vec![format!("{:#066x}", FieldElement::from(0xB1u64))],
+            weight_commitments: vec![format!("{:#066x}", FieldElement::from(0xF1u64))],
+            weight_opening_calldata: vec![format!("{:#066x}", FieldElement::ZERO)],
         };
 
         let mut result = make_batch_result(1);
@@ -736,21 +718,36 @@ mod tests {
 
         let cd = &calldata[0];
         let mut i = 0;
-        assert_eq!(cd[i], FieldElement::from(2u64)); i += 1;
-        assert_eq!(cd[i], FieldElement::from(1u64)); i += 1;
-        assert_eq!(cd[i], FieldElement::from(0xB1u64)); i += 1;
-        assert_eq!(cd[i], FieldElement::from(4u64)); i += 1;
-        assert_eq!(cd[i], FieldElement::from(2u64)); i += 1;
-        assert_eq!(cd[i], FieldElement::from(3u64)); i += 1;
-        assert_eq!(cd[i], FieldElement::from(4u64)); i += 1;
-        assert_eq!(cd[i], FieldElement::from(4u64)); i += 1;
-        assert_eq!(cd[i], FieldElement::from(4u64)); i += 1;
-        assert_eq!(cd[i], FieldElement::ZERO); i += 1;
-        assert_eq!(cd[i], FieldElement::from(2u64)); i += 1;
-        assert_eq!(cd[i], FieldElement::from(0xA1u64)); i += 1;
-        assert_eq!(cd[i], FieldElement::from(0xA2u64)); i += 1;
-        assert_eq!(cd[i], FieldElement::from(1u64)); i += 1;
-        assert_eq!(cd[i], FieldElement::from(0xF1u64)); i += 1;
+        assert_eq!(cd[i], FieldElement::from(2u64));
+        i += 1;
+        assert_eq!(cd[i], FieldElement::from(1u64));
+        i += 1;
+        assert_eq!(cd[i], FieldElement::from(0xB1u64));
+        i += 1;
+        assert_eq!(cd[i], FieldElement::from(4u64));
+        i += 1;
+        assert_eq!(cd[i], FieldElement::from(2u64));
+        i += 1;
+        assert_eq!(cd[i], FieldElement::from(3u64));
+        i += 1;
+        assert_eq!(cd[i], FieldElement::from(4u64));
+        i += 1;
+        assert_eq!(cd[i], FieldElement::from(4u64));
+        i += 1;
+        assert_eq!(cd[i], FieldElement::from(4u64));
+        i += 1;
+        assert_eq!(cd[i], FieldElement::ZERO);
+        i += 1;
+        assert_eq!(cd[i], FieldElement::from(2u64));
+        i += 1;
+        assert_eq!(cd[i], FieldElement::from(0xA1u64));
+        i += 1;
+        assert_eq!(cd[i], FieldElement::from(0xA2u64));
+        i += 1;
+        assert_eq!(cd[i], FieldElement::from(1u64));
+        i += 1;
+        assert_eq!(cd[i], FieldElement::from(0xF1u64));
+        i += 1;
         assert_eq!(cd[i], FieldElement::ZERO);
         assert_eq!(cd.len(), 16);
     }
@@ -782,9 +779,7 @@ mod tests {
                     format!("{:#066x}", FieldElement::from(0xD1u64)),
                     format!("{:#066x}", FieldElement::from(0xD2u64)),
                 ],
-                vec![
-                    format!("{:#066x}", FieldElement::from(0xE1u64)),
-                ],
+                vec![format!("{:#066x}", FieldElement::from(0xE1u64))],
             ],
         });
 

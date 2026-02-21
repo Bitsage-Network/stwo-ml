@@ -28,7 +28,9 @@ use stwo_ml::gkr::prover::set_proof_sink;
 fn main() {
     // First arg: viewer address ("spawn" | "file:out.rrd" | "host:port")
     // Second arg: optional .rrd save path alongside live view
-    let rerun_addr = std::env::args().nth(1).unwrap_or_else(|| "spawn".to_string());
+    let rerun_addr = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "spawn".to_string());
     let save_path = std::env::args().nth(2); // e.g. "proof.rrd"
     eprintln!("proof-stream demo: connecting to Rerun via '{rerun_addr}'");
     if let Some(ref p) = save_path {
@@ -74,7 +76,8 @@ fn main() {
     let t0 = std::time::Instant::now();
     match prove_model_pure_gkr_auto(&model.graph, &input, &model.weights) {
         Ok(proof) => {
-            let n_layer_proofs = proof.gkr_proof
+            let n_layer_proofs = proof
+                .gkr_proof
                 .as_ref()
                 .map(|g| g.layer_proofs.len())
                 .unwrap_or(0);

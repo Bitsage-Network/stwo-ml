@@ -136,11 +136,11 @@ mod tests {
     #[test]
     fn test_aggregate_score_distribution() {
         let evals = vec![
-            make_eval(0, Some(0.95), true),  // excellent
-            make_eval(1, Some(0.85), true),  // good
-            make_eval(2, Some(0.75), true),  // good
-            make_eval(3, Some(0.6), true),   // fair
-            make_eval(4, Some(0.3), false),  // poor
+            make_eval(0, Some(0.95), true), // excellent
+            make_eval(1, Some(0.85), true), // good
+            make_eval(2, Some(0.75), true), // good
+            make_eval(3, Some(0.6), true),  // fair
+            make_eval(4, Some(0.3), false), // poor
         ];
 
         let summary = aggregate_evaluations(&evals, "self_eval", false);
@@ -163,10 +163,8 @@ mod tests {
             .collect();
 
         let summary = aggregate_evaluations(&evals, "combined", false);
-        let total = summary.excellent_count
-            + summary.good_count
-            + summary.fair_count
-            + summary.poor_count;
+        let total =
+            summary.excellent_count + summary.good_count + summary.fair_count + summary.poor_count;
         assert_eq!(total, 100);
     }
 
@@ -179,10 +177,7 @@ mod tests {
 
     #[test]
     fn test_aggregate_no_scores() {
-        let evals = vec![
-            make_eval(0, None, true),
-            make_eval(1, None, false),
-        ];
+        let evals = vec![make_eval(0, None, true), make_eval(1, None, false)];
         let summary = aggregate_evaluations(&evals, "deterministic", false);
         assert_eq!(summary.avg_quality_score, 0.0);
         assert_eq!(summary.excellent_count, 0);

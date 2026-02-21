@@ -17,8 +17,7 @@ use stwo_constraint_framework::EvalAtRow;
 
 use crate::crypto::poseidon2_m31::{
     apply_external_round_matrix, apply_internal_round_matrix, get_round_constants,
-    INTERNAL_DIAG_U32, N_FULL_ROUNDS, N_HALF_FULL_ROUNDS,
-    N_PARTIAL_ROUNDS, RATE, STATE_WIDTH,
+    INTERNAL_DIAG_U32, N_FULL_ROUNDS, N_HALF_FULL_ROUNDS, N_PARTIAL_ROUNDS, RATE, STATE_WIDTH,
 };
 
 /// Number of execution trace columns per Poseidon2 permutation.
@@ -26,8 +25,8 @@ pub const COLS_PER_PERM: usize = 23 * STATE_WIDTH  // states
     + N_FULL_ROUNDS * STATE_WIDTH                   // full_sq
     + N_FULL_ROUNDS * STATE_WIDTH                   // full_quad
     + N_PARTIAL_ROUNDS                              // partial_sq
-    + N_PARTIAL_ROUNDS;                             // partial_quad
-// = 368 + 128 + 128 + 14 + 14 = 652
+    + N_PARTIAL_ROUNDS; // partial_quad
+                        // = 368 + 128 + 128 + 14 + 14 = 652
 
 // ──────────────────────── Trace data (prover side) ────────────────────────
 
@@ -225,9 +224,7 @@ impl<F: Clone> Poseidon2Columns<F> {
 ///
 /// Each call reads the next 652 execution trace columns, adds ~352 degree-2
 /// constraints for all 22 rounds, and returns column references for wiring.
-pub fn constrain_poseidon2_permutation<E: EvalAtRow>(
-    eval: &mut E,
-) -> Poseidon2Columns<E::F> {
+pub fn constrain_poseidon2_permutation<E: EvalAtRow>(eval: &mut E) -> Poseidon2Columns<E::F> {
     // Read all columns in layout order
     let states: [[E::F; STATE_WIDTH]; 23] =
         std::array::from_fn(|_| std::array::from_fn(|_| eval.next_trace_mask()));
@@ -235,10 +232,8 @@ pub fn constrain_poseidon2_permutation<E: EvalAtRow>(
         std::array::from_fn(|_| std::array::from_fn(|_| eval.next_trace_mask()));
     let full_quad: [[E::F; STATE_WIDTH]; N_FULL_ROUNDS] =
         std::array::from_fn(|_| std::array::from_fn(|_| eval.next_trace_mask()));
-    let partial_sq: [E::F; N_PARTIAL_ROUNDS] =
-        std::array::from_fn(|_| eval.next_trace_mask());
-    let partial_quad: [E::F; N_PARTIAL_ROUNDS] =
-        std::array::from_fn(|_| eval.next_trace_mask());
+    let partial_sq: [E::F; N_PARTIAL_ROUNDS] = std::array::from_fn(|_| eval.next_trace_mask());
+    let partial_quad: [E::F; N_PARTIAL_ROUNDS] = std::array::from_fn(|_| eval.next_trace_mask());
 
     let cols = Poseidon2Columns {
         states,
@@ -258,13 +253,7 @@ pub fn constrain_poseidon2_permutation<E: EvalAtRow>(
 
     // 14 partial rounds (round_idx 4..17, partial_idx 0..13)
     for r in 0..N_PARTIAL_ROUNDS {
-        constrain_partial_round(
-            eval,
-            &cols,
-            r + N_HALF_FULL_ROUNDS,
-            r,
-            rc.internal[r],
-        );
+        constrain_partial_round(eval, &cols, r + N_HALF_FULL_ROUNDS, r, rc.internal[r]);
     }
 
     // Last 4 full rounds (round_idx 18..21, full_idx 4..7)
@@ -380,30 +369,10 @@ pub fn apply_external_matrix_exprs<F: Clone + Add<Output = F> + AddAssign>(
     x: &[F; STATE_WIDTH],
 ) -> [F; STATE_WIDTH] {
     // M4 on each 4-element block
-    let b0 = apply_m4_exprs(&[
-        x[0].clone(),
-        x[1].clone(),
-        x[2].clone(),
-        x[3].clone(),
-    ]);
-    let b1 = apply_m4_exprs(&[
-        x[4].clone(),
-        x[5].clone(),
-        x[6].clone(),
-        x[7].clone(),
-    ]);
-    let b2 = apply_m4_exprs(&[
-        x[8].clone(),
-        x[9].clone(),
-        x[10].clone(),
-        x[11].clone(),
-    ]);
-    let b3 = apply_m4_exprs(&[
-        x[12].clone(),
-        x[13].clone(),
-        x[14].clone(),
-        x[15].clone(),
-    ]);
+    let b0 = apply_m4_exprs(&[x[0].clone(), x[1].clone(), x[2].clone(), x[3].clone()]);
+    let b1 = apply_m4_exprs(&[x[4].clone(), x[5].clone(), x[6].clone(), x[7].clone()]);
+    let b2 = apply_m4_exprs(&[x[8].clone(), x[9].clone(), x[10].clone(), x[11].clone()]);
+    let b3 = apply_m4_exprs(&[x[12].clone(), x[13].clone(), x[14].clone(), x[15].clone()]);
 
     let mut result: [F; STATE_WIDTH] = std::array::from_fn(|i| {
         let block = i / 4;
@@ -469,9 +438,10 @@ mod tests {
     fn test_sbox_decomposition() {
         // Verify sq/quad values correctly decompose x^5
         let rc = get_round_constants();
-        let input =
-            [7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67]
-                .map(M31::from_u32_unchecked);
+        let input = [
+            7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67,
+        ]
+        .map(M31::from_u32_unchecked);
         let trace = compute_permutation_trace(&input);
 
         // Check first full round, element 0
@@ -544,10 +514,12 @@ mod tests {
 
         // Compute via the same formula used in constraints:
         // result[j] = DIAG[j] * input[j] + sum(input)
-        let sum: M31 = input.iter().copied().fold(M31::from_u32_unchecked(0), |a, b| a + b);
-        let result: [M31; STATE_WIDTH] = std::array::from_fn(|j| {
-            input[j] * M31::from_u32_unchecked(INTERNAL_DIAG_U32[j]) + sum
-        });
+        let sum: M31 = input
+            .iter()
+            .copied()
+            .fold(M31::from_u32_unchecked(0), |a, b| a + b);
+        let result: [M31; STATE_WIDTH] =
+            std::array::from_fn(|j| input[j] * M31::from_u32_unchecked(INTERNAL_DIAG_U32[j]) + sum);
 
         assert_eq!(result, expected, "Internal matrix constraint mismatch");
     }

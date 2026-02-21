@@ -143,9 +143,9 @@ mod tests {
         let pk = derive_pubkey(sk);
         Note::new(
             pk,
-            M31::from_u32_unchecked(0),   // STRK
-            M31::from_u32_unchecked(1000), // amount_lo
-            M31::from_u32_unchecked(0),    // amount_hi
+            M31::from_u32_unchecked(0),                // STRK
+            M31::from_u32_unchecked(1000),             // amount_lo
+            M31::from_u32_unchecked(0),                // amount_hi
             [1, 2, 3, 4].map(M31::from_u32_unchecked), // blinding
         )
     }
