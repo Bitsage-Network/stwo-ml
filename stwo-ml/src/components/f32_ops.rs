@@ -9,9 +9,7 @@ use rayon::prelude::*;
 
 use crate::components::activation::ActivationType;
 use crate::components::matmul::M31Matrix;
-use crate::gadgets::quantize::{
-    QuantParams, QuantStrategy, dequantize_value, quantize_tensor,
-};
+use crate::gadgets::quantize::{dequantize_value, quantize_tensor, QuantParams, QuantStrategy};
 
 /// Flat matrix stored in row-major order over f32.
 #[derive(Debug, Clone)]
@@ -53,7 +51,11 @@ impl F32Matrix {
 
     /// Dequantize an M31Matrix into f32 using the given quantization parameters.
     pub fn from_m31(m31: &M31Matrix, params: &QuantParams) -> Self {
-        let data: Vec<f32> = m31.data.iter().map(|&v| dequantize_value(v, params)).collect();
+        let data: Vec<f32> = m31
+            .data
+            .iter()
+            .map(|&v| dequantize_value(v, params))
+            .collect();
         Self {
             rows: m31.rows,
             cols: m31.cols,
@@ -80,7 +82,11 @@ impl F32Matrix {
 ///
 /// Uses rayon parallelism for matrices with 64+ rows (same threshold as matmul_m31).
 pub fn matmul_f32(a: &F32Matrix, b: &F32Matrix) -> F32Matrix {
-    assert_eq!(a.cols, b.rows, "A.cols ({}) must equal B.rows ({})", a.cols, b.rows);
+    assert_eq!(
+        a.cols, b.rows,
+        "A.cols ({}) must equal B.rows ({})",
+        a.cols, b.rows
+    );
     let m = a.rows;
     let k = a.cols;
     let n = b.cols;
@@ -114,7 +120,11 @@ pub fn matmul_f32(a: &F32Matrix, b: &F32Matrix) -> F32Matrix {
                 row
             })
             .collect();
-        F32Matrix { rows: m, cols: n, data }
+        F32Matrix {
+            rows: m,
+            cols: n,
+            data,
+        }
     }
 }
 
@@ -275,7 +285,10 @@ mod tests {
         let row = vec![1.0, 2.0, 3.0, 4.0];
         let result = softmax_f32(&row);
         let sum: f32 = result.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-5, "softmax should sum to 1.0, got {sum}");
+        assert!(
+            (sum - 1.0).abs() < 1e-5,
+            "softmax should sum to 1.0, got {sum}"
+        );
         // Elements should be monotonically increasing
         for i in 0..result.len() - 1 {
             assert!(result[i] < result[i + 1], "softmax should preserve order");
@@ -304,10 +317,7 @@ mod tests {
                 var += diff * diff;
             }
             var /= normed.cols as f32;
-            assert!(
-                (var - 1.0).abs() < 0.05,
-                "variance should be ~1, got {var}"
-            );
+            assert!((var - 1.0).abs() < 0.05, "variance should be ~1, got {var}");
         }
     }
 

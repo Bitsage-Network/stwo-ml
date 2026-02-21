@@ -27,23 +27,21 @@ use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::{BackendForChannel, Col, Column, ColumnOps};
 use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
 use stwo::prover::poly::BitReversedOrder;
+use stwo::prover::prove;
 use stwo::prover::CommitmentSchemeProver;
 use stwo::prover::ComponentProver;
-use stwo::prover::prove;
 
+use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 use stwo_constraint_framework::{
     EvalAtRow, FrameworkComponent, FrameworkEval, TraceLocationAllocator,
 };
-use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 
 use crate::backend::convert_evaluations;
-use crate::circuits::withdraw::{
-    WithdrawPublicInputs, WithdrawWitness, execute_withdraw,
-};
+use crate::circuits::withdraw::{execute_withdraw, WithdrawPublicInputs, WithdrawWitness};
 use crate::components::poseidon2_air::{
-    constrain_poseidon2_permutation, compute_merkle_chain_padding, compute_permutation_trace,
-    decompose_to_bits, dummy_permutation_trace, write_permutation_to_trace,
-    Poseidon2Columns, COLS_PER_PERM,
+    compute_merkle_chain_padding, compute_permutation_trace, constrain_poseidon2_permutation,
+    decompose_to_bits, dummy_permutation_trace, write_permutation_to_trace, Poseidon2Columns,
+    COLS_PER_PERM,
 };
 use crate::crypto::poseidon2_m31::{RATE, STATE_WIDTH};
 
@@ -114,9 +112,7 @@ pub fn constrain_withdraw_wiring<E: EvalAtRow>(
                 - E::F::from(M31::from_u32_unchecked(11))),
     );
     for j in (RATE + 1)..STATE_WIDTH {
-        eval.add_constraint(
-            is_real.clone() * perms[COMMITMENT_PERM_START].input()[j].clone(),
-        );
+        eval.add_constraint(is_real.clone() * perms[COMMITMENT_PERM_START].input()[j].clone());
     }
     for j in 0..4 {
         eval.add_constraint(
@@ -142,9 +138,7 @@ pub fn constrain_withdraw_wiring<E: EvalAtRow>(
                 - E::F::from(M31::from_u32_unchecked(12))),
     );
     for j in (RATE + 1)..STATE_WIDTH {
-        eval.add_constraint(
-            is_real.clone() * perms[NULLIFIER_PERM_START].input()[j].clone(),
-        );
+        eval.add_constraint(is_real.clone() * perms[NULLIFIER_PERM_START].input()[j].clone());
     }
 
     // S1: Nullifier sk must match ownership sk
@@ -188,8 +182,7 @@ pub fn constrain_withdraw_wiring<E: EvalAtRow>(
     for j in 0..RATE {
         eval.add_constraint(
             is_real.clone()
-                * (perms[NULLIFIER_PERM_END - 1].output()[j].clone()
-                    - nullifier[j].clone()),
+                * (perms[NULLIFIER_PERM_END - 1].output()[j].clone() - nullifier[j].clone()),
         );
     }
 
@@ -199,9 +192,7 @@ pub fn constrain_withdraw_wiring<E: EvalAtRow>(
         let commit_out = perms[commitment_perm].output()[j].clone();
         let curr_left = perms[MERKLE_PERM_START].input()[j].clone();
         let curr_right = perms[MERKLE_PERM_START].input()[j + RATE].clone();
-        eval.add_constraint(
-            (curr_left - commit_out.clone()) * (curr_right - commit_out),
-        );
+        eval.add_constraint((curr_left - commit_out.clone()) * (curr_right - commit_out));
     }
 
     for i in (MERKLE_PERM_START + 1)..MERKLE_PERM_END {
@@ -209,9 +200,7 @@ pub fn constrain_withdraw_wiring<E: EvalAtRow>(
             let prev_out = perms[i - 1].output()[j].clone();
             let curr_left = perms[i].input()[j].clone();
             let curr_right = perms[i].input()[j + RATE].clone();
-            eval.add_constraint(
-                (curr_left - prev_out.clone()) * (curr_right - prev_out),
-            );
+            eval.add_constraint((curr_left - prev_out.clone()) * (curr_right - prev_out));
         }
     }
 
@@ -219,39 +208,30 @@ pub fn constrain_withdraw_wiring<E: EvalAtRow>(
     for j in 0..RATE {
         eval.add_constraint(
             is_real.clone()
-                * (perms[MERKLE_PERM_END - 1].output()[j].clone()
-                    - merkle_root[j].clone()),
+                * (perms[MERKLE_PERM_END - 1].output()[j].clone() - merkle_root[j].clone()),
         );
     }
 
     // 6. Amount/asset binding
     eval.add_constraint(
-        is_real.clone()
-            * (perms[COMMITMENT_PERM_START].input()[5].clone()
-                - amount_lo.clone()),
+        is_real.clone() * (perms[COMMITMENT_PERM_START].input()[5].clone() - amount_lo.clone()),
     );
     eval.add_constraint(
-        is_real.clone()
-            * (perms[COMMITMENT_PERM_START].input()[6].clone()
-                - amount_hi.clone()),
+        is_real.clone() * (perms[COMMITMENT_PERM_START].input()[6].clone() - amount_hi.clone()),
     );
     eval.add_constraint(
-        is_real.clone()
-            * (perms[COMMITMENT_PERM_START].input()[4].clone()
-                - asset_id.clone()),
+        is_real.clone() * (perms[COMMITMENT_PERM_START].input()[4].clone() - asset_id.clone()),
     );
 
     // Sub-limb ↔ amount binding
     let c65536 = M31::from_u32_unchecked(65536);
     eval.add_constraint(
         is_real.clone()
-            * (sub_limbs[0].clone() + sub_limbs[1].clone() * c65536
-                - amount_lo.clone()),
+            * (sub_limbs[0].clone() + sub_limbs[1].clone() * c65536 - amount_lo.clone()),
     );
     eval.add_constraint(
         is_real.clone()
-            * (sub_limbs[2].clone() + sub_limbs[3].clone() * c65536
-                - amount_hi.clone()),
+            * (sub_limbs[2].clone() + sub_limbs[3].clone() * c65536 - amount_hi.clone()),
     );
 }
 
@@ -287,8 +267,7 @@ impl FrameworkEval for WithdrawStarkEval {
             .collect();
 
         // ── Sub-limb & bit columns ──
-        let sub_limbs: [E::F; NUM_SUB_LIMBS] =
-            std::array::from_fn(|_| eval.next_trace_mask());
+        let sub_limbs: [E::F; NUM_SUB_LIMBS] = std::array::from_fn(|_| eval.next_trace_mask());
         let bits: [[E::F; BITS_PER_LIMB]; NUM_SUB_LIMBS] =
             std::array::from_fn(|_| std::array::from_fn(|_| eval.next_trace_mask()));
 
@@ -315,10 +294,15 @@ impl FrameworkEval for WithdrawStarkEval {
         let asset_id = E::F::from(self.asset_id);
 
         constrain_withdraw_wiring(
-            &mut eval, &is_real,
-            &perms, &sub_limbs,
-            &merkle_root, &nullifier,
-            &amount_lo, &amount_hi, &asset_id,
+            &mut eval,
+            &is_real,
+            &perms,
+            &sub_limbs,
+            &merkle_root,
+            &nullifier,
+            &amount_lo,
+            &amount_hi,
+            &asset_id,
         );
 
         eval
@@ -359,8 +343,8 @@ where
     <B as ColumnOps<M31>>::Column: 'static,
     FrameworkComponent<WithdrawStarkEval>: ComponentProver<B>,
 {
-    let (execution, public_inputs) = execute_withdraw(witness)
-        .map_err(|e| WithdrawStarkError::Execution(format!("{e}")))?;
+    let (execution, public_inputs) =
+        execute_withdraw(witness).map_err(|e| WithdrawStarkError::Execution(format!("{e}")))?;
 
     let table_size = 1usize << LOG_SIZE;
 
@@ -413,8 +397,7 @@ where
     for (k, &limb) in execution.range_check_limbs.iter().enumerate() {
         let bit_vals = decompose_to_bits(limb.0);
         for (i, &bit) in bit_vals.iter().enumerate() {
-            exec_cols[bit_offset + k * BITS_PER_LIMB + i]
-                .set(0, M31::from_u32_unchecked(bit));
+            exec_cols[bit_offset + k * BITS_PER_LIMB + i].set(0, M31::from_u32_unchecked(bit));
         }
     }
 
@@ -422,7 +405,8 @@ where
     let mut is_real_col = Col::<B, M31>::zeros(table_size);
     is_real_col.set(0, M31::from_u32_unchecked(1));
     let preprocessed = vec![CircleEvaluation::<B, M31, BitReversedOrder>::new(
-        domain, is_real_col,
+        domain,
+        is_real_col,
     )];
     let execution_evals: Vec<CircleEvaluation<B, M31, BitReversedOrder>> = exec_cols
         .into_iter()
@@ -445,9 +429,7 @@ where
     tree_builder.commit(channel);
 
     let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(convert_evaluations::<B, B, M31>(
-        execution_evals,
-    ));
+    tree_builder.extend_evals(convert_evaluations::<B, B, M31>(execution_evals));
     tree_builder.commit(channel);
 
     let eval = WithdrawStarkEval {
@@ -464,12 +446,8 @@ where
         SecureField::zero(),
     );
 
-    let stark_proof = prove::<B, Blake2sMerkleChannel>(
-        &[&component],
-        channel,
-        commitment_scheme,
-    )
-    .map_err(|e| WithdrawStarkError::Proving(format!("{e:?}")))?;
+    let stark_proof = prove::<B, Blake2sMerkleChannel>(&[&component], channel, commitment_scheme)
+        .map_err(|e| WithdrawStarkError::Proving(format!("{e:?}")))?;
 
     Ok(WithdrawStarkProof {
         stark_proof,
@@ -494,13 +472,11 @@ pub fn verify_withdraw_stark(
         asset_id: public_inputs.asset_id,
     };
     let mut allocator = TraceLocationAllocator::default();
-    let dummy_component =
-        FrameworkComponent::new(&mut allocator, dummy_eval, SecureField::zero());
+    let dummy_component = FrameworkComponent::new(&mut allocator, dummy_eval, SecureField::zero());
     let bounds = Component::trace_log_degree_bounds(&dummy_component);
 
     let channel = &mut <Blake2sMerkleChannel as MerkleChannel>::C::default();
-    let mut commitment_scheme =
-        CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(pcs_config);
+    let mut commitment_scheme = CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(pcs_config);
 
     commitment_scheme.commit(proof.stark_proof.commitments[0], &bounds[0], channel);
     commitment_scheme.commit(proof.stark_proof.commitments[1], &bounds[1], channel);
@@ -514,8 +490,7 @@ pub fn verify_withdraw_stark(
         asset_id: public_inputs.asset_id,
     };
     let mut allocator = TraceLocationAllocator::default();
-    let component =
-        FrameworkComponent::new(&mut allocator, real_eval, SecureField::zero());
+    let component = FrameworkComponent::new(&mut allocator, real_eval, SecureField::zero());
 
     stwo_verify::<Blake2sMerkleChannel>(
         &[&component as &dyn Component],
@@ -562,8 +537,7 @@ mod tests {
     fn test_withdraw_stark_prove_verify() {
         let witness = make_withdraw_witness(1000);
         let proof = prove_withdraw_stark(&witness).expect("proving should succeed");
-        verify_withdraw_stark(&proof, &proof.public_inputs)
-            .expect("verification should succeed");
+        verify_withdraw_stark(&proof, &proof.public_inputs).expect("verification should succeed");
     }
 
     #[test]
@@ -615,8 +589,7 @@ mod tests {
         verify_withdraw(&phase3_proof).expect("phase3 verify");
 
         let stark_proof = prove_withdraw_stark(&witness).expect("stark prove");
-        verify_withdraw_stark(&stark_proof, &stark_proof.public_inputs)
-            .expect("stark verify");
+        verify_withdraw_stark(&stark_proof, &stark_proof.public_inputs).expect("stark verify");
 
         assert_eq!(
             phase3_proof.public_inputs.nullifier,

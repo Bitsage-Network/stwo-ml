@@ -25,19 +25,19 @@ use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::{BackendForChannel, Col, Column, ColumnOps};
 use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
 use stwo::prover::poly::BitReversedOrder;
+use stwo::prover::prove;
 use stwo::prover::CommitmentSchemeProver;
 use stwo::prover::ComponentProver;
-use stwo::prover::prove;
 
+use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 use stwo_constraint_framework::{
     EvalAtRow, FrameworkComponent, FrameworkEval, TraceLocationAllocator,
 };
-use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 
 use crate::backend::convert_evaluations;
-use crate::circuits::deposit::{DepositPublicInputs, DepositWitness, execute_deposit};
+use crate::circuits::deposit::{execute_deposit, DepositPublicInputs, DepositWitness};
 use crate::components::poseidon2_air::{
-    constrain_poseidon2_permutation, compute_permutation_trace, decompose_to_bits,
+    compute_permutation_trace, constrain_poseidon2_permutation, decompose_to_bits,
     dummy_permutation_trace, write_permutation_to_trace, Poseidon2Columns, COLS_PER_PERM,
 };
 use crate::crypto::poseidon2_m31::{RATE, STATE_WIDTH};
@@ -81,8 +81,7 @@ pub fn constrain_deposit_wiring<E: EvalAtRow>(
 ) {
     // Domain separation: perm0.input[8] = 11 (commitment hash input length)
     eval.add_constraint(
-        is_real.clone()
-            * (perm0.input()[RATE].clone() - E::F::from(M31::from_u32_unchecked(11))),
+        is_real.clone() * (perm0.input()[RATE].clone() - E::F::from(M31::from_u32_unchecked(11))),
     );
 
     // Zero padding: perm0.input[9..15] = 0
@@ -93,34 +92,21 @@ pub fn constrain_deposit_wiring<E: EvalAtRow>(
     // Sponge chain: perm1.input[3..15] = perm0.output[3..15]
     for j in 3..STATE_WIDTH {
         eval.add_constraint(
-            is_real.clone()
-                * (perm1.input()[j].clone() - perm0.output()[j].clone()),
+            is_real.clone() * (perm1.input()[j].clone() - perm0.output()[j].clone()),
         );
     }
 
     // Commitment output: perm1.output[0..7] = public commitment
     for j in 0..RATE {
-        eval.add_constraint(
-            is_real.clone()
-                * (perm1.output()[j].clone() - commitment[j].clone()),
-        );
+        eval.add_constraint(is_real.clone() * (perm1.output()[j].clone() - commitment[j].clone()));
     }
 
     // Amount binding: perm0.input[5] = amount_lo, [6] = amount_hi
-    eval.add_constraint(
-        is_real.clone()
-            * (perm0.input()[5].clone() - amount_lo.clone()),
-    );
-    eval.add_constraint(
-        is_real.clone()
-            * (perm0.input()[6].clone() - amount_hi.clone()),
-    );
+    eval.add_constraint(is_real.clone() * (perm0.input()[5].clone() - amount_lo.clone()));
+    eval.add_constraint(is_real.clone() * (perm0.input()[6].clone() - amount_hi.clone()));
 
     // Asset binding: perm0.input[4] = asset_id
-    eval.add_constraint(
-        is_real.clone()
-            * (perm0.input()[4].clone() - asset_id.clone()),
-    );
+    eval.add_constraint(is_real.clone() * (perm0.input()[4].clone() - asset_id.clone()));
 
     // Sub-limb ↔ amount binding:
     // sub_limbs[0] + sub_limbs[1] * 65536 = amount_lo (mod p)
@@ -128,13 +114,11 @@ pub fn constrain_deposit_wiring<E: EvalAtRow>(
     let c65536 = M31::from_u32_unchecked(65536);
     eval.add_constraint(
         is_real.clone()
-            * (sub_limbs[0].clone() + sub_limbs[1].clone() * c65536
-                - amount_lo.clone()),
+            * (sub_limbs[0].clone() + sub_limbs[1].clone() * c65536 - amount_lo.clone()),
     );
     eval.add_constraint(
         is_real.clone()
-            * (sub_limbs[2].clone() + sub_limbs[3].clone() * c65536
-                - amount_hi.clone()),
+            * (sub_limbs[2].clone() + sub_limbs[3].clone() * c65536 - amount_hi.clone()),
     );
 }
 
@@ -172,8 +156,7 @@ impl FrameworkEval for DepositStarkEval {
         let perm1 = constrain_poseidon2_permutation(&mut eval);
 
         // ── Sub-limb columns (4) ──
-        let sub_limbs: [E::F; NUM_SUB_LIMBS] =
-            std::array::from_fn(|_| eval.next_trace_mask());
+        let sub_limbs: [E::F; NUM_SUB_LIMBS] = std::array::from_fn(|_| eval.next_trace_mask());
 
         // ── Bit columns (64 = 4 × 16) ──
         let bits: [[E::F; BITS_PER_LIMB]; NUM_SUB_LIMBS] =
@@ -204,10 +187,15 @@ impl FrameworkEval for DepositStarkEval {
         let asset_id = E::F::from(self.asset_id);
 
         constrain_deposit_wiring(
-            &mut eval, &is_real,
-            &perm0, &perm1,
+            &mut eval,
+            &is_real,
+            &perm0,
+            &perm1,
             &sub_limbs,
-            &commitment, &amount_lo, &amount_hi, &asset_id,
+            &commitment,
+            &amount_lo,
+            &amount_hi,
+            &asset_id,
         );
 
         eval
@@ -252,8 +240,8 @@ where
     <B as ColumnOps<M31>>::Column: 'static,
     FrameworkComponent<DepositStarkEval>: ComponentProver<B>,
 {
-    let (execution, public_inputs) = execute_deposit(witness)
-        .map_err(|e| DepositStarkError::Execution(format!("{e}")))?;
+    let (execution, public_inputs) =
+        execute_deposit(witness).map_err(|e| DepositStarkError::Execution(format!("{e}")))?;
 
     let table_size = 1usize << LOG_SIZE;
 
@@ -303,7 +291,8 @@ where
     is_real_col.set(0, M31::from_u32_unchecked(1));
 
     let preprocessed = vec![CircleEvaluation::<B, M31, BitReversedOrder>::new(
-        domain, is_real_col,
+        domain,
+        is_real_col,
     )];
     let execution_evals: Vec<CircleEvaluation<B, M31, BitReversedOrder>> = exec_cols
         .into_iter()
@@ -328,9 +317,7 @@ where
 
     // Tree 1: Execution trace
     let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(convert_evaluations::<B, B, M31>(
-        execution_evals,
-    ));
+    tree_builder.extend_evals(convert_evaluations::<B, B, M31>(execution_evals));
     tree_builder.commit(channel);
 
     // Build component (no LogUp → claimed_sum = 0)
@@ -347,12 +334,8 @@ where
         SecureField::zero(),
     );
 
-    let stark_proof = prove::<B, Blake2sMerkleChannel>(
-        &[&component],
-        channel,
-        commitment_scheme,
-    )
-    .map_err(|e| DepositStarkError::Proving(format!("{e:?}")))?;
+    let stark_proof = prove::<B, Blake2sMerkleChannel>(&[&component], channel, commitment_scheme)
+        .map_err(|e| DepositStarkError::Proving(format!("{e:?}")))?;
 
     Ok(DepositStarkProof {
         stark_proof,
@@ -380,14 +363,12 @@ pub fn verify_deposit_stark(
         asset_id: public_inputs.asset_id,
     };
     let mut allocator = TraceLocationAllocator::default();
-    let dummy_component =
-        FrameworkComponent::new(&mut allocator, dummy_eval, SecureField::zero());
+    let dummy_component = FrameworkComponent::new(&mut allocator, dummy_eval, SecureField::zero());
     let bounds = Component::trace_log_degree_bounds(&dummy_component);
 
     // Set up channel and verifier
     let channel = &mut <Blake2sMerkleChannel as MerkleChannel>::C::default();
-    let mut commitment_scheme =
-        CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(pcs_config);
+    let mut commitment_scheme = CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(pcs_config);
 
     // Replay commitments
     commitment_scheme.commit(proof.stark_proof.commitments[0], &bounds[0], channel);
@@ -402,8 +383,7 @@ pub fn verify_deposit_stark(
         asset_id: public_inputs.asset_id,
     };
     let mut allocator = TraceLocationAllocator::default();
-    let component =
-        FrameworkComponent::new(&mut allocator, real_eval, SecureField::zero());
+    let component = FrameworkComponent::new(&mut allocator, real_eval, SecureField::zero());
 
     stwo_verify::<Blake2sMerkleChannel>(
         &[&component as &dyn Component],
@@ -479,8 +459,7 @@ mod tests {
 
         // Phase 4 STARK proof
         let stark_proof = prove_deposit_stark(&witness).expect("stark prove");
-        verify_deposit_stark(&stark_proof, &stark_proof.public_inputs)
-            .expect("stark verify");
+        verify_deposit_stark(&stark_proof, &stark_proof.public_inputs).expect("stark verify");
 
         // Public inputs should match
         assert_eq!(

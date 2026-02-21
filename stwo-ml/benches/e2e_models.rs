@@ -3,14 +3,14 @@
 //! Benchmarks different model architectures through the full proving pipeline:
 //! forward pass → per-layer proof generation → verification.
 
-use criterion::{Criterion, criterion_group, criterion_main, BenchmarkId};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use stwo::core::fields::m31::M31;
 
-use stwo_ml::components::activation::ActivationType;
-use stwo_ml::components::matmul::M31Matrix;
 use stwo_ml::compiler::graph::GraphBuilder;
 use stwo_ml::compiler::onnx::generate_weights_for_graph;
 use stwo_ml::compiler::prove::{prove_model, verify_model_matmuls};
+use stwo_ml::components::activation::ActivationType;
+use stwo_ml::components::matmul::M31Matrix;
 
 /// Build a test input matrix.
 fn make_input(rows: usize, cols: usize) -> M31Matrix {
@@ -46,7 +46,7 @@ fn bench_mlp_mnist(c: &mut Criterion) {
 
 /// Benchmark: Transformer block (tiny)
 fn bench_transformer_tiny(c: &mut Criterion) {
-    use stwo_ml::compiler::onnx::{TransformerConfig, build_transformer_block};
+    use stwo_ml::compiler::onnx::{build_transformer_block, TransformerConfig};
 
     let config = TransformerConfig {
         d_model: 4,

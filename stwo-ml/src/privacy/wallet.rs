@@ -51,10 +51,18 @@ impl Wallet {
             .map_err(|e| WalletError::Crypto(format!("getrandom failed: {e}")))?;
 
         let spending_key: SpendingKey = [
-            M31::from_u32_unchecked(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) & 0x7FFFFFFF),
-            M31::from_u32_unchecked(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) & 0x7FFFFFFF),
-            M31::from_u32_unchecked(u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) & 0x7FFFFFFF),
-            M31::from_u32_unchecked(u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) & 0x7FFFFFFF),
+            M31::from_u32_unchecked(
+                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) & 0x7FFFFFFF,
+            ),
+            M31::from_u32_unchecked(
+                u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) & 0x7FFFFFFF,
+            ),
+            M31::from_u32_unchecked(
+                u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) & 0x7FFFFFFF,
+            ),
+            M31::from_u32_unchecked(
+                u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) & 0x7FFFFFFF,
+            ),
         ];
 
         Ok(Self::from_spending_key(spending_key))
@@ -89,10 +97,7 @@ impl Wallet {
     pub fn address(&self) -> String {
         format!(
             "0x{:08x}{:08x}{:08x}{:08x}",
-            self.public_key[0].0,
-            self.public_key[1].0,
-            self.public_key[2].0,
-            self.public_key[3].0,
+            self.public_key[0].0, self.public_key[1].0, self.public_key[2].0, self.public_key[3].0,
         )
     }
 
@@ -105,13 +110,14 @@ impl Wallet {
 
         let pk_hex = format!(
             "0x{:08x}{:08x}{:08x}{:08x}",
-            self.public_key[0].0, self.public_key[1].0,
-            self.public_key[2].0, self.public_key[3].0,
+            self.public_key[0].0, self.public_key[1].0, self.public_key[2].0, self.public_key[3].0,
         );
         let vk_hex = format!(
             "0x{:08x}{:08x}{:08x}{:08x}",
-            self.viewing_key[0].0, self.viewing_key[1].0,
-            self.viewing_key[2].0, self.viewing_key[3].0,
+            self.viewing_key[0].0,
+            self.viewing_key[1].0,
+            self.viewing_key[2].0,
+            self.viewing_key[3].0,
         );
 
         let json = if let Some(pw) = password {
@@ -135,11 +141,15 @@ impl Wallet {
                 "{{\n  \"version\": 2,\n  \"public_key\": \"{pk_hex}\",\n  \"viewing_key\": \"{vk_hex}\",\n  \"encrypted_spending_key\": \"{enc_hex}\",\n  \"spending_key_nonce\": \"{nonce_hex}\",\n  \"kdf_salt\": \"{salt_hex}\",\n  \"kdf_iterations\": {KDF_ITERATIONS}\n}}"
             )
         } else {
-            eprintln!("WARNING: saving spending key in PLAINTEXT. Use --password for production wallets.");
+            eprintln!(
+                "WARNING: saving spending key in PLAINTEXT. Use --password for production wallets."
+            );
             let sk_hex = format!(
                 "0x{:08x}{:08x}{:08x}{:08x}",
-                self.spending_key[0].0, self.spending_key[1].0,
-                self.spending_key[2].0, self.spending_key[3].0,
+                self.spending_key[0].0,
+                self.spending_key[1].0,
+                self.spending_key[2].0,
+                self.spending_key[3].0,
             );
             format!(
                 "{{\n  \"version\": 2,\n  \"public_key\": \"{pk_hex}\",\n  \"viewing_key\": \"{vk_hex}\",\n  \"spending_key_plaintext\": \"{sk_hex}\"\n}}"
@@ -280,10 +290,18 @@ fn generate_salt() -> Result<[M31; 4], WalletError> {
     getrandom::getrandom(&mut bytes)
         .map_err(|e| WalletError::Crypto(format!("getrandom failed: {e}")))?;
     Ok([
-        M31::from_u32_unchecked(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) & 0x7FFFFFFF),
-        M31::from_u32_unchecked(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) & 0x7FFFFFFF),
-        M31::from_u32_unchecked(u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) & 0x7FFFFFFF),
-        M31::from_u32_unchecked(u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) & 0x7FFFFFFF),
+        M31::from_u32_unchecked(
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) & 0x7FFFFFFF,
+        ),
+        M31::from_u32_unchecked(
+            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) & 0x7FFFFFFF,
+        ),
+        M31::from_u32_unchecked(
+            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) & 0x7FFFFFFF,
+        ),
+        M31::from_u32_unchecked(
+            u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) & 0x7FFFFFFF,
+        ),
     ])
 }
 
@@ -292,10 +310,18 @@ fn generate_nonce() -> Result<[M31; 4], WalletError> {
     getrandom::getrandom(&mut bytes)
         .map_err(|e| WalletError::Crypto(format!("getrandom failed: {e}")))?;
     Ok([
-        M31::from_u32_unchecked(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) & 0x7FFFFFFF),
-        M31::from_u32_unchecked(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) & 0x7FFFFFFF),
-        M31::from_u32_unchecked(u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) & 0x7FFFFFFF),
-        M31::from_u32_unchecked(u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) & 0x7FFFFFFF),
+        M31::from_u32_unchecked(
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) & 0x7FFFFFFF,
+        ),
+        M31::from_u32_unchecked(
+            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) & 0x7FFFFFFF,
+        ),
+        M31::from_u32_unchecked(
+            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) & 0x7FFFFFFF,
+        ),
+        M31::from_u32_unchecked(
+            u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) & 0x7FFFFFFF,
+        ),
     ])
 }
 

@@ -13,9 +13,9 @@ use std::process::Command;
 use std::thread::sleep;
 use std::time::Duration;
 
-use stwo::core::fields::m31::BaseField as M31;
 use starknet_crypto::poseidon_hash_many;
 use starknet_ff::FieldElement;
+use stwo::core::fields::m31::BaseField as M31;
 
 use crate::circuits::batch::BatchPublicInputs;
 use crate::crypto::poseidon2_m31::{poseidon2_hash, RATE};
@@ -98,10 +98,7 @@ pub struct WithdrawalRecipients {
 
 impl WithdrawalRecipients {
     pub fn new(payout: Vec<String>, credit: Vec<String>) -> Self {
-        Self {
-            payout,
-            credit,
-        }
+        Self { payout, credit }
     }
 
     // Legacy helper for migration flows where payout and credit were the same recipient.
@@ -667,9 +664,8 @@ pub fn compute_withdrawal_binding_digest(
         ));
     }
 
-    let domain = FieldElement::from_hex_be(WITHDRAW_BINDING_DOMAIN_V2_HEX).map_err(|e| {
-        RelayerError::InvalidInput(format!("invalid binding domain constant: {e}"))
-    })?;
+    let domain = FieldElement::from_hex_be(WITHDRAW_BINDING_DOMAIN_V2_HEX)
+        .map_err(|e| RelayerError::InvalidInput(format!("invalid binding domain constant: {e}")))?;
     let payout_recipient_fe = parse_field_element(payout_recipient)?;
     let credit_recipient_fe = parse_field_element(credit_recipient)?;
     let hash = poseidon_hash_many(&[
@@ -704,9 +700,8 @@ pub fn compute_withdrawal_binding_digest_v1(
         ));
     }
 
-    let domain = FieldElement::from_hex_be(WITHDRAW_BINDING_DOMAIN_V1_HEX).map_err(|e| {
-        RelayerError::InvalidInput(format!("invalid binding domain constant: {e}"))
-    })?;
+    let domain = FieldElement::from_hex_be(WITHDRAW_BINDING_DOMAIN_V1_HEX)
+        .map_err(|e| RelayerError::InvalidInput(format!("invalid binding domain constant: {e}")))?;
     let payout_recipient_fe = parse_field_element(payout_recipient)?;
     let hash = poseidon_hash_many(&[
         domain,
@@ -826,9 +821,8 @@ fn append_packed_digest(
 
 fn parse_field_element(value: &str) -> Result<FieldElement, RelayerError> {
     let normalized = normalize_hex(value);
-    FieldElement::from_hex_be(normalized.as_str()).map_err(|e| {
-        RelayerError::InvalidInput(format!("invalid felt '{}': {e}", value))
-    })
+    FieldElement::from_hex_be(normalized.as_str())
+        .map_err(|e| RelayerError::InvalidInput(format!("invalid felt '{}': {e}", value)))
 }
 
 fn field_element_to_binding_digest(fe: FieldElement) -> [M31; RATE] {
@@ -1125,10 +1119,8 @@ mod tests {
     #[test]
     fn test_build_submit_batch_proof_calldata_has_expected_prefixes() {
         let inputs = sample_inputs();
-        let recipients = WithdrawalRecipients::new(
-            vec!["0x1234".to_string()],
-            vec!["0x5678".to_string()],
-        );
+        let recipients =
+            WithdrawalRecipients::new(vec!["0x1234".to_string()], vec!["0x5678".to_string()]);
         let calldata = build_submit_batch_proof_calldata(&inputs, "0xabc", &recipients).unwrap();
         // deposits_len, deposit struct, withdrawals_len, withdraw struct, spends_len, spend struct, proof hash
         assert_eq!(calldata[0], "0x1");
@@ -1154,14 +1146,7 @@ mod tests {
             },
         };
         let recipients = WithdrawalRecipients::mirrored(vec!["0x1234".to_string()]);
-        let outcome = run_vm31_relayer_flow(
-            &backend,
-            &inputs,
-            "0xabc",
-            &recipients,
-            &cfg,
-        )
-        .unwrap();
+        let outcome = run_vm31_relayer_flow(&backend, &inputs, "0xabc", &recipients, &cfg).unwrap();
 
         assert_eq!(outcome.batch_id, "0xbeef");
         assert_eq!(outcome.total_txs, 5);
@@ -1188,14 +1173,7 @@ mod tests {
 
         let cfg = Vm31RelayerConfig::default();
         let recipients = WithdrawalRecipients::mirrored(vec!["0x1234".to_string()]);
-        let outcome = run_vm31_relayer_flow(
-            &backend,
-            &inputs,
-            "0xabc",
-            &recipients,
-            &cfg,
-        )
-        .unwrap();
+        let outcome = run_vm31_relayer_flow(&backend, &inputs, "0xabc", &recipients, &cfg).unwrap();
 
         assert_eq!(outcome.batch_id, "0xbeef");
         assert!(outcome.finalized);
@@ -1218,14 +1196,7 @@ mod tests {
             },
         };
         let recipients = WithdrawalRecipients::mirrored(vec!["0x1234".to_string()]);
-        let outcome = run_vm31_relayer_flow(
-            &backend,
-            &inputs,
-            "0xabc",
-            &recipients,
-            &cfg,
-        )
-        .unwrap();
+        let outcome = run_vm31_relayer_flow(&backend, &inputs, "0xabc", &recipients, &cfg).unwrap();
 
         assert!(outcome.finalized);
         assert_eq!(*backend.bind_calls.borrow(), 2);
@@ -1258,20 +1229,13 @@ mod tests {
         let backend = MockBackend::new(1);
         let inputs = sample_inputs();
         let cfg = Vm31RelayerConfig::default();
-        let recipients = WithdrawalRecipients::new(
-            vec!["0x9999".to_string()],
-            vec!["0x1234".to_string()],
-        );
-        let err = run_vm31_relayer_flow(
-            &backend,
-            &inputs,
-            "0xabc",
-            &recipients,
-            &cfg,
-        )
-        .unwrap_err();
+        let recipients =
+            WithdrawalRecipients::new(vec!["0x9999".to_string()], vec!["0x1234".to_string()]);
+        let err = run_vm31_relayer_flow(&backend, &inputs, "0xabc", &recipients, &cfg).unwrap_err();
         assert!(matches!(err, RelayerError::InvalidInput(_)));
-        assert!(err.to_string().contains("withdrawal binding mismatch at index 0"));
+        assert!(err
+            .to_string()
+            .contains("withdrawal binding mismatch at index 0"));
     }
 
     #[test]
@@ -1279,20 +1243,13 @@ mod tests {
         let backend = MockBackend::new(1);
         let inputs = sample_inputs();
         let cfg = Vm31RelayerConfig::default();
-        let recipients = WithdrawalRecipients::new(
-            vec!["0x1234".to_string()],
-            vec!["0x9999".to_string()],
-        );
-        let err = run_vm31_relayer_flow(
-            &backend,
-            &inputs,
-            "0xabc",
-            &recipients,
-            &cfg,
-        )
-        .unwrap_err();
+        let recipients =
+            WithdrawalRecipients::new(vec!["0x1234".to_string()], vec!["0x9999".to_string()]);
+        let err = run_vm31_relayer_flow(&backend, &inputs, "0xabc", &recipients, &cfg).unwrap_err();
         assert!(matches!(err, RelayerError::InvalidInput(_)));
-        assert!(err.to_string().contains("withdrawal binding mismatch at index 0"));
+        assert!(err
+            .to_string()
+            .contains("withdrawal binding mismatch at index 0"));
     }
 
     #[test]
@@ -1314,53 +1271,21 @@ mod tests {
         inputs.withdrawals[0].withdrawal_binding =
             compute_withdrawal_binding_digest_v1("0x1234", 7, 5, 0, 0).unwrap();
         let cfg = Vm31RelayerConfig::default();
-        let recipients = WithdrawalRecipients::new(
-            vec!["0x1234".to_string()],
-            vec!["0x5678".to_string()],
-        );
+        let recipients =
+            WithdrawalRecipients::new(vec!["0x1234".to_string()], vec!["0x5678".to_string()]);
         let err = run_vm31_relayer_flow(&backend, &inputs, "0xabc", &recipients, &cfg).unwrap_err();
         assert!(matches!(err, RelayerError::InvalidInput(_)));
-        assert!(err.to_string().contains("legacy v1 binding requires payout==credit"));
+        assert!(err
+            .to_string()
+            .contains("legacy v1 binding requires payout==credit"));
     }
 
     #[test]
     fn test_compute_withdrawal_binding_digest_deterministic() {
-        let a = compute_withdrawal_binding_digest(
-            "0x1234",
-            "0x5678",
-            7,
-            10,
-            0,
-            3,
-        )
-        .unwrap();
-        let b = compute_withdrawal_binding_digest(
-            "0x1234",
-            "0x5678",
-            7,
-            10,
-            0,
-            3,
-        )
-        .unwrap();
-        let c = compute_withdrawal_binding_digest(
-            "0x9999",
-            "0x5678",
-            7,
-            10,
-            0,
-            3,
-        )
-        .unwrap();
-        let d = compute_withdrawal_binding_digest(
-            "0x1234",
-            "0x9999",
-            7,
-            10,
-            0,
-            3,
-        )
-        .unwrap();
+        let a = compute_withdrawal_binding_digest("0x1234", "0x5678", 7, 10, 0, 3).unwrap();
+        let b = compute_withdrawal_binding_digest("0x1234", "0x5678", 7, 10, 0, 3).unwrap();
+        let c = compute_withdrawal_binding_digest("0x9999", "0x5678", 7, 10, 0, 3).unwrap();
+        let d = compute_withdrawal_binding_digest("0x1234", "0x9999", 7, 10, 0, 3).unwrap();
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert_ne!(a, d);

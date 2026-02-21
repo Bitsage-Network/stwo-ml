@@ -162,8 +162,8 @@ pub struct GpuDeviceInfo {
 pub fn discover_devices() -> Vec<GpuDeviceInfo> {
     #[cfg(feature = "cuda-runtime")]
     {
-        use stwo::prover::backend::gpu::multi_gpu::GpuCapabilities;
         use stwo::prover::backend::gpu::cuda_executor::get_device_count;
+        use stwo::prover::backend::gpu::multi_gpu::GpuCapabilities;
 
         let count = get_device_count();
         let mut devices = Vec::with_capacity(count);
@@ -173,7 +173,10 @@ pub fn discover_devices() -> Vec<GpuDeviceInfo> {
                 Ok(cap) => {
                     devices.push(GpuDeviceInfo {
                         ordinal: i,
-                        name: format!("GPU {} (SM {}.{})", i, cap.compute_capability.0, cap.compute_capability.1),
+                        name: format!(
+                            "GPU {} (SM {}.{})",
+                            i, cap.compute_capability.0, cap.compute_capability.1
+                        ),
                         total_memory: cap.total_memory,
                         compute_capability: cap.compute_capability,
                         sm_count: cap.sm_count,
@@ -350,13 +353,17 @@ impl MultiGpuExecutor {
         Self::with_devices_inner(devices, ordinals)
     }
 
-    fn with_devices_inner(devices: Vec<GpuDeviceInfo>, ordinals: &[usize]) -> Result<Self, MultiGpuError> {
+    fn with_devices_inner(
+        devices: Vec<GpuDeviceInfo>,
+        ordinals: &[usize],
+    ) -> Result<Self, MultiGpuError> {
         #[cfg(feature = "cuda-runtime")]
         {
             use std::sync::Mutex;
 
-            let results: Mutex<Vec<Result<(usize, Arc<crate::gpu_sumcheck::GpuSumcheckExecutor>), MultiGpuError>>> =
-                Mutex::new(Vec::with_capacity(ordinals.len()));
+            let results: Mutex<
+                Vec<Result<(usize, Arc<crate::gpu_sumcheck::GpuSumcheckExecutor>), MultiGpuError>>,
+            > = Mutex::new(Vec::with_capacity(ordinals.len()));
 
             let compile_start = Instant::now();
 
@@ -366,18 +373,20 @@ impl MultiGpuExecutor {
                     let results_ref = &results;
                     s.spawn(move || {
                         info!(device_id, "Compiling sumcheck kernels on GPU");
-                        let result = crate::gpu_sumcheck::GpuSumcheckExecutor::cached_for_device(device_id)
-                            .map(|exec| (device_id, exec))
-                            .map_err(|e| MultiGpuError::KernelCompilation {
-                                device_id,
-                                message: format!("{e}"),
-                            });
+                        let result =
+                            crate::gpu_sumcheck::GpuSumcheckExecutor::cached_for_device(device_id)
+                                .map(|exec| (device_id, exec))
+                                .map_err(|e| MultiGpuError::KernelCompilation {
+                                    device_id,
+                                    message: format!("{e}"),
+                                });
                         results_ref.lock().unwrap().push(result);
                     });
                 }
             });
 
-            let mut executors: Vec<(usize, Arc<crate::gpu_sumcheck::GpuSumcheckExecutor>)> = Vec::new();
+            let mut executors: Vec<(usize, Arc<crate::gpu_sumcheck::GpuSumcheckExecutor>)> =
+                Vec::new();
             for result in results.into_inner().unwrap() {
                 executors.push(result?);
             }
@@ -390,13 +399,20 @@ impl MultiGpuExecutor {
                 "MultiGpuExecutor initialized"
             );
 
-            Ok(Self { executors, devices, validated: false })
+            Ok(Self {
+                executors,
+                devices,
+                validated: false,
+            })
         }
 
         #[cfg(not(feature = "cuda-runtime"))]
         {
             let _ = ordinals;
-            Ok(Self { devices, validated: false })
+            Ok(Self {
+                devices,
+                validated: false,
+            })
         }
     }
 
@@ -441,13 +457,18 @@ impl MultiGpuExecutor {
                     let _guard = DeviceGuard::new(device_id);
 
                     // Phase 1: Verify executor cache works for this device.
-                    let exec = match crate::gpu_sumcheck::GpuSumcheckExecutor::cached_for_device(device_id) {
+                    let exec = match crate::gpu_sumcheck::GpuSumcheckExecutor::cached_for_device(
+                        device_id,
+                    ) {
                         Ok(e) => e,
                         Err(e) => {
-                            errors_ref.lock().unwrap().push(MultiGpuError::WarmupFailed {
-                                device_id,
-                                message: format!("Executor cache: {e}"),
-                            });
+                            errors_ref
+                                .lock()
+                                .unwrap()
+                                .push(MultiGpuError::WarmupFailed {
+                                    device_id,
+                                    message: format!("Executor cache: {e}"),
+                                });
                             return;
                         }
                     };
@@ -455,29 +476,50 @@ impl MultiGpuExecutor {
                     // Phase 2: Execute a real 4-element GPU add kernel.
                     // Tests: memory allocation, host→device transfer, kernel launch,
                     // device→host transfer, and numerical correctness.
-                    let lhs = [M31::from(3u32), M31::from(7u32), M31::from(11u32), M31::from(0u32)];
-                    let rhs = [M31::from(5u32), M31::from(2u32), M31::from(1u32), M31::from(100u32)];
-                    let expected = [M31::from(8u32), M31::from(9u32), M31::from(12u32), M31::from(100u32)];
+                    let lhs = [
+                        M31::from(3u32),
+                        M31::from(7u32),
+                        M31::from(11u32),
+                        M31::from(0u32),
+                    ];
+                    let rhs = [
+                        M31::from(5u32),
+                        M31::from(2u32),
+                        M31::from(1u32),
+                        M31::from(100u32),
+                    ];
+                    let expected = [
+                        M31::from(8u32),
+                        M31::from(9u32),
+                        M31::from(12u32),
+                        M31::from(100u32),
+                    ];
 
                     match crate::gpu_sumcheck::gpu_elementwise_add(&lhs, &rhs) {
                         Ok(result) => {
                             if result.as_slice() != expected {
-                                errors_ref.lock().unwrap().push(MultiGpuError::WarmupFailed {
-                                    device_id,
-                                    message: format!(
-                                        "Numerical mismatch: got {:?}, expected {:?}",
-                                        result, expected,
-                                    ),
-                                });
+                                errors_ref
+                                    .lock()
+                                    .unwrap()
+                                    .push(MultiGpuError::WarmupFailed {
+                                        device_id,
+                                        message: format!(
+                                            "Numerical mismatch: got {:?}, expected {:?}",
+                                            result, expected,
+                                        ),
+                                    });
                             } else {
                                 info!(device_id, "Warmup OK (kernel execution verified)");
                             }
                         }
                         Err(e) => {
-                            errors_ref.lock().unwrap().push(MultiGpuError::WarmupFailed {
-                                device_id,
-                                message: format!("Kernel execution: {e}"),
-                            });
+                            errors_ref
+                                .lock()
+                                .unwrap()
+                                .push(MultiGpuError::WarmupFailed {
+                                    device_id,
+                                    message: format!("Kernel execution: {e}"),
+                                });
                         }
                     }
                 });
@@ -510,10 +552,15 @@ impl MultiGpuExecutor {
 
         // Sort chunks by estimated memory, descending (largest first for bin-packing)
         let mut sorted_indices: Vec<usize> = (0..chunks.len()).collect();
-        sorted_indices.sort_by(|&a, &b| chunks[b].estimated_memory.cmp(&chunks[a].estimated_memory));
+        sorted_indices
+            .sort_by(|&a, &b| chunks[b].estimated_memory.cmp(&chunks[a].estimated_memory));
 
         // Track remaining capacity per device (80% safety margin)
-        let usable: Vec<usize> = self.devices.iter().map(|d| d.total_memory * 4 / 5).collect();
+        let usable: Vec<usize> = self
+            .devices
+            .iter()
+            .map(|d| d.total_memory * 4 / 5)
+            .collect();
         let max_single_gpu = usable.iter().copied().max().unwrap_or(0);
         let mut remaining = usable.clone();
         let mut assignments = Vec::with_capacity(chunks.len());
@@ -648,7 +695,10 @@ mod tests {
         .join()
         .unwrap();
 
-        assert_eq!(child_device.0, None, "child should not inherit parent device");
+        assert_eq!(
+            child_device.0, None,
+            "child should not inherit parent device"
+        );
         assert_eq!(child_device.1, Some(3));
 
         // Parent's device unchanged
@@ -752,16 +802,14 @@ mod tests {
         let executor = MultiGpuExecutor {
             #[cfg(feature = "cuda-runtime")]
             executors: Vec::new(),
-            devices: vec![
-                GpuDeviceInfo {
-                    ordinal: 0,
-                    name: "GPU 0".into(),
-                    total_memory: 80 * 1024 * 1024 * 1024,
-                    compute_capability: (9, 0),
-                    sm_count: 132,
-                    relative_power: 3.0,
-                },
-            ],
+            devices: vec![GpuDeviceInfo {
+                ordinal: 0,
+                name: "GPU 0".into(),
+                total_memory: 80 * 1024 * 1024 * 1024,
+                compute_capability: (9, 0),
+                sm_count: 132,
+                relative_power: 3.0,
+            }],
             validated: false,
         };
 
@@ -774,22 +822,30 @@ mod tests {
         let executor = MultiGpuExecutor {
             #[cfg(feature = "cuda-runtime")]
             executors: Vec::new(),
-            devices: vec![
-                GpuDeviceInfo {
-                    ordinal: 0,
-                    name: "GPU 0".into(),
-                    total_memory: 80_000_000_000,
-                    compute_capability: (9, 0),
-                    sm_count: 132,
-                    relative_power: 3.0,
-                },
-            ],
+            devices: vec![GpuDeviceInfo {
+                ordinal: 0,
+                name: "GPU 0".into(),
+                total_memory: 80_000_000_000,
+                compute_capability: (9, 0),
+                sm_count: 132,
+                relative_power: 3.0,
+            }],
             validated: false,
         };
 
         let chunks = vec![
-            ChunkWorkload { chunk_index: 0, estimated_memory: 10_000_000_000, num_matmuls: 40, block_range: 0..40 },
-            ChunkWorkload { chunk_index: 1, estimated_memory: 15_000_000_000, num_matmuls: 40, block_range: 40..80 },
+            ChunkWorkload {
+                chunk_index: 0,
+                estimated_memory: 10_000_000_000,
+                num_matmuls: 40,
+                block_range: 0..40,
+            },
+            ChunkWorkload {
+                chunk_index: 1,
+                estimated_memory: 15_000_000_000,
+                num_matmuls: 40,
+                block_range: 40..80,
+            },
         ];
 
         let assignments = executor.partition_chunks(&chunks);
@@ -825,10 +881,30 @@ mod tests {
         };
 
         let chunks = vec![
-            ChunkWorkload { chunk_index: 0, estimated_memory: 30_000_000_000, num_matmuls: 40, block_range: 0..40 },
-            ChunkWorkload { chunk_index: 1, estimated_memory: 25_000_000_000, num_matmuls: 40, block_range: 40..80 },
-            ChunkWorkload { chunk_index: 2, estimated_memory: 20_000_000_000, num_matmuls: 40, block_range: 80..120 },
-            ChunkWorkload { chunk_index: 3, estimated_memory: 15_000_000_000, num_matmuls: 40, block_range: 120..160 },
+            ChunkWorkload {
+                chunk_index: 0,
+                estimated_memory: 30_000_000_000,
+                num_matmuls: 40,
+                block_range: 0..40,
+            },
+            ChunkWorkload {
+                chunk_index: 1,
+                estimated_memory: 25_000_000_000,
+                num_matmuls: 40,
+                block_range: 40..80,
+            },
+            ChunkWorkload {
+                chunk_index: 2,
+                estimated_memory: 20_000_000_000,
+                num_matmuls: 40,
+                block_range: 80..120,
+            },
+            ChunkWorkload {
+                chunk_index: 3,
+                estimated_memory: 15_000_000_000,
+                num_matmuls: 40,
+                block_range: 120..160,
+            },
         ];
 
         let assignments = executor.partition_chunks(&chunks);
@@ -868,9 +944,24 @@ mod tests {
         };
 
         let chunks = vec![
-            ChunkWorkload { chunk_index: 0, estimated_memory: 35_000_000_000, num_matmuls: 40, block_range: 0..40 },
-            ChunkWorkload { chunk_index: 1, estimated_memory: 30_000_000_000, num_matmuls: 40, block_range: 40..80 },
-            ChunkWorkload { chunk_index: 2, estimated_memory: 10_000_000_000, num_matmuls: 20, block_range: 80..100 },
+            ChunkWorkload {
+                chunk_index: 0,
+                estimated_memory: 35_000_000_000,
+                num_matmuls: 40,
+                block_range: 0..40,
+            },
+            ChunkWorkload {
+                chunk_index: 1,
+                estimated_memory: 30_000_000_000,
+                num_matmuls: 40,
+                block_range: 40..80,
+            },
+            ChunkWorkload {
+                chunk_index: 2,
+                estimated_memory: 10_000_000_000,
+                num_matmuls: 20,
+                block_range: 80..100,
+            },
         ];
 
         let assignments = executor.partition_chunks(&chunks);
@@ -910,8 +1001,18 @@ mod tests {
         };
 
         let chunks = vec![
-            ChunkWorkload { chunk_index: 0, estimated_memory: 10_000_000_000, num_matmuls: 20, block_range: 0..20 },
-            ChunkWorkload { chunk_index: 1, estimated_memory: 10_000_000_000, num_matmuls: 30, block_range: 20..50 },
+            ChunkWorkload {
+                chunk_index: 0,
+                estimated_memory: 10_000_000_000,
+                num_matmuls: 20,
+                block_range: 0..20,
+            },
+            ChunkWorkload {
+                chunk_index: 1,
+                estimated_memory: 10_000_000_000,
+                num_matmuls: 30,
+                block_range: 20..50,
+            },
         ];
 
         let plan = executor.plan_partition(&chunks);

@@ -12,12 +12,12 @@
 //! - [`withdraw`] — Withdraw circuit (shielded note → public amount).
 //! - [`spend`] — 2-in/2-out spend circuit (private transfer).
 
-pub mod poseidon_circuit;
-pub mod helpers;
+pub mod batch;
 pub mod deposit;
-pub mod withdraw;
+pub mod helpers;
+pub mod poseidon_circuit;
 pub mod spend;
 pub mod stark_deposit;
-pub mod stark_withdraw;
 pub mod stark_spend;
-pub mod batch;
+pub mod stark_withdraw;
+pub mod withdraw;

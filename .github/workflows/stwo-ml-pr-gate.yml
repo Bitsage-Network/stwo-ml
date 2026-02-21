@@ -1,0 +1,95 @@
+name: stwo-ml PR Gate
+
+on:
+  pull_request:
+    paths:
+      - "stwo-ml/**"
+      - "proof-stream/**"
+      - "stwo/**"
+      - ".github/workflows/stwo-ml-pr-gate.yml"
+
+concurrency:
+  group: pr-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Manifest & Compile
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: stwo-ml
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: stwo-ml
+
+      - name: Manifest Validation
+        run: cargo metadata --no-deps --format-version 1 > /dev/null
+
+      - name: Check lib (default features)
+        run: cargo check --lib
+
+      - name: Check lib (audit)
+        run: cargo check --lib --features audit
+
+      - name: Check lib (cli + audit)
+        run: cargo check --lib --features "cli,audit"
+
+      - name: Check lib (server + cli + audit)
+        run: cargo check --lib --features "server,cli,audit"
+
+  fmt:
+    name: Formatting
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: stwo-ml
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable (for rustfmt)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo +stable fmt --check
+
+  test:
+    name: Core Tests
+    needs: check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: stwo-ml
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: stwo-ml
+
+      - name: Run lib tests (default)
+        run: cargo test --lib -- --test-threads=2
+
+      - name: Run lib tests (audit)
+        run: cargo test --lib --features audit -- --test-threads=2
+
+      - name: Soundness Gates
+        run: |
+          cargo test --lib gkr_soundness_gate_rejects_missing_activation_logup -- --nocapture
+          cargo test --lib gkr_soundness_gate_rejects_missing_weight_openings -- --nocapture

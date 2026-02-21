@@ -4,9 +4,7 @@
 
 use stwo::core::fields::m31::BaseField as M31;
 
-use crate::circuits::batch::{
-    PrivacyBatch, PrivacyBatchProof, prove_privacy_batch, BatchError,
-};
+use crate::circuits::batch::{prove_privacy_batch, BatchError, PrivacyBatch, PrivacyBatchProof};
 use crate::circuits::deposit::DepositWitness;
 use crate::circuits::spend::{InputNoteWitness, OutputNoteWitness, SpendWitness};
 use crate::circuits::withdraw::WithdrawWitness;
@@ -222,11 +220,8 @@ impl TxBuilder {
                     new_commitments.push((note.commitment(), note.clone()));
 
                     // Encrypt memo using recipient's viewing key
-                    let memo = build_encrypted_memo(
-                        &note,
-                        recipient_pubkey,
-                        recipient_viewing_key,
-                    )?;
+                    let memo =
+                        build_encrypted_memo(&note, recipient_pubkey, recipient_viewing_key)?;
                     memos.push(memo);
 
                     deposits.push(witness);
@@ -286,11 +281,8 @@ impl TxBuilder {
 
                     // Change note → sender (encrypted with sender's viewing key)
                     let sender_pk = input_notes[0].0.owner_pubkey;
-                    let memo_change = build_encrypted_memo(
-                        &out_notes[1],
-                        &sender_pk,
-                        sender_viewing_key,
-                    )?;
+                    let memo_change =
+                        build_encrypted_memo(&out_notes[1], &sender_pk, sender_viewing_key)?;
                     memos.push(memo_change);
 
                     spends.push(witness);
@@ -448,8 +440,10 @@ fn build_encrypted_memo(
         ),
         recipient_pubkey: format!(
             "0x{:08x}{:08x}{:08x}{:08x}",
-            recipient_pubkey[0].0, recipient_pubkey[1].0,
-            recipient_pubkey[2].0, recipient_pubkey[3].0,
+            recipient_pubkey[0].0,
+            recipient_pubkey[1].0,
+            recipient_pubkey[2].0,
+            recipient_pubkey[3].0,
         ),
     })
 }
@@ -458,13 +452,20 @@ fn build_encrypted_memo(
 
 fn generate_random_blinding() -> Result<[M31; 4], TxBuilderError> {
     let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes)
-        .map_err(|e| TxBuilderError::Rng(format!("{e}")))?;
+    getrandom::getrandom(&mut bytes).map_err(|e| TxBuilderError::Rng(format!("{e}")))?;
     Ok([
-        M31::from_u32_unchecked(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) & 0x7FFFFFFF),
-        M31::from_u32_unchecked(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) & 0x7FFFFFFF),
-        M31::from_u32_unchecked(u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) & 0x7FFFFFFF),
-        M31::from_u32_unchecked(u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) & 0x7FFFFFFF),
+        M31::from_u32_unchecked(
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) & 0x7FFFFFFF,
+        ),
+        M31::from_u32_unchecked(
+            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) & 0x7FFFFFFF,
+        ),
+        M31::from_u32_unchecked(
+            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) & 0x7FFFFFFF,
+        ),
+        M31::from_u32_unchecked(
+            u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) & 0x7FFFFFFF,
+        ),
     ])
 }
 

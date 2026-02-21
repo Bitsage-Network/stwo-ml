@@ -70,14 +70,12 @@ impl ExecutionCheckpoint {
         let cols = extract_usize(&contents, "cols")?;
 
         // Extract data array
-        let data_start = contents
-            .find("\"data\":[")
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "missing data field"))?
-            + 8;
-        let data_end = contents[data_start..]
-            .find(']')
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "unclosed data array"))?
-            + data_start;
+        let data_start = contents.find("\"data\":[").ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "missing data field")
+        })? + 8;
+        let data_end = contents[data_start..].find(']').ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "unclosed data array")
+        })? + data_start;
 
         let data_str = &contents[data_start..data_end];
         let data: Vec<u32> = if data_str.is_empty() {
@@ -87,7 +85,10 @@ impl ExecutionCheckpoint {
                 .split(',')
                 .map(|s| {
                     s.trim().parse::<u32>().map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad u32: {e}"))
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("bad u32: {e}"),
+                        )
                     })
                 })
                 .collect::<std::io::Result<Vec<u32>>>()?
@@ -105,25 +106,21 @@ impl ExecutionCheckpoint {
 /// Extract a usize value from a JSON string by key name.
 fn extract_usize(json: &str, key: &str) -> std::io::Result<usize> {
     let pattern = format!("\"{}\":", key);
-    let start = json
-        .find(&pattern)
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("missing key '{key}'"),
-            )
-        })?
-        + pattern.len();
+    let start = json.find(&pattern).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("missing key '{key}'"),
+        )
+    })? + pattern.len();
 
     let end = json[start..]
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(json.len() - start)
         + start;
 
-    json[start..end]
-        .trim()
-        .parse::<usize>()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad usize: {e}")))
+    json[start..end].trim().parse::<usize>().map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad usize: {e}"))
+    })
 }
 
 #[cfg(test)]

@@ -1891,7 +1891,8 @@ fn run_deposit_command(cmd: &DepositCmd) {
     eprintln!("  Proving batch (1 deposit, 0 withdrawals, 0 spends)...");
 
     let mut builder = TxBuilder::new();
-    builder.deposit(cmd.amount, cmd.asset, recipient_pk, recipient_vk)
+    builder
+        .deposit(cmd.amount, cmd.asset, recipient_pk, recipient_vk)
         .unwrap_or_else(|e| {
             eprintln!("Error: invalid deposit parameters: {e}");
             process::exit(1);
@@ -2108,18 +2109,20 @@ fn run_withdraw_command(cmd: &WithdrawCmd) {
     eprintln!("  credit_recipient: {}", credit_recipient);
 
     let mut builder = TxBuilder::new();
-    builder.withdraw_with_binding(
-        cmd.amount,
-        cmd.asset,
-        note,
-        wallet.spending_key,
-        path,
-        root,
-        withdrawal_binding,
-    ).unwrap_or_else(|e| {
-        eprintln!("Error: invalid withdraw parameters: {e}");
-        process::exit(1);
-    });
+    builder
+        .withdraw_with_binding(
+            cmd.amount,
+            cmd.asset,
+            note,
+            wallet.spending_key,
+            path,
+            root,
+            withdrawal_binding,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("Error: invalid withdraw parameters: {e}");
+            process::exit(1);
+        });
 
     let result = builder.prove().unwrap_or_else(|e| {
         eprintln!("Error: proving failed: {e}");
@@ -2294,21 +2297,23 @@ fn run_transfer_command(cmd: &TransferCmd) {
     eprintln!("  Proving batch (0 deposits, 0 withdrawals, 1 spend)...");
 
     let mut builder = TxBuilder::new();
-    builder.transfer(
-        cmd.amount,
-        cmd.asset,
-        recipient_pk,
-        recipient_vk,
-        wallet.viewing_key,
-        [
-            (note1, wallet.spending_key, path1),
-            (note2, wallet.spending_key, path2),
-        ],
-        root,
-    ).unwrap_or_else(|e| {
-        eprintln!("Error: invalid transfer parameters: {e}");
-        process::exit(1);
-    });
+    builder
+        .transfer(
+            cmd.amount,
+            cmd.asset,
+            recipient_pk,
+            recipient_vk,
+            wallet.viewing_key,
+            [
+                (note1, wallet.spending_key, path1),
+                (note2, wallet.spending_key, path2),
+            ],
+            root,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("Error: invalid transfer parameters: {e}");
+            process::exit(1);
+        });
 
     let result = builder.prove().unwrap_or_else(|e| {
         eprintln!("Error: proving failed: {e}");
@@ -2397,7 +2402,8 @@ fn run_batch_command(cmd: &BatchCmd) {
                     .unwrap_or(wallet.public_key);
                 // Batch deposits use wallet's viewing key (self-deposit).
                 // External deposits in batch mode not yet supported.
-                builder.deposit(entry.amount, entry.asset_id, pk, wallet.viewing_key)
+                builder
+                    .deposit(entry.amount, entry.asset_id, pk, wallet.viewing_key)
                     .unwrap_or_else(|e| {
                         eprintln!("Error: tx[{i}] invalid deposit: {e}");
                         process::exit(1);

@@ -188,12 +188,15 @@ mod tests {
 
     #[test]
     fn test_direct_quantization() {
-        let val = quantize_value(42.0, &QuantParams {
-            strategy: QuantStrategy::Direct,
-            scale: 1.0,
-            zero_point: 0,
-            bits: 31,
-        });
+        let val = quantize_value(
+            42.0,
+            &QuantParams {
+                strategy: QuantStrategy::Direct,
+                scale: 1.0,
+                zero_point: 0,
+                bits: 31,
+            },
+        );
         assert_eq!(val, M31::from(42));
     }
 

@@ -6,14 +6,11 @@
 
 use stwo::core::fields::m31::{BaseField, M31};
 use stwo::core::fields::qm31::SecureField;
-use stwo_constraint_framework::{
-    FrameworkEval, FrameworkComponent,
-    EvalAtRow, RelationEntry,
-};
 use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
+use stwo_constraint_framework::{EvalAtRow, FrameworkComponent, FrameworkEval, RelationEntry};
 
 use crate::gadgets::lookup_table::PrecomputedTable;
-use crate::gadgets::quantize::{QuantParams, dequantize_value, quantize_value, QuantStrategy};
+use crate::gadgets::quantize::{dequantize_value, quantize_value, QuantParams, QuantStrategy};
 
 // Relation type for dequantize lookups: (quantized_input, dequantized_output).
 stwo_constraint_framework::relation!(DequantizeRelation, 2);
@@ -122,9 +119,16 @@ mod tests {
         assert_eq!(table.size(), 16);
 
         // q=7 (zero point) should dequantize to 0
-        let zp_idx = table.inputs.iter().position(|&x| x == M31::from(7)).unwrap();
+        let zp_idx = table
+            .inputs
+            .iter()
+            .position(|&x| x == M31::from(7))
+            .unwrap();
         let deq_val = dequantize_value(M31::from(7), &params);
-        assert!(deq_val.abs() < 1e-6, "zero_point should map to ~0: {deq_val}");
+        assert!(
+            deq_val.abs() < 1e-6,
+            "zero_point should map to ~0: {deq_val}"
+        );
 
         // Table should have 16 distinct input entries
         let unique: std::collections::HashSet<u32> = table.inputs.iter().map(|m| m.0).collect();
@@ -144,7 +148,10 @@ mod tests {
 
         // q=127 (zero point) should map to ~0
         let deq_val = dequantize_value(M31::from(127), &params);
-        assert!(deq_val.abs() < 1e-6, "zero_point should map to ~0: {deq_val}");
+        assert!(
+            deq_val.abs() < 1e-6,
+            "zero_point should map to ~0: {deq_val}"
+        );
     }
 
     #[test]
@@ -160,13 +167,17 @@ mod tests {
 
         for (i, (&inp, &out)) in table.inputs.iter().zip(table.outputs.iter()).enumerate() {
             let expected_f32 = dequantize_value(inp, &params);
-            let expected_m31 = quantize_value(expected_f32, &QuantParams {
-                strategy: QuantStrategy::Direct,
-                scale: 1.0,
-                zero_point: 0,
-                bits: 31,
-            });
-            assert_eq!(out, expected_m31,
+            let expected_m31 = quantize_value(
+                expected_f32,
+                &QuantParams {
+                    strategy: QuantStrategy::Direct,
+                    scale: 1.0,
+                    zero_point: 0,
+                    bits: 31,
+                },
+            );
+            assert_eq!(
+                out, expected_m31,
                 "Table entry {i}: input={}, expected output={}, got={}",
                 inp.0, expected_m31.0, out.0,
             );

@@ -122,10 +122,7 @@ impl PoseidonMerkleTreeM31 {
             current_idx /= 2;
         }
 
-        MerklePath {
-            siblings,
-            index,
-        }
+        MerklePath { siblings, index }
     }
 
     /// Number of leaves inserted.
@@ -341,11 +338,7 @@ mod tests {
         tree.append(make_leaf(4));
 
         // Proof against old root should still be valid
-        assert!(verify_merkle_proof(
-            &root_after_2,
-            &make_leaf(1),
-            &proof_1
-        ));
+        assert!(verify_merkle_proof(&root_after_2, &make_leaf(1), &proof_1));
 
         // But proof against new root should fail (path changed)
         assert!(!verify_merkle_proof(&tree.root(), &make_leaf(1), &proof_1));

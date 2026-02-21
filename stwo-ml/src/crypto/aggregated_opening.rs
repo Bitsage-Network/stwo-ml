@@ -15,12 +15,11 @@
 //!
 //! Result: ~17K felts calldata instead of ~2.4M (160 separate openings).
 
-use crate::crypto::mle_opening::{
-    evaluate_mle_at, prove_mle_opening, verify_mle_opening, MleOpeningProof,
-    MLE_N_QUERIES,
-};
 #[cfg(feature = "cuda-runtime")]
 use crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32;
+use crate::crypto::mle_opening::{
+    evaluate_mle_at, prove_mle_opening, verify_mle_opening, MleOpeningProof, MLE_N_QUERIES,
+};
 use crate::crypto::poseidon_channel::PoseidonChannel;
 
 use num_traits::Zero;
@@ -72,11 +71,7 @@ impl AggregatedBindingConfig {
             MAX_MATRICES
         );
 
-        let n_max = claims
-            .iter()
-            .map(|c| c.local_n_vars)
-            .max()
-            .unwrap_or(0);
+        let n_max = claims.iter().map(|c| c.local_n_vars).max().unwrap_or(0);
 
         // Pad matrix count to power of 2 for clean selector addressing
         let m_padded = claims.len().next_power_of_two();
@@ -328,7 +323,11 @@ fn eval_unified_oracle(
         let mut sel_weight = one;
         for (j, &s_j) in selector.iter().enumerate() {
             let bit_pos = config.selector_bits - 1 - j;
-            let bit_j = if (i >> bit_pos) & 1 == 1 { one } else { SecureField::zero() };
+            let bit_j = if (i >> bit_pos) & 1 == 1 {
+                one
+            } else {
+                SecureField::zero()
+            };
             sel_weight = sel_weight * (s_j * bit_j + (one - s_j) * (one - bit_j));
         }
 
@@ -371,15 +370,16 @@ fn mismatch_sumcheck(
     config: &AggregatedBindingConfig,
     betas: &[SecureField],
     channel: &mut PoseidonChannel,
-) -> (Vec<(SecureField, SecureField, SecureField)>, Vec<SecureField>) {
+) -> (
+    Vec<(SecureField, SecureField, SecureField)>,
+    Vec<SecureField>,
+) {
     let n = config.n_global;
     let one = SecureField::from(M31::from(1));
 
     // Pre-compute global points for each claim
-    let global_points: Vec<Vec<SecureField>> = claims
-        .iter()
-        .map(|c| global_point(c, config))
-        .collect();
+    let global_points: Vec<Vec<SecureField>> =
+        claims.iter().map(|c| global_point(c, config)).collect();
 
     // eq tables: for each claim i, maintain running eq product
     // eq_tables[i] = current partial eq(g_i, t) contribution
@@ -564,7 +564,7 @@ fn eval_round_at_value(
         // Build the full evaluation point
         let mut eval_pt = Vec::with_capacity(n);
         eval_pt.extend_from_slice(challenge_point); // r_0..r_{round-1}
-        eval_pt.push(value);                        // X_round = value
+        eval_pt.push(value); // X_round = value
         eval_pt.extend_from_slice(&gp[round + 1..]); // g_i[round+1:]
 
         let w_at_pt = eval_unified_oracle(&eval_pt, weight_mles, config);
@@ -606,10 +606,7 @@ fn build_virtual_mle(
 /// Layout matches `build_virtual_mle`: `m_padded` slots of `2^n_max` elements each,
 /// but stored as 4 u32 words per QM31 point: `[a0,b0,c0,d0, a1,b1,c1,d1, ...]`.
 #[cfg(any(feature = "cuda-runtime", test))]
-fn build_virtual_mle_u32(
-    weight_mles_u32: &[&[u32]],
-    config: &AggregatedBindingConfig,
-) -> Vec<u32> {
+fn build_virtual_mle_u32(weight_mles_u32: &[&[u32]], config: &AggregatedBindingConfig) -> Vec<u32> {
     let total_size = 1usize << config.n_global;
     let slot_size = 1usize << config.n_max;
 
@@ -654,13 +651,8 @@ pub fn prove_aggregated_binding(
     let betas = draw_beta_weights(channel, claims.len());
 
     // 3. Run mismatch sumcheck
-    let (round_polys, challenge_point) = mismatch_sumcheck(
-        claims,
-        weight_mles,
-        &config,
-        &betas,
-        channel,
-    );
+    let (round_polys, challenge_point) =
+        mismatch_sumcheck(claims, weight_mles, &config, &betas, channel);
 
     // 4. Evaluate oracle at challenge point
     let oracle_eval = eval_unified_oracle(&challenge_point, weight_mles, &config);
@@ -706,13 +698,15 @@ pub fn prove_aggregated_binding_gpu(
         let sf_n_points = sf_mle.len();
         let u32_n_points = u32_mle.len() / 4;
         assert_eq!(
-            sf_n_points, u32_n_points,
+            sf_n_points,
+            u32_n_points,
             "n_vars mismatch at matrix {i}: SecureField MLE has {sf_n_points} points, \
              u32 MLE has {u32_n_points} points ({}  u32 words)",
             u32_mle.len(),
         );
         assert_eq!(
-            u32_mle.len() % 4, 0,
+            u32_mle.len() % 4,
+            0,
             "u32 MLE at matrix {i} has {} words (not a multiple of 4)",
             u32_mle.len(),
         );
@@ -728,13 +722,8 @@ pub fn prove_aggregated_binding_gpu(
     let betas = draw_beta_weights(channel, claims.len());
 
     // 3. Run mismatch sumcheck (CPU, uses SecureField MLEs for sparse evaluation)
-    let (round_polys, challenge_point) = mismatch_sumcheck(
-        claims,
-        weight_mles,
-        &config,
-        &betas,
-        channel,
-    );
+    let (round_polys, challenge_point) =
+        mismatch_sumcheck(claims, weight_mles, &config, &betas, channel);
 
     // 4. Evaluate oracle at challenge point
     let oracle_eval = eval_unified_oracle(&challenge_point, weight_mles, &config);
@@ -742,11 +731,8 @@ pub fn prove_aggregated_binding_gpu(
 
     // 5. Build virtual MLE in u32 format and prove opening with GPU
     let virtual_mle_u32 = build_virtual_mle_u32(weight_mles_u32, &config);
-    let (commitment, opening_proof) = prove_mle_opening_with_commitment_qm31_u32(
-        &virtual_mle_u32,
-        &challenge_point,
-        channel,
-    );
+    let (commitment, opening_proof) =
+        prove_mle_opening_with_commitment_qm31_u32(&virtual_mle_u32, &challenge_point, channel);
 
     // Soundness gate: the GPU tree commitment must equal the super-root.
     // Both are Poseidon Merkle roots over the same data in the same layout —
@@ -803,10 +789,8 @@ pub fn verify_aggregated_binding(
     let betas = draw_beta_weights(channel, claims.len());
 
     // 4. Verify sumcheck
-    let global_points: Vec<Vec<SecureField>> = claims
-        .iter()
-        .map(|c| global_point(c, config))
-        .collect();
+    let global_points: Vec<Vec<SecureField>> =
+        claims.iter().map(|c| global_point(c, config)).collect();
 
     let n = config.n_global;
 
@@ -848,7 +832,8 @@ pub fn verify_aggregated_binding(
     let mut verifier_sum = SecureField::zero();
     for (i, claim) in claims.iter().enumerate() {
         let eq_val = eq_eval(&global_points[i], &challenge_point);
-        verifier_sum = verifier_sum + betas[i] * eq_val * (proof.oracle_eval_at_s - claim.expected_value);
+        verifier_sum =
+            verifier_sum + betas[i] * eq_val * (proof.oracle_eval_at_s - claim.expected_value);
     }
 
     if current_sum != verifier_sum {
@@ -911,8 +896,14 @@ mod tests {
         use rand::Rng;
         let mut rng = rand::thread_rng();
         QM31(
-            CM31(M31::from(rng.gen_range(0..((1u64 << 31) - 1) as u32)), M31::from(rng.gen_range(0..((1u64 << 31) - 1) as u32))),
-            CM31(M31::from(rng.gen_range(0..((1u64 << 31) - 1) as u32)), M31::from(rng.gen_range(0..((1u64 << 31) - 1) as u32))),
+            CM31(
+                M31::from(rng.gen_range(0..((1u64 << 31) - 1) as u32)),
+                M31::from(rng.gen_range(0..((1u64 << 31) - 1) as u32)),
+            ),
+            CM31(
+                M31::from(rng.gen_range(0..((1u64 << 31) - 1) as u32)),
+                M31::from(rng.gen_range(0..((1u64 << 31) - 1) as u32)),
+            ),
         )
     }
 
@@ -920,10 +911,7 @@ mod tests {
         (0..1 << n_vars).map(|_| random_qm31()).collect()
     }
 
-    fn make_claim(
-        matrix_index: usize,
-        mle: &[SecureField],
-    ) -> AggregatedWeightClaim {
+    fn make_claim(matrix_index: usize, mle: &[SecureField]) -> AggregatedWeightClaim {
         let n_vars = mle.len().trailing_zeros() as usize;
         let eval_point: Vec<SecureField> = (0..n_vars).map(|_| random_qm31()).collect();
         let expected_value = evaluate_mle_at(mle, &eval_point);
@@ -1098,7 +1086,10 @@ mod tests {
         let dense_val = evaluate_mle_at(&virtual_mle, &point);
         let sparse_val = eval_unified_oracle(&point, &weight_mles, &config);
 
-        assert_eq!(dense_val, sparse_val, "sparse and dense oracle evaluation should match");
+        assert_eq!(
+            dense_val, sparse_val,
+            "sparse and dense oracle evaluation should match"
+        );
     }
 
     #[test]
@@ -1179,10 +1170,26 @@ mod tests {
         // Verify per-element data consistency
         for (i, &sf) in virtual_sf.iter().enumerate() {
             let QM31(CM31(a, b), CM31(c, d)) = sf;
-            assert_eq!(virtual_u32[i * 4], a.0, "mismatch at element {i}, component a");
-            assert_eq!(virtual_u32[i * 4 + 1], b.0, "mismatch at element {i}, component b");
-            assert_eq!(virtual_u32[i * 4 + 2], c.0, "mismatch at element {i}, component c");
-            assert_eq!(virtual_u32[i * 4 + 3], d.0, "mismatch at element {i}, component d");
+            assert_eq!(
+                virtual_u32[i * 4],
+                a.0,
+                "mismatch at element {i}, component a"
+            );
+            assert_eq!(
+                virtual_u32[i * 4 + 1],
+                b.0,
+                "mismatch at element {i}, component b"
+            );
+            assert_eq!(
+                virtual_u32[i * 4 + 2],
+                c.0,
+                "mismatch at element {i}, component c"
+            );
+            assert_eq!(
+                virtual_u32[i * 4 + 3],
+                d.0,
+                "mismatch at element {i}, component d"
+            );
         }
 
         // Verify commitment roots match
@@ -1380,11 +1387,7 @@ mod tests {
         // Slot 1: entries from mle1 (at offset slot_u32_size)
         for i in 0..mle1.len() {
             let QM31(CM31(a, _), CM31(_, _)) = mle1[i];
-            assert_eq!(
-                virt[slot_u32_size + i * 4],
-                a.0,
-                "slot 1 data at index {i}",
-            );
+            assert_eq!(virt[slot_u32_size + i * 4], a.0, "slot 1 data at index {i}",);
         }
 
         // Gap between slots should be zero

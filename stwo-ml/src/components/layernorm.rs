@@ -10,14 +10,12 @@
 
 use stwo::core::fields::m31::{BaseField, M31};
 use stwo::core::fields::qm31::SecureField;
-use stwo::prover::poly::circle::CircleEvaluation;
-use stwo::prover::poly::BitReversedOrder;
 use stwo::core::poly::circle::CanonicCoset;
 use stwo::prover::backend::{Col, Column, ColumnOps};
-use stwo_constraint_framework::{
-    FrameworkEval, FrameworkComponent, EvalAtRow, RelationEntry,
-};
+use stwo::prover::poly::circle::CircleEvaluation;
+use stwo::prover::poly::BitReversedOrder;
 use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
+use stwo_constraint_framework::{EvalAtRow, FrameworkComponent, FrameworkEval, RelationEntry};
 
 use crate::gadgets::lookup_table::PrecomputedTable;
 
@@ -41,7 +39,11 @@ pub struct LayerNormConfig {
 
 impl LayerNormConfig {
     pub fn new(dim: usize) -> Self {
-        Self { dim, rsqrt_table_log_size: 16, epsilon: 1 }
+        Self {
+            dim,
+            rsqrt_table_log_size: 16,
+            epsilon: 1,
+        }
     }
 }
 
@@ -137,7 +139,14 @@ pub fn generate_layernorm_trace<B: ColumnOps<BaseField>>(
     let size = 1usize << log_size;
     let domain = CanonicCoset::new(log_size).circle_domain();
 
-    let cols_data: Vec<&[M31]> = vec![inputs, means, variances, rsqrt_vals, outputs, multiplicities];
+    let cols_data: Vec<&[M31]> = vec![
+        inputs,
+        means,
+        variances,
+        rsqrt_vals,
+        outputs,
+        multiplicities,
+    ];
     let mut result = Vec::with_capacity(6);
 
     for data in cols_data {
@@ -182,7 +191,13 @@ mod tests {
         let mults = vec![M31::from(1); n];
 
         let trace = generate_layernorm_trace::<SimdBackend>(
-            &inputs, &means, &variances, &rsqrt_vals, &outputs, &mults, 4,
+            &inputs,
+            &means,
+            &variances,
+            &rsqrt_vals,
+            &outputs,
+            &mults,
+            4,
         );
         assert_eq!(trace.len(), 6);
     }

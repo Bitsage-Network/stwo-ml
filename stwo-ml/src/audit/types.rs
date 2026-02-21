@@ -175,7 +175,6 @@ pub struct InferenceProofResult {
     pub proving_time_ms: u64,
 
     // ── Proof calldata (populated by GKR/Direct pipelines) ──────────
-
     /// Serialized GKR or combined proof calldata (hex felt252 strings).
     /// Empty for Legacy mode.
     #[serde(default)]
@@ -226,9 +225,7 @@ pub enum VerificationCalldata {
         per_inference: Vec<GkrInferenceCalldata>,
     },
     /// Direct mode: per-inference combined calldata for `verify_model_direct()`.
-    Direct {
-        per_inference: Vec<Vec<String>>,
-    },
+    Direct { per_inference: Vec<Vec<String>> },
 }
 
 /// Result of batch audit proving over a time window.
@@ -313,9 +310,9 @@ pub struct AuditSemanticSummary {
     pub avg_quality_score: f32,
     /// Score distribution.
     pub excellent_count: u32, // 0.9 - 1.0
-    pub good_count: u32,      // 0.7 - 0.9
-    pub fair_count: u32,      // 0.5 - 0.7
-    pub poor_count: u32,      // 0.0 - 0.5
+    pub good_count: u32, // 0.7 - 0.9
+    pub fair_count: u32, // 0.5 - 0.7
+    pub poor_count: u32, // 0.0 - 0.5
     /// Deterministic check totals.
     pub deterministic_pass: u32,
     pub deterministic_fail: u32,
@@ -600,7 +597,9 @@ pub enum EncryptionError {
 pub enum AuditError {
     #[error("Log error: {0}")]
     LogError(String),
-    #[error("Replay mismatch at sequence {sequence}: expected io_commitment {expected}, got {actual}")]
+    #[error(
+        "Replay mismatch at sequence {sequence}: expected io_commitment {expected}, got {actual}"
+    )]
     ReplayMismatch {
         sequence: u64,
         expected: String,
@@ -613,7 +612,10 @@ pub enum AuditError {
     #[error("No inferences in window [{start}..{end}]")]
     EmptyWindow { start: u64, end: u64 },
     #[error("Weight commitment mismatch: log has {log_value}, model has {model_value}")]
-    WeightMismatch { log_value: String, model_value: String },
+    WeightMismatch {
+        log_value: String,
+        model_value: String,
+    },
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("Serialization error: {0}")]

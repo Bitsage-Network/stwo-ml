@@ -31,18 +31,18 @@
 //! assert!(verify_poseidon2_batch(&proof, &inputs, &outputs, &mut v_channel).is_ok());
 //! ```
 
+use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField as M31;
 use stwo::core::fields::qm31::QM31;
 use stwo::core::fields::FieldExpOps;
-use num_traits::{One, Zero};
 
+use crate::components::matmul::RoundPoly;
 use crate::crypto::poseidon2_m31::{
-    poseidon2_permutation, apply_external_round_matrix, apply_internal_round_matrix,
-    get_round_constants, INTERNAL_DIAG_U32,
-    STATE_WIDTH, N_HALF_FULL_ROUNDS, N_PARTIAL_ROUNDS, N_FULL_ROUNDS,
+    apply_external_round_matrix, apply_internal_round_matrix, get_round_constants,
+    poseidon2_permutation, INTERNAL_DIAG_U32, N_FULL_ROUNDS, N_HALF_FULL_ROUNDS, N_PARTIAL_ROUNDS,
+    STATE_WIDTH,
 };
 use crate::crypto::poseidon_channel::PoseidonChannel;
-use crate::components::matmul::RoundPoly;
 use crate::gkr::types::RoundPolyDeg3;
 
 pub type SecureField = QM31;
@@ -104,7 +104,11 @@ pub struct Poseidon2BatchProof {
 #[derive(Debug, thiserror::Error)]
 pub enum Poseidon2Error {
     #[error("sumcheck failed at round {round}, step {step}: {reason}")]
-    SumcheckFailed { round: usize, step: String, reason: String },
+    SumcheckFailed {
+        round: usize,
+        step: String,
+        reason: String,
+    },
 
     #[error("final check failed at round {round}: {reason}")]
     FinalCheckFailed { round: usize, reason: String },
@@ -142,7 +146,10 @@ pub struct Poseidon2Trace {
 /// Generate the complete execution trace for N parallel Poseidon2 permutations.
 pub fn generate_trace(inputs: &[[M31; STATE_WIDTH]]) -> Poseidon2Trace {
     let n = inputs.len();
-    assert!(n > 0 && n.is_power_of_two(), "batch size must be a positive power of 2");
+    assert!(
+        n > 0 && n.is_power_of_two(),
+        "batch size must be a positive power of 2"
+    );
     let rc = get_round_constants();
 
     let mut states = Vec::with_capacity(N_ROUNDS + 1);
@@ -159,8 +166,7 @@ pub fn generate_trace(inputs: &[[M31; STATE_WIDTH]]) -> Poseidon2Trace {
 
     // First half: 4 full rounds
     for round in 0..N_HALF_FULL_ROUNDS {
-        let (next, aa, sq, ft, fifth, asbox) =
-            execute_full_round(&current, &rc.external[round]);
+        let (next, aa, sq, ft, fifth, asbox) = execute_full_round(&current, &rc.external[round]);
         states.push(next.clone());
         after_adds.push(aa);
         x2s.push(sq);
@@ -174,8 +180,7 @@ pub fn generate_trace(inputs: &[[M31; STATE_WIDTH]]) -> Poseidon2Trace {
 
     // Partial rounds: 14 rounds
     for round in 0..N_PARTIAL_ROUNDS {
-        let (next, aa, sq, ft, fifth, asbox) =
-            execute_partial_round(&current, rc.internal[round]);
+        let (next, aa, sq, ft, fifth, asbox) = execute_partial_round(&current, rc.internal[round]);
         states.push(next.clone());
         after_adds.push(aa);
         x2s.push(sq);
@@ -190,8 +195,7 @@ pub fn generate_trace(inputs: &[[M31; STATE_WIDTH]]) -> Poseidon2Trace {
     // Second half: 4 full rounds
     for round in 0..N_HALF_FULL_ROUNDS {
         let rc_idx = round + N_HALF_FULL_ROUNDS;
-        let (next, aa, sq, ft, fifth, asbox) =
-            execute_full_round(&current, &rc.external[rc_idx]);
+        let (next, aa, sq, ft, fifth, asbox) = execute_full_round(&current, &rc.external[rc_idx]);
         states.push(next.clone());
         after_adds.push(aa);
         x2s.push(sq);
@@ -204,7 +208,15 @@ pub fn generate_trace(inputs: &[[M31; STATE_WIDTH]]) -> Poseidon2Trace {
     }
 
     Poseidon2Trace {
-        n, states, after_adds, x2s, x4s, x5s, after_sboxes, is_full, rc_indices,
+        n,
+        states,
+        after_adds,
+        x2s,
+        x4s,
+        x5s,
+        after_sboxes,
+        is_full,
+        rc_indices,
     }
 }
 
@@ -333,10 +345,7 @@ fn flatten_states(states: &[[M31; STATE_WIDTH]]) -> Vec<SecureField> {
 
 /// Flatten N values (element-0 only) into a single vector.
 fn flatten_elem0(states: &[[M31; STATE_WIDTH]]) -> Vec<SecureField> {
-    states
-        .iter()
-        .map(|s| SecureField::from(s[0]))
-        .collect()
+    states.iter().map(|s| SecureField::from(s[0])).collect()
 }
 
 /// Evaluate MLE at a point. evals[i] = f(binary_repr(i)).
@@ -434,7 +443,11 @@ fn build_internal_matrix_mle() -> Vec<SecureField> {
 }
 
 /// Evaluate M(r_row, r_col) for a 16×16 matrix stored as flat MLE.
-fn eval_matrix_mle(matrix_flat: &[SecureField], r_row: &[SecureField], r_col: &[SecureField]) -> SecureField {
+fn eval_matrix_mle(
+    matrix_flat: &[SecureField],
+    r_row: &[SecureField],
+    r_col: &[SecureField],
+) -> SecureField {
     assert_eq!(r_row.len(), LOG_STATE);
     assert_eq!(r_col.len(), LOG_STATE);
     // Matrix MLE: Ṽ_M(r_row, r_col) = Σ_{i,j} eq(r_row,i) eq(r_col,j) M[i][j]
@@ -524,7 +537,10 @@ fn prove_linear_sumcheck(
         // Lagrange interpolation: p(t) = c0 + c1*t + c2*t²
         let inv2 = two.inverse();
         let c0 = s0;
-        let c1 = (SecureField::from(M31::from(4u32)) * s1 - s2 - SecureField::from(M31::from(3u32)) * s0) * inv2;
+        let c1 = (SecureField::from(M31::from(4u32)) * s1
+            - s2
+            - SecureField::from(M31::from(3u32)) * s0)
+            * inv2;
         let c2 = (s2 - SecureField::from(M31::from(2u32)) * s1 + s0) * inv2;
 
         let rp = RoundPoly { c0, c1, c2 };
@@ -609,7 +625,12 @@ fn prove_mul_eq_sumcheck(
     claimed_sum: SecureField,
     tag: u64,
     channel: &mut PoseidonChannel,
-) -> (Vec<RoundPolyDeg3>, Vec<SecureField>, SecureField, SecureField) {
+) -> (
+    Vec<RoundPolyDeg3>,
+    Vec<SecureField>,
+    SecureField,
+    SecureField,
+) {
     let n = a_evals.len();
     assert_eq!(n, b_evals.len());
     assert!(n.is_power_of_two());
@@ -740,7 +761,10 @@ fn prove_combination_sumcheck(
 
         let inv2 = two.inverse();
         let c0 = s0;
-        let c1 = (SecureField::from(M31::from(4u32)) * s1 - s2 - SecureField::from(M31::from(3u32)) * s0) * inv2;
+        let c1 = (SecureField::from(M31::from(4u32)) * s1
+            - s2
+            - SecureField::from(M31::from(3u32)) * s0)
+            * inv2;
         let c2 = (s2 - SecureField::from(M31::from(2u32)) * s1 + s0) * inv2;
 
         let rp = RoundPoly { c0, c1, c2 };
@@ -811,15 +835,14 @@ pub fn prove_poseidon2_batch(
 
         // ── Step 1: Linear layer sumcheck ──
         let sbox_out_flat = flatten_states(&trace.after_sboxes[round_idx]);
-        let (linear_polys, lin_challenges, sbox_out_eval) =
-            prove_linear_sumcheck(
-                matrix,
-                &sbox_out_flat,
-                &r_inst,
-                &r_elem,
-                current_value,
-                channel,
-            );
+        let (linear_polys, lin_challenges, sbox_out_eval) = prove_linear_sumcheck(
+            matrix,
+            &sbox_out_flat,
+            &r_inst,
+            &r_elem,
+            current_value,
+            channel,
+        );
 
         // New element point after linear layer sumcheck
         let r_elem_new = lin_challenges.clone();
@@ -837,34 +860,33 @@ pub fn prove_poseidon2_batch(
             sbox_point.extend_from_slice(&r_elem_new);
 
             // ── Step 2: x5 = x4 · after_add at sbox_point ──
-            let (mul3_polys, mul3_ch, x4_eval, aa_eval_1) =
-                prove_mul_eq_sumcheck(
-                    &x4_flat, &after_add_flat,
-                    &sbox_point, sbox_out_eval,
-                    0x4D5533, // "MU3"
-                    channel,
-                );
+            let (mul3_polys, mul3_ch, x4_eval, aa_eval_1) = prove_mul_eq_sumcheck(
+                &x4_flat,
+                &after_add_flat,
+                &sbox_point,
+                sbox_out_eval,
+                0x4D5533, // "MU3"
+                channel,
+            );
             // After mul3: x4_eval = x4(mul3_ch), aa_eval_1 = aa(mul3_ch)
 
             // ── Step 3: x4 = x2² at mul3_ch ──
             let x2_flat = flatten_states(&trace.x2s[round_idx]);
-            let (mul2_polys, mul2_ch, x2_eval, _x2_eval_dup) =
-                prove_mul_eq_sumcheck(
-                    &x2_flat, &x2_flat,
-                    &mul3_ch, x4_eval,
-                    0x4D5532, // "MU2"
-                    channel,
-                );
+            let (mul2_polys, mul2_ch, x2_eval, _x2_eval_dup) = prove_mul_eq_sumcheck(
+                &x2_flat, &x2_flat, &mul3_ch, x4_eval, 0x4D5532, // "MU2"
+                channel,
+            );
             // After mul2: x2_eval = x2(mul2_ch)
 
             // ── Step 4: x2 = after_add² at mul2_ch ──
-            let (mul1_polys, mul1_ch, aa_eval_2, _aa_eval_2_dup) =
-                prove_mul_eq_sumcheck(
-                    &after_add_flat, &after_add_flat,
-                    &mul2_ch, x2_eval,
-                    0x4D5531, // "MU1"
-                    channel,
-                );
+            let (mul1_polys, mul1_ch, aa_eval_2, _aa_eval_2_dup) = prove_mul_eq_sumcheck(
+                &after_add_flat,
+                &after_add_flat,
+                &mul2_ch,
+                x2_eval,
+                0x4D5531, // "MU1"
+                channel,
+            );
             // After mul1: aa_eval_2 = aa(mul1_ch)
 
             // ── Step 5: Combination sumcheck for dual after_add claims ──
@@ -875,13 +897,14 @@ pub fn prove_poseidon2_batch(
             // Two claims on after_add at different points:
             //   aa(mul3_ch) = aa_eval_1  (from mul3)
             //   aa(mul1_ch) = aa_eval_2  (from mul1)
-            let (combine_polys, cmb_ch, combined_eval) =
-                prove_combination_sumcheck(
-                    &after_add_flat,
-                    &mul3_ch, aa_eval_1,
-                    &mul1_ch, aa_eval_2,
-                    channel,
-                );
+            let (combine_polys, cmb_ch, combined_eval) = prove_combination_sumcheck(
+                &after_add_flat,
+                &mul3_ch,
+                aa_eval_1,
+                &mul1_ch,
+                aa_eval_2,
+                channel,
+            );
 
             // Resolve after_add → state by subtracting round constants
             // combined_eval is after_add at the combination challenges (cmb_ch)
@@ -946,8 +969,10 @@ pub fn prove_poseidon2_batch(
             let eq_0 = eval_eq_zero(&r_elem_new);
             let expected = after_add_eval + eq_0 * (x5_0_eval - after_add_0_eval);
             debug_assert!(
-                (sbox_out_eval - expected).0.0.0 == 0 && (sbox_out_eval - expected).0.1.0 == 0
-                && (sbox_out_eval - expected).1.0.0 == 0 && (sbox_out_eval - expected).1.1.0 == 0,
+                (sbox_out_eval - expected).0 .0 .0 == 0
+                    && (sbox_out_eval - expected).0 .1 .0 == 0
+                    && (sbox_out_eval - expected).1 .0 .0 == 0
+                    && (sbox_out_eval - expected).1 .1 .0 == 0,
                 "partial round decomposition mismatch"
             );
 
@@ -956,33 +981,30 @@ pub fn prove_poseidon2_batch(
             let x2_0_flat = flatten_elem0(&trace.x2s[round_idx]);
 
             // x5_0 = x4_0 · after_add_0 at r_inst
-            let (mul3_polys, mul3_ch, x4_eval, aa0_eval_from_mul3) =
-                prove_mul_eq_sumcheck(
-                    &x4_0_flat, &after_add_0_flat,
-                    &r_inst, x5_0_eval,
-                    0x4D5533,
-                    channel,
-                );
+            let (mul3_polys, mul3_ch, x4_eval, aa0_eval_from_mul3) = prove_mul_eq_sumcheck(
+                &x4_0_flat,
+                &after_add_0_flat,
+                &r_inst,
+                x5_0_eval,
+                0x4D5533,
+                channel,
+            );
             // After mul3: x4_eval = x4_0(mul3_ch), aa0_eval = aa_0(mul3_ch)
 
             // x4_0 = x2_0² at mul3_ch
             let (mul2_polys, mul2_ch, x2_eval, _) =
-                prove_mul_eq_sumcheck(
-                    &x2_0_flat, &x2_0_flat,
-                    &mul3_ch, x4_eval,
-                    0x4D5532,
-                    channel,
-                );
+                prove_mul_eq_sumcheck(&x2_0_flat, &x2_0_flat, &mul3_ch, x4_eval, 0x4D5532, channel);
             // After mul2: x2_eval = x2_0(mul2_ch)
 
             // x2_0 = after_add_0² at mul2_ch
-            let (mul1_polys, _mul1_ch, aa0_eval_from_mul1, _) =
-                prove_mul_eq_sumcheck(
-                    &after_add_0_flat, &after_add_0_flat,
-                    &mul2_ch, x2_eval,
-                    0x4D5531,
-                    channel,
-                );
+            let (mul1_polys, _mul1_ch, aa0_eval_from_mul1, _) = prove_mul_eq_sumcheck(
+                &after_add_0_flat,
+                &after_add_0_flat,
+                &mul2_ch,
+                x2_eval,
+                0x4D5531,
+                channel,
+            );
             // After mul1: aa0_eval_from_mul1 = aa_0(mul1_ch)
 
             // Combination: merge claims on after_add (full N×16 MLE)
@@ -993,13 +1015,14 @@ pub fn prove_poseidon2_batch(
             let mut point_2 = r_inst.clone();
             point_2.extend(vec![SecureField::zero(); LOG_STATE]);
 
-            let (combine_polys, cmb_ch, combined_eval) =
-                prove_combination_sumcheck(
-                    &after_add_flat,
-                    &full_point, after_add_eval,
-                    &point_2, after_add_0_eval,
-                    channel,
-                );
+            let (combine_polys, cmb_ch, combined_eval) = prove_combination_sumcheck(
+                &after_add_flat,
+                &full_point,
+                after_add_eval,
+                &point_2,
+                after_add_0_eval,
+                channel,
+            );
 
             // Resolve after_add → state using combination challenges as the point
             let rc = get_round_constants();
@@ -1053,7 +1076,9 @@ pub fn verify_poseidon2_batch(
 ) -> Result<(), Poseidon2Error> {
     let n = inputs.len();
     if !n.is_power_of_two() || n == 0 {
-        return Err(Poseidon2Error::InputMismatch("batch size must be positive power of 2".into()));
+        return Err(Poseidon2Error::InputMismatch(
+            "batch size must be positive power of 2".into(),
+        ));
     }
     let log_n = n.ilog2() as usize;
     let total_vars = log_n + LOG_STATE;
@@ -1104,9 +1129,7 @@ pub fn verify_poseidon2_batch(
 
         // The remaining verification differs for full vs partial rounds
         if is_full {
-            let cmb_ch = verify_full_round_sbox(
-                rp, &r_inst, &sbox_point, round_idx, channel,
-            )?;
+            let cmb_ch = verify_full_round_sbox(rp, &r_inst, &sbox_point, round_idx, channel)?;
 
             // Resolve after_add → state using combination challenges
             let rc_idx = if round_idx < N_HALF_FULL_ROUNDS {
@@ -1123,9 +1146,8 @@ pub fn verify_poseidon2_batch(
             current_point = cmb_ch;
             current_value = state_eval;
         } else {
-            let cmb_ch = verify_partial_round_sbox(
-                rp, &r_inst, &r_elem_new, log_n, round_idx, channel,
-            )?;
+            let cmb_ch =
+                verify_partial_round_sbox(rp, &r_inst, &r_elem_new, log_n, round_idx, channel)?;
 
             // Resolve after_add → state using combination challenges
             let rc_internal = rc.internal[round_idx - N_HALF_FULL_ROUNDS];
@@ -1386,8 +1408,10 @@ fn verify_full_round_sbox(
     // Claim B: after_add at mul1_ch = aa_eval_from_mul1
     let cmb_ch = verify_combination_sumcheck(
         &rp.combine_polys,
-        &mul3_ch, rp.after_add_eval_from_mul3,
-        &mul1_ch, rp.after_add_eval_from_mul1,
+        &mul3_ch,
+        rp.after_add_eval_from_mul3,
+        &mul1_ch,
+        rp.after_add_eval_from_mul1,
         rp.combined_eval,
         round_idx,
         channel,
@@ -1405,18 +1429,24 @@ fn verify_partial_round_sbox(
     channel: &mut PoseidonChannel,
 ) -> Result<Vec<SecureField>, Poseidon2Error> {
     // For partial rounds, S-box mul checks operate on element-0 only (log_n variables).
-    let x5_0_eval = rp.partial_x5_0_eval.ok_or_else(|| Poseidon2Error::FinalCheckFailed {
-        round: round_idx,
-        reason: "missing partial_x5_0_eval".into(),
-    })?;
-    let after_add_eval = rp.partial_after_add_eval.ok_or_else(|| Poseidon2Error::FinalCheckFailed {
-        round: round_idx,
-        reason: "missing partial_after_add_eval".into(),
-    })?;
-    let after_add_0_eval = rp.partial_after_add_0_eval.ok_or_else(|| Poseidon2Error::FinalCheckFailed {
-        round: round_idx,
-        reason: "missing partial_after_add_0_eval".into(),
-    })?;
+    let x5_0_eval = rp
+        .partial_x5_0_eval
+        .ok_or_else(|| Poseidon2Error::FinalCheckFailed {
+            round: round_idx,
+            reason: "missing partial_x5_0_eval".into(),
+        })?;
+    let after_add_eval =
+        rp.partial_after_add_eval
+            .ok_or_else(|| Poseidon2Error::FinalCheckFailed {
+                round: round_idx,
+                reason: "missing partial_after_add_eval".into(),
+            })?;
+    let after_add_0_eval =
+        rp.partial_after_add_0_eval
+            .ok_or_else(|| Poseidon2Error::FinalCheckFailed {
+                round: round_idx,
+                reason: "missing partial_after_add_0_eval".into(),
+            })?;
 
     // Verify decomposition: sbox_out_eval = after_add_eval + eq_0 * (x5_0_eval - after_add_0_eval)
     let eq_0 = eval_eq_zero(r_elem_new);
@@ -1478,8 +1508,10 @@ fn verify_partial_round_sbox(
     point_2.extend(vec![SecureField::zero(); LOG_STATE]);
     let cmb_ch = verify_combination_sumcheck(
         &rp.combine_polys,
-        &full_point, after_add_eval,
-        &point_2, after_add_0_eval,
+        &full_point,
+        after_add_eval,
+        &point_2,
+        after_add_0_eval,
         rp.combined_eval,
         round_idx,
         channel,
@@ -1548,9 +1580,15 @@ mod tests {
         assert_eq!(trace.is_full.len(), N_ROUNDS);
 
         // First 4 rounds are full, next 14 partial, last 4 full
-        for i in 0..4 { assert!(trace.is_full[i], "round {} should be full", i); }
-        for i in 4..18 { assert!(!trace.is_full[i], "round {} should be partial", i); }
-        for i in 18..22 { assert!(trace.is_full[i], "round {} should be full", i); }
+        for i in 0..4 {
+            assert!(trace.is_full[i], "round {} should be full", i);
+        }
+        for i in 4..18 {
+            assert!(!trace.is_full[i], "round {} should be partial", i);
+        }
+        for i in 18..22 {
+            assert!(trace.is_full[i], "round {} should be full", i);
+        }
     }
 
     #[test]
@@ -1564,8 +1602,7 @@ mod tests {
         // The MLE at (i, 0) should give M[i][0] = e0[i]
         for i in 0..STATE_WIDTH {
             let val = matrix[i * STATE_WIDTH + 0];
-            assert_eq!(val, SecureField::from(e0[i]),
-                "M_ext[{}][0] mismatch", i);
+            assert_eq!(val, SecureField::from(e0[i]), "M_ext[{}][0] mismatch", i);
         }
     }
 
@@ -1582,7 +1619,9 @@ mod tests {
                 assert_eq!(
                     matrix[i * STATE_WIDTH + j],
                     SecureField::from(expected),
-                    "M_int[{}][{}] mismatch", i, j,
+                    "M_int[{}][{}] mismatch",
+                    i,
+                    j,
                 );
             }
         }
@@ -1665,9 +1704,8 @@ mod tests {
         let output_eval = evaluate_mle(&output_flat, &r_elem);
 
         let mut p_channel = PoseidonChannel::default();
-        let (polys, challenges, x5_eval) = prove_linear_sumcheck(
-            &matrix, &x5_flat, &[], &r_elem, output_eval, &mut p_channel,
-        );
+        let (polys, challenges, x5_eval) =
+            prove_linear_sumcheck(&matrix, &x5_flat, &[], &r_elem, output_eval, &mut p_channel);
 
         assert_eq!(polys.len(), LOG_STATE);
 
@@ -1680,8 +1718,12 @@ mod tests {
     fn test_mul_eq_sumcheck_simple() {
         // Prove c = a · b for simple arrays
         let n = 4;
-        let a: Vec<SecureField> = (1..=n).map(|i| SecureField::from(M31::from(i as u32))).collect();
-        let b: Vec<SecureField> = (5..5+n).map(|i| SecureField::from(M31::from(i as u32))).collect();
+        let a: Vec<SecureField> = (1..=n)
+            .map(|i| SecureField::from(M31::from(i as u32)))
+            .collect();
+        let b: Vec<SecureField> = (5..5 + n)
+            .map(|i| SecureField::from(M31::from(i as u32)))
+            .collect();
         let c: Vec<SecureField> = a.iter().zip(b.iter()).map(|(&x, &y)| x * y).collect();
 
         let mut channel = PoseidonChannel::default();
@@ -1700,7 +1742,11 @@ mod tests {
         let p_last = polys.last().unwrap();
         let last_ch = challenges.last().unwrap();
         let final_sum = p_last.eval(*last_ch);
-        assert_eq!(final_sum, eq_val * a_eval * b_eval, "mul sumcheck final check");
+        assert_eq!(
+            final_sum,
+            eq_val * a_eval * b_eval,
+            "mul sumcheck final check"
+        );
     }
 
     #[test]
@@ -1713,7 +1759,11 @@ mod tests {
 
         let mut v_channel = PoseidonChannel::default();
         let result = verify_poseidon2_batch(&proof, &inputs, &outputs, &mut v_channel);
-        assert!(result.is_ok(), "verification should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "verification should succeed: {:?}",
+            result.err()
+        );
         assert_eq!(proof.round_proofs.len(), N_ROUNDS);
     }
 
@@ -1728,14 +1778,20 @@ mod tests {
         // Full verify
         let mut v_channel = PoseidonChannel::default();
         let result = verify_poseidon2_batch(&proof, &inputs, &outputs, &mut v_channel);
-        assert!(result.is_ok(), "batch-4 verification should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "batch-4 verification should succeed: {:?}",
+            result.err()
+        );
 
         assert_eq!(proof.round_proofs.len(), N_ROUNDS);
 
         // Verify round types
         for (i, rp) in proof.round_proofs.iter().enumerate() {
             let expected_round = N_ROUNDS - 1 - i;
-            if expected_round < N_HALF_FULL_ROUNDS || expected_round >= N_HALF_FULL_ROUNDS + N_PARTIAL_ROUNDS {
+            if expected_round < N_HALF_FULL_ROUNDS
+                || expected_round >= N_HALF_FULL_ROUNDS + N_PARTIAL_ROUNDS
+            {
                 assert!(rp.is_full_round, "round proof {} should be full", i);
             } else {
                 assert!(!rp.is_full_round, "round proof {} should be partial", i);
@@ -1768,7 +1824,11 @@ mod tests {
 
         let mut v_channel = PoseidonChannel::default();
         let result = verify_poseidon2_batch(&proof, &inputs, &outputs, &mut v_channel);
-        assert!(result.is_ok(), "batch-16 verification should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "batch-16 verification should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -1842,9 +1902,17 @@ mod tests {
             assert_eq!(x4[0], x2[0] * x2[0], "partial x4[{}][0]", i);
             assert_eq!(x5[0], x4[0] * aa[0], "partial x5[{}][0]", i);
             // after_sbox[0] = x5[0], after_sbox[k>0] = aa[k]
-            assert_eq!(trace.after_sboxes[4][i][0], x5[0], "partial after_sbox[{}][0]", i);
+            assert_eq!(
+                trace.after_sboxes[4][i][0], x5[0],
+                "partial after_sbox[{}][0]",
+                i
+            );
             for j in 1..STATE_WIDTH {
-                assert_eq!(trace.after_sboxes[4][i][j], aa[j], "partial after_sbox[{}][{}]", i, j);
+                assert_eq!(
+                    trace.after_sboxes[4][i][j], aa[j],
+                    "partial after_sbox[{}][{}]",
+                    i, j
+                );
             }
         }
     }

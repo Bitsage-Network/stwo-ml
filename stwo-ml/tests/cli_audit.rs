@@ -9,11 +9,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use stwo::core::fields::m31::M31;
 
+use stwo_ml::aggregation::compute_io_commitment;
 use stwo_ml::audit::log::InferenceLog;
 use stwo_ml::audit::orchestrator::run_audit_dry;
 use stwo_ml::audit::replay::execute_forward_pass;
 use stwo_ml::audit::types::{AuditRequest, InferenceLogEntry, ModelInfo};
-use stwo_ml::aggregation::compute_io_commitment;
 use stwo_ml::compiler::onnx::build_mlp_with_weights;
 use stwo_ml::components::activation::ActivationType;
 use stwo_ml::components::matmul::M31Matrix;
@@ -125,7 +125,9 @@ fn test_cli_audit_dry_run_output() {
     };
 
     let bar = |value: u32, max: u32, bw: usize| -> String {
-        if max == 0 { return "\u{2591}".repeat(bw); }
+        if max == 0 {
+            return "\u{2591}".repeat(bw);
+        }
         let filled = ((value as f64 / max as f64) * bw as f64).round() as usize;
         let filled = filled.min(bw);
         let empty = bw - filled;
@@ -139,7 +141,12 @@ fn test_cli_audit_dry_run_output() {
     let pad = inner.saturating_sub(title.len());
     let lpad = pad / 2;
     let rpad = pad - lpad;
-    eprintln!("\u{2551}{}{}{}\u{2551}", " ".repeat(lpad), title, " ".repeat(rpad));
+    eprintln!(
+        "\u{2551}{}{}{}\u{2551}",
+        " ".repeat(lpad),
+        title,
+        " ".repeat(rpad)
+    );
     eprintln!("\u{255a}{}\u{255d}", box_border);
 
     eprintln!();
@@ -151,19 +158,26 @@ fn test_cli_audit_dry_run_output() {
     eprintln!("{}", section("MODEL"));
     eprintln!();
     eprintln!("  {:<56}ID  {}", report.model.name, report.model.model_id);
-    eprintln!("  {} \u{00b7} {} parameters \u{00b7} {} layers",
-        report.model.architecture, report.model.parameters, report.model.layers);
+    eprintln!(
+        "  {} \u{00b7} {} parameters \u{00b7} {} layers",
+        report.model.architecture, report.model.parameters, report.model.layers
+    );
     eprintln!("  Weight  {}", report.model.weight_commitment);
 
     // Time window
     let duration_secs = report.time_window.duration_seconds;
-    let dur_str = if duration_secs < 60 { format!("{}s", duration_secs) }
-        else { format!("{}m {}s", duration_secs / 60, duration_secs % 60) };
+    let dur_str = if duration_secs < 60 {
+        format!("{}s", duration_secs)
+    } else {
+        format!("{}m {}s", duration_secs / 60, duration_secs % 60)
+    };
     eprintln!();
     eprintln!("{}", section_info("TIME WINDOW", &dur_str));
     eprintln!();
-    eprintln!("  {}  \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}  {}",
-        report.time_window.start, report.time_window.end);
+    eprintln!(
+        "  {}  \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}  {}",
+        report.time_window.start, report.time_window.end
+    );
 
     // Inference summary
     let s = &report.inference_summary;
@@ -171,10 +185,18 @@ fn test_cli_audit_dry_run_output() {
     let inf_label = format!("{} inferences", s.total_inferences);
     eprintln!("{}", section_info("INFERENCE SUMMARY", &inf_label));
     eprintln!();
-    eprintln!("  {:<38}Throughput  {:.1} tok/s",
-        format!("Tokens    {} in \u{00b7} {} out", s.total_input_tokens, s.total_output_tokens),
-        s.throughput_tokens_per_sec);
-    let latency_str = format!("Latency   avg {}ms \u{00b7} p95 {}ms", s.avg_latency_ms, s.p95_latency_ms);
+    eprintln!(
+        "  {:<38}Throughput  {:.1} tok/s",
+        format!(
+            "Tokens    {} in \u{00b7} {} out",
+            s.total_input_tokens, s.total_output_tokens
+        ),
+        s.throughput_tokens_per_sec
+    );
+    let latency_str = format!(
+        "Latency   avg {}ms \u{00b7} p95 {}ms",
+        s.avg_latency_ms, s.p95_latency_ms
+    );
     if !s.categories.is_empty() {
         let mut cats: Vec<_> = s.categories.iter().collect();
         cats.sort_by(|a, b| b.1.cmp(a.1));
@@ -184,48 +206,99 @@ fn test_cli_audit_dry_run_output() {
 
     // Semantic evaluation
     if let Some(ref sem) = report.semantic_evaluation {
-        let sem_info = format!("{} \u{00b7} {}/{} checked",
-            sem.method, sem.evaluated_count, s.total_inferences);
+        let sem_info = format!(
+            "{} \u{00b7} {}/{} checked",
+            sem.method, sem.evaluated_count, s.total_inferences
+        );
         eprintln!();
         eprintln!("{}", section_info("SEMANTIC EVALUATION", &sem_info));
         eprintln!();
         eprintln!("  Average Quality   {:.1}%", sem.avg_quality_score * 100.0);
         eprintln!();
 
-        let max_bucket = sem.excellent_count.max(sem.good_count).max(sem.fair_count).max(sem.poor_count).max(1);
+        let max_bucket = sem
+            .excellent_count
+            .max(sem.good_count)
+            .max(sem.fair_count)
+            .max(sem.poor_count)
+            .max(1);
         let bw = 20;
-        eprintln!("  Excellent  {}  {:>3}", bar(sem.excellent_count, max_bucket, bw), sem.excellent_count);
-        eprintln!("  Good       {}  {:>3}", bar(sem.good_count, max_bucket, bw), sem.good_count);
-        eprintln!("  Fair       {}  {:>3}", bar(sem.fair_count, max_bucket, bw), sem.fair_count);
-        eprintln!("  Poor       {}  {:>3}", bar(sem.poor_count, max_bucket, bw), sem.poor_count);
+        eprintln!(
+            "  Excellent  {}  {:>3}",
+            bar(sem.excellent_count, max_bucket, bw),
+            sem.excellent_count
+        );
+        eprintln!(
+            "  Good       {}  {:>3}",
+            bar(sem.good_count, max_bucket, bw),
+            sem.good_count
+        );
+        eprintln!(
+            "  Fair       {}  {:>3}",
+            bar(sem.fair_count, max_bucket, bw),
+            sem.fair_count
+        );
+        eprintln!(
+            "  Poor       {}  {:>3}",
+            bar(sem.poor_count, max_bucket, bw),
+            sem.poor_count
+        );
 
         let det_total = sem.deterministic_pass + sem.deterministic_fail;
         if det_total > 0 {
             let pct = (sem.deterministic_pass as f64 / det_total as f64 * 100.0) as u32;
             eprintln!();
-            eprintln!("  Deterministic   {} pass \u{00b7} {} fail ({}% pass rate)",
-                sem.deterministic_pass, sem.deterministic_fail, pct);
+            eprintln!(
+                "  Deterministic   {} pass \u{00b7} {} fail ({}% pass rate)",
+                sem.deterministic_pass, sem.deterministic_fail, pct
+            );
         }
 
         if !sem.per_inference.is_empty() {
             let show_count = sem.per_inference.len().min(10);
             eprintln!();
-            eprintln!("  Per-Inference ({}/{}):", show_count, sem.per_inference.len());
-            eprintln!("  {:>4}  {:>5}  {:>7}  {:>5}  {}", "#", "Seq", "Score", "Det", "Status");
-            eprintln!("  {:─>4}  {:─>5}  {:─>7}  {:─>5}  {:─>8}", "", "", "", "", "");
+            eprintln!(
+                "  Per-Inference ({}/{}):",
+                show_count,
+                sem.per_inference.len()
+            );
+            eprintln!(
+                "  {:>4}  {:>5}  {:>7}  {:>5}  {}",
+                "#", "Seq", "Score", "Det", "Status"
+            );
+            eprintln!(
+                "  {:─>4}  {:─>5}  {:─>7}  {:─>5}  {:─>8}",
+                "", "", "", "", ""
+            );
 
             for eval in sem.per_inference.iter().take(show_count) {
-                let score_str = eval.semantic_score
+                let score_str = eval
+                    .semantic_score
                     .map(|sc| format!("{:.1}%", sc * 100.0))
                     .unwrap_or_else(|| "\u{2014}".to_string());
-                let det_pass = eval.deterministic_checks.iter().filter(|c| c.passed).count();
+                let det_pass = eval
+                    .deterministic_checks
+                    .iter()
+                    .filter(|c| c.passed)
+                    .count();
                 let det_total = eval.deterministic_checks.len();
                 let status = if eval.deterministic_checks.iter().all(|c| c.passed) {
-                    if eval.evaluation_proved { "proved" } else { "ok" }
-                } else { "FAIL" };
-                eprintln!("  {:>4}  {:>5}  {:>7}  {:>5}  {}",
-                    eval.sequence, eval.sequence, score_str,
-                    format!("{}/{}", det_pass, det_total), status);
+                    if eval.evaluation_proved {
+                        "proved"
+                    } else {
+                        "ok"
+                    }
+                } else {
+                    "FAIL"
+                };
+                eprintln!(
+                    "  {:>4}  {:>5}  {:>7}  {:>5}  {}",
+                    eval.sequence,
+                    eval.sequence,
+                    score_str,
+                    format!("{}/{}", det_pass, det_total),
+                    status
+                );
             }
         }
     }
@@ -237,23 +310,38 @@ fn test_cli_audit_dry_run_output() {
     eprintln!("{}", section("PROOF & INFRASTRUCTURE"));
     eprintln!();
     let proof_str = if proof.proving_time_seconds > 0 {
-        format!("Proof       {} \u{00b7} {}s", proof.mode, proof.proving_time_seconds)
+        format!(
+            "Proof       {} \u{00b7} {}s",
+            proof.mode, proof.proving_time_seconds
+        )
     } else {
         format!("Proof       {}", proof.mode)
     };
     eprintln!("  {:<38}GPU         {}", proof_str, infra.gpu_device);
-    eprintln!("  {:<38}TEE         {}",
+    eprintln!(
+        "  {:<38}TEE         {}",
         format!("Prover      stwo-ml v{}", infra.prover_version),
-        if infra.tee_active { "active" } else { "inactive" });
+        if infra.tee_active {
+            "active"
+        } else {
+            "inactive"
+        }
+    );
 
     // Commitments
     eprintln!();
     eprintln!("{}", section("COMMITMENTS"));
     eprintln!();
     eprintln!("  IO root      {}", report.commitments.io_merkle_root);
-    eprintln!("  Log root     {}", report.commitments.inference_log_merkle_root);
+    eprintln!(
+        "  Log root     {}",
+        report.commitments.inference_log_merkle_root
+    );
     eprintln!("  Weight       {}", report.commitments.weight_commitment);
-    eprintln!("  Chain        {}", report.commitments.combined_chain_commitment);
+    eprintln!(
+        "  Chain        {}",
+        report.commitments.combined_chain_commitment
+    );
     eprintln!("  Report hash  {}", report.commitments.audit_report_hash);
 
     // Inferences
@@ -266,10 +354,15 @@ fn test_cli_audit_dry_run_output() {
         for entry in report.inferences.iter().take(show_count) {
             eprintln!();
             let cat = entry.category.as_deref().unwrap_or("-");
-            let time_short = entry.timestamp.find('T')
+            let time_short = entry
+                .timestamp
+                .find('T')
                 .map(|i| &entry.timestamp[i + 1..entry.timestamp.len().min(i + 9)])
                 .unwrap_or(&entry.timestamp);
-            eprintln!("  #{:<3} {}  {}ms  {}", entry.index, time_short, entry.latency_ms, cat);
+            eprintln!(
+                "  #{:<3} {}  {}ms  {}",
+                entry.index, time_short, entry.latency_ms, cat
+            );
             if let Some(ref preview) = entry.input_preview {
                 eprintln!("       \u{25b8} {}", preview);
             }
@@ -305,7 +398,9 @@ fn test_cli_audit_dry_run_output() {
 
     // Score distribution matches inferences with scores
     let dist_total = sem.excellent_count + sem.good_count + sem.fair_count + sem.poor_count;
-    let scored_count = sem.per_inference.iter()
+    let scored_count = sem
+        .per_inference
+        .iter()
         .filter(|e| e.semantic_score.is_some())
         .count() as u32;
     assert_eq!(dist_total, scored_count);

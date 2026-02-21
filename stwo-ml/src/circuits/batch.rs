@@ -25,28 +25,30 @@ use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::{BackendForChannel, Col, Column, ColumnOps};
 use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
 use stwo::prover::poly::BitReversedOrder;
+use stwo::prover::prove;
 use stwo::prover::CommitmentSchemeProver;
 use stwo::prover::ComponentProver;
-use stwo::prover::prove;
 
+use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 use stwo_constraint_framework::{
     EvalAtRow, FrameworkComponent, FrameworkEval, TraceLocationAllocator,
 };
-use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 
-use crate::circuits::deposit::{DepositPublicInputs, DepositWitness, execute_deposit};
-use crate::circuits::withdraw::{WithdrawPublicInputs, WithdrawWitness, execute_withdraw, MERKLE_DEPTH};
+use crate::circuits::deposit::{execute_deposit, DepositPublicInputs, DepositWitness};
 use crate::circuits::spend::{
-    SpendPublicInputs, SpendWitness, execute_spend,
-    SPEND_NUM_INPUTS, SPEND_NUM_OUTPUTS,
+    execute_spend, SpendPublicInputs, SpendWitness, SPEND_NUM_INPUTS, SPEND_NUM_OUTPUTS,
 };
-use crate::circuits::stark_deposit::{constrain_deposit_wiring, NUM_SUB_LIMBS as DEP_NUM_SUB_LIMBS};
-use crate::circuits::stark_withdraw::constrain_withdraw_wiring;
+use crate::circuits::stark_deposit::{
+    constrain_deposit_wiring, NUM_SUB_LIMBS as DEP_NUM_SUB_LIMBS,
+};
 use crate::circuits::stark_spend::constrain_spend_wiring;
+use crate::circuits::stark_withdraw::constrain_withdraw_wiring;
+use crate::circuits::withdraw::{
+    execute_withdraw, WithdrawPublicInputs, WithdrawWitness, MERKLE_DEPTH,
+};
 use crate::components::poseidon2_air::{
-    constrain_poseidon2_permutation, compute_merkle_chain_padding, compute_permutation_trace,
-    decompose_to_bits, dummy_permutation_trace, write_permutation_to_trace,
-    COLS_PER_PERM,
+    compute_merkle_chain_padding, compute_permutation_trace, constrain_poseidon2_permutation,
+    decompose_to_bits, dummy_permutation_trace, write_permutation_to_trace, COLS_PER_PERM,
 };
 use crate::crypto::poseidon2_m31::{poseidon2_hash, RATE};
 
@@ -79,7 +81,8 @@ const SPD_NUM_SUB_LIMBS: usize = SPEND_NUM_OUTPUTS * 4; // 8
 const SPD_BITS_PER_LIMB: usize = 16;
 const SPD_NUM_BIT_COLS: usize = SPD_NUM_SUB_LIMBS * SPD_BITS_PER_LIMB;
 const SPD_NUM_CARRY_COLS: usize = 3;
-const SPD_EXEC_COLS: usize = SPD_NUM_PERMS * COLS_PER_PERM + SPD_NUM_SUB_LIMBS + SPD_NUM_BIT_COLS + SPD_NUM_CARRY_COLS;
+const SPD_EXEC_COLS: usize =
+    SPD_NUM_PERMS * COLS_PER_PERM + SPD_NUM_SUB_LIMBS + SPD_NUM_BIT_COLS + SPD_NUM_CARRY_COLS;
 // Preprocessed: is_real(1) + merkle_root(8) + nullifiers(2×8=16) + output_commitments(2×8=16) = 41
 const SPD_PREPROC_COLS: usize = 41;
 
@@ -178,10 +181,7 @@ fn mix_public_inputs_into_channel(
     inputs: &BatchPublicInputs,
 ) {
     let hash = hash_batch_public_inputs(inputs);
-    let felts: Vec<SecureField> = hash
-        .iter()
-        .map(|&m| SecureField::from(m))
-        .collect();
+    let felts: Vec<SecureField> = hash.iter().map(|&m| SecureField::from(m)).collect();
     channel.mix_felts(&felts);
 }
 
@@ -226,8 +226,7 @@ impl FrameworkEval for BatchedDepositEval {
         let perm1 = constrain_poseidon2_permutation(&mut eval);
 
         // Sub-limb & bit columns
-        let sub_limbs: [E::F; DEP_NUM_SUB_LIMBS] =
-            std::array::from_fn(|_| eval.next_trace_mask());
+        let sub_limbs: [E::F; DEP_NUM_SUB_LIMBS] = std::array::from_fn(|_| eval.next_trace_mask());
         let bits: [[E::F; DEP_BITS_PER_LIMB]; DEP_NUM_SUB_LIMBS] =
             std::array::from_fn(|_| std::array::from_fn(|_| eval.next_trace_mask()));
 
@@ -246,10 +245,15 @@ impl FrameworkEval for BatchedDepositEval {
         }
 
         constrain_deposit_wiring(
-            &mut eval, &is_real,
-            &perm0, &perm1,
+            &mut eval,
+            &is_real,
+            &perm0,
+            &perm1,
             &sub_limbs,
-            &commitment, &amount_lo, &amount_hi, &asset_id,
+            &commitment,
+            &amount_lo,
+            &amount_hi,
+            &asset_id,
         );
 
         eval
@@ -301,8 +305,7 @@ impl FrameworkEval for BatchedWithdrawEval {
             .map(|_| constrain_poseidon2_permutation(&mut eval))
             .collect();
 
-        let sub_limbs: [E::F; WDR_NUM_SUB_LIMBS] =
-            std::array::from_fn(|_| eval.next_trace_mask());
+        let sub_limbs: [E::F; WDR_NUM_SUB_LIMBS] = std::array::from_fn(|_| eval.next_trace_mask());
         let bits: [[E::F; WDR_BITS_PER_LIMB]; WDR_NUM_SUB_LIMBS] =
             std::array::from_fn(|_| std::array::from_fn(|_| eval.next_trace_mask()));
 
@@ -321,10 +324,15 @@ impl FrameworkEval for BatchedWithdrawEval {
         }
 
         constrain_withdraw_wiring(
-            &mut eval, &is_real,
-            &perms, &sub_limbs,
-            &merkle_root, &nullifier,
-            &amount_lo, &amount_hi, &asset_id,
+            &mut eval,
+            &is_real,
+            &perms,
+            &sub_limbs,
+            &merkle_root,
+            &nullifier,
+            &amount_lo,
+            &amount_hi,
+            &asset_id,
         );
 
         eval
@@ -376,8 +384,7 @@ impl FrameworkEval for BatchedSpendEval {
             .map(|_| constrain_poseidon2_permutation(&mut eval))
             .collect();
 
-        let sub_limbs: [E::F; SPD_NUM_SUB_LIMBS] =
-            std::array::from_fn(|_| eval.next_trace_mask());
+        let sub_limbs: [E::F; SPD_NUM_SUB_LIMBS] = std::array::from_fn(|_| eval.next_trace_mask());
         let bits: [[E::F; SPD_BITS_PER_LIMB]; SPD_NUM_SUB_LIMBS] =
             std::array::from_fn(|_| std::array::from_fn(|_| eval.next_trace_mask()));
 
@@ -405,10 +412,14 @@ impl FrameworkEval for BatchedSpendEval {
         eval.add_constraint(carry.clone() - carry_pos + carry_neg);
 
         constrain_spend_wiring(
-            &mut eval, &is_real,
-            &perms, &sub_limbs,
+            &mut eval,
+            &is_real,
+            &perms,
+            &sub_limbs,
             &carry,
-            &merkle_root, &nullifiers, &output_commitments,
+            &merkle_root,
+            &nullifiers,
+            &output_commitments,
         );
 
         eval
@@ -449,8 +460,8 @@ where
     let dummy = dummy_permutation_trace();
 
     for (row, (witness, pub_in)) in witnesses.iter().zip(public_inputs.iter()).enumerate() {
-        let (execution, _) = execute_deposit(witness)
-            .map_err(|e| BatchError::DepositExecution(format!("{e}")))?;
+        let (execution, _) =
+            execute_deposit(witness).map_err(|e| BatchError::DepositExecution(format!("{e}")))?;
 
         // Preprocessed: set per-row public inputs
         preproc_cols[0].set(row, M31::from_u32_unchecked(1)); // is_real
@@ -525,7 +536,7 @@ where
     B: ColumnOps<M31>,
     Col<B, M31>: Column<M31>,
 {
-    use crate::circuits::stark_withdraw::{MERKLE_PERM_START, MERKLE_PERM_END};
+    use crate::circuits::stark_withdraw::{MERKLE_PERM_END, MERKLE_PERM_START};
 
     let table_size = 1usize << log_size;
     let domain = CanonicCoset::new(log_size).circle_domain();
@@ -544,8 +555,8 @@ where
     let merkle_padding = compute_merkle_chain_padding(&dummy_hash, merkle_levels);
 
     for (row, (witness, pub_in)) in witnesses.iter().zip(public_inputs.iter()).enumerate() {
-        let (execution, _) = execute_withdraw(witness)
-            .map_err(|e| BatchError::WithdrawExecution(format!("{e}")))?;
+        let (execution, _) =
+            execute_withdraw(witness).map_err(|e| BatchError::WithdrawExecution(format!("{e}")))?;
 
         // Preprocessed
         preproc_cols[0].set(row, M31::from_u32_unchecked(1)); // is_real
@@ -644,8 +655,8 @@ where
     let merkle_padding = compute_merkle_chain_padding(&dummy_hash, MERKLE_DEPTH);
 
     for (row, (witness, pub_in)) in witnesses.iter().zip(public_inputs.iter()).enumerate() {
-        let (execution, _) = execute_spend(witness)
-            .map_err(|e| BatchError::SpendExecution(format!("{e}")))?;
+        let (execution, _) =
+            execute_spend(witness).map_err(|e| BatchError::SpendExecution(format!("{e}")))?;
 
         // Preprocessed: is_real(1), merkle_root(8), nullifiers(16), output_commitments(16)
         preproc_cols[0].set(row, M31::from_u32_unchecked(1)); // is_real
@@ -709,10 +720,14 @@ where
             M31::from_u32_unchecked(p - ((-carry_val) as u32))
         };
         exec_cols[carry_offset].set(row, carry_m31);
-        exec_cols[carry_offset + 1]
-            .set(row, M31::from_u32_unchecked(if carry_val > 0 { 1 } else { 0 }));
-        exec_cols[carry_offset + 2]
-            .set(row, M31::from_u32_unchecked(if carry_val < 0 { 1 } else { 0 }));
+        exec_cols[carry_offset + 1].set(
+            row,
+            M31::from_u32_unchecked(if carry_val > 0 { 1 } else { 0 }),
+        );
+        exec_cols[carry_offset + 2].set(
+            row,
+            M31::from_u32_unchecked(if carry_val < 0 { 1 } else { 0 }),
+        );
     }
 
     // Padding rows
@@ -755,9 +770,7 @@ where
 // ──────────────────────── Prover ─────────────────────────────────────
 
 /// Prove a batch of privacy transactions with a single STARK proof.
-pub fn prove_privacy_batch(
-    batch: &PrivacyBatch,
-) -> Result<PrivacyBatchProof, BatchError> {
+pub fn prove_privacy_batch(batch: &PrivacyBatch) -> Result<PrivacyBatchProof, BatchError> {
     #[cfg(feature = "cuda-runtime")]
     {
         if crate::backend::force_gpu() || crate::backend::gpu_is_available() {
@@ -768,9 +781,7 @@ pub fn prove_privacy_batch(
     prove_privacy_batch_with::<SimdBackend>(batch)
 }
 
-fn prove_privacy_batch_with<B>(
-    batch: &PrivacyBatch,
-) -> Result<PrivacyBatchProof, BatchError>
+fn prove_privacy_batch_with<B>(batch: &PrivacyBatch) -> Result<PrivacyBatchProof, BatchError>
 where
     B: BackendForChannel<Blake2sMerkleChannel> + PolyOps + ColumnOps<M31>,
     Col<B, M31>: Column<M31>,
@@ -786,22 +797,21 @@ where
     // Execute all witnesses and collect public inputs
     let mut dep_pub: Vec<DepositPublicInputs> = Vec::with_capacity(batch.deposits.len());
     for w in &batch.deposits {
-        let (_, pi) = execute_deposit(w)
-            .map_err(|e| BatchError::DepositExecution(format!("{e}")))?;
+        let (_, pi) =
+            execute_deposit(w).map_err(|e| BatchError::DepositExecution(format!("{e}")))?;
         dep_pub.push(pi);
     }
 
     let mut wdr_pub: Vec<WithdrawPublicInputs> = Vec::with_capacity(batch.withdrawals.len());
     for w in &batch.withdrawals {
-        let (_, pi) = execute_withdraw(w)
-            .map_err(|e| BatchError::WithdrawExecution(format!("{e}")))?;
+        let (_, pi) =
+            execute_withdraw(w).map_err(|e| BatchError::WithdrawExecution(format!("{e}")))?;
         wdr_pub.push(pi);
     }
 
     let mut spd_pub: Vec<SpendPublicInputs> = Vec::with_capacity(batch.spends.len());
     for w in &batch.spends {
-        let (_, pi) = execute_spend(w)
-            .map_err(|e| BatchError::SpendExecution(format!("{e}")))?;
+        let (_, pi) = execute_spend(w).map_err(|e| BatchError::SpendExecution(format!("{e}")))?;
         spd_pub.push(pi);
     }
 
@@ -849,26 +859,21 @@ where
         CommitmentSchemeProver::<B, Blake2sMerkleChannel>::new(pcs_config, &twiddles);
 
     // Build traces for each non-empty type
-    let mut all_preprocessed: Vec<CircleEvaluation<B, M31, BitReversedOrder>> =
-        Vec::new();
-    let mut all_execution: Vec<CircleEvaluation<B, M31, BitReversedOrder>> =
-        Vec::new();
+    let mut all_preprocessed: Vec<CircleEvaluation<B, M31, BitReversedOrder>> = Vec::new();
+    let mut all_execution: Vec<CircleEvaluation<B, M31, BitReversedOrder>> = Vec::new();
 
     if let Some(log) = dep_log {
-        let (prep, exec) =
-            build_deposit_batch_traces::<B>(&batch.deposits, &dep_pub, log)?;
+        let (prep, exec) = build_deposit_batch_traces::<B>(&batch.deposits, &dep_pub, log)?;
         all_preprocessed.extend(prep);
         all_execution.extend(exec);
     }
     if let Some(log) = wdr_log {
-        let (prep, exec) =
-            build_withdraw_batch_traces::<B>(&batch.withdrawals, &wdr_pub, log)?;
+        let (prep, exec) = build_withdraw_batch_traces::<B>(&batch.withdrawals, &wdr_pub, log)?;
         all_preprocessed.extend(prep);
         all_execution.extend(exec);
     }
     if let Some(log) = spd_log {
-        let (prep, exec) =
-            build_spend_batch_traces::<B>(&batch.spends, &spd_pub, log)?;
+        let (prep, exec) = build_spend_batch_traces::<B>(&batch.spends, &spd_pub, log)?;
         all_preprocessed.extend(prep);
         all_execution.extend(exec);
     }
@@ -906,16 +911,18 @@ where
     }
 
     let mut component_refs: Vec<&dyn ComponentProver<B>> = Vec::new();
-    for c in &typed_deps { component_refs.push(c); }
-    for c in &typed_wdrs { component_refs.push(c); }
-    for c in &typed_spds { component_refs.push(c); }
+    for c in &typed_deps {
+        component_refs.push(c);
+    }
+    for c in &typed_wdrs {
+        component_refs.push(c);
+    }
+    for c in &typed_spds {
+        component_refs.push(c);
+    }
 
-    let stark_proof = prove::<B, Blake2sMerkleChannel>(
-        &component_refs,
-        channel,
-        commitment_scheme,
-    )
-    .map_err(|e| BatchError::Proving(format!("{e:?}")))?;
+    let stark_proof = prove::<B, Blake2sMerkleChannel>(&component_refs, channel, commitment_scheme)
+        .map_err(|e| BatchError::Proving(format!("{e:?}")))?;
 
     Ok(PrivacyBatchProof {
         stark_proof,
@@ -965,22 +972,40 @@ pub fn verify_privacy_batch(
 
     if let Some(log) = dep_log {
         let eval = BatchedDepositEval { log_n_rows: log };
-        typed_deps_dummy.push(FrameworkComponent::new(&mut dummy_allocator, eval, SecureField::zero()));
+        typed_deps_dummy.push(FrameworkComponent::new(
+            &mut dummy_allocator,
+            eval,
+            SecureField::zero(),
+        ));
     }
     if let Some(log) = wdr_log {
         let eval = BatchedWithdrawEval { log_n_rows: log };
-        typed_wdrs_dummy.push(FrameworkComponent::new(&mut dummy_allocator, eval, SecureField::zero()));
+        typed_wdrs_dummy.push(FrameworkComponent::new(
+            &mut dummy_allocator,
+            eval,
+            SecureField::zero(),
+        ));
     }
     if let Some(log) = spd_log {
         let eval = BatchedSpendEval { log_n_rows: log };
-        typed_spds_dummy.push(FrameworkComponent::new(&mut dummy_allocator, eval, SecureField::zero()));
+        typed_spds_dummy.push(FrameworkComponent::new(
+            &mut dummy_allocator,
+            eval,
+            SecureField::zero(),
+        ));
     }
 
     // Collect all components as dyn Component for bounds
     let mut dummy_refs: Vec<&dyn Component> = Vec::new();
-    for c in &typed_deps_dummy { dummy_refs.push(c); }
-    for c in &typed_wdrs_dummy { dummy_refs.push(c); }
-    for c in &typed_spds_dummy { dummy_refs.push(c); }
+    for c in &typed_deps_dummy {
+        dummy_refs.push(c);
+    }
+    for c in &typed_wdrs_dummy {
+        dummy_refs.push(c);
+    }
+    for c in &typed_spds_dummy {
+        dummy_refs.push(c);
+    }
 
     // Merge bounds: each component returns TreeVec<Vec<u32>>, we merge per tree index
     let num_trees = 2; // Tree 0 = preprocessed, Tree 1 = execution
@@ -996,16 +1021,11 @@ pub fn verify_privacy_batch(
     let channel = &mut <Blake2sMerkleChannel as MerkleChannel>::C::default();
     mix_public_inputs_into_channel(channel, public_inputs);
 
-    let mut commitment_scheme =
-        CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(pcs_config);
+    let mut commitment_scheme = CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(pcs_config);
 
     // Replay commitments for each tree
     for (tree_idx, bounds) in merged_bounds.iter().enumerate() {
-        commitment_scheme.commit(
-            proof.stark_proof.commitments[tree_idx],
-            bounds,
-            channel,
-        );
+        commitment_scheme.commit(proof.stark_proof.commitments[tree_idx], bounds, channel);
     }
 
     // Build real components (same allocator order as prover)
@@ -1017,21 +1037,39 @@ pub fn verify_privacy_batch(
 
     if let Some(log) = dep_log {
         let eval = BatchedDepositEval { log_n_rows: log };
-        typed_deps.push(FrameworkComponent::new(&mut allocator, eval, SecureField::zero()));
+        typed_deps.push(FrameworkComponent::new(
+            &mut allocator,
+            eval,
+            SecureField::zero(),
+        ));
     }
     if let Some(log) = wdr_log {
         let eval = BatchedWithdrawEval { log_n_rows: log };
-        typed_wdrs.push(FrameworkComponent::new(&mut allocator, eval, SecureField::zero()));
+        typed_wdrs.push(FrameworkComponent::new(
+            &mut allocator,
+            eval,
+            SecureField::zero(),
+        ));
     }
     if let Some(log) = spd_log {
         let eval = BatchedSpendEval { log_n_rows: log };
-        typed_spds.push(FrameworkComponent::new(&mut allocator, eval, SecureField::zero()));
+        typed_spds.push(FrameworkComponent::new(
+            &mut allocator,
+            eval,
+            SecureField::zero(),
+        ));
     }
 
     let mut component_refs: Vec<&dyn Component> = Vec::new();
-    for c in &typed_deps { component_refs.push(c); }
-    for c in &typed_wdrs { component_refs.push(c); }
-    for c in &typed_spds { component_refs.push(c); }
+    for c in &typed_deps {
+        component_refs.push(c);
+    }
+    for c in &typed_wdrs {
+        component_refs.push(c);
+    }
+    for c in &typed_spds {
+        component_refs.push(c);
+    }
 
     stwo_verify::<Blake2sMerkleChannel>(
         &component_refs,
@@ -1072,8 +1110,13 @@ mod tests {
         let amount_lo = M31::from_u32_unchecked((amount & 0x7FFFFFFF) as u32);
         let amount_hi = M31::from_u32_unchecked((amount >> 31) as u32);
         let asset_id = M31::from_u32_unchecked(0);
-        let blinding = [blinding_seed, blinding_seed + 1, blinding_seed + 2, blinding_seed + 3]
-            .map(M31::from_u32_unchecked);
+        let blinding = [
+            blinding_seed,
+            blinding_seed + 1,
+            blinding_seed + 2,
+            blinding_seed + 3,
+        ]
+        .map(M31::from_u32_unchecked);
         let note = Note::new(pk, asset_id, amount_lo, amount_hi, blinding);
         DepositWitness {
             note,
@@ -1185,8 +1228,7 @@ mod tests {
             spends: vec![],
         };
         let proof = prove_privacy_batch(&batch).expect("proving should succeed");
-        verify_privacy_batch(&proof, &proof.public_inputs)
-            .expect("verification should succeed");
+        verify_privacy_batch(&proof, &proof.public_inputs).expect("verification should succeed");
 
         // Public inputs should match single-tx execution
         assert_eq!(proof.public_inputs.deposits.len(), 1);
@@ -1208,8 +1250,7 @@ mod tests {
             spends: vec![],
         };
         let proof = prove_privacy_batch(&batch).expect("proving should succeed");
-        verify_privacy_batch(&proof, &proof.public_inputs)
-            .expect("verification should succeed");
+        verify_privacy_batch(&proof, &proof.public_inputs).expect("verification should succeed");
         assert_eq!(proof.public_inputs.deposits.len(), 4);
     }
 
@@ -1223,8 +1264,7 @@ mod tests {
             spends: vec![],
         };
         let proof = prove_privacy_batch(&batch).expect("proving should succeed");
-        verify_privacy_batch(&proof, &proof.public_inputs)
-            .expect("verification should succeed");
+        verify_privacy_batch(&proof, &proof.public_inputs).expect("verification should succeed");
         assert_eq!(proof.public_inputs.withdrawals.len(), 1);
     }
 
@@ -1238,8 +1278,7 @@ mod tests {
             spends: vec![make_spend_witness([1000, 2000], [1500, 1500])],
         };
         let proof = prove_privacy_batch(&batch).expect("proving should succeed");
-        verify_privacy_batch(&proof, &proof.public_inputs)
-            .expect("verification should succeed");
+        verify_privacy_batch(&proof, &proof.public_inputs).expect("verification should succeed");
         assert_eq!(proof.public_inputs.spends.len(), 1);
     }
 
@@ -1253,15 +1292,11 @@ mod tests {
                 make_deposit_witness_with_blinding(200, 5),
                 make_deposit_witness_with_blinding(300, 9),
             ],
-            withdrawals: vec![
-                make_withdraw_witness(500),
-                make_withdraw_witness(600),
-            ],
+            withdrawals: vec![make_withdraw_witness(500), make_withdraw_witness(600)],
             spends: vec![make_spend_witness([1000, 2000], [1500, 1500])],
         };
         let proof = prove_privacy_batch(&batch).expect("proving should succeed");
-        verify_privacy_batch(&proof, &proof.public_inputs)
-            .expect("verification should succeed");
+        verify_privacy_batch(&proof, &proof.public_inputs).expect("verification should succeed");
         assert_eq!(proof.public_inputs.deposits.len(), 3);
         assert_eq!(proof.public_inputs.withdrawals.len(), 2);
         assert_eq!(proof.public_inputs.spends.len(), 1);
@@ -1280,8 +1315,7 @@ mod tests {
             spends: vec![],
         };
         let proof = prove_privacy_batch(&batch).expect("proving should succeed");
-        verify_privacy_batch(&proof, &proof.public_inputs)
-            .expect("verification should succeed");
+        verify_privacy_batch(&proof, &proof.public_inputs).expect("verification should succeed");
     }
 
     // ── Test 7: Wrong commitment rejected ──
@@ -1299,7 +1333,10 @@ mod tests {
         bad_inputs.deposits[0].commitment[0] = M31::from_u32_unchecked(999999);
 
         let result = verify_privacy_batch(&proof, &bad_inputs);
-        assert!(result.is_err(), "modified commitment should fail verification");
+        assert!(
+            result.is_err(),
+            "modified commitment should fail verification"
+        );
     }
 
     // ── Test 8: Wrong nullifier rejected ──
@@ -1317,7 +1354,10 @@ mod tests {
         bad_inputs.withdrawals[0].nullifier[0] = M31::from_u32_unchecked(999999);
 
         let result = verify_privacy_batch(&proof, &bad_inputs);
-        assert!(result.is_err(), "modified nullifier should fail verification");
+        assert!(
+            result.is_err(),
+            "modified nullifier should fail verification"
+        );
     }
 
     // ── Test 9: Empty batch rejected ──
@@ -1390,7 +1430,10 @@ mod tests {
         // Plus 1 more to force log_size=5
         let mut deposits: Vec<DepositWitness> = Vec::new();
         for i in 0..17 {
-            deposits.push(make_deposit_witness_with_blinding(100 + i as u64, (i * 4) as u32 + 1));
+            deposits.push(make_deposit_witness_with_blinding(
+                100 + i as u64,
+                (i * 4) as u32 + 1,
+            ));
         }
         let batch = PrivacyBatch {
             deposits,
@@ -1398,8 +1441,7 @@ mod tests {
             spends: vec![],
         };
         let proof = prove_privacy_batch(&batch).expect("larger batch should prove");
-        verify_privacy_batch(&proof, &proof.public_inputs)
-            .expect("larger batch should verify");
+        verify_privacy_batch(&proof, &proof.public_inputs).expect("larger batch should verify");
         assert_eq!(proof.public_inputs.deposits.len(), 17);
     }
 }

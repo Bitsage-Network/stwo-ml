@@ -8,9 +8,7 @@ use starknet_ff::FieldElement;
 
 use crate::aggregation::compute_io_commitment;
 use crate::audit::deterministic::evaluate_deterministic;
-use crate::audit::types::{
-    AuditError, InferenceEvaluation, InferenceLogEntry,
-};
+use crate::audit::types::{AuditError, InferenceEvaluation, InferenceLogEntry};
 use crate::compiler::graph::{ComputationGraph, GraphWeights};
 use crate::components::matmul::M31Matrix;
 
@@ -225,29 +223,25 @@ pub fn evaluate_inference(
     let input_text = entry.input_preview.as_deref().unwrap_or("");
     let output_text = entry.output_preview.as_deref().unwrap_or("");
 
-    let category = entry
-        .task_category
-        .as_deref()
-        .unwrap_or_else(|| "general");
+    let category = entry.task_category.as_deref().unwrap_or_else(|| "general");
 
     // Deterministic checks.
     let deterministic_checks = evaluate_deterministic(input_text, output_text, Some(category));
 
     // Self-evaluation via model forward pass (if model available).
-    let (semantic_score, eval_io_commitment) =
-        if let (Some(g), Some(w)) = (graph, weights) {
-            let template = config
-                .template
-                .unwrap_or_else(|| EvalTemplate::for_category(category));
-            let eval_prompt = build_eval_prompt(input_text, output_text, template);
+    let (semantic_score, eval_io_commitment) = if let (Some(g), Some(w)) = (graph, weights) {
+        let template = config
+            .template
+            .unwrap_or_else(|| EvalTemplate::for_category(category));
+        let eval_prompt = build_eval_prompt(input_text, output_text, template);
 
-            match run_eval_forward_pass(g, w, &eval_prompt) {
-                Ok((score, commitment)) => (score, Some(format!("{:#066x}", commitment))),
-                Err(_) => (None, None),
-            }
-        } else {
-            (None, None)
-        };
+        match run_eval_forward_pass(g, w, &eval_prompt) {
+            Ok((score, commitment)) => (score, Some(format!("{:#066x}", commitment))),
+            Err(_) => (None, None),
+        }
+    } else {
+        (None, None)
+    };
 
     InferenceEvaluation {
         sequence: entry.sequence_number,
@@ -290,11 +284,7 @@ fn run_eval_forward_pass(
         data[i] = M31::from(b as u32);
     }
 
-    let input = M31Matrix {
-        rows,
-        cols,
-        data,
-    };
+    let input = M31Matrix { rows, cols, data };
 
     let output = crate::audit::replay::execute_forward_pass(graph, &input, weights)?;
     let commitment = compute_io_commitment(&input, &output);

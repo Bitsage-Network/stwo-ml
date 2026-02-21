@@ -103,8 +103,14 @@ pub fn unpack_digest_felt252(lo: &[u8; 32], hi: &[u8; 32]) -> M31Digest {
     let lo_parts = unpack_half(lo);
     let hi_parts = unpack_half(hi);
     [
-        lo_parts[0], lo_parts[1], lo_parts[2], lo_parts[3],
-        hi_parts[0], hi_parts[1], hi_parts[2], hi_parts[3],
+        lo_parts[0],
+        lo_parts[1],
+        lo_parts[2],
+        lo_parts[3],
+        hi_parts[0],
+        hi_parts[1],
+        hi_parts[2],
+        hi_parts[3],
     ]
 }
 
@@ -226,7 +232,10 @@ mod tests {
     #[test]
     fn test_hex_parse_errors() {
         assert!(hex_to_digest("0x123").is_err()); // too short
-        assert!(hex_to_digest("not_hex_at_all_padding_to_64_chars_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx").is_err());
+        assert!(hex_to_digest(
+            "not_hex_at_all_padding_to_64_chars_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        )
+        .is_err());
     }
 
     #[test]

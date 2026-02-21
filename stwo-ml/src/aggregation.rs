@@ -602,17 +602,17 @@ impl std::fmt::Debug for GkrBatchData {
 fn graph_op_to_layer_kind(op: &crate::compiler::graph::GraphOp) -> proof_stream::LayerKind {
     use crate::compiler::graph::GraphOp;
     match op {
-        GraphOp::MatMul { .. }      => proof_stream::LayerKind::MatMul,
-        GraphOp::Activation { .. }  => proof_stream::LayerKind::Activation,
-        GraphOp::Add { .. }         => proof_stream::LayerKind::Add,
-        GraphOp::Mul { .. }         => proof_stream::LayerKind::Mul,
-        GraphOp::LayerNorm { .. }   => proof_stream::LayerKind::LayerNorm,
-        GraphOp::RMSNorm { .. }     => proof_stream::LayerKind::RMSNorm,
-        GraphOp::Attention { .. }   => proof_stream::LayerKind::Attention,
-        GraphOp::Embedding { .. }   => proof_stream::LayerKind::Embedding,
-        GraphOp::Quantize { .. }    => proof_stream::LayerKind::Quantize,
-        GraphOp::Dequantize { .. }  => proof_stream::LayerKind::Dequantize,
-        _                           => proof_stream::LayerKind::MatMul,
+        GraphOp::MatMul { .. } => proof_stream::LayerKind::MatMul,
+        GraphOp::Activation { .. } => proof_stream::LayerKind::Activation,
+        GraphOp::Add { .. } => proof_stream::LayerKind::Add,
+        GraphOp::Mul { .. } => proof_stream::LayerKind::Mul,
+        GraphOp::LayerNorm { .. } => proof_stream::LayerKind::LayerNorm,
+        GraphOp::RMSNorm { .. } => proof_stream::LayerKind::RMSNorm,
+        GraphOp::Attention { .. } => proof_stream::LayerKind::Attention,
+        GraphOp::Embedding { .. } => proof_stream::LayerKind::Embedding,
+        GraphOp::Quantize { .. } => proof_stream::LayerKind::Quantize,
+        GraphOp::Dequantize { .. } => proof_stream::LayerKind::Dequantize,
+        _ => proof_stream::LayerKind::MatMul,
     }
 }
 
@@ -1060,7 +1060,8 @@ where
         PROOF_SINK.with(|s| {
             if let Some(sink) = s.borrow().as_ref() {
                 for (idx, (node_id, matrix)) in intermediates.iter().enumerate() {
-                    let sample: Vec<u32> = matrix.data
+                    let sample: Vec<u32> = matrix
+                        .data
                         .iter()
                         .step_by((matrix.data.len() / 128).max(1))
                         .take(128)
@@ -1069,15 +1070,26 @@ where
                     let n = matrix.data.len() as f64;
                     let mean = matrix.data.iter().map(|v| v.0 as f64).sum::<f64>() / n.max(1.0);
                     let std = if n > 1.0 {
-                        (matrix.data.iter().map(|v| (v.0 as f64 - mean).powi(2)).sum::<f64>() / (n - 1.0)).sqrt()
-                    } else { 0.0 };
+                        (matrix
+                            .data
+                            .iter()
+                            .map(|v| (v.0 as f64 - mean).powi(2))
+                            .sum::<f64>()
+                            / (n - 1.0))
+                            .sqrt()
+                    } else {
+                        0.0
+                    };
                     let min = matrix.data.iter().map(|v| v.0).min().unwrap_or(0);
                     let max = matrix.data.iter().map(|v| v.0).max().unwrap_or(0);
                     let zeros = matrix.data.iter().filter(|v| v.0 == 0).count();
                     sink.emit(proof_stream::ProofEvent::LayerActivation {
                         layer_idx: idx,
                         node_id: *node_id,
-                        kind: graph.nodes.iter().find(|n| n.id == *node_id)
+                        kind: graph
+                            .nodes
+                            .iter()
+                            .find(|n| n.id == *node_id)
                             .map(|n| graph_op_to_layer_kind(&n.op))
                             .unwrap_or(proof_stream::LayerKind::MatMul),
                         output_shape: (matrix.rows, matrix.cols),
@@ -1187,7 +1199,8 @@ where
         for layer in &activation_layers {
             let layer_size = 1usize << layer.log_size;
             let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-            let (table_input_col, table_output_col) = build_table_columns::<SimdBackend>(&layer.table, layer_size);
+            let (table_input_col, table_output_col) =
+                build_table_columns::<SimdBackend>(&layer.table, layer_size);
             let simd_evals = vec![
                 CircleEvaluation::new(layer_domain, table_input_col),
                 CircleEvaluation::new(layer_domain, table_output_col),
@@ -1244,7 +1257,8 @@ where
             let table = build_dequantize_table(&layer.params);
             let layer_size = 1usize << layer.log_size;
             let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-            let (table_input_col, table_output_col) = build_table_columns::<SimdBackend>(&table, layer_size);
+            let (table_input_col, table_output_col) =
+                build_table_columns::<SimdBackend>(&table, layer_size);
             let simd_evals = vec![
                 CircleEvaluation::new(layer_domain, table_input_col),
                 CircleEvaluation::new(layer_domain, table_output_col),
@@ -1294,8 +1308,12 @@ where
     for layer in &add_layers {
         let layer_size = 1usize << layer.log_size;
         let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-        let (lhs_col, rhs_col, out_col) =
-            build_elementwise_trace_columns::<SimdBackend>(&layer.lhs, &layer.rhs, &layer.output, layer_size);
+        let (lhs_col, rhs_col, out_col) = build_elementwise_trace_columns::<SimdBackend>(
+            &layer.lhs,
+            &layer.rhs,
+            &layer.output,
+            layer_size,
+        );
         let simd_evals = vec![
             CircleEvaluation::new(layer_domain, lhs_col),
             CircleEvaluation::new(layer_domain, rhs_col),
@@ -1306,8 +1324,12 @@ where
     for layer in &mul_layers {
         let layer_size = 1usize << layer.log_size;
         let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-        let (lhs_col, rhs_col, out_col) =
-            build_elementwise_trace_columns::<SimdBackend>(&layer.lhs, &layer.rhs, &layer.output, layer_size);
+        let (lhs_col, rhs_col, out_col) = build_elementwise_trace_columns::<SimdBackend>(
+            &layer.lhs,
+            &layer.rhs,
+            &layer.output,
+            layer_size,
+        );
         let simd_evals = vec![
             CircleEvaluation::new(layer_domain, lhs_col),
             CircleEvaluation::new(layer_domain, rhs_col),
@@ -1474,7 +1496,8 @@ where
                 let pad_input = layer.table.inputs[0];
                 let pad_output = layer.table.outputs[0];
 
-                let (table_in_col, table_out_col) = build_table_columns::<SimdBackend>(&layer.table, layer_size);
+                let (table_in_col, table_out_col) =
+                    build_table_columns::<SimdBackend>(&layer.table, layer_size);
                 let (trace_in_col, trace_out_col, _) = build_trace_columns::<SimdBackend>(
                     &layer.inputs,
                     &layer.outputs,
@@ -1757,7 +1780,8 @@ where
                 let pad_input = table.inputs[0];
                 let pad_output = table.outputs[0];
 
-                let (table_in_col, table_out_col) = build_table_columns::<SimdBackend>(&table, layer_size);
+                let (table_in_col, table_out_col) =
+                    build_table_columns::<SimdBackend>(&table, layer_size);
                 let (trace_in_col, trace_out_col, _) = build_trace_columns::<SimdBackend>(
                     &layer.input_values,
                     &layer.output_values,
@@ -3273,7 +3297,8 @@ where
         for layer in &activation_layers {
             let layer_size = 1usize << layer.log_size;
             let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-            let (table_input_col, table_output_col) = build_table_columns::<SimdBackend>(&layer.table, layer_size);
+            let (table_input_col, table_output_col) =
+                build_table_columns::<SimdBackend>(&layer.table, layer_size);
             let simd_evals = vec![
                 CircleEvaluation::new(layer_domain, table_input_col),
                 CircleEvaluation::new(layer_domain, table_output_col),
@@ -3319,7 +3344,8 @@ where
             let table = build_dequantize_table(&layer.params);
             let layer_size = 1usize << layer.log_size;
             let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-            let (table_input_col, table_output_col) = build_table_columns::<SimdBackend>(&table, layer_size);
+            let (table_input_col, table_output_col) =
+                build_table_columns::<SimdBackend>(&table, layer_size);
             let simd_evals = vec![
                 CircleEvaluation::new(layer_domain, table_input_col),
                 CircleEvaluation::new(layer_domain, table_output_col),
@@ -3363,8 +3389,12 @@ where
     for layer in &add_layers {
         let layer_size = 1usize << layer.log_size;
         let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-        let (lhs_col, rhs_col, out_col) =
-            build_elementwise_trace_columns::<SimdBackend>(&layer.lhs, &layer.rhs, &layer.output, layer_size);
+        let (lhs_col, rhs_col, out_col) = build_elementwise_trace_columns::<SimdBackend>(
+            &layer.lhs,
+            &layer.rhs,
+            &layer.output,
+            layer_size,
+        );
         let simd_evals = vec![
             CircleEvaluation::new(layer_domain, lhs_col),
             CircleEvaluation::new(layer_domain, rhs_col),
@@ -3375,8 +3405,12 @@ where
     for layer in &mul_layers {
         let layer_size = 1usize << layer.log_size;
         let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-        let (lhs_col, rhs_col, out_col) =
-            build_elementwise_trace_columns::<SimdBackend>(&layer.lhs, &layer.rhs, &layer.output, layer_size);
+        let (lhs_col, rhs_col, out_col) = build_elementwise_trace_columns::<SimdBackend>(
+            &layer.lhs,
+            &layer.rhs,
+            &layer.output,
+            layer_size,
+        );
         let simd_evals = vec![
             CircleEvaluation::new(layer_domain, lhs_col),
             CircleEvaluation::new(layer_domain, rhs_col),
@@ -3539,7 +3573,8 @@ where
                 let pad_input = layer.table.inputs[0];
                 let pad_output = layer.table.outputs[0];
 
-                let (table_in_col, table_out_col) = build_table_columns::<SimdBackend>(&layer.table, layer_size);
+                let (table_in_col, table_out_col) =
+                    build_table_columns::<SimdBackend>(&layer.table, layer_size);
                 let (trace_in_col, trace_out_col, _) = build_trace_columns::<SimdBackend>(
                     &layer.inputs,
                     &layer.outputs,
@@ -3816,7 +3851,8 @@ where
                 let pad_input = table.inputs[0];
                 let pad_output = table.outputs[0];
 
-                let (table_in_col, table_out_col) = build_table_columns::<SimdBackend>(&table, layer_size);
+                let (table_in_col, table_out_col) =
+                    build_table_columns::<SimdBackend>(&table, layer_size);
                 let (trace_in_col, trace_out_col, _) = build_trace_columns::<SimdBackend>(
                     &layer.input_values,
                     &layer.output_values,
@@ -4123,7 +4159,13 @@ pub(crate) fn prove_model_aggregated_onchain_with_precomputed(
         }
     }
 
-    prove_model_aggregated_onchain_with_cache::<SimdBackend>(graph, input, weights, None, Some(precomputed))
+    prove_model_aggregated_onchain_with_cache::<SimdBackend>(
+        graph,
+        input,
+        weights,
+        None,
+        Some(precomputed),
+    )
 }
 
 /// GPU proving path for on-chain aggregation.
@@ -4877,7 +4919,8 @@ where
         PROOF_SINK.with(|s| {
             if let Some(sink) = s.borrow().as_ref() {
                 for (idx, (node_id, matrix)) in intermediates.iter().enumerate() {
-                    let sample: Vec<u32> = matrix.data
+                    let sample: Vec<u32> = matrix
+                        .data
                         .iter()
                         .step_by((matrix.data.len() / 128).max(1))
                         .take(128)
@@ -4886,14 +4929,23 @@ where
                     let n = matrix.data.len() as f64;
                     let mean = matrix.data.iter().map(|v| v.0 as f64).sum::<f64>() / n.max(1.0);
                     let std = if n > 1.0 {
-                        (matrix.data.iter()
+                        (matrix
+                            .data
+                            .iter()
                             .map(|v| (v.0 as f64 - mean).powi(2))
-                            .sum::<f64>() / (n - 1.0)).sqrt()
-                    } else { 0.0 };
+                            .sum::<f64>()
+                            / (n - 1.0))
+                            .sqrt()
+                    } else {
+                        0.0
+                    };
                     let min = matrix.data.iter().map(|v| v.0).min().unwrap_or(0);
                     let max = matrix.data.iter().map(|v| v.0).max().unwrap_or(0);
                     let zeros = matrix.data.iter().filter(|v| v.0 == 0).count();
-                    let kind = graph.nodes.iter().find(|n| n.id == *node_id)
+                    let kind = graph
+                        .nodes
+                        .iter()
+                        .find(|n| n.id == *node_id)
                         .map(|n| graph_op_to_layer_kind(&n.op))
                         .unwrap_or(proof_stream::LayerKind::MatMul);
                     sink.emit(proof_stream::ProofEvent::LayerActivation {
@@ -5227,7 +5279,9 @@ pub fn prove_model_aggregated_onchain_logup_gkr(
     {
         if crate::backend::force_gpu() || crate::backend::gpu_is_available() {
             use stwo::prover::backend::gpu::GpuBackend;
-            return prove_model_aggregated_onchain_logup_gkr_inner::<GpuBackend>(graph, input, weights);
+            return prove_model_aggregated_onchain_logup_gkr_inner::<GpuBackend>(
+                graph, input, weights,
+            );
         }
     }
 
@@ -5848,7 +5902,8 @@ where
         if padding > 0 {
             mults[0] += M31::from(padding as u32);
         }
-        let (ti, to, mc) = build_trace_columns::<SimdBackend>(&layer.inputs, &layer.outputs, &mults, pi, po, sz);
+        let (ti, to, mc) =
+            build_trace_columns::<SimdBackend>(&layer.inputs, &layer.outputs, &mults, pi, po, sz);
         tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(vec![
             CircleEvaluation::new(dom, ti),
             CircleEvaluation::new(dom, to),
@@ -5859,7 +5914,12 @@ where
     for layer in add_layers {
         let sz = 1usize << layer.log_size;
         let dom = CanonicCoset::new(layer.log_size).circle_domain();
-        let (l, r, o) = build_elementwise_trace_columns::<SimdBackend>(&layer.lhs, &layer.rhs, &layer.output, sz);
+        let (l, r, o) = build_elementwise_trace_columns::<SimdBackend>(
+            &layer.lhs,
+            &layer.rhs,
+            &layer.output,
+            sz,
+        );
         tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(vec![
             CircleEvaluation::new(dom, l),
             CircleEvaluation::new(dom, r),
@@ -5869,7 +5929,12 @@ where
     for layer in mul_layers {
         let sz = 1usize << layer.log_size;
         let dom = CanonicCoset::new(layer.log_size).circle_domain();
-        let (l, r, o) = build_elementwise_trace_columns::<SimdBackend>(&layer.lhs, &layer.rhs, &layer.output, sz);
+        let (l, r, o) = build_elementwise_trace_columns::<SimdBackend>(
+            &layer.lhs,
+            &layer.rhs,
+            &layer.output,
+            sz,
+        );
         tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(vec![
             CircleEvaluation::new(dom, l),
             CircleEvaluation::new(dom, r),
@@ -6453,11 +6518,7 @@ fn build_trace_columns<B: ColumnOps<BaseField>>(
     pad_input: M31,
     pad_output: M31,
     size: usize,
-) -> (
-    Col<B, BaseField>,
-    Col<B, BaseField>,
-    Col<B, BaseField>,
-)
+) -> (Col<B, BaseField>, Col<B, BaseField>, Col<B, BaseField>)
 where
     Col<B, BaseField>: Column<BaseField>,
 {
@@ -6486,11 +6547,7 @@ fn build_elementwise_trace_columns<B: ColumnOps<BaseField>>(
     rhs: &[M31],
     output: &[M31],
     size: usize,
-) -> (
-    Col<B, BaseField>,
-    Col<B, BaseField>,
-    Col<B, BaseField>,
-)
+) -> (Col<B, BaseField>, Col<B, BaseField>, Col<B, BaseField>)
 where
     Col<B, BaseField>: Column<BaseField>,
 {
@@ -6733,11 +6790,7 @@ fn build_quantize_trace_simd_2d<B: ColumnOps<BaseField>>(
     pad_input: M31,
     pad_output: M31,
     size: usize,
-) -> (
-    Col<B, BaseField>,
-    Col<B, BaseField>,
-    Col<B, BaseField>,
-)
+) -> (Col<B, BaseField>, Col<B, BaseField>, Col<B, BaseField>)
 where
     Col<B, BaseField>: Column<BaseField>,
 {

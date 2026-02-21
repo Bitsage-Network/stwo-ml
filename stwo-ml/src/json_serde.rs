@@ -4,11 +4,11 @@
 //! `#[derive(Serialize)]` on foreign STWO types. Converts proofs to
 //! JSON-friendly structures for external tool integration.
 
+use starknet_ff::FieldElement;
 use stwo::core::fields::m31::M31;
 use stwo::core::fields::qm31::SecureField;
-use starknet_ff::FieldElement;
 
-use crate::aggregation::{AggregatedModelProofOnChain, LayerClaim, BatchedMatMulProofOnChain};
+use crate::aggregation::{AggregatedModelProofOnChain, BatchedMatMulProofOnChain, LayerClaim};
 use crate::cairo_serde::MLClaimMetadata;
 use crate::components::matmul::{MatMulSumcheckProofOnChain, RoundPoly};
 
@@ -76,7 +76,8 @@ fn batched_matmul_to_json(batch: &BatchedMatMulProofOnChain) -> String {
     }).collect();
     format!(
         r#"{{"k":{},"num_rounds":{},"lambda":{:?},"combined_claimed_sum":{:?},"round_polys":[{}],"entries":[{}]}}"#,
-        batch.k, batch.num_rounds,
+        batch.k,
+        batch.num_rounds,
         qm31_to_array(batch.lambda),
         qm31_to_array(batch.combined_claimed_sum),
         round_polys.join(","),
@@ -88,10 +89,7 @@ fn batched_matmul_to_json(batch: &BatchedMatMulProofOnChain) -> String {
 ///
 /// This produces a human-readable JSON representation of the proof,
 /// suitable for debugging, external tooling, or archival.
-pub fn proof_to_json(
-    proof: &AggregatedModelProofOnChain,
-    metadata: &MLClaimMetadata,
-) -> String {
+pub fn proof_to_json(proof: &AggregatedModelProofOnChain, metadata: &MLClaimMetadata) -> String {
     let matmul_proofs: Vec<String> = proof
         .matmul_proofs
         .iter()
@@ -159,7 +157,10 @@ mod tests {
 
     #[test]
     fn test_qm31_to_array() {
-        let val = QM31(CM31(M31::from(1), M31::from(2)), CM31(M31::from(3), M31::from(4)));
+        let val = QM31(
+            CM31(M31::from(1), M31::from(2)),
+            CM31(M31::from(3), M31::from(4)),
+        );
         let arr = qm31_to_array(val);
         assert_eq!(arr, [1, 2, 3, 4]);
     }
@@ -175,9 +176,18 @@ mod tests {
     #[test]
     fn test_round_poly_to_json() {
         let rp = RoundPoly {
-            c0: QM31(CM31(M31::from(1), M31::from(0)), CM31(M31::from(0), M31::from(0))),
-            c1: QM31(CM31(M31::from(2), M31::from(0)), CM31(M31::from(0), M31::from(0))),
-            c2: QM31(CM31(M31::from(3), M31::from(0)), CM31(M31::from(0), M31::from(0))),
+            c0: QM31(
+                CM31(M31::from(1), M31::from(0)),
+                CM31(M31::from(0), M31::from(0)),
+            ),
+            c1: QM31(
+                CM31(M31::from(2), M31::from(0)),
+                CM31(M31::from(0), M31::from(0)),
+            ),
+            c2: QM31(
+                CM31(M31::from(3), M31::from(0)),
+                CM31(M31::from(0), M31::from(0)),
+            ),
         };
         let json = round_poly_to_json(&rp);
         assert!(json.contains("\"c0\""));

@@ -5,8 +5,8 @@
 
 use std::fmt;
 
-use crate::compiler::graph::{ComputationGraph, GraphOp, GraphWeights};
 use crate::backend::estimate_proof_memory;
+use crate::compiler::graph::{ComputationGraph, GraphOp, GraphWeights};
 
 /// Summary of a single layer in the model.
 #[derive(Debug, Clone)]
@@ -57,14 +57,23 @@ pub struct ModelSummary {
 impl fmt::Display for ModelSummary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "Model: {}", self.name)?;
-        writeln!(f, "Input:  {:?}  Output: {:?}", self.input_shape, self.output_shape)?;
+        writeln!(
+            f,
+            "Input:  {:?}  Output: {:?}",
+            self.input_shape, self.output_shape
+        )?;
         writeln!(f, "{:-<72}", "")?;
-        writeln!(f, "{:<6} {:<16} {:<14} {:<10} {:<10} {:<6}",
-            "Layer", "Op", "Shape", "Params", "TraceRows", "Weight")?;
+        writeln!(
+            f,
+            "{:<6} {:<16} {:<14} {:<10} {:<10} {:<6}",
+            "Layer", "Op", "Shape", "Params", "TraceRows", "Weight"
+        )?;
         writeln!(f, "{:-<72}", "")?;
 
         for layer in &self.layers {
-            writeln!(f, "{:<6} {:<16} {:?}{:<4} {:<10} {:<10} {:<6}",
+            writeln!(
+                f,
+                "{:<6} {:<16} {:?}{:<4} {:<10} {:<10} {:<6}",
                 layer.index,
                 layer.op_name,
                 layer.output_shape,
@@ -76,7 +85,9 @@ impl fmt::Display for ModelSummary {
         }
 
         writeln!(f, "{:-<72}", "")?;
-        writeln!(f, "Layers: {} total ({} MatMul, {} Activation, {} LayerNorm, {} Other)",
+        writeln!(
+            f,
+            "Layers: {} total ({} MatMul, {} Activation, {} LayerNorm, {} Other)",
             self.layers.len(),
             self.num_matmul_layers,
             self.num_activation_layers,
@@ -85,8 +96,16 @@ impl fmt::Display for ModelSummary {
         )?;
         writeln!(f, "Parameters: {}", self.total_parameters)?;
         writeln!(f, "Trace rows:  {}", self.total_trace_rows)?;
-        writeln!(f, "Weight memory: {:.2} KB", self.weight_memory_bytes as f64 / 1024.0)?;
-        writeln!(f, "Proof memory:  {:.2} KB", self.proof_memory_bytes as f64 / 1024.0)?;
+        writeln!(
+            f,
+            "Weight memory: {:.2} KB",
+            self.weight_memory_bytes as f64 / 1024.0
+        )?;
+        writeln!(
+            f,
+            "Proof memory:  {:.2} KB",
+            self.proof_memory_bytes as f64 / 1024.0
+        )?;
 
         Ok(())
     }
@@ -107,7 +126,9 @@ pub fn summarize_graph(graph: &ComputationGraph, weights: &GraphWeights) -> Mode
                 num_matmul += 1;
                 ("MatMul".to_string(), k * n)
             }
-            GraphOp::Activation { activation_type, .. } => {
+            GraphOp::Activation {
+                activation_type, ..
+            } => {
                 num_activation += 1;
                 (format!("Activation({activation_type:?})"), 0)
             }
@@ -137,13 +158,24 @@ pub fn summarize_graph(graph: &ComputationGraph, weights: &GraphWeights) -> Mode
                 num_other += 1;
                 ("Mul".to_string(), 0)
             }
-            GraphOp::Embedding { vocab_size, embed_dim } => {
+            GraphOp::Embedding {
+                vocab_size,
+                embed_dim,
+            } => {
                 num_other += 1;
                 ("Embedding".to_string(), vocab_size * embed_dim)
             }
-            GraphOp::Conv2D { in_channels, out_channels, kernel_size, .. } => {
+            GraphOp::Conv2D {
+                in_channels,
+                out_channels,
+                kernel_size,
+                ..
+            } => {
                 num_other += 1;
-                ("Conv2D".to_string(), in_channels * out_channels * kernel_size * kernel_size)
+                (
+                    "Conv2D".to_string(),
+                    in_channels * out_channels * kernel_size * kernel_size,
+                )
             }
             GraphOp::Dequantize { .. } => {
                 num_other += 1;
@@ -210,7 +242,7 @@ pub fn summarize_model(model: &super::onnx::OnnxModel) -> ModelSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::onnx::{build_mlp_with_weights, build_mlp};
+    use crate::compiler::onnx::{build_mlp, build_mlp_with_weights};
     use crate::components::activation::ActivationType;
 
     #[test]
@@ -226,14 +258,24 @@ mod tests {
         // All MatMul layers should have weights
         for layer in &summary.layers {
             if layer.op_name == "MatMul" {
-                assert!(layer.has_weight, "MatMul layer {} should have weight", layer.index);
+                assert!(
+                    layer.has_weight,
+                    "MatMul layer {} should have weight",
+                    layer.index
+                );
             }
         }
 
         // Display output should contain "MatMul"
         let display = format!("{summary}");
-        assert!(display.contains("MatMul"), "Display should contain 'MatMul'");
-        assert!(display.contains("Parameters:"), "Display should contain 'Parameters:'");
+        assert!(
+            display.contains("MatMul"),
+            "Display should contain 'MatMul'"
+        );
+        assert!(
+            display.contains("Parameters:"),
+            "Display should contain 'Parameters:'"
+        );
     }
 
     #[test]
@@ -243,7 +285,11 @@ mod tests {
 
         // No weights in build_mlp
         for layer in &summary.layers {
-            assert!(!layer.has_weight, "Layer {} should not have weight", layer.index);
+            assert!(
+                !layer.has_weight,
+                "Layer {} should not have weight",
+                layer.index
+            );
         }
 
         assert_eq!(summary.num_matmul_layers, 2);

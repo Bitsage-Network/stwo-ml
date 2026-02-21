@@ -10,16 +10,14 @@
 //! This ensures the Rust prover and Cairo verifier operate on
 //! identical proof data.
 
-use stwo::core::fields::m31::M31;
 use starknet_ff::FieldElement;
+use stwo::core::fields::m31::M31;
 
-use stwo_ml::prelude::*;
-use stwo_ml::aggregation::prove_model_aggregated_onchain;
-use stwo_ml::compiler::prove::{prove_model, verify_model_matmuls};
-use stwo_ml::cairo_serde::{
-    serialize_ml_proof_for_recursive, serialize_proof, MLClaimMetadata,
-};
 use stwo_ml::aggregation::compute_io_commitment;
+use stwo_ml::aggregation::prove_model_aggregated_onchain;
+use stwo_ml::cairo_serde::{serialize_ml_proof_for_recursive, serialize_proof, MLClaimMetadata};
+use stwo_ml::compiler::prove::{prove_model, verify_model_matmuls};
+use stwo_ml::prelude::*;
 
 /// Cross-verify: per-layer proof verified in Rust, then aggregated and serialized.
 #[test]
@@ -44,8 +42,7 @@ fn test_cross_verify_mlp() {
 
     // 3. Same forward pass output
     assert_eq!(
-        execution.output.data,
-        agg_proof.execution.output.data,
+        execution.output.data, agg_proof.execution.output.data,
         "per-layer and aggregated should produce identical outputs"
     );
 
@@ -66,7 +63,10 @@ fn test_cross_verify_mlp() {
     // 5. Verify activation STARK serializes correctly
     if let Some(stark) = &agg_proof.unified_stark {
         let stark_calldata = serialize_proof(stark);
-        assert!(!stark_calldata.is_empty(), "activation STARK calldata should be non-empty");
+        assert!(
+            !stark_calldata.is_empty(),
+            "activation STARK calldata should be non-empty"
+        );
     }
 }
 
@@ -81,8 +81,8 @@ fn test_cross_verify_deep_mlp() {
     }
 
     // Per-layer
-    let (proofs, exec_per_layer) = prove_model(&model.graph, &input, &model.weights)
-        .expect("deep MLP per-layer proving");
+    let (proofs, exec_per_layer) =
+        prove_model(&model.graph, &input, &model.weights).expect("deep MLP per-layer proving");
 
     verify_model_matmuls(&proofs, &model.graph, &input, &model.weights)
         .expect("deep MLP Rust verification");
@@ -92,8 +92,7 @@ fn test_cross_verify_deep_mlp() {
         .expect("deep MLP aggregated proving");
 
     assert_eq!(
-        exec_per_layer.output.data,
-        agg_proof.execution.output.data,
+        exec_per_layer.output.data, agg_proof.execution.output.data,
         "outputs must match"
     );
 
@@ -129,8 +128,8 @@ fn test_cross_verify_transformer() {
     }
 
     // Per-layer prove + verify
-    let (proofs, exec) = prove_model(&model.graph, &input, &model.weights)
-        .expect("transformer per-layer proving");
+    let (proofs, exec) =
+        prove_model(&model.graph, &input, &model.weights).expect("transformer per-layer proving");
 
     verify_model_matmuls(&proofs, &model.graph, &input, &model.weights)
         .expect("transformer Rust verification");
@@ -141,8 +140,7 @@ fn test_cross_verify_transformer() {
 
     // Same output
     assert_eq!(
-        exec.output.data,
-        agg_proof.execution.output.data,
+        exec.output.data, agg_proof.execution.output.data,
         "transformer outputs must match"
     );
 
@@ -179,19 +177,16 @@ fn test_cross_verify_residual() {
     }
 
     // Per-layer prove + verify
-    let (proofs, exec) = prove_model(&graph, &input, &weights)
-        .expect("residual per-layer proving");
+    let (proofs, exec) = prove_model(&graph, &input, &weights).expect("residual per-layer proving");
 
-    verify_model_matmuls(&proofs, &graph, &input, &weights)
-        .expect("residual Rust verification");
+    verify_model_matmuls(&proofs, &graph, &input, &weights).expect("residual Rust verification");
 
     // Aggregated
     let agg_proof = prove_model_aggregated_onchain(&graph, &input, &weights)
         .expect("residual aggregated proving");
 
     assert_eq!(
-        exec.output.data,
-        agg_proof.execution.output.data,
+        exec.output.data, agg_proof.execution.output.data,
         "residual outputs must match"
     );
 }
@@ -202,16 +197,20 @@ fn test_cross_verify_different_inputs_different_commitments() {
     let model = build_mlp_with_weights(4, &[4], 2, ActivationType::ReLU, 42);
 
     let mut input1 = M31Matrix::new(1, 4);
-    for j in 0..4 { input1.set(0, j, M31::from((j + 1) as u32)); }
+    for j in 0..4 {
+        input1.set(0, j, M31::from((j + 1) as u32));
+    }
 
     let mut input2 = M31Matrix::new(1, 4);
-    for j in 0..4 { input2.set(0, j, M31::from((j + 10) as u32)); }
+    for j in 0..4 {
+        input2.set(0, j, M31::from((j + 10) as u32));
+    }
 
     // Prove both
-    let agg1 = prove_model_aggregated_onchain(&model.graph, &input1, &model.weights)
-        .expect("proof1");
-    let agg2 = prove_model_aggregated_onchain(&model.graph, &input2, &model.weights)
-        .expect("proof2");
+    let agg1 =
+        prove_model_aggregated_onchain(&model.graph, &input1, &model.weights).expect("proof1");
+    let agg2 =
+        prove_model_aggregated_onchain(&model.graph, &input2, &model.weights).expect("proof2");
 
     // Different outputs
     assert_ne!(agg1.execution.output.data, agg2.execution.output.data);
@@ -219,7 +218,10 @@ fn test_cross_verify_different_inputs_different_commitments() {
     // Different IO commitments
     let io1 = compute_io_commitment(&input1, &agg1.execution.output);
     let io2 = compute_io_commitment(&input2, &agg2.execution.output);
-    assert_ne!(io1, io2, "different inputs should produce different IO commitments");
+    assert_ne!(
+        io1, io2,
+        "different inputs should produce different IO commitments"
+    );
 
     // Both verify in Rust
     let (proofs1, _) = prove_model(&model.graph, &input1, &model.weights).expect("prove1");
@@ -268,16 +270,16 @@ impl Drop for EnvVarGuard {
 #[test]
 fn test_cross_verify_mode4_aggregated_binding() {
     use stwo_ml::aggregation::prove_model_pure_gkr;
+    use stwo_ml::cairo_serde::serialize_aggregated_binding_proof;
+    use stwo_ml::components::matmul::{matrix_to_mle_col_major_pub, M31Matrix};
     use stwo_ml::crypto::aggregated_opening::AggregatedWeightClaim;
     use stwo_ml::crypto::poseidon_channel::PoseidonChannel;
-    use stwo_ml::cairo_serde::serialize_aggregated_binding_proof;
-    use stwo_ml::components::matmul::{M31Matrix, matrix_to_mle_col_major_pub};
     // commit_mle_root_only and evaluate_mle_at are exercised internally by
     // prove_aggregated_binding and verify_aggregated_binding respectively.
-    use stwo_ml::compiler::graph::{GraphBuilder, GraphWeights};
-    use stwo_ml::gkr::{LayeredCircuit, verify_gkr, WeightOpeningTranscriptMode};
-    use stwo_ml::starknet::build_gkr_starknet_proof;
     use stwo::core::fields::m31::M31;
+    use stwo_ml::compiler::graph::{GraphBuilder, GraphWeights};
+    use stwo_ml::gkr::{verify_gkr, LayeredCircuit, WeightOpeningTranscriptMode};
+    use stwo_ml::starknet::build_gkr_starknet_proof;
 
     // Activate mode 4 aggregated oracle sumcheck for this test.
     let _binding_mode = EnvVarGuard::set("STWO_WEIGHT_BINDING", "aggregated");
@@ -358,10 +360,7 @@ fn test_cross_verify_mode4_aggregated_binding() {
 
     // Verify estimated calldata matches actual serialized length roughly
     let estimated = aggregated_binding.estimated_calldata_felts();
-    assert!(
-        estimated > 0,
-        "estimated calldata felts must be positive"
-    );
+    assert!(estimated > 0, "estimated calldata felts must be positive");
 
     // ── Step 6: Cross-verify with verify_aggregated_binding ──────────────────
     // Reconstruct the AggregatedWeightClaim structs from the GKR proof data,
@@ -391,12 +390,16 @@ fn test_cross_verify_mode4_aggregated_binding() {
     // The verifier uses a fresh channel and replays the same Fiat-Shamir
     // transcript as the prover. We call verify_gkr (which internally calls
     // verify_aggregated_binding) to confirm end-to-end.
-    let circuit = LayeredCircuit::from_graph(&graph)
-        .expect("circuit compilation should succeed");
+    let circuit = LayeredCircuit::from_graph(&graph).expect("circuit compilation should succeed");
 
     let mut verifier_channel = PoseidonChannel::new();
-    verify_gkr(&circuit, gkr_proof, &agg_proof.execution.output, &mut verifier_channel)
-        .expect("mode 4 GKR verification with aggregated binding must pass");
+    verify_gkr(
+        &circuit,
+        gkr_proof,
+        &agg_proof.execution.output,
+        &mut verifier_channel,
+    )
+    .expect("mode 4 GKR verification with aggregated binding must pass");
 
     // ── Step 7: Verify v4 calldata builder works ─────────────────────────────
     let model_id = FieldElement::from(0xDEAD_BEEFu64);

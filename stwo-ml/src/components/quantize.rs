@@ -6,11 +6,11 @@
 
 use stwo::core::fields::m31::{BaseField, M31};
 use stwo::core::fields::qm31::SecureField;
-use stwo_constraint_framework::{FrameworkEval, FrameworkComponent, EvalAtRow, RelationEntry};
 use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
+use stwo_constraint_framework::{EvalAtRow, FrameworkComponent, FrameworkEval, RelationEntry};
 
 use crate::gadgets::lookup_table::PrecomputedTable;
-use crate::gadgets::quantize::{QuantParams, QuantStrategy, dequantize_value, quantize_value};
+use crate::gadgets::quantize::{dequantize_value, quantize_value, QuantParams, QuantStrategy};
 
 // Relation for quantize lookup: (input, output).
 stwo_constraint_framework::relation!(QuantizeRelation, 2);
@@ -150,7 +150,11 @@ mod tests {
             }
             let f32_val = dequantize_value(inp, &direct_params);
             let expected = quantize_value(f32_val, &params);
-            assert_eq!(out, expected, "input={}, expected={}, got={}", inp.0, expected.0, out.0);
+            assert_eq!(
+                out, expected,
+                "input={}, expected={}, got={}",
+                inp.0, expected.0, out.0
+            );
         }
     }
 

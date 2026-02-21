@@ -11,23 +11,20 @@
 //!
 //! No actual Starknet submission — validates everything up to calldata.
 
-use stwo::core::fields::m31::M31;
 use starknet_ff::FieldElement;
+use stwo::core::fields::m31::M31;
 
-use stwo_ml::prelude::*;
 use stwo_ml::aggregation::{
-    prove_model_aggregated_onchain,
-    prove_model_aggregated_onchain_gkr,
+    compute_io_commitment, prove_model_aggregated_onchain, prove_model_aggregated_onchain_gkr,
     verify_aggregated_model_proof_onchain,
-    compute_io_commitment,
-};
-use stwo_ml::starknet::{
-    build_starknet_proof_onchain, build_starknet_proof_direct,
-    estimate_gas_from_proof,
-    prepare_model_registration, register_model_calldata,
-    register_model_calldata_sumcheck, compute_weight_commitment,
 };
 use stwo_ml::cairo_serde::DirectProofMetadata;
+use stwo_ml::prelude::*;
+use stwo_ml::starknet::{
+    build_starknet_proof_direct, build_starknet_proof_onchain, compute_weight_commitment,
+    estimate_gas_from_proof, prepare_model_registration, register_model_calldata,
+    register_model_calldata_sumcheck,
+};
 
 /// Build a 3-layer MLP: linear(8) → relu → linear(8) → relu → linear(4).
 fn build_e2e_mlp() -> (ComputationGraph, M31Matrix, GraphWeights) {
@@ -91,10 +88,16 @@ fn test_e2e_full_pipeline() {
     let agg_proof = prove_model_aggregated_onchain(&graph, &input, &weights)
         .expect("on-chain aggregated proving should succeed");
 
-    assert!(agg_proof.unified_stark.is_some(), "MLP with activations needs unified STARK");
+    assert!(
+        agg_proof.unified_stark.is_some(),
+        "MLP with activations needs unified STARK"
+    );
     assert_eq!(agg_proof.matmul_proofs.len(), 3, "3 matmul layers");
     assert_eq!(agg_proof.activation_claims.len(), 2, "2 ReLU activations");
-    assert!(!agg_proof.execution.output.data.is_empty(), "forward pass must produce output");
+    assert!(
+        !agg_proof.execution.output.data.is_empty(),
+        "forward pass must produce output"
+    );
 
     // === Phase 2: Verify ===
     let proof_for_verify = prove_model_aggregated_onchain(&graph, &input, &weights)
@@ -102,8 +105,7 @@ fn test_e2e_full_pipeline() {
 
     // Verify execution output matches (deterministic forward pass)
     assert_eq!(
-        agg_proof.execution.output.data,
-        proof_for_verify.execution.output.data,
+        agg_proof.execution.output.data, proof_for_verify.execution.output.data,
         "forward pass must be deterministic"
     );
 
@@ -113,9 +115,20 @@ fn test_e2e_full_pipeline() {
     // === Phase 3: Model Registration ===
     let registration = prepare_model_registration(&graph, &weights, "e2e-test-mlp");
 
-    assert_ne!(registration.model_id, FieldElement::ZERO, "model_id must be non-zero");
-    assert_ne!(registration.weight_commitment, FieldElement::ZERO, "weight_commitment must be non-zero");
-    assert!(registration.num_layers >= 5, "3 matmul + 2 relu = at least 5 layers");
+    assert_ne!(
+        registration.model_id,
+        FieldElement::ZERO,
+        "model_id must be non-zero"
+    );
+    assert_ne!(
+        registration.weight_commitment,
+        FieldElement::ZERO,
+        "weight_commitment must be non-zero"
+    );
+    assert!(
+        registration.num_layers >= 5,
+        "3 matmul + 2 relu = at least 5 layers"
+    );
 
     // Weight commitment should match standalone computation
     let standalone_commitment = compute_weight_commitment(&weights);
@@ -133,12 +146,20 @@ fn test_e2e_full_pipeline() {
 
     // === Phase 4: Registration Calldata ===
     let calldata_obelysk = register_model_calldata(&registration);
-    assert_eq!(calldata_obelysk.len(), 4, "ObelyskVerifier calldata: [model_id, weight_commitment, num_layers, description]");
+    assert_eq!(
+        calldata_obelysk.len(),
+        4,
+        "ObelyskVerifier calldata: [model_id, weight_commitment, num_layers, description]"
+    );
     assert_eq!(calldata_obelysk[0], registration.model_id);
     assert_eq!(calldata_obelysk[1], registration.weight_commitment);
 
     let calldata_sumcheck = register_model_calldata_sumcheck(&registration);
-    assert_eq!(calldata_sumcheck.len(), 2, "SumcheckVerifier calldata: [model_id, weight_commitment]");
+    assert_eq!(
+        calldata_sumcheck.len(),
+        2,
+        "SumcheckVerifier calldata: [model_id, weight_commitment]"
+    );
     assert_eq!(calldata_sumcheck[0], registration.model_id);
     assert_eq!(calldata_sumcheck[1], registration.weight_commitment);
 
@@ -148,10 +169,17 @@ fn test_e2e_full_pipeline() {
     // Raw IO data starts at combined_calldata[4] as a length-prefixed array.
     // combined_calldata[4] = raw_io_data.len(), followed by the raw elements.
     // The on-chain verifier recomputes Poseidon(raw_io_data) to derive io_commitment.
-    assert!(starknet_proof.combined_calldata.len() > 6, "combined calldata too small");
+    assert!(
+        starknet_proof.combined_calldata.len() > 6,
+        "combined calldata too small"
+    );
     let raw_io_len = starknet_proof.combined_calldata[4];
     let raw_io_len_usize: usize = u64::try_from(raw_io_len).unwrap() as usize;
-    assert_eq!(raw_io_len_usize, starknet_proof.raw_io_data.len(), "length prefix must match raw_io_data");
+    assert_eq!(
+        raw_io_len_usize,
+        starknet_proof.raw_io_data.len(),
+        "length prefix must match raw_io_data"
+    );
     let recomputed_io = starknet_crypto::poseidon_hash_many(
         &starknet_proof.combined_calldata[5..5 + raw_io_len_usize],
     );
@@ -164,8 +192,7 @@ fn test_e2e_full_pipeline() {
     // Layer chain commitment follows the raw IO data array
     let layer_chain_idx = 5 + raw_io_len_usize;
     assert_eq!(
-        starknet_proof.combined_calldata[layer_chain_idx],
-        starknet_proof.layer_chain_commitment,
+        starknet_proof.combined_calldata[layer_chain_idx], starknet_proof.layer_chain_commitment,
         "combined_calldata after raw_io_data must equal layer_chain_commitment"
     );
     assert_ne!(starknet_proof.layer_chain_commitment, FieldElement::ZERO);
@@ -173,16 +200,28 @@ fn test_e2e_full_pipeline() {
     // Proof structure
     assert_eq!(starknet_proof.num_matmul_proofs, 3);
     assert_eq!(starknet_proof.layer_claims.len(), 2, "2 activation claims");
-    assert_eq!(starknet_proof.num_proven_layers, 5, "3 matmul + 2 activation");
+    assert_eq!(
+        starknet_proof.num_proven_layers, 5,
+        "3 matmul + 2 activation"
+    );
     assert!(starknet_proof.calldata_size > 0);
 
     // PCS config must have real security parameters
-    assert!(starknet_proof.pcs_config.pow_bits > 0, "pow_bits must be > 0");
-    assert!(starknet_proof.pcs_config.fri_config.n_queries > 0, "n_queries must be > 0");
+    assert!(
+        starknet_proof.pcs_config.pow_bits > 0,
+        "pow_bits must be > 0"
+    );
+    assert!(
+        starknet_proof.pcs_config.fri_config.n_queries > 0,
+        "n_queries must be > 0"
+    );
 
     // Gas estimation
     let gas = estimate_gas_from_proof(&starknet_proof);
-    assert!(gas > starknet_proof.estimated_gas, "DA cost should increase gas");
+    assert!(
+        gas > starknet_proof.estimated_gas,
+        "DA cost should increase gas"
+    );
     assert!(gas > 50_000, "gas should exceed base cost");
 
     // === Phase 6: IO Commitment Consistency ===
@@ -203,7 +242,10 @@ fn test_e2e_full_pipeline() {
     eprintln!("  Calldata size: {} felt252s", starknet_proof.calldata_size);
     eprintln!("  Estimated gas: {}", gas);
     eprintln!("  Model ID: {:#066x}", registration.model_id);
-    eprintln!("  Weight commitment: {:#066x}", registration.weight_commitment);
+    eprintln!(
+        "  Weight commitment: {:#066x}",
+        registration.weight_commitment
+    );
     eprintln!("  IO commitment: {:#066x}", starknet_proof.io_commitment);
 }
 
@@ -225,11 +267,19 @@ fn test_e2e_gkr_pipeline() {
     // GKR proof must be present
     assert!(gkr_proof.gkr_proof.is_some(), "GKR proof must be populated");
     let gkr_layer_count = gkr_proof.gkr_proof.as_ref().unwrap().layer_proofs.len();
-    let gkr_weight_count = gkr_proof.gkr_proof.as_ref().unwrap().weight_commitments.len();
+    let gkr_weight_count = gkr_proof
+        .gkr_proof
+        .as_ref()
+        .unwrap()
+        .weight_commitments
+        .len();
     assert!(gkr_layer_count > 0, "GKR must have layer proofs");
 
     // Standard fields still populated (GKR is additive — doesn't replace STARK)
-    assert!(gkr_proof.unified_stark.is_some(), "unified STARK still present");
+    assert!(
+        gkr_proof.unified_stark.is_some(),
+        "unified STARK still present"
+    );
     assert_eq!(gkr_proof.matmul_proofs.len(), 3);
     assert_eq!(gkr_proof.activation_claims.len(), 2);
 
@@ -243,7 +293,10 @@ fn test_e2e_gkr_pipeline() {
 
     // Starknet proof build works with GKR proof present
     let starknet_proof = build_starknet_proof_onchain(&gkr_proof, &input);
-    assert!(starknet_proof.gkr_calldata.is_some(), "GKR calldata must be present");
+    assert!(
+        starknet_proof.gkr_calldata.is_some(),
+        "GKR calldata must be present"
+    );
     assert!(!starknet_proof.gkr_calldata.as_ref().unwrap().is_empty());
 
     // Verify GKR proof end-to-end (prover↔verifier channel sync)
@@ -255,13 +308,17 @@ fn test_e2e_gkr_pipeline() {
             gkr_proof.gkr_proof.as_ref().unwrap(),
             &gkr_proof.execution.output,
             &mut verify_channel,
-        ).expect("GKR multi-layer verification should succeed");
+        )
+        .expect("GKR multi-layer verification should succeed");
     }
 
     eprintln!("=== E2E GKR Pipeline Test Passed ===");
     eprintln!("  GKR layer proofs: {}", gkr_layer_count);
     eprintln!("  Weight commitments: {}", gkr_weight_count);
-    eprintln!("  GKR calldata size: {} felts", starknet_proof.gkr_calldata.as_ref().unwrap().len());
+    eprintln!(
+        "  GKR calldata size: {} felts",
+        starknet_proof.gkr_calldata.as_ref().unwrap().len()
+    );
 }
 
 /// Direct verification pipeline test: prove → build_starknet_proof_direct → assert.
@@ -305,8 +362,14 @@ fn test_e2e_direct_pipeline() {
     assert_eq!(direct_proof.activation_type, 0);
 
     // MLP with activations must have activation STARK
-    assert!(direct_proof.has_activation_stark, "MLP with ReLU should have activation STARK");
-    assert!(!direct_proof.stark_chunks.is_empty(), "STARK proof must produce chunks");
+    assert!(
+        direct_proof.has_activation_stark,
+        "MLP with ReLU should have activation STARK"
+    );
+    assert!(
+        !direct_proof.stark_chunks.is_empty(),
+        "STARK proof must produce chunks"
+    );
 
     // Each chunk should be at most 4000 felts
     for (i, chunk) in direct_proof.stark_chunks.iter().enumerate() {
@@ -321,16 +384,22 @@ fn test_e2e_direct_pipeline() {
     // Matmul proofs must be present via either batched (CUDA) or individual path.
     // On non-CUDA builds, batched_calldata is empty but matmul_proofs exist in the
     // underlying AggregatedModelProofOnChain.
-    let has_matmul_proofs = !direct_proof.batched_calldata.is_empty()
-        || !agg_proof.matmul_proofs.is_empty();
-    assert!(has_matmul_proofs, "3-layer MLP should have matmul proofs (batched or individual)");
+    let has_matmul_proofs =
+        !direct_proof.batched_calldata.is_empty() || !agg_proof.matmul_proofs.is_empty();
+    assert!(
+        has_matmul_proofs,
+        "3-layer MLP should have matmul proofs (batched or individual)"
+    );
     for (i, batch) in direct_proof.batched_calldata.iter().enumerate() {
         assert!(!batch.is_empty(), "batch {i} calldata is empty");
     }
 
     // Gas and calldata size estimates
     assert!(direct_proof.estimated_gas > 0, "estimated gas must be > 0");
-    assert!(direct_proof.total_calldata_size > 0, "total calldata size must be > 0");
+    assert!(
+        direct_proof.total_calldata_size > 0,
+        "total calldata size must be > 0"
+    );
 
     // === Phase 4: IO Commitment Consistency ===
     // Direct proof IO commitment must match standard pipeline
@@ -342,12 +411,23 @@ fn test_e2e_direct_pipeline() {
 
     eprintln!("=== E2E Direct Pipeline Test Passed ===");
     eprintln!("  Model: 3-layer MLP (8→8→8→4) with ReLU");
-    eprintln!("  Batched sumcheck proofs: {}", direct_proof.batched_calldata.len());
-    eprintln!("  STARK chunks: {} ({} felts total)",
+    eprintln!(
+        "  Batched sumcheck proofs: {}",
+        direct_proof.batched_calldata.len()
+    );
+    eprintln!(
+        "  STARK chunks: {} ({} felts total)",
         direct_proof.stark_chunks.len(),
-        direct_proof.stark_chunks.iter().map(|c| c.len()).sum::<usize>(),
+        direct_proof
+            .stark_chunks
+            .iter()
+            .map(|c| c.len())
+            .sum::<usize>(),
     );
     eprintln!("  Estimated gas: {}", direct_proof.estimated_gas);
-    eprintln!("  Total calldata: {} felts", direct_proof.total_calldata_size);
+    eprintln!(
+        "  Total calldata: {} felts",
+        direct_proof.total_calldata_size
+    );
     eprintln!("  IO commitment: {:#066x}", direct_io_commitment);
 }

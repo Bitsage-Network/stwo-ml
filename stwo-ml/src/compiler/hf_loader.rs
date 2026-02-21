@@ -14,11 +14,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::compiler::graph::{ComputationGraph, GraphBuilder, GraphOp, GraphWeights};
-use crate::components::matmul::M31Matrix;
-use crate::compiler::onnx::{OnnxModel, OnnxError, ModelMetadata, TransformerConfig};
+use crate::compiler::onnx::{ModelMetadata, OnnxError, OnnxModel, TransformerConfig};
 use crate::compiler::quantize_weights::quantize_weight_matrix;
 use crate::compiler::safetensors::{discover_shards, list_tensors_sharded, tensor_to_f32};
 use crate::components::activation::ActivationType;
+use crate::components::matmul::M31Matrix;
 use crate::gadgets::quantize::QuantStrategy;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -61,12 +61,19 @@ impl ValidationReport {
 
         for check in &self.checks {
             let icon = if check.passed { "✓" } else { "✗" };
-            let color = if check.passed { "\x1b[0;32m" } else { "\x1b[0;31m" };
+            let color = if check.passed {
+                "\x1b[0;32m"
+            } else {
+                "\x1b[0;31m"
+            };
             let reset = "\x1b[0m";
             if check.detail.is_empty() {
                 lines.push(format!("  {color}{icon}{reset} {}", check.name));
             } else {
-                lines.push(format!("  {color}{icon}{reset} {}  ({})", check.name, check.detail));
+                lines.push(format!(
+                    "  {color}{icon}{reset} {}  ({})",
+                    check.name, check.detail
+                ));
             }
         }
 
@@ -104,10 +111,7 @@ impl ValidationReport {
 /// 6. Weight files are readable (binary header parses)
 /// 7. Required weight tensors exist for the requested layers
 /// 8. Weight dimensions match expected graph dimensions
-pub fn validate_model_directory(
-    model_dir: &Path,
-    num_layers: Option<usize>,
-) -> ValidationReport {
+pub fn validate_model_directory(model_dir: &Path, num_layers: Option<usize>) -> ValidationReport {
     let mut checks = Vec::new();
 
     // Check 1: Directory exists
@@ -118,7 +122,10 @@ pub fn validate_model_directory(
     });
 
     if !model_dir.is_dir() {
-        return ValidationReport { model_dir: model_dir.to_path_buf(), checks };
+        return ValidationReport {
+            model_dir: model_dir.to_path_buf(),
+            checks,
+        };
     }
 
     // Check 2: config.json exists
@@ -126,11 +133,18 @@ pub fn validate_model_directory(
     checks.push(ValidationCheck {
         name: "config.json present".into(),
         passed: config_path.is_file(),
-        detail: if config_path.is_file() { "found".into() } else { "MISSING".into() },
+        detail: if config_path.is_file() {
+            "found".into()
+        } else {
+            "MISSING".into()
+        },
     });
 
     if !config_path.is_file() {
-        return ValidationReport { model_dir: model_dir.to_path_buf(), checks };
+        return ValidationReport {
+            model_dir: model_dir.to_path_buf(),
+            checks,
+        };
     }
 
     // Check 3: config.json parseable
@@ -141,8 +155,12 @@ pub fn validate_model_directory(
                 passed: true,
                 detail: format!(
                     "{}: d={}, heads={}, ff={}, layers={}, vocab={}",
-                    c.model_type, c.hidden_size, c.num_attention_heads,
-                    c.intermediate_size, c.num_hidden_layers, c.vocab_size,
+                    c.model_type,
+                    c.hidden_size,
+                    c.num_attention_heads,
+                    c.intermediate_size,
+                    c.num_hidden_layers,
+                    c.vocab_size,
                 ),
             });
             Some(c)
@@ -167,7 +185,10 @@ pub fn validate_model_directory(
             } else if cfg.num_hidden_layers == 0 {
                 "num_hidden_layers is 0".into()
             } else {
-                format!("hidden_size={}, layers={}", cfg.hidden_size, cfg.num_hidden_layers)
+                format!(
+                    "hidden_size={}, layers={}",
+                    cfg.hidden_size, cfg.num_hidden_layers
+                )
             },
         });
     }
@@ -176,7 +197,8 @@ pub fn validate_model_directory(
     let shard_paths = discover_shards(model_dir, "model").unwrap_or_default();
     // Also try without "model" filter (some models use different naming)
     let shard_paths = if shard_paths.is_empty() {
-        discover_shards(model_dir, "").unwrap_or_default()
+        discover_shards(model_dir, "")
+            .unwrap_or_default()
             .into_iter()
             .filter(|p| p.extension().map_or(false, |e| e == "safetensors"))
             .collect()
@@ -184,7 +206,8 @@ pub fn validate_model_directory(
         shard_paths
     };
 
-    let total_weight_bytes: u64 = shard_paths.iter()
+    let total_weight_bytes: u64 = shard_paths
+        .iter()
         .filter_map(|p| std::fs::metadata(p).ok())
         .map(|m| m.len())
         .sum();
@@ -192,7 +215,11 @@ pub fn validate_model_directory(
     checks.push(ValidationCheck {
         name: "SafeTensors weight files present".into(),
         passed: !shard_paths.is_empty(),
-        detail: format!("{} shards, {:.1} GB", shard_paths.len(), total_weight_bytes as f64 / 1e9),
+        detail: format!(
+            "{} shards, {:.1} GB",
+            shard_paths.len(),
+            total_weight_bytes as f64 / 1e9
+        ),
     });
 
     // Check 6: Shard index (for multi-shard models)
@@ -216,7 +243,11 @@ pub fn validate_model_directory(
                 checks.push(ValidationCheck {
                     name: "Weight shards readable".into(),
                     passed: true,
-                    detail: format!("{} tensors across {} shards", total_tensors, shard_paths.len()),
+                    detail: format!(
+                        "{} tensors across {} shards",
+                        total_tensors,
+                        shard_paths.len()
+                    ),
                 });
             }
             Err(e) => {
@@ -232,14 +263,20 @@ pub fn validate_model_directory(
     // Check 8: Required weight tensors exist for requested layers
     if let Some(ref cfg) = hf_config {
         let layers = num_layers.unwrap_or(cfg.num_hidden_layers);
-        let layers = if layers == 0 { cfg.num_hidden_layers } else { layers };
+        let layers = if layers == 0 {
+            cfg.num_hidden_layers
+        } else {
+            layers
+        };
 
         if let Ok(all_tensors) = list_tensors_sharded(&shard_paths) {
             let transformer_config = cfg.to_transformer_config();
             let graph = build_hf_transformer_graph(&transformer_config, layers);
             let name_map = build_weight_name_map(&graph, layers, &all_tensors);
 
-            let matmul_count = graph.nodes.iter()
+            let matmul_count = graph
+                .nodes
+                .iter()
                 .filter(|n| matches!(n.op, GraphOp::MatMul { .. }))
                 .count();
             let mapped_count = name_map.len();
@@ -252,7 +289,10 @@ pub fn validate_model_directory(
 
             // Check 9: List which specific weights are missing
             if mapped_count < matmul_count {
-                let missing: Vec<String> = graph.nodes.iter().enumerate()
+                let missing: Vec<String> = graph
+                    .nodes
+                    .iter()
+                    .enumerate()
                     .filter(|(_, n)| matches!(n.op, GraphOp::MatMul { .. }))
                     .filter(|(idx, _)| !name_map.contains_key(idx))
                     .map(|(idx, _)| format!("node {} (MatMul)", idx))
@@ -286,7 +326,10 @@ pub fn validate_model_directory(
         }
     }
 
-    ValidationReport { model_dir: model_dir.to_path_buf(), checks }
+    ValidationReport {
+        model_dir: model_dir.to_path_buf(),
+        checks,
+    }
 }
 
 /// Validate that SafeTensors shard files can be opened and headers parsed.
@@ -323,15 +366,14 @@ fn validate_weight_dimensions(
         if let GraphOp::MatMul { dims: (_m, k, n) } = &node.op {
             if let Some(tensor_name) = name_map.get(&idx) {
                 for mmap in &shard_data {
-                    let tensors = safetensors::SafeTensors::deserialize(mmap)
-                        .map_err(|e| e.to_string())?;
+                    let tensors =
+                        safetensors::SafeTensors::deserialize(mmap).map_err(|e| e.to_string())?;
                     if let Ok(tensor) = tensors.tensor(tensor_name) {
                         let shape = tensor.shape();
                         if shape.len() == 2 {
                             let (rows, cols) = (shape[0], shape[1]);
                             // HF stores (out, in) or (in, out) — either orientation is valid
-                            let ok = (rows == *k && cols == *n)
-                                || (rows == *n && cols == *k);
+                            let ok = (rows == *k && cols == *n) || (rows == *n && cols == *k);
                             if !ok {
                                 mismatches.push(format!(
                                     "{}: shape ({}, {}) does not match expected ({}, {})",
@@ -381,10 +423,7 @@ impl HfConfig {
             .map_err(|e| OnnxError::ParseError(format!("Invalid config.json: {e}")))?;
 
         Ok(Self {
-            model_type: json["model_type"]
-                .as_str()
-                .unwrap_or("unknown")
-                .to_string(),
+            model_type: json["model_type"].as_str().unwrap_or("unknown").to_string(),
             hidden_size: json["hidden_size"]
                 .as_u64()
                 .ok_or_else(|| OnnxError::ParseError("missing hidden_size".into()))?
@@ -405,18 +444,13 @@ impl HfConfig {
                 .as_u64()
                 .ok_or_else(|| OnnxError::ParseError("missing num_hidden_layers".into()))?
                 as usize,
-            vocab_size: json["vocab_size"]
-                .as_u64()
-                .unwrap_or(32000)
-                as usize,
+            vocab_size: json["vocab_size"].as_u64().unwrap_or(32000) as usize,
             hidden_act: json["hidden_act"]
                 .as_str()
                 .or_else(|| json["hidden_activation"].as_str())
                 .unwrap_or("silu")
                 .to_string(),
-            max_position_embeddings: json["max_position_embeddings"]
-                .as_u64()
-                .unwrap_or(2048)
+            max_position_embeddings: json["max_position_embeddings"].as_u64().unwrap_or(2048)
                 as usize,
         })
     }
@@ -454,10 +488,7 @@ impl HfConfig {
 /// * `num_layers` - Number of transformer layers to load (None = all from config)
 ///
 /// Returns an `OnnxModel` with the graph and loaded weights.
-pub fn load_hf_model(
-    model_dir: &Path,
-    num_layers: Option<usize>,
-) -> Result<OnnxModel, OnnxError> {
+pub fn load_hf_model(model_dir: &Path, num_layers: Option<usize>) -> Result<OnnxModel, OnnxError> {
     // ── Step 1: Run full validation ──
     let report = validate_model_directory(model_dir, num_layers);
 
@@ -484,7 +515,11 @@ pub fn load_hf_model(
     let transformer_config = hf_config.to_transformer_config();
 
     let layers = num_layers.unwrap_or(hf_config.num_hidden_layers);
-    let layers = if layers == 0 { hf_config.num_hidden_layers } else { layers };
+    let layers = if layers == 0 {
+        hf_config.num_hidden_layers
+    } else {
+        layers
+    };
 
     eprintln!("Model: {} ({})", hf_config.model_type, model_dir.display());
     eprintln!(
@@ -522,12 +557,15 @@ pub fn load_hf_model(
     let name_map = build_weight_name_map(&graph, layers, &all_tensor_names);
     eprintln!("  Weight name mapping: {} entries", name_map.len());
 
-    let weights = load_weights_from_shards(
-        &shard_paths, &graph, &name_map, QuantStrategy::Symmetric8,
-    ).map_err(|e| OnnxError::WeightError(format!("Cannot load weights: {e}")))?;
+    let weights =
+        load_weights_from_shards(&shard_paths, &graph, &name_map, QuantStrategy::Symmetric8)
+            .map_err(|e| OnnxError::WeightError(format!("Cannot load weights: {e}")))?;
 
     // ── Step 5: Verify all MatMul nodes have weights ──
-    let matmul_nodes: Vec<usize> = graph.nodes.iter().enumerate()
+    let matmul_nodes: Vec<usize> = graph
+        .nodes
+        .iter()
+        .enumerate()
         .filter(|(_, n)| matches!(n.op, GraphOp::MatMul { .. }))
         .map(|(idx, _)| idx)
         .collect();
@@ -550,7 +588,11 @@ pub fn load_hf_model(
     }
 
     let loaded_count = matmul_nodes.len() - missing_weights.len();
-    eprintln!("  Loaded weights for {}/{} MatMul layers ✓", loaded_count, matmul_nodes.len());
+    eprintln!(
+        "  Loaded weights for {}/{} MatMul layers ✓",
+        loaded_count,
+        matmul_nodes.len()
+    );
 
     let num_parameters = crate::compiler::onnx::count_matmul_params(&graph);
 
@@ -588,14 +630,24 @@ pub fn open_streaming_pipeline(
     model_dir: &std::path::Path,
     strategy: QuantStrategy,
     num_layers: Option<usize>,
-) -> Result<(crate::compiler::streaming::StreamingWeightPipeline, ComputationGraph), OnnxError> {
+) -> Result<
+    (
+        crate::compiler::streaming::StreamingWeightPipeline,
+        ComputationGraph,
+    ),
+    OnnxError,
+> {
     // Parse config
     let config_path = model_dir.join("config.json");
     let hf_config = HfConfig::from_file(&config_path)?;
     let transformer_config = hf_config.to_transformer_config();
 
     let layers = num_layers.unwrap_or(hf_config.num_hidden_layers);
-    let layers = if layers == 0 { hf_config.num_hidden_layers } else { layers };
+    let layers = if layers == 0 {
+        hf_config.num_hidden_layers
+    } else {
+        layers
+    };
 
     // Build computation graph
     let graph = build_hf_transformer_graph(&transformer_config, layers);
@@ -618,8 +670,12 @@ pub fn open_streaming_pipeline(
 
     // Open pipeline (mmap only, no weight loading)
     let pipeline = crate::compiler::streaming::StreamingWeightPipeline::open(
-        &shard_paths, &graph, name_map, strategy,
-    ).map_err(|e| OnnxError::WeightError(format!("Cannot open streaming pipeline: {e}")))?;
+        &shard_paths,
+        &graph,
+        name_map,
+        strategy,
+    )
+    .map_err(|e| OnnxError::WeightError(format!("Cannot open streaming pipeline: {e}")))?;
 
     Ok((pipeline, graph))
 }
@@ -631,10 +687,7 @@ pub fn open_streaming_pipeline(
 /// Build a transformer computation graph matching a HuggingFace architecture.
 ///
 /// Each transformer block: LayerNorm → Q proj → O proj → LayerNorm → FFN up → act → FFN down
-fn build_hf_transformer_graph(
-    config: &TransformerConfig,
-    num_layers: usize,
-) -> ComputationGraph {
+fn build_hf_transformer_graph(config: &TransformerConfig, num_layers: usize) -> ComputationGraph {
     let d = config.d_model;
     let d_ff = config.d_ff;
 
@@ -785,8 +838,7 @@ fn load_weights_from_shards(
 
     let mut shards: Vec<ShardHandle> = Vec::with_capacity(shard_paths.len());
     for path in shard_paths {
-        let file = std::fs::File::open(path)
-            .map_err(|e| WeightError::IoError(e.to_string()))?;
+        let file = std::fs::File::open(path).map_err(|e| WeightError::IoError(e.to_string()))?;
         let mmap = unsafe { memmap2::Mmap::map(&file) }
             .map_err(|e| WeightError::IoError(e.to_string()))?;
 
@@ -822,7 +874,9 @@ fn load_weights_from_shards(
     }
     eprintln!(
         "  Indexed {} tensors across {} shards in {:.1}s",
-        tensor_to_shard.len(), shards.len(), t_load_start.elapsed().as_secs_f64(),
+        tensor_to_shard.len(),
+        shards.len(),
+        t_load_start.elapsed().as_secs_f64(),
     );
 
     let mut weights = GraphWeights::new();
@@ -833,9 +887,10 @@ fn load_weights_from_shards(
     let mut shard_to_weights: HashMap<usize, Vec<(usize, usize, usize, &str)>> = HashMap::new();
     for (idx, node) in graph.nodes.iter().enumerate() {
         if let GraphOp::MatMul { dims: (_m, k, n) } = &node.op {
-            if let Some(tensor_name) = name_map.get(& idx) {
+            if let Some(tensor_name) = name_map.get(&idx) {
                 if let Some(&shard_idx) = tensor_to_shard.get(tensor_name) {
-                    shard_to_weights.entry(shard_idx)
+                    shard_to_weights
+                        .entry(shard_idx)
                         .or_default()
                         .push((idx, *k, *n, tensor_name));
                 } else {
@@ -856,15 +911,19 @@ fn load_weights_from_shards(
     use rayon::prelude::*;
 
     let t_extract = std::time::Instant::now();
-    let mut all_raw: Vec<(usize, usize, usize, Vec<f32>, Vec<usize>)> = Vec::with_capacity(total_weights);
+    let mut all_raw: Vec<(usize, usize, usize, Vec<f32>, Vec<usize>)> =
+        Vec::with_capacity(total_weights);
 
     for shard_idx in 0..shards.len() {
-        let Some(weight_list) = shard_to_weights.get(&shard_idx) else { continue };
+        let Some(weight_list) = shard_to_weights.get(&shard_idx) else {
+            continue;
+        };
         let tensors = safetensors::SafeTensors::deserialize(&shards[shard_idx].mmap)
             .map_err(|e| WeightError::IoError(e.to_string()))?;
 
         for &(idx, k, n, tensor_name) in weight_list {
-            let tensor = tensors.tensor(tensor_name)
+            let tensor = tensors
+                .tensor(tensor_name)
                 .map_err(|e| WeightError::IoError(format!("{}: {e}", tensor_name)))?;
             let data = tensor_to_f32(tensor.data(), tensor.dtype());
             let shape = tensor.shape().to_vec();
@@ -873,16 +932,22 @@ fn load_weights_from_shards(
     }
     eprintln!(
         "  Extracted {} tensors from {} shards in {:.1}s",
-        all_raw.len(), shards.len(), t_extract.elapsed().as_secs_f64(),
+        all_raw.len(),
+        shards.len(),
+        t_extract.elapsed().as_secs_f64(),
     );
 
     // Drop shard mmaps to free virtual memory before parallel processing
     drop(shards);
 
     let t_process = std::time::Instant::now();
-    eprintln!("  Processing {} weights in parallel (transpose + quantize)...", all_raw.len());
+    eprintln!(
+        "  Processing {} weights in parallel (transpose + quantize)...",
+        all_raw.len()
+    );
 
-    let processed: Vec<(usize, M31Matrix)> = all_raw.par_iter()
+    let processed: Vec<(usize, M31Matrix)> = all_raw
+        .par_iter()
         .map(|(idx, k, n, data, shape)| {
             let (k, n) = (*k, *n);
             let (weight_data, wk, wn) = if shape.len() == 2 {
@@ -927,7 +992,8 @@ fn load_weights_from_shards(
 
     eprintln!(
         "  All {} weights loaded in {:.1}s",
-        loaded_count, t_load_start.elapsed().as_secs_f64(),
+        loaded_count,
+        t_load_start.elapsed().as_secs_f64(),
     );
 
     Ok(weights)

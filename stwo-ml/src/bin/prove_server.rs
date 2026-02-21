@@ -30,17 +30,15 @@ use stwo_ml::circuits::batch::BatchPublicInputs;
 use stwo_ml::compiler::hf_loader::load_hf_model;
 use stwo_ml::compiler::onnx::load_onnx;
 use stwo_ml::components::matmul::M31Matrix;
-use stwo_ml::gadgets::quantize::{QuantStrategy, quantize_tensor};
+use stwo_ml::gadgets::quantize::{quantize_tensor, QuantStrategy};
 use stwo_ml::starknet::{prepare_model_registration, prove_for_starknet_onchain};
 use stwo_ml::tee::detect_tee_capability;
 
-use stwo_ml::privacy::relayer::{
-    WithdrawalRecipients,
-    build_submit_batch_proof_calldata,
-    compute_withdrawal_binding_digest,
-    hash_batch_public_inputs_for_cairo,
-};
 use stwo_ml::cairo_serde::serialize_proof;
+use stwo_ml::privacy::relayer::{
+    build_submit_batch_proof_calldata, compute_withdrawal_binding_digest,
+    hash_batch_public_inputs_for_cairo, WithdrawalRecipients,
+};
 
 // =============================================================================
 // State
@@ -381,9 +379,18 @@ fn create_capture_hook(
         Err(_) => return None,
     };
     let hook_dir = std::path::Path::new(&audit_dir).join(model_id);
-    match stwo_ml::audit::capture::CaptureHook::new(&hook_dir, model_id, weight_commitment, description) {
+    match stwo_ml::audit::capture::CaptureHook::new(
+        &hook_dir,
+        model_id,
+        weight_commitment,
+        description,
+    ) {
         Ok(hook) => {
-            eprintln!("Audit capture enabled for model {} -> {}", model_id, hook_dir.display());
+            eprintln!(
+                "Audit capture enabled for model {} -> {}",
+                model_id,
+                hook_dir.display()
+            );
             Some(Arc::new(hook))
         }
         Err(e) => {
@@ -397,7 +404,10 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     let cap = detect_tee_capability();
     let models = state.models.read().await;
     let jobs = state.jobs.read().await;
-    let active = jobs.values().filter(|j| j.status == JobStatus::Proving || j.status == JobStatus::Queued).count();
+    let active = jobs
+        .values()
+        .filter(|j| j.status == JobStatus::Proving || j.status == JobStatus::Queued)
+        .count();
 
     Json(HealthResponse {
         status: "ok".to_string(),
@@ -420,7 +430,9 @@ async fn load_model(
         load_hf_model(&path, None).map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
-                Json(ErrorResponse { error: format!("Failed to load HF model: {e}") }),
+                Json(ErrorResponse {
+                    error: format!("Failed to load HF model: {e}"),
+                }),
             )
         })?
     } else {
@@ -428,7 +440,9 @@ async fn load_model(
         load_onnx(&path).map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
-                Json(ErrorResponse { error: format!("Failed to load model: {e}") }),
+                Json(ErrorResponse {
+                    error: format!("Failed to load model: {e}"),
+                }),
             )
         })?
     };
@@ -468,7 +482,9 @@ async fn load_hf_model_handler(
     let hf = load_hf_model(&path, req.layers).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse { error: format!("Failed to load HF model: {e}") }),
+            Json(ErrorResponse {
+                error: format!("Failed to load HF model: {e}"),
+            }),
         )
     })?;
 
@@ -507,7 +523,9 @@ async fn get_model(
     let model = models.get(&model_id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
-            Json(ErrorResponse { error: format!("Model '{model_id}' not found") }),
+            Json(ErrorResponse {
+                error: format!("Model '{model_id}' not found"),
+            }),
         )
     })?;
 
@@ -528,7 +546,12 @@ async fn submit_prove(
     let model = models.get(&req.model_id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
-            Json(ErrorResponse { error: format!("Model '{}' not found. Load it first via POST /api/v1/models", req.model_id) }),
+            Json(ErrorResponse {
+                error: format!(
+                    "Model '{}' not found. Load it first via POST /api/v1/models",
+                    req.model_id
+                ),
+            }),
         )
     })?;
 
@@ -539,7 +562,11 @@ async fn submit_prove(
             return Err((
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
-                    error: format!("Input has {} values, model expects {} ({in_rows}x{in_cols})", input_f32.len(), expected),
+                    error: format!(
+                        "Input has {} values, model expects {} ({in_rows}x{in_cols})",
+                        input_f32.len(),
+                        expected
+                    ),
                 }),
             ));
         }
@@ -635,9 +662,7 @@ async fn submit_prove(
                     num_matmul_proofs: proof.num_matmul_proofs,
                     num_layers: proof.num_proven_layers,
                     prove_time_ms: prove_elapsed.as_millis() as u64,
-                    tee_attestation_hash: proof
-                        .tee_attestation_hash
-                        .map(|h| format!("0x{:x}", h)),
+                    tee_attestation_hash: proof.tee_attestation_hash.map(|h| format!("0x{:x}", h)),
                 };
 
                 if let Some(j) = jobs.get_mut(&jid) {
@@ -659,13 +684,11 @@ async fn submit_prove(
                     if let Some(model) = models.get(&jid_model) {
                         if let Some(ref hook) = model.capture_hook {
                             // Replay forward pass to get output for audit record
-                            if let Ok(output_m31) =
-                                stwo_ml::audit::replay::execute_forward_pass(
-                                    &audit_graph,
-                                    &input_matrix_clone,
-                                    &audit_weights,
-                                )
-                            {
+                            if let Ok(output_m31) = stwo_ml::audit::replay::execute_forward_pass(
+                                &audit_graph,
+                                &input_matrix_clone,
+                                &audit_weights,
+                            ) {
                                 hook.record(stwo_ml::audit::capture::CaptureJob {
                                     input_tokens: vec![],
                                     output_tokens: vec![],
@@ -674,7 +697,8 @@ async fn submit_prove(
                                     timestamp_ns: std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap()
-                                        .as_nanos() as u64,
+                                        .as_nanos()
+                                        as u64,
                                     latency_ms: prove_elapsed.as_millis() as u64,
                                     gpu_device: "server".to_string(),
                                     tee_report_hash: tee_hash,
@@ -715,7 +739,9 @@ async fn get_prove_status(
     let job = jobs.get(&job_id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
-            Json(ErrorResponse { error: format!("Job '{job_id}' not found") }),
+            Json(ErrorResponse {
+                error: format!("Job '{job_id}' not found"),
+            }),
         )
     })?;
 
@@ -735,23 +761,31 @@ async fn get_prove_result(
     let job = jobs.get(&job_id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
-            Json(ErrorResponse { error: format!("Job '{job_id}' not found") }),
+            Json(ErrorResponse {
+                error: format!("Job '{job_id}' not found"),
+            }),
         )
     })?;
 
     match job.status {
         JobStatus::Completed => {
             let result = job.result.as_ref().ok_or_else(|| {
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
-                    error: "Job completed but result is missing (internal error)".to_string(),
-                }))
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "Job completed but result is missing (internal error)".to_string(),
+                    }),
+                )
             })?;
             Ok(Json(result.clone()))
         }
         JobStatus::Failed => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
-                error: job.error.clone().unwrap_or_else(|| "Unknown error".to_string()),
+                error: job
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "Unknown error".to_string()),
             }),
         )),
         _ => Err((
@@ -774,7 +808,9 @@ async fn submit_privacy_batch(
     if req.deposits.is_empty() && req.withdrawals.is_empty() && req.spends.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse { error: "Batch must contain at least one transaction".to_string() }),
+            Json(ErrorResponse {
+                error: "Batch must contain at least one transaction".to_string(),
+            }),
         ));
     }
 
@@ -808,205 +844,217 @@ async fn submit_privacy_batch(
 
         let prove_start = Instant::now();
 
-        let result = tokio::task::spawn_blocking(move || {
-            use stwo::core::fields::m31::BaseField;
-            use stwo_ml::crypto::commitment::Note;
-            use stwo_ml::circuits::deposit::DepositWitness;
-            use stwo_ml::circuits::withdraw::WithdrawWitness;
-            use stwo_ml::circuits::spend::{SpendWitness, InputNoteWitness, OutputNoteWitness};
-            use stwo_ml::circuits::batch::{PrivacyBatch, prove_privacy_batch};
-            use stwo_ml::crypto::merkle_m31::MerklePath;
-            use stwo_ml::crypto::poseidon2_m31::RATE;
+        let result =
+            tokio::task::spawn_blocking(move || {
+                use stwo::core::fields::m31::BaseField;
+                use stwo_ml::circuits::batch::{prove_privacy_batch, PrivacyBatch};
+                use stwo_ml::circuits::deposit::DepositWitness;
+                use stwo_ml::circuits::spend::{InputNoteWitness, OutputNoteWitness, SpendWitness};
+                use stwo_ml::circuits::withdraw::WithdrawWitness;
+                use stwo_ml::crypto::commitment::Note;
+                use stwo_ml::crypto::merkle_m31::MerklePath;
+                use stwo_ml::crypto::poseidon2_m31::RATE;
 
-            let m31 = |v: u32| BaseField::from_u32_unchecked(v);
-            let m31_4 = |arr: [u32; 4]| [m31(arr[0]), m31(arr[1]), m31(arr[2]), m31(arr[3])];
-            let m31_8 = |arr: [u32; 8]| -> [BaseField; 8] {
-                [m31(arr[0]), m31(arr[1]), m31(arr[2]), m31(arr[3]),
-                 m31(arr[4]), m31(arr[5]), m31(arr[6]), m31(arr[7])]
-            };
-
-            // Helper: generate random blinding (fallible)
-            let random_blinding = || -> Result<[BaseField; 4], String> {
-                let mut buf = [0u8; 16];
-                getrandom::getrandom(&mut buf)
-                    .map_err(|e| format!("entropy source unavailable: {e}"))?;
-                Ok([
-                    m31(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) % ((1u32 << 31) - 1)),
-                    m31(u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) % ((1u32 << 31) - 1)),
-                    m31(u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]) % ((1u32 << 31) - 1)),
-                    m31(u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]) % ((1u32 << 31) - 1)),
-                ])
-            };
-
-            // Max amount that fits in two M31 limbs
-            const MAX_AMOUNT: u64 = ((1u64 << 31) - 1) + ((1u64 << 31) - 1) * (1u64 << 31);
-
-            // Build deposit witnesses
-            let deposits: Vec<DepositWitness> = {
-                let mut v = Vec::with_capacity(req.deposits.len());
-                for d in &req.deposits {
-                    if d.amount > MAX_AMOUNT {
-                        return Err(format!("deposit amount {} exceeds max {}", d.amount, MAX_AMOUNT));
-                    }
-                    let pubkey = m31_4(d.recipient_pubkey);
-                    let amount_lo = m31((d.amount & 0x7FFF_FFFF) as u32);
-                    let amount_hi = m31((d.amount >> 31) as u32);
-                    let blinding = random_blinding()?;
-                    let note = Note {
-                        owner_pubkey: pubkey,
-                        amount_lo,
-                        amount_hi,
-                        asset_id: m31(d.asset_id),
-                        blinding,
-                    };
-                    v.push(DepositWitness {
-                        note,
-                        amount: d.amount,
-                        asset_id: m31(d.asset_id),
-                    });
-                }
-                v
-            };
-
-            // Build withdraw witnesses and recipient bindings.
-            let mut payout_recipients: Vec<String> = Vec::with_capacity(req.withdrawals.len());
-            let mut credit_recipients: Vec<String> = Vec::with_capacity(req.withdrawals.len());
-            let mut withdrawals: Vec<WithdrawWitness> = Vec::with_capacity(req.withdrawals.len());
-            for (idx, w) in req.withdrawals.iter().enumerate() {
-                let payout = w.payout_recipient.clone().ok_or_else(|| {
-                    format!("withdrawals[{idx}] missing payout_recipient")
-                })?;
-                let credit = w
-                    .credit_recipient
-                    .clone()
-                    .unwrap_or_else(|| payout.clone());
-                let binding = compute_withdrawal_binding_digest(
-                    &payout,
-                    &credit,
-                    w.note.asset_id as u64,
-                    w.note.amount_lo as u64,
-                    w.note.amount_hi as u64,
-                    idx as u32,
-                )
-                .map_err(|e| format!("withdrawals[{idx}] invalid binding inputs: {e}"))?;
-
-                let note = Note {
-                    owner_pubkey: m31_4(w.note.pub_key),
-                    amount_lo: m31(w.note.amount_lo),
-                    amount_hi: m31(w.note.amount_hi),
-                    asset_id: m31(w.note.asset_id),
-                    blinding: m31_4(w.note.blinding),
+                let m31 = |v: u32| BaseField::from_u32_unchecked(v);
+                let m31_4 = |arr: [u32; 4]| [m31(arr[0]), m31(arr[1]), m31(arr[2]), m31(arr[3])];
+                let m31_8 = |arr: [u32; 8]| -> [BaseField; 8] {
+                    [
+                        m31(arr[0]),
+                        m31(arr[1]),
+                        m31(arr[2]),
+                        m31(arr[3]),
+                        m31(arr[4]),
+                        m31(arr[5]),
+                        m31(arr[6]),
+                        m31(arr[7]),
+                    ]
                 };
-                let siblings: Vec<[BaseField; RATE]> = w
-                    .merkle_siblings
-                    .iter()
-                    .map(|s| m31_8(*s))
-                    .collect();
-                withdrawals.push(WithdrawWitness {
-                    note,
-                    spending_key: m31_4(w.spending_key),
-                    merkle_path: MerklePath {
-                        siblings,
-                        index: w.merkle_index,
-                    },
-                    merkle_root: m31_8(w.merkle_root),
-                    withdrawal_binding: binding,
-                });
-                payout_recipients.push(payout);
-                credit_recipients.push(credit);
-            }
 
-            // Build spend witnesses
-            let spends: Vec<SpendWitness> = req.spends.iter().map(|s| {
-                let inputs: [InputNoteWitness; 2] = [
-                    {
-                        let inp = &s.inputs[0];
+                // Helper: generate random blinding (fallible)
+                let random_blinding = || -> Result<[BaseField; 4], String> {
+                    let mut buf = [0u8; 16];
+                    getrandom::getrandom(&mut buf)
+                        .map_err(|e| format!("entropy source unavailable: {e}"))?;
+                    Ok([
+                        m31(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])
+                            % ((1u32 << 31) - 1)),
+                        m31(u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]])
+                            % ((1u32 << 31) - 1)),
+                        m31(u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]])
+                            % ((1u32 << 31) - 1)),
+                        m31(u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]])
+                            % ((1u32 << 31) - 1)),
+                    ])
+                };
+
+                // Max amount that fits in two M31 limbs
+                const MAX_AMOUNT: u64 = ((1u64 << 31) - 1) + ((1u64 << 31) - 1) * (1u64 << 31);
+
+                // Build deposit witnesses
+                let deposits: Vec<DepositWitness> = {
+                    let mut v = Vec::with_capacity(req.deposits.len());
+                    for d in &req.deposits {
+                        if d.amount > MAX_AMOUNT {
+                            return Err(format!(
+                                "deposit amount {} exceeds max {}",
+                                d.amount, MAX_AMOUNT
+                            ));
+                        }
+                        let pubkey = m31_4(d.recipient_pubkey);
+                        let amount_lo = m31((d.amount & 0x7FFF_FFFF) as u32);
+                        let amount_hi = m31((d.amount >> 31) as u32);
+                        let blinding = random_blinding()?;
                         let note = Note {
-                            owner_pubkey: m31_4(inp.note.pub_key),
-                            amount_lo: m31(inp.note.amount_lo),
-                            amount_hi: m31(inp.note.amount_hi),
-                            asset_id: m31(inp.note.asset_id),
-                            blinding: m31_4(inp.note.blinding),
+                            owner_pubkey: pubkey,
+                            amount_lo,
+                            amount_hi,
+                            asset_id: m31(d.asset_id),
+                            blinding,
                         };
-                        let siblings: Vec<[BaseField; RATE]> = inp.merkle_siblings
-                            .iter()
-                            .map(|sib| m31_8(*sib))
-                            .collect();
-                        InputNoteWitness {
+                        v.push(DepositWitness {
                             note,
-                            spending_key: m31_4(inp.spending_key),
-                            merkle_path: MerklePath {
-                                siblings,
-                                index: inp.merkle_index,
-                            },
-                        }
-                    },
-                    {
-                        let inp = &s.inputs[1];
-                        let note = Note {
-                            owner_pubkey: m31_4(inp.note.pub_key),
-                            amount_lo: m31(inp.note.amount_lo),
-                            amount_hi: m31(inp.note.amount_hi),
-                            asset_id: m31(inp.note.asset_id),
-                            blinding: m31_4(inp.note.blinding),
-                        };
-                        let siblings: Vec<[BaseField; RATE]> = inp.merkle_siblings
-                            .iter()
-                            .map(|sib| m31_8(*sib))
-                            .collect();
-                        InputNoteWitness {
-                            note,
-                            spending_key: m31_4(inp.spending_key),
-                            merkle_path: MerklePath {
-                                siblings,
-                                index: inp.merkle_index,
-                            },
-                        }
-                    },
-                ];
-                let outputs: [OutputNoteWitness; 2] = [
-                    {
-                        let out = &s.outputs[0];
-                        OutputNoteWitness {
-                            note: Note {
-                                owner_pubkey: m31_4(out.recipient_pubkey),
-                                amount_lo: m31(out.amount_lo),
-                                amount_hi: m31(out.amount_hi),
-                                asset_id: m31(out.asset_id),
-                                blinding: m31_4(out.blinding),
-                            },
-                        }
-                    },
-                    {
-                        let out = &s.outputs[1];
-                        OutputNoteWitness {
-                            note: Note {
-                                owner_pubkey: m31_4(out.recipient_pubkey),
-                                amount_lo: m31(out.amount_lo),
-                                amount_hi: m31(out.amount_hi),
-                                asset_id: m31(out.asset_id),
-                                blinding: m31_4(out.blinding),
-                            },
-                        }
-                    },
-                ];
-                SpendWitness {
-                    inputs,
-                    outputs,
-                    merkle_root: m31_8(s.merkle_root),
+                            amount: d.amount,
+                            asset_id: m31(d.asset_id),
+                        });
+                    }
+                    v
+                };
+
+                // Build withdraw witnesses and recipient bindings.
+                let mut payout_recipients: Vec<String> = Vec::with_capacity(req.withdrawals.len());
+                let mut credit_recipients: Vec<String> = Vec::with_capacity(req.withdrawals.len());
+                let mut withdrawals: Vec<WithdrawWitness> =
+                    Vec::with_capacity(req.withdrawals.len());
+                for (idx, w) in req.withdrawals.iter().enumerate() {
+                    let payout = w
+                        .payout_recipient
+                        .clone()
+                        .ok_or_else(|| format!("withdrawals[{idx}] missing payout_recipient"))?;
+                    let credit = w.credit_recipient.clone().unwrap_or_else(|| payout.clone());
+                    let binding = compute_withdrawal_binding_digest(
+                        &payout,
+                        &credit,
+                        w.note.asset_id as u64,
+                        w.note.amount_lo as u64,
+                        w.note.amount_hi as u64,
+                        idx as u32,
+                    )
+                    .map_err(|e| format!("withdrawals[{idx}] invalid binding inputs: {e}"))?;
+
+                    let note = Note {
+                        owner_pubkey: m31_4(w.note.pub_key),
+                        amount_lo: m31(w.note.amount_lo),
+                        amount_hi: m31(w.note.amount_hi),
+                        asset_id: m31(w.note.asset_id),
+                        blinding: m31_4(w.note.blinding),
+                    };
+                    let siblings: Vec<[BaseField; RATE]> =
+                        w.merkle_siblings.iter().map(|s| m31_8(*s)).collect();
+                    withdrawals.push(WithdrawWitness {
+                        note,
+                        spending_key: m31_4(w.spending_key),
+                        merkle_path: MerklePath {
+                            siblings,
+                            index: w.merkle_index,
+                        },
+                        merkle_root: m31_8(w.merkle_root),
+                        withdrawal_binding: binding,
+                    });
+                    payout_recipients.push(payout);
+                    credit_recipients.push(credit);
                 }
-            }).collect();
 
-            let batch = PrivacyBatch {
-                deposits,
-                withdrawals,
-                spends,
-            };
+                // Build spend witnesses
+                let spends: Vec<SpendWitness> = req
+                    .spends
+                    .iter()
+                    .map(|s| {
+                        let inputs: [InputNoteWitness; 2] = [
+                            {
+                                let inp = &s.inputs[0];
+                                let note = Note {
+                                    owner_pubkey: m31_4(inp.note.pub_key),
+                                    amount_lo: m31(inp.note.amount_lo),
+                                    amount_hi: m31(inp.note.amount_hi),
+                                    asset_id: m31(inp.note.asset_id),
+                                    blinding: m31_4(inp.note.blinding),
+                                };
+                                let siblings: Vec<[BaseField; RATE]> =
+                                    inp.merkle_siblings.iter().map(|sib| m31_8(*sib)).collect();
+                                InputNoteWitness {
+                                    note,
+                                    spending_key: m31_4(inp.spending_key),
+                                    merkle_path: MerklePath {
+                                        siblings,
+                                        index: inp.merkle_index,
+                                    },
+                                }
+                            },
+                            {
+                                let inp = &s.inputs[1];
+                                let note = Note {
+                                    owner_pubkey: m31_4(inp.note.pub_key),
+                                    amount_lo: m31(inp.note.amount_lo),
+                                    amount_hi: m31(inp.note.amount_hi),
+                                    asset_id: m31(inp.note.asset_id),
+                                    blinding: m31_4(inp.note.blinding),
+                                };
+                                let siblings: Vec<[BaseField; RATE]> =
+                                    inp.merkle_siblings.iter().map(|sib| m31_8(*sib)).collect();
+                                InputNoteWitness {
+                                    note,
+                                    spending_key: m31_4(inp.spending_key),
+                                    merkle_path: MerklePath {
+                                        siblings,
+                                        index: inp.merkle_index,
+                                    },
+                                }
+                            },
+                        ];
+                        let outputs: [OutputNoteWitness; 2] = [
+                            {
+                                let out = &s.outputs[0];
+                                OutputNoteWitness {
+                                    note: Note {
+                                        owner_pubkey: m31_4(out.recipient_pubkey),
+                                        amount_lo: m31(out.amount_lo),
+                                        amount_hi: m31(out.amount_hi),
+                                        asset_id: m31(out.asset_id),
+                                        blinding: m31_4(out.blinding),
+                                    },
+                                }
+                            },
+                            {
+                                let out = &s.outputs[1];
+                                OutputNoteWitness {
+                                    note: Note {
+                                        owner_pubkey: m31_4(out.recipient_pubkey),
+                                        amount_lo: m31(out.amount_lo),
+                                        amount_hi: m31(out.amount_hi),
+                                        asset_id: m31(out.asset_id),
+                                        blinding: m31_4(out.blinding),
+                                    },
+                                }
+                            },
+                        ];
+                        SpendWitness {
+                            inputs,
+                            outputs,
+                            merkle_root: m31_8(s.merkle_root),
+                        }
+                    })
+                    .collect();
 
-            let proof = prove_privacy_batch(&batch).map_err(|e| format!("{e}"))?;
-            Ok((proof, payout_recipients, credit_recipients))
-        })
-        .await;
+                let batch = PrivacyBatch {
+                    deposits,
+                    withdrawals,
+                    spends,
+                };
+
+                let proof = prove_privacy_batch(&batch).map_err(|e| format!("{e}"))?;
+                Ok((proof, payout_recipients, credit_recipients))
+            })
+            .await;
 
         let prove_elapsed = prove_start.elapsed();
         let mut jobs = state_clone.privacy_jobs.write().await;
@@ -1016,43 +1064,64 @@ async fn submit_privacy_batch(
                 let pi = &batch_proof.public_inputs;
 
                 // Build deposit results
-                let deposit_results: Vec<PrivacyDepositResult> = pi.deposits.iter().map(|d| {
-                    let mut hex = String::with_capacity(2 + 8 * 8);
-                    hex.push_str("0x");
-                    for &e in &d.commitment { hex.push_str(&format!("{:08x}", e.0)); }
-                    PrivacyDepositResult {
-                        commitment: hex,
-                        amount: d.amount,
-                        asset_id: d.asset_id.0,
-                    }
-                }).collect();
+                let deposit_results: Vec<PrivacyDepositResult> = pi
+                    .deposits
+                    .iter()
+                    .map(|d| {
+                        let mut hex = String::with_capacity(2 + 8 * 8);
+                        hex.push_str("0x");
+                        for &e in &d.commitment {
+                            hex.push_str(&format!("{:08x}", e.0));
+                        }
+                        PrivacyDepositResult {
+                            commitment: hex,
+                            amount: d.amount,
+                            asset_id: d.asset_id.0,
+                        }
+                    })
+                    .collect();
 
                 // Build withdraw results
-                let withdraw_results: Vec<PrivacyWithdrawResult> = pi.withdrawals.iter().map(|w| {
-                    let mut hex = String::with_capacity(2 + 8 * 8);
-                    hex.push_str("0x");
-                    for &e in &w.nullifier { hex.push_str(&format!("{:08x}", e.0)); }
-                    let amount = (w.amount_lo.0 as u64) | ((w.amount_hi.0 as u64) << 31);
-                    PrivacyWithdrawResult {
-                        nullifier: hex,
-                        amount,
-                        asset_id: w.asset_id.0,
-                    }
-                }).collect();
+                let withdraw_results: Vec<PrivacyWithdrawResult> = pi
+                    .withdrawals
+                    .iter()
+                    .map(|w| {
+                        let mut hex = String::with_capacity(2 + 8 * 8);
+                        hex.push_str("0x");
+                        for &e in &w.nullifier {
+                            hex.push_str(&format!("{:08x}", e.0));
+                        }
+                        let amount = (w.amount_lo.0 as u64) | ((w.amount_hi.0 as u64) << 31);
+                        PrivacyWithdrawResult {
+                            nullifier: hex,
+                            amount,
+                            asset_id: w.asset_id.0,
+                        }
+                    })
+                    .collect();
 
                 // Build spend results
-                let spend_results: Vec<PrivacySpendResult> = pi.spends.iter().map(|s| {
-                    let nul_hex = |nul: &[M31]| -> String {
-                        let mut h = String::with_capacity(2 + 8 * 8);
-                        h.push_str("0x");
-                        for &e in nul { h.push_str(&format!("{:08x}", e.0)); }
-                        h
-                    };
-                    PrivacySpendResult {
-                        nullifiers: [nul_hex(&s.nullifiers[0]), nul_hex(&s.nullifiers[1])],
-                        output_commitments: [nul_hex(&s.output_commitments[0]), nul_hex(&s.output_commitments[1])],
-                    }
-                }).collect();
+                let spend_results: Vec<PrivacySpendResult> = pi
+                    .spends
+                    .iter()
+                    .map(|s| {
+                        let nul_hex = |nul: &[M31]| -> String {
+                            let mut h = String::with_capacity(2 + 8 * 8);
+                            h.push_str("0x");
+                            for &e in nul {
+                                h.push_str(&format!("{:08x}", e.0));
+                            }
+                            h
+                        };
+                        PrivacySpendResult {
+                            nullifiers: [nul_hex(&s.nullifiers[0]), nul_hex(&s.nullifiers[1])],
+                            output_commitments: [
+                                nul_hex(&s.output_commitments[0]),
+                                nul_hex(&s.output_commitments[1]),
+                            ],
+                        }
+                    })
+                    .collect();
 
                 // Compute VM31 batch hash using the exact Cairo-compatible encoding.
                 let pi_hash = match hash_batch_public_inputs_for_cairo(pi) {
@@ -1068,7 +1137,9 @@ async fn submit_privacy_batch(
                 };
                 let mut pi_hash_hex = String::with_capacity(2 + 8 * 8);
                 pi_hash_hex.push_str("0x");
-                for &e in &pi_hash { pi_hash_hex.push_str(&format!("{:08x}", e.0)); }
+                for &e in &pi_hash {
+                    pi_hash_hex.push_str(&format!("{:08x}", e.0));
+                }
 
                 // Serialize STARK proof as felt252 calldata for on-chain verification
                 let stark_proof_felts = serialize_proof(&batch_proof.stark_proof);
@@ -1136,7 +1207,9 @@ async fn get_privacy_batch_status(
     let job = jobs.get(&job_id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
-            Json(ErrorResponse { error: format!("Privacy job '{job_id}' not found") }),
+            Json(ErrorResponse {
+                error: format!("Privacy job '{job_id}' not found"),
+            }),
         )
     })?;
 
@@ -1155,23 +1228,32 @@ async fn get_privacy_batch_result(
     let job = jobs.get(&job_id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
-            Json(ErrorResponse { error: format!("Privacy job '{job_id}' not found") }),
+            Json(ErrorResponse {
+                error: format!("Privacy job '{job_id}' not found"),
+            }),
         )
     })?;
 
     match job.status {
         JobStatus::Completed => {
             let result = job.result.as_ref().ok_or_else(|| {
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
-                    error: "Privacy job completed but result is missing (internal error)".to_string(),
-                }))
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "Privacy job completed but result is missing (internal error)"
+                            .to_string(),
+                    }),
+                )
             })?;
             Ok(Json(result.clone()))
         }
         JobStatus::Failed => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
-                error: job.error.clone().unwrap_or_else(|| "Unknown error".to_string()),
+                error: job
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "Unknown error".to_string()),
             }),
         )),
         _ => Err((
@@ -1191,7 +1273,9 @@ async fn build_privacy_submit_calldata(
     let proof_hash = normalize_canonical_proof_hash(&req.proof_hash).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse { error: format!("invalid proof_hash: {e}") }),
+            Json(ErrorResponse {
+                error: format!("invalid proof_hash: {e}"),
+            }),
         )
     })?;
 
@@ -1199,7 +1283,9 @@ async fn build_privacy_submit_calldata(
     let job = jobs.get_mut(&job_id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
-            Json(ErrorResponse { error: format!("Privacy job '{job_id}' not found") }),
+            Json(ErrorResponse {
+                error: format!("Privacy job '{job_id}' not found"),
+            }),
         )
     })?;
 
@@ -1261,7 +1347,10 @@ async fn build_privacy_submit_calldata(
         JobStatus::Failed => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
-                error: job.error.clone().unwrap_or_else(|| "Unknown error".to_string()),
+                error: job
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "Unknown error".to_string()),
             }),
         )),
         _ => Err((
@@ -1321,8 +1410,14 @@ async fn main() {
         .route("/api/v1/prove/{job_id}", get(get_prove_status))
         .route("/api/v1/prove/{job_id}/result", get(get_prove_result))
         .route("/api/v1/privacy/batch", post(submit_privacy_batch))
-        .route("/api/v1/privacy/batch/{job_id}", get(get_privacy_batch_status))
-        .route("/api/v1/privacy/batch/{job_id}/result", get(get_privacy_batch_result))
+        .route(
+            "/api/v1/privacy/batch/{job_id}",
+            get(get_privacy_batch_status),
+        )
+        .route(
+            "/api/v1/privacy/batch/{job_id}/result",
+            get(get_privacy_batch_result),
+        )
         .route(
             "/api/v1/privacy/batch/{job_id}/submit-calldata",
             post(build_privacy_submit_calldata),

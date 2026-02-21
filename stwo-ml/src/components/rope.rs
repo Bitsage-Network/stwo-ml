@@ -16,14 +16,12 @@
 
 use stwo::core::fields::m31::{BaseField, M31};
 use stwo::core::fields::qm31::SecureField;
-use stwo::prover::poly::circle::CircleEvaluation;
-use stwo::prover::poly::BitReversedOrder;
 use stwo::core::poly::circle::CanonicCoset;
 use stwo::prover::backend::{Col, Column, ColumnOps};
-use stwo_constraint_framework::{
-    FrameworkEval, EvalAtRow, RelationEntry,
-};
+use stwo::prover::poly::circle::CircleEvaluation;
+use stwo::prover::poly::BitReversedOrder;
 use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
+use stwo_constraint_framework::{EvalAtRow, FrameworkEval, RelationEntry};
 
 use crate::components::matmul::M31Matrix;
 use crate::gadgets::lookup_table::PrecomputedTable;
@@ -147,16 +145,18 @@ pub fn build_rope_table(config: &RoPEConfig) -> RoPETable {
         }
     }
 
-    RoPETable { cos_vals, sin_vals, config: *config }
+    RoPETable {
+        cos_vals,
+        sin_vals,
+        config: *config,
+    }
 }
 
 /// Build a PrecomputedTable for LogUp verification.
 /// The table has entries: (cos_val, sin_val) for each (pos, dim_pair).
 pub fn build_rope_lookup_table(config: &RoPEConfig) -> PrecomputedTable {
     let table = build_rope_table(config);
-    let pairs: Vec<(M31, M31)> = table.cos_vals.into_iter()
-        .zip(table.sin_vals)
-        .collect();
+    let pairs: Vec<(M31, M31)> = table.cos_vals.into_iter().zip(table.sin_vals).collect();
     let log_size = config.table_log_size();
     PrecomputedTable::from_pairs(pairs, log_size)
 }
@@ -170,18 +170,22 @@ pub fn build_rope_lookup_table(config: &RoPEConfig) -> PrecomputedTable {
 /// The rotation in M31 fixed-point arithmetic:
 ///   x' = x·cos - y·sin  (mod P, with re-centering)
 ///   y' = x·sin + y·cos  (mod P, with re-centering)
-pub fn apply_rope(
-    matrix: &M31Matrix,
-    table: &RoPETable,
-) -> (M31Matrix, Vec<M31>, Vec<M31>) {
+pub fn apply_rope(matrix: &M31Matrix, table: &RoPETable) -> (M31Matrix, Vec<M31>, Vec<M31>) {
     let seq_len = matrix.rows;
     let head_dim = matrix.cols;
     let n_pairs = head_dim / 2;
 
-    assert!(seq_len <= table.config.max_seq_len,
-        "seq_len {} exceeds table max_seq_len {}", seq_len, table.config.max_seq_len);
-    assert_eq!(head_dim, table.config.head_dim,
-        "head_dim mismatch: matrix has {}, table has {}", head_dim, table.config.head_dim);
+    assert!(
+        seq_len <= table.config.max_seq_len,
+        "seq_len {} exceeds table max_seq_len {}",
+        seq_len,
+        table.config.max_seq_len
+    );
+    assert_eq!(
+        head_dim, table.config.head_dim,
+        "head_dim mismatch: matrix has {}, table has {}",
+        head_dim, table.config.head_dim
+    );
 
     let mut out_data = Vec::with_capacity(seq_len * head_dim);
     let mut cos_used = Vec::with_capacity(seq_len * n_pairs);
@@ -283,9 +287,7 @@ impl FrameworkEval for RoPEEval {
         );
 
         // Constraint: output_y = input_x * sin_val + input_y * cos_val
-        eval.add_constraint(
-            output_y - (input_x * sin_val.clone() + input_y * cos_val.clone()),
-        );
+        eval.add_constraint(output_y - (input_x * sin_val.clone() + input_y * cos_val.clone()));
 
         // LogUp: table side
         eval.add_to_relation(RelationEntry::new(
@@ -319,7 +321,10 @@ pub fn generate_rope_trace<B: stwo::prover::backend::Backend>(
     output_y: &[M31],
     table: &PrecomputedTable,
     log_size: u32,
-) -> (Vec<CircleEvaluation<B, BaseField, BitReversedOrder>>, Vec<M31>)
+) -> (
+    Vec<CircleEvaluation<B, BaseField, BitReversedOrder>>,
+    Vec<M31>,
+)
 where
     B: ColumnOps<BaseField>,
 {
@@ -328,10 +333,7 @@ where
     let domain = CanonicCoset::new(log_size).circle_domain();
 
     // Compute multiplicities
-    let multiplicities = crate::components::activation::compute_multiplicities(
-        cos_vals,
-        table,
-    );
+    let multiplicities = crate::components::activation::compute_multiplicities(cos_vals, table);
 
     // Build 7 trace columns
     let mut col_ix = Col::<B, BaseField>::zeros(size);
@@ -373,7 +375,13 @@ where
     ];
 
     let mults_vec: Vec<M31> = (0..size)
-        .map(|i| if i < multiplicities.len() { multiplicities[i] } else { M31::from(0) })
+        .map(|i| {
+            if i < multiplicities.len() {
+                multiplicities[i]
+            } else {
+                M31::from(0)
+            }
+        })
         .collect();
 
     (evals, mults_vec)
@@ -390,7 +398,12 @@ mod tests {
         for v in vals {
             let m = float_to_m31_signed(v);
             let back = m31_to_float_signed(m);
-            assert!((back - v).abs() < 1e-6, "roundtrip failed for {}: got {}", v, back);
+            assert!(
+                (back - v).abs() < 1e-6,
+                "roundtrip failed for {}: got {}",
+                v,
+                back
+            );
         }
     }
 
@@ -405,7 +418,11 @@ mod tests {
         // Position 0: angle = 0 for all pairs → cos=1, sin=0
         let cos_00 = m31_to_float_signed(table.cos_vals[0]);
         let sin_00 = m31_to_float_signed(table.sin_vals[0]);
-        assert!((cos_00 - 1.0).abs() < 1e-6, "cos(0) should be 1, got {}", cos_00);
+        assert!(
+            (cos_00 - 1.0).abs() < 1e-6,
+            "cos(0) should be 1, got {}",
+            cos_00
+        );
         assert!(sin_00.abs() < 1e-6, "sin(0) should be 0, got {}", sin_00);
     }
 
@@ -419,10 +436,14 @@ mod tests {
             rows: 2,
             cols: 4,
             data: vec![
-                float_to_m31_signed(1.0), float_to_m31_signed(0.0),
-                float_to_m31_signed(0.0), float_to_m31_signed(1.0),
-                float_to_m31_signed(0.5), float_to_m31_signed(0.5),
-                float_to_m31_signed(-0.5), float_to_m31_signed(0.5),
+                float_to_m31_signed(1.0),
+                float_to_m31_signed(0.0),
+                float_to_m31_signed(0.0),
+                float_to_m31_signed(1.0),
+                float_to_m31_signed(0.5),
+                float_to_m31_signed(0.5),
+                float_to_m31_signed(-0.5),
+                float_to_m31_signed(0.5),
             ],
         };
 
@@ -435,8 +456,16 @@ mod tests {
         // Position 0: angle = 0, so output should equal input
         let x0 = m31_to_float_signed(rotated.data[0]);
         let y0 = m31_to_float_signed(rotated.data[1]);
-        assert!((x0 - 1.0).abs() < 0.01, "pos 0, pair 0: x should be ~1.0, got {}", x0);
-        assert!(y0.abs() < 0.01, "pos 0, pair 0: y should be ~0.0, got {}", y0);
+        assert!(
+            (x0 - 1.0).abs() < 0.01,
+            "pos 0, pair 0: x should be ~1.0, got {}",
+            x0
+        );
+        assert!(
+            y0.abs() < 0.01,
+            "pos 0, pair 0: y should be ~0.0, got {}",
+            y0
+        );
     }
 
     #[test]
@@ -460,8 +489,13 @@ mod tests {
                 let s = m31_to_float_signed(table.sin_vals[idx]);
                 // cos² + sin² ≈ 1
                 let norm = c * c + s * s;
-                assert!((norm - 1.0).abs() < 0.001,
-                    "pos={}, pair={}: cos²+sin²={}, expected 1.0", pos, j, norm);
+                assert!(
+                    (norm - 1.0).abs() < 0.001,
+                    "pos={}, pair={}: cos²+sin²={}, expected 1.0",
+                    pos,
+                    j,
+                    norm
+                );
             }
         }
     }

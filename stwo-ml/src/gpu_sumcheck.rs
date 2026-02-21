@@ -22,32 +22,31 @@ use std::sync::OnceLock;
 use num_traits::{One, Zero};
 
 #[cfg(feature = "cuda-runtime")]
-use stwo::core::fields::m31::M31;
-#[cfg(feature = "cuda-runtime")]
-use stwo::core::fields::qm31::{QM31, SecureField};
+use stwo::core::channel::{Blake2sChannel, Channel};
 #[cfg(feature = "cuda-runtime")]
 use stwo::core::fields::cm31::CM31;
 #[cfg(feature = "cuda-runtime")]
+use stwo::core::fields::m31::M31;
+#[cfg(feature = "cuda-runtime")]
+use stwo::core::fields::qm31::{SecureField, QM31};
+#[cfg(feature = "cuda-runtime")]
 use stwo::core::fields::FieldExpOps;
 #[cfg(feature = "cuda-runtime")]
-use stwo::core::channel::{Blake2sChannel, Channel};
+use stwo::prover::backend::gpu::cuda_executor::{get_cuda_executor, CudaFftError};
 #[cfg(feature = "cuda-runtime")]
 use stwo::prover::lookups::sumcheck::{self, MultivariatePolyOracle};
 #[cfg(feature = "cuda-runtime")]
 use stwo::prover::lookups::utils::UnivariatePoly;
-#[cfg(feature = "cuda-runtime")]
-use stwo::prover::backend::gpu::cuda_executor::{get_cuda_executor, CudaFftError};
 
 #[cfg(feature = "cuda-runtime")]
-use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, CudaViewMut, LaunchConfig, LaunchAsync};
+use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, CudaViewMut, LaunchAsync, LaunchConfig};
 
-#[cfg(feature = "cuda-runtime")]
-use crate::components::matmul::{
-    M31Matrix, MatMulSumcheckProof, MatMulError,
-    evaluate_mle_pub, matrix_to_mle_pub,
-};
 #[cfg(all(feature = "cuda-runtime", test))]
 use crate::components::matmul::restrict_mle_pub;
+#[cfg(feature = "cuda-runtime")]
+use crate::components::matmul::{
+    evaluate_mle_pub, matrix_to_mle_pub, M31Matrix, MatMulError, MatMulSumcheckProof,
+};
 
 // =============================================================================
 // CUDA Kernel Source
@@ -1118,10 +1117,7 @@ extern "C" __global__ void combine_blocks_kernel(
 /// Replaces CPU `matmul_m31` for the common case of m=1 (single-row input).
 /// Falls back to CPU for multi-row inputs.
 #[cfg(feature = "cuda-runtime")]
-pub fn gpu_matmul_m31(
-    input: &M31Matrix,
-    weight: &M31Matrix,
-) -> Result<M31Matrix, MatMulError> {
+pub fn gpu_matmul_m31(input: &M31Matrix, weight: &M31Matrix) -> Result<M31Matrix, MatMulError> {
     use crate::components::matmul::matmul_m31;
 
     // Only accelerate single-row inputs (common in inference)
@@ -1143,19 +1139,26 @@ pub fn gpu_matmul_m31(
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU init: {e}")))?;
 
     // Compile GEMV kernel (separate from sumcheck kernels, cached in executor)
-    let gemv_fn = executor.get_gemv_fn()
+    let gemv_fn = executor
+        .get_gemv_fn()
         .map_err(|e| MatMulError::SumcheckFailed(format!("GEMV kernel: {e}")))?;
 
     // Upload input and weight as u32 arrays
     let input_u32: Vec<u32> = input.data.iter().map(|v| v.0).collect();
     let weight_u32: Vec<u32> = weight.data.iter().map(|v| v.0).collect();
 
-    let d_input = executor.device.htod_sync_copy(&input_u32)
+    let d_input = executor
+        .device
+        .htod_sync_copy(&input_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU upload input: {:?}", e)))?;
-    let d_weight = executor.device.htod_sync_copy(&weight_u32)
+    let d_weight = executor
+        .device
+        .htod_sync_copy(&weight_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU upload weight: {:?}", e)))?;
 
-    let d_output: CudaSlice<u32> = executor.device.alloc_zeros(n)
+    let d_output: CudaSlice<u32> = executor
+        .device
+        .alloc_zeros(n)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU alloc output: {:?}", e)))?;
 
     // Launch: one thread per output column
@@ -1163,19 +1166,24 @@ pub fn gpu_matmul_m31(
     let grid_size = (n as u32 + block_size - 1) / block_size;
 
     unsafe {
-        gemv_fn.clone().launch(
-            LaunchConfig {
-                grid_dim: (grid_size, 1, 1),
-                block_dim: (block_size, 1, 1),
-                shared_mem_bytes: 0,
-            },
-            (&d_input, &d_weight, &d_output, k as u32, n as u32),
-        ).map_err(|e| MatMulError::SumcheckFailed(format!("GPU GEMV launch: {:?}", e)))?;
+        gemv_fn
+            .clone()
+            .launch(
+                LaunchConfig {
+                    grid_dim: (grid_size, 1, 1),
+                    block_dim: (block_size, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                (&d_input, &d_weight, &d_output, k as u32, n as u32),
+            )
+            .map_err(|e| MatMulError::SumcheckFailed(format!("GPU GEMV launch: {:?}", e)))?;
     }
 
     // Download result
     let mut output_u32 = vec![0u32; n];
-    executor.device.dtoh_sync_copy_into(&d_output, &mut output_u32)
+    executor
+        .device
+        .dtoh_sync_copy_into(&d_output, &mut output_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU download: {:?}", e)))?;
 
     let mut result = M31Matrix::new(1, n);
@@ -1256,26 +1264,33 @@ impl GpuSumcheckExecutor {
         let ptx = cudarc::nvrtc::compile_ptx(SUMCHECK_CUDA_KERNEL)
             .map_err(|e| CudaFftError::KernelCompilation(format!("sumcheck kernel: {:?}", e)))?;
 
-        device.load_ptx(ptx, "sumcheck", &[
-            "sumcheck_round_kernel",
-            "sumcheck_reduce_kernel",
-            "mle_fold_kernel",
-        ]).map_err(|e| CudaFftError::KernelCompilation(format!("load sumcheck PTX: {:?}", e)))?;
+        device
+            .load_ptx(
+                ptx,
+                "sumcheck",
+                &[
+                    "sumcheck_round_kernel",
+                    "sumcheck_reduce_kernel",
+                    "mle_fold_kernel",
+                ],
+            )
+            .map_err(|e| CudaFftError::KernelCompilation(format!("load sumcheck PTX: {:?}", e)))?;
 
-        let sumcheck_round_fn = device.get_func("sumcheck", "sumcheck_round_kernel")
-            .ok_or_else(|| CudaFftError::KernelCompilation(
-                "sumcheck_round_kernel not found".into(),
-            ))?;
+        let sumcheck_round_fn = device
+            .get_func("sumcheck", "sumcheck_round_kernel")
+            .ok_or_else(|| {
+                CudaFftError::KernelCompilation("sumcheck_round_kernel not found".into())
+            })?;
 
-        let sumcheck_reduce_fn = device.get_func("sumcheck", "sumcheck_reduce_kernel")
-            .ok_or_else(|| CudaFftError::KernelCompilation(
-                "sumcheck_reduce_kernel not found".into(),
-            ))?;
+        let sumcheck_reduce_fn = device
+            .get_func("sumcheck", "sumcheck_reduce_kernel")
+            .ok_or_else(|| {
+                CudaFftError::KernelCompilation("sumcheck_reduce_kernel not found".into())
+            })?;
 
-        let mle_fold_fn = device.get_func("sumcheck", "mle_fold_kernel")
-            .ok_or_else(|| CudaFftError::KernelCompilation(
-                "mle_fold_kernel not found".into(),
-            ))?;
+        let mle_fold_fn = device
+            .get_func("sumcheck", "mle_fold_kernel")
+            .ok_or_else(|| CudaFftError::KernelCompilation("mle_fold_kernel not found".into()))?;
 
         Ok(Self {
             device,
@@ -1304,12 +1319,14 @@ impl GpuSumcheckExecutor {
         }
 
         static EXECUTOR: OnceLock<Arc<GpuSumcheckExecutor>> = OnceLock::new();
-        EXECUTOR.get_or_try_init(|| {
-            eprintln!("[GPU] Compiling sumcheck CUDA kernels (one-time)...");
-            let executor = GpuSumcheckExecutor::new()?;
-            eprintln!("[GPU] Kernels compiled and cached.");
-            Ok(Arc::new(executor))
-        }).cloned()
+        EXECUTOR
+            .get_or_try_init(|| {
+                eprintln!("[GPU] Compiling sumcheck CUDA kernels (one-time)...");
+                let executor = GpuSumcheckExecutor::new()?;
+                eprintln!("[GPU] Kernels compiled and cached.");
+                Ok(Arc::new(executor))
+            })
+            .cloned()
     }
 
     /// Create a new GPU sumcheck executor on a specific device.
@@ -1324,29 +1341,56 @@ impl GpuSumcheckExecutor {
         let device = executor.device.clone();
 
         // PTX is device-independent, but load_ptx must run on the target device context
-        let ptx = cudarc::nvrtc::compile_ptx(SUMCHECK_CUDA_KERNEL)
-            .map_err(|e| CudaFftError::KernelCompilation(format!("sumcheck kernel (device {}): {:?}", device_id, e)))?;
+        let ptx = cudarc::nvrtc::compile_ptx(SUMCHECK_CUDA_KERNEL).map_err(|e| {
+            CudaFftError::KernelCompilation(format!(
+                "sumcheck kernel (device {}): {:?}",
+                device_id, e
+            ))
+        })?;
 
-        device.load_ptx(ptx, "sumcheck", &[
-            "sumcheck_round_kernel",
-            "sumcheck_reduce_kernel",
-            "mle_fold_kernel",
-        ]).map_err(|e| CudaFftError::KernelCompilation(format!("load sumcheck PTX (device {}): {:?}", device_id, e)))?;
+        device
+            .load_ptx(
+                ptx,
+                "sumcheck",
+                &[
+                    "sumcheck_round_kernel",
+                    "sumcheck_reduce_kernel",
+                    "mle_fold_kernel",
+                ],
+            )
+            .map_err(|e| {
+                CudaFftError::KernelCompilation(format!(
+                    "load sumcheck PTX (device {}): {:?}",
+                    device_id, e
+                ))
+            })?;
 
-        let sumcheck_round_fn = device.get_func("sumcheck", "sumcheck_round_kernel")
-            .ok_or_else(|| CudaFftError::KernelCompilation(
-                format!("sumcheck_round_kernel not found on device {}", device_id),
-            ))?;
+        let sumcheck_round_fn = device
+            .get_func("sumcheck", "sumcheck_round_kernel")
+            .ok_or_else(|| {
+                CudaFftError::KernelCompilation(format!(
+                    "sumcheck_round_kernel not found on device {}",
+                    device_id
+                ))
+            })?;
 
-        let sumcheck_reduce_fn = device.get_func("sumcheck", "sumcheck_reduce_kernel")
-            .ok_or_else(|| CudaFftError::KernelCompilation(
-                format!("sumcheck_reduce_kernel not found on device {}", device_id),
-            ))?;
+        let sumcheck_reduce_fn = device
+            .get_func("sumcheck", "sumcheck_reduce_kernel")
+            .ok_or_else(|| {
+                CudaFftError::KernelCompilation(format!(
+                    "sumcheck_reduce_kernel not found on device {}",
+                    device_id
+                ))
+            })?;
 
-        let mle_fold_fn = device.get_func("sumcheck", "mle_fold_kernel")
-            .ok_or_else(|| CudaFftError::KernelCompilation(
-                format!("mle_fold_kernel not found on device {}", device_id),
-            ))?;
+        let mle_fold_fn = device
+            .get_func("sumcheck", "mle_fold_kernel")
+            .ok_or_else(|| {
+                CudaFftError::KernelCompilation(format!(
+                    "mle_fold_kernel not found on device {}",
+                    device_id
+                ))
+            })?;
 
         Ok(Self {
             device,
@@ -1368,7 +1412,8 @@ impl GpuSumcheckExecutor {
         use std::collections::HashMap;
         use std::sync::Mutex;
 
-        static MULTI_EXECUTORS: OnceLock<Mutex<HashMap<usize, Arc<GpuSumcheckExecutor>>>> = OnceLock::new();
+        static MULTI_EXECUTORS: OnceLock<Mutex<HashMap<usize, Arc<GpuSumcheckExecutor>>>> =
+            OnceLock::new();
 
         let pool = MULTI_EXECUTORS.get_or_init(|| Mutex::new(HashMap::new()));
         let mut guard = pool.lock().map_err(|_| {
@@ -1406,27 +1451,65 @@ impl GpuSumcheckExecutor {
         let ptx = cudarc::nvrtc::compile_ptx(M31_FORWARD_KERNEL)
             .map_err(|e| CudaFftError::KernelCompilation(format!("forward kernel: {:?}", e)))?;
 
-        self.device.load_ptx(ptx, "forward", &[
-            "m31_gemv_kernel", "m31_gemm_kernel",
-            "m31_add_kernel", "m31_mul_kernel", "m31_relu_kernel",
-            "m31_layernorm_kernel", "m31_rmsnorm_kernel",
-        ]).map_err(|e| CudaFftError::KernelCompilation(format!("load forward PTX: {:?}", e)))?;
+        self.device
+            .load_ptx(
+                ptx,
+                "forward",
+                &[
+                    "m31_gemv_kernel",
+                    "m31_gemm_kernel",
+                    "m31_add_kernel",
+                    "m31_mul_kernel",
+                    "m31_relu_kernel",
+                    "m31_layernorm_kernel",
+                    "m31_rmsnorm_kernel",
+                ],
+            )
+            .map_err(|e| CudaFftError::KernelCompilation(format!("load forward PTX: {:?}", e)))?;
 
         let fns = ForwardKernels {
-            gemv_fn: self.device.get_func("forward", "m31_gemv_kernel")
-                .ok_or_else(|| CudaFftError::KernelCompilation("m31_gemv_kernel not found".into()))?,
-            gemm_fn: self.device.get_func("forward", "m31_gemm_kernel")
-                .ok_or_else(|| CudaFftError::KernelCompilation("m31_gemm_kernel not found".into()))?,
-            add_fn: self.device.get_func("forward", "m31_add_kernel")
-                .ok_or_else(|| CudaFftError::KernelCompilation("m31_add_kernel not found".into()))?,
-            mul_fn: self.device.get_func("forward", "m31_mul_kernel")
-                .ok_or_else(|| CudaFftError::KernelCompilation("m31_mul_kernel not found".into()))?,
-            relu_fn: self.device.get_func("forward", "m31_relu_kernel")
-                .ok_or_else(|| CudaFftError::KernelCompilation("m31_relu_kernel not found".into()))?,
-            layernorm_fn: self.device.get_func("forward", "m31_layernorm_kernel")
-                .ok_or_else(|| CudaFftError::KernelCompilation("m31_layernorm_kernel not found".into()))?,
-            rmsnorm_fn: self.device.get_func("forward", "m31_rmsnorm_kernel")
-                .ok_or_else(|| CudaFftError::KernelCompilation("m31_rmsnorm_kernel not found".into()))?,
+            gemv_fn: self
+                .device
+                .get_func("forward", "m31_gemv_kernel")
+                .ok_or_else(|| {
+                    CudaFftError::KernelCompilation("m31_gemv_kernel not found".into())
+                })?,
+            gemm_fn: self
+                .device
+                .get_func("forward", "m31_gemm_kernel")
+                .ok_or_else(|| {
+                    CudaFftError::KernelCompilation("m31_gemm_kernel not found".into())
+                })?,
+            add_fn: self
+                .device
+                .get_func("forward", "m31_add_kernel")
+                .ok_or_else(|| {
+                    CudaFftError::KernelCompilation("m31_add_kernel not found".into())
+                })?,
+            mul_fn: self
+                .device
+                .get_func("forward", "m31_mul_kernel")
+                .ok_or_else(|| {
+                    CudaFftError::KernelCompilation("m31_mul_kernel not found".into())
+                })?,
+            relu_fn: self
+                .device
+                .get_func("forward", "m31_relu_kernel")
+                .ok_or_else(|| {
+                    CudaFftError::KernelCompilation("m31_relu_kernel not found".into())
+                })?,
+            layernorm_fn: self
+                .device
+                .get_func("forward", "m31_layernorm_kernel")
+                .ok_or_else(|| {
+                    CudaFftError::KernelCompilation("m31_layernorm_kernel not found".into())
+                })?,
+            rmsnorm_fn: self
+                .device
+                .get_func("forward", "m31_rmsnorm_kernel")
+                .ok_or_else(|| {
+                    CudaFftError::KernelCompilation("m31_rmsnorm_kernel not found".into())
+                })?,
         };
 
         *guard = Some(ForwardKernels {
@@ -1459,15 +1542,27 @@ impl GpuSumcheckExecutor {
         let ptx = cudarc::nvrtc::compile_ptx(MLE_RESTRICT_KERNEL)
             .map_err(|e| CudaFftError::KernelCompilation(format!("restrict kernel: {:?}", e)))?;
 
-        self.device.load_ptx(ptx, "restrict", &[
-            "m31_restrict_rows_kernel", "m31_restrict_cols_kernel",
-        ]).map_err(|e| CudaFftError::KernelCompilation(format!("load restrict PTX: {:?}", e)))?;
+        self.device
+            .load_ptx(
+                ptx,
+                "restrict",
+                &["m31_restrict_rows_kernel", "m31_restrict_cols_kernel"],
+            )
+            .map_err(|e| CudaFftError::KernelCompilation(format!("load restrict PTX: {:?}", e)))?;
 
         let fns = RestrictKernels {
-            restrict_rows_fn: self.device.get_func("restrict", "m31_restrict_rows_kernel")
-                .ok_or_else(|| CudaFftError::KernelCompilation("m31_restrict_rows_kernel not found".into()))?,
-            restrict_cols_fn: self.device.get_func("restrict", "m31_restrict_cols_kernel")
-                .ok_or_else(|| CudaFftError::KernelCompilation("m31_restrict_cols_kernel not found".into()))?,
+            restrict_rows_fn: self
+                .device
+                .get_func("restrict", "m31_restrict_rows_kernel")
+                .ok_or_else(|| {
+                    CudaFftError::KernelCompilation("m31_restrict_rows_kernel not found".into())
+                })?,
+            restrict_cols_fn: self
+                .device
+                .get_func("restrict", "m31_restrict_cols_kernel")
+                .ok_or_else(|| {
+                    CudaFftError::KernelCompilation("m31_restrict_cols_kernel not found".into())
+                })?,
         };
 
         *guard = Some(RestrictKernels {
@@ -1505,32 +1600,39 @@ impl GpuSumcheckExecutor {
         };
 
         unsafe {
-            self.sumcheck_round_fn.clone().launch(
-                cfg,
-                (
-                    d_f_a,
-                    d_f_b,
-                    &mut d_block_s0,
-                    &mut d_block_s1,
-                    &mut d_block_s2,
-                    mid as u32,
-                ),
-            ).map_err(|e| CudaFftError::KernelExecution(format!("sumcheck_round: {:?}", e)))?;
+            self.sumcheck_round_fn
+                .clone()
+                .launch(
+                    cfg,
+                    (
+                        d_f_a,
+                        d_f_b,
+                        &mut d_block_s0,
+                        &mut d_block_s1,
+                        &mut d_block_s2,
+                        mid as u32,
+                    ),
+                )
+                .map_err(|e| CudaFftError::KernelExecution(format!("sumcheck_round: {:?}", e)))?;
         }
 
         if n_blocks == 1 {
             // Single block — download directly
-            self.device.synchronize()
+            self.device
+                .synchronize()
                 .map_err(|e| CudaFftError::KernelExecution(format!("sync: {:?}", e)))?;
 
             let mut s0 = [0u32; 4];
             let mut s1 = [0u32; 4];
             let mut s2 = [0u32; 4];
-            self.device.dtoh_sync_copy_into(&d_block_s0, &mut s0)
+            self.device
+                .dtoh_sync_copy_into(&d_block_s0, &mut s0)
                 .map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
-            self.device.dtoh_sync_copy_into(&d_block_s1, &mut s1)
+            self.device
+                .dtoh_sync_copy_into(&d_block_s1, &mut s1)
                 .map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
-            self.device.dtoh_sync_copy_into(&d_block_s2, &mut s2)
+            self.device
+                .dtoh_sync_copy_into(&d_block_s2, &mut s2)
                 .map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
             return Ok((s0, s1, s2));
         }
@@ -1545,11 +1647,20 @@ impl GpuSumcheckExecutor {
         let s0_len = n_blocks * 4;
         let s1_offset = s0_len;
         let s2_offset = 2 * s0_len;
-        self.device.dtod_copy(&d_block_s0, &mut d_partials.slice_mut(0..s0_len))
+        self.device
+            .dtod_copy(&d_block_s0, &mut d_partials.slice_mut(0..s0_len))
             .map_err(|e| CudaFftError::MemoryTransfer(format!("dtod s0: {:?}", e)))?;
-        self.device.dtod_copy(&d_block_s1, &mut d_partials.slice_mut(s1_offset..s1_offset + s0_len))
+        self.device
+            .dtod_copy(
+                &d_block_s1,
+                &mut d_partials.slice_mut(s1_offset..s1_offset + s0_len),
+            )
             .map_err(|e| CudaFftError::MemoryTransfer(format!("dtod s1: {:?}", e)))?;
-        self.device.dtod_copy(&d_block_s2, &mut d_partials.slice_mut(s2_offset..s2_offset + s0_len))
+        self.device
+            .dtod_copy(
+                &d_block_s2,
+                &mut d_partials.slice_mut(s2_offset..s2_offset + s0_len),
+            )
             .map_err(|e| CudaFftError::MemoryTransfer(format!("dtod s2: {:?}", e)))?;
 
         // Output: 3 QM31 values = 12 u32
@@ -1563,21 +1674,19 @@ impl GpuSumcheckExecutor {
         };
 
         unsafe {
-            self.sumcheck_reduce_fn.clone().launch(
-                reduce_cfg,
-                (
-                    &d_partials,
-                    &mut d_output,
-                    n_blocks as u32,
-                ),
-            ).map_err(|e| CudaFftError::KernelExecution(format!("sumcheck_reduce: {:?}", e)))?;
+            self.sumcheck_reduce_fn
+                .clone()
+                .launch(reduce_cfg, (&d_partials, &mut d_output, n_blocks as u32))
+                .map_err(|e| CudaFftError::KernelExecution(format!("sumcheck_reduce: {:?}", e)))?;
         }
 
-        self.device.synchronize()
+        self.device
+            .synchronize()
             .map_err(|e| CudaFftError::KernelExecution(format!("sync: {:?}", e)))?;
 
         let mut output = [0u32; 12];
-        self.device.dtoh_sync_copy_into(&d_output, &mut output)
+        self.device
+            .dtoh_sync_copy_into(&d_output, &mut output)
             .map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
 
         let s0 = [output[0], output[1], output[2], output[3]];
@@ -1604,7 +1713,9 @@ impl GpuSumcheckExecutor {
         let half_n = n_points / 2;
 
         // Upload challenge (4 u32 = 16 bytes — the only transfer per round)
-        let d_alpha = self.device.htod_sync_copy(challenge)
+        let d_alpha = self
+            .device
+            .htod_sync_copy(challenge)
             .map_err(|e| CudaFftError::MemoryAllocation(format!("alpha upload: {:?}", e)))?;
 
         // Allocate output buffer on GPU
@@ -1621,15 +1732,10 @@ impl GpuSumcheckExecutor {
         };
 
         unsafe {
-            self.mle_fold_fn.clone().launch(
-                cfg,
-                (
-                    d_input,
-                    &d_alpha,
-                    &mut d_output,
-                    half_n as u32,
-                ),
-            ).map_err(|e| CudaFftError::KernelExecution(format!("mle_fold: {:?}", e)))?;
+            self.mle_fold_fn
+                .clone()
+                .launch(cfg, (d_input, &d_alpha, &mut d_output, half_n as u32))
+                .map_err(|e| CudaFftError::KernelExecution(format!("mle_fold: {:?}", e)))?;
         }
 
         Ok(d_output)
@@ -1646,8 +1752,13 @@ impl GpuSumcheckExecutor {
                 mle.len()
             )));
         }
-        let flat: Vec<u32> = mle.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
-        let d_current = self.device.htod_sync_copy(&flat)
+        let flat: Vec<u32> = mle
+            .iter()
+            .flat_map(|sf| secure_field_to_u32s(*sf))
+            .collect();
+        let d_current = self
+            .device
+            .htod_sync_copy(&flat)
             .map_err(|e| CudaFftError::MemoryAllocation(format!("mle session upload: {:?}", e)))?;
         Ok(GpuMleFoldSession {
             d_current,
@@ -1805,39 +1916,46 @@ impl GpuSumcheckExecutor {
 
         // Upload M31 matrix
         let mat_u32: Vec<u32> = matrix.data.iter().map(|v| v.0).collect();
-        let d_matrix = self.device.htod_sync_copy(&mat_u32)
-            .map_err(|e| CudaFftError::MemoryAllocation(format!("restrict_rows upload matrix: {:?}", e)))?;
+        let d_matrix = self.device.htod_sync_copy(&mat_u32).map_err(|e| {
+            CudaFftError::MemoryAllocation(format!("restrict_rows upload matrix: {:?}", e))
+        })?;
 
         // Upload Lagrange basis (only first m_used entries as QM31)
-        let lag_u32: Vec<u32> = lagrange[..m_used].iter()
+        let lag_u32: Vec<u32> = lagrange[..m_used]
+            .iter()
             .flat_map(|sf| secure_field_to_u32s(*sf))
             .collect();
-        let d_lagrange = self.device.htod_sync_copy(&lag_u32)
-            .map_err(|e| CudaFftError::MemoryAllocation(format!("restrict_rows upload lagrange: {:?}", e)))?;
+        let d_lagrange = self.device.htod_sync_copy(&lag_u32).map_err(|e| {
+            CudaFftError::MemoryAllocation(format!("restrict_rows upload lagrange: {:?}", e))
+        })?;
 
         // Allocate output
-        let mut d_output = unsafe { self.device.alloc::<u32>(k_padded * 4) }
-            .map_err(|e| CudaFftError::MemoryAllocation(format!("restrict_rows output: {:?}", e)))?;
+        let mut d_output = unsafe { self.device.alloc::<u32>(k_padded * 4) }.map_err(|e| {
+            CudaFftError::MemoryAllocation(format!("restrict_rows output: {:?}", e))
+        })?;
 
         let block_size = 256u32;
         let grid_size = (k_padded as u32 + block_size - 1) / block_size;
 
         unsafe {
-            fns.restrict_rows_fn.clone().launch(
-                LaunchConfig {
-                    grid_dim: (grid_size, 1, 1),
-                    block_dim: (block_size, 1, 1),
-                    shared_mem_bytes: 0,
-                },
-                (
-                    &d_matrix,
-                    &d_lagrange,
-                    &mut d_output,
-                    m_used as u32,
-                    k_orig as u32,
-                    k_padded as u32,
-                ),
-            ).map_err(|e| CudaFftError::KernelExecution(format!("restrict_rows: {:?}", e)))?;
+            fns.restrict_rows_fn
+                .clone()
+                .launch(
+                    LaunchConfig {
+                        grid_dim: (grid_size, 1, 1),
+                        block_dim: (block_size, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    (
+                        &d_matrix,
+                        &d_lagrange,
+                        &mut d_output,
+                        m_used as u32,
+                        k_orig as u32,
+                        k_padded as u32,
+                    ),
+                )
+                .map_err(|e| CudaFftError::KernelExecution(format!("restrict_rows: {:?}", e)))?;
         }
 
         Ok(d_output)
@@ -1865,39 +1983,46 @@ impl GpuSumcheckExecutor {
 
         // Upload M31 matrix
         let mat_u32: Vec<u32> = matrix.data.iter().map(|v| v.0).collect();
-        let d_matrix = self.device.htod_sync_copy(&mat_u32)
-            .map_err(|e| CudaFftError::MemoryAllocation(format!("restrict_cols upload matrix: {:?}", e)))?;
+        let d_matrix = self.device.htod_sync_copy(&mat_u32).map_err(|e| {
+            CudaFftError::MemoryAllocation(format!("restrict_cols upload matrix: {:?}", e))
+        })?;
 
         // Upload Lagrange basis (only first n_used entries)
-        let lag_u32: Vec<u32> = lagrange[..n_used].iter()
+        let lag_u32: Vec<u32> = lagrange[..n_used]
+            .iter()
             .flat_map(|sf| secure_field_to_u32s(*sf))
             .collect();
-        let d_lagrange = self.device.htod_sync_copy(&lag_u32)
-            .map_err(|e| CudaFftError::MemoryAllocation(format!("restrict_cols upload lagrange: {:?}", e)))?;
+        let d_lagrange = self.device.htod_sync_copy(&lag_u32).map_err(|e| {
+            CudaFftError::MemoryAllocation(format!("restrict_cols upload lagrange: {:?}", e))
+        })?;
 
         // Allocate output
-        let mut d_output = unsafe { self.device.alloc::<u32>(k_padded * 4) }
-            .map_err(|e| CudaFftError::MemoryAllocation(format!("restrict_cols output: {:?}", e)))?;
+        let mut d_output = unsafe { self.device.alloc::<u32>(k_padded * 4) }.map_err(|e| {
+            CudaFftError::MemoryAllocation(format!("restrict_cols output: {:?}", e))
+        })?;
 
         let block_size = 256u32;
         let grid_size = (k_padded as u32 + block_size - 1) / block_size;
 
         unsafe {
-            fns.restrict_cols_fn.clone().launch(
-                LaunchConfig {
-                    grid_dim: (grid_size, 1, 1),
-                    block_dim: (block_size, 1, 1),
-                    shared_mem_bytes: 0,
-                },
-                (
-                    &d_matrix,
-                    &d_lagrange,
-                    &mut d_output,
-                    k_orig as u32,
-                    n_used as u32,
-                    k_padded as u32,
-                ),
-            ).map_err(|e| CudaFftError::KernelExecution(format!("restrict_cols: {:?}", e)))?;
+            fns.restrict_cols_fn
+                .clone()
+                .launch(
+                    LaunchConfig {
+                        grid_dim: (grid_size, 1, 1),
+                        block_dim: (block_size, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    (
+                        &d_matrix,
+                        &d_lagrange,
+                        &mut d_output,
+                        k_orig as u32,
+                        n_used as u32,
+                        k_padded as u32,
+                    ),
+                )
+                .map_err(|e| CudaFftError::KernelExecution(format!("restrict_cols: {:?}", e)))?;
         }
 
         Ok(d_output)
@@ -1923,25 +2048,51 @@ impl GpuSumcheckExecutor {
         let ptx = cudarc::nvrtc::compile_ptx(LOGUP_CUDA_KERNEL)
             .map_err(|e| CudaFftError::KernelCompilation(format!("logup kernel: {:?}", e)))?;
 
-        self.device.load_ptx(ptx, "logup", &[
-            "logup_denominator_kernel",
-            "logup_3way_round_kernel",
-            "logup_4way_reduce_kernel",
-            "logup_3way_fold_kernel",
-            "combine_blocks_kernel",
-        ]).map_err(|e| CudaFftError::KernelCompilation(format!("load logup PTX: {:?}", e)))?;
+        self.device
+            .load_ptx(
+                ptx,
+                "logup",
+                &[
+                    "logup_denominator_kernel",
+                    "logup_3way_round_kernel",
+                    "logup_4way_reduce_kernel",
+                    "logup_3way_fold_kernel",
+                    "combine_blocks_kernel",
+                ],
+            )
+            .map_err(|e| CudaFftError::KernelCompilation(format!("load logup PTX: {:?}", e)))?;
 
         let fns = LogupKernels {
-            denominator_fn: self.device.get_func("logup", "logup_denominator_kernel")
-                .ok_or_else(|| CudaFftError::KernelCompilation("logup_denominator_kernel not found".into()))?,
-            round_3way_fn: self.device.get_func("logup", "logup_3way_round_kernel")
-                .ok_or_else(|| CudaFftError::KernelCompilation("logup_3way_round_kernel not found".into()))?,
-            reduce_4way_fn: self.device.get_func("logup", "logup_4way_reduce_kernel")
-                .ok_or_else(|| CudaFftError::KernelCompilation("logup_4way_reduce_kernel not found".into()))?,
-            fold_3way_fn: self.device.get_func("logup", "logup_3way_fold_kernel")
-                .ok_or_else(|| CudaFftError::KernelCompilation("logup_3way_fold_kernel not found".into()))?,
-            combine_blocks_fn: self.device.get_func("logup", "combine_blocks_kernel")
-                .ok_or_else(|| CudaFftError::KernelCompilation("combine_blocks_kernel not found".into()))?,
+            denominator_fn: self
+                .device
+                .get_func("logup", "logup_denominator_kernel")
+                .ok_or_else(|| {
+                    CudaFftError::KernelCompilation("logup_denominator_kernel not found".into())
+                })?,
+            round_3way_fn: self
+                .device
+                .get_func("logup", "logup_3way_round_kernel")
+                .ok_or_else(|| {
+                    CudaFftError::KernelCompilation("logup_3way_round_kernel not found".into())
+                })?,
+            reduce_4way_fn: self
+                .device
+                .get_func("logup", "logup_4way_reduce_kernel")
+                .ok_or_else(|| {
+                    CudaFftError::KernelCompilation("logup_4way_reduce_kernel not found".into())
+                })?,
+            fold_3way_fn: self
+                .device
+                .get_func("logup", "logup_3way_fold_kernel")
+                .ok_or_else(|| {
+                    CudaFftError::KernelCompilation("logup_3way_fold_kernel not found".into())
+                })?,
+            combine_blocks_fn: self
+                .device
+                .get_func("logup", "combine_blocks_kernel")
+                .ok_or_else(|| {
+                    CudaFftError::KernelCompilation("combine_blocks_kernel not found".into())
+                })?,
         };
 
         *guard = Some(LogupKernels {
@@ -1975,9 +2126,13 @@ impl GpuSumcheckExecutor {
             return Ok(mle[0]);
         }
 
-        let flat: Vec<u32> = mle.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
-        let mut d_current = self.device.htod_sync_copy(&flat)
-            .map_err(|e| CudaFftError::MemoryAllocation(format!("evaluate_mle_gpu upload: {:?}", e)))?;
+        let flat: Vec<u32> = mle
+            .iter()
+            .flat_map(|sf| secure_field_to_u32s(*sf))
+            .collect();
+        let mut d_current = self.device.htod_sync_copy(&flat).map_err(|e| {
+            CudaFftError::MemoryAllocation(format!("evaluate_mle_gpu upload: {:?}", e))
+        })?;
         let mut cur_n = n;
 
         for challenge in point.iter() {
@@ -1988,8 +2143,11 @@ impl GpuSumcheckExecutor {
 
         // Download final scalar (1 QM31 = 4 u32)
         let mut result = [0u32; 4];
-        self.device.dtoh_sync_copy_into(&d_current, &mut result)
-            .map_err(|e| CudaFftError::MemoryTransfer(format!("evaluate_mle_gpu download: {:?}", e)))?;
+        self.device
+            .dtoh_sync_copy_into(&d_current, &mut result)
+            .map_err(|e| {
+                CudaFftError::MemoryTransfer(format!("evaluate_mle_gpu download: {:?}", e))
+            })?;
         Ok(u32s_to_secure_field(&result))
     }
 
@@ -2015,40 +2173,58 @@ impl GpuSumcheckExecutor {
         let fns = self.get_logup_fns()?;
 
         // Pack blocks contiguously: [block_0_elem_0..block_0_elem_n, block_1_elem_0..]
-        let blocks_flat: Vec<u32> = blocks.iter()
+        let blocks_flat: Vec<u32> = blocks
+            .iter()
             .flat_map(|block| block.iter().flat_map(|sf| secure_field_to_u32s(*sf)))
             .collect();
-        let weights_flat: Vec<u32> = weights.iter()
+        let weights_flat: Vec<u32> = weights
+            .iter()
             .flat_map(|sf| secure_field_to_u32s(*sf))
             .collect();
 
-        let d_blocks = self.device.htod_sync_copy(&blocks_flat)
-            .map_err(|e| CudaFftError::MemoryAllocation(format!("combine_blocks upload blocks: {:?}", e)))?;
-        let d_weights = self.device.htod_sync_copy(&weights_flat)
-            .map_err(|e| CudaFftError::MemoryAllocation(format!("combine_blocks upload weights: {:?}", e)))?;
-        let mut d_output = unsafe { self.device.alloc::<u32>(n_elems * 4) }
-            .map_err(|e| CudaFftError::MemoryAllocation(format!("combine_blocks output: {:?}", e)))?;
+        let d_blocks = self.device.htod_sync_copy(&blocks_flat).map_err(|e| {
+            CudaFftError::MemoryAllocation(format!("combine_blocks upload blocks: {:?}", e))
+        })?;
+        let d_weights = self.device.htod_sync_copy(&weights_flat).map_err(|e| {
+            CudaFftError::MemoryAllocation(format!("combine_blocks upload weights: {:?}", e))
+        })?;
+        let mut d_output = unsafe { self.device.alloc::<u32>(n_elems * 4) }.map_err(|e| {
+            CudaFftError::MemoryAllocation(format!("combine_blocks output: {:?}", e))
+        })?;
 
         let block_size = 256u32;
         let grid_size = (n_elems as u32 + block_size - 1) / block_size;
 
         unsafe {
-            fns.combine_blocks_fn.clone().launch(
-                LaunchConfig {
-                    grid_dim: (grid_size, 1, 1),
-                    block_dim: (block_size, 1, 1),
-                    shared_mem_bytes: 0,
-                },
-                (&d_blocks, &d_weights, &mut d_output, n_elems as u32, n_blocks as u32),
-            ).map_err(|e| CudaFftError::KernelExecution(format!("combine_blocks: {:?}", e)))?;
+            fns.combine_blocks_fn
+                .clone()
+                .launch(
+                    LaunchConfig {
+                        grid_dim: (grid_size, 1, 1),
+                        block_dim: (block_size, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    (
+                        &d_blocks,
+                        &d_weights,
+                        &mut d_output,
+                        n_elems as u32,
+                        n_blocks as u32,
+                    ),
+                )
+                .map_err(|e| CudaFftError::KernelExecution(format!("combine_blocks: {:?}", e)))?;
         }
 
         // Download result
         let mut out_flat = vec![0u32; n_elems * 4];
-        self.device.dtoh_sync_copy_into(&d_output, &mut out_flat)
-            .map_err(|e| CudaFftError::MemoryTransfer(format!("combine_blocks download: {:?}", e)))?;
+        self.device
+            .dtoh_sync_copy_into(&d_output, &mut out_flat)
+            .map_err(|e| {
+                CudaFftError::MemoryTransfer(format!("combine_blocks download: {:?}", e))
+            })?;
 
-        let result: Vec<SecureField> = out_flat.chunks_exact(4)
+        let result: Vec<SecureField> = out_flat
+            .chunks_exact(4)
             .map(|c| u32s_to_secure_field(&[c[0], c[1], c[2], c[3]]))
             .collect();
         Ok(result)
@@ -2073,19 +2249,29 @@ impl GpuSumcheckExecutor {
 
         let fns = self.get_logup_fns()?;
 
-        let input_flat: Vec<u32> = input.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
-        let output_flat: Vec<u32> = output.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
+        let input_flat: Vec<u32> = input
+            .iter()
+            .flat_map(|sf| secure_field_to_u32s(*sf))
+            .collect();
+        let output_flat: Vec<u32> = output
+            .iter()
+            .flat_map(|sf| secure_field_to_u32s(*sf))
+            .collect();
         let gamma_u32 = secure_field_to_u32s(gamma);
         let beta_u32 = secure_field_to_u32s(beta);
 
-        let d_input = self.device.htod_sync_copy(&input_flat)
-            .map_err(|e| CudaFftError::MemoryAllocation(format!("logup denom upload input: {:?}", e)))?;
-        let d_output_mle = self.device.htod_sync_copy(&output_flat)
-            .map_err(|e| CudaFftError::MemoryAllocation(format!("logup denom upload output: {:?}", e)))?;
-        let d_gamma = self.device.htod_sync_copy(&gamma_u32)
-            .map_err(|e| CudaFftError::MemoryAllocation(format!("logup denom upload gamma: {:?}", e)))?;
-        let d_beta = self.device.htod_sync_copy(&beta_u32)
-            .map_err(|e| CudaFftError::MemoryAllocation(format!("logup denom upload beta: {:?}", e)))?;
+        let d_input = self.device.htod_sync_copy(&input_flat).map_err(|e| {
+            CudaFftError::MemoryAllocation(format!("logup denom upload input: {:?}", e))
+        })?;
+        let d_output_mle = self.device.htod_sync_copy(&output_flat).map_err(|e| {
+            CudaFftError::MemoryAllocation(format!("logup denom upload output: {:?}", e))
+        })?;
+        let d_gamma = self.device.htod_sync_copy(&gamma_u32).map_err(|e| {
+            CudaFftError::MemoryAllocation(format!("logup denom upload gamma: {:?}", e))
+        })?;
+        let d_beta = self.device.htod_sync_copy(&beta_u32).map_err(|e| {
+            CudaFftError::MemoryAllocation(format!("logup denom upload beta: {:?}", e))
+        })?;
         let mut d_out = unsafe { self.device.alloc::<u32>(n * 4) }
             .map_err(|e| CudaFftError::MemoryAllocation(format!("logup denom output: {:?}", e)))?;
 
@@ -2093,14 +2279,26 @@ impl GpuSumcheckExecutor {
         let grid_size = (n as u32 + block_size - 1) / block_size;
 
         unsafe {
-            fns.denominator_fn.clone().launch(
-                LaunchConfig {
-                    grid_dim: (grid_size, 1, 1),
-                    block_dim: (block_size, 1, 1),
-                    shared_mem_bytes: 0,
-                },
-                (&d_input, &d_output_mle, &d_gamma, &d_beta, &mut d_out, n as u32),
-            ).map_err(|e| CudaFftError::KernelExecution(format!("logup_denominator: {:?}", e)))?;
+            fns.denominator_fn
+                .clone()
+                .launch(
+                    LaunchConfig {
+                        grid_dim: (grid_size, 1, 1),
+                        block_dim: (block_size, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    (
+                        &d_input,
+                        &d_output_mle,
+                        &d_gamma,
+                        &d_beta,
+                        &mut d_out,
+                        n as u32,
+                    ),
+                )
+                .map_err(|e| {
+                    CudaFftError::KernelExecution(format!("logup_denominator: {:?}", e))
+                })?;
         }
 
         Ok(d_out)
@@ -2138,29 +2336,43 @@ impl GpuSumcheckExecutor {
         };
 
         unsafe {
-            fns.round_3way_fn.clone().launch(
-                cfg,
-                (d_eq, d_w, d_d,
-                 &mut d_block_s0, &mut d_block_s1,
-                 &mut d_block_s2, &mut d_block_s3,
-                 mid as u32),
-            ).map_err(|e| CudaFftError::KernelExecution(format!("logup_3way_round: {:?}", e)))?;
+            fns.round_3way_fn
+                .clone()
+                .launch(
+                    cfg,
+                    (
+                        d_eq,
+                        d_w,
+                        d_d,
+                        &mut d_block_s0,
+                        &mut d_block_s1,
+                        &mut d_block_s2,
+                        &mut d_block_s3,
+                        mid as u32,
+                    ),
+                )
+                .map_err(|e| CudaFftError::KernelExecution(format!("logup_3way_round: {:?}", e)))?;
         }
 
         if n_blocks == 1 {
-            self.device.synchronize()
+            self.device
+                .synchronize()
                 .map_err(|e| CudaFftError::KernelExecution(format!("sync: {:?}", e)))?;
             let mut s0 = [0u32; 4];
             let mut s1 = [0u32; 4];
             let mut s2 = [0u32; 4];
             let mut s3 = [0u32; 4];
-            self.device.dtoh_sync_copy_into(&d_block_s0, &mut s0)
+            self.device
+                .dtoh_sync_copy_into(&d_block_s0, &mut s0)
                 .map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
-            self.device.dtoh_sync_copy_into(&d_block_s1, &mut s1)
+            self.device
+                .dtoh_sync_copy_into(&d_block_s1, &mut s1)
                 .map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
-            self.device.dtoh_sync_copy_into(&d_block_s2, &mut s2)
+            self.device
+                .dtoh_sync_copy_into(&d_block_s2, &mut s2)
                 .map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
-            self.device.dtoh_sync_copy_into(&d_block_s3, &mut s3)
+            self.device
+                .dtoh_sync_copy_into(&d_block_s3, &mut s3)
                 .map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
             return Ok((s0, s1, s2, s3));
         }
@@ -2171,34 +2383,46 @@ impl GpuSumcheckExecutor {
             .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
 
         let chunk = n_blocks * 4;
-        self.device.dtod_copy(&d_block_s0, &mut d_partials.slice_mut(0..chunk))
+        self.device
+            .dtod_copy(&d_block_s0, &mut d_partials.slice_mut(0..chunk))
             .map_err(|e| CudaFftError::MemoryTransfer(format!("dtod s0: {:?}", e)))?;
-        self.device.dtod_copy(&d_block_s1, &mut d_partials.slice_mut(chunk..2*chunk))
+        self.device
+            .dtod_copy(&d_block_s1, &mut d_partials.slice_mut(chunk..2 * chunk))
             .map_err(|e| CudaFftError::MemoryTransfer(format!("dtod s1: {:?}", e)))?;
-        self.device.dtod_copy(&d_block_s2, &mut d_partials.slice_mut(2*chunk..3*chunk))
+        self.device
+            .dtod_copy(&d_block_s2, &mut d_partials.slice_mut(2 * chunk..3 * chunk))
             .map_err(|e| CudaFftError::MemoryTransfer(format!("dtod s2: {:?}", e)))?;
-        self.device.dtod_copy(&d_block_s3, &mut d_partials.slice_mut(3*chunk..4*chunk))
+        self.device
+            .dtod_copy(&d_block_s3, &mut d_partials.slice_mut(3 * chunk..4 * chunk))
             .map_err(|e| CudaFftError::MemoryTransfer(format!("dtod s3: {:?}", e)))?;
 
-        let mut d_reduced = unsafe { self.device.alloc::<u32>(16) } // 4 QM31 = 16 u32
-            .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        let mut d_reduced =
+            unsafe { self.device.alloc::<u32>(16) } // 4 QM31 = 16 u32
+                .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
 
         unsafe {
-            fns.reduce_4way_fn.clone().launch(
-                LaunchConfig {
-                    grid_dim: (4, 1, 1),
-                    block_dim: (block_size, 1, 1),
-                    shared_mem_bytes: 256 * 4 * 4,
-                },
-                (&d_partials, &mut d_reduced, n_blocks as u32),
-            ).map_err(|e| CudaFftError::KernelExecution(format!("logup_4way_reduce: {:?}", e)))?;
+            fns.reduce_4way_fn
+                .clone()
+                .launch(
+                    LaunchConfig {
+                        grid_dim: (4, 1, 1),
+                        block_dim: (block_size, 1, 1),
+                        shared_mem_bytes: 256 * 4 * 4,
+                    },
+                    (&d_partials, &mut d_reduced, n_blocks as u32),
+                )
+                .map_err(|e| {
+                    CudaFftError::KernelExecution(format!("logup_4way_reduce: {:?}", e))
+                })?;
         }
 
-        self.device.synchronize()
+        self.device
+            .synchronize()
             .map_err(|e| CudaFftError::KernelExecution(format!("sync: {:?}", e)))?;
 
         let mut output = [0u32; 16];
-        self.device.dtoh_sync_copy_into(&d_reduced, &mut output)
+        self.device
+            .dtoh_sync_copy_into(&d_reduced, &mut output)
             .map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
 
         Ok((
@@ -2223,7 +2447,9 @@ impl GpuSumcheckExecutor {
         let fns = self.get_logup_fns()?;
         let half_n = n_points / 2;
 
-        let d_alpha = self.device.htod_sync_copy(challenge)
+        let d_alpha = self
+            .device
+            .htod_sync_copy(challenge)
             .map_err(|e| CudaFftError::MemoryAllocation(format!("3way_fold alpha: {:?}", e)))?;
 
         let mut d_eq_out = unsafe { self.device.alloc::<u32>(half_n * 4) }
@@ -2237,16 +2463,26 @@ impl GpuSumcheckExecutor {
         let grid_size = ((half_n as u32) + block_size - 1) / block_size;
 
         unsafe {
-            fns.fold_3way_fn.clone().launch(
-                LaunchConfig {
-                    grid_dim: (grid_size, 1, 1),
-                    block_dim: (block_size, 1, 1),
-                    shared_mem_bytes: 0,
-                },
-                (d_eq, d_w, d_d, &d_alpha,
-                 &mut d_eq_out, &mut d_w_out, &mut d_d_out,
-                 half_n as u32),
-            ).map_err(|e| CudaFftError::KernelExecution(format!("logup_3way_fold: {:?}", e)))?;
+            fns.fold_3way_fn
+                .clone()
+                .launch(
+                    LaunchConfig {
+                        grid_dim: (grid_size, 1, 1),
+                        block_dim: (block_size, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    (
+                        d_eq,
+                        d_w,
+                        d_d,
+                        &d_alpha,
+                        &mut d_eq_out,
+                        &mut d_w_out,
+                        &mut d_d_out,
+                        half_n as u32,
+                    ),
+                )
+                .map_err(|e| CudaFftError::KernelExecution(format!("logup_3way_fold: {:?}", e)))?;
         }
 
         Ok((d_eq_out, d_w_out, d_d_out))
@@ -2331,11 +2567,14 @@ impl GpuSumcheckExecutor {
         let mut final_w_u32 = [0u32; 4];
         let mut final_a_u32 = [0u32; 4];
         let mut final_b_u32 = [0u32; 4];
-        self.device.dtoh_sync_copy_into(&cur_w, &mut final_w_u32)
+        self.device
+            .dtoh_sync_copy_into(&cur_w, &mut final_w_u32)
             .map_err(|e| CudaFftError::MemoryTransfer(format!("final_w: {:?}", e)))?;
-        self.device.dtoh_sync_copy_into(&cur_a, &mut final_a_u32)
+        self.device
+            .dtoh_sync_copy_into(&cur_a, &mut final_a_u32)
             .map_err(|e| CudaFftError::MemoryTransfer(format!("final_a: {:?}", e)))?;
-        self.device.dtoh_sync_copy_into(&cur_b, &mut final_b_u32)
+        self.device
+            .dtoh_sync_copy_into(&cur_b, &mut final_b_u32)
             .map_err(|e| CudaFftError::MemoryTransfer(format!("final_b: {:?}", e)))?;
 
         Ok(Sumcheck3WayResult {
@@ -2387,8 +2626,7 @@ impl GpuSumcheckExecutor {
             let mid = cur_n / 2;
 
             // Evaluate round poly at t=0,1,2 on GPU.
-            let (s0_raw, s1_raw, s2_raw) =
-                self.compute_round_poly(&d_f_a_cur, &d_f_b_cur, mid)?;
+            let (s0_raw, s1_raw, s2_raw) = self.compute_round_poly(&d_f_a_cur, &d_f_b_cur, mid)?;
             let s0 = u32s_to_secure_field(&s0_raw);
             let s1 = u32s_to_secure_field(&s1_raw);
             let s2 = u32s_to_secure_field(&s2_raw);
@@ -2419,9 +2657,11 @@ impl GpuSumcheckExecutor {
         debug_assert_eq!(cur_n, 1);
         let mut final_a_u32 = [0u32; 4];
         let mut final_b_u32 = [0u32; 4];
-        self.device.dtoh_sync_copy_into(&d_f_a_cur, &mut final_a_u32)
+        self.device
+            .dtoh_sync_copy_into(&d_f_a_cur, &mut final_a_u32)
             .map_err(|e| CudaFftError::MemoryTransfer(format!("reduce final_a: {:?}", e)))?;
-        self.device.dtoh_sync_copy_into(&d_f_b_cur, &mut final_b_u32)
+        self.device
+            .dtoh_sync_copy_into(&d_f_b_cur, &mut final_b_u32)
             .map_err(|e| CudaFftError::MemoryTransfer(format!("reduce final_b: {:?}", e)))?;
         let final_a_eval = u32s_to_secure_field(&final_a_u32);
         let final_b_eval = u32s_to_secure_field(&final_b_u32);
@@ -2527,9 +2767,11 @@ impl GpuSumcheckExecutor {
         let mut round_poly_raw = vec![0u32; num_rounds * 12];
         let mut challenges_raw = vec![0u32; num_rounds * 4];
 
-        self.device.dtoh_sync_copy_into(d_round_polys, &mut round_poly_raw)
+        self.device
+            .dtoh_sync_copy_into(d_round_polys, &mut round_poly_raw)
             .map_err(|e| CudaFftError::MemoryTransfer(format!("download round_polys: {:?}", e)))?;
-        self.device.dtoh_sync_copy_into(d_challenges, &mut challenges_raw)
+        self.device
+            .dtoh_sync_copy_into(d_challenges, &mut challenges_raw)
             .map_err(|e| CudaFftError::MemoryTransfer(format!("download challenges: {:?}", e)))?;
 
         // Convert raw u32 data to structured SecureField arrays
@@ -2598,18 +2840,25 @@ pub fn gpu_matmul_m31_full(
     let executor = GpuSumcheckExecutor::cached()
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU init: {e}")))?;
 
-    let fns = executor.get_forward_fns()
+    let fns = executor
+        .get_forward_fns()
         .map_err(|e| MatMulError::SumcheckFailed(format!("forward kernels: {e}")))?;
 
     // Upload matrices
     let input_u32: Vec<u32> = input.data.iter().map(|v| v.0).collect();
     let weight_u32: Vec<u32> = weight.data.iter().map(|v| v.0).collect();
 
-    let d_input = executor.device.htod_sync_copy(&input_u32)
+    let d_input = executor
+        .device
+        .htod_sync_copy(&input_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU upload input: {:?}", e)))?;
-    let d_weight = executor.device.htod_sync_copy(&weight_u32)
+    let d_weight = executor
+        .device
+        .htod_sync_copy(&weight_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU upload weight: {:?}", e)))?;
-    let d_output: CudaSlice<u32> = executor.device.alloc_zeros(m * n)
+    let d_output: CudaSlice<u32> = executor
+        .device
+        .alloc_zeros(m * n)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU alloc output: {:?}", e)))?;
 
     if m == 1 {
@@ -2617,10 +2866,17 @@ pub fn gpu_matmul_m31_full(
         let block_size = 256u32;
         let grid_size = (n as u32 + block_size - 1) / block_size;
         unsafe {
-            fns.gemv_fn.clone().launch(
-                LaunchConfig { grid_dim: (grid_size, 1, 1), block_dim: (block_size, 1, 1), shared_mem_bytes: 0 },
-                (&d_input, &d_weight, &d_output, k as u32, n as u32),
-            ).map_err(|e| MatMulError::SumcheckFailed(format!("GPU GEMV: {:?}", e)))?;
+            fns.gemv_fn
+                .clone()
+                .launch(
+                    LaunchConfig {
+                        grid_dim: (grid_size, 1, 1),
+                        block_dim: (block_size, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    (&d_input, &d_weight, &d_output, k as u32, n as u32),
+                )
+                .map_err(|e| MatMulError::SumcheckFailed(format!("GPU GEMV: {:?}", e)))?;
         }
     } else {
         // GEMM path: 2D grid with 16×16 blocks
@@ -2629,20 +2885,33 @@ pub fn gpu_matmul_m31_full(
         let grid_x = (n as u32 + block_x - 1) / block_x;
         let grid_y = (m as u32 + block_y - 1) / block_y;
         unsafe {
-            fns.gemm_fn.clone().launch(
-                LaunchConfig { grid_dim: (grid_x, grid_y, 1), block_dim: (block_x, block_y, 1), shared_mem_bytes: 0 },
-                (&d_input, &d_weight, &d_output, m as u32, k as u32, n as u32),
-            ).map_err(|e| MatMulError::SumcheckFailed(format!("GPU GEMM: {:?}", e)))?;
+            fns.gemm_fn
+                .clone()
+                .launch(
+                    LaunchConfig {
+                        grid_dim: (grid_x, grid_y, 1),
+                        block_dim: (block_x, block_y, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    (&d_input, &d_weight, &d_output, m as u32, k as u32, n as u32),
+                )
+                .map_err(|e| MatMulError::SumcheckFailed(format!("GPU GEMM: {:?}", e)))?;
         }
     }
 
     // Download result
     let mut output_u32 = vec![0u32; m * n];
-    executor.device.dtoh_sync_copy_into(&d_output, &mut output_u32)
+    executor
+        .device
+        .dtoh_sync_copy_into(&d_output, &mut output_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU download: {:?}", e)))?;
 
     let data: Vec<M31> = output_u32.iter().map(|&v| M31::from(v)).collect();
-    Ok(M31Matrix { rows: m, cols: n, data })
+    Ok(M31Matrix {
+        rows: m,
+        cols: n,
+        data,
+    })
 }
 
 /// GPU element-wise M31 addition.
@@ -2651,36 +2920,54 @@ pub fn gpu_elementwise_add(lhs: &[M31], rhs: &[M31]) -> Result<Vec<M31>, MatMulE
     let n = lhs.len();
     if n != rhs.len() {
         return Err(MatMulError::SumcheckFailed(format!(
-            "GPU add length mismatch: {} != {}", n, rhs.len(),
+            "GPU add length mismatch: {} != {}",
+            n,
+            rhs.len(),
         )));
     }
 
     let executor = GpuSumcheckExecutor::cached()
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU init: {e}")))?;
-    let fns = executor.get_forward_fns()
+    let fns = executor
+        .get_forward_fns()
         .map_err(|e| MatMulError::SumcheckFailed(format!("forward kernels: {e}")))?;
 
     let lhs_u32: Vec<u32> = lhs.iter().map(|v| v.0).collect();
     let rhs_u32: Vec<u32> = rhs.iter().map(|v| v.0).collect();
 
-    let d_lhs = executor.device.htod_sync_copy(&lhs_u32)
+    let d_lhs = executor
+        .device
+        .htod_sync_copy(&lhs_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU upload lhs: {:?}", e)))?;
-    let d_rhs = executor.device.htod_sync_copy(&rhs_u32)
+    let d_rhs = executor
+        .device
+        .htod_sync_copy(&rhs_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU upload rhs: {:?}", e)))?;
-    let d_out: CudaSlice<u32> = executor.device.alloc_zeros(n)
+    let d_out: CudaSlice<u32> = executor
+        .device
+        .alloc_zeros(n)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU alloc: {:?}", e)))?;
 
     let block_size = 256u32;
     let grid_size = (n as u32 + block_size - 1) / block_size;
     unsafe {
-        fns.add_fn.clone().launch(
-            LaunchConfig { grid_dim: (grid_size, 1, 1), block_dim: (block_size, 1, 1), shared_mem_bytes: 0 },
-            (&d_lhs, &d_rhs, &d_out, n as u32),
-        ).map_err(|e| MatMulError::SumcheckFailed(format!("GPU add: {:?}", e)))?;
+        fns.add_fn
+            .clone()
+            .launch(
+                LaunchConfig {
+                    grid_dim: (grid_size, 1, 1),
+                    block_dim: (block_size, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                (&d_lhs, &d_rhs, &d_out, n as u32),
+            )
+            .map_err(|e| MatMulError::SumcheckFailed(format!("GPU add: {:?}", e)))?;
     }
 
     let mut out_u32 = vec![0u32; n];
-    executor.device.dtoh_sync_copy_into(&d_out, &mut out_u32)
+    executor
+        .device
+        .dtoh_sync_copy_into(&d_out, &mut out_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU download: {:?}", e)))?;
     Ok(out_u32.iter().map(|&v| M31::from(v)).collect())
 }
@@ -2691,36 +2978,54 @@ pub fn gpu_elementwise_mul(lhs: &[M31], rhs: &[M31]) -> Result<Vec<M31>, MatMulE
     let n = lhs.len();
     if n != rhs.len() {
         return Err(MatMulError::SumcheckFailed(format!(
-            "GPU mul length mismatch: {} != {}", n, rhs.len(),
+            "GPU mul length mismatch: {} != {}",
+            n,
+            rhs.len(),
         )));
     }
 
     let executor = GpuSumcheckExecutor::cached()
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU init: {e}")))?;
-    let fns = executor.get_forward_fns()
+    let fns = executor
+        .get_forward_fns()
         .map_err(|e| MatMulError::SumcheckFailed(format!("forward kernels: {e}")))?;
 
     let lhs_u32: Vec<u32> = lhs.iter().map(|v| v.0).collect();
     let rhs_u32: Vec<u32> = rhs.iter().map(|v| v.0).collect();
 
-    let d_lhs = executor.device.htod_sync_copy(&lhs_u32)
+    let d_lhs = executor
+        .device
+        .htod_sync_copy(&lhs_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU upload lhs: {:?}", e)))?;
-    let d_rhs = executor.device.htod_sync_copy(&rhs_u32)
+    let d_rhs = executor
+        .device
+        .htod_sync_copy(&rhs_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU upload rhs: {:?}", e)))?;
-    let d_out: CudaSlice<u32> = executor.device.alloc_zeros(n)
+    let d_out: CudaSlice<u32> = executor
+        .device
+        .alloc_zeros(n)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU alloc: {:?}", e)))?;
 
     let block_size = 256u32;
     let grid_size = (n as u32 + block_size - 1) / block_size;
     unsafe {
-        fns.mul_fn.clone().launch(
-            LaunchConfig { grid_dim: (grid_size, 1, 1), block_dim: (block_size, 1, 1), shared_mem_bytes: 0 },
-            (&d_lhs, &d_rhs, &d_out, n as u32),
-        ).map_err(|e| MatMulError::SumcheckFailed(format!("GPU mul: {:?}", e)))?;
+        fns.mul_fn
+            .clone()
+            .launch(
+                LaunchConfig {
+                    grid_dim: (grid_size, 1, 1),
+                    block_dim: (block_size, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                (&d_lhs, &d_rhs, &d_out, n as u32),
+            )
+            .map_err(|e| MatMulError::SumcheckFailed(format!("GPU mul: {:?}", e)))?;
     }
 
     let mut out_u32 = vec![0u32; n];
-    executor.device.dtoh_sync_copy_into(&d_out, &mut out_u32)
+    executor
+        .device
+        .dtoh_sync_copy_into(&d_out, &mut out_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU download: {:?}", e)))?;
     Ok(out_u32.iter().map(|&v| M31::from(v)).collect())
 }
@@ -2732,26 +3037,40 @@ pub fn gpu_relu(input: &[M31]) -> Result<Vec<M31>, MatMulError> {
 
     let executor = GpuSumcheckExecutor::cached()
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU init: {e}")))?;
-    let fns = executor.get_forward_fns()
+    let fns = executor
+        .get_forward_fns()
         .map_err(|e| MatMulError::SumcheckFailed(format!("forward kernels: {e}")))?;
 
     let input_u32: Vec<u32> = input.iter().map(|v| v.0).collect();
-    let d_input = executor.device.htod_sync_copy(&input_u32)
+    let d_input = executor
+        .device
+        .htod_sync_copy(&input_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU upload: {:?}", e)))?;
-    let d_out: CudaSlice<u32> = executor.device.alloc_zeros(n)
+    let d_out: CudaSlice<u32> = executor
+        .device
+        .alloc_zeros(n)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU alloc: {:?}", e)))?;
 
     let block_size = 256u32;
     let grid_size = (n as u32 + block_size - 1) / block_size;
     unsafe {
-        fns.relu_fn.clone().launch(
-            LaunchConfig { grid_dim: (grid_size, 1, 1), block_dim: (block_size, 1, 1), shared_mem_bytes: 0 },
-            (&d_input, &d_out, n as u32),
-        ).map_err(|e| MatMulError::SumcheckFailed(format!("GPU relu: {:?}", e)))?;
+        fns.relu_fn
+            .clone()
+            .launch(
+                LaunchConfig {
+                    grid_dim: (grid_size, 1, 1),
+                    block_dim: (block_size, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                (&d_input, &d_out, n as u32),
+            )
+            .map_err(|e| MatMulError::SumcheckFailed(format!("GPU relu: {:?}", e)))?;
     }
 
     let mut out_u32 = vec![0u32; n];
-    executor.device.dtoh_sync_copy_into(&d_out, &mut out_u32)
+    executor
+        .device
+        .dtoh_sync_copy_into(&d_out, &mut out_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU download: {:?}", e)))?;
     Ok(out_u32.iter().map(|&v| M31::from(v)).collect())
 }
@@ -2779,43 +3098,67 @@ pub fn gpu_layernorm_m31(
 
     let executor = GpuSumcheckExecutor::cached()
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU init: {e}")))?;
-    let fns = executor.get_forward_fns()
+    let fns = executor
+        .get_forward_fns()
         .map_err(|e| MatMulError::SumcheckFailed(format!("forward kernels: {e}")))?;
 
     // Upload input (only the active dim portion per row if cols > dim)
     // For simplicity, upload full matrix and let kernel work on first `dim` elements.
     // If cols != dim, we handle the padding columns on CPU after download.
     let input_u32: Vec<u32> = input.data.iter().map(|v| v.0).collect();
-    let d_input = executor.device.htod_sync_copy(&input_u32)
+    let d_input = executor
+        .device
+        .htod_sync_copy(&input_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU upload input: {:?}", e)))?;
 
     // Upload rsqrt table
-    let d_rsqrt_table = executor.device.htod_sync_copy(rsqrt_table)
+    let d_rsqrt_table = executor
+        .device
+        .htod_sync_copy(rsqrt_table)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU upload rsqrt_table: {:?}", e)))?;
 
     // Allocate output buffers
-    let d_output: CudaSlice<u32> = executor.device.alloc_zeros(rows * cols)
+    let d_output: CudaSlice<u32> = executor
+        .device
+        .alloc_zeros(rows * cols)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU alloc output: {:?}", e)))?;
-    let d_means: CudaSlice<u32> = executor.device.alloc_zeros(rows)
+    let d_means: CudaSlice<u32> = executor
+        .device
+        .alloc_zeros(rows)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU alloc means: {:?}", e)))?;
-    let d_variances: CudaSlice<u32> = executor.device.alloc_zeros(rows)
+    let d_variances: CudaSlice<u32> = executor
+        .device
+        .alloc_zeros(rows)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU alloc variances: {:?}", e)))?;
-    let d_rsqrt: CudaSlice<u32> = executor.device.alloc_zeros(rows)
+    let d_rsqrt: CudaSlice<u32> = executor
+        .device
+        .alloc_zeros(rows)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU alloc rsqrt: {:?}", e)))?;
 
     // Launch: one block per row, 256 threads per block
     // Kernel uses cols as the dim parameter and processes first `n` elements per row.
     // We pass `n` (the active dim) so the kernel only reduces over the active range.
     unsafe {
-        fns.layernorm_fn.clone().launch(
-            LaunchConfig {
-                grid_dim: (rows as u32, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 256 * 4,
-            },
-            (&d_input, &d_output, &d_means, &d_variances, &d_rsqrt,
-             &d_rsqrt_table, n as u32, inv_n),
-        ).map_err(|e| MatMulError::SumcheckFailed(format!("GPU LayerNorm launch: {:?}", e)))?;
+        fns.layernorm_fn
+            .clone()
+            .launch(
+                LaunchConfig {
+                    grid_dim: (rows as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 256 * 4,
+                },
+                (
+                    &d_input,
+                    &d_output,
+                    &d_means,
+                    &d_variances,
+                    &d_rsqrt,
+                    &d_rsqrt_table,
+                    n as u32,
+                    inv_n,
+                ),
+            )
+            .map_err(|e| MatMulError::SumcheckFailed(format!("GPU LayerNorm launch: {:?}", e)))?;
     }
 
     // Download results
@@ -2824,13 +3167,21 @@ pub fn gpu_layernorm_m31(
     let mut variances_u32 = vec![0u32; rows];
     let mut rsqrt_u32 = vec![0u32; rows];
 
-    executor.device.dtoh_sync_copy_into(&d_output, &mut output_u32)
+    executor
+        .device
+        .dtoh_sync_copy_into(&d_output, &mut output_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU download output: {:?}", e)))?;
-    executor.device.dtoh_sync_copy_into(&d_means, &mut means_u32)
+    executor
+        .device
+        .dtoh_sync_copy_into(&d_means, &mut means_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU download means: {:?}", e)))?;
-    executor.device.dtoh_sync_copy_into(&d_variances, &mut variances_u32)
+    executor
+        .device
+        .dtoh_sync_copy_into(&d_variances, &mut variances_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU download variances: {:?}", e)))?;
-    executor.device.dtoh_sync_copy_into(&d_rsqrt, &mut rsqrt_u32)
+    executor
+        .device
+        .dtoh_sync_copy_into(&d_rsqrt, &mut rsqrt_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU download rsqrt: {:?}", e)))?;
 
     // Convert to M31
@@ -2851,7 +3202,11 @@ pub fn gpu_layernorm_m31(
     }
 
     Ok((
-        M31Matrix { rows, cols, data: final_data },
+        M31Matrix {
+            rows,
+            cols,
+            data: final_data,
+        },
         means,
         variances,
         rsqrt_vals,
@@ -2881,43 +3236,70 @@ pub fn gpu_rmsnorm_m31(
 
     let executor = GpuSumcheckExecutor::cached()
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU init: {e}")))?;
-    let fns = executor.get_forward_fns()
+    let fns = executor
+        .get_forward_fns()
         .map_err(|e| MatMulError::SumcheckFailed(format!("forward kernels: {e}")))?;
 
     let input_u32: Vec<u32> = input.data.iter().map(|v| v.0).collect();
-    let d_input = executor.device.htod_sync_copy(&input_u32)
+    let d_input = executor
+        .device
+        .htod_sync_copy(&input_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU upload input: {:?}", e)))?;
-    let d_rsqrt_table = executor.device.htod_sync_copy(rsqrt_table)
+    let d_rsqrt_table = executor
+        .device
+        .htod_sync_copy(rsqrt_table)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU upload rsqrt_table: {:?}", e)))?;
 
-    let d_output: CudaSlice<u32> = executor.device.alloc_zeros(rows * cols)
+    let d_output: CudaSlice<u32> = executor
+        .device
+        .alloc_zeros(rows * cols)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU alloc output: {:?}", e)))?;
-    let d_rms_sq: CudaSlice<u32> = executor.device.alloc_zeros(rows)
+    let d_rms_sq: CudaSlice<u32> = executor
+        .device
+        .alloc_zeros(rows)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU alloc rms_sq: {:?}", e)))?;
-    let d_rsqrt: CudaSlice<u32> = executor.device.alloc_zeros(rows)
+    let d_rsqrt: CudaSlice<u32> = executor
+        .device
+        .alloc_zeros(rows)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU alloc rsqrt: {:?}", e)))?;
 
     unsafe {
-        fns.rmsnorm_fn.clone().launch(
-            LaunchConfig {
-                grid_dim: (rows as u32, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 256 * 4,
-            },
-            (&d_input, &d_output, &d_rms_sq, &d_rsqrt,
-             &d_rsqrt_table, n as u32, inv_n),
-        ).map_err(|e| MatMulError::SumcheckFailed(format!("GPU RMSNorm launch: {:?}", e)))?;
+        fns.rmsnorm_fn
+            .clone()
+            .launch(
+                LaunchConfig {
+                    grid_dim: (rows as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 256 * 4,
+                },
+                (
+                    &d_input,
+                    &d_output,
+                    &d_rms_sq,
+                    &d_rsqrt,
+                    &d_rsqrt_table,
+                    n as u32,
+                    inv_n,
+                ),
+            )
+            .map_err(|e| MatMulError::SumcheckFailed(format!("GPU RMSNorm launch: {:?}", e)))?;
     }
 
     let mut output_u32 = vec![0u32; rows * cols];
     let mut rms_sq_u32 = vec![0u32; rows];
     let mut rsqrt_u32 = vec![0u32; rows];
 
-    executor.device.dtoh_sync_copy_into(&d_output, &mut output_u32)
+    executor
+        .device
+        .dtoh_sync_copy_into(&d_output, &mut output_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU download output: {:?}", e)))?;
-    executor.device.dtoh_sync_copy_into(&d_rms_sq, &mut rms_sq_u32)
+    executor
+        .device
+        .dtoh_sync_copy_into(&d_rms_sq, &mut rms_sq_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU download rms_sq: {:?}", e)))?;
-    executor.device.dtoh_sync_copy_into(&d_rsqrt, &mut rsqrt_u32)
+    executor
+        .device
+        .dtoh_sync_copy_into(&d_rsqrt, &mut rsqrt_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU download rsqrt: {:?}", e)))?;
 
     let output_data: Vec<M31> = output_u32.iter().map(|&v| M31::from(v)).collect();
@@ -2934,7 +3316,11 @@ pub fn gpu_rmsnorm_m31(
     }
 
     Ok((
-        M31Matrix { rows, cols, data: final_data },
+        M31Matrix {
+            rows,
+            cols,
+            data: final_data,
+        },
         rms_sq,
         rsqrt_vals,
     ))
@@ -2990,7 +3376,8 @@ impl MultivariatePolyOracle for GpuMatMulOracle {
         let mid = self.n_points / 2;
 
         // Launch GPU reduction kernel
-        let (s0_u32, s1_u32, s2_u32) = self.executor
+        let (s0_u32, s1_u32, s2_u32) = self
+            .executor
             .compute_round_poly(&self.d_f_a, &self.d_f_b, mid)
             .expect("GPU sumcheck round kernel failed");
 
@@ -3009,11 +3396,13 @@ impl MultivariatePolyOracle for GpuMatMulOracle {
     fn fix_first_variable(self, challenge: SecureField) -> Self {
         let challenge_u32 = secure_field_to_u32s(challenge);
 
-        let new_d_f_a = self.executor
+        let new_d_f_a = self
+            .executor
             .mle_fold(&self.d_f_a, self.n_points, &challenge_u32)
             .expect("GPU MLE fold for f_a failed");
 
-        let new_d_f_b = self.executor
+        let new_d_f_b = self
+            .executor
             .mle_fold(&self.d_f_b, self.n_points, &challenge_u32)
             .expect("GPU MLE fold for f_b failed");
 
@@ -3050,17 +3439,18 @@ pub fn prove_matmul_sumcheck_gpu(
     b: &M31Matrix,
     c: &M31Matrix,
 ) -> Result<MatMulSumcheckProof, MatMulError> {
-
     // Validate dimensions
     if a.cols != b.rows {
-        return Err(MatMulError::DimensionMismatch(
-            format!("A.cols={} != B.rows={}", a.cols, b.rows),
-        ));
+        return Err(MatMulError::DimensionMismatch(format!(
+            "A.cols={} != B.rows={}",
+            a.cols, b.rows
+        )));
     }
     if c.rows != a.rows || c.cols != b.cols {
-        return Err(MatMulError::DimensionMismatch(
-            format!("C({},{}) != expected ({},{})", c.rows, c.cols, a.rows, b.cols),
-        ));
+        return Err(MatMulError::DimensionMismatch(format!(
+            "C({},{}) != expected ({},{})",
+            c.rows, c.cols, a.rows, b.cols
+        )));
     }
 
     // Padded dimensions for Fiat-Shamir consistency
@@ -3098,9 +3488,11 @@ pub fn prove_matmul_sumcheck_gpu(
 
     // GPU fused restrict: upload original M31 matrices, compute QM31 restrict on GPU.
     // No matrix_to_mle, no restrict_mle, no pad_matrix_pow2 for A or B.
-    let d_f_a = gpu_executor.restrict_rows(a, &r_i, k)
+    let d_f_a = gpu_executor
+        .restrict_rows(a, &r_i, k)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU restrict_rows: {e}")))?;
-    let d_f_b = gpu_executor.restrict_cols(b, &r_j, k)
+    let d_f_b = gpu_executor
+        .restrict_cols(b, &r_j, k)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU restrict_cols: {e}")))?;
 
     // Build GPU oracle and run sumcheck (data already on GPU)
@@ -3121,9 +3513,15 @@ pub fn prove_matmul_sumcheck_gpu(
 
     let mut final_a_u32 = [0u32; 4];
     let mut final_b_u32 = [0u32; 4];
-    final_oracle.executor.device.dtoh_sync_copy_into(&final_oracle.d_f_a, &mut final_a_u32)
+    final_oracle
+        .executor
+        .device
+        .dtoh_sync_copy_into(&final_oracle.d_f_a, &mut final_a_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU download final_a: {:?}", e)))?;
-    final_oracle.executor.device.dtoh_sync_copy_into(&final_oracle.d_f_b, &mut final_b_u32)
+    final_oracle
+        .executor
+        .device
+        .dtoh_sync_copy_into(&final_oracle.d_f_b, &mut final_b_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU download final_b: {:?}", e)))?;
 
     let final_a_eval = u32s_to_secure_field(&final_a_u32);
@@ -3157,22 +3555,22 @@ pub fn prove_matmul_sumcheck_onchain_gpu(
     b: &M31Matrix,
     c: &M31Matrix,
 ) -> Result<crate::components::matmul::MatMulSumcheckProofOnChain, MatMulError> {
-    use crate::components::matmul::{
-        MatMulSumcheckProofOnChain, RoundPoly, pad_matrix_pow2,
-    };
-    use crate::crypto::poseidon_channel::{PoseidonChannel, securefield_to_felt};
+    use crate::components::matmul::{pad_matrix_pow2, MatMulSumcheckProofOnChain, RoundPoly};
     use crate::crypto::mle_opening::{commit_mle_root_only, prove_mle_opening};
+    use crate::crypto::poseidon_channel::{securefield_to_felt, PoseidonChannel};
 
     // Validate dimensions
     if a.cols != b.rows {
-        return Err(MatMulError::DimensionMismatch(
-            format!("A.cols={} != B.rows={}", a.cols, b.rows),
-        ));
+        return Err(MatMulError::DimensionMismatch(format!(
+            "A.cols={} != B.rows={}",
+            a.cols, b.rows
+        )));
     }
     if c.rows != a.rows || c.cols != b.cols {
-        return Err(MatMulError::DimensionMismatch(
-            format!("C({},{}) != expected ({},{})", c.rows, c.cols, a.rows, b.cols),
-        ));
+        return Err(MatMulError::DimensionMismatch(format!(
+            "C({},{}) != expected ({},{})",
+            c.rows, c.cols, a.rows, b.cols
+        )));
     }
 
     // Padded dimensions for Fiat-Shamir
@@ -3207,23 +3605,31 @@ pub fn prove_matmul_sumcheck_onchain_gpu(
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU init: {e}")))?;
 
     // GPU fused restrict: original M31 matrices → QM31 on GPU
-    let d_f_a_restrict = gpu_executor.restrict_rows(a, &r_i, k)
+    let d_f_a_restrict = gpu_executor
+        .restrict_rows(a, &r_i, k)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU restrict_rows: {e}")))?;
-    let d_f_b_restrict = gpu_executor.restrict_cols(b, &r_j, k)
+    let d_f_b_restrict = gpu_executor
+        .restrict_cols(b, &r_j, k)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU restrict_cols: {e}")))?;
 
     // Download restrict results for commitment + MLE opening proofs
     let mut f_a_u32 = vec![0u32; k * 4];
     let mut f_b_u32 = vec![0u32; k * 4];
-    gpu_executor.device.dtoh_sync_copy_into(&d_f_a_restrict, &mut f_a_u32)
+    gpu_executor
+        .device
+        .dtoh_sync_copy_into(&d_f_a_restrict, &mut f_a_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("download f_a: {:?}", e)))?;
-    gpu_executor.device.dtoh_sync_copy_into(&d_f_b_restrict, &mut f_b_u32)
+    gpu_executor
+        .device
+        .dtoh_sync_copy_into(&d_f_b_restrict, &mut f_b_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("download f_b: {:?}", e)))?;
 
-    let f_a: Vec<SecureField> = f_a_u32.chunks_exact(4)
+    let f_a: Vec<SecureField> = f_a_u32
+        .chunks_exact(4)
         .map(|c| u32s_to_secure_field(&[c[0], c[1], c[2], c[3]]))
         .collect();
-    let f_b: Vec<SecureField> = f_b_u32.chunks_exact(4)
+    let f_b: Vec<SecureField> = f_b_u32
+        .chunks_exact(4)
         .map(|c| u32s_to_secure_field(&[c[0], c[1], c[2], c[3]]))
         .collect();
 
@@ -3272,9 +3678,11 @@ pub fn prove_matmul_sumcheck_onchain_gpu(
         // GPU: fold both MLEs with challenge (16 bytes uploaded, no download)
         let challenge_u32 = secure_field_to_u32s(r_k);
 
-        let new_d_f_a = gpu_executor.mle_fold(&d_f_a, cur_n_points, &challenge_u32)
+        let new_d_f_a = gpu_executor
+            .mle_fold(&d_f_a, cur_n_points, &challenge_u32)
             .map_err(|e| MatMulError::SumcheckFailed(format!("GPU fold f_a: {e}")))?;
-        let new_d_f_b = gpu_executor.mle_fold(&d_f_b, cur_n_points, &challenge_u32)
+        let new_d_f_b = gpu_executor
+            .mle_fold(&d_f_b, cur_n_points, &challenge_u32)
             .map_err(|e| MatMulError::SumcheckFailed(format!("GPU fold f_b: {e}")))?;
 
         d_f_a = new_d_f_a;
@@ -3286,9 +3694,13 @@ pub fn prove_matmul_sumcheck_onchain_gpu(
     assert_eq!(cur_n_points, 1);
     let mut final_a_u32 = [0u32; 4];
     let mut final_b_u32 = [0u32; 4];
-    gpu_executor.device.dtoh_sync_copy_into(&d_f_a, &mut final_a_u32)
+    gpu_executor
+        .device
+        .dtoh_sync_copy_into(&d_f_a, &mut final_a_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU download final_a: {:?}", e)))?;
-    gpu_executor.device.dtoh_sync_copy_into(&d_f_b, &mut final_b_u32)
+    gpu_executor
+        .device
+        .dtoh_sync_copy_into(&d_f_b, &mut final_b_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU download final_b: {:?}", e)))?;
 
     let final_a_eval = u32s_to_secure_field(&final_a_u32);
@@ -3368,7 +3780,7 @@ pub fn prove_matmul_batch_onchain_gpu(
     entries: &[BatchEntry],
 ) -> Result<BatchedSumcheckResult, MatMulError> {
     use crate::components::matmul::RoundPoly;
-    use crate::crypto::poseidon_channel::{PoseidonChannel, securefield_to_felt};
+    use crate::crypto::poseidon_channel::{securefield_to_felt, PoseidonChannel};
 
     if entries.is_empty() {
         return Err(MatMulError::SumcheckFailed("empty batch".into()));
@@ -3408,12 +3820,24 @@ pub fn prove_matmul_batch_onchain_gpu(
     let mut d_f_b_list: Vec<CudaSlice<u32>> = Vec::with_capacity(num_entries);
 
     for e in entries {
-        let f_a_u32: Vec<u32> = e.f_a.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
-        let f_b_u32: Vec<u32> = e.f_b.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
+        let f_a_u32: Vec<u32> = e
+            .f_a
+            .iter()
+            .flat_map(|sf| secure_field_to_u32s(*sf))
+            .collect();
+        let f_b_u32: Vec<u32> = e
+            .f_b
+            .iter()
+            .flat_map(|sf| secure_field_to_u32s(*sf))
+            .collect();
 
-        let d_f_a = gpu_executor.device.htod_sync_copy(&f_a_u32)
+        let d_f_a = gpu_executor
+            .device
+            .htod_sync_copy(&f_a_u32)
             .map_err(|e| MatMulError::SumcheckFailed(format!("GPU upload batch f_a: {:?}", e)))?;
-        let d_f_b = gpu_executor.device.htod_sync_copy(&f_b_u32)
+        let d_f_b = gpu_executor
+            .device
+            .htod_sync_copy(&f_b_u32)
             .map_err(|e| MatMulError::SumcheckFailed(format!("GPU upload batch f_b: {:?}", e)))?;
 
         d_f_a_list.push(d_f_a);
@@ -3437,9 +3861,9 @@ pub fn prove_matmul_batch_onchain_gpu(
         for i in 0..num_entries {
             let (s0_u32, s1_u32, s2_u32) = gpu_executor
                 .compute_round_poly(&d_f_a_list[i], &d_f_b_list[i], mid)
-                .map_err(|e| MatMulError::SumcheckFailed(
-                    format!("GPU batch round entry {i}: {e}"),
-                ))?;
+                .map_err(|e| {
+                    MatMulError::SumcheckFailed(format!("GPU batch round entry {i}: {e}"))
+                })?;
 
             let s0 = u32s_to_secure_field(&s0_u32);
             let s1 = u32s_to_secure_field(&s1_u32);
@@ -3469,14 +3893,16 @@ pub fn prove_matmul_batch_onchain_gpu(
         let challenge_u32 = secure_field_to_u32s(r_k);
 
         for i in 0..num_entries {
-            let new_d_f_a = gpu_executor.mle_fold(&d_f_a_list[i], cur_n_points, &challenge_u32)
-                .map_err(|e| MatMulError::SumcheckFailed(
-                    format!("GPU batch fold f_a entry {i}: {e}"),
-                ))?;
-            let new_d_f_b = gpu_executor.mle_fold(&d_f_b_list[i], cur_n_points, &challenge_u32)
-                .map_err(|e| MatMulError::SumcheckFailed(
-                    format!("GPU batch fold f_b entry {i}: {e}"),
-                ))?;
+            let new_d_f_a = gpu_executor
+                .mle_fold(&d_f_a_list[i], cur_n_points, &challenge_u32)
+                .map_err(|e| {
+                    MatMulError::SumcheckFailed(format!("GPU batch fold f_a entry {i}: {e}"))
+                })?;
+            let new_d_f_b = gpu_executor
+                .mle_fold(&d_f_b_list[i], cur_n_points, &challenge_u32)
+                .map_err(|e| {
+                    MatMulError::SumcheckFailed(format!("GPU batch fold f_b entry {i}: {e}"))
+                })?;
 
             d_f_a_list[i] = new_d_f_a;
             d_f_b_list[i] = new_d_f_b;
@@ -3492,9 +3918,13 @@ pub fn prove_matmul_batch_onchain_gpu(
     for i in 0..num_entries {
         let mut final_a_u32 = [0u32; 4];
         let mut final_b_u32 = [0u32; 4];
-        gpu_executor.device.dtoh_sync_copy_into(&d_f_a_list[i], &mut final_a_u32)
+        gpu_executor
+            .device
+            .dtoh_sync_copy_into(&d_f_a_list[i], &mut final_a_u32)
             .map_err(|e| MatMulError::SumcheckFailed(format!("download final_a {i}: {:?}", e)))?;
-        gpu_executor.device.dtoh_sync_copy_into(&d_f_b_list[i], &mut final_b_u32)
+        gpu_executor
+            .device
+            .dtoh_sync_copy_into(&d_f_b_list[i], &mut final_b_u32)
             .map_err(|e| MatMulError::SumcheckFailed(format!("download final_b {i}: {:?}", e)))?;
 
         per_matmul.push(BatchedPerMatMulResult {
@@ -3531,8 +3961,8 @@ pub fn prepare_batch_entry(
     c: &M31Matrix,
 ) -> Result<BatchEntry, MatMulError> {
     use crate::components::matmul::pad_matrix_pow2;
-    use crate::crypto::poseidon_channel::PoseidonChannel;
     use crate::crypto::mle_opening::commit_mle_root_only;
+    use crate::crypto::poseidon_channel::PoseidonChannel;
 
     // Padded dimensions for channel draws and output sizing
     let m = a.rows.next_power_of_two();
@@ -3564,23 +3994,31 @@ pub fn prepare_batch_entry(
     let gpu_executor = GpuSumcheckExecutor::cached()
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU init: {e}")))?;
 
-    let d_f_a = gpu_executor.restrict_rows(a, &r_i, k)
+    let d_f_a = gpu_executor
+        .restrict_rows(a, &r_i, k)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU restrict_rows batch: {e}")))?;
-    let d_f_b = gpu_executor.restrict_cols(b, &r_j, k)
+    let d_f_b = gpu_executor
+        .restrict_cols(b, &r_j, k)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU restrict_cols batch: {e}")))?;
 
     // Download restricted MLEs for commitment and later batch upload
     let mut f_a_u32 = vec![0u32; k * 4];
     let mut f_b_u32 = vec![0u32; k * 4];
-    gpu_executor.device.dtoh_sync_copy_into(&d_f_a, &mut f_a_u32)
+    gpu_executor
+        .device
+        .dtoh_sync_copy_into(&d_f_a, &mut f_a_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("download batch f_a: {:?}", e)))?;
-    gpu_executor.device.dtoh_sync_copy_into(&d_f_b, &mut f_b_u32)
+    gpu_executor
+        .device
+        .dtoh_sync_copy_into(&d_f_b, &mut f_b_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("download batch f_b: {:?}", e)))?;
 
-    let f_a: Vec<SecureField> = f_a_u32.chunks_exact(4)
+    let f_a: Vec<SecureField> = f_a_u32
+        .chunks_exact(4)
         .map(|c| u32s_to_secure_field(&[c[0], c[1], c[2], c[3]]))
         .collect();
-    let f_b: Vec<SecureField> = f_b_u32.chunks_exact(4)
+    let f_b: Vec<SecureField> = f_b_u32
+        .chunks_exact(4)
         .map(|c| u32s_to_secure_field(&[c[0], c[1], c[2], c[3]]))
         .collect();
 
@@ -3618,8 +4056,8 @@ pub fn prepare_batch_entry_cached(
     cache: &crate::weight_cache::SharedWeightCache,
 ) -> Result<BatchEntry, MatMulError> {
     use crate::components::matmul::pad_matrix_pow2;
-    use crate::crypto::poseidon_channel::PoseidonChannel;
     use crate::crypto::mle_opening::commit_mle_root_only;
+    use crate::crypto::poseidon_channel::PoseidonChannel;
 
     let m = a.rows.next_power_of_two();
     let k = a.cols.next_power_of_two();
@@ -3629,9 +4067,9 @@ pub fn prepare_batch_entry_cached(
 
     // Check cache for weight-side data
     let cached = {
-        let guard = cache.read().map_err(|_| {
-            MatMulError::SumcheckFailed("weight cache lock poisoned".into())
-        })?;
+        let guard = cache
+            .read()
+            .map_err(|_| MatMulError::SumcheckFailed("weight cache lock poisoned".into()))?;
         guard.get(node_id, m, k, n).cloned()
     };
 
@@ -3657,14 +4095,18 @@ pub fn prepare_batch_entry_cached(
         let gpu_executor = GpuSumcheckExecutor::cached()
             .map_err(|e| MatMulError::SumcheckFailed(format!("GPU init: {e}")))?;
 
-        let d_f_a = gpu_executor.restrict_rows(a, &r_i, k)
+        let d_f_a = gpu_executor
+            .restrict_rows(a, &r_i, k)
             .map_err(|e| MatMulError::SumcheckFailed(format!("GPU restrict_rows cached: {e}")))?;
 
         let mut f_a_u32 = vec![0u32; k * 4];
-        gpu_executor.device.dtoh_sync_copy_into(&d_f_a, &mut f_a_u32)
+        gpu_executor
+            .device
+            .dtoh_sync_copy_into(&d_f_a, &mut f_a_u32)
             .map_err(|e| MatMulError::SumcheckFailed(format!("download cached f_a: {:?}", e)))?;
 
-        let f_a: Vec<SecureField> = f_a_u32.chunks_exact(4)
+        let f_a: Vec<SecureField> = f_a_u32
+            .chunks_exact(4)
             .map(|c| u32s_to_secure_field(&[c[0], c[1], c[2], c[3]]))
             .collect();
 
@@ -3689,9 +4131,9 @@ pub fn prepare_batch_entry_cached(
     let entry = prepare_batch_entry(node_id, a, b, c)?;
 
     {
-        let mut guard = cache.write().map_err(|_| {
-            MatMulError::SumcheckFailed("weight cache write lock poisoned".into())
-        })?;
+        let mut guard = cache
+            .write()
+            .map_err(|_| MatMulError::SumcheckFailed("weight cache write lock poisoned".into()))?;
         guard.insert(
             node_id,
             m,
@@ -3722,9 +4164,9 @@ impl crate::backend::ZkmlOps for stwo::prover::backend::gpu::GpuBackend {
         pk: usize,
         channel: &mut crate::crypto::poseidon_channel::PoseidonChannel,
     ) -> Result<crate::backend::MatMulReduction, String> {
-        let gpu = GpuSumcheckExecutor::cached()
-            .map_err(|e| format!("GPU init failed: {:?}", e))?;
-        let result = gpu.reduce_matmul_layer_gpu(a, b, r_i, r_j, pk, channel)
+        let gpu = GpuSumcheckExecutor::cached().map_err(|e| format!("GPU init failed: {:?}", e))?;
+        let result = gpu
+            .reduce_matmul_layer_gpu(a, b, r_i, r_j, pk, channel)
             .map_err(|e| format!("GPU reduce_matmul: {:?}", e))?;
         Ok(crate::backend::MatMulReduction {
             round_polys: result.round_polys,
@@ -3738,8 +4180,7 @@ impl crate::backend::ZkmlOps for stwo::prover::backend::gpu::GpuBackend {
         mle: &[SecureField],
         point: &[SecureField],
     ) -> Result<SecureField, String> {
-        let gpu = GpuSumcheckExecutor::cached()
-            .map_err(|e| format!("GPU init failed: {:?}", e))?;
+        let gpu = GpuSumcheckExecutor::cached().map_err(|e| format!("GPU init failed: {:?}", e))?;
         gpu.evaluate_mle_gpu(mle, point)
             .map_err(|e| format!("GPU evaluate_mle: {:?}", e))
     }
@@ -3750,7 +4191,10 @@ impl crate::backend::ZkmlOps for stwo::prover::backend::gpu::GpuBackend {
     ) -> Result<Vec<SecureField>, String> {
         // GPU restrict operates on matrices; for generic MLE restriction
         // fall back to CPU which is efficient for small MLEs.
-        Ok(crate::components::matmul::restrict_mle_pub(mle, assignments))
+        Ok(crate::components::matmul::restrict_mle_pub(
+            mle,
+            assignments,
+        ))
     }
 }
 
@@ -3763,8 +4207,7 @@ impl crate::backend::ZkmlOps for stwo::prover::backend::gpu::GpuBackend {
 mod tests {
     use super::*;
     use crate::components::matmul::{
-        M31Matrix, matmul_m31, prove_matmul_sumcheck, verify_matmul_sumcheck,
-        MatMulOracle,
+        matmul_m31, prove_matmul_sumcheck, verify_matmul_sumcheck, M31Matrix, MatMulOracle,
     };
     use stwo::core::fields::m31::M31;
 
@@ -3782,7 +4225,11 @@ mod tests {
     #[test]
     fn test_gpu_sumcheck_executor_init() {
         let executor = GpuSumcheckExecutor::new();
-        assert!(executor.is_ok(), "GPU sumcheck executor should initialize: {:?}", executor.err());
+        assert!(
+            executor.is_ok(),
+            "GPU sumcheck executor should initialize: {:?}",
+            executor.err()
+        );
     }
 
     #[test]
@@ -3810,13 +4257,22 @@ mod tests {
         let f_b = restrict_mle_pub(&mle_b_t, &r_j);
 
         // CPU oracle computation
-        let cpu_oracle = MatMulOracle { f_a: f_a.clone(), f_b: f_b.clone() };
+        let cpu_oracle = MatMulOracle {
+            f_a: f_a.clone(),
+            f_b: f_b.clone(),
+        };
         let cpu_poly = cpu_oracle.sum_as_poly_in_first_variable(SecureField::zero());
 
         // GPU computation
         let executor = GpuSumcheckExecutor::new().expect("GPU init");
-        let f_a_u32: Vec<u32> = f_a.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
-        let f_b_u32: Vec<u32> = f_b.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
+        let f_a_u32: Vec<u32> = f_a
+            .iter()
+            .flat_map(|sf| secure_field_to_u32s(*sf))
+            .collect();
+        let f_b_u32: Vec<u32> = f_b
+            .iter()
+            .flat_map(|sf| secure_field_to_u32s(*sf))
+            .collect();
 
         let d_f_a = executor.device.htod_sync_copy(&f_a_u32).unwrap();
         let d_f_b = executor.device.htod_sync_copy(&f_b_u32).unwrap();
@@ -3869,13 +4325,19 @@ mod tests {
 
         // GPU fold
         let executor = GpuSumcheckExecutor::new().expect("GPU init");
-        let f_a_u32: Vec<u32> = f_a.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
+        let f_a_u32: Vec<u32> = f_a
+            .iter()
+            .flat_map(|sf| secure_field_to_u32s(*sf))
+            .collect();
         let d_f_a = executor.device.htod_sync_copy(&f_a_u32).unwrap();
         let challenge_u32 = secure_field_to_u32s(challenge);
 
         let d_result = executor.mle_fold(&d_f_a, k, &challenge_u32).unwrap();
         let mut gpu_result_u32 = vec![0u32; mid * 4];
-        executor.device.dtoh_sync_copy_into(&d_result, &mut gpu_result_u32).unwrap();
+        executor
+            .device
+            .dtoh_sync_copy_into(&d_result, &mut gpu_result_u32)
+            .unwrap();
 
         for i in 0..mid {
             let gpu_val = u32s_to_secure_field(&[
@@ -3895,8 +4357,7 @@ mod tests {
         let b = test_matrix(4, 4);
         let c = matmul_m31(&a, &b);
 
-        let proof = prove_matmul_sumcheck_gpu(&a, &b, &c)
-            .expect("GPU proving should succeed");
+        let proof = prove_matmul_sumcheck_gpu(&a, &b, &c).expect("GPU proving should succeed");
 
         verify_matmul_sumcheck(&proof, &a, &b, &c)
             .expect("CPU verification of GPU proof should succeed");
@@ -3909,10 +4370,8 @@ mod tests {
         let b = test_matrix(4, 4);
         let c = matmul_m31(&a, &b);
 
-        let cpu_proof = prove_matmul_sumcheck(&a, &b, &c)
-            .expect("CPU proving should succeed");
-        let gpu_proof = prove_matmul_sumcheck_gpu(&a, &b, &c)
-            .expect("GPU proving should succeed");
+        let cpu_proof = prove_matmul_sumcheck(&a, &b, &c).expect("CPU proving should succeed");
+        let gpu_proof = prove_matmul_sumcheck_gpu(&a, &b, &c).expect("GPU proving should succeed");
 
         // Both should have the same claimed sum and Fiat-Shamir points
         assert_eq!(cpu_proof.claimed_sum, gpu_proof.claimed_sum);
@@ -3921,10 +4380,8 @@ mod tests {
         assert_eq!(cpu_proof.assignment.len(), gpu_proof.assignment.len());
 
         // Both should verify
-        verify_matmul_sumcheck(&cpu_proof, &a, &b, &c)
-            .expect("CPU proof verification failed");
-        verify_matmul_sumcheck(&gpu_proof, &a, &b, &c)
-            .expect("GPU proof verification failed");
+        verify_matmul_sumcheck(&cpu_proof, &a, &b, &c).expect("CPU proof verification failed");
+        verify_matmul_sumcheck(&gpu_proof, &a, &b, &c).expect("GPU proof verification failed");
     }
 
     #[test]
@@ -3944,8 +4401,8 @@ mod tests {
         }
         let c = matmul_m31(&a, &b);
 
-        let proof = prove_matmul_sumcheck_gpu(&a, &b, &c)
-            .expect("GPU rectangular proving should succeed");
+        let proof =
+            prove_matmul_sumcheck_gpu(&a, &b, &c).expect("GPU rectangular proving should succeed");
         verify_matmul_sumcheck(&proof, &a, &b, &c)
             .expect("GPU rectangular verification should succeed");
     }

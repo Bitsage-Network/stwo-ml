@@ -4,8 +4,8 @@
 //! tensor using the im2col transform. The resulting matmul is proven using
 //! the existing sumcheck infrastructure.
 
+use crate::components::matmul::{matmul_m31_auto, M31Matrix};
 use stwo::core::fields::m31::M31;
-use crate::components::matmul::{M31Matrix, matmul_m31_auto};
 
 /// im2col configuration.
 #[derive(Debug, Clone, Copy)]
@@ -224,6 +224,9 @@ mod tests {
 
         // Verify output matches manual im2col × kernel
         let manual_output = matmul_m31_auto(&im2col_mat, &kernel_mat);
-        assert_eq!(output.data, manual_output.data, "conv2d_forward should match manual im2col + matmul");
+        assert_eq!(
+            output.data, manual_output.data,
+            "conv2d_forward should match manual im2col + matmul"
+        );
     }
 }

@@ -10,9 +10,9 @@
 use std::time::Instant;
 use stwo::core::fields::m31::M31;
 use stwo_ml::components::matmul::{
-    M31Matrix, matmul_m31, pad_matrix_pow2, estimate_sumcheck_memory,
-    prove_matmul_sumcheck, verify_matmul_sumcheck,
-    prove_matmul_sumcheck_onchain, verify_matmul_sumcheck_onchain,
+    estimate_sumcheck_memory, matmul_m31, pad_matrix_pow2, prove_matmul_sumcheck,
+    prove_matmul_sumcheck_onchain, verify_matmul_sumcheck, verify_matmul_sumcheck_onchain,
+    M31Matrix,
 };
 
 /// Build a deterministic test matrix with values in [1, 251].
@@ -22,7 +22,9 @@ fn make_matrix(rows: usize, cols: usize, seed: u64) -> M31Matrix {
     for i in 0..rows {
         for j in 0..cols {
             // LCG pseudorandom
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let val = ((state >> 33) % 251 + 1) as u32;
             m.data[i * cols + j] = M31::from(val);
         }
@@ -81,7 +83,10 @@ fn scale_test(size: usize, run_onchain: bool) -> bool {
     let t = Instant::now();
     let c = matmul_m31(&a, &b);
     let matmul_time = t.elapsed();
-    println!("  [2/6] matmul_m31:           {}", fmt_duration(matmul_time));
+    println!(
+        "  [2/6] matmul_m31:           {}",
+        fmt_duration(matmul_time)
+    );
 
     // Sanity check: verify a few elements
     let mut check_sum = M31::from(0);
@@ -116,7 +121,10 @@ fn scale_test(size: usize, run_onchain: bool) -> bool {
         }
     }
     let verify_time = t.elapsed();
-    println!("  [4/6] verify (Blake2s):     {}", fmt_duration(verify_time));
+    println!(
+        "  [4/6] verify (Blake2s):     {}",
+        fmt_duration(verify_time)
+    );
 
     if run_onchain {
         // Step 5: Prove (Poseidon channel, on-chain format)
@@ -145,7 +153,10 @@ fn scale_test(size: usize, run_onchain: bool) -> bool {
             }
         }
         let onchain_verify_time = t.elapsed();
-        println!("  [6/6] verify (Poseidon):    {}", fmt_duration(onchain_verify_time));
+        println!(
+            "  [6/6] verify (Poseidon):    {}",
+            fmt_duration(onchain_verify_time)
+        );
     } else {
         println!("  [5/6] prove (Poseidon):     SKIPPED (too large)");
         println!("  [6/6] verify (Poseidon):    SKIPPED");
@@ -215,7 +226,10 @@ fn scale_5120_padded() {
 
     println!("  Original:       {orig_size} × {orig_size}");
     println!("  Padded to:      {padded_size} × {padded_size}");
-    println!("  Padding waste:  {:.0}%", (1.0 - (orig_size * orig_size) as f64 / (padded_size * padded_size) as f64) * 100.0);
+    println!(
+        "  Padding waste:  {:.0}%",
+        (1.0 - (orig_size * orig_size) as f64 / (padded_size * padded_size) as f64) * 100.0
+    );
     println!("  MLE memory:     {} (3 MLEs)", fmt_bytes(mle_bytes));
     println!("  Total estimate: {}", fmt_bytes(total_bytes));
     println!();
@@ -245,7 +259,10 @@ fn scale_5120_padded() {
     let pad_time = t.elapsed();
     assert_eq!(a.rows, padded_size);
     assert_eq!(a.cols, padded_size);
-    println!("  [2/5] Pad to {padded_size}:       {}", fmt_duration(pad_time));
+    println!(
+        "  [2/5] Pad to {padded_size}:       {}",
+        fmt_duration(pad_time)
+    );
 
     // Step 3: Matmul on padded
     let t = Instant::now();
@@ -296,7 +313,10 @@ fn scale_5120_padded() {
 #[test]
 fn test_memory_estimates_report() {
     println!("\n  Memory Estimates for Matmul Sumcheck:");
-    println!("  {:<12} {:>12} {:>12} {:>12}", "Size", "MLE Mem", "Total Est", "Matmul Ops");
+    println!(
+        "  {:<12} {:>12} {:>12} {:>12}",
+        "Size", "MLE Mem", "Total Est", "Matmul Ops"
+    );
     println!("  {}", "-".repeat(52));
 
     for &size in &[32, 64, 128, 256, 512, 1024, 2048, 4096, 8192] {
@@ -387,7 +407,11 @@ fn scale_rectangular_tall() {
 
     let t = Instant::now();
     let proof = prove_matmul_sumcheck(&a, &b, &c).expect("tall×wide proving should succeed");
-    println!("  prove:    {} ({} rounds)", fmt_duration(t.elapsed()), proof.sumcheck_proof.round_polys.len());
+    println!(
+        "  prove:    {} ({} rounds)",
+        fmt_duration(t.elapsed()),
+        proof.sumcheck_proof.round_polys.len()
+    );
 
     let t = Instant::now();
     verify_matmul_sumcheck(&proof, &a, &b, &c).expect("tall×wide verification should succeed");
@@ -408,7 +432,11 @@ fn scale_rectangular_wide() {
 
     let t = Instant::now();
     let proof = prove_matmul_sumcheck(&a, &b, &c).expect("wide×tall proving should succeed");
-    println!("  prove:    {} ({} rounds)", fmt_duration(t.elapsed()), proof.sumcheck_proof.round_polys.len());
+    println!(
+        "  prove:    {} ({} rounds)",
+        fmt_duration(t.elapsed()),
+        proof.sumcheck_proof.round_polys.len()
+    );
 
     let t = Instant::now();
     verify_matmul_sumcheck(&proof, &a, &b, &c).expect("wide×tall verification should succeed");

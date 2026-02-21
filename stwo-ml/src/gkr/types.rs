@@ -404,7 +404,9 @@ impl DeferredProof {
     /// Returns the weight commitment if this is a MatMul deferred proof.
     pub fn weight_commitment(&self) -> Option<starknet_ff::FieldElement> {
         match &self.kind {
-            DeferredProofKind::MatMul { weight_commitment, .. } => Some(*weight_commitment),
+            DeferredProofKind::MatMul {
+                weight_commitment, ..
+            } => Some(*weight_commitment),
             DeferredProofKind::Weightless => None,
         }
     }
@@ -412,7 +414,9 @@ impl DeferredProof {
     /// Returns a mutable reference to the weight commitment if this is a MatMul deferred proof.
     pub fn weight_commitment_mut(&mut self) -> Option<&mut starknet_ff::FieldElement> {
         match &mut self.kind {
-            DeferredProofKind::MatMul { weight_commitment, .. } => Some(weight_commitment),
+            DeferredProofKind::MatMul {
+                weight_commitment, ..
+            } => Some(weight_commitment),
             DeferredProofKind::Weightless => None,
         }
     }

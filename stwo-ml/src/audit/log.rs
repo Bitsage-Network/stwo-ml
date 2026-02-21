@@ -20,8 +20,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::audit::digest::{
-    digest_to_hex, hash_felt_hex_m31, parse_digest_or_zero, u64_to_m31,
-    M31Digest, ZERO_DIGEST,
+    digest_to_hex, hash_felt_hex_m31, parse_digest_or_zero, u64_to_m31, M31Digest, ZERO_DIGEST,
 };
 use crate::audit::types::{AuditError, InferenceLogEntry, LogWindow};
 use crate::crypto::poseidon2_m31::{poseidon2_compress, poseidon2_hash};
@@ -79,9 +78,7 @@ pub struct AuditMerkleTree {
 
 impl AuditMerkleTree {
     pub fn new() -> Self {
-        Self {
-            leaves: Vec::new(),
-        }
+        Self { leaves: Vec::new() }
     }
 
     /// Append a leaf digest.
@@ -320,8 +317,8 @@ impl InferenceLog {
         // Read session metadata.
         let meta_path = log_dir.join("meta.json");
         let meta_file = File::open(&meta_path)?;
-        let meta: SessionMeta = serde_json::from_reader(meta_file)
-            .map_err(|e| AuditError::Serde(e.to_string()))?;
+        let meta: SessionMeta =
+            serde_json::from_reader(meta_file).map_err(|e| AuditError::Serde(e.to_string()))?;
 
         // Replay log entries to rebuild in-memory state.
         let log_path = log_dir.join("log.jsonl");
@@ -337,8 +334,8 @@ impl InferenceLog {
                 if line.trim().is_empty() {
                     continue;
                 }
-                let entry: InferenceLogEntry = serde_json::from_str(&line)
-                    .map_err(|e| AuditError::Serde(e.to_string()))?;
+                let entry: InferenceLogEntry =
+                    serde_json::from_str(&line).map_err(|e| AuditError::Serde(e.to_string()))?;
 
                 let hash = parse_digest_or_zero(&entry.entry_hash);
                 merkle.push(hash);
@@ -455,11 +452,7 @@ impl InferenceLog {
     /// Read M31 matrix data from the binary sidecar.
     ///
     /// Returns `(rows, cols, data)`.
-    pub fn read_matrix(
-        &self,
-        offset: u64,
-        size: u64,
-    ) -> Result<(u32, u32, Vec<u32>), AuditError> {
+    pub fn read_matrix(&self, offset: u64, size: u64) -> Result<(u32, u32, Vec<u32>), AuditError> {
         let matrix_path = self.log_dir.join("matrices.bin");
         let mut file = File::open(&matrix_path)?;
         file.seek(SeekFrom::Start(offset))?;
@@ -568,7 +561,8 @@ impl InferenceLog {
                     sequence: self.entries[i].sequence_number,
                     detail: format!(
                         "prev_entry_hash {} does not match previous entry_hash {}",
-                        self.entries[i].prev_entry_hash, self.entries[i - 1].entry_hash
+                        self.entries[i].prev_entry_hash,
+                        self.entries[i - 1].entry_hash
                     ),
                 });
             }
@@ -696,9 +690,9 @@ fn is_leap(y: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audit::digest::hex_to_digest;
     use std::time::{SystemTime, UNIX_EPOCH};
     use stwo::core::fields::m31::BaseField as M31;
-    use crate::audit::digest::hex_to_digest;
 
     /// Create a test entry with given sequence.
     fn make_entry(seq: u64, timestamp_ns: u64) -> InferenceLogEntry {
@@ -742,8 +736,7 @@ mod tests {
     #[test]
     fn test_append_and_chain_integrity() {
         let dir = temp_dir();
-        let mut log =
-            InferenceLog::new(&dir, "0x2", "0xabc", "test-model").expect("create log");
+        let mut log = InferenceLog::new(&dir, "0x2", "0xabc", "test-model").expect("create log");
 
         let base_ts = 1_000_000_000_000u64;
         for i in 0..100 {
@@ -760,8 +753,7 @@ mod tests {
     #[test]
     fn test_query_window() {
         let dir = temp_dir();
-        let mut log =
-            InferenceLog::new(&dir, "0x2", "0xabc", "test-model").expect("create log");
+        let mut log = InferenceLog::new(&dir, "0x2", "0xabc", "test-model").expect("create log");
 
         let base_ts = 1_000_000_000_000u64;
         for i in 0..20 {
@@ -785,10 +777,8 @@ mod tests {
     fn test_merkle_root_deterministic() {
         let dir1 = temp_dir();
         let dir2 = temp_dir();
-        let mut log1 =
-            InferenceLog::new(&dir1, "0x2", "0xabc", "test-model").expect("create log1");
-        let mut log2 =
-            InferenceLog::new(&dir2, "0x2", "0xabc", "test-model").expect("create log2");
+        let mut log1 = InferenceLog::new(&dir1, "0x2", "0xabc", "test-model").expect("create log1");
+        let mut log2 = InferenceLog::new(&dir2, "0x2", "0xabc", "test-model").expect("create log2");
 
         let base_ts = 1_000_000_000_000u64;
         for i in 0..10 {
@@ -808,8 +798,7 @@ mod tests {
     #[test]
     fn test_merkle_proof_verifies() {
         let dir = temp_dir();
-        let mut log =
-            InferenceLog::new(&dir, "0x2", "0xabc", "test-model").expect("create log");
+        let mut log = InferenceLog::new(&dir, "0x2", "0xabc", "test-model").expect("create log");
 
         let base_ts = 1_000_000_000_000u64;
         for i in 0..8 {
@@ -847,7 +836,9 @@ mod tests {
 
         let loaded = InferenceLog::load(&dir).expect("load log");
         assert_eq!(loaded.entry_count(), 25);
-        loaded.verify_chain().expect("chain should be valid after reload");
+        loaded
+            .verify_chain()
+            .expect("chain should be valid after reload");
 
         let fresh_root = {
             let mut log2 =
@@ -867,8 +858,7 @@ mod tests {
     #[test]
     fn test_empty_log() {
         let dir = temp_dir();
-        let log =
-            InferenceLog::new(&dir, "0x2", "0xabc", "test-model").expect("create log");
+        let log = InferenceLog::new(&dir, "0x2", "0xabc", "test-model").expect("create log");
 
         assert_eq!(log.entry_count(), 0);
         assert_eq!(log.merkle_root(), ZERO_DIGEST);
@@ -883,8 +873,7 @@ mod tests {
     #[test]
     fn test_matrix_sidecar_roundtrip() {
         let dir = temp_dir();
-        let mut log =
-            InferenceLog::new(&dir, "0x2", "0xabc", "test-model").expect("create log");
+        let mut log = InferenceLog::new(&dir, "0x2", "0xabc", "test-model").expect("create log");
 
         let data1: Vec<u32> = vec![1, 2, 3, 4, 5, 6];
         let (off1, sz1) = log.write_matrix(2, 3, &data1).expect("write matrix 1");
@@ -947,8 +936,7 @@ mod tests {
         let dir = temp_dir();
 
         {
-            let mut log =
-                InferenceLog::new(&dir, "0x2", "0xabc", "test-model").expect("create");
+            let mut log = InferenceLog::new(&dir, "0x2", "0xabc", "test-model").expect("create");
             let base_ts = 1_000_000_000_000u64;
             for i in 0..10 {
                 log.append(make_entry(i, base_ts + i * 1_000_000))
@@ -964,7 +952,8 @@ mod tests {
         }
 
         assert_eq!(log.entry_count(), 20);
-        log.verify_chain().expect("chain valid after reload + append");
+        log.verify_chain()
+            .expect("chain valid after reload + append");
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -972,8 +961,7 @@ mod tests {
     #[test]
     fn test_entry_hash_uses_m31_format() {
         let dir = temp_dir();
-        let mut log =
-            InferenceLog::new(&dir, "0x2", "0xabc", "test-model").expect("create log");
+        let mut log = InferenceLog::new(&dir, "0x2", "0xabc", "test-model").expect("create log");
 
         let entry = make_entry(0, 1_000_000_000_000);
         log.append(entry).expect("append");

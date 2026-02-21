@@ -17,11 +17,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-use crossbeam::channel::{self, Receiver, Sender};
 use crate::aggregation::compute_io_commitment;
 use crate::audit::log::InferenceLog;
 use crate::audit::types::{AuditError, InferenceLogEntry};
 use crate::components::matmul::M31Matrix;
+use crossbeam::channel::{self, Receiver, Sender};
 
 /// A job submitted to the capture hook's background thread.
 pub struct CaptureJob {
@@ -136,11 +136,7 @@ impl Drop for CaptureHook {
 }
 
 /// Background worker that processes capture jobs.
-fn background_worker(
-    mut log: InferenceLog,
-    rx: Receiver<CaptureMsg>,
-    entry_count: Arc<AtomicU64>,
-) {
+fn background_worker(mut log: InferenceLog, rx: Receiver<CaptureMsg>, entry_count: Arc<AtomicU64>) {
     for msg in rx {
         match msg {
             CaptureMsg::Job(job) => {
@@ -205,8 +201,8 @@ fn process_job(log: &mut InferenceLog, job: &CaptureJob) -> Result<(), AuditErro
         output_cols: job.output_m31.cols as u32,
         io_commitment: format!("{:#066x}", io_commitment),
         layer_chain_commitment: "0x0".to_string(), // Set during replay/proving.
-        prev_entry_hash: String::new(), // Set by log.append().
-        entry_hash: String::new(),      // Set by log.append().
+        prev_entry_hash: String::new(),            // Set by log.append().
+        entry_hash: String::new(),                 // Set by log.append().
         timestamp_ns: job.timestamp_ns,
         latency_ms: job.latency_ms,
         gpu_device: job.gpu_device.clone(),
@@ -226,8 +222,8 @@ fn process_job(log: &mut InferenceLog, job: &CaptureJob) -> Result<(), AuditErro
 mod tests {
     use super::*;
     use starknet_ff::FieldElement;
-    use stwo::core::fields::m31::M31;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use stwo::core::fields::m31::M31;
 
     fn temp_dir() -> std::path::PathBuf {
         let d = SystemTime::now()
@@ -263,8 +259,7 @@ mod tests {
     #[test]
     fn test_record_1000_entries() {
         let dir = temp_dir();
-        let hook = CaptureHook::new(&dir, "0x2", "0xabc", "test-model")
-            .expect("create hook");
+        let hook = CaptureHook::new(&dir, "0x2", "0xabc", "test-model").expect("create hook");
 
         for i in 0..1000 {
             hook.record(make_job(i));
@@ -285,8 +280,7 @@ mod tests {
     #[test]
     fn test_record_is_nonblocking() {
         let dir = temp_dir();
-        let hook = CaptureHook::new(&dir, "0x2", "0xabc", "test-model")
-            .expect("create hook");
+        let hook = CaptureHook::new(&dir, "0x2", "0xabc", "test-model").expect("create hook");
 
         let start = Instant::now();
         for i in 0..100 {
@@ -310,8 +304,7 @@ mod tests {
     #[test]
     fn test_commitments_match_manual() {
         let dir = temp_dir();
-        let hook = CaptureHook::new(&dir, "0x2", "0xabc", "test-model")
-            .expect("create hook");
+        let hook = CaptureHook::new(&dir, "0x2", "0xabc", "test-model").expect("create hook");
 
         let input = make_m31_matrix(1, 3, 10);
         let output = make_m31_matrix(1, 2, 50);
@@ -340,7 +333,10 @@ mod tests {
         let log = InferenceLog::load(&dir).expect("load");
         let entry = &log.entries()[0];
         let stored = FieldElement::from_hex_be(&entry.io_commitment).unwrap();
-        assert_eq!(stored, expected, "io_commitment should match manual computation");
+        assert_eq!(
+            stored, expected,
+            "io_commitment should match manual computation"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

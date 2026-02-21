@@ -36,21 +36,21 @@
 //! - [`encryption`] — Encryption integration with VM31 (Dev B)
 //! - [`orchestrator`] — E2E audit orchestration (Dev B)
 
-pub mod types;
 pub mod digest;
+pub mod types;
 
 // ── Dev A modules (inference log + proving) ──────────────────────────────
-pub mod log;
 pub mod capture;
-pub mod replay;
+pub mod log;
 pub mod prover;
+pub mod replay;
 pub mod submit;
 
 // ── Dev B modules (evaluation + report + storage) ────────────────────────
 pub mod deterministic;
-pub mod self_eval;
-pub mod scoring;
-pub mod report;
-pub mod storage;
 pub mod encryption;
 pub mod orchestrator;
+pub mod report;
+pub mod scoring;
+pub mod self_eval;
+pub mod storage;

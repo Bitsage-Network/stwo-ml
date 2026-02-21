@@ -9,8 +9,8 @@
 //! - `mix_poly_coeffs(c0, c1, c2)`: absorb a degree-2 round polynomial
 
 use starknet_ff::FieldElement;
-use stwo::core::fields::m31::M31;
 use stwo::core::fields::cm31::CM31;
+use stwo::core::fields::m31::M31;
 use stwo::core::fields::qm31::{SecureField, QM31};
 
 use crate::crypto::hades::hades_permutation;
@@ -42,8 +42,7 @@ pub fn unpack_m31s(felt: FieldElement, count: usize) -> Vec<M31> {
         // Extract lowest 31 bits: remaining mod 2^31
         let bytes = remaining.to_bytes_be();
         let low = u64::from_be_bytes([
-            bytes[24], bytes[25], bytes[26], bytes[27],
-            bytes[28], bytes[29], bytes[30], bytes[31],
+            bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29], bytes[30], bytes[31],
         ]);
         let m31_val = (low % (1u64 << 31)) as u32;
         result[i] = M31::from(m31_val % p_m31 as u32);
@@ -148,8 +147,8 @@ impl PoseidonChannel {
             // Extract the small value from the low bytes of the remainder
             let bytes = res.to_bytes_be();
             let val = u64::from_be_bytes([
-                bytes[24], bytes[25], bytes[26], bytes[27],
-                bytes[28], bytes[29], bytes[30], bytes[31],
+                bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29], bytes[30],
+                bytes[31],
             ]);
             // Reduce mod P = 2^31 - 1 (matching BaseField::reduce)
             *m31 = M31::from((val % p) as u32);
@@ -171,9 +170,8 @@ impl PoseidonChannel {
     /// - Then hashes: digest = poseidon_hash_many([digest, felt1, felt2])
     pub fn mix_poly_coeffs(&mut self, c0: SecureField, c1: SecureField, c2: SecureField) {
         let m31s: Vec<M31> = vec![
-            c0.0 .0, c0.0 .1, c0.1 .0, c0.1 .1,
-            c1.0 .0, c1.0 .1, c1.1 .0, c1.1 .1,
-            c2.0 .0, c2.0 .1, c2.1 .0, c2.1 .1,
+            c0.0 .0, c0.0 .1, c0.1 .0, c0.1 .1, c1.0 .0, c1.0 .1, c1.1 .0, c1.1 .1, c2.0 .0,
+            c2.0 .1, c2.1 .0, c2.1 .1,
         ];
 
         let felt1 = pack_m31s(&m31s[..8]);
@@ -198,10 +196,8 @@ impl PoseidonChannel {
         c3: SecureField,
     ) {
         let m31s: Vec<M31> = vec![
-            c0.0 .0, c0.0 .1, c0.1 .0, c0.1 .1,
-            c1.0 .0, c1.0 .1, c1.1 .0, c1.1 .1,
-            c2.0 .0, c2.0 .1, c2.1 .0, c2.1 .1,
-            c3.0 .0, c3.0 .1, c3.1 .0, c3.1 .1,
+            c0.0 .0, c0.0 .1, c0.1 .0, c0.1 .1, c1.0 .0, c1.0 .1, c1.1 .0, c1.1 .1, c2.0 .0,
+            c2.0 .1, c2.1 .0, c2.1 .1, c3.0 .0, c3.0 .1, c3.1 .0, c3.1 .1,
         ];
 
         let felt1 = pack_m31s(&m31s[..8]);
@@ -231,16 +227,21 @@ impl PoseidonChannel {
             if remaining >= 2 {
                 // Pack pair of QM31s: 8 M31 components
                 let m31s: Vec<M31> = vec![
-                    felts[i].0 .0, felts[i].0 .1, felts[i].1 .0, felts[i].1 .1,
-                    felts[i + 1].0 .0, felts[i + 1].0 .1, felts[i + 1].1 .0, felts[i + 1].1 .1,
+                    felts[i].0 .0,
+                    felts[i].0 .1,
+                    felts[i].1 .0,
+                    felts[i].1 .1,
+                    felts[i + 1].0 .0,
+                    felts[i + 1].0 .1,
+                    felts[i + 1].1 .0,
+                    felts[i + 1].1 .1,
                 ];
                 hash_inputs.push(pack_m31s(&m31s));
                 i += 2;
             } else {
                 // Pack single QM31: 4 M31 components
-                let m31s: Vec<M31> = vec![
-                    felts[i].0 .0, felts[i].0 .1, felts[i].1 .0, felts[i].1 .1,
-                ];
+                let m31s: Vec<M31> =
+                    vec![felts[i].0 .0, felts[i].0 .1, felts[i].1 .0, felts[i].1 .1];
                 hash_inputs.push(pack_m31s(&m31s));
                 i += 1;
             }
@@ -269,8 +270,14 @@ mod tests {
     #[test]
     fn test_securefield_to_felt_fast_path_matches_pack() {
         let samples = [
-            QM31(CM31(M31::from(0), M31::from(0)), CM31(M31::from(0), M31::from(0))),
-            QM31(CM31(M31::from(1), M31::from(2)), CM31(M31::from(3), M31::from(4))),
+            QM31(
+                CM31(M31::from(0), M31::from(0)),
+                CM31(M31::from(0), M31::from(0)),
+            ),
+            QM31(
+                CM31(M31::from(1), M31::from(2)),
+                CM31(M31::from(3), M31::from(4)),
+            ),
             QM31(
                 CM31(M31::from((1u32 << 31) - 2), M31::from(17)),
                 CM31(M31::from(1234567), M31::from((1u32 << 31) - 3)),
@@ -320,13 +327,26 @@ mod tests {
         let mut ch = PoseidonChannel::new();
         let initial_digest = ch.digest();
 
-        let c0 = QM31(CM31(M31::from(1), M31::from(2)), CM31(M31::from(3), M31::from(4)));
-        let c1 = QM31(CM31(M31::from(5), M31::from(6)), CM31(M31::from(7), M31::from(8)));
-        let c2 = QM31(CM31(M31::from(9), M31::from(10)), CM31(M31::from(11), M31::from(12)));
+        let c0 = QM31(
+            CM31(M31::from(1), M31::from(2)),
+            CM31(M31::from(3), M31::from(4)),
+        );
+        let c1 = QM31(
+            CM31(M31::from(5), M31::from(6)),
+            CM31(M31::from(7), M31::from(8)),
+        );
+        let c2 = QM31(
+            CM31(M31::from(9), M31::from(10)),
+            CM31(M31::from(11), M31::from(12)),
+        );
 
         ch.mix_poly_coeffs(c0, c1, c2);
 
-        assert_ne!(ch.digest(), initial_digest, "mixing poly coeffs should change digest");
+        assert_ne!(
+            ch.digest(),
+            initial_digest,
+            "mixing poly coeffs should change digest"
+        );
 
         // Determinism: same coefficients should produce same digest
         let mut ch2 = PoseidonChannel::new();
@@ -358,8 +378,8 @@ mod tests {
     /// consistency between stwo-ml (Rust prover) and the Cairo verifier.
     #[test]
     fn test_draw_qm31_matches_stwo_canonical() {
-        use stwo::core::channel::Poseidon252Channel;
         use stwo::core::channel::Channel;
+        use stwo::core::channel::Poseidon252Channel;
 
         // Test with several different initial states
         for seed in [0u64, 1, 42, 12345, 999999, u64::MAX] {
@@ -416,8 +436,8 @@ mod tests {
             cur = next;
             let bytes = rem.to_bytes_be();
             let v = u64::from_be_bytes([
-                bytes[24], bytes[25], bytes[26], bytes[27],
-                bytes[28], bytes[29], bytes[30], bytes[31],
+                bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29], bytes[30],
+                bytes[31],
             ]);
             *val = (v % p) as u32;
         }
@@ -438,8 +458,8 @@ mod tests {
     /// The on-chain verifier matches our encoding (mix_felt + pack_qm31_to_felt).
     #[test]
     fn test_mix_u64_draw_matches_stwo_canonical() {
-        use stwo::core::channel::Poseidon252Channel;
         use stwo::core::channel::Channel;
+        use stwo::core::channel::Poseidon252Channel;
 
         // Both channels should agree after identical mix_u64 sequences
         let mut our_ch = PoseidonChannel::new();
@@ -474,15 +494,19 @@ mod tests {
     /// is correctly computed.
     #[test]
     fn test_qm31_arithmetic_cross_verify() {
-        use stwo::core::fields::m31::M31;
         use stwo::core::fields::cm31::CM31;
+        use stwo::core::fields::m31::M31;
         use stwo::core::fields::qm31::QM31;
 
         // Test vectors: complex QM31 values that exercise all 4 components
-        let a = QM31(CM31(M31::from(1234567), M31::from(7654321)),
-                      CM31(M31::from(111222), M31::from(333444)));
-        let b = QM31(CM31(M31::from(9876543), M31::from(3456789)),
-                      CM31(M31::from(555666), M31::from(777888)));
+        let a = QM31(
+            CM31(M31::from(1234567), M31::from(7654321)),
+            CM31(M31::from(111222), M31::from(333444)),
+        );
+        let b = QM31(
+            CM31(M31::from(9876543), M31::from(3456789)),
+            CM31(M31::from(555666), M31::from(777888)),
+        );
 
         // Multiplication: (a0+a1*j)(b0+b1*j) = a0*b0 + (a0*b1+a1*b0)*j + a1*b1*j²
         // where j² = 2+i, so a1*b1*j² = a1*b1*(2+i)
@@ -501,26 +525,43 @@ mod tests {
         assert_eq!(zero, QM31::default(), "a + (-a) = 0");
 
         // Verify distributivity: a*(b+c) = a*b + a*c
-        let c = QM31(CM31(M31::from(42), M31::from(17)),
-                      CM31(M31::from(99), M31::from(5)));
+        let c = QM31(
+            CM31(M31::from(42), M31::from(17)),
+            CM31(M31::from(99), M31::from(5)),
+        );
         let left = a * (b + c);
         let right = a * b + a * c;
         assert_eq!(left, right, "QM31 distributivity failed");
 
         // Print test vectors for Cairo cross-verification
         println!("=== QM31 Cross-Verification Vectors ===");
-        println!("a = QM31({}, {}, {}, {})", a.0 .0 .0, a.0 .1 .0, a.1 .0 .0, a.1 .1 .0);
-        println!("b = QM31({}, {}, {}, {})", b.0 .0 .0, b.0 .1 .0, b.1 .0 .0, b.1 .1 .0);
-        println!("a*b = QM31({}, {}, {}, {})", product.0 .0 .0, product.0 .1 .0, product.1 .0 .0, product.1 .1 .0);
-        println!("a+b = QM31({}, {}, {}, {})", (a+b).0 .0 .0, (a+b).0 .1 .0, (a+b).1 .0 .0, (a+b).1 .1 .0);
+        println!(
+            "a = QM31({}, {}, {}, {})",
+            a.0 .0 .0, a.0 .1 .0, a.1 .0 .0, a.1 .1 .0
+        );
+        println!(
+            "b = QM31({}, {}, {}, {})",
+            b.0 .0 .0, b.0 .1 .0, b.1 .0 .0, b.1 .1 .0
+        );
+        println!(
+            "a*b = QM31({}, {}, {}, {})",
+            product.0 .0 .0, product.0 .1 .0, product.1 .0 .0, product.1 .1 .0
+        );
+        println!(
+            "a+b = QM31({}, {}, {}, {})",
+            (a + b).0 .0 .0,
+            (a + b).0 .1 .0,
+            (a + b).1 .0 .0,
+            (a + b).1 .1 .0
+        );
     }
 
     /// Verify eq_eval (Lagrange kernel) produces identical results.
     /// eq(x, y) = Π_i (x_i*y_i + (1-x_i)*(1-y_i))
     #[test]
     fn test_eq_eval_cross_verify() {
-        use stwo::core::fields::m31::M31;
         use stwo::core::fields::cm31::CM31;
+        use stwo::core::fields::m31::M31;
         use stwo::core::fields::qm31::QM31;
         use stwo::prover::lookups::utils::eq;
 
@@ -538,29 +579,47 @@ mod tests {
 
         // Test vector 3: non-boolean points (field elements)
         let x3 = vec![
-            QM31(CM31(M31::from(42), M31::from(0)), CM31(M31::from(0), M31::from(0))),
-            QM31(CM31(M31::from(17), M31::from(0)), CM31(M31::from(0), M31::from(0))),
+            QM31(
+                CM31(M31::from(42), M31::from(0)),
+                CM31(M31::from(0), M31::from(0)),
+            ),
+            QM31(
+                CM31(M31::from(17), M31::from(0)),
+                CM31(M31::from(0), M31::from(0)),
+            ),
         ];
         let y3 = vec![
-            QM31(CM31(M31::from(99), M31::from(0)), CM31(M31::from(0), M31::from(0))),
-            QM31(CM31(M31::from(5), M31::from(0)), CM31(M31::from(0), M31::from(0))),
+            QM31(
+                CM31(M31::from(99), M31::from(0)),
+                CM31(M31::from(0), M31::from(0)),
+            ),
+            QM31(
+                CM31(M31::from(5), M31::from(0)),
+                CM31(M31::from(0), M31::from(0)),
+            ),
         ];
         let result3 = eq(&x3, &y3);
 
         println!("=== eq_eval Cross-Verification Vectors ===");
-        println!("eq([42,17], [99,5]) = QM31({}, {}, {}, {})",
-                 result3.0 .0 .0, result3.0 .1 .0, result3.1 .0 .0, result3.1 .1 .0);
+        println!(
+            "eq([42,17], [99,5]) = QM31({}, {}, {}, {})",
+            result3.0 .0 .0, result3.0 .1 .0, result3.1 .0 .0, result3.1 .1 .0
+        );
 
         // Test vector 4: complex QM31 points
-        let x4 = vec![
-            QM31(CM31(M31::from(100), M31::from(200)), CM31(M31::from(300), M31::from(400))),
-        ];
-        let y4 = vec![
-            QM31(CM31(M31::from(500), M31::from(600)), CM31(M31::from(700), M31::from(800))),
-        ];
+        let x4 = vec![QM31(
+            CM31(M31::from(100), M31::from(200)),
+            CM31(M31::from(300), M31::from(400)),
+        )];
+        let y4 = vec![QM31(
+            CM31(M31::from(500), M31::from(600)),
+            CM31(M31::from(700), M31::from(800)),
+        )];
         let result4 = eq(&x4, &y4);
-        println!("eq_complex = QM31({}, {}, {}, {})",
-                 result4.0 .0 .0, result4.0 .1 .0, result4.1 .0 .0, result4.1 .1 .0);
+        println!(
+            "eq_complex = QM31({}, {}, {}, {})",
+            result4.0 .0 .0, result4.0 .1 .0, result4.1 .0 .0, result4.1 .1 .0
+        );
 
         // Empty input: eq([], []) = 1
         let empty_x: &[QM31] = &[];
@@ -572,14 +631,18 @@ mod tests {
     /// Verify fold_mle_eval: v0*(1-x) + v1*x
     #[test]
     fn test_fold_mle_eval_cross_verify() {
-        use stwo::core::fields::m31::M31;
         use stwo::core::fields::cm31::CM31;
+        use stwo::core::fields::m31::M31;
         use stwo::core::fields::qm31::QM31;
 
-        let v0 = QM31(CM31(M31::from(1000), M31::from(2000)),
-                       CM31(M31::from(3000), M31::from(4000)));
-        let v1 = QM31(CM31(M31::from(5000), M31::from(6000)),
-                       CM31(M31::from(7000), M31::from(8000)));
+        let v0 = QM31(
+            CM31(M31::from(1000), M31::from(2000)),
+            CM31(M31::from(3000), M31::from(4000)),
+        );
+        let v1 = QM31(
+            CM31(M31::from(5000), M31::from(6000)),
+            CM31(M31::from(7000), M31::from(8000)),
+        );
         let one = QM31::from(M31::from(1));
 
         // fold(v0, v1, 0) = v0
@@ -591,16 +654,29 @@ mod tests {
         assert_eq!(at_one, v1, "fold at 1 = v1");
 
         // fold at arbitrary point
-        let x = QM31(CM31(M31::from(42), M31::from(7)),
-                      CM31(M31::from(13), M31::from(99)));
+        let x = QM31(
+            CM31(M31::from(42), M31::from(7)),
+            CM31(M31::from(13), M31::from(99)),
+        );
         let result = v0 * (one - x) + v1 * x;
 
         println!("=== fold_mle_eval Cross-Verification Vectors ===");
-        println!("v0 = QM31({}, {}, {}, {})", v0.0 .0 .0, v0.0 .1 .0, v0.1 .0 .0, v0.1 .1 .0);
-        println!("v1 = QM31({}, {}, {}, {})", v1.0 .0 .0, v1.0 .1 .0, v1.1 .0 .0, v1.1 .1 .0);
-        println!("x = QM31({}, {}, {}, {})", x.0 .0 .0, x.0 .1 .0, x.1 .0 .0, x.1 .1 .0);
-        println!("fold(v0,v1,x) = QM31({}, {}, {}, {})",
-                 result.0 .0 .0, result.0 .1 .0, result.1 .0 .0, result.1 .1 .0);
+        println!(
+            "v0 = QM31({}, {}, {}, {})",
+            v0.0 .0 .0, v0.0 .1 .0, v0.1 .0 .0, v0.1 .1 .0
+        );
+        println!(
+            "v1 = QM31({}, {}, {}, {})",
+            v1.0 .0 .0, v1.0 .1 .0, v1.1 .0 .0, v1.1 .1 .0
+        );
+        println!(
+            "x = QM31({}, {}, {}, {})",
+            x.0 .0 .0, x.0 .1 .0, x.1 .0 .0, x.1 .1 .0
+        );
+        println!(
+            "fold(v0,v1,x) = QM31({}, {}, {}, {})",
+            result.0 .0 .0, result.0 .1 .0, result.1 .0 .0, result.1 .1 .0
+        );
     }
 
     // ========================================================================
@@ -611,13 +687,22 @@ mod tests {
     /// This is critical for GKR Fiat-Shamir consistency.
     #[test]
     fn test_mix_felts_matches_stwo_canonical() {
-        use stwo::core::channel::Poseidon252Channel;
         use stwo::core::channel::Channel;
+        use stwo::core::channel::Poseidon252Channel;
 
         // Test 1: 3 QM31s (same as mix_poly_coeffs degree-2)
-        let c0 = QM31(CM31(M31::from(1), M31::from(2)), CM31(M31::from(3), M31::from(4)));
-        let c1 = QM31(CM31(M31::from(5), M31::from(6)), CM31(M31::from(7), M31::from(8)));
-        let c2 = QM31(CM31(M31::from(9), M31::from(10)), CM31(M31::from(11), M31::from(12)));
+        let c0 = QM31(
+            CM31(M31::from(1), M31::from(2)),
+            CM31(M31::from(3), M31::from(4)),
+        );
+        let c1 = QM31(
+            CM31(M31::from(5), M31::from(6)),
+            CM31(M31::from(7), M31::from(8)),
+        );
+        let c2 = QM31(
+            CM31(M31::from(9), M31::from(10)),
+            CM31(M31::from(11), M31::from(12)),
+        );
 
         let mut our_ch = PoseidonChannel::new();
         let mut stwo_ch = Poseidon252Channel::default();
@@ -631,7 +716,10 @@ mod tests {
         assert_eq!(our_val, stwo_val, "mix_felts 3 QM31s: draw mismatch");
 
         // Test 2: 4 QM31s (same as GKR degree-3 round poly)
-        let c3 = QM31(CM31(M31::from(13), M31::from(14)), CM31(M31::from(15), M31::from(16)));
+        let c3 = QM31(
+            CM31(M31::from(13), M31::from(14)),
+            CM31(M31::from(15), M31::from(16)),
+        );
 
         let mut our_ch2 = PoseidonChannel::new();
         let mut stwo_ch2 = Poseidon252Channel::default();
@@ -655,7 +743,10 @@ mod tests {
         assert_eq!(our_val3, stwo_val3, "mix_felts 1 QM31: draw mismatch");
 
         // Test 4: 5 QM31s (2 pairs + 1 leftover)
-        let c4 = QM31(CM31(M31::from(17), M31::from(18)), CM31(M31::from(19), M31::from(20)));
+        let c4 = QM31(
+            CM31(M31::from(17), M31::from(18)),
+            CM31(M31::from(19), M31::from(20)),
+        );
 
         let mut our_ch4 = PoseidonChannel::new();
         let mut stwo_ch4 = Poseidon252Channel::default();
@@ -671,9 +762,18 @@ mod tests {
     /// Verify mix_felts is consistent with the existing mix_poly_coeffs helpers.
     #[test]
     fn test_mix_felts_matches_mix_poly_coeffs() {
-        let c0 = QM31(CM31(M31::from(42), M31::from(17)), CM31(M31::from(99), M31::from(5)));
-        let c1 = QM31(CM31(M31::from(100), M31::from(200)), CM31(M31::from(300), M31::from(400)));
-        let c2 = QM31(CM31(M31::from(500), M31::from(600)), CM31(M31::from(700), M31::from(800)));
+        let c0 = QM31(
+            CM31(M31::from(42), M31::from(17)),
+            CM31(M31::from(99), M31::from(5)),
+        );
+        let c1 = QM31(
+            CM31(M31::from(100), M31::from(200)),
+            CM31(M31::from(300), M31::from(400)),
+        );
+        let c2 = QM31(
+            CM31(M31::from(500), M31::from(600)),
+            CM31(M31::from(700), M31::from(800)),
+        );
 
         // mix_poly_coeffs should produce same result as mix_felts with 3 values
         let mut ch1 = PoseidonChannel::new();
@@ -682,10 +782,17 @@ mod tests {
         ch1.mix_poly_coeffs(c0, c1, c2);
         ch2.mix_felts(&[c0, c1, c2]);
 
-        assert_eq!(ch1.digest(), ch2.digest(), "mix_poly_coeffs != mix_felts for 3 QM31s");
+        assert_eq!(
+            ch1.digest(),
+            ch2.digest(),
+            "mix_poly_coeffs != mix_felts for 3 QM31s"
+        );
 
         // mix_poly_coeffs_deg3 should match mix_felts with 4 values
-        let c3 = QM31(CM31(M31::from(900), M31::from(1000)), CM31(M31::from(1100), M31::from(1200)));
+        let c3 = QM31(
+            CM31(M31::from(900), M31::from(1000)),
+            CM31(M31::from(1100), M31::from(1200)),
+        );
 
         let mut ch3 = PoseidonChannel::new();
         let mut ch4 = PoseidonChannel::new();
@@ -693,7 +800,11 @@ mod tests {
         ch3.mix_poly_coeffs_deg3(c0, c1, c2, c3);
         ch4.mix_felts(&[c0, c1, c2, c3]);
 
-        assert_eq!(ch3.digest(), ch4.digest(), "mix_poly_coeffs_deg3 != mix_felts for 4 QM31s");
+        assert_eq!(
+            ch3.digest(),
+            ch4.digest(),
+            "mix_poly_coeffs_deg3 != mix_felts for 4 QM31s"
+        );
     }
 
     /// Full GKR transcript replay: mix sequence matching partially_verify_batch.
@@ -705,15 +816,17 @@ mod tests {
     /// 4. Mix mask values, draw random challenge r
     #[test]
     fn test_gkr_transcript_replay_poseidon() {
-        use stwo::core::channel::Poseidon252Channel;
         use stwo::core::channel::Channel;
+        use stwo::core::channel::Poseidon252Channel;
 
         // Simulate a single-layer GKR with 1 GP instance:
         // This replays exactly what partially_verify_batch does.
 
         // Step 1: Mix output claims
-        let output_claim = QM31(CM31(M31::from(42), M31::from(0)),
-                                CM31(M31::from(0), M31::from(0)));
+        let output_claim = QM31(
+            CM31(M31::from(42), M31::from(0)),
+            CM31(M31::from(0), M31::from(0)),
+        );
 
         let mut our_ch = PoseidonChannel::new();
         let mut stwo_ch = Poseidon252Channel::default();
@@ -734,10 +847,14 @@ mod tests {
 
         // Step 4: For layer 0 (0 sumcheck rounds), skip to masks.
         // Mix mask values
-        let mask_v0 = QM31(CM31(M31::from(6), M31::from(0)),
-                           CM31(M31::from(0), M31::from(0)));
-        let mask_v1 = QM31(CM31(M31::from(7), M31::from(0)),
-                           CM31(M31::from(0), M31::from(0)));
+        let mask_v0 = QM31(
+            CM31(M31::from(6), M31::from(0)),
+            CM31(M31::from(0), M31::from(0)),
+        );
+        let mask_v1 = QM31(
+            CM31(M31::from(7), M31::from(0)),
+            CM31(M31::from(0), M31::from(0)),
+        );
 
         our_ch.mix_felts(&[mask_v0, mask_v1]);
         stwo_ch.mix_felts(&[mask_v0, mask_v1]);
@@ -748,22 +865,35 @@ mod tests {
         assert_eq!(our_r, stwo_r, "challenge r mismatch");
 
         println!("=== GKR Transcript Test Vectors ===");
-        println!("After mix_felts([{}]): alpha = QM31({}, {}, {}, {})",
-                 output_claim.0 .0 .0,
-                 our_alpha.0 .0 .0, our_alpha.0 .1 .0, our_alpha.1 .0 .0, our_alpha.1 .1 .0);
-        println!("lambda = QM31({}, {}, {}, {})",
-                 our_lambda.0 .0 .0, our_lambda.0 .1 .0, our_lambda.1 .0 .0, our_lambda.1 .1 .0);
-        println!("After mix_felts([{},{}]): r = QM31({}, {}, {}, {})",
-                 mask_v0.0 .0 .0, mask_v1.0 .0 .0,
-                 our_r.0 .0 .0, our_r.0 .1 .0, our_r.1 .0 .0, our_r.1 .1 .0);
+        println!(
+            "After mix_felts([{}]): alpha = QM31({}, {}, {}, {})",
+            output_claim.0 .0 .0,
+            our_alpha.0 .0 .0,
+            our_alpha.0 .1 .0,
+            our_alpha.1 .0 .0,
+            our_alpha.1 .1 .0
+        );
+        println!(
+            "lambda = QM31({}, {}, {}, {})",
+            our_lambda.0 .0 .0, our_lambda.0 .1 .0, our_lambda.1 .0 .0, our_lambda.1 .1 .0
+        );
+        println!(
+            "After mix_felts([{},{}]): r = QM31({}, {}, {}, {})",
+            mask_v0.0 .0 .0,
+            mask_v1.0 .0 .0,
+            our_r.0 .0 .0,
+            our_r.0 .1 .0,
+            our_r.1 .0 .0,
+            our_r.1 .1 .0
+        );
     }
 
     /// Multi-step transcript: mix_u64 → draw → mix_felts → draw cycle.
     /// Exercises the full channel state machine as used in the complete protocol.
     #[test]
     fn test_channel_state_machine_cross_verify() {
-        use stwo::core::channel::Poseidon252Channel;
         use stwo::core::channel::Channel;
+        use stwo::core::channel::Poseidon252Channel;
 
         let mut our_ch = PoseidonChannel::new();
         let mut stwo_ch = Poseidon252Channel::default();
@@ -780,8 +910,10 @@ mod tests {
         assert_eq!(our_d1, stwo_d1, "post-dimensions draw mismatch");
 
         // Phase 2: Mix field elements (like mixing commitments)
-        let val = QM31(CM31(M31::from(999), M31::from(888)),
-                       CM31(M31::from(777), M31::from(666)));
+        let val = QM31(
+            CM31(M31::from(999), M31::from(888)),
+            CM31(M31::from(777), M31::from(666)),
+        );
         our_ch.mix_felts(&[val]);
         stwo_ch.mix_felts(&[val]);
 
@@ -810,15 +942,23 @@ mod tests {
     // ========================================================================
 
     fn qm31(a: u32, b: u32, c: u32, d: u32) -> SecureField {
-        QM31(CM31(M31::from(a), M31::from(b)), CM31(M31::from(c), M31::from(d)))
+        QM31(
+            CM31(M31::from(a), M31::from(b)),
+            CM31(M31::from(c), M31::from(d)),
+        )
     }
 
     fn print_qm31(label: &str, v: SecureField) {
-        println!("{label} = QM31({}, {}, {}, {})", v.0.0.0, v.0.1.0, v.1.0.0, v.1.1.0);
+        println!(
+            "{label} = QM31({}, {}, {}, {})",
+            v.0 .0 .0, v.0 .1 .0, v.1 .0 .0, v.1 .1 .0
+        );
     }
 
     fn rlc(values: &[SecureField], alpha: SecureField) -> SecureField {
-        if values.is_empty() { return SecureField::default(); }
+        if values.is_empty() {
+            return SecureField::default();
+        }
         let mut acc = values[0];
         let mut alpha_pow = alpha;
         for &v in &values[1..] {
@@ -864,12 +1004,12 @@ mod tests {
         // 4 leaves: a=3, b=5, c=7, d=11
         // Layer 0 (output): left=a*b=15, right=c*d=77, product=15*77=1155
         // Layer 1: mask values are the sub-tree values for the FOLDED circuit
-        let a = qm31(3,0,0,0);
-        let b = qm31(5,0,0,0);
-        let c = qm31(7,0,0,0);
-        let d = qm31(11,0,0,0);
-        let left = a * b;   // 15
-        let right = c * d;  // 77
+        let a = qm31(3, 0, 0, 0);
+        let b = qm31(5, 0, 0, 0);
+        let c = qm31(7, 0, 0, 0);
+        let d = qm31(11, 0, 0, 0);
+        let left = a * b; // 15
+        let right = c * d; // 77
         let product = left * right; // 1155
 
         print_qm31("product (output_claim)", product);

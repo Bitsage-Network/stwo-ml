@@ -392,8 +392,14 @@ mod tests {
 
     #[test]
     fn test_detect_category() {
-        assert_eq!(detect_category("Write code for a function"), "code_generation");
-        assert_eq!(detect_category("implement a binary search"), "code_generation");
+        assert_eq!(
+            detect_category("Write code for a function"),
+            "code_generation"
+        );
+        assert_eq!(
+            detect_category("implement a binary search"),
+            "code_generation"
+        );
         assert_eq!(detect_category("Return the result as JSON"), "json");
         assert_eq!(detect_category("Write a SQL query to find users"), "sql");
         assert_eq!(detect_category("Calculate 2+2"), "math");
@@ -407,14 +413,20 @@ mod tests {
     #[test]
     fn test_json_valid() {
         let checks = evaluate_deterministic("return json", r#"{"key": "value"}"#, Some("json"));
-        let json_check = checks.iter().find(|c| c.check_type == "json_valid").unwrap();
+        let json_check = checks
+            .iter()
+            .find(|c| c.check_type == "json_valid")
+            .unwrap();
         assert!(json_check.passed);
     }
 
     #[test]
     fn test_json_invalid() {
         let checks = evaluate_deterministic("return json", "{invalid json", Some("json"));
-        let json_check = checks.iter().find(|c| c.check_type == "json_valid").unwrap();
+        let json_check = checks
+            .iter()
+            .find(|c| c.check_type == "json_valid")
+            .unwrap();
         assert!(!json_check.passed);
         assert!(json_check.detail.is_some());
     }
@@ -423,7 +435,10 @@ mod tests {
     fn test_json_in_code_fence() {
         let output = "Here is the JSON:\n```json\n{\"name\": \"test\", \"value\": 42}\n```\nDone.";
         let checks = evaluate_deterministic("", output, Some("json"));
-        let json_check = checks.iter().find(|c| c.check_type == "json_valid").unwrap();
+        let json_check = checks
+            .iter()
+            .find(|c| c.check_type == "json_valid")
+            .unwrap();
         assert!(json_check.passed);
     }
 
@@ -431,7 +446,10 @@ mod tests {
     fn test_code_syntax_balanced() {
         let code = "```python\ndef foo(x):\n    return [x, {1: 2}]\n```";
         let checks = evaluate_deterministic("", code, Some("code_generation"));
-        let syntax = checks.iter().find(|c| c.check_type == "code_syntax").unwrap();
+        let syntax = checks
+            .iter()
+            .find(|c| c.check_type == "code_syntax")
+            .unwrap();
         assert!(syntax.passed);
     }
 
@@ -439,21 +457,30 @@ mod tests {
     fn test_code_syntax_unbalanced() {
         let code = "function foo() { return [1, 2";
         let checks = evaluate_deterministic("", code, Some("code_generation"));
-        let syntax = checks.iter().find(|c| c.check_type == "code_syntax").unwrap();
+        let syntax = checks
+            .iter()
+            .find(|c| c.check_type == "code_syntax")
+            .unwrap();
         assert!(!syntax.passed);
     }
 
     #[test]
     fn test_math_correct() {
         let checks = evaluate_deterministic("", "2 + 2 = 4", Some("math"));
-        let math = checks.iter().find(|c| c.check_type == "math_correct").unwrap();
+        let math = checks
+            .iter()
+            .find(|c| c.check_type == "math_correct")
+            .unwrap();
         assert!(math.passed);
     }
 
     #[test]
     fn test_math_wrong() {
         let checks = evaluate_deterministic("", "2 + 2 = 5", Some("math"));
-        let math = checks.iter().find(|c| c.check_type == "math_correct").unwrap();
+        let math = checks
+            .iter()
+            .find(|c| c.check_type == "math_correct")
+            .unwrap();
         assert!(!math.passed);
     }
 
@@ -490,7 +517,10 @@ mod tests {
     fn test_structured_output_truncated() {
         let long = "a".repeat(200) + "...";
         let checks = evaluate_deterministic("", &long, None);
-        let so = checks.iter().find(|c| c.check_type == "structured_output").unwrap();
+        let so = checks
+            .iter()
+            .find(|c| c.check_type == "structured_output")
+            .unwrap();
         assert!(!so.passed);
     }
 

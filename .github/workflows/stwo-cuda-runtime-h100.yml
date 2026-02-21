@@ -1,4 +1,4 @@
-name: stwo-cuda-runtime-h100
+name: stwo CUDA Runtime (H100)
 
 on:
   workflow_dispatch:
@@ -6,13 +6,19 @@ on:
     paths:
       - "stwo/**"
       - "stwo-ml/**"
+      - "proof-stream/**"
       - ".github/workflows/stwo-cuda-runtime-h100.yml"
   push:
     branches: [main]
     paths:
       - "stwo/**"
       - "stwo-ml/**"
+      - "proof-stream/**"
       - ".github/workflows/stwo-cuda-runtime-h100.yml"
+
+concurrency:
+  group: cuda-h100-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
 
 jobs:
   cuda-runtime-strict:
@@ -42,6 +48,10 @@ jobs:
         run: |
           nvidia-smi
           nvcc --version
+
+      - name: Manifest Validation
+        working-directory: stwo-ml
+        run: cargo metadata --no-deps --format-version 1 > /dev/null
 
       - name: Build stwo (cuda-runtime)
         working-directory: stwo/crates/stwo

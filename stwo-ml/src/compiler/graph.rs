@@ -34,27 +34,15 @@ pub enum GraphOp {
         dim: usize,
     },
     /// Quantization / dequantization step.
-    Quantize {
-        params: QuantParams,
-        size: usize,
-    },
+    Quantize { params: QuantParams, size: usize },
     /// Multi-head attention block.
-    Attention {
-        config: MultiHeadAttentionConfig,
-    },
+    Attention { config: MultiHeadAttentionConfig },
     /// Element-wise addition: output[i] = lhs[i] + rhs[i].
-    Add {
-        size: usize,
-    },
+    Add { size: usize },
     /// Element-wise multiplication: output[i] = lhs[i] * rhs[i].
-    Mul {
-        size: usize,
-    },
+    Mul { size: usize },
     /// Embedding table lookup: output = table[token_ids].
-    Embedding {
-        vocab_size: usize,
-        embed_dim: usize,
-    },
+    Embedding { vocab_size: usize, embed_dim: usize },
     /// 2D convolution via im2col + MatMul.
     Conv2D {
         in_channels: usize,
@@ -65,19 +53,14 @@ pub enum GraphOp {
     },
     /// Dequantization step: maps quantized M31 values back to dequantized M31 values
     /// via a lookup table. Provable via LogUp (table size = 2^bits).
-    Dequantize {
-        params: QuantParams,
-        size: usize,
-    },
+    Dequantize { params: QuantParams, size: usize },
     /// Rotary Positional Embedding applied to Q/K vectors.
     /// Applies position-dependent rotations to adjacent element pairs.
     RoPE {
         config: crate::components::rope::RoPEConfig,
     },
     /// Identity / passthrough (for graph structure).
-    Identity {
-        size: usize,
-    },
+    Identity { size: usize },
 }
 
 impl GraphOp {
@@ -108,18 +91,24 @@ impl GraphOp {
                 // Trace must be >= table size (2^bits)
                 (*size).max(1usize << params.bits)
             }
-            GraphOp::Attention { config } => {
-                config.sumcheck_trace_rows()
-            }
+            GraphOp::Attention { config } => config.sumcheck_trace_rows(),
             GraphOp::Add { size } | GraphOp::Mul { size } => {
                 // One constraint per element
                 *size
             }
-            GraphOp::Embedding { vocab_size, embed_dim } => {
+            GraphOp::Embedding {
+                vocab_size,
+                embed_dim,
+            } => {
                 // LogUp lookup per token
                 *vocab_size + *embed_dim
             }
-            GraphOp::Conv2D { in_channels, out_channels, kernel_size, .. } => {
+            GraphOp::Conv2D {
+                in_channels,
+                out_channels,
+                kernel_size,
+                ..
+            } => {
                 // im2col + matmul cost
                 in_channels * kernel_size * kernel_size * out_channels
             }
@@ -233,7 +222,6 @@ impl Default for GraphWeights {
     }
 }
 
-
 /// A computation graph representing a neural network.
 #[derive(Debug, Clone)]
 pub struct ComputationGraph {
@@ -254,7 +242,12 @@ impl ComputationGraph {
     }
 
     /// Add a node to the graph and return its ID.
-    pub fn add_node(&mut self, op: GraphOp, inputs: Vec<usize>, output_shape: (usize, usize)) -> usize {
+    pub fn add_node(
+        &mut self,
+        op: GraphOp,
+        inputs: Vec<usize>,
+        output_shape: (usize, usize),
+    ) -> usize {
         let id = self.nodes.len();
         self.nodes.push(GraphNode {
             id,
@@ -415,8 +408,16 @@ impl ComputationGraph {
                 }
                 GraphOp::Dequantize { size, .. } => size * 16,
                 GraphOp::Add { size } | GraphOp::Mul { size } => size * 16,
-                GraphOp::Embedding { vocab_size, embed_dim } => vocab_size * embed_dim * 4,
-                GraphOp::Conv2D { in_channels, out_channels, kernel_size, .. } => {
+                GraphOp::Embedding {
+                    vocab_size,
+                    embed_dim,
+                } => vocab_size * embed_dim * 4,
+                GraphOp::Conv2D {
+                    in_channels,
+                    out_channels,
+                    kernel_size,
+                    ..
+                } => {
                     let k = in_channels * kernel_size * kernel_size;
                     let (_, total) = estimate_sumcheck_memory(1, k, *out_channels);
                     total
@@ -449,11 +450,9 @@ impl GraphBuilder {
         let dims = (batch, in_features, out_features);
         let inputs = self.last_node.map(|n| vec![n]).unwrap_or_default();
 
-        let id = self.graph.add_node(
-            GraphOp::MatMul { dims },
-            inputs,
-            (batch, out_features),
-        );
+        let id = self
+            .graph
+            .add_node(GraphOp::MatMul { dims }, inputs, (batch, out_features));
         self.last_node = Some(id);
         self
     }
@@ -465,7 +464,10 @@ impl GraphBuilder {
         let inputs = self.last_node.map(|n| vec![n]).unwrap_or_default();
 
         let id = self.graph.add_node(
-            GraphOp::Activation { activation_type: act_type, size },
+            GraphOp::Activation {
+                activation_type: act_type,
+                size,
+            },
             inputs,
             shape,
         );
@@ -478,11 +480,9 @@ impl GraphBuilder {
         let shape = self.current_output_shape();
         let inputs = self.last_node.map(|n| vec![n]).unwrap_or_default();
 
-        let id = self.graph.add_node(
-            GraphOp::Attention { config },
-            inputs,
-            shape,
-        );
+        let id = self
+            .graph
+            .add_node(GraphOp::Attention { config }, inputs, shape);
         self.last_node = Some(id);
         self
     }
@@ -497,7 +497,8 @@ impl GraphBuilder {
     ) -> &mut Self {
         let shape = self.current_output_shape();
         let d_model = shape.1;
-        let config = MultiHeadAttentionConfig::new_gqa(num_heads, num_kv_heads, d_model, seq_len, causal);
+        let config =
+            MultiHeadAttentionConfig::new_gqa(num_heads, num_kv_heads, d_model, seq_len, causal);
         self.attention(config)
     }
 
@@ -506,11 +507,9 @@ impl GraphBuilder {
         let shape = self.current_output_shape();
         let inputs = self.last_node.map(|n| vec![n]).unwrap_or_default();
 
-        let id = self.graph.add_node(
-            GraphOp::LayerNorm { dim: shape.1 },
-            inputs,
-            shape,
-        );
+        let id = self
+            .graph
+            .add_node(GraphOp::LayerNorm { dim: shape.1 }, inputs, shape);
         self.last_node = Some(id);
         self
     }
@@ -520,11 +519,9 @@ impl GraphBuilder {
         let shape = self.current_output_shape();
         let inputs = self.last_node.map(|n| vec![n]).unwrap_or_default();
 
-        let id = self.graph.add_node(
-            GraphOp::RMSNorm { dim: shape.1 },
-            inputs,
-            shape,
-        );
+        let id = self
+            .graph
+            .add_node(GraphOp::RMSNorm { dim: shape.1 }, inputs, shape);
         self.last_node = Some(id);
         self
     }
@@ -537,11 +534,7 @@ impl GraphBuilder {
         let inputs = self.last_node.map(|n| vec![n]).unwrap_or_default();
         let config = crate::components::rope::RoPEConfig::new(shape.0, head_dim);
 
-        let id = self.graph.add_node(
-            GraphOp::RoPE { config },
-            inputs,
-            shape,
-        );
+        let id = self.graph.add_node(GraphOp::RoPE { config }, inputs, shape);
         self.last_node = Some(id);
         self
     }
@@ -557,11 +550,9 @@ impl GraphBuilder {
         let size = shape.0 * shape.1;
         let inputs = self.last_node.map(|n| vec![n]).unwrap_or_default();
 
-        let id = self.graph.add_node(
-            GraphOp::Identity { size },
-            inputs,
-            shape,
-        );
+        let id = self
+            .graph
+            .add_node(GraphOp::Identity { size }, inputs, shape);
         self.last_node = Some(id);
         self
     }
@@ -572,11 +563,9 @@ impl GraphBuilder {
         let size = shape.0 * shape.1;
         let inputs = self.last_node.map(|n| vec![n]).unwrap_or_default();
 
-        let id = self.graph.add_node(
-            GraphOp::Dequantize { params, size },
-            inputs,
-            shape,
-        );
+        let id = self
+            .graph
+            .add_node(GraphOp::Dequantize { params, size }, inputs, shape);
         self.last_node = Some(id);
         self
     }
@@ -598,11 +587,9 @@ impl GraphBuilder {
         let size = shape.0 * shape.1;
         let inputs = self.last_node.map(|n| vec![n]).unwrap_or_default();
 
-        let id = self.graph.add_node(
-            GraphOp::Quantize { params, size },
-            inputs,
-            shape,
-        );
+        let id = self
+            .graph
+            .add_node(GraphOp::Quantize { params, size }, inputs, shape);
         self.last_node = Some(id);
         self
     }
@@ -624,11 +611,9 @@ impl GraphBuilder {
         let shape = self.current_output_shape();
         let size = shape.0 * shape.1;
         let rhs = self.last_node.expect("add_from requires a current node");
-        let id = self.graph.add_node(
-            GraphOp::Add { size },
-            vec![lhs, rhs],
-            shape,
-        );
+        let id = self
+            .graph
+            .add_node(GraphOp::Add { size }, vec![lhs, rhs], shape);
         self.last_node = Some(id);
         self
     }
@@ -638,11 +623,9 @@ impl GraphBuilder {
         let shape = self.current_output_shape();
         let size = shape.0 * shape.1;
         let rhs = self.last_node.expect("mul_from requires a current node");
-        let id = self.graph.add_node(
-            GraphOp::Mul { size },
-            vec![lhs, rhs],
-            shape,
-        );
+        let id = self
+            .graph
+            .add_node(GraphOp::Mul { size }, vec![lhs, rhs], shape);
         self.last_node = Some(id);
         self
     }
@@ -651,7 +634,10 @@ impl GraphBuilder {
     pub fn embedding(&mut self, vocab_size: usize, embed_dim: usize) -> &mut Self {
         let inputs = self.last_node.map(|n| vec![n]).unwrap_or_default();
         let id = self.graph.add_node(
-            GraphOp::Embedding { vocab_size, embed_dim },
+            GraphOp::Embedding {
+                vocab_size,
+                embed_dim,
+            },
             inputs,
             (1, embed_dim),
         );
@@ -674,7 +660,13 @@ impl GraphBuilder {
         // Output spatial dim: (input_dim + 2*padding - kernel_size) / stride + 1
         // Simplified: we track (batch, out_channels) as shape
         let id = self.graph.add_node(
-            GraphOp::Conv2D { in_channels, out_channels, kernel_size, stride, padding },
+            GraphOp::Conv2D {
+                in_channels,
+                out_channels,
+                kernel_size,
+                stride,
+                padding,
+            },
             inputs,
             (shape.0, out_channels),
         );
@@ -723,14 +715,16 @@ impl GraphBuilder {
 
         let d_model = self.current_output_shape().1;
         let attn_config = crate::components::attention::MultiHeadAttentionConfig::new_gqa(
-            num_heads, num_kv_heads, d_model, seq_len, true,
+            num_heads,
+            num_kv_heads,
+            d_model,
+            seq_len,
+            true,
         );
 
         // Pre-attention norm + attention + residual
         let residual1 = self.fork();
-        self.rms_norm()
-            .attention(attn_config)
-            .add_from(residual1);
+        self.rms_norm().attention(attn_config).add_from(residual1);
 
         // Pre-FFN norm + FFN + residual
         let residual2 = self.fork();
@@ -786,9 +780,9 @@ mod tests {
             .linear(768)
             .layer_norm()
             .activation(ActivationType::GELU)
-            .linear(3072)  // FFN expansion
+            .linear(3072) // FFN expansion
             .activation(ActivationType::GELU)
-            .linear(768);  // FFN contraction
+            .linear(768); // FFN contraction
 
         let graph = builder.build();
         let total = graph.total_trace_rows();
@@ -889,16 +883,24 @@ mod tests {
         assert!(sub.get_weight(0).is_some()); // was node 2
         assert!(sub.get_weight(2).is_some()); // was node 4
         assert!(sub.get_weight(1).is_none()); // node 3 had no weight
-        assert!(sub.get_bias(0).is_some());   // was node 2
+        assert!(sub.get_bias(0).is_some()); // was node 2
     }
 
     #[test]
     fn test_find_block_boundaries_with_layernorm() {
         let mut builder = GraphBuilder::new((1, 64));
         // Block 0: LN → MatMul → ReLU → MatMul
-        builder.layer_norm().linear(64).activation(ActivationType::ReLU).linear(64);
+        builder
+            .layer_norm()
+            .linear(64)
+            .activation(ActivationType::ReLU)
+            .linear(64);
         // Block 1: LN → MatMul → ReLU → MatMul
-        builder.layer_norm().linear(64).activation(ActivationType::ReLU).linear(64);
+        builder
+            .layer_norm()
+            .linear(64)
+            .activation(ActivationType::ReLU)
+            .linear(64);
         let graph = builder.build();
 
         let blocks = graph.find_block_boundaries();
@@ -995,9 +997,9 @@ mod tests {
         builder.linear(4); // node 0
         let branch = builder.fork(); // save node 0
         builder.activation(ActivationType::ReLU); // node 1, depends on 0
-        // Now we want node 2 to also depend on 0, then add 1+2
-        // But with current API, 'current' is node 1.
-        // So we use add_from(branch) to combine node 0 + node 1
+                                                  // Now we want node 2 to also depend on 0, then add 1+2
+                                                  // But with current API, 'current' is node 1.
+                                                  // So we use add_from(branch) to combine node 0 + node 1
         builder.add_from(branch); // node 2 = add(0, 1)
 
         let graph = builder.build();
@@ -1018,7 +1020,13 @@ mod tests {
 
         assert_eq!(graph.num_layers(), 1);
         assert_eq!(graph.output_shape, (1, 768));
-        assert!(matches!(graph.nodes[0].op, GraphOp::Embedding { vocab_size: 1000, embed_dim: 768 }));
+        assert!(matches!(
+            graph.nodes[0].op,
+            GraphOp::Embedding {
+                vocab_size: 1000,
+                embed_dim: 768
+            }
+        ));
     }
 
     #[test]

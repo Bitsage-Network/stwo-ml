@@ -1,15 +1,21 @@
-name: stwo-ml-soundness-gates
+name: stwo-ml Soundness Gates
 
 on:
   pull_request:
     paths:
       - "stwo-ml/**"
+      - "proof-stream/**"
       - ".github/workflows/stwo-ml-soundness-gates.yml"
   push:
     branches: [main]
     paths:
       - "stwo-ml/**"
+      - "proof-stream/**"
       - ".github/workflows/stwo-ml-soundness-gates.yml"
+
+concurrency:
+  group: soundness-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
 
 jobs:
   soundness:
@@ -28,6 +34,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: stwo-ml
+
+      - name: Manifest Validation
+        run: cargo metadata --no-deps --format-version 1 > /dev/null
+
+      - name: Compile Check
+        run: cargo check
 
       - name: Activation LogUp Gate
         run: cargo test --lib gkr_soundness_gate_rejects_missing_activation_logup -- --nocapture

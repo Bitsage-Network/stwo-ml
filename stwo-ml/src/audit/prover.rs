@@ -16,19 +16,17 @@ use std::time::Instant;
 use starknet_ff::FieldElement;
 use tracing::info;
 
-use crate::audit::digest::{
-    digest_to_hex, hash_felt_hex_m31, M31Digest, ZERO_DIGEST,
-};
+use crate::audit::digest::{digest_to_hex, hash_felt_hex_m31, M31Digest, ZERO_DIGEST};
 use crate::audit::log::{AuditMerkleTree, InferenceLog};
 use crate::audit::replay::verify_replay;
 use crate::audit::types::{
-    AuditError, AuditRequest, BatchAuditResult, GkrInferenceCalldata,
-    InferenceProofResult, ProofMode, VerificationCalldata,
+    AuditError, AuditRequest, BatchAuditResult, GkrInferenceCalldata, InferenceProofResult,
+    ProofMode, VerificationCalldata,
 };
-use crate::crypto::poseidon2_m31::poseidon2_hash;
 use crate::compiler::graph::{ComputationGraph, GraphWeights};
 use crate::compiler::prove::prove_model;
 use crate::components::matmul::M31Matrix;
+use crate::crypto::poseidon2_m31::poseidon2_hash;
 use crate::starknet::{prove_for_starknet_ml_gkr, prove_for_starknet_onchain};
 
 use stwo::core::fields::m31::M31;
@@ -173,8 +171,9 @@ impl<'a> AuditProver<'a> {
         start: Instant,
     ) -> Result<InferenceProofResult, AuditError> {
         // Parse model_id from the log entry.
-        let model_id = FieldElement::from_hex_be(&entry.model_id)
-            .map_err(|_| AuditError::ProvingFailed(format!("invalid model_id: {}", entry.model_id)))?;
+        let model_id = FieldElement::from_hex_be(&entry.model_id).map_err(|_| {
+            AuditError::ProvingFailed(format!("invalid model_id: {}", entry.model_id))
+        })?;
 
         let gkr_proof = prove_for_starknet_ml_gkr(self.graph, input, self.weights, model_id)
             .map_err(|e| AuditError::ProvingFailed(format!("GKR proving failed: {}", e)))?;
@@ -184,11 +183,12 @@ impl<'a> AuditProver<'a> {
         // Cross-check: proof's io_commitment must match the log entry's.
         // The GKR proof is cryptographically bound to its io_commitment — if they
         // diverge, on-chain verification would fail.
-        let logged_io = FieldElement::from_hex_be(&entry.io_commitment)
-            .map_err(|_| AuditError::LogError(format!(
+        let logged_io = FieldElement::from_hex_be(&entry.io_commitment).map_err(|_| {
+            AuditError::LogError(format!(
                 "invalid io_commitment hex: {}",
                 entry.io_commitment
-            )))?;
+            ))
+        })?;
         if gkr_proof.io_commitment != logged_io {
             return Err(AuditError::ReplayMismatch {
                 sequence: entry.sequence_number,
@@ -198,16 +198,24 @@ impl<'a> AuditProver<'a> {
         }
 
         // Serialize FieldElement vectors to hex strings.
-        let gkr_calldata: Vec<String> = gkr_proof.gkr_calldata.iter()
+        let gkr_calldata: Vec<String> = gkr_proof
+            .gkr_calldata
+            .iter()
             .map(|f| format!("{:#066x}", f))
             .collect();
-        let io_calldata: Vec<String> = gkr_proof.io_calldata.iter()
+        let io_calldata: Vec<String> = gkr_proof
+            .io_calldata
+            .iter()
             .map(|f| format!("{:#066x}", f))
             .collect();
-        let weight_commitments_calldata: Vec<String> = gkr_proof.weight_commitments.iter()
+        let weight_commitments_calldata: Vec<String> = gkr_proof
+            .weight_commitments
+            .iter()
             .map(|f| format!("{:#066x}", f))
             .collect();
-        let weight_opening_calldata: Vec<String> = gkr_proof.weight_opening_calldata.iter()
+        let weight_opening_calldata: Vec<String> = gkr_proof
+            .weight_opening_calldata
+            .iter()
             .map(|f| format!("{:#066x}", f))
             .collect();
 
@@ -249,11 +257,12 @@ impl<'a> AuditProver<'a> {
         let proving_time_ms = start.elapsed().as_millis() as u64;
 
         // Cross-check: proof's io_commitment must match the log entry's.
-        let logged_io = FieldElement::from_hex_be(&entry.io_commitment)
-            .map_err(|_| AuditError::LogError(format!(
+        let logged_io = FieldElement::from_hex_be(&entry.io_commitment).map_err(|_| {
+            AuditError::LogError(format!(
                 "invalid io_commitment hex: {}",
                 entry.io_commitment
-            )))?;
+            ))
+        })?;
         if proof.io_commitment != logged_io {
             return Err(AuditError::ReplayMismatch {
                 sequence: entry.sequence_number,
@@ -262,7 +271,9 @@ impl<'a> AuditProver<'a> {
             });
         }
 
-        let proof_calldata: Vec<String> = proof.combined_calldata.iter()
+        let proof_calldata: Vec<String> = proof
+            .combined_calldata
+            .iter()
             .map(|f| format!("{:#066x}", f))
             .collect();
 
@@ -323,9 +334,7 @@ impl<'a> AuditProver<'a> {
 ///
 /// - `io_merkle_root`: M31 Merkle root of all io_commitments
 /// - `combined_chain`: Poseidon2-M31 hash of all layer_chain_commitments
-pub fn compute_batch_commitments(
-    results: &[InferenceProofResult],
-) -> (M31Digest, M31Digest) {
+pub fn compute_batch_commitments(results: &[InferenceProofResult]) -> (M31Digest, M31Digest) {
     // Build M31 Merkle root of io_commitments.
     // io_commitments from ZKML prover are felt252 hex strings — hash into M31 space.
     let mut io_tree = AuditMerkleTree::new();
@@ -398,10 +407,7 @@ fn build_verification_calldata(
             Some(VerificationCalldata::Gkr { per_inference })
         }
         ProofMode::Direct => {
-            let per_inference = results
-                .iter()
-                .map(|r| r.proof_calldata.clone())
-                .collect();
+            let per_inference = results.iter().map(|r| r.proof_calldata.clone()).collect();
             Some(VerificationCalldata::Direct { per_inference })
         }
         ProofMode::Legacy => None,
@@ -421,8 +427,8 @@ mod tests {
     use crate::compiler::graph::{GraphBuilder, GraphWeights};
     use crate::components::activation::ActivationType;
     use crate::components::matmul::M31Matrix;
-    use stwo::core::fields::m31::M31;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use stwo::core::fields::m31::M31;
 
     fn temp_dir() -> std::path::PathBuf {
         let d = SystemTime::now()
@@ -687,10 +693,7 @@ mod tests {
                 timestamp_ns: 2000,
                 proof_size_felts: 2,
                 proving_time_ms: 50,
-                proof_calldata: vec![
-                    format!("{:#066x}", 0xDDu64),
-                    format!("{:#066x}", 0xEEu64),
-                ],
+                proof_calldata: vec![format!("{:#066x}", 0xDDu64), format!("{:#066x}", 0xEEu64)],
                 io_calldata: Vec::new(),
                 weight_opening_calldata: Vec::new(),
                 weight_commitments_calldata: Vec::new(),
@@ -702,7 +705,7 @@ mod tests {
 
         // Format: [count=2, len_0=3, AA, BB, CC, len_1=2, DD, EE]
         assert_eq!(aggregated.len(), 8); // 1 + 1+3 + 1+2 = 8
-        // First element is count = 2.
+                                         // First element is count = 2.
         assert_eq!(aggregated[0], format!("{:#066x}", 2u64));
         // Second element is len of first proof = 3.
         assert_eq!(aggregated[1], format!("{:#066x}", 3u64));
@@ -712,21 +715,19 @@ mod tests {
 
     #[test]
     fn test_aggregate_proof_calldata_empty_for_legacy() {
-        let results = vec![
-            InferenceProofResult {
-                sequence: 0,
-                io_commitment: "0x1".to_string(),
-                layer_chain_commitment: "0x10".to_string(),
-                timestamp_ns: 1000,
-                proof_size_felts: 5,
-                proving_time_ms: 50,
-                proof_calldata: Vec::new(), // Legacy: empty
-                io_calldata: Vec::new(),
-                weight_opening_calldata: Vec::new(),
-                weight_commitments_calldata: Vec::new(),
-                proof_mode: ProofMode::Legacy,
-            },
-        ];
+        let results = vec![InferenceProofResult {
+            sequence: 0,
+            io_commitment: "0x1".to_string(),
+            layer_chain_commitment: "0x10".to_string(),
+            timestamp_ns: 1000,
+            proof_size_felts: 5,
+            proving_time_ms: 50,
+            proof_calldata: Vec::new(), // Legacy: empty
+            io_calldata: Vec::new(),
+            weight_opening_calldata: Vec::new(),
+            weight_commitments_calldata: Vec::new(),
+            proof_mode: ProofMode::Legacy,
+        }];
 
         let aggregated = aggregate_proof_calldata(&results);
         assert!(aggregated.is_empty());

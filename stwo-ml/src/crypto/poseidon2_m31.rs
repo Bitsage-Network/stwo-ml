@@ -114,7 +114,12 @@ pub fn apply_external_round_matrix(state: &mut [M31; STATE_WIDTH]) {
     // Apply M4 to each 4-element chunk
     for i in 0..4 {
         let base = 4 * i;
-        let mut chunk = [state[base], state[base + 1], state[base + 2], state[base + 3]];
+        let mut chunk = [
+            state[base],
+            state[base + 1],
+            state[base + 2],
+            state[base + 3],
+        ];
         apply_m4(&mut chunk);
         state[base] = chunk[0];
         state[base + 1] = chunk[1];
@@ -136,7 +141,10 @@ pub fn apply_external_round_matrix(state: &mut [M31; STATE_WIDTH]) {
 /// result[i] = INTERNAL_DIAG[i] * state[i] + sum(state)
 #[inline]
 pub fn apply_internal_round_matrix(state: &mut [M31; STATE_WIDTH]) {
-    let sum: M31 = state.iter().copied().fold(M31::from_u32_unchecked(0), |a, b| a + b);
+    let sum: M31 = state
+        .iter()
+        .copied()
+        .fold(M31::from_u32_unchecked(0), |a, b| a + b);
 
     for (i, s) in state.iter_mut().enumerate() {
         *s = *s * M31::from_u32_unchecked(INTERNAL_DIAG_U32[i]) + sum;
@@ -324,14 +332,14 @@ mod tests {
     fn test_m4_matches_stwo() {
         // Verify our M4 matches STWO's matrix:
         // [[5, 7, 1, 3], [4, 6, 1, 1], [1, 3, 5, 7], [1, 1, 4, 6]]
-        let m4 = [
-            [5u32, 7, 1, 3],
-            [4, 6, 1, 1],
-            [1, 3, 5, 7],
-            [1, 1, 4, 6],
-        ];
+        let m4 = [[5u32, 7, 1, 3], [4, 6, 1, 1], [1, 3, 5, 7], [1, 1, 4, 6]];
 
-        for test_input in [[0u32, 1, 2, 3], [1, 0, 0, 0], [0, 0, 0, 1], [10, 20, 30, 40]] {
+        for test_input in [
+            [0u32, 1, 2, 3],
+            [1, 0, 0, 0],
+            [0, 0, 0, 1],
+            [10, 20, 30, 40],
+        ] {
             let mut state: [M31; 4] = test_input.map(M31::from_u32_unchecked);
             apply_m4(&mut state);
 
@@ -351,8 +359,8 @@ mod tests {
 
     #[test]
     fn test_external_matrix_deterministic() {
-        let mut s1 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
-            .map(M31::from_u32_unchecked);
+        let mut s1 =
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16].map(M31::from_u32_unchecked);
         let mut s2 = s1;
 
         apply_external_round_matrix(&mut s1);
@@ -368,16 +376,16 @@ mod tests {
             .map(M31::from_u32_unchecked);
         let mut state = input;
 
-        let sum: M31 = input.iter().copied().fold(M31::from_u32_unchecked(0), |a, b| a + b);
+        let sum: M31 = input
+            .iter()
+            .copied()
+            .fold(M31::from_u32_unchecked(0), |a, b| a + b);
 
         apply_internal_round_matrix(&mut state);
 
         for i in 0..STATE_WIDTH {
             let expected = input[i] * M31::from_u32_unchecked(INTERNAL_DIAG_U32[i]) + sum;
-            assert_eq!(
-                state[i], expected,
-                "Internal matrix mismatch at index {i}"
-            );
+            assert_eq!(state[i], expected, "Internal matrix mismatch at index {i}");
         }
     }
 
@@ -395,8 +403,7 @@ mod tests {
     #[test]
     fn test_permutation_not_identity() {
         let input: [M31; STATE_WIDTH] =
-            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
-                .map(M31::from_u32_unchecked);
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16].map(M31::from_u32_unchecked);
         let mut state = input;
         poseidon2_permutation(&mut state);
 
@@ -419,11 +426,7 @@ mod tests {
         poseidon2_permutation(&mut s2);
 
         // Count differing positions
-        let diffs = s1
-            .iter()
-            .zip(s2.iter())
-            .filter(|(a, b)| a != b)
-            .count();
+        let diffs = s1.iter().zip(s2.iter()).filter(|(a, b)| a != b).count();
 
         // All 16 elements should differ (full diffusion)
         assert_eq!(

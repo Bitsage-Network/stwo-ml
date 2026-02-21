@@ -69,24 +69,15 @@ pub enum LayerType {
 
     /// Dequantization: maps quantized values to dequantized values via lookup table.
     /// Reduction: LogUp lookup argument (same protocol as Activation).
-    Dequantize {
-        size: usize,
-        params: QuantParams,
-    },
+    Dequantize { size: usize, params: QuantParams },
 
     /// Quantization: maps direct-encoded values to quantized values via lookup table.
     /// Reduction: LogUp lookup argument.
-    Quantize {
-        size: usize,
-        params: QuantParams,
-    },
+    Quantize { size: usize, params: QuantParams },
 
     /// Embedding lookup: output[row, col] = table[token[row], col].
     /// Reduction: LogUp lookup argument on (token_id, col_idx, value).
-    Embedding {
-        vocab_size: usize,
-        embed_dim: usize,
-    },
+    Embedding { vocab_size: usize, embed_dim: usize },
 
     /// Identity / passthrough (zero-cost in GKR, claim propagates unchanged).
     Identity,
@@ -225,9 +216,7 @@ impl LayeredCircuit {
             GraphOp::LayerNorm { dim } => Ok(LayerType::LayerNorm { dim: *dim }),
             GraphOp::Add { size } => Ok(LayerType::Add { size: *size }),
             GraphOp::Mul { size } => Ok(LayerType::Mul { size: *size }),
-            GraphOp::Attention { config } => Ok(LayerType::Attention {
-                config: *config,
-            }),
+            GraphOp::Attention { config } => Ok(LayerType::Attention { config: *config }),
             GraphOp::Identity { .. } => Ok(LayerType::Identity),
             GraphOp::Embedding {
                 vocab_size,
@@ -392,18 +381,12 @@ fn layer_type_matches(a: &LayerType, b: &LayerType) -> bool {
         (LayerType::LayerNorm { dim: d1 }, LayerType::LayerNorm { dim: d2 }) => d1 == d2,
         (LayerType::RMSNorm { dim: d1 }, LayerType::RMSNorm { dim: d2 }) => d1 == d2,
         (LayerType::Attention { config: c1 }, LayerType::Attention { config: c2 }) => {
-            c1.num_heads == c2.num_heads
-                && c1.d_model == c2.d_model
-                && c1.seq_len == c2.seq_len
+            c1.num_heads == c2.num_heads && c1.d_model == c2.d_model && c1.seq_len == c2.seq_len
         }
-        (
-            LayerType::Dequantize { size: s1, .. },
-            LayerType::Dequantize { size: s2, .. },
-        ) => s1 == s2,
-        (
-            LayerType::Quantize { size: s1, .. },
-            LayerType::Quantize { size: s2, .. },
-        ) => s1 == s2,
+        (LayerType::Dequantize { size: s1, .. }, LayerType::Dequantize { size: s2, .. }) => {
+            s1 == s2
+        }
+        (LayerType::Quantize { size: s1, .. }, LayerType::Quantize { size: s2, .. }) => s1 == s2,
         (
             LayerType::Embedding {
                 vocab_size: v1,
@@ -554,13 +537,33 @@ mod tests {
     #[test]
     fn test_layer_type_matches() {
         assert!(layer_type_matches(
-            &LayerType::MatMul { m: 1, k: 64, n: 128, weight_node_id: 0 },
-            &LayerType::MatMul { m: 1, k: 64, n: 128, weight_node_id: 5 },
+            &LayerType::MatMul {
+                m: 1,
+                k: 64,
+                n: 128,
+                weight_node_id: 0
+            },
+            &LayerType::MatMul {
+                m: 1,
+                k: 64,
+                n: 128,
+                weight_node_id: 5
+            },
         ));
 
         assert!(!layer_type_matches(
-            &LayerType::MatMul { m: 1, k: 64, n: 128, weight_node_id: 0 },
-            &LayerType::MatMul { m: 1, k: 32, n: 128, weight_node_id: 0 },
+            &LayerType::MatMul {
+                m: 1,
+                k: 64,
+                n: 128,
+                weight_node_id: 0
+            },
+            &LayerType::MatMul {
+                m: 1,
+                k: 32,
+                n: 128,
+                weight_node_id: 0
+            },
         ));
 
         assert!(!layer_type_matches(

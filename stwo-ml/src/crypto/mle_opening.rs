@@ -18,11 +18,6 @@ use crate::gpu_sumcheck::GpuSumcheckExecutor;
 use cudarc::driver::CudaSlice;
 #[cfg(feature = "cuda-runtime")]
 use cudarc::driver::DeviceSlice;
-#[cfg(feature = "cuda-runtime")]
-use stwo::prover::backend::gpu::cuda_executor::{
-    get_cuda_executor, is_cuda_available, upload_poseidon252_round_constants, CudaFftExecutor,
-    Poseidon252MerkleGpuTree,
-};
 use rayon::prelude::*;
 use starknet_ff::FieldElement;
 #[cfg(feature = "cuda-runtime")]
@@ -36,6 +31,11 @@ use stwo::core::fields::m31::M31;
 use stwo::core::fields::qm31::SecureField;
 #[cfg(feature = "cuda-runtime")]
 use stwo::core::fields::qm31::QM31;
+#[cfg(feature = "cuda-runtime")]
+use stwo::prover::backend::gpu::cuda_executor::{
+    get_cuda_executor, is_cuda_available, upload_poseidon252_round_constants, CudaFftExecutor,
+    Poseidon252MerkleGpuTree,
+};
 
 /// Number of queries for MLE opening (matching STARK FRI query count).
 pub const MLE_N_QUERIES: usize = 14;
@@ -344,13 +344,10 @@ fn fold_layer_cpu_qm31_words(words: &[u32], r: SecureField) -> Vec<SecureField> 
             .map(|j| {
                 let l = j * 4;
                 let rr = (mid + j) * 4;
-                let left = u32s_to_secure_field(&[words[l], words[l + 1], words[l + 2], words[l + 3]]);
-                let right = u32s_to_secure_field(&[
-                    words[rr],
-                    words[rr + 1],
-                    words[rr + 2],
-                    words[rr + 3],
-                ]);
+                let left =
+                    u32s_to_secure_field(&[words[l], words[l + 1], words[l + 2], words[l + 3]]);
+                let right =
+                    u32s_to_secure_field(&[words[rr], words[rr + 1], words[rr + 2], words[rr + 3]]);
                 left + r * (right - left)
             })
             .collect()
@@ -488,7 +485,7 @@ fn prove_mle_opening_with_commitment_qm31_u32_gpu_tree(
         Some(v) => v,
         None => {
             return Err(
-                "GPU-resident opening path requires GPU fold session (falling back)".to_string()
+                "GPU-resident opening path requires GPU fold session (falling back)".to_string(),
             )
         }
     };
@@ -623,17 +620,35 @@ fn prove_mle_opening_with_commitment_qm31_u32_gpu_tree(
 
             let left_words = gpu
                 .mle_fold_session_read_qm31_at(&replay_session, left_idx)
-                .map_err(|e| format!("download left query value (round {}, query {}): {}", round, q, e))?;
+                .map_err(|e| {
+                    format!(
+                        "download left query value (round {}, query {}): {}",
+                        round, q, e
+                    )
+                })?;
             let right_words = gpu
                 .mle_fold_session_read_qm31_at(&replay_session, right_idx)
-                .map_err(|e| format!("download right query value (round {}, query {}): {}", round, q, e))?;
+                .map_err(|e| {
+                    format!(
+                        "download right query value (round {}, query {}): {}",
+                        round, q, e
+                    )
+                })?;
 
             let left_value = u32s_to_secure_field(&left_words);
             let right_value = u32s_to_secure_field(&right_words);
-            let left_siblings =
-                build_gpu_merkle_path_with_leaf_sibling(tree, left_idx, replay_layer_size, right_value)?;
-            let right_siblings =
-                build_gpu_merkle_path_with_leaf_sibling(tree, right_idx, replay_layer_size, left_value)?;
+            let left_siblings = build_gpu_merkle_path_with_leaf_sibling(
+                tree,
+                left_idx,
+                replay_layer_size,
+                right_value,
+            )?;
+            let right_siblings = build_gpu_merkle_path_with_leaf_sibling(
+                tree,
+                right_idx,
+                replay_layer_size,
+                left_value,
+            )?;
 
             query_rounds[q].push(MleQueryRoundData {
                 left_value,

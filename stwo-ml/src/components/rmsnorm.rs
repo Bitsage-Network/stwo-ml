@@ -11,14 +11,12 @@
 
 use stwo::core::fields::m31::{BaseField, M31};
 use stwo::core::fields::qm31::SecureField;
-use stwo::prover::poly::circle::CircleEvaluation;
-use stwo::prover::poly::BitReversedOrder;
 use stwo::core::poly::circle::CanonicCoset;
 use stwo::prover::backend::{Col, Column, ColumnOps};
-use stwo_constraint_framework::{
-    FrameworkEval, FrameworkComponent, EvalAtRow, RelationEntry,
-};
+use stwo::prover::poly::circle::CircleEvaluation;
+use stwo::prover::poly::BitReversedOrder;
 use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
+use stwo_constraint_framework::{EvalAtRow, FrameworkComponent, FrameworkEval, RelationEntry};
 
 use crate::gadgets::lookup_table::PrecomputedTable;
 
@@ -42,7 +40,11 @@ pub struct RMSNormConfig {
 
 impl RMSNormConfig {
     pub fn new(dim: usize) -> Self {
-        Self { dim, rsqrt_table_log_size: 16, epsilon: 1 }
+        Self {
+            dim,
+            rsqrt_table_log_size: 16,
+            epsilon: 1,
+        }
     }
 }
 
@@ -182,7 +184,12 @@ mod tests {
         let mults = vec![M31::from(1); n];
 
         let trace = generate_rmsnorm_trace::<SimdBackend>(
-            &inputs, &rms_sq, &rsqrt_vals, &outputs, &mults, 4,
+            &inputs,
+            &rms_sq,
+            &rsqrt_vals,
+            &outputs,
+            &mults,
+            4,
         );
         // 5 columns: input, rms_sq, rsqrt, output, multiplicity
         assert_eq!(trace.len(), 5);

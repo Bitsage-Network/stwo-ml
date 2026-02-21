@@ -17,9 +17,8 @@
 use stwo::core::fields::qm31::SecureField;
 
 use super::matmul::{
+    estimate_sumcheck_memory, matmul_m31_auto, pad_matrix_pow2, prove_matmul_sumcheck_onchain_auto,
     M31Matrix, MatMulSumcheckProofOnChain,
-    estimate_sumcheck_memory, matmul_m31_auto, pad_matrix_pow2,
-    prove_matmul_sumcheck_onchain_auto,
 };
 
 /// Configuration for tiled matmul proving.
@@ -56,7 +55,9 @@ impl TiledMatMulConfig {
             tile_k /= 2;
         }
 
-        Self { max_tile_k: tile_k.max(1) }
+        Self {
+            max_tile_k: tile_k.max(1),
+        }
     }
 
     /// Number of tiles needed for a matmul with inner dimension `k`.
@@ -197,10 +198,12 @@ pub fn prove_tiled_matmul(
         let c_padded = pad_matrix_pow2(&c_tile);
 
         // Prove this tile
-        let proof = prove_matmul_sumcheck_onchain_auto(&a_padded, &b_padded, &c_padded)
-            .map_err(|e| TiledMatMulError::TileProvingFailed {
-                tile: tile_idx,
-                message: format!("{e}"),
+        let proof =
+            prove_matmul_sumcheck_onchain_auto(&a_padded, &b_padded, &c_padded).map_err(|e| {
+                TiledMatMulError::TileProvingFailed {
+                    tile: tile_idx,
+                    message: format!("{e}"),
+                }
             })?;
 
         total_claimed_sum = total_claimed_sum + proof.claimed_sum;
@@ -362,8 +365,8 @@ mod tests {
         let c = matmul_m31_auto(&a, &b);
 
         let config = TiledMatMulConfig::new(2);
-        let proof = prove_tiled_matmul(&a, &b, &c, &config)
-            .expect("single-tile proving should succeed");
+        let proof =
+            prove_tiled_matmul(&a, &b, &c, &config).expect("single-tile proving should succeed");
 
         assert_eq!(proof.tile_proofs.len(), 1);
         assert_eq!(proof.m, 2);
@@ -381,8 +384,8 @@ mod tests {
         let c = matmul_m31_auto(&a, &b);
 
         let config = TiledMatMulConfig::new(2);
-        let proof = prove_tiled_matmul(&a, &b, &c, &config)
-            .expect("two-tile proving should succeed");
+        let proof =
+            prove_tiled_matmul(&a, &b, &c, &config).expect("two-tile proving should succeed");
 
         assert_eq!(proof.tile_proofs.len(), 2);
         assert_eq!(proof.tile_proofs[0].k_start, 0);
@@ -417,12 +420,12 @@ mod tests {
         let c = matmul_m31_auto(&a, &b);
 
         let config = TiledMatMulConfig::new(2); // tile_k=2 == k=2 → single tile
-        let tiled_proof = prove_tiled_matmul(&a, &b, &c, &config)
-            .expect("tiled proving should succeed");
+        let tiled_proof =
+            prove_tiled_matmul(&a, &b, &c, &config).expect("tiled proving should succeed");
         assert_eq!(tiled_proof.tile_proofs.len(), 1);
 
-        let composed = compose_tiled_proof(&tiled_proof)
-            .expect("single-tile composition should succeed");
+        let composed =
+            compose_tiled_proof(&tiled_proof).expect("single-tile composition should succeed");
         assert_eq!(composed.m, 2);
         assert_eq!(composed.k, 2);
         assert_eq!(composed.n, 2);
@@ -437,8 +440,8 @@ mod tests {
         let c = matmul_m31_auto(&a, &b);
 
         let config = TiledMatMulConfig::new(2); // tile_k=2 < k=4 → 2 tiles
-        let tiled_proof = prove_tiled_matmul(&a, &b, &c, &config)
-            .expect("tiled proving should succeed");
+        let tiled_proof =
+            prove_tiled_matmul(&a, &b, &c, &config).expect("tiled proving should succeed");
         assert_eq!(tiled_proof.tile_proofs.len(), 2);
 
         let result = compose_tiled_proof(&tiled_proof);

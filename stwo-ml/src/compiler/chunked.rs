@@ -18,9 +18,9 @@ use tracing::info;
 
 use crate::aggregation::{AggregatedModelProofOnChain, AggregationError};
 use crate::compiler::checkpoint::ExecutionCheckpoint;
-use crate::compiler::graph::{ComputationGraph, GraphWeights};
 #[cfg(feature = "safetensors")]
 use crate::compiler::graph::GraphOp;
+use crate::compiler::graph::{ComputationGraph, GraphWeights};
 use crate::components::matmul::M31Matrix;
 use starknet_crypto::FieldElement;
 

@@ -107,7 +107,15 @@ pub fn encrypt_note_memo(
     blinding: &[M31; 4],
 ) -> [M31; RATE] {
     // Compute checksum: hash of all fields (enables scan-time validation)
-    let checksum_input = [asset_id, amount_lo, amount_hi, blinding[0], blinding[1], blinding[2], blinding[3]];
+    let checksum_input = [
+        asset_id,
+        amount_lo,
+        amount_hi,
+        blinding[0],
+        blinding[1],
+        blinding[2],
+        blinding[3],
+    ];
     let checksum_hash = poseidon2_hash(&checksum_input);
     let checksum = checksum_hash[0]; // First element as checksum
 
@@ -146,7 +154,15 @@ pub fn decrypt_note_memo(
     let checksum = decrypted[7];
 
     // Verify checksum
-    let checksum_input = [asset_id, amount_lo, amount_hi, blinding[0], blinding[1], blinding[2], blinding[3]];
+    let checksum_input = [
+        asset_id,
+        amount_lo,
+        amount_hi,
+        blinding[0],
+        blinding[1],
+        blinding[2],
+        blinding[3],
+    ];
     let expected_checksum = poseidon2_hash(&checksum_input)[0];
 
     if checksum == expected_checksum {
@@ -169,7 +185,12 @@ pub trait AuditEncryption {
 
     /// Decrypt ciphertext with a private key.
     /// The `nonce` must match the one used during encryption.
-    fn decrypt_with_key(&self, ciphertext: &[M31], nonce: &[M31; 4], key: &[M31; RATE]) -> Option<Vec<M31>>;
+    fn decrypt_with_key(
+        &self,
+        ciphertext: &[M31],
+        nonce: &[M31; 4],
+        key: &[M31; RATE],
+    ) -> Option<Vec<M31>>;
 }
 
 /// Poseidon2-M31 implementation of AuditEncryption.
@@ -188,7 +209,12 @@ impl AuditEncryption for PoseidonM31Encryption {
             .collect()
     }
 
-    fn decrypt_with_key(&self, ciphertext: &[M31], nonce: &[M31; 4], key: &[M31; RATE]) -> Option<Vec<M31>> {
+    fn decrypt_with_key(
+        &self,
+        ciphertext: &[M31],
+        nonce: &[M31; 4],
+        key: &[M31; RATE],
+    ) -> Option<Vec<M31>> {
         Some(poseidon2_decrypt(key, nonce, ciphertext))
     }
 }
@@ -226,10 +252,7 @@ mod tests {
         let ciphertext = poseidon2_encrypt(&key, &nonce, &plaintext);
 
         // Ciphertext should differ from plaintext
-        let differs = ciphertext
-            .iter()
-            .zip(plaintext.iter())
-            .any(|(c, p)| c != p);
+        let differs = ciphertext.iter().zip(plaintext.iter()).any(|(c, p)| c != p);
         assert!(differs, "Ciphertext should differ from plaintext");
     }
 
@@ -341,8 +364,12 @@ mod tests {
         assert_eq!(ciphertexts.len(), 2);
 
         // Each recipient can decrypt with their key
-        let d1 = enc.decrypt_with_key(&ciphertexts[0], &nonce, &key1).unwrap();
-        let d2 = enc.decrypt_with_key(&ciphertexts[1], &nonce, &key2).unwrap();
+        let d1 = enc
+            .decrypt_with_key(&ciphertexts[0], &nonce, &key1)
+            .unwrap();
+        let d2 = enc
+            .decrypt_with_key(&ciphertexts[1], &nonce, &key2)
+            .unwrap();
 
         assert_eq!(d1, plaintext.to_vec());
         assert_eq!(d2, plaintext.to_vec());
@@ -370,6 +397,9 @@ mod tests {
 
         let ct1 = poseidon2_encrypt(&key, &nonce1, &plaintext);
         let ct2 = poseidon2_encrypt(&key, &nonce2, &plaintext);
-        assert_ne!(ct1, ct2, "Different nonces must produce different ciphertexts");
+        assert_ne!(
+            ct1, ct2,
+            "Different nonces must produce different ciphertexts"
+        );
     }
 }
