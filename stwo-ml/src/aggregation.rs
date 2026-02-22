@@ -4270,13 +4270,35 @@ fn prove_model_aggregated_onchain_gpu_cached(
     weight_cache: &crate::weight_cache::SharedWeightCache,
 ) -> Result<AggregatedModelProofOnChain, AggregationError> {
     use stwo::prover::backend::gpu::GpuBackend;
-    prove_model_aggregated_onchain_with_cache::<GpuBackend>(
+    let result = prove_model_aggregated_onchain_with_cache::<GpuBackend>(
         graph,
         input,
         weights,
         Some(weight_cache),
         None,
-    )
+    );
+    // Fallback: if GPU unified STARK fails with ConstraintsNotSatisfied (known
+    // GPU component prover issue with shared preprocessed columns), retry with
+    // SIMD backend. The unified STARK is fast (<1s) so the fallback is cheap.
+    match &result {
+        Err(AggregationError::ProvingError(msg))
+            if msg.contains("ConstraintsNotSatisfied")
+                && !flag_enabled("STWO_UNIFIED_STARK_NO_FALLBACK") =>
+        {
+            eprintln!(
+                "  [GPU→SIMD fallback] GPU unified STARK failed ({}), retrying with SimdBackend...",
+                msg
+            );
+            prove_model_aggregated_onchain_with_cache::<SimdBackend>(
+                graph,
+                input,
+                weights,
+                Some(weight_cache),
+                None,
+            )
+        }
+        _ => result,
+    }
 }
 
 // ---------------------------------------------------------------------------
