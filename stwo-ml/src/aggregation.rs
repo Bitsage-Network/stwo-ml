@@ -4280,6 +4280,9 @@ fn prove_model_aggregated_onchain_gpu_cached(
     // Fallback: if GPU unified STARK fails with ConstraintsNotSatisfied (known
     // GPU component prover issue with shared preprocessed columns), retry with
     // SIMD backend. The unified STARK is fast (<1s) so the fallback is cheap.
+    if let Err(ref e) = result {
+        eprintln!("  [GPU path] result = Err({e})");
+    }
     match &result {
         Err(AggregationError::ProvingError(msg))
             if msg.contains("ConstraintsNotSatisfied")
