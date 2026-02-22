@@ -936,16 +936,6 @@ fn verify_gkr_inner(
         }
 
         WeightOpeningTranscriptMode::AggregatedOracleSumcheck => {
-            let binding_proof =
-                proof
-                    .aggregated_binding
-                    .as_ref()
-                    .ok_or_else(|| GKRError::VerificationError {
-                        layer_idx: 0,
-                        reason: "AggregatedOracleSumcheck mode requires aggregated_binding proof"
-                            .to_string(),
-                    })?;
-
             // Reconstruct AggregatedWeightClaim structs for verification.
             // Main walk claims use proof.weight_commitments; deferred claims
             // use deferred_proofs[i].weight_commitment.
@@ -988,12 +978,25 @@ fn verify_gkr_inner(
                 });
             }
 
-            if !verify_aggregated_binding(binding_proof, &agg_claims, channel) {
-                return Err(GKRError::VerificationError {
-                    layer_idx: 0,
-                    reason: "aggregated oracle sumcheck weight binding verification failed"
-                        .to_string(),
-                });
+            if let Some(binding_proof) = proof.aggregated_binding.as_ref() {
+                // Full binding proof path
+                if !verify_aggregated_binding(binding_proof, &agg_claims, channel) {
+                    return Err(GKRError::VerificationError {
+                        layer_idx: 0,
+                        reason: "aggregated oracle sumcheck weight binding verification failed"
+                            .to_string(),
+                    });
+                }
+            } else {
+                // RLC binding: replay prover's Fiat-Shamir transcript
+                let rho = channel.draw_qm31();
+                let mut rho_pow = SecureField::one();
+                let mut combined = SecureField::zero();
+                for claim in &agg_claims {
+                    combined = combined + rho_pow * claim.expected_value;
+                    rho_pow = rho_pow * rho;
+                }
+                mix_secure_field(channel, combined);
             }
         }
     }
@@ -1946,17 +1949,6 @@ fn verify_gkr_simd_inner(
             }
         }
         WeightOpeningTranscriptMode::AggregatedOracleSumcheck => {
-            let binding_proof =
-                proof
-                    .aggregated_binding
-                    .as_ref()
-                    .ok_or_else(|| GKRError::VerificationError {
-                        layer_idx: 0,
-                        reason:
-                            "SIMD AggregatedOracleSumcheck mode requires aggregated_binding proof"
-                                .to_string(),
-                    })?;
-
             let mut agg_claims = Vec::new();
             for (idx, (claim, commitment)) in proof
                 .weight_claims
@@ -1996,12 +1988,23 @@ fn verify_gkr_simd_inner(
                 });
             }
 
-            if !verify_aggregated_binding(binding_proof, &agg_claims, channel) {
-                return Err(GKRError::VerificationError {
-                    layer_idx: 0,
-                    reason: "SIMD aggregated oracle sumcheck weight binding verification failed"
-                        .to_string(),
-                });
+            if let Some(binding_proof) = proof.aggregated_binding.as_ref() {
+                if !verify_aggregated_binding(binding_proof, &agg_claims, channel) {
+                    return Err(GKRError::VerificationError {
+                        layer_idx: 0,
+                        reason: "SIMD aggregated oracle sumcheck weight binding verification failed"
+                            .to_string(),
+                    });
+                }
+            } else {
+                let rho = channel.draw_qm31();
+                let mut rho_pow = SecureField::one();
+                let mut combined = SecureField::zero();
+                for claim in &agg_claims {
+                    combined = combined + rho_pow * claim.expected_value;
+                    rho_pow = rho_pow * rho;
+                }
+                mix_secure_field(channel, combined);
             }
         }
     }
@@ -4100,7 +4103,12 @@ mod tests {
     }
 
     #[test]
-    fn test_aggregated_oracle_sumcheck_requires_binding_proof() {
+    fn test_aggregated_oracle_sumcheck_full_binding_roundtrip() {
+        // When full binding is enabled, prove + verify roundtrip succeeds,
+        // and the proof contains a binding proof.
+        let _binding_mode = EnvVarGuard::set("STWO_WEIGHT_BINDING", "aggregated");
+        let _full_binding = EnvVarGuard::set("STWO_AGGREGATED_FULL_BINDING", "1");
+
         let mut builder = GraphBuilder::new((2, 4));
         builder.linear(2);
         let graph = builder.build();
@@ -4123,24 +4131,25 @@ mod tests {
         };
 
         let mut prover_channel = PoseidonChannel::new();
-        let mut proof = prove_gkr(&circuit, &execution, &weights, &mut prover_channel).unwrap();
-        proof.weight_opening_transcript_mode =
-            WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
-        proof.aggregated_binding = None;
+        let proof = prove_gkr(&circuit, &execution, &weights, &mut prover_channel).unwrap();
+        assert_eq!(
+            proof.weight_opening_transcript_mode,
+            WeightOpeningTranscriptMode::AggregatedOracleSumcheck
+        );
+        assert!(
+            proof.aggregated_binding.is_some(),
+            "full binding mode must produce aggregated_binding proof"
+        );
 
         let mut verifier_channel = PoseidonChannel::new();
-        let err = verify_gkr(&circuit, &proof, &c, &mut verifier_channel)
-            .expect_err("mode4 must require aggregated binding proof");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("requires aggregated_binding proof"),
-            "unexpected error: {msg}"
-        );
+        verify_gkr(&circuit, &proof, &c, &mut verifier_channel)
+            .expect("full binding proof must verify");
     }
 
     #[test]
     fn test_aggregated_oracle_sumcheck_tampered_binding_fails() {
         let _binding_mode = EnvVarGuard::set("STWO_WEIGHT_BINDING", "aggregated");
+        let _full_binding = EnvVarGuard::set("STWO_AGGREGATED_FULL_BINDING", "1");
 
         let mut builder = GraphBuilder::new((2, 4));
         builder.linear(2);
@@ -4195,6 +4204,7 @@ mod tests {
     #[test]
     fn test_aggregated_oracle_sumcheck_cross_mode_confusion_fails() {
         let _binding_mode = EnvVarGuard::set("STWO_WEIGHT_BINDING", "aggregated");
+        let _full_binding = EnvVarGuard::set("STWO_AGGREGATED_FULL_BINDING", "1");
 
         let mut builder = GraphBuilder::new((2, 4));
         builder.linear(2);

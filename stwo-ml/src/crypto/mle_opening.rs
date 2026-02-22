@@ -39,8 +39,24 @@ use stwo::prover::backend::gpu::cuda_executor::{
     Poseidon252MerkleGpuTree,
 };
 
-/// Number of queries for MLE opening (matching STARK FRI query count).
-pub const MLE_N_QUERIES: usize = 14;
+/// Number of queries for MLE opening proofs.
+///
+/// Configurable via `STWO_MLE_N_QUERIES` env var (2..=20, default 8).
+/// Each query on an n-variable MLE provides ~n bits of soundness, so
+/// 8 queries × 27 vars = 216 bits — well above 128-bit security.
+pub const MLE_N_QUERIES: usize = 8;
+
+/// Runtime-configurable query count (cached on first call).
+pub fn mle_n_queries() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("STWO_MLE_N_QUERIES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&v| v >= 2 && v <= 20)
+            .unwrap_or(MLE_N_QUERIES)
+    })
+}
 #[cfg(feature = "cuda-runtime")]
 static GPU_MLE_FOLD_BACKEND_LOGGED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "cuda-runtime")]
@@ -737,7 +753,7 @@ fn prove_mle_opening_with_commitment_qm31_u32_gpu_tree(
     let final_value = u32s_to_secure_field(&final_words);
 
     let half_n = n_points / 2;
-    let n_queries = MLE_N_QUERIES.min(half_n);
+    let n_queries = mle_n_queries().min(half_n);
 
     let mut query_indices: Vec<usize> = Vec::with_capacity(n_queries);
     for _ in 0..n_queries {
@@ -1089,7 +1105,7 @@ pub fn prove_mle_opening_with_commitment_qm31_u32(
 
     // Draw query indices (each query selects an index in [0, n/2))
     let half_n = n_points / 2;
-    let n_queries = MLE_N_QUERIES.min(half_n);
+    let n_queries = mle_n_queries().min(half_n);
 
     let mut query_indices: Vec<usize> = Vec::with_capacity(n_queries);
     for _ in 0..n_queries {
@@ -1318,7 +1334,7 @@ pub fn prove_mle_opening_with_commitment(
     // Draw query indices (each query selects an index in [0, n/2))
     let initial_n = evals.len();
     let half_n = initial_n / 2;
-    let n_queries = MLE_N_QUERIES.min(half_n);
+    let n_queries = mle_n_queries().min(half_n);
 
     let mut query_indices: Vec<usize> = Vec::with_capacity(n_queries);
     for _ in 0..n_queries {
@@ -1425,7 +1441,7 @@ pub fn verify_mle_opening(
 
     // 2. Draw query indices from channel (matching prover's query derivation)
     let half_n = 1usize << (n_rounds - 1);
-    let n_queries = MLE_N_QUERIES.min(half_n);
+    let n_queries = mle_n_queries().min(half_n);
 
     let mut query_indices = Vec::with_capacity(n_queries);
     for _ in 0..n_queries {

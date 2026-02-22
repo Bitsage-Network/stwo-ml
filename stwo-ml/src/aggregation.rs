@@ -5205,6 +5205,7 @@ where
         &add_layers,
         &mul_layers,
         &layernorm_layers,
+        &rmsnorm_layers,
         &embedding_layers,
         &quantize_layers,
         &dequantize_layers,
@@ -5229,6 +5230,7 @@ where
                     &add_layers,
                     &mul_layers,
                     &layernorm_layers,
+                    &rmsnorm_layers,
                     &embedding_layers,
                     &quantize_layers,
                     &dequantize_layers,
@@ -5778,6 +5780,7 @@ pub(crate) fn build_unified_stark<B>(
     add_layers: &[AddLayerData],
     mul_layers: &[MulLayerData],
     layernorm_layers: &[LayerNormLayerData],
+    rmsnorm_layers: &[RMSNormLayerData],
     embedding_layers: &[EmbeddingLayerData],
     quantize_layers: &[QuantizeLayerData],
     dequantize_layers: &[DequantizeLayerData],
@@ -5795,7 +5798,6 @@ where
     FrameworkComponent<DequantizeEval>: ComponentProver<B>,
 {
     let config = PcsConfig::default();
-    let rmsnorm_layers: &[RMSNormLayerData] = &[];
 
     let all_log_sizes: Vec<u32> = activation_layers
         .iter()
@@ -5822,16 +5824,18 @@ where
 
     let has_logup = !activation_layers.is_empty()
         || !layernorm_layers.is_empty()
+        || !rmsnorm_layers.is_empty()
         || !embedding_layers.is_empty()
         || !quantize_layers.is_empty()
         || !dequantize_layers.is_empty();
     let t_unified = std::time::Instant::now();
     eprintln!(
-        "  [Unified STARK] components: act={} add={} mul={} ln={} emb={} q={} dq={} (logup={})",
+        "  [Unified STARK] components: act={} add={} mul={} ln={} rn={} emb={} q={} dq={} (logup={})",
         activation_layers.len(),
         add_layers.len(),
         mul_layers.len(),
         layernorm_layers.len(),
+        rmsnorm_layers.len(),
         embedding_layers.len(),
         quantize_layers.len(),
         dequantize_layers.len(),
@@ -5853,6 +5857,15 @@ where
             ]));
         }
         for layer in layernorm_layers {
+            let sz = 1usize << layer.log_size;
+            let dom = CanonicCoset::new(layer.log_size).circle_domain();
+            let (tv, tr) = build_table_columns::<SimdBackend>(&layer.rsqrt_table, sz);
+            tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(vec![
+                CircleEvaluation::new(dom, tv),
+                CircleEvaluation::new(dom, tr),
+            ]));
+        }
+        for layer in rmsnorm_layers {
             let sz = 1usize << layer.log_size;
             let dom = CanonicCoset::new(layer.log_size).circle_domain();
             let (tv, tr) = build_table_columns::<SimdBackend>(&layer.rsqrt_table, sz);
@@ -5975,6 +5988,25 @@ where
         tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(cols));
         layernorm_mults.push(mults);
     }
+    let mut rmsnorm_mults: Vec<Vec<M31>> = Vec::new();
+    for layer in rmsnorm_layers {
+        let sz = 1usize << layer.log_size;
+        let padding = sz.saturating_sub(layer.rms_sq_vals.len());
+        let mut mults = compute_multiplicities(&layer.rms_sq_vals, &layer.rsqrt_table);
+        if padding > 0 {
+            mults[0] += M31::from(padding as u32);
+        }
+        let cols = crate::components::rmsnorm::generate_rmsnorm_trace::<SimdBackend>(
+            &layer.inputs,
+            &layer.rms_sq_vals,
+            &layer.rsqrt_vals,
+            &layer.outputs,
+            &mults,
+            layer.log_size,
+        );
+        tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(cols));
+        rmsnorm_mults.push(mults);
+    }
     for layer in embedding_layers {
         let sz = 1usize << layer.log_size;
         let dom = CanonicCoset::new(layer.log_size).circle_domain();
@@ -6050,13 +6082,13 @@ where
     // Tree 2: Interaction traces (LogUp)
     let mut activation_lookup: Option<ActivationRelation> = None;
     let mut layernorm_lookup: Option<LayerNormRelation> = None;
-    let mut _rmsnorm_lookup: Option<RMSNormRelation> = None;
+    let mut rmsnorm_lookup: Option<RMSNormRelation> = None;
     let mut embedding_lookup_rel: Option<EmbeddingRelation> = None;
     let mut quantize_lookup: Option<QuantizeRelation> = None;
     let mut dequantize_lookup: Option<DequantizeRelation> = None;
     let mut activation_claimed_sums: Vec<SecureField> = Vec::new();
     let mut layernorm_claimed_sums: Vec<SecureField> = Vec::new();
-    let mut _rmsnorm_claimed_sums: Vec<SecureField> = Vec::new();
+    let mut rmsnorm_claimed_sums: Vec<SecureField> = Vec::new();
     let mut embedding_claimed_sums: Vec<SecureField> = Vec::new();
     let mut quantize_claimed_sums: Vec<SecureField> = Vec::new();
     let mut dequantize_claimed_sums: Vec<SecureField> = Vec::new();
@@ -6071,7 +6103,7 @@ where
             layernorm_lookup = Some(LayerNormRelation::draw(channel));
         }
         if !rmsnorm_layers.is_empty() {
-            _rmsnorm_lookup = Some(RMSNormRelation::draw(channel));
+            rmsnorm_lookup = Some(RMSNormRelation::draw(channel));
         }
         if !embedding_layers.is_empty() {
             embedding_lookup_rel = Some(EmbeddingRelation::draw(channel));
@@ -6167,6 +6199,53 @@ where
                 let (it, cs) = lg.finalize_last();
                 tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(it));
                 layernorm_claimed_sums.push(cs);
+            }
+        }
+
+        if let Some(ref lookup) = rmsnorm_lookup {
+            for (idx, layer) in rmsnorm_layers.iter().enumerate() {
+                let sz = 1usize << layer.log_size;
+                let vsz = sz >> LOG_N_LANES;
+                let (tvc, trc) = build_table_columns::<SimdBackend>(&layer.rsqrt_table, sz);
+                let mut vc = Col::<SimdBackend, BaseField>::zeros(sz);
+                let mut rc = Col::<SimdBackend, BaseField>::zeros(sz);
+                let n = layer.rms_sq_vals.len().min(sz);
+                for i in 0..n {
+                    vc.set(i, layer.rms_sq_vals[i]);
+                    rc.set(i, layer.rsqrt_vals[i]);
+                }
+                let pv = layer
+                    .rsqrt_table
+                    .inputs
+                    .first()
+                    .copied()
+                    .unwrap_or(M31::from(0));
+                let pr = layer
+                    .rsqrt_table
+                    .outputs
+                    .first()
+                    .copied()
+                    .unwrap_or(M31::from(0));
+                for i in n..sz {
+                    vc.set(i, pv);
+                    rc.set(i, pr);
+                }
+                let mut lg = LogupTraceGenerator::new(layer.log_size);
+                let mut cg = lg.new_col();
+                for vr in 0..vsz {
+                    let qt: PackedSecureField = lookup
+                        .lookup_elements()
+                        .combine(&[tvc.data[vr], trc.data[vr]]);
+                    let qr: PackedSecureField = lookup
+                        .lookup_elements()
+                        .combine(&[vc.data[vr], rc.data[vr]]);
+                    let mp = pack_multiplicities(&rmsnorm_mults[idx], vr);
+                    cg.write_frac(vr, qt - mp * qr, qt * qr);
+                }
+                cg.finalize_col();
+                let (it, cs) = lg.finalize_last();
+                tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(it));
+                rmsnorm_claimed_sums.push(cs);
             }
         }
 
@@ -6306,7 +6385,7 @@ where
     let mut add_claims: Vec<LayerClaim> = Vec::new();
     let mut mul_claims: Vec<LayerClaim> = Vec::new();
     let mut layernorm_claims: Vec<LayerClaim> = Vec::new();
-    let rmsnorm_claims: Vec<LayerClaim> = Vec::new();
+    let mut rmsnorm_claims: Vec<LayerClaim> = Vec::new();
     let mut embedding_claims: Vec<LayerClaim> = Vec::new();
     let mut quantize_claims: Vec<LayerClaim> = Vec::new();
 
@@ -6373,6 +6452,26 @@ where
                 cs,
             )));
             layernorm_claims.push(LayerClaim {
+                layer_index: layer.node_id,
+                claimed_sum: cs,
+                trace_rows: 1 << layer.log_size,
+            });
+        }
+    }
+    if let Some(ref lookup) = rmsnorm_lookup {
+        for (idx, layer) in rmsnorm_layers.iter().enumerate() {
+            let cs = rmsnorm_claimed_sums[idx];
+            comp_storage.push(Box::new(FrameworkComponent::new(
+                &mut allocator,
+                RMSNormEval {
+                    log_n_rows: layer.log_size,
+                    dim: layer.rms_sq_vals.len(),
+                    lookup_elements: lookup.clone(),
+                    claimed_sum: cs,
+                },
+                cs,
+            )));
+            rmsnorm_claims.push(LayerClaim {
                 layer_index: layer.node_id,
                 claimed_sum: cs,
                 trace_rows: 1 << layer.log_size,

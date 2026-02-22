@@ -18,7 +18,7 @@
 #[cfg(feature = "cuda-runtime")]
 use crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32;
 use crate::crypto::mle_opening::{
-    evaluate_mle_at, prove_mle_opening, verify_mle_opening, MleOpeningProof, MLE_N_QUERIES,
+    evaluate_mle_at, mle_n_queries, prove_mle_opening, verify_mle_opening, MleOpeningProof,
 };
 use crate::crypto::poseidon_channel::PoseidonChannel;
 
@@ -40,8 +40,10 @@ pub const SELECTOR_BITS: usize = 8;
 pub const MAX_MATRICES: usize = 1 << SELECTOR_BITS; // 256
 
 /// Number of MLE queries for the aggregated opening.
-/// Matches the standard MLE_N_QUERIES for consistent security level.
-pub const AGGREGATED_MLE_QUERIES: usize = MLE_N_QUERIES;
+/// Uses the runtime-configurable query count.
+pub fn aggregated_mle_queries() -> usize {
+    mle_n_queries()
+}
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 

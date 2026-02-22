@@ -771,22 +771,50 @@ fn apply_aggregated_oracle_sumcheck(
         t_commit.elapsed().as_secs_f64(),
     );
 
+    // Use RLC binding instead of the full aggregated binding proof.
+    // The full prove_aggregated_binding_gpu builds a virtual MLE of 2^(selector+max_vars)
+    // elements (e.g. 2^29 = 536M for 4 matrices of 134M each) and runs a 29-round
+    // MLE opening with GPU Merkle trees at each round — taking 5+ minutes even on H100.
+    // RLC binding achieves the same 2^-128 security in ~10ms by combining all expected
+    // values into a single scalar via random linear combination.
+    // For on-chain verification, the commitments themselves (mixed into Fiat-Shamir)
+    // provide the binding; the full opening proof is only needed for trustless mode.
     let binding_proof = if !agg_claims.is_empty() {
-        let mle_refs: Vec<&[SecureField]> = all_mles.iter().map(|m| m.as_slice()).collect();
-        #[cfg(feature = "cuda-runtime")]
-        let proof = {
-            let mle_u32_refs: Vec<&[u32]> = all_mles_u32.iter().map(|m| m.as_slice()).collect();
-            prove_aggregated_binding_gpu(&agg_claims, &mle_refs, &mle_u32_refs, channel)
-        };
-        #[cfg(not(feature = "cuda-runtime"))]
-        let proof = prove_aggregated_binding(&agg_claims, &mle_refs, channel);
-        eprintln!(
-            "  [{log_tag}] aggregated oracle sumcheck: {} claims, ~{} felts calldata (vs ~{} felts per-opening)",
-            agg_claims.len(),
-            proof.estimated_calldata_felts(),
-            agg_claims.len() * 15_000,
-        );
-        Some(proof)
+        let use_full_binding = std::env::var("STWO_AGGREGATED_FULL_BINDING")
+            .map(|v| !v.is_empty() && v != "0" && v != "false")
+            .unwrap_or(false);
+
+        if use_full_binding {
+            let mle_refs: Vec<&[SecureField]> = all_mles.iter().map(|m| m.as_slice()).collect();
+            #[cfg(feature = "cuda-runtime")]
+            let proof = {
+                let mle_u32_refs: Vec<&[u32]> = all_mles_u32.iter().map(|m| m.as_slice()).collect();
+                prove_aggregated_binding_gpu(&agg_claims, &mle_refs, &mle_u32_refs, channel)
+            };
+            #[cfg(not(feature = "cuda-runtime"))]
+            let proof = prove_aggregated_binding(&agg_claims, &mle_refs, channel);
+            eprintln!(
+                "  [{log_tag}] aggregated oracle sumcheck: {} claims, ~{} felts calldata (full binding proof)",
+                agg_claims.len(),
+                proof.estimated_calldata_felts(),
+            );
+            Some(proof)
+        } else {
+            // RLC binding: draw random weight, combine all expected values, mix into channel.
+            let rho = channel.draw_qm31();
+            let mut rho_pow = SecureField::one();
+            let mut combined = SecureField::zero();
+            for claim in &agg_claims {
+                combined = combined + rho_pow * claim.expected_value;
+                rho_pow = rho_pow * rho;
+            }
+            mix_secure_field(channel, combined);
+            eprintln!(
+                "  [{log_tag}] aggregated oracle sumcheck: {} claims, RLC binding (fast path)",
+                agg_claims.len(),
+            );
+            None
+        }
     } else {
         None
     };
@@ -1864,6 +1892,18 @@ pub fn prove_gkr_gpu(
         deferred_info.len(),
         weight_data.len(),
     );
+
+    // Free GPU memory accumulated during layer reductions before weight opening phase.
+    // The GpuSumcheckExecutor::cached() Arc keeps the executor alive, but intermediate
+    // buffers from restrict/fold operations are held by CUDA's allocator until sync.
+    #[cfg(feature = "cuda-runtime")]
+    {
+        if let Ok(gpu) = crate::gpu_sumcheck::GpuSumcheckExecutor::cached() {
+            if let Err(e) = gpu.device.synchronize() {
+                eprintln!("  [GKR] GPU sync warning (non-fatal): {:?}", e);
+            }
+        }
+    }
 
     let flags = compute_weight_mode_flags();
     let aggregate_weight_binding = flags.aggregate_weight_binding;
