@@ -337,6 +337,11 @@ struct AuditCmd {
     /// Irys API token for authenticated Arweave uploads (or set IRYS_TOKEN env var).
     #[arg(long, env = "IRYS_TOKEN")]
     irys_token: Option<String>,
+
+    /// Proof mode: "direct" (fast, aggregated STARK — default), "gkr" (full GKR with
+    /// weight openings), or "legacy" (Blake2s, not on-chain verifiable).
+    #[arg(long, default_value = "direct")]
+    mode: String,
 }
 
 /// CLI arguments for the `retrieve` subcommand.
@@ -3028,7 +3033,7 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
         start_ns,
         end_ns,
         model_id: model_id.clone(),
-        mode: "gkr".to_string(),
+        mode: cmd.mode.clone(),
         evaluate_semantics: cmd.evaluate,
         max_inferences: cmd.max_inferences,
         gpu_device: if cmd.gpu { Some(0) } else { None },
