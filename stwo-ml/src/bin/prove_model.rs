@@ -1516,7 +1516,7 @@ fn submit_gkr_onchain(
     eprintln!("  Contract: {}", cli.contract);
     eprintln!("  Account:  {}", cli.account);
     eprintln!("  Network:  {}", cli.network);
-    eprintln!("  Max fee:  {} ETH", cli.max_fee);
+    eprintln!("  Fee:      auto-estimated");
 
     let use_starknet_gkr_v3 = std::env::var("STWO_STARKNET_GKR_V3")
         .ok()
@@ -1636,8 +1636,6 @@ fn submit_gkr_onchain(
                 "register_model_gkr",
                 "--calldata",
                 &register_str,
-                "--max-fee",
-                &cli.max_fee,
             ])
             .output();
 
@@ -1680,14 +1678,12 @@ fn submit_gkr_onchain(
              --url '{}' \
              --contract-address '{}' \
              --function {} \
-             --calldata $(cat '{}') \
-             --max-fee {}",
+             --calldata $(cat '{}')",
             cli.account,
             rpc_url,
             cli.contract,
             verify_entrypoint,
             calldata_path.display(),
-            cli.max_fee,
         ))
         .output();
 
@@ -3214,7 +3210,7 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
             eprintln!("  Contract: {}", cmd.contract);
             eprintln!("  Account:  {}", cmd.account);
             eprintln!("  Network:  {}", cmd.network);
-            eprintln!("  Max fee:  {} ETH", cmd.max_fee);
+            eprintln!("  Fee:      auto-estimated");
 
             // Write calldata to temp file (may exceed shell arg limit)
             let calldata_txt = cmd.output.with_extension("calldata.txt");
@@ -3238,13 +3234,11 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
                      --url '{}' \
                      --contract-address '{}' \
                      --function submit_audit \
-                     --calldata $(cat '{}') \
-                     --max-fee {}",
+                     --calldata $(cat '{}')",
                     cmd.account,
                     rpc_url,
                     cmd.contract,
                     calldata_txt.display(),
-                    cmd.max_fee,
                 ))
                 .output();
 
