@@ -10,6 +10,11 @@
 #   VALIDATOR_URL   Optional validator endpoint to receive proof results
 #   BIND_ADDR       Full bind address override (default: 0.0.0.0:$PORT)
 #   SKIP_BUILD      Set to 1 to skip cargo build (use existing binary)
+#
+# GPU commitment env vars (passed through to prover):
+#   STWO_GPU_MLE_COMMITMENT          Enable GPU Poseidon Merkle commitments (default: 1)
+#   STWO_GPU_MLE_COMMITMENT_REQUIRE  Strict mode: fail if GPU unavailable (default: 0)
+#   STWO_WEIGHT_BINDING              Weight binding mode: "aggregated" for oracle sumcheck
 set -euo pipefail
 
 FEATURES="${FEATURES:-server-stream,cuda-runtime}"
@@ -65,4 +70,5 @@ echo ""
 exec env \
     BIND_ADDR="${BIND_ADDR}" \
     VALIDATOR_URL="${VALIDATOR_URL}" \
+    STWO_GPU_MLE_COMMITMENT="${STWO_GPU_MLE_COMMITMENT:-1}" \
     "${REPO_ROOT}/target/release/prove-server"
