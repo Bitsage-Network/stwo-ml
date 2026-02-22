@@ -457,6 +457,8 @@ impl HfConfig {
 
     /// Convert to internal TransformerConfig.
     pub fn to_transformer_config(&self) -> TransformerConfig {
+        use crate::compiler::onnx::NormType;
+
         let activation = match self.hidden_act.as_str() {
             "gelu" | "gelu_new" | "gelu_fast" => ActivationType::GELU,
             "relu" => ActivationType::ReLU,
@@ -464,11 +466,19 @@ impl HfConfig {
             _ => ActivationType::GELU,
         };
 
+        // Most modern LLMs (Llama, Qwen, Mistral, Gemma, etc.) use RMSNorm.
+        // Only older architectures (GPT-2, BERT, etc.) use full LayerNorm.
+        let norm_type = match self.model_type.as_str() {
+            "gpt2" | "bert" | "roberta" | "bart" | "t5" => NormType::LayerNorm,
+            _ => NormType::RMSNorm,
+        };
+
         TransformerConfig {
             d_model: self.hidden_size,
             num_heads: self.num_attention_heads,
             d_ff: self.intermediate_size,
             activation,
+            norm_type,
         }
     }
 }
@@ -686,22 +696,29 @@ pub fn open_streaming_pipeline(
 
 /// Build a transformer computation graph matching a HuggingFace architecture.
 ///
-/// Each transformer block: LayerNorm → Q proj → O proj → LayerNorm → FFN up → act → FFN down
+/// Each transformer block: Norm → Q proj → O proj → Norm → FFN up → act → FFN down
 fn build_hf_transformer_graph(config: &TransformerConfig, num_layers: usize) -> ComputationGraph {
+    use crate::compiler::onnx::NormType;
     let d = config.d_model;
     let d_ff = config.d_ff;
 
     let mut builder = GraphBuilder::new((1, d));
 
     for _ in 0..num_layers {
-        // Pre-attention LayerNorm
-        builder.layer_norm();
+        // Pre-attention norm
+        match config.norm_type {
+            NormType::LayerNorm => { builder.layer_norm(); }
+            NormType::RMSNorm => { builder.rms_norm(); }
+        }
         // Q projection (d → d)
         builder.linear(d);
         // O projection (d → d)
         builder.linear(d);
-        // Post-attention LayerNorm
-        builder.layer_norm();
+        // Post-attention norm
+        match config.norm_type {
+            NormType::LayerNorm => { builder.layer_norm(); }
+            NormType::RMSNorm => { builder.rms_norm(); }
+        }
         // FFN up projection (d → d_ff)
         builder.linear(d_ff);
         // FFN activation
@@ -710,8 +727,11 @@ fn build_hf_transformer_graph(config: &TransformerConfig, num_layers: usize) -> 
         builder.linear(d);
     }
 
-    // Final LayerNorm
-    builder.layer_norm();
+    // Final norm
+    match config.norm_type {
+        NormType::LayerNorm => { builder.layer_norm(); }
+        NormType::RMSNorm => { builder.rms_norm(); }
+    }
 
     builder.build()
 }
@@ -1042,6 +1062,7 @@ mod tests {
             num_heads: 2,
             d_ff: 16,
             activation: ActivationType::GELU,
+            norm_type: crate::compiler::onnx::NormType::LayerNorm,
         };
 
         let graph = build_hf_transformer_graph(&config, 2);

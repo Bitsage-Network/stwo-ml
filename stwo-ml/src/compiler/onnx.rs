@@ -296,6 +296,13 @@ pub fn build_mlp(
     }
 }
 
+/// Which normalization layer to use in the transformer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NormType {
+    LayerNorm,
+    RMSNorm,
+}
+
 /// Configuration for building a transformer block.
 #[derive(Debug, Clone)]
 pub struct TransformerConfig {
@@ -307,17 +314,27 @@ pub struct TransformerConfig {
     pub d_ff: usize,
     /// Activation function for FFN.
     pub activation: ActivationType,
+    /// Normalization type (LayerNorm or RMSNorm).
+    pub norm_type: NormType,
 }
 
 impl TransformerConfig {
-    /// Create a new config with defaults: d_ff = 4 * d_model, activation = GELU.
+    /// Create a new config with defaults: d_ff = 4 * d_model, activation = GELU, LayerNorm.
     pub fn new(d_model: usize, num_heads: usize) -> Self {
         Self {
             d_model,
             num_heads,
             d_ff: 4 * d_model,
             activation: ActivationType::GELU,
+            norm_type: NormType::LayerNorm,
         }
+    }
+}
+
+fn add_norm(builder: &mut GraphBuilder, norm_type: NormType) {
+    match norm_type {
+        NormType::LayerNorm => { builder.layer_norm(); }
+        NormType::RMSNorm => { builder.rms_norm(); }
     }
 }
 
@@ -331,14 +348,14 @@ pub fn build_transformer_block(config: &TransformerConfig, seed: u64) -> OnnxMod
 
     let mut builder = GraphBuilder::new((1, d));
 
-    // Pre-attention LayerNorm
-    builder.layer_norm();
+    // Pre-attention norm
+    add_norm(&mut builder, config.norm_type);
     // Q projection (simplified: d_model → d_model)
     builder.linear(d);
     // O projection (d_model → d_model)
     builder.linear(d);
-    // Post-attention LayerNorm
-    builder.layer_norm();
+    // Post-attention norm
+    add_norm(&mut builder, config.norm_type);
     // FFN up projection (d_model → d_ff)
     builder.linear(d_ff);
     // FFN activation
@@ -381,18 +398,18 @@ pub fn build_transformer(
     let mut builder = GraphBuilder::new((1, d));
 
     for _ in 0..num_layers {
-        // Each block: LN → Q → O → LN → FFN up → act → FFN down
-        builder.layer_norm();
+        // Each block: Norm → Q → O → Norm → FFN up → act → FFN down
+        add_norm(&mut builder, config.norm_type);
         builder.linear(d);
         builder.linear(d);
-        builder.layer_norm();
+        add_norm(&mut builder, config.norm_type);
         builder.linear(d_ff);
         builder.activation(config.activation);
         builder.linear(d);
     }
 
-    // Final LayerNorm + LM head
-    builder.layer_norm();
+    // Final norm + LM head
+    add_norm(&mut builder, config.norm_type);
     builder.linear(vocab_size);
 
     let graph = builder.build();
@@ -549,6 +566,7 @@ mod tests {
             num_heads: 1,
             d_ff: 8,
             activation: ActivationType::GELU,
+            norm_type: NormType::LayerNorm,
         };
         let model = build_transformer_block(&config, 77);
 
