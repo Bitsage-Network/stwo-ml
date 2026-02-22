@@ -31,6 +31,9 @@ pub struct QuantizeEval {
     pub log_n_rows: u32,
     pub lookup_elements: QuantizeRelation,
     pub claimed_sum: SecureField,
+    /// Instance ID — disambiguates preprocessed column names when multiple
+    /// quantize layers share the unified STARK. Defaults to 0.
+    pub instance_id: usize,
 }
 
 impl FrameworkEval for QuantizeEval {
@@ -45,10 +48,10 @@ impl FrameworkEval for QuantizeEval {
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
         // Preprocessed: quantize table (input, output)
         let table_input = eval.get_preprocessed_column(PreProcessedColumnId {
-            id: "quantize_table_input".into(),
+            id: format!("quantize_table_input_{}", self.instance_id).into(),
         });
         let table_output = eval.get_preprocessed_column(PreProcessedColumnId {
-            id: "quantize_table_output".into(),
+            id: format!("quantize_table_output_{}", self.instance_id).into(),
         });
 
         // Execution trace: (input, output, multiplicity)
@@ -120,6 +123,7 @@ mod tests {
             log_n_rows: 8,
             lookup_elements: QuantizeRelation::dummy(),
             claimed_sum: SecureField::from(M31::from(0)),
+            instance_id: 0,
         };
         assert_eq!(eval.log_size(), 8);
     }

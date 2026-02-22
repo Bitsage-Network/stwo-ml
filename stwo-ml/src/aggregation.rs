@@ -1853,6 +1853,7 @@ where
                     claimed_sum,
                     total_sum: claimed_sum,
                     activation_type_tag: layer.type_tag,
+                    instance_id: idx,
                 },
                 claimed_sum,
             );
@@ -1910,6 +1911,7 @@ where
                     dim: layer.inputs.len(),
                     lookup_elements: lookup.clone(),
                     claimed_sum,
+                    instance_id: idx,
                 },
                 claimed_sum,
             );
@@ -1933,6 +1935,7 @@ where
                     dim: layer.inputs.len(),
                     lookup_elements: lookup.clone(),
                     claimed_sum,
+                    instance_id: idx,
                 },
                 claimed_sum,
             );
@@ -1955,6 +1958,7 @@ where
                     log_n_rows: layer.log_size,
                     lookup_elements: lookup.clone(),
                     claimed_sum,
+                    instance_id: idx,
                 },
                 claimed_sum,
             );
@@ -1977,6 +1981,7 @@ where
                     log_n_rows: layer.log_size,
                     lookup_elements: lookup.clone(),
                     claimed_sum,
+                    instance_id: idx,
                 },
                 claimed_sum,
             );
@@ -2000,6 +2005,7 @@ where
                     log_n_rows: layer.log_size,
                     lookup_elements: lookup.clone(),
                     claimed_sum,
+                    instance_id: idx,
                 },
                 claimed_sum,
             );
@@ -3937,6 +3943,7 @@ where
                     claimed_sum,
                     total_sum: claimed_sum,
                     activation_type_tag: layer.type_tag,
+                    instance_id: idx,
                 },
                 claimed_sum,
             );
@@ -3994,6 +4001,7 @@ where
                     dim: layer.inputs.len(),
                     lookup_elements: lookup.clone(),
                     claimed_sum,
+                    instance_id: idx,
                 },
                 claimed_sum,
             );
@@ -4017,6 +4025,7 @@ where
                     dim: layer.inputs.len(),
                     lookup_elements: lookup.clone(),
                     claimed_sum,
+                    instance_id: idx,
                 },
                 claimed_sum,
             );
@@ -4039,6 +4048,7 @@ where
                     log_n_rows: layer.log_size,
                     lookup_elements: lookup.clone(),
                     claimed_sum,
+                    instance_id: idx,
                 },
                 claimed_sum,
             );
@@ -4061,6 +4071,7 @@ where
                     log_n_rows: layer.log_size,
                     lookup_elements: lookup.clone(),
                     claimed_sum,
+                    instance_id: idx,
                 },
                 claimed_sum,
             );
@@ -4084,6 +4095,7 @@ where
                     log_n_rows: layer.log_size,
                     lookup_elements: lookup.clone(),
                     claimed_sum,
+                    instance_id: idx,
                 },
                 claimed_sum,
             );
@@ -6475,6 +6487,7 @@ where
                     claimed_sum: cs,
                     total_sum: cs,
                     activation_type_tag: layer.type_tag,
+                    instance_id: idx,
                 },
                 cs,
             )));
@@ -6523,6 +6536,7 @@ where
                     dim: layer.inputs.len(),
                     lookup_elements: lookup.clone(),
                     claimed_sum: cs,
+                    instance_id: idx,
                 },
                 cs,
             )));
@@ -6543,6 +6557,7 @@ where
                     dim: layer.rms_sq_vals.len(),
                     lookup_elements: lookup.clone(),
                     claimed_sum: cs,
+                    instance_id: idx,
                 },
                 cs,
             )));
@@ -6562,6 +6577,7 @@ where
                     log_n_rows: layer.log_size,
                     lookup_elements: lookup.clone(),
                     claimed_sum: cs,
+                    instance_id: idx,
                 },
                 cs,
             )));
@@ -6581,6 +6597,7 @@ where
                     log_n_rows: layer.log_size,
                     lookup_elements: lookup.clone(),
                     claimed_sum: cs,
+                    instance_id: idx,
                 },
                 cs,
             )));
@@ -6601,6 +6618,7 @@ where
                     log_n_rows: layer.log_size,
                     lookup_elements: lookup.clone(),
                     claimed_sum: cs,
+                    instance_id: idx,
                 },
                 cs,
             )));
@@ -8217,7 +8235,7 @@ fn verify_unified_stark_blake2s(
 
     // Activation components
     if let Some(ref lookup) = activation_lookup {
-        for claim in activation_claims {
+        for (idx, claim) in activation_claims.iter().enumerate() {
             let ls = claim.trace_rows.ilog2();
             // Look up activation type tag from graph for M1 domain separation.
             let type_tag = match &graph.nodes.get(claim.layer_index).map(|n| &n.op) {
@@ -8246,6 +8264,7 @@ fn verify_unified_stark_blake2s(
                     claimed_sum: claim.claimed_sum,
                     total_sum: claim.claimed_sum,
                     activation_type_tag: type_tag,
+                    instance_id: idx,
                 },
                 claim.claimed_sum,
             );
@@ -8277,7 +8296,7 @@ fn verify_unified_stark_blake2s(
 
     // LayerNorm components
     if let Some(ref lookup) = layernorm_lookup {
-        for claim in layernorm_claims {
+        for (idx, claim) in layernorm_claims.iter().enumerate() {
             let ls = claim.trace_rows.ilog2();
             let dim = layernorm_dims.get(&claim.layer_index).copied().unwrap_or(1);
             let component = FrameworkComponent::new(
@@ -8287,6 +8306,7 @@ fn verify_unified_stark_blake2s(
                     dim,
                     lookup_elements: lookup.clone(),
                     claimed_sum: claim.claimed_sum,
+                    instance_id: idx,
                 },
                 claim.claimed_sum,
             );
@@ -8296,7 +8316,7 @@ fn verify_unified_stark_blake2s(
 
     // RMSNorm components
     if let Some(ref lookup) = rmsnorm_lookup {
-        for claim in rmsnorm_claims {
+        for (idx, claim) in rmsnorm_claims.iter().enumerate() {
             let ls = claim.trace_rows.ilog2();
             let component = FrameworkComponent::new(
                 &mut allocator,
@@ -8305,6 +8325,7 @@ fn verify_unified_stark_blake2s(
                     dim: 1, // dim not used in constraint evaluation
                     lookup_elements: lookup.clone(),
                     claimed_sum: claim.claimed_sum,
+                    instance_id: idx,
                 },
                 claim.claimed_sum,
             );
@@ -8314,7 +8335,7 @@ fn verify_unified_stark_blake2s(
 
     // Embedding components
     if let Some(ref lookup) = embedding_lookup_rel {
-        for claim in embedding_claims {
+        for (idx, claim) in embedding_claims.iter().enumerate() {
             let ls = claim.trace_rows.ilog2();
             let component = FrameworkComponent::new(
                 &mut allocator,
@@ -8322,6 +8343,7 @@ fn verify_unified_stark_blake2s(
                     log_n_rows: ls,
                     lookup_elements: lookup.clone(),
                     claimed_sum: claim.claimed_sum,
+                    instance_id: idx,
                 },
                 claim.claimed_sum,
             );
@@ -8331,7 +8353,7 @@ fn verify_unified_stark_blake2s(
 
     // Quantize components (LogUp range-check)
     if let Some(ref lookup) = quantize_lookup {
-        for claim in quantize_claims {
+        for (idx, claim) in quantize_claims.iter().enumerate() {
             let ls = claim.trace_rows.ilog2();
             let component = FrameworkComponent::new(
                 &mut allocator,
@@ -8339,6 +8361,7 @@ fn verify_unified_stark_blake2s(
                     log_n_rows: ls,
                     lookup_elements: lookup.clone(),
                     claimed_sum: claim.claimed_sum,
+                    instance_id: idx,
                 },
                 claim.claimed_sum,
             );
@@ -8348,7 +8371,7 @@ fn verify_unified_stark_blake2s(
 
     // Dequantize components (LogUp lookup)
     if let Some(ref lookup) = dequantize_lookup {
-        for claim in dequantize_claims {
+        for (idx, claim) in dequantize_claims.iter().enumerate() {
             let ls = claim.trace_rows.ilog2();
             let component = FrameworkComponent::new(
                 &mut allocator,
@@ -8356,6 +8379,7 @@ fn verify_unified_stark_blake2s(
                     log_n_rows: ls,
                     lookup_elements: lookup.clone(),
                     claimed_sum: claim.claimed_sum,
+                    instance_id: idx,
                 },
                 claim.claimed_sum,
             );
@@ -8505,6 +8529,7 @@ fn verify_attention_softmax_stark(
             claimed_sum,
             total_sum: claimed_sum,
             activation_type_tag: 0,
+            instance_id: 0,
         },
         claimed_sum,
     );
@@ -8538,6 +8563,7 @@ fn verify_attention_softmax_stark(
             claimed_sum,
             total_sum: claimed_sum,
             activation_type_tag: 0, // standalone softmax proof
+            instance_id: 0,
         },
         claimed_sum,
     );
@@ -8580,7 +8606,7 @@ fn build_component_tree_sizes(
     let mut all_bounds: Vec<Vec<Vec<u32>>> = Vec::new();
 
     // Activation (dummy)
-    for claim in activation_claims {
+    for (idx, claim) in activation_claims.iter().enumerate() {
         let ls = claim.trace_rows.ilog2();
         let component = FrameworkComponent::new(
             &mut allocator,
@@ -8590,6 +8616,7 @@ fn build_component_tree_sizes(
                 claimed_sum: claim.claimed_sum,
                 total_sum: claim.claimed_sum,
                 activation_type_tag: 0,
+                instance_id: idx,
             },
             claim.claimed_sum,
         );
@@ -8622,7 +8649,7 @@ fn build_component_tree_sizes(
     }
 
     // LayerNorm (dummy)
-    for claim in layernorm_claims {
+    for (idx, claim) in layernorm_claims.iter().enumerate() {
         let ls = claim.trace_rows.ilog2();
         let dim = layernorm_dims.get(&claim.layer_index).copied().unwrap_or(1);
         let component = FrameworkComponent::new(
@@ -8632,6 +8659,7 @@ fn build_component_tree_sizes(
                 dim,
                 lookup_elements: LayerNormRelation::dummy(),
                 claimed_sum: claim.claimed_sum,
+                instance_id: idx,
             },
             claim.claimed_sum,
         );
@@ -8640,7 +8668,7 @@ fn build_component_tree_sizes(
     }
 
     // RMSNorm (dummy)
-    for claim in rmsnorm_claims {
+    for (idx, claim) in rmsnorm_claims.iter().enumerate() {
         let ls = claim.trace_rows.ilog2();
         let component = FrameworkComponent::new(
             &mut allocator,
@@ -8649,6 +8677,7 @@ fn build_component_tree_sizes(
                 dim: 1,
                 lookup_elements: RMSNormRelation::dummy(),
                 claimed_sum: claim.claimed_sum,
+                instance_id: idx,
             },
             claim.claimed_sum,
         );
@@ -8657,7 +8686,7 @@ fn build_component_tree_sizes(
     }
 
     // Embedding (dummy)
-    for claim in embedding_claims {
+    for (idx, claim) in embedding_claims.iter().enumerate() {
         let ls = claim.trace_rows.ilog2();
         let component = FrameworkComponent::new(
             &mut allocator,
@@ -8665,6 +8694,7 @@ fn build_component_tree_sizes(
                 log_n_rows: ls,
                 lookup_elements: EmbeddingRelation::dummy(),
                 claimed_sum: claim.claimed_sum,
+                instance_id: idx,
             },
             claim.claimed_sum,
         );
@@ -8673,7 +8703,7 @@ fn build_component_tree_sizes(
     }
 
     // Quantize (dummy)
-    for claim in quantize_claims {
+    for (idx, claim) in quantize_claims.iter().enumerate() {
         let ls = claim.trace_rows.ilog2();
         let component = FrameworkComponent::new(
             &mut allocator,
@@ -8681,6 +8711,7 @@ fn build_component_tree_sizes(
                 log_n_rows: ls,
                 lookup_elements: QuantizeRelation::dummy(),
                 claimed_sum: claim.claimed_sum,
+                instance_id: idx,
             },
             claim.claimed_sum,
         );
@@ -8689,7 +8720,7 @@ fn build_component_tree_sizes(
     }
 
     // Dequantize (dummy)
-    for claim in dequantize_claims {
+    for (idx, claim) in dequantize_claims.iter().enumerate() {
         let ls = claim.trace_rows.ilog2();
         let component = FrameworkComponent::new(
             &mut allocator,
@@ -8697,6 +8728,7 @@ fn build_component_tree_sizes(
                 log_n_rows: ls,
                 lookup_elements: DequantizeRelation::dummy(),
                 claimed_sum: claim.claimed_sum,
+                instance_id: idx,
             },
             claim.claimed_sum,
         );
@@ -10780,6 +10812,57 @@ mod tests {
             "should have unified STARK for RMSNorm"
         );
         assert_eq!(proof.rmsnorm_claims.len(), 1, "1 RMSNorm layer in STARK");
+    }
+
+    #[test]
+    fn test_pure_gkr_multi_rmsnorm() {
+        // matmul → rmsnorm → matmul → rmsnorm → matmul
+        // 3 matmuls + 2 rmsnorm layers: validates instance_id prevents
+        // preprocessed column index collision in multi-component STARK.
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(4).rms_norm().linear(4).rms_norm().linear(2);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
+
+        let mut weights = GraphWeights::new();
+        // weight for node 0 (4→4)
+        let mut w0 = M31Matrix::new(4, 4);
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32));
+            }
+        }
+        weights.add_weight(0, w0);
+        // weight for node 2 (4→4)
+        let mut w2 = M31Matrix::new(4, 4);
+        for i in 0..4 {
+            for j in 0..4 {
+                w2.set(i, j, M31::from(((i * 2 + j) % 5 + 1) as u32));
+            }
+        }
+        weights.add_weight(2, w2);
+        // weight for node 4 (4→2)
+        let mut w4 = M31Matrix::new(4, 2);
+        for i in 0..4 {
+            for j in 0..2 {
+                w4.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
+        weights.add_weight(4, w4);
+
+        let proof = prove_model_pure_gkr(&graph, &input, &weights)
+            .expect("pure GKR with 2 RMSNorm layers should succeed");
+
+        assert!(proof.gkr_proof.is_some(), "should have GKR proof");
+        assert!(
+            proof.unified_stark.is_some(),
+            "should have unified STARK for RMSNorm"
+        );
+        assert_eq!(proof.rmsnorm_claims.len(), 2, "2 RMSNorm layers in STARK");
     }
 
     #[test]

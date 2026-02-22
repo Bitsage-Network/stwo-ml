@@ -27,6 +27,9 @@ pub struct DequantizeEval {
     pub log_n_rows: u32,
     pub lookup_elements: DequantizeRelation,
     pub claimed_sum: SecureField,
+    /// Instance ID — disambiguates preprocessed column names when multiple
+    /// dequantize layers share the unified STARK. Defaults to 0.
+    pub instance_id: usize,
 }
 
 impl FrameworkEval for DequantizeEval {
@@ -41,10 +44,10 @@ impl FrameworkEval for DequantizeEval {
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
         // Preprocessed columns (table side)
         let table_input = eval.get_preprocessed_column(PreProcessedColumnId {
-            id: "dequantize_table_input".into(),
+            id: format!("dequantize_table_input_{}", self.instance_id).into(),
         });
         let table_output = eval.get_preprocessed_column(PreProcessedColumnId {
-            id: "dequantize_table_output".into(),
+            id: format!("dequantize_table_output_{}", self.instance_id).into(),
         });
 
         // Execution trace columns

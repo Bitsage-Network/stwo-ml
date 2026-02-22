@@ -100,6 +100,9 @@ pub struct ActivationEval {
     pub total_sum: SecureField,
     /// Type tag for LogUp domain separation (M1 fix).
     pub activation_type_tag: u32,
+    /// Instance ID — disambiguates preprocessed column names when multiple
+    /// activation layers share the unified STARK. Defaults to 0.
+    pub instance_id: usize,
 }
 
 impl FrameworkEval for ActivationEval {
@@ -113,11 +116,12 @@ impl FrameworkEval for ActivationEval {
 
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
         // Read preprocessed columns (table input, table output)
+        // Instance ID disambiguates when multiple activation layers exist in the same STARK.
         let table_input = eval.get_preprocessed_column(PreProcessedColumnId {
-            id: "activation_table_input".into(),
+            id: format!("activation_table_input_{}", self.instance_id).into(),
         });
         let table_output = eval.get_preprocessed_column(PreProcessedColumnId {
-            id: "activation_table_output".into(),
+            id: format!("activation_table_output_{}", self.instance_id).into(),
         });
 
         // Read execution trace columns

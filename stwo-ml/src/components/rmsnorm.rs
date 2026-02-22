@@ -66,6 +66,9 @@ pub struct RMSNormEval {
     pub dim: usize,
     pub lookup_elements: RMSNormRelation,
     pub claimed_sum: SecureField,
+    /// Instance ID — disambiguates preprocessed column names when multiple
+    /// RMSNorm layers share the unified STARK. Defaults to 0.
+    pub instance_id: usize,
 }
 
 impl FrameworkEval for RMSNormEval {
@@ -79,10 +82,10 @@ impl FrameworkEval for RMSNormEval {
 
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
         let table_rms = eval.get_preprocessed_column(PreProcessedColumnId {
-            id: "rmsnorm_rms_input".into(),
+            id: format!("rmsnorm_rms_input_{}", self.instance_id).into(),
         });
         let table_rsqrt = eval.get_preprocessed_column(PreProcessedColumnId {
-            id: "rmsnorm_rsqrt_output".into(),
+            id: format!("rmsnorm_rsqrt_output_{}", self.instance_id).into(),
         });
 
         let input = eval.next_trace_mask();

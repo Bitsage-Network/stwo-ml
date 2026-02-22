@@ -206,6 +206,7 @@ where
             claimed_sum,
             total_sum: claimed_sum,
             activation_type_tag: 0, // standalone proof — no cross-type batching
+            instance_id: 0,
         },
         claimed_sum,
     );
@@ -694,6 +695,7 @@ where
             dim: inputs.len(),
             lookup_elements,
             claimed_sum,
+            instance_id: 0,
         },
         claimed_sum,
     );
@@ -853,6 +855,7 @@ where
             dim: inputs.len(),
             lookup_elements,
             claimed_sum,
+            instance_id: 0,
         },
         claimed_sum,
     );

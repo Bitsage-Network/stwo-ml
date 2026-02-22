@@ -54,6 +54,9 @@ pub struct LayerNormEval {
     pub dim: usize,
     pub lookup_elements: LayerNormRelation,
     pub claimed_sum: SecureField,
+    /// Instance ID — disambiguates preprocessed column names when multiple
+    /// LayerNorm layers share the unified STARK. Defaults to 0.
+    pub instance_id: usize,
 }
 
 impl FrameworkEval for LayerNormEval {
@@ -67,10 +70,10 @@ impl FrameworkEval for LayerNormEval {
 
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
         let table_var = eval.get_preprocessed_column(PreProcessedColumnId {
-            id: "layernorm_var_input".into(),
+            id: format!("layernorm_var_input_{}", self.instance_id).into(),
         });
         let table_rsqrt = eval.get_preprocessed_column(PreProcessedColumnId {
-            id: "layernorm_rsqrt_output".into(),
+            id: format!("layernorm_rsqrt_output_{}", self.instance_id).into(),
         });
 
         let input = eval.next_trace_mask();

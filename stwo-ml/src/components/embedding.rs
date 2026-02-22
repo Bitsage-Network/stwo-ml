@@ -105,6 +105,9 @@ pub struct EmbeddingEval {
     pub log_n_rows: u32,
     pub lookup_elements: EmbeddingRelation,
     pub claimed_sum: SecureField,
+    /// Instance ID — disambiguates preprocessed column names when multiple
+    /// embedding layers share the unified STARK. Defaults to 0.
+    pub instance_id: usize,
 }
 
 impl FrameworkEval for EmbeddingEval {
@@ -119,13 +122,13 @@ impl FrameworkEval for EmbeddingEval {
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
         // Preprocessed: embedding table flattened as (token_id, col_idx, value)
         let table_token = eval.get_preprocessed_column(PreProcessedColumnId {
-            id: "embed_table_token".into(),
+            id: format!("embed_table_token_{}", self.instance_id).into(),
         });
         let table_col = eval.get_preprocessed_column(PreProcessedColumnId {
-            id: "embed_table_col".into(),
+            id: format!("embed_table_col_{}", self.instance_id).into(),
         });
         let table_value = eval.get_preprocessed_column(PreProcessedColumnId {
-            id: "embed_table_value".into(),
+            id: format!("embed_table_value_{}", self.instance_id).into(),
         });
 
         // Execution trace: looked-up values
@@ -167,6 +170,7 @@ mod tests {
             log_n_rows: 8,
             lookup_elements: EmbeddingRelation::dummy(),
             claimed_sum: SecureField::from(M31::from(0)),
+            instance_id: 0,
         };
         assert_eq!(eval.log_size(), 8);
     }
