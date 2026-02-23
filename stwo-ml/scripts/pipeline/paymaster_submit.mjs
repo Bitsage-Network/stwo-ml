@@ -31,8 +31,8 @@ const PAYMASTER_URLS = {
 };
 
 const RPC_URLS = {
-  mainnet: "https://starknet-mainnet.public.blastapi.io/rpc/v0_7",
-  sepolia: "https://starknet-sepolia.public.blastapi.io/rpc/v0_7",
+  mainnet: "https://starknet-mainnet.drpc.org",
+  sepolia: "https://starknet-sepolia.drpc.org",
 };
 
 // STRK token address (same on mainnet and sepolia)
