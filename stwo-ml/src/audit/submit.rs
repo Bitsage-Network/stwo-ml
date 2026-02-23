@@ -315,9 +315,9 @@ pub fn explorer_url(network: &str, tx_hash: &str) -> String {
 /// part of the proof itself.
 #[derive(Debug, Clone)]
 pub struct GkrVerificationConfig {
-    /// Circuit depth (log2 of the largest layer dimension).
+    /// Total layers including Identity (used for Fiat-Shamir channel seeding).
     pub circuit_depth: u32,
-    /// Number of layers in the model.
+    /// Proof layers only (excludes Identity/Input — matches `proof.layer_proofs.len()`).
     pub num_layers: u32,
     /// Flat matmul dimensions as `[rows0, cols0, k0, rows1, cols1, k1, ...]`.
     /// Matches the Cairo contract's `matmul_dims: Array<u32>`.
@@ -326,6 +326,65 @@ pub struct GkrVerificationConfig {
     /// Matches the Cairo contract's `dequantize_bits: Array<u64>`.
     /// Empty if no quantization layers.
     pub dequantize_bits: Vec<u64>,
+}
+
+/// Configuration for submitting GKR verification transactions on-chain.
+#[derive(Debug, Clone)]
+pub struct GkrVerificationSubmitConfig {
+    /// EloVerifier contract address (hex felt252).
+    pub verifier_contract: String,
+    /// Network: "sepolia" or "mainnet".
+    pub network: String,
+    /// Maximum felts per transaction (default 7500, safe under 8188 limit).
+    pub max_felts_per_tx: usize,
+    /// Contract entrypoint name (default "verify_model_gkr").
+    pub entrypoint: String,
+}
+
+impl Default for GkrVerificationSubmitConfig {
+    fn default() -> Self {
+        Self {
+            verifier_contract:
+                "0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005".to_string(),
+            network: "sepolia".to_string(),
+            max_felts_per_tx: 7500,
+            entrypoint: "verify_model_gkr".to_string(),
+        }
+    }
+}
+
+/// Extract a [`GkrVerificationConfig`] from a [`ComputationGraph`].
+///
+/// Compiles the graph into a `LayeredCircuit`, then extracts matmul dimensions
+/// and dequantize bit widths needed by the on-chain verifier.
+///
+/// `circuit_depth` = total layers including Identity (used for channel seeding).
+/// `num_layers` = proof layers only (excludes Identity and Input, which don't
+/// produce GKR sumcheck proofs).
+pub fn extract_gkr_config(
+    graph: &crate::compiler::graph::ComputationGraph,
+) -> Result<GkrVerificationConfig, AuditError> {
+    use crate::gkr::circuit::LayerType;
+
+    let circuit = crate::gkr::LayeredCircuit::from_graph(graph)
+        .map_err(|e| AuditError::ProvingFailed(format!("circuit compile: {e}")))?;
+    let matmul_dims = crate::starknet::extract_matmul_dims(&circuit);
+    let dequantize_bits = crate::starknet::extract_dequantize_bits(&circuit);
+
+    // num_layers counts only layers that produce a GKR proof (sumcheck round).
+    // Identity layers propagate the claim unchanged (continue), Input breaks the loop.
+    let num_layers = circuit
+        .layers
+        .iter()
+        .filter(|l| !matches!(l.layer_type, LayerType::Identity | LayerType::Input))
+        .count() as u32;
+
+    Ok(GkrVerificationConfig {
+        circuit_depth: circuit.layers.len() as u32,
+        num_layers,
+        matmul_dims,
+        dequantize_bits,
+    })
 }
 
 /// Build calldata for `verify_model_gkr()` from verification calldata.
@@ -538,6 +597,7 @@ mod tests {
                 format!("{:#066x}", FieldElement::from(0x333u64)),
             ],
             verification_calldata: None,
+            weight_binding_mode: None,
             tee_attestation_hash: None,
         }
     }
@@ -800,6 +860,15 @@ mod tests {
 
         let err = build_direct_verification_calldata(&result);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_gkr_verification_submit_config_default() {
+        let cfg = super::GkrVerificationSubmitConfig::default();
+        assert!(cfg.verifier_contract.starts_with("0x"));
+        assert_eq!(cfg.network, "sepolia");
+        assert_eq!(cfg.max_felts_per_tx, 7500);
+        assert_eq!(cfg.entrypoint, "verify_model_gkr");
     }
 
     #[test]

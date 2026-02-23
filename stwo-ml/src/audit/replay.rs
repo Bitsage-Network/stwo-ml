@@ -14,8 +14,7 @@ use crate::audit::log::InferenceLog;
 use crate::audit::types::{AuditError, InferenceLogEntry};
 use crate::compiler::graph::{ComputationGraph, GraphOp, GraphWeights};
 use crate::compiler::prove::{
-    apply_activation_pub, apply_layernorm_pub, apply_rmsnorm_detailed, elementwise_add,
-    elementwise_mul,
+    apply_layernorm_pub, apply_rmsnorm_detailed, elementwise_add, elementwise_mul,
 };
 use crate::components::matmul::{matmul_m31_auto, M31Matrix};
 
@@ -69,7 +68,23 @@ pub fn execute_forward_pass(
                 activation_type, ..
             } => {
                 let f = activation_type.as_fn();
-                apply_activation_pub(&current, &*f)
+                let act_log_size = activation_type.recommended_table_log_size();
+                let table_mask = (1u32 << act_log_size) - 1;
+                // Reduce inputs to table range before applying activation.
+                // Matches prover (aggregation.rs:3820-3828).
+                let data: Vec<M31> = current
+                    .data
+                    .iter()
+                    .map(|&x| {
+                        let reduced = M31::from(x.0 & table_mask);
+                        (*f)(reduced)
+                    })
+                    .collect();
+                M31Matrix {
+                    rows: current.rows,
+                    cols: current.cols,
+                    data,
+                }
             }
             GraphOp::LayerNorm { dim } => apply_layernorm_pub(&current, *dim),
             GraphOp::RMSNorm { dim } => apply_rmsnorm_detailed(&current, *dim).output_matrix,

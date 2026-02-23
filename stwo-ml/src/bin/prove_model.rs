@@ -343,6 +343,22 @@ struct AuditCmd {
     /// weight openings), or "legacy" (Blake2s, not on-chain verifiable).
     #[arg(long, default_value = "direct")]
     mode: String,
+
+    /// Submit GKR proofs for on-chain verification (requires --submit --mode gkr).
+    #[arg(long)]
+    verify_gkr: bool,
+
+    /// EloVerifier contract address for GKR verification.
+    #[arg(
+        long,
+        default_value = "0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005"
+    )]
+    verifier_contract: String,
+
+    /// Weight binding mode for GKR proving: "aggregated" (default for --mode gkr,
+    /// uses AggregatedOracleSumcheck mode 4), "sequential" (legacy mode 0).
+    #[arg(long, default_value = "aggregated")]
+    weight_binding: String,
 }
 
 /// CLI arguments for the `retrieve` subcommand.
@@ -2878,6 +2894,20 @@ fn run_capture_command(cmd: &CaptureCmd) {
             .unwrap_or_default()
             .as_nanos() as u64;
 
+        // Generate output preview from M31 matrix.
+        let output_preview = {
+            let n = output.data.len();
+            let first: Vec<String> = output.data.iter().take(5).map(|v| v.0.to_string()).collect();
+            let last: Vec<String> = output.data.iter().rev().take(3).rev().map(|v| v.0.to_string()).collect();
+            let sum: u64 = output.data.iter().map(|v| v.0 as u64).sum();
+            let mean = if n > 0 { sum / n as u64 } else { 0 };
+            Some(format!(
+                "M31[{}x{}] first=[{}] last=[{}] mean={}",
+                output.rows, output.cols,
+                first.join(","), last.join(","), mean
+            ))
+        };
+
         hook.record(CaptureJob {
             input_tokens: vec![], // No tokenization in capture mode.
             output_tokens: vec![],
@@ -2889,7 +2919,7 @@ fn run_capture_command(cmd: &CaptureCmd) {
             tee_report_hash: "0x0".to_string(),
             task_category: Some("capture".to_string()),
             input_preview: Some(format!("capture_iter_{}", i)),
-            output_preview: None,
+            output_preview,
         });
 
         eprintln!("  [{}/{}] forward pass: {}ms", i + 1, cmd.count, latency_ms);
@@ -2916,7 +2946,7 @@ fn run_capture_command(cmd: &CaptureCmd) {
 /// Run the `prove-model audit` subcommand.
 fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
     use stwo_ml::audit::log::InferenceLog;
-    use stwo_ml::audit::orchestrator::{run_audit, run_audit_dry, AuditPipelineConfig};
+    use stwo_ml::audit::orchestrator::{run_audit, AuditPipelineConfig};
     use stwo_ml::audit::submit::{explorer_url, SubmitConfig};
     use stwo_ml::audit::types::{AuditRequest, ModelInfo};
 
@@ -3035,6 +3065,7 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
         evaluate_semantics: cmd.evaluate,
         max_inferences: cmd.max_inferences,
         gpu_device: if cmd.gpu { Some(0) } else { None },
+        weight_binding: cmd.weight_binding.clone(),
     };
 
     // ── Run audit ────────────────────────────────────────────────────────
@@ -3044,21 +3075,71 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
         // Dry-run: prove + evaluate + report, skip storage/on-chain
         eprintln!();
         eprintln!("Running dry-run audit...");
-        let report = run_audit_dry(&log, graph, weights, request, model_info).unwrap_or_else(|e| {
+
+        // Use full pipeline (not run_audit_dry) when --verify-gkr so we can
+        // show GKR verification calldata without submitting.
+        let config = AuditPipelineConfig {
+            request,
+            model_info,
+            evaluate_semantics: cmd.evaluate,
+            prove_evaluations: cmd.prove_evals,
+            privacy_tier: "public".to_string(),
+            owner_pubkey: Vec::new(),
+            submit_config: None,
+            billing: None,
+        };
+        let result = run_audit(&log, graph, weights, &config, None, None).unwrap_or_else(|e| {
             eprintln!("Error: audit failed: {e}");
             process::exit(1);
         });
 
         let elapsed = t0.elapsed();
-        print_audit_report(&report, elapsed, &cmd.output);
+        print_audit_report(&result.report, elapsed, &cmd.output);
 
         // Write report JSON
-        let report_json = serde_json::to_string_pretty(&report).unwrap();
+        let report_json = serde_json::to_string_pretty(&result.report).unwrap();
         std::fs::write(&cmd.output, &report_json).unwrap_or_else(|e| {
             eprintln!("Error writing report to '{}': {e}", cmd.output.display());
             process::exit(1);
         });
         eprintln!("Report written to: {}", cmd.output.display());
+
+        // Show GKR verification calldata info in dry-run mode
+        if cmd.verify_gkr {
+            if let Some(ref gkr_calldata) = result.gkr_verification_calldata {
+                eprintln!();
+                eprintln!("=== GKR Verification Calldata (dry-run) ===");
+                for (idx, cd) in gkr_calldata.iter().enumerate() {
+                    eprintln!("  Inference {}: {} felts", idx, cd.len());
+                    if cd.len() > 7500 {
+                        eprintln!("    Warning: exceeds 7500 single-TX limit");
+                    }
+
+                    // Write calldata files for manual inspection
+                    let verify_txt = cmd.output.with_extension(format!("verify_gkr_{}.txt", idx));
+                    let verify_strs: Vec<String> =
+                        cd.iter().map(|f| format!("0x{:x}", f)).collect();
+                    let verify_flat = verify_strs.join(" ");
+                    if let Err(e) = std::fs::write(&verify_txt, &verify_flat) {
+                        eprintln!("    Warning: could not write calldata: {e}");
+                    } else {
+                        eprintln!("    Calldata: {}", verify_txt.display());
+                    }
+                }
+                if let Some(ref cfg) = result.gkr_verification_config {
+                    eprintln!("  circuit_depth: {}", cfg.circuit_depth);
+                    eprintln!("  num_layers:    {}", cfg.num_layers);
+                    eprintln!("  matmul_dims:   {:?}", cfg.matmul_dims);
+                    eprintln!("  dequant_bits:  {:?}", cfg.dequantize_bits);
+                }
+            } else {
+                eprintln!();
+                eprintln!("Warning: --verify-gkr dry-run: no GKR verification calldata (mode={}, has_verification={})",
+                    cmd.mode,
+                    "none"
+                );
+            }
+        }
     } else {
         // Full pipeline
         eprintln!();
@@ -3178,7 +3259,33 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
         });
         eprintln!("Report written to: {}", cmd.output.display());
 
-        // Write calldata and submit on-chain
+        // Resolve account address and private key from CLI or env (shared by
+        // attestation and GKR verification submission blocks).
+        let acct_addr = cmd
+            .account
+            .clone()
+            .or_else(|| std::env::var("STARKNET_ACCOUNT").ok())
+            .unwrap_or_default();
+        let priv_key = cmd
+            .private_key
+            .clone()
+            .or_else(|| std::env::var("STARKNET_PRIVATE_KEY").ok())
+            .unwrap_or_default();
+
+        // Find the paymaster script relative to the binary
+        let paymaster_script = {
+            let exe = std::env::current_exe().unwrap_or_default();
+            let repo_root = exe
+                .parent() // target/release
+                .and_then(|p| p.parent()) // target
+                .and_then(|p| p.parent()); // repo root
+            match repo_root {
+                Some(root) => root.join("scripts/pipeline/paymaster_submit.mjs"),
+                None => PathBuf::from("scripts/pipeline/paymaster_submit.mjs"),
+            }
+        };
+
+        // Write calldata and submit attestation on-chain
         if let Some(ref calldata) = result.calldata {
             let calldata_strs: Vec<String> =
                 calldata.iter().map(|f| format!("0x{:x}", f)).collect();
@@ -3207,18 +3314,6 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
             let submit_mode = if std::env::var("AVNU_API_KEY").is_ok() { "sponsored" } else { "direct" };
             eprintln!("  Fee:      {submit_mode}");
 
-            // Resolve account address and private key from CLI or env
-            let acct_addr = cmd
-                .account
-                .clone()
-                .or_else(|| std::env::var("STARKNET_ACCOUNT").ok())
-                .unwrap_or_default();
-            let priv_key = cmd
-                .private_key
-                .clone()
-                .or_else(|| std::env::var("STARKNET_PRIVATE_KEY").ok())
-                .unwrap_or_default();
-
             if acct_addr.is_empty() || priv_key.is_empty() {
                 eprintln!("  Error: --account + --private-key (or STARKNET_ACCOUNT + STARKNET_PRIVATE_KEY env vars) required for submission");
                 eprintln!("  Calldata saved to: {}", calldata_path.display());
@@ -3237,19 +3332,6 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
                     eprintln!("Error writing calldata txt: {e}");
                     process::exit(1);
                 });
-
-                // Find the paymaster script relative to the binary
-                let paymaster_script = {
-                    let exe = std::env::current_exe().unwrap_or_default();
-                    let repo_root = exe
-                        .parent() // target/release
-                        .and_then(|p| p.parent()) // target
-                        .and_then(|p| p.parent()); // repo root
-                    match repo_root {
-                        Some(root) => root.join("scripts/pipeline/paymaster_submit.mjs"),
-                        None => PathBuf::from("scripts/pipeline/paymaster_submit.mjs"),
-                    }
-                };
 
                 eprintln!("  Submitting via paymaster...");
                 let mut submit_cmd = std::process::Command::new("node");
@@ -3321,6 +3403,131 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
                         eprintln!("  Calldata saved to: {}", calldata_txt.display());
                     }
                 }
+            }
+        }
+
+        // Submit GKR verification proofs on-chain (per-inference)
+        if cmd.verify_gkr {
+            if !cmd.submit {
+                eprintln!("Warning: --verify-gkr requires --submit, skipping GKR verification");
+            } else if cmd.mode != "gkr" {
+                eprintln!("Warning: --verify-gkr requires --mode gkr, skipping GKR verification");
+            } else if acct_addr.is_empty() || priv_key.is_empty() {
+                eprintln!("Warning: --verify-gkr requires account credentials, skipping GKR verification");
+            } else if let Some(ref gkr_calldata) = result.gkr_verification_calldata {
+                eprintln!();
+                eprintln!("=== On-Chain GKR Verification (per-inference) ===");
+                eprintln!("  Verifier: {}", cmd.verifier_contract);
+                eprintln!("  Inferences: {}", gkr_calldata.len());
+
+                let mut report = result.report.clone();
+                report.proof.gkr_verifier_contract = Some(cmd.verifier_contract.clone());
+
+                for (idx, inference_cd) in gkr_calldata.iter().enumerate() {
+                    let felt_count = inference_cd.len();
+                    if felt_count > 7500 {
+                        eprintln!(
+                            "  Inference {}: {} felts exceeds 7500 limit, skipping (multi-TX not yet supported)",
+                            idx, felt_count
+                        );
+                        continue;
+                    }
+
+                    eprintln!("  Inference {}: {} felts", idx, felt_count);
+
+                    // Write per-inference calldata
+                    let verify_txt = cmd.output.with_extension(format!("verify_gkr_{}.txt", idx));
+                    let verify_strs: Vec<String> =
+                        inference_cd.iter().map(|f| format!("0x{:x}", f)).collect();
+                    let verify_flat = verify_strs.join(" ");
+                    if let Err(e) = std::fs::write(&verify_txt, &verify_flat) {
+                        eprintln!("    Warning: could not write calldata file: {e}");
+                        continue;
+                    }
+
+                    // Also write calldata JSON for manual retry
+                    let verify_json_path = cmd.output.with_extension(format!("verify_gkr_{}.json", idx));
+                    let verify_json = serde_json::to_string_pretty(&verify_strs).unwrap();
+                    let _ = std::fs::write(&verify_json_path, &verify_json);
+
+                    // Submit via paymaster targeting the verifier contract
+                    let mut verify_cmd = std::process::Command::new("node");
+                    verify_cmd
+                        .arg(&paymaster_script)
+                        .arg("--contract")
+                        .arg(&cmd.verifier_contract)
+                        .arg("--function")
+                        .arg("verify_model_gkr")
+                        .arg("--calldata-file")
+                        .arg(&verify_txt)
+                        .arg("--account-address")
+                        .arg(&acct_addr)
+                        .arg("--private-key")
+                        .arg(&priv_key)
+                        .arg("--network")
+                        .arg(&cmd.network);
+
+                    if let Ok(api_key) = std::env::var("AVNU_API_KEY") {
+                        verify_cmd.arg("--mode").arg("sponsored");
+                        verify_cmd.env("AVNU_API_KEY", api_key);
+                    } else {
+                        verify_cmd.arg("--mode").arg("direct");
+                    }
+
+                    match verify_cmd.output() {
+                        Ok(output) if output.status.success() => {
+                            let stdout = String::from_utf8_lossy(&output.stdout);
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            if !stderr.trim().is_empty() {
+                                eprintln!("    {}", stderr.trim());
+                            }
+
+                            if let Ok(json) =
+                                serde_json::from_str::<serde_json::Value>(stdout.trim())
+                            {
+                                if let Some(tx) =
+                                    json.get("transaction_hash").and_then(|v| v.as_str())
+                                {
+                                    eprintln!("    TX hash: {}", tx);
+                                    eprintln!(
+                                        "    Explorer: {}",
+                                        explorer_url(&cmd.network, tx)
+                                    );
+                                    report.proof.gkr_verification_txs.push(tx.to_string());
+                                }
+                            }
+                        }
+                        Ok(output) => {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            let stdout = String::from_utf8_lossy(&output.stdout);
+                            eprintln!("    Warning: verification TX may have failed:");
+                            if !stderr.is_empty() {
+                                eprintln!("      {}", stderr.trim());
+                            }
+                            if !stdout.is_empty() {
+                                eprintln!("      {}", stdout.trim());
+                            }
+                            eprintln!("    Calldata saved to: {}", verify_txt.display());
+                        }
+                        Err(e) => {
+                            eprintln!("    Error: could not run paymaster script: {e}");
+                            eprintln!("    Calldata saved to: {}", verify_txt.display());
+                        }
+                    }
+                }
+
+                // Re-write report with GKR verification TX hashes
+                if !report.proof.gkr_verification_txs.is_empty() {
+                    eprintln!();
+                    eprintln!(
+                        "  GKR verification: {} TX(s) submitted",
+                        report.proof.gkr_verification_txs.len()
+                    );
+                    let report_json = serde_json::to_string_pretty(&report).unwrap();
+                    let _ = std::fs::write(&cmd.output, &report_json);
+                }
+            } else {
+                eprintln!("Warning: --verify-gkr specified but no GKR verification calldata available");
             }
         }
 

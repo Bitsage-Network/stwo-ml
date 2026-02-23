@@ -271,6 +271,9 @@ impl AuditReportBuilder {
             on_chain_verified: None,
             arweave_tx_id: None,
             audit_record_id: None,
+            gkr_verification_txs: Vec::new(),
+            gkr_verifier_contract: None,
+            weight_binding_mode: result.weight_binding_mode.clone(),
         };
 
         // Generate audit ID using Poseidon2-M31.
@@ -438,6 +441,7 @@ mod tests {
             proving_time_ms: 1100,
             proof_calldata: vec!["0x1".to_string(), "0x2".to_string()],
             verification_calldata: None,
+            weight_binding_mode: None,
             tee_attestation_hash: None,
         }
     }

@@ -25,6 +25,8 @@ PRESET=""
 GPU_FLAG=""
 DRY_RUN=""
 SUBMIT=""
+VERIFY_GKR=""
+WEIGHT_BINDING=""
 COUNT=3
 OUTPUT_DIR="$HOME/.obelysk/audits"
 
@@ -38,7 +40,9 @@ usage() {
   echo "  --gpu               Use GPU acceleration"
   echo "  --count N           Number of inferences to capture (default: 3)"
   echo "  --submit            Submit proof on-chain via Avnu paymaster (gasless)"
+  echo "  --verify-gkr        Submit GKR proofs for on-chain verification (with --submit)"
   echo "  --dry-run           Prove + report, skip on-chain submission"
+  echo "  --weight-binding M  Weight binding mode: aggregated (default), sequential"
   echo "  --output-dir PATH   Where to save reports (default: ~/.obelysk/audits)"
   echo "  -h, --help          Show this help"
   echo ""
@@ -58,7 +62,9 @@ while [[ $# -gt 0 ]]; do
     --gpu)        GPU_FLAG="--gpu"; shift ;;
     --count)      COUNT="$2"; shift 2 ;;
     --submit)     SUBMIT="--submit"; shift ;;
+    --verify-gkr) VERIFY_GKR="--verify-gkr"; shift ;;
     --dry-run)    DRY_RUN="--dry-run"; shift ;;
+    --weight-binding) WEIGHT_BINDING="$2"; shift 2 ;;
     --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
     -h|--help)    usage ;;
     *)            echo "Unknown option: $1"; usage ;;
@@ -154,6 +160,7 @@ echo "  Layers:     $LAYERS"
 echo "  Inferences: $COUNT"
 echo "  GPU:        ${GPU_FLAG:-off}"
 echo "  Submit:     ${SUBMIT:-off}"
+echo "  Verify GKR: ${VERIFY_GKR:-off}"
 echo "  Output:     $REPORT"
 echo ""
 
@@ -181,6 +188,10 @@ AUDIT_ARGS=(
 [[ -n "$GPU_FLAG" ]] && AUDIT_ARGS+=($GPU_FLAG)
 [[ -n "$DRY_RUN" ]] && AUDIT_ARGS+=($DRY_RUN)
 [[ -n "$SUBMIT" ]] && AUDIT_ARGS+=($SUBMIT)
+if [[ -n "$VERIFY_GKR" ]]; then
+  AUDIT_ARGS+=(--mode gkr --verify-gkr)
+fi
+[[ -n "$WEIGHT_BINDING" ]] && AUDIT_ARGS+=(--weight-binding "$WEIGHT_BINDING")
 
 "$BINARY" audit "${AUDIT_ARGS[@]}"
 
