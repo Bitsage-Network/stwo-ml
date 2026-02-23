@@ -115,7 +115,6 @@ async function main() {
   console.error(`  Mode:      ${opts.mode}`);
 
   const provider = new RpcProvider({ nodeUrl: rpcUrl });
-  const account = new Account(provider, opts.accountAddress, opts.privateKey);
 
   const calls = [
     {
@@ -129,6 +128,7 @@ async function main() {
 
   if (opts.mode === "direct") {
     // ─── Direct execution (account pays gas in STRK) ──────────────
+    const account = new Account({ provider, address: opts.accountAddress, signer: opts.privateKey });
     console.error(`  Executing directly...`);
     const result = await account.execute(calls);
     txHash = result.transaction_hash;
@@ -147,6 +147,14 @@ async function main() {
 
     const paymaster = new PaymasterRpc(paymasterOpts);
 
+    // Create account with paymaster attached
+    const account = new Account({
+      provider,
+      address: opts.accountAddress,
+      signer: opts.privateKey,
+      paymaster,
+    });
+
     let feeMode;
     if (opts.mode === "sponsored") {
       feeMode = { mode: "sponsored" };
@@ -155,8 +163,18 @@ async function main() {
       feeMode = { mode: "default", gasToken: STRK_TOKEN };
     }
 
-    console.error(`  Building transaction...`);
-    const result = await account.execute(calls, { paymaster, feeMode });
+    const paymasterDetails = { feeMode };
+
+    console.error(`  Estimating fee...`);
+    const feeEstimate = await account.estimatePaymasterTransactionFee(calls, paymasterDetails);
+    console.error(`  Estimated fee: ${feeEstimate.suggested_max_fee_in_gas_token} (gas token units)`);
+
+    console.error(`  Executing via paymaster...`);
+    const result = await account.executePaymasterTransaction(
+      calls,
+      paymasterDetails,
+      feeEstimate.suggested_max_fee_in_gas_token
+    );
     txHash = result.transaction_hash;
     console.error(`  Waiting for confirmation...`);
     await provider.waitForTransaction(txHash);
