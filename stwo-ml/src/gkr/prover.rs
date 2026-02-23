@@ -532,14 +532,26 @@ fn apply_aggregated_oracle_sumcheck(
                             );
                         }
 
+                        // Drop MLEs immediately when full binding isn't needed,
+                        // freeing ~4 GB per matrix before the next one is prepared.
+                        let (mle_out, mle_u32_out) = if need_full_binding {
+                            (
+                                std::mem::take(&mut current_prep.mle),
+                                std::mem::take(&mut current_prep.mle_u32),
+                            )
+                        } else {
+                            drop(std::mem::take(&mut current_prep.mle));
+                            drop(std::mem::take(&mut current_prep.mle_u32));
+                            (Vec::new(), Vec::new())
+                        };
                         results.push(Ok(WeightPrepResult {
                             matrix_index: input.matrix_index,
                             n_vars: current_prep.n_vars,
                             commitment,
                             eval_point: input.eval_point.to_vec(),
                             expected_value: input.expected_value,
-                            mle: std::mem::take(&mut current_prep.mle),
-                            mle_u32: std::mem::take(&mut current_prep.mle_u32),
+                            mle: mle_out,
+                            mle_u32: mle_u32_out,
                             is_deferred: input.is_deferred,
                             deferred_idx: input.deferred_idx,
                         }));
@@ -587,14 +599,24 @@ fn apply_aggregated_oracle_sumcheck(
                         t_commit.elapsed().as_secs_f64(),
                     );
 
+                    let (mle_out, mle_u32_out) = if need_full_binding {
+                        (
+                            std::mem::take(&mut current_prep.mle),
+                            std::mem::take(&mut current_prep.mle_u32),
+                        )
+                    } else {
+                        drop(std::mem::take(&mut current_prep.mle));
+                        drop(std::mem::take(&mut current_prep.mle_u32));
+                        (Vec::new(), Vec::new())
+                    };
                     results.push(Ok(WeightPrepResult {
                         matrix_index: input.matrix_index,
                         n_vars: current_prep.n_vars,
                         commitment,
                         eval_point: input.eval_point.to_vec(),
                         expected_value: input.expected_value,
-                        mle: std::mem::take(&mut current_prep.mle),
-                        mle_u32: std::mem::take(&mut current_prep.mle_u32),
+                        mle: mle_out,
+                        mle_u32: mle_u32_out,
                         is_deferred: input.is_deferred,
                         deferred_idx: input.deferred_idx,
                     }));
@@ -668,14 +690,21 @@ fn apply_aggregated_oracle_sumcheck(
                         );
                     }
 
+                    let (mle_out, mle_u32_out) = if need_full_binding {
+                        (b_mle, mle_u32)
+                    } else {
+                        drop(b_mle);
+                        drop(mle_u32);
+                        (Vec::new(), Vec::new())
+                    };
                     Ok(WeightPrepResult {
                         matrix_index: input.matrix_index,
                         n_vars,
                         commitment,
                         eval_point: input.eval_point.to_vec(),
                         expected_value: input.expected_value,
-                        mle: b_mle,
-                        mle_u32,
+                        mle: mle_out,
+                        mle_u32: mle_u32_out,
                         is_deferred: input.is_deferred,
                         deferred_idx: input.deferred_idx,
                     })
@@ -730,13 +759,14 @@ fn apply_aggregated_oracle_sumcheck(
                     );
                 }
 
+                let mle_out = if need_full_binding { b_mle } else { drop(b_mle); Vec::new() };
                 Ok(WeightPrepResult {
                     matrix_index: input.matrix_index,
                     n_vars,
                     commitment,
                     eval_point: input.eval_point.to_vec(),
                     expected_value: input.expected_value,
-                    mle: b_mle,
+                    mle: mle_out,
                     is_deferred: input.is_deferred,
                     deferred_idx: input.deferred_idx,
                 })
