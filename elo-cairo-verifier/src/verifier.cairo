@@ -202,6 +202,7 @@ pub trait ISumcheckVerifier<TContractState> {
         circuit_depth: u32,
         num_layers: u32,
         weight_binding_mode: u32,
+        packed: bool,
     ) -> felt252;
 
     /// Upload a chunk of proof data to an open session.
@@ -350,6 +351,8 @@ mod SumcheckVerifierContract {
         gkr_session_num_layers: Map<felt252, u32>,
         /// session_id → weight_binding_mode parameter.
         gkr_session_weight_binding_mode: Map<felt252, u32>,
+        /// session_id → packed QM31 format flag (true = 1 felt per QM31, false = 4 felts).
+        gkr_session_packed: Map<felt252, bool>,
         /// Monotonic nonce for generating unique session IDs.
         next_gkr_session_nonce: u64,
     }
@@ -578,6 +581,7 @@ mod SumcheckVerifierContract {
         weight_binding_mode: u32,
         weight_binding_data: Span<felt252>,
         weight_opening_proofs: Array<MleOpeningProof>,
+        packed: bool,
     ) -> bool {
         assert!(
             weight_binding_mode == WEIGHT_BINDING_MODE_SEQUENTIAL
@@ -765,6 +769,7 @@ mod SumcheckVerifierContract {
                 dequantize_bits.span(),
                 initial_claim,
                 ref ch,
+                packed,
             );
 
         // ================================================================
@@ -1223,6 +1228,7 @@ mod SumcheckVerifierContract {
                 WEIGHT_BINDING_MODE_SEQUENTIAL,
                 empty_binding_data.span(),
                 weight_opening_proofs,
+                false,
             )
         }
 
@@ -1258,6 +1264,7 @@ mod SumcheckVerifierContract {
                 weight_binding_mode,
                 empty_binding_data.span(),
                 weight_opening_proofs,
+                false,
             )
         }
 
@@ -1295,6 +1302,7 @@ mod SumcheckVerifierContract {
                 weight_binding_mode,
                 weight_binding_data.span(),
                 weight_opening_proofs,
+                false,
             )
         }
 
@@ -1331,6 +1339,7 @@ mod SumcheckVerifierContract {
                 weight_binding_mode,
                 weight_binding_data.span(),
                 weight_opening_proofs,
+                false,
             )
         }
 
@@ -1351,6 +1360,7 @@ mod SumcheckVerifierContract {
             circuit_depth: u32,
             num_layers: u32,
             weight_binding_mode: u32,
+            packed: bool,
         ) -> felt252 {
             assert!(total_felts > 0, "GKR_SESSION_ZERO_FELTS");
             assert!(circuit_depth > 0, "GKR_SESSION_ZERO_CIRCUIT_DEPTH");
@@ -1388,6 +1398,7 @@ mod SumcheckVerifierContract {
             self.gkr_session_circuit_depth.entry(session_id).write(circuit_depth);
             self.gkr_session_num_layers.entry(session_id).write(num_layers);
             self.gkr_session_weight_binding_mode.entry(session_id).write(weight_binding_mode);
+            self.gkr_session_packed.entry(session_id).write(packed);
 
             self.emit(GkrSessionOpened {
                 session_id, model_id, owner: caller, total_felts, num_chunks,
@@ -1495,6 +1506,7 @@ mod SumcheckVerifierContract {
             let circuit_depth = self.gkr_session_circuit_depth.entry(session_id).read();
             let num_layers = self.gkr_session_num_layers.entry(session_id).read();
             let weight_binding_mode = self.gkr_session_weight_binding_mode.entry(session_id).read();
+            let packed = self.gkr_session_packed.entry(session_id).read();
 
             // ── Read all data from flat storage into memory ──
             // Layout: [raw_io_data_len, raw_io_data...,
@@ -1637,6 +1649,7 @@ mod SumcheckVerifierContract {
                 weight_binding_mode,
                 weight_binding_data.span(),
                 weight_opening_proofs,
+                packed,
             );
 
             // Mark session as verified.

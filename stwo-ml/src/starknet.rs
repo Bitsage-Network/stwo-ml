@@ -1233,6 +1233,8 @@ pub struct ChunkedGkrCalldata {
     pub num_layers: u32,
     /// Weight binding mode (3 or 4).
     pub weight_binding_mode: u32,
+    /// Whether proof_data uses packed QM31 format (1 felt per QM31).
+    pub packed: bool,
     /// Session data split into chunks of ≤ MAX_GKR_CHUNK_FELTS hex-encoded felts.
     pub chunks: Vec<Vec<String>>,
     /// Number of chunks.
@@ -1259,8 +1261,6 @@ pub fn build_chunked_gkr_calldata(
     model_id: FieldElement,
     raw_io_data: &[FieldElement],
 ) -> Result<ChunkedGkrCalldata, StarknetModelError> {
-    use crate::cairo_serde::serialize_gkr_proof_data_only;
-
     enforce_gkr_soundness_gates(proof)?;
 
     let binding_mode = starknet_weight_binding_mode(proof.weight_opening_transcript_mode)?;
@@ -1302,9 +1302,9 @@ pub fn build_chunked_gkr_calldata(
         flat.push(format!("{}", b));
     }
 
-    // 4. proof_data
+    // 4. proof_data (packed QM31 format: 1 felt per QM31 instead of 4)
     let mut proof_data = Vec::new();
-    serialize_gkr_proof_data_only(proof, &mut proof_data);
+    crate::cairo_serde::serialize_gkr_proof_data_only_packed(proof, &mut proof_data);
     push_felt_section!(&proof_data);
 
     // 5. weight_commitments
@@ -1378,6 +1378,7 @@ pub fn build_chunked_gkr_calldata(
         circuit_depth,
         num_layers,
         weight_binding_mode: binding_mode,
+        packed: true,
         chunks,
         num_chunks,
     })

@@ -1310,6 +1310,7 @@ fn main() {
                                                 "circuit_depth": chunked.circuit_depth,
                                                 "num_layers": chunked.num_layers,
                                                 "weight_binding_mode": chunked.weight_binding_mode,
+                                                "packed": chunked.packed,
                                                 "model_id": chunked.model_id,
                                                 "chunks": chunked.chunks,
                                             })

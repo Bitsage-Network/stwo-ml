@@ -12,7 +12,7 @@
 //   0=MatMul, 1=Add, 2=Mul, 3=Activation, 4=LayerNorm,
 //   5=Attention, 6=Dequantize, 7=MatMulDualSimd, 8=RMSNorm
 
-use crate::field::{QM31, CM31, qm31_zero, log2_ceil, next_power_of_two};
+use crate::field::{QM31, CM31, qm31_zero, log2_ceil, next_power_of_two, unpack_qm31_from_felt};
 use crate::channel::{PoseidonChannel, channel_mix_secure_field};
 use crate::types::{RoundPoly, GkrRoundPoly, GKRClaim};
 use crate::layer_verifiers::{
@@ -39,14 +39,17 @@ pub struct WeightClaimData {
 
 /// Offset-based reader for flat felt252 proof data.
 /// Advances through the data one field at a time.
+/// When `packed` is true, QM31 values are read from a single packed felt252
+/// (4x compression) instead of 4 separate felt252s.
 #[derive(Drop, Copy)]
 struct ProofReader {
     data: Span<felt252>,
     offset: u32,
+    packed: bool,
 }
 
-fn reader_new(data: Span<felt252>) -> ProofReader {
-    ProofReader { data, offset: 0 }
+fn reader_new(data: Span<felt252>, packed: bool) -> ProofReader {
+    ProofReader { data, offset: 0, packed }
 }
 
 fn read_felt(ref r: ProofReader) -> felt252 {
@@ -69,11 +72,16 @@ fn read_u64(ref r: ProofReader) -> u64 {
 }
 
 fn read_qm31(ref r: ProofReader) -> QM31 {
-    let aa = read_u64(ref r);
-    let ab = read_u64(ref r);
-    let ba = read_u64(ref r);
-    let bb = read_u64(ref r);
-    QM31 { a: CM31 { a: aa, b: ab }, b: CM31 { a: ba, b: bb } }
+    if r.packed {
+        let f = read_felt(ref r);
+        unpack_qm31_from_felt(f)
+    } else {
+        let aa = read_u64(ref r);
+        let ab = read_u64(ref r);
+        let ba = read_u64(ref r);
+        let bb = read_u64(ref r);
+        QM31 { a: CM31 { a: aa, b: ab }, b: CM31 { a: ba, b: bb } }
+    }
 }
 
 fn read_deg2_poly(ref r: ProofReader) -> RoundPoly {
@@ -339,11 +347,16 @@ pub fn verify_gkr_model(
             dequantize_bits,
             initial_claim,
             ref ch,
+            false,
         );
     (final_claim, weight_claims)
 }
 
 /// Verify a complete GKR model proof and return additional trace metadata.
+///
+/// When `packed` is true, QM31 values in proof_data are read from single
+/// packed felt252s (4x compression). All other data (tags, u32, felt252)
+/// is read identically.
 ///
 /// Returns:
 ///   - final_input_claim
@@ -357,8 +370,9 @@ pub fn verify_gkr_model_with_trace(
     dequantize_bits: Span<u64>,
     initial_claim: GKRClaim,
     ref ch: PoseidonChannel,
+    packed: bool,
 ) -> (GKRClaim, Array<WeightClaimData>, Array<u32>, Array<felt252>) {
-    let mut reader = reader_new(proof_data);
+    let mut reader = reader_new(proof_data, packed);
     let mut current_claim = initial_claim;
     let mut weight_claims: Array<WeightClaimData> = array![];
     let mut layer_tags: Array<u32> = array![];

@@ -446,6 +446,18 @@ pub fn pack_qm31_to_felt(v: QM31) -> felt252 {
     result
 }
 
+/// Unpack a QM31 from a single felt252 (reverse of pack_qm31_to_felt).
+/// Layout: [1-bit sentinel | 31-bit a.a | 31-bit a.b | 31-bit b.a | 31-bit b.b]
+pub fn unpack_qm31_from_felt(fe: felt252) -> QM31 {
+    let val: u256 = fe.into();
+    let mask: u256 = 0x7FFFFFFF; // 2^31 - 1
+    let bb: u64 = (val & mask).try_into().unwrap();
+    let ba: u64 = ((val / 0x80000000) & mask).try_into().unwrap();
+    let ab: u64 = ((val / 0x4000000000000000) & mask).try_into().unwrap();
+    let aa: u64 = ((val / 0x200000000000000000000000) & mask).try_into().unwrap();
+    QM31 { a: CM31 { a: aa, b: ab }, b: CM31 { a: ba, b: bb } }
+}
+
 /// Compute ceil(log2(n)) for n > 0.
 pub fn log2_ceil(n: u32) -> u32 {
     assert!(n > 0, "log2(0) undefined");

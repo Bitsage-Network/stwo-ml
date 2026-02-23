@@ -505,6 +505,7 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
       circuitDepth,
       numLayers,
       weightBindingMode,
+      packed: verifyCalldata.packed === true || verifyCalldata.packed === undefined,
     };
   }
 
@@ -1106,6 +1107,7 @@ async function cmdVerify(args) {
         String(verifyPayload.circuitDepth),
         String(verifyPayload.numLayers),
         String(verifyPayload.weightBindingMode),
+        verifyPayload.packed ? "1" : "0",
       ],
       "open_gkr_session"
     );
