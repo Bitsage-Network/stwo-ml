@@ -3204,7 +3204,8 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
             eprintln!("=== On-Chain Audit Submission (Avnu Paymaster) ===");
             eprintln!("  Contract: {}", cmd.contract);
             eprintln!("  Network:  {}", cmd.network);
-            eprintln!("  Fee:      sponsored (gasless)");
+            let submit_mode = if std::env::var("AVNU_API_KEY").is_ok() { "sponsored" } else { "direct" };
+            eprintln!("  Fee:      {submit_mode}");
 
             // Resolve account address and private key from CLI or env
             let acct_addr = cmd
@@ -3267,9 +3268,15 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
                     .arg("--network")
                     .arg(&cmd.network);
 
-                // Pass Avnu API key via env if set
+                // Select paymaster mode:
+                //   - sponsored: if AVNU_API_KEY is set (dApp pays gas)
+                //   - direct: default (account pays gas in STRK)
+                // Note: "gasless" mode requires SNIP-9 compatible account (Argent/Braavos)
                 if let Ok(api_key) = std::env::var("AVNU_API_KEY") {
+                    submit_cmd.arg("--mode").arg("sponsored");
                     submit_cmd.env("AVNU_API_KEY", api_key);
+                } else {
+                    submit_cmd.arg("--mode").arg("direct");
                 }
 
                 let submit_result = submit_cmd.output();
