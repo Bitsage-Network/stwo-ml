@@ -169,6 +169,16 @@ function die(msg) {
   process.exit(1);
 }
 
+function truncateRpcError(e) {
+  const msg = e.message || String(e);
+  // starknet.js RpcError embeds the full request params (100K+ chars of
+  // calldata JSON) in the error message.  Extract just the error code.
+  const codeMatch = msg.match(/(-\d+):\s*"?(.{1,300})/);
+  if (codeMatch) return `RPC ${codeMatch[1]}: ${codeMatch[2]}`;
+  // Fallback: first 500 chars
+  return msg.length > 500 ? msg.slice(0, 500) + "..." : msg;
+}
+
 function info(msg) {
   process.stderr.write(`[INFO] ${msg}\n`);
 }
@@ -270,13 +280,77 @@ function generateEphemeralAccount(network) {
 
 // ─── Paymaster Execution ─────────────────────────────────────────────
 
+async function deployAccountDirect(provider, account, deploymentData, network) {
+  // Deploy account via standard DEPLOY_ACCOUNT transaction.
+  // This uses the account's own key to self-deploy (gas paid by the account
+  // or estimated from the provider). On Sepolia, a small balance is needed
+  // to cover gas. If the account has no balance, we try paymaster first as
+  // a fallback.
+  const net = NETWORKS[network];
+
+  // Try paymaster-sponsored deployment first (empty calls + deploymentData)
+  try {
+    info("Attempting paymaster-sponsored account deployment...");
+    const deployFeeDetails = {
+      feeMode: { mode: "sponsored" },
+      deploymentData: { ...deploymentData, version: 1 },
+    };
+    const deployEstimation = await account.estimatePaymasterTransactionFee(
+      [],
+      deployFeeDetails
+    );
+    const deployResult = await account.executePaymasterTransaction(
+      [],
+      deployFeeDetails,
+      deployEstimation.suggested_max_fee_in_gas_token
+    );
+    const deployTxHash = deployResult.transaction_hash;
+    info(`Account deploy TX (paymaster): ${deployTxHash}`);
+    info("Waiting for account deployment confirmation...");
+    const deployReceipt = await provider.waitForTransaction(deployTxHash);
+    const deployStatus = deployReceipt.execution_status ?? deployReceipt.status ?? "unknown";
+    if (deployStatus === "REVERTED") {
+      throw new Error(`TX reverted: ${deployReceipt.revert_reason || "unknown"}`);
+    }
+    info("Account deployed successfully via paymaster.");
+    return deployTxHash;
+  } catch (e) {
+    info(`Paymaster account deploy failed: ${truncateRpcError(e)}`);
+    info("Falling back to standard DEPLOY_ACCOUNT...");
+  }
+
+  // Fallback: standard deploy_account (needs gas balance on the account)
+  const deployPayload = {
+    classHash: deploymentData.classHash,
+    constructorCalldata: deploymentData.constructorCalldata,
+    addressSalt: deploymentData.salt,
+  };
+
+  const { transaction_hash } = await account.deployAccount(deployPayload);
+  info(`Account deploy TX (standard): ${transaction_hash}`);
+  info("Waiting for account deployment confirmation...");
+  const receipt = await provider.waitForTransaction(transaction_hash);
+  const status = receipt.execution_status ?? receipt.status ?? "unknown";
+  if (status === "REVERTED") {
+    die(`Account deployment reverted: ${receipt.revert_reason || "unknown"}`);
+  }
+  info("Account deployed successfully.");
+  return transaction_hash;
+}
+
 async function executeViaPaymaster(account, calls, deploymentData) {
   const callsArray = Array.isArray(calls) ? calls : [calls];
-  const feeDetails = { feeMode: { mode: "sponsored" } };
 
+  // ── Deploy account first if needed (separate TX) ──
+  // AVNU paymaster rejects deploy_and_invoke combined with large calldata
+  // (RPC -32602: missing field 'address'). Deploy the account separately
+  // before submitting the verification invoke.
   if (deploymentData) {
-    feeDetails.deploymentData = deploymentData;
+    await deployAccountDirect(account.provider, account, deploymentData, "sepolia");
   }
+
+  // ── Submit the actual call (invoke-only, no deploymentData) ──
+  const feeDetails = { feeMode: { mode: "sponsored" } };
 
   info("Estimating paymaster fee...");
   const estimation = await account.estimatePaymasterTransactionFee(
@@ -758,7 +832,7 @@ async function cmdVerify(args) {
   try {
     txHash = await executeViaPaymaster(account, calls, deploymentData);
   } catch (e) {
-    const msg = e.message || String(e);
+    const msg = truncateRpcError(e);
     if (msg.includes("not eligible") || msg.includes("not supported")) {
       die(
         `Paymaster rejected transaction: ${msg}\n` +
@@ -769,7 +843,7 @@ async function cmdVerify(args) {
           "Try: STARKNET_PRIVATE_KEY=0x... ./04_verify_onchain.sh --submit --no-paymaster"
       );
     }
-    throw e;
+    die(`Paymaster submission failed: ${msg}`);
   }
 
   info(`TX submitted: ${txHash}`);
@@ -1094,5 +1168,5 @@ try {
       process.exit(1);
   }
 } catch (e) {
-  die(e.message || String(e));
+  die(truncateRpcError(e));
 }
