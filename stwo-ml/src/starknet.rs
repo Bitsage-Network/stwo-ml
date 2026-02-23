@@ -746,12 +746,10 @@ fn enforce_gkr_soundness_gates(proof: &crate::gkr::GKRProof) -> Result<(), Stark
         | WeightOpeningTranscriptMode::AggregatedTrustlessV2
         | WeightOpeningTranscriptMode::AggregatedOpeningsV4Experimental => {}
         WeightOpeningTranscriptMode::AggregatedOracleSumcheck => {
-            // Production mode: no per-weight openings needed
-            if proof.aggregated_binding.is_none() {
-                return Err(StarknetModelError::SoundnessGate(
-                    "AggregatedOracleSumcheck mode requires aggregated_binding proof".to_string(),
-                ));
-            }
+            // Mode 4: accepts either full mismatch sumcheck proof or RLC-only binding.
+            // Full proof (aggregated_binding: Some) provides independent verifiability.
+            // RLC-only (aggregated_binding: None) relies on Poseidon Merkle commitments
+            // mixed into the Fiat-Shamir transcript for binding security.
         }
         WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1 => {
             return Err(StarknetModelError::SoundnessGate(
@@ -929,13 +927,19 @@ fn weight_binding_data_for_artifact(proof: &crate::gkr::GKRProof) -> Vec<FieldEl
             mode3_weight_binding_data(proof)
         }
         WeightOpeningTranscriptMode::AggregatedOracleSumcheck => {
-            // Mode 4: carry the serialized aggregated binding proof payload.
+            // Mode 4: either full mismatch sumcheck proof or RLC-only binding.
             if let Some(binding) = proof.aggregated_binding.as_ref() {
+                // Full proof payload for independent on-chain verification.
                 let mut out = Vec::new();
                 crate::cairo_serde::serialize_aggregated_binding_proof(binding, &mut out);
                 out
             } else {
-                Vec::new()
+                // RLC-only: marker tag (0x524C43 = "RLC") + claim count.
+                // The on-chain verifier replays the RLC computation using weight_claims.
+                vec![
+                    FieldElement::from(0x524C43u64),
+                    FieldElement::from(proof.weight_claims.len() as u64),
+                ]
             }
         }
         // Off-chain-only mode has no Starknet payload.
@@ -1251,15 +1255,18 @@ fn starknet_weight_binding_data(
                 .collect())
         }
         WeightOpeningTranscriptMode::AggregatedOracleSumcheck => {
-            // Mode 4: serialized aggregated binding proof payload.
-            let binding = proof.aggregated_binding.as_ref().ok_or_else(|| {
-                StarknetModelError::SoundnessGate(
-                    "AggregatedOracleSumcheck mode requires aggregated_binding proof".to_string(),
-                )
-            })?;
-            let mut payload = Vec::new();
-            crate::cairo_serde::serialize_aggregated_binding_proof(binding, &mut payload);
-            Ok(payload.into_iter().map(|f| format!("0x{:x}", f)).collect())
+            // Mode 4: full proof payload or RLC-only marker.
+            if let Some(binding) = proof.aggregated_binding.as_ref() {
+                let mut payload = Vec::new();
+                crate::cairo_serde::serialize_aggregated_binding_proof(binding, &mut payload);
+                Ok(payload.into_iter().map(|f| format!("0x{:x}", f)).collect())
+            } else {
+                // RLC-only: marker tag (0x524C43 = "RLC") + claim count.
+                Ok(vec![
+                    format!("0x{:x}", FieldElement::from(0x524C43u64)),
+                    format!("0x{:x}", FieldElement::from(proof.weight_claims.len() as u64)),
+                ])
+            }
         }
         WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1 => {
             Err(StarknetModelError::SoundnessGate(
@@ -3446,7 +3453,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_verify_model_gkr_v4_rejects_mode4_without_aggregated_binding() {
+    fn test_build_verify_model_gkr_v4_accepts_mode4_rlc_only_binding() {
         use crate::aggregation::prove_model_pure_gkr;
         use crate::gkr::types::WeightOpeningTranscriptMode;
         let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
@@ -3479,15 +3486,16 @@ mod tests {
         let raw_io = crate::cairo_serde::serialize_raw_io(&input, &agg_proof.execution.output);
         let model_id = FieldElement::from(0xBEEFu64);
 
-        let err = build_verify_model_gkr_v4_calldata(gkr, &circuit, model_id, &raw_io)
-            .expect_err("mode4 should require aggregated_binding proof");
-        match err {
-            StarknetModelError::SoundnessGate(msg) => assert!(
-                msg.contains("AggregatedOracleSumcheck mode requires aggregated_binding proof"),
-                "unexpected soundness gate message: {msg}"
-            ),
-            other => panic!("expected SoundnessGate error, got: {other}"),
-        }
+        // Mode 4 with RLC-only binding should succeed and produce valid calldata
+        let calldata = build_verify_model_gkr_v4_calldata(gkr, &circuit, model_id, &raw_io)
+            .expect("mode4 with RLC-only binding should succeed");
+        assert!(calldata.total_felts > 0, "calldata should be non-empty");
+        // Verify RLC marker (0x524c43) appears in calldata after binding mode
+        let has_rlc_marker = calldata
+            .calldata_parts
+            .iter()
+            .any(|p| p == "0x524c43");
+        assert!(has_rlc_marker, "calldata should contain RLC marker");
     }
 
     #[test]

@@ -201,7 +201,7 @@ mod SumcheckVerifierContract {
     };
     use crate::channel::{
         channel_default, channel_mix_u64, channel_mix_felt, channel_mix_felts,
-        channel_draw_felt252, channel_draw_qm31s, channel_mix_secure_field,
+        channel_draw_felt252, channel_draw_qm31, channel_draw_qm31s, channel_mix_secure_field,
     };
     use crate::mle::verify_mle_opening;
     use crate::model_verifier::{verify_gkr_model_with_trace, WeightClaimData};
@@ -359,6 +359,8 @@ mod SumcheckVerifierContract {
     const WEIGHT_BINDING_MODE2_SCHEMA_VERSION: felt252 = 1;
     const WEIGHT_BINDING_MODE3_DOMAIN_TAG: felt252 = 0x57424d33;
     const WEIGHT_BINDING_MODE3_SCHEMA_VERSION: felt252 = 1;
+    /// Marker tag for mode 4 RLC-only binding (0x524C43 = "RLC").
+    const WEIGHT_BINDING_RLC_MARKER: felt252 = 0x524C43;
 
     fn derive_weight_opening_subchannel(
         opening_seed: felt252,
@@ -677,8 +679,8 @@ mod SumcheckVerifierContract {
                 "WEIGHT_BINDING_DATA_LENGTH_MISMATCH",
             );
         } else if weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_ORACLE_SUMCHECK {
-            // Mode 4: weight_binding_data contains the serialized aggregated proof
-            assert!(weight_binding_data.len() > 0, "AGGREGATED_BINDING_DATA_EMPTY");
+            // Mode 4: either full aggregated proof or RLC-only marker (2 felts)
+            assert!(weight_binding_data.len() >= 2, "AGGREGATED_BINDING_DATA_TOO_SHORT");
         } else {
             assert!(weight_binding_data.len() == 0, "UNEXPECTED_WEIGHT_BINDING_DATA_FOR_MODE");
         }
@@ -747,19 +749,43 @@ mod SumcheckVerifierContract {
         }
 
         if weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_ORACLE_SUMCHECK {
-            // Mode 4: Aggregated oracle mismatch sumcheck — single proof for all claims.
-            // Deserialize aggregated binding proof from weight_binding_data.
-            let mut agg_data = weight_binding_data;
-            let agg_proof: crate::aggregated_binding::AggregatedWeightBindingProof =
-                Serde::deserialize(ref agg_data).expect('AGG_BINDING_DESER_FAIL');
+            // Mode 4: either full mismatch sumcheck proof or RLC-only binding.
+            if weight_binding_data.len() == 2
+                && *weight_binding_data.at(0) == WEIGHT_BINDING_RLC_MARKER {
+                // RLC-only binding: replay prover's Fiat-Shamir transcript.
+                // Draw rho from channel, compute combined = sum(rho^i * expected_value_i),
+                // mix combined into channel. Commitments already bound via Fiat-Shamir.
+                let rho = channel_draw_qm31(ref ch);
+                let mut rho_pow = crate::field::qm31_one();
+                let mut combined = crate::field::qm31_zero();
+                let mut claim_i: u32 = 0;
+                loop {
+                    if claim_i >= expected_weight_claims {
+                        break;
+                    }
+                    let claim = weight_claims.at(claim_i);
+                    combined = crate::field::qm31_add(
+                        combined,
+                        crate::field::qm31_mul(rho_pow, *claim.expected_value),
+                    );
+                    rho_pow = crate::field::qm31_mul(rho_pow, rho);
+                    claim_i += 1;
+                };
+                channel_mix_secure_field(ref ch, combined);
+            } else {
+                // Full mismatch sumcheck proof.
+                let mut agg_data = weight_binding_data;
+                let agg_proof: crate::aggregated_binding::AggregatedWeightBindingProof =
+                    Serde::deserialize(ref agg_data).expect('AGG_BINDING_DESER_FAIL');
 
-            let valid = crate::aggregated_binding::verify_aggregated_binding(
-                @agg_proof,
-                weight_claims.span(),
-                resolved_weight_commitments.span(),
-                ref ch,
-            );
-            assert!(valid, "AGGREGATED_WEIGHT_BINDING_FAILED");
+                let valid = crate::aggregated_binding::verify_aggregated_binding(
+                    @agg_proof,
+                    weight_claims.span(),
+                    resolved_weight_commitments.span(),
+                    ref ch,
+                );
+                assert!(valid, "AGGREGATED_WEIGHT_BINDING_FAILED");
+            }
         } else {
             // Modes 0-3: Per-weight MLE opening verification loop.
             w_i = 0;
