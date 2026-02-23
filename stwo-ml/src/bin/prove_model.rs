@@ -3258,7 +3258,7 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
                     .arg("--contract")
                     .arg(&cmd.contract)
                     .arg("--function")
-                    .arg("submit_audit")
+                    .arg("submit_audit_record")
                     .arg("--calldata-file")
                     .arg(&calldata_txt)
                     .arg("--account-address")
