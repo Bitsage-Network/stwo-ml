@@ -119,9 +119,8 @@ if [[ -n "$SUBMIT" ]]; then
     exit 1
   fi
   if [[ -z "${AVNU_API_KEY:-}" ]]; then
-    echo "Error: on-chain submission requires AVNU_API_KEY env var"
-    echo "  export AVNU_API_KEY=..."
-    exit 1
+    echo "Note: AVNU_API_KEY not set — using gasless mode (account pays gas in STRK)"
+    echo "  For sponsored (free gas), set: export AVNU_API_KEY=..."
   fi
 
   # Install Node.js deps if needed

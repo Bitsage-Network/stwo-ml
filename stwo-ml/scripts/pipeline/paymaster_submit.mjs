@@ -1,6 +1,10 @@
 #!/usr/bin/env node
-// Avnu paymaster submission — gasless on-chain audit submission.
-// No STRK needed on the submitter account. Avnu sponsors gas.
+// On-chain audit submission via Avnu paymaster or direct execution.
+//
+// Modes:
+//   1. Gasless (default) — user pays gas in STRK via Avnu paymaster. No API key needed.
+//   2. Sponsored — Avnu pays gas. Requires AVNU_API_KEY with credits (free on Sepolia).
+//   3. Direct — standard starknet.js execute. Account pays gas normally.
 //
 // Usage:
 //   node paymaster_submit.mjs \
@@ -9,20 +13,21 @@
 //     --calldata-file /path/to/calldata.txt \
 //     --account-address 0x01b17c... \
 //     --private-key 0x0abc... \
-//     --network sepolia
+//     --network sepolia \
+//     --mode gasless
 //
-// Env vars (optional overrides):
-//   AVNU_API_KEY — Avnu paymaster API key
-//   STARKNET_ACCOUNT — account address
-//   STARKNET_PRIVATE_KEY — account private key
+// Env vars:
+//   STARKNET_ACCOUNT      — account address (overridden by --account-address)
+//   STARKNET_PRIVATE_KEY  — account private key (overridden by --private-key)
+//   AVNU_API_KEY          — Avnu API key (only needed for --mode sponsored)
 
-import { Account, RpcProvider, stark, ec } from "starknet";
+import { Account, RpcProvider, PaymasterRpc } from "starknet";
 import { readFileSync } from "fs";
 
 // ─── Config ──────────────────────────────────────────────────────────
-const AVNU_URLS = {
-  mainnet: "https://starknet.api.avnu.fi",
-  sepolia: "https://sepolia.api.avnu.fi",
+const PAYMASTER_URLS = {
+  mainnet: "https://starknet.paymaster.avnu.fi",
+  sepolia: "https://sepolia.paymaster.avnu.fi",
 };
 
 const RPC_URLS = {
@@ -30,7 +35,8 @@ const RPC_URLS = {
   sepolia: "https://starknet-sepolia.public.blastapi.io/rpc/v0_7",
 };
 
-const DEFAULT_API_KEY = process.env.AVNU_API_KEY || "";
+// STRK token address (same on mainnet and sepolia)
+const STRK_TOKEN = "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d";
 
 // ─── Parse args ──────────────────────────────────────────────────────
 function parseArgs() {
@@ -42,7 +48,8 @@ function parseArgs() {
     accountAddress: process.env.STARKNET_ACCOUNT || "",
     privateKey: process.env.STARKNET_PRIVATE_KEY || "",
     network: "sepolia",
-    apiKey: DEFAULT_API_KEY,
+    mode: "gasless", // gasless | sponsored | direct
+    apiKey: process.env.AVNU_API_KEY || "",
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -65,6 +72,9 @@ function parseArgs() {
       case "--network":
         opts.network = args[++i];
         break;
+      case "--mode":
+        opts.mode = args[++i];
+        break;
       case "--api-key":
         opts.apiKey = args[++i];
         break;
@@ -72,11 +82,14 @@ function parseArgs() {
   }
 
   if (!opts.contract || !opts.calldataFile || !opts.accountAddress || !opts.privateKey) {
-    console.error("Missing required args: --contract, --calldata-file, --account-address, --private-key");
+    console.error(
+      "Missing required args: --contract, --calldata-file, --account-address, --private-key"
+    );
     process.exit(1);
   }
-  if (!opts.apiKey) {
-    console.error("Missing AVNU_API_KEY env var or --api-key flag");
+
+  if (opts.mode === "sponsored" && !opts.apiKey) {
+    console.error("Sponsored mode requires AVNU_API_KEY env var or --api-key flag");
     process.exit(1);
   }
 
@@ -86,22 +99,21 @@ function parseArgs() {
 // ─── Main ────────────────────────────────────────────────────────────
 async function main() {
   const opts = parseArgs();
-  const avnuBase = AVNU_URLS[opts.network] || AVNU_URLS.sepolia;
   const rpcUrl = RPC_URLS[opts.network] || RPC_URLS.sepolia;
+  const paymasterUrl = PAYMASTER_URLS[opts.network] || PAYMASTER_URLS.sepolia;
 
   // Read calldata from file (space-separated felts)
   const raw = readFileSync(opts.calldataFile, "utf-8").trim();
   const calldata = raw.split(/\s+/);
 
-  console.error(`Paymaster submit:`);
+  console.error(`Submit on-chain:`);
   console.error(`  Contract:  ${opts.contract}`);
   console.error(`  Function:  ${opts.function}`);
   console.error(`  Calldata:  ${calldata.length} felts`);
   console.error(`  Account:   ${opts.accountAddress}`);
   console.error(`  Network:   ${opts.network}`);
-  console.error(`  Avnu:      ${avnuBase}`);
+  console.error(`  Mode:      ${opts.mode}`);
 
-  // Set up starknet.js account
   const provider = new RpcProvider({ nodeUrl: rpcUrl });
   const account = new Account(provider, opts.accountAddress, opts.privateKey);
 
@@ -113,57 +125,42 @@ async function main() {
     },
   ];
 
-  const headers = {
-    "Content-Type": "application/json",
-    "api-key": opts.apiKey,
-  };
+  let txHash;
 
-  // Step 1: Build typed data (sponsored — gasTokenAddress=null)
-  console.error(`  Building typed data...`);
-  const buildResp = await fetch(`${avnuBase}/paymaster/v1/build-typed-data`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      userAddress: opts.accountAddress,
-      calls,
-      gasTokenAddress: null,
-      maxGasTokenAmount: null,
-    }),
-  });
+  if (opts.mode === "direct") {
+    // ─── Direct execution (account pays gas in STRK) ──────────────
+    console.error(`  Executing directly...`);
+    const result = await account.execute(calls);
+    txHash = result.transaction_hash;
+    console.error(`  Waiting for confirmation...`);
+    await provider.waitForTransaction(txHash);
+  } else {
+    // ─── Paymaster execution (gasless or sponsored) ───────────────
+    const paymasterOpts = { nodeUrl: paymasterUrl };
 
-  if (!buildResp.ok) {
-    const errText = await buildResp.text();
-    console.error(`  Error building typed data: ${buildResp.status} ${errText}`);
-    process.exit(1);
+    if (opts.mode === "sponsored" && opts.apiKey) {
+      paymasterOpts.headers = { "x-paymaster-api-key": opts.apiKey };
+      console.error(`  Paymaster: ${paymasterUrl} (sponsored)`);
+    } else {
+      console.error(`  Paymaster: ${paymasterUrl} (gasless, pay in STRK)`);
+    }
+
+    const paymaster = new PaymasterRpc(paymasterOpts);
+
+    let feeMode;
+    if (opts.mode === "sponsored") {
+      feeMode = { mode: "sponsored" };
+    } else {
+      // Gasless: user pays gas in STRK via paymaster
+      feeMode = { mode: "default", gasToken: STRK_TOKEN };
+    }
+
+    console.error(`  Building transaction...`);
+    const result = await account.execute(calls, { paymaster, feeMode });
+    txHash = result.transaction_hash;
+    console.error(`  Waiting for confirmation...`);
+    await provider.waitForTransaction(txHash);
   }
-
-  const typedData = await buildResp.json();
-  console.error(`  Typed data received, signing...`);
-
-  // Step 2: Sign the typed data
-  const signature = await account.signMessage(typedData);
-  const sigArray = stark.formatSignature(signature);
-
-  // Step 3: Execute via Avnu paymaster
-  console.error(`  Submitting to Avnu paymaster...`);
-  const execResp = await fetch(`${avnuBase}/paymaster/v1/execute`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      userAddress: opts.accountAddress,
-      typedData: JSON.stringify(typedData),
-      signature: sigArray,
-    }),
-  });
-
-  if (!execResp.ok) {
-    const errText = await execResp.text();
-    console.error(`  Error executing: ${execResp.status} ${errText}`);
-    process.exit(1);
-  }
-
-  const result = await execResp.json();
-  const txHash = result.transactionHash;
 
   // Output
   const explorerBase =
@@ -171,7 +168,7 @@ async function main() {
       ? "https://starkscan.co"
       : "https://sepolia.starkscan.co";
 
-  console.error(`  Transaction submitted!`);
+  console.error(`  Transaction confirmed!`);
   console.error(`  TX hash:  ${txHash}`);
   console.error(`  Explorer: ${explorerBase}/tx/${txHash}`);
 
@@ -181,6 +178,7 @@ async function main() {
       transaction_hash: txHash,
       explorer_url: `${explorerBase}/tx/${txHash}`,
       network: opts.network,
+      mode: opts.mode,
       contract: opts.contract,
       function: opts.function,
       calldata_count: calldata.length,
