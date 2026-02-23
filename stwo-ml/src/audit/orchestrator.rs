@@ -26,7 +26,7 @@ use crate::audit::report::AuditReportBuilder;
 use crate::audit::scoring::aggregate_evaluations;
 use crate::audit::self_eval::{evaluate_batch, SelfEvalConfig};
 use crate::audit::storage::ArweaveClient;
-use crate::audit::submit::{serialize_audit_record_calldata, SubmitConfig};
+use crate::audit::submit::{digest_hex_to_felts, SubmitConfig};
 use crate::audit::types::{
     AuditEncryption, AuditError, AuditReport, AuditRequest, ModelInfo, PrivacyInfo,
 };
@@ -249,10 +249,29 @@ pub fn run_audit(
             cfg.report_hash = Some((lo, hi));
         }
 
-        // Use record-only calldata (11 felts) matching the Cairo submit_audit
-        // function signature. The proof is verified locally; on-chain record
-        // serves as timestamped attestation of audit commitments.
-        let data = serialize_audit_record_calldata(&audit_result, &cfg)?;
+        // Build 9-felt calldata matching the deployed submit_audit ABI:
+        //   model_id, report_hash, merkle_root, weight_commitment,
+        //   time_start, time_end, inference_count, tee_attestation_hash, privacy_tier
+        // Note: deployed contract uses single felt252 for hashes (not lo/hi pairs).
+        let data = {
+            use crate::audit::submit::parse_felt;
+            let mut cd = Vec::with_capacity(9);
+            cd.push(parse_felt(&audit_result.model_id, "model_id")?);
+            // report_hash: use lo part (most significant 124 bits of M31 digest)
+            let (rh_lo, _rh_hi) = cfg.report_hash.unwrap_or((FieldElement::ZERO, FieldElement::ZERO));
+            cd.push(rh_lo);
+            // merkle_root: use lo part
+            let (mr_lo, _mr_hi) = digest_hex_to_felts(&audit_result.log_merkle_root, "log_merkle_root")?;
+            cd.push(mr_lo);
+            cd.push(parse_felt(&audit_result.weight_commitment, "weight_commitment")?);
+            cd.push(FieldElement::from(audit_result.time_start));
+            cd.push(FieldElement::from(audit_result.time_end));
+            cd.push(FieldElement::from(audit_result.inference_count as u64));
+            let tee_hash = audit_result.tee_attestation_hash.as_deref().unwrap_or("0x0");
+            cd.push(parse_felt(tee_hash, "tee_attestation_hash")?);
+            cd.push(FieldElement::from(cfg.privacy_tier as u64));
+            cd
+        };
 
         info!(felts = data.len(), "Audit pipeline: calldata serialized");
 

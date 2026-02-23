@@ -465,13 +465,13 @@ pub fn build_direct_verification_calldata(
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 /// Parse a hex string into a FieldElement.
-fn parse_felt(hex: &str, field_name: &str) -> Result<FieldElement, AuditError> {
+pub(crate) fn parse_felt(hex: &str, field_name: &str) -> Result<FieldElement, AuditError> {
     FieldElement::from_hex_be(hex)
         .map_err(|_| AuditError::Serde(format!("invalid hex for {}: {}", field_name, hex)))
 }
 
 /// Convert an M31 digest hex string to a (lo, hi) felt252 pair.
-fn digest_hex_to_felts(hex: &str, name: &str) -> Result<(FieldElement, FieldElement), AuditError> {
+pub(crate) fn digest_hex_to_felts(hex: &str, name: &str) -> Result<(FieldElement, FieldElement), AuditError> {
     let digest = hex_to_digest(hex).map_err(|e| AuditError::Serde(format!("{}: {}", name, e)))?;
     digest_to_felt_pair(&digest)
 }
