@@ -284,6 +284,14 @@ fn apply_aggregated_oracle_sumcheck(
     //
     // GPU path: sequential per-matrix GPU Poseidon Merkle (~200ms each, ~32s total).
     // CPU fallback: 4-thread parallel pool (~3-5s each, ~5-10min total).
+    //
+    // Memory optimization: check early if full binding proof is needed.
+    // If not (RLC fast path), skip storing per-matrix MLEs — they're only needed
+    // for prove_aggregated_binding_gpu(). Without this, 160 matrices × ~4GB each
+    // would require ~640 GB RAM, causing OOM on machines with ≤256 GB.
+    let need_full_binding = std::env::var("STWO_AGGREGATED_FULL_BINDING")
+        .map(|v| !v.is_empty() && v != "0" && v != "false")
+        .unwrap_or(false);
     let total_claims = weight_data.len() + deferred_weight_claims_data.len();
     eprintln!(
         "  [{log_tag}] aggregated oracle sumcheck: preparing {total_claims} weight commitments..."
@@ -737,11 +745,21 @@ fn apply_aggregated_oracle_sumcheck(
         })
     };
 
-    // Unpack results in order
+    // Unpack results in order.
+    // Only retain MLEs when full binding proof is needed — otherwise each
+    // ~4 GB MLE × 160 matrices would require ~640 GB RAM.
     let mut agg_claims = Vec::with_capacity(total_claims);
-    let mut all_mles: Vec<Vec<SecureField>> = Vec::with_capacity(total_claims);
+    let mut all_mles: Vec<Vec<SecureField>> = if need_full_binding {
+        Vec::with_capacity(total_claims)
+    } else {
+        Vec::new()
+    };
     #[cfg(feature = "cuda-runtime")]
-    let mut all_mles_u32: Vec<Vec<u32>> = Vec::with_capacity(total_claims);
+    let mut all_mles_u32: Vec<Vec<u32>> = if need_full_binding {
+        Vec::with_capacity(total_claims)
+    } else {
+        Vec::new()
+    };
 
     for result in prep_results {
         let r = result?;
@@ -762,9 +780,13 @@ fn apply_aggregated_oracle_sumcheck(
             expected_value: r.expected_value,
             commitment: r.commitment,
         });
-        all_mles.push(r.mle);
-        #[cfg(feature = "cuda-runtime")]
-        all_mles_u32.push(r.mle_u32);
+        if need_full_binding {
+            all_mles.push(r.mle);
+            #[cfg(feature = "cuda-runtime")]
+            all_mles_u32.push(r.mle_u32);
+        }
+        // When !need_full_binding, r.mle and r.mle_u32 are dropped here,
+        // freeing ~4 GB per matrix immediately.
     }
     eprintln!(
         "  [{log_tag}] all {total_claims} weight commitments ready in {:.1}s",
@@ -780,11 +802,7 @@ fn apply_aggregated_oracle_sumcheck(
     // For on-chain verification, the commitments themselves (mixed into Fiat-Shamir)
     // provide the binding; the full opening proof is only needed for trustless mode.
     let binding_proof = if !agg_claims.is_empty() {
-        let use_full_binding = std::env::var("STWO_AGGREGATED_FULL_BINDING")
-            .map(|v| !v.is_empty() && v != "0" && v != "false")
-            .unwrap_or(false);
-
-        if use_full_binding {
+        if need_full_binding {
             let mle_refs: Vec<&[SecureField]> = all_mles.iter().map(|m| m.as_slice()).collect();
             #[cfg(feature = "cuda-runtime")]
             let proof = {
