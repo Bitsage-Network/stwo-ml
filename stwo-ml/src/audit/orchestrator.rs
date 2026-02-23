@@ -26,7 +26,7 @@ use crate::audit::report::AuditReportBuilder;
 use crate::audit::scoring::aggregate_evaluations;
 use crate::audit::self_eval::{evaluate_batch, SelfEvalConfig};
 use crate::audit::storage::ArweaveClient;
-use crate::audit::submit::{serialize_audit_record_calldata, SubmitConfig};
+use crate::audit::submit::{serialize_audit_calldata, SubmitConfig};
 use crate::audit::types::{
     AuditEncryption, AuditError, AuditReport, AuditRequest, ModelInfo, PrivacyInfo,
 };
@@ -249,10 +249,13 @@ pub fn run_audit(
             cfg.report_hash = Some((lo, hi));
         }
 
-        // Use record-only calldata (11 felts) — proof data is too large for
-        // a single Starknet transaction (5000 felt limit). The proof is verified
-        // locally; on-chain we submit only the audit commitments as attestation.
-        let data = serialize_audit_record_calldata(&audit_result, &cfg)?;
+        // Clear proof calldata before serialization — full proof data (~50K felts)
+        // exceeds Starknet's 5000 felt transaction limit. We submit only the
+        // audit header (12 felts) with proof_calldata_len=0. The proof is
+        // verified locally; on-chain record serves as timestamped attestation.
+        let mut audit_for_submit = audit_result.clone();
+        audit_for_submit.proof_calldata.clear();
+        let data = serialize_audit_calldata(&audit_for_submit, &cfg)?;
 
         info!(felts = data.len(), "Audit pipeline: calldata serialized");
 
