@@ -194,7 +194,7 @@ fi
 # Infer mode from proof artifact if metadata mode is absent.
 if [[ -z "$PROOF_MODE" ]]; then
     ENTRYPOINT_IN_PROOF=$(parse_json_field "$PROOF_FILE" "verify_calldata.entrypoint")
-    if [[ "$ENTRYPOINT_IN_PROOF" == "verify_model_gkr" || "$ENTRYPOINT_IN_PROOF" == "verify_model_gkr_v2" || "$ENTRYPOINT_IN_PROOF" == "verify_model_gkr_v3" || "$ENTRYPOINT_IN_PROOF" == "verify_model_gkr_v4" ]]; then
+    if [[ "$ENTRYPOINT_IN_PROOF" == "verify_model_gkr" || "$ENTRYPOINT_IN_PROOF" == "verify_model_gkr_v2" || "$ENTRYPOINT_IN_PROOF" == "verify_model_gkr_v3" || "$ENTRYPOINT_IN_PROOF" == "verify_model_gkr_v4" || "$ENTRYPOINT_IN_PROOF" == "verify_gkr_from_session" ]]; then
         PROOF_MODE="gkr"
         log "Inferred mode: gkr (from verify_calldata.entrypoint)"
     elif [[ "$ENTRYPOINT_IN_PROOF" == "unsupported" ]]; then
@@ -414,6 +414,14 @@ if [[ "$USE_PAYMASTER" == "true" ]] && [[ "$PROOF_MODE" != "recursive" ]]; then
     #   2. ~/.obelysk/starknet/pipeline_account.json → saved account
     #   3. Neither → auto-generate ephemeral keypair + deploy in same TX
     # No env vars needed for path 3 (true zero-config).
+
+    # Detect schema version for logging
+    SCHEMA_VERSION=$(parse_json_field "$PROOF_FILE" "verify_calldata.schema_version" 2>/dev/null || echo "1")
+    if [[ "$SCHEMA_VERSION" == "2" ]]; then
+        NUM_CHUNKS=$(parse_json_field "$PROOF_FILE" "verify_calldata.num_chunks" 2>/dev/null || echo "?")
+        TOTAL_FELTS=$(parse_json_field "$PROOF_FILE" "verify_calldata.total_felts" 2>/dev/null || echo "?")
+        log "Chunked session mode: ${TOTAL_FELTS} felts in ${NUM_CHUNKS} chunks"
+    fi
 
     # Submit via paymaster
     log "Submitting ${PROOF_MODE} proof via AVNU paymaster (gasless)..."

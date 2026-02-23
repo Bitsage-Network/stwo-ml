@@ -1210,6 +1210,179 @@ pub struct VerifyModelGkrCalldata {
     pub total_felts: usize,
 }
 
+/// Maximum felts per chunk for chunked GKR session uploads.
+pub const MAX_GKR_CHUNK_FELTS: usize = 4000;
+
+/// Threshold above which chunked session mode is auto-selected.
+pub const CHUNKED_GKR_THRESHOLD: usize = 4500;
+
+/// Chunked GKR calldata for session-based upload.
+///
+/// When total calldata exceeds `CHUNKED_GKR_THRESHOLD`, the proof is split
+/// into a flat session data buffer and uploaded in chunks via:
+///   `open_gkr_session` → `upload_gkr_chunk` × N → `seal_gkr_session` → `verify_gkr_from_session`
+#[derive(Debug, Clone)]
+pub struct ChunkedGkrCalldata {
+    /// Model ID (hex-encoded felt252).
+    pub model_id: String,
+    /// Total flat felt252 count in the session data buffer.
+    pub total_felts: usize,
+    /// Circuit depth parameter.
+    pub circuit_depth: u32,
+    /// Number of proof layers.
+    pub num_layers: u32,
+    /// Weight binding mode (3 or 4).
+    pub weight_binding_mode: u32,
+    /// Session data split into chunks of ≤ MAX_GKR_CHUNK_FELTS hex-encoded felts.
+    pub chunks: Vec<Vec<String>>,
+    /// Number of chunks.
+    pub num_chunks: usize,
+}
+
+/// Build chunked GKR session calldata from a v4 proof.
+///
+/// Produces a flat session data buffer with length-prefixed sections:
+/// ```text
+/// [raw_io_data_len, raw_io_data...,
+///  matmul_dims_len, matmul_dims...,
+///  dequantize_bits_len, dequantize_bits...,
+///  proof_data_len, proof_data...,
+///  weight_commitments_len, weight_commitments...,
+///  weight_binding_data_len, weight_binding_data...,
+///  <remaining: Serde-serialized Array<MleOpeningProof>>]
+/// ```
+///
+/// Then splits into chunks of `MAX_GKR_CHUNK_FELTS`.
+pub fn build_chunked_gkr_calldata(
+    proof: &crate::gkr::GKRProof,
+    circuit: &crate::gkr::LayeredCircuit,
+    model_id: FieldElement,
+    raw_io_data: &[FieldElement],
+) -> Result<ChunkedGkrCalldata, StarknetModelError> {
+    use crate::cairo_serde::serialize_gkr_proof_data_only;
+
+    enforce_gkr_soundness_gates(proof)?;
+
+    let binding_mode = starknet_weight_binding_mode(proof.weight_opening_transcript_mode)?;
+    if binding_mode != 3 && binding_mode != 4 {
+        return Err(StarknetModelError::SoundnessGate(format!(
+            "chunked GKR requires weight_binding_mode in {{3,4}} (got: {binding_mode})"
+        )));
+    }
+
+    let circuit_depth = circuit.layers.len() as u32;
+    let num_layers = proof.layer_proofs.len() as u32;
+
+    let mut flat: Vec<String> = Vec::new();
+
+    // Helper: push a length-prefixed Array<felt252> section.
+    macro_rules! push_felt_section {
+        ($data:expr) => {
+            flat.push(format!("{}", $data.len()));
+            for f in $data {
+                flat.push(format!("0x{:x}", f));
+            }
+        };
+    }
+
+    // 1. raw_io_data
+    push_felt_section!(raw_io_data);
+
+    // 2. matmul_dims (as felt252 values)
+    let matmul_dims = extract_matmul_dims(circuit);
+    flat.push(format!("{}", matmul_dims.len()));
+    for d in &matmul_dims {
+        flat.push(format!("{}", d));
+    }
+
+    // 3. dequantize_bits (as felt252 values)
+    let dequantize_bits = extract_dequantize_bits(circuit);
+    flat.push(format!("{}", dequantize_bits.len()));
+    for b in &dequantize_bits {
+        flat.push(format!("{}", b));
+    }
+
+    // 4. proof_data
+    let mut proof_data = Vec::new();
+    serialize_gkr_proof_data_only(proof, &mut proof_data);
+    push_felt_section!(&proof_data);
+
+    // 5. weight_commitments
+    let mut weight_commitments = proof.weight_commitments.clone();
+    for deferred in &proof.deferred_proofs {
+        if let Some(wc) = deferred.weight_commitment() {
+            weight_commitments.push(wc);
+        }
+    }
+    push_felt_section!(&weight_commitments);
+
+    // 6. weight_binding_data
+    let weight_binding_data_strs = starknet_weight_binding_data(proof)?;
+    flat.push(format!("{}", weight_binding_data_strs.len()));
+    for s in &weight_binding_data_strs {
+        flat.push(s.clone());
+    }
+
+    // 7. weight_opening_proofs — Serde-serialized as-is (count + per-proof data).
+    //    This matches how Cairo calldata deserialization works for Array<MleOpeningProof>.
+    //
+    //    For Mode 4 RLC-only (aggregated_binding is None), the on-chain verifier
+    //    never iterates over opening proofs — it uses RLC binding instead.
+    //    Omitting them drops ~53K felts (~160 proofs × ~330 felts each), reducing
+    //    total session data from ~86K to ~33K felts, which fits within Starknet's
+    //    per-TX step limit for storage reads.
+    let is_mode4_rlc = binding_mode == 4 && proof.aggregated_binding.is_none();
+    if is_mode4_rlc {
+        // Empty opening proofs array — Cairo verifier skips them for Mode 4 RLC.
+        flat.push("0".to_string());
+    } else {
+        let deferred_opening_count = proof
+            .deferred_proofs
+            .iter()
+            .filter(|d| d.has_weights())
+            .count();
+        let total_openings = proof.weight_openings.len() + deferred_opening_count;
+        flat.push(format!("{}", total_openings));
+
+        let mut opening_buf = Vec::new();
+        for opening in &proof.weight_openings {
+            opening_buf.clear();
+            crate::cairo_serde::serialize_mle_opening_proof(opening, &mut opening_buf);
+            for felt in &opening_buf {
+                flat.push(format!("0x{:x}", felt));
+            }
+        }
+        for deferred in &proof.deferred_proofs {
+            if let Some(wo) = deferred.weight_opening() {
+                opening_buf.clear();
+                crate::cairo_serde::serialize_mle_opening_proof(wo, &mut opening_buf);
+                for felt in &opening_buf {
+                    flat.push(format!("0x{:x}", felt));
+                }
+            }
+        }
+    }
+
+    let total_felts = flat.len();
+
+    // Split into chunks.
+    let chunks: Vec<Vec<String>> = flat
+        .chunks(MAX_GKR_CHUNK_FELTS)
+        .map(|c| c.to_vec())
+        .collect();
+    let num_chunks = chunks.len();
+
+    Ok(ChunkedGkrCalldata {
+        model_id: format!("0x{:x}", model_id),
+        total_felts,
+        circuit_depth,
+        num_layers,
+        weight_binding_mode: binding_mode,
+        chunks,
+        num_chunks,
+    })
+}
+
 fn starknet_weight_binding_mode(
     mode: crate::gkr::types::WeightOpeningTranscriptMode,
 ) -> Result<u32, StarknetModelError> {

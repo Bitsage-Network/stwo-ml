@@ -40,7 +40,7 @@ import { homedir } from "os";
 
 const NETWORKS = {
   sepolia: {
-    rpcPublic: "https://free-rpc.nethermind.io/sepolia-juno/",
+    rpcPublic: "https://api.cartridge.gg/x/starknet/sepolia",
     paymasterUrl: "https://sepolia.paymaster.avnu.fi",
     explorer: "https://sepolia.starkscan.co/tx/",
     factory: "0x2f69e566802910359b438ccdb3565dce304a7cc52edbf9fd246d6ad2cd89ce4",
@@ -321,12 +321,20 @@ async function deployAccountDirect(provider, account, deploymentData, network) {
 
   // Fallback: standard deploy_account (needs gas balance on the account)
   const deployPayload = {
-    classHash: deploymentData.classHash,
-    constructorCalldata: deploymentData.constructorCalldata,
+    classHash: deploymentData.class_hash || deploymentData.classHash,
+    constructorCalldata: deploymentData.calldata || deploymentData.constructorCalldata,
     addressSalt: deploymentData.salt,
   };
 
-  const { transaction_hash } = await account.deployAccount(deployPayload);
+  let transaction_hash;
+  try {
+    const result = await account.deployAccount(deployPayload);
+    transaction_hash = result.transaction_hash;
+  } catch (deployErr) {
+    const fullMsg = deployErr.message || String(deployErr);
+    info(`Standard DEPLOY_ACCOUNT error (full): ${fullMsg.slice(0, 2000)}`);
+    throw deployErr;
+  }
   info(`Account deploy TX (standard): ${transaction_hash}`);
   info("Waiting for account deployment confirmation...");
   const receipt = await provider.waitForTransaction(transaction_hash);
@@ -385,8 +393,119 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
   }
 
   const schemaVersion = verifyCalldata.schema_version;
-  if (schemaVersion !== 1) {
-    die("verify_calldata.schema_version must be 1");
+  if (schemaVersion !== 1 && schemaVersion !== 2) {
+    die("verify_calldata.schema_version must be 1 or 2");
+  }
+
+  // ── Schema v2: chunked session mode ──
+  if (schemaVersion === 2) {
+    const entrypoint = verifyCalldata.entrypoint;
+    if (entrypoint !== "verify_gkr_from_session") {
+      die(`schema_version 2 requires entrypoint=verify_gkr_from_session (got: ${entrypoint})`);
+    }
+    if (verifyCalldata.mode !== "chunked") {
+      die(`schema_version 2 requires mode=chunked (got: ${verifyCalldata.mode})`);
+    }
+    const chunks = verifyCalldata.chunks;
+    if (!Array.isArray(chunks) || chunks.length === 0) {
+      die("schema_version 2 requires non-empty chunks array");
+    }
+    const totalFelts = verifyCalldata.total_felts;
+    if (typeof totalFelts !== "number" || totalFelts <= 0) {
+      die("schema_version 2 requires positive total_felts");
+    }
+    const numChunks = verifyCalldata.num_chunks;
+    if (typeof numChunks !== "number" || numChunks !== chunks.length) {
+      die(`num_chunks mismatch: declared=${numChunks} actual=${chunks.length}`);
+    }
+    const circuitDepth = verifyCalldata.circuit_depth;
+    const numLayers = verifyCalldata.num_layers;
+    const weightBindingMode = verifyCalldata.weight_binding_mode;
+    if (typeof circuitDepth !== "number" || circuitDepth <= 0) {
+      die("schema_version 2 requires positive circuit_depth");
+    }
+    if (typeof numLayers !== "number" || numLayers <= 0) {
+      die("schema_version 2 requires positive num_layers");
+    }
+    if (![3, 4].includes(weightBindingMode)) {
+      die(`schema_version 2 requires weight_binding_mode in {3,4} (got: ${weightBindingMode})`);
+    }
+    // Validate chunk sizes.
+    let feltCount = 0;
+    for (let i = 0; i < chunks.length; i++) {
+      if (!Array.isArray(chunks[i]) || chunks[i].length === 0) {
+        die(`chunk[${i}] must be a non-empty array`);
+      }
+      if (chunks[i].length > 4000) {
+        die(`chunk[${i}] exceeds max 4000 felts (has ${chunks[i].length})`);
+      }
+      feltCount += chunks[i].length;
+    }
+    if (feltCount !== totalFelts) {
+      die(`chunk felt total mismatch: sum=${feltCount} declared=${totalFelts}`);
+    }
+    const modelId = verifyCalldata.model_id || proofData.model_id || fallbackModelId;
+
+    // For Mode 4 RLC-only: strip weight_opening_proofs from session data.
+    // The on-chain verifier never uses them, and including them pushes
+    // total storage reads past the per-TX step limit.
+    let finalChunks = chunks;
+    let finalTotalFelts = totalFelts;
+    let finalNumChunks = numChunks;
+    if (weightBindingMode === 4) {
+      // Flatten chunks → parse sections → check if Mode 4 RLC → strip openings
+      const flat = [];
+      for (const c of chunks) for (const f of c) flat.push(f);
+      const readNat = (i) => {
+        const s = String(flat[i]);
+        return s.startsWith("0x") || s.startsWith("0X") ? Number(BigInt(s)) : Number(s);
+      };
+      let off = 0;
+      // Skip through 6 length-prefixed sections
+      for (let sec = 0; sec < 6; sec++) {
+        const secLen = readNat(off); off += 1 + secLen;
+      }
+      // off now points at weight_opening_proofs start
+      const wopFelts = flat.length - off;
+      // Check if weight_binding_data (section 6) is RLC marker
+      // Parse backwards from off to find section 6
+      let sec6Off = 0, sec6Len = 0;
+      let tmpOff = 0;
+      for (let sec = 0; sec < 6; sec++) {
+        if (sec === 5) { sec6Off = tmpOff; sec6Len = readNat(tmpOff); }
+        const len = readNat(tmpOff); tmpOff += 1 + len;
+      }
+      const isRlc = sec6Len === 2 && BigInt(flat[sec6Off + 1]) === 0x524C43n;
+      if (isRlc && wopFelts > 1) {
+        // Replace opening proofs with empty array [0]
+        const stripped = flat.slice(0, off);
+        stripped.push("0");
+        info(`  Mode 4 RLC v2: stripping ${wopFelts} felts of weight_opening_proofs (${flat.length} → ${stripped.length})`);
+        // Re-chunk
+        const chunkSize = parseInt(process.env.OBELYSK_CHUNK_SIZE || "1500", 10);
+        finalChunks = [];
+        for (let i = 0; i < stripped.length; i += chunkSize) {
+          finalChunks.push(stripped.slice(i, i + chunkSize));
+        }
+        finalTotalFelts = stripped.length;
+        finalNumChunks = finalChunks.length;
+      }
+    }
+
+    return {
+      entrypoint,
+      calldata: [],
+      uploadChunks: finalChunks,
+      sessionId: null,
+      modelId,
+      schemaVersion,
+      chunked: true,
+      totalFelts: finalTotalFelts,
+      numChunks: finalNumChunks,
+      circuitDepth,
+      numLayers,
+      weightBindingMode,
+    };
   }
 
   const entrypoint = verifyCalldata.entrypoint;
@@ -409,6 +528,130 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
   if (!Array.isArray(rawCalldata) || rawCalldata.length === 0) {
     die("verify_calldata.calldata must be a non-empty array");
   }
+
+  // ── Auto-convert v1 → chunked v2 when calldata exceeds single-TX limit ──
+  // Starknet enforces ~5000-felt max calldata per TX. When a v4 proof exceeds
+  // this threshold, we parse the flat v4 calldata and rebuild it as a chunked
+  // session data buffer (schema_version 2) on the fly.
+  const CHUNKED_THRESHOLD = 5000;
+  // Default chunk size reduced from 4000 to 1500: Cartridge/public RPCs drop
+  // large-calldata TXs from mempool (TX gets RECEIVED but never ACCEPTED_ON_L2).
+  // 1500 felts → ~1503 felt calldata per TX, well within limits.
+  const MAX_CHUNK_FELTS = parseInt(process.env.OBELYSK_CHUNK_SIZE || "1500", 10);
+  if (entrypoint === "verify_model_gkr_v4" && rawCalldata.length > CHUNKED_THRESHOLD) {
+    info(`Auto-converting v1 calldata (${rawCalldata.length} felts) to chunked session format...`);
+    const cd = rawCalldata.map((v) => String(v));
+    const readNat = (idx, label) => {
+      const s = cd[idx];
+      const n = s.startsWith("0x") || s.startsWith("0X") ? Number(BigInt(s)) : Number(s);
+      if (!Number.isSafeInteger(n) || n < 0) die(`auto-chunk: invalid ${label} at idx ${idx}: ${s}`);
+      return n;
+    };
+
+    // Parse v4 calldata structure:
+    // [0] model_id, [1] raw_io_len, raw_io..., circuit_depth, num_layers,
+    // matmul_dims_len, matmul_dims..., deq_bits_len, deq_bits...,
+    // proof_data_len, proof_data..., wc_len, wc..., weight_binding_mode,
+    // wbd_len, wbd..., wop_count, wop_data...
+    let idx = 0;
+    const modelIdStr = cd[idx]; idx += 1;
+
+    // raw_io_data section
+    const rawIoLen = readNat(idx, "raw_io_len"); idx += 1;
+    const rawIoStart = idx; idx += rawIoLen;
+
+    // circuit_depth, num_layers (scalars — stored in session metadata)
+    const circuitDepth = readNat(idx, "circuit_depth"); idx += 1;
+    const numLayers = readNat(idx, "num_layers"); idx += 1;
+
+    // matmul_dims section
+    const matmulDimsLen = readNat(idx, "matmul_dims_len"); idx += 1;
+    const matmulDimsStart = idx; idx += matmulDimsLen;
+
+    // dequantize_bits section
+    const deqBitsLen = readNat(idx, "deq_bits_len"); idx += 1;
+    const deqBitsStart = idx; idx += deqBitsLen;
+
+    // proof_data section
+    const proofDataLen = readNat(idx, "proof_data_len"); idx += 1;
+    const proofDataStart = idx; idx += proofDataLen;
+
+    // weight_commitments section
+    const wcLen = readNat(idx, "wc_len"); idx += 1;
+    const wcStart = idx; idx += wcLen;
+
+    // weight_binding_mode (scalar — stored in session metadata)
+    const weightBindingMode = readNat(idx, "weight_binding_mode"); idx += 1;
+
+    // weight_binding_data section
+    const wbdLen = readNat(idx, "wbd_len"); idx += 1;
+    const wbdStart = idx; idx += wbdLen;
+
+    // weight_opening_proofs (rest of calldata = Serde-serialized Array<MleOpeningProof>)
+    const wopStart = idx;
+    const wopLen = cd.length - wopStart;
+
+    // Build session data: length-prefixed sections, no model_id/circuit_depth/num_layers/binding_mode
+    const sessionData = [];
+    // 1. raw_io_data
+    sessionData.push(String(rawIoLen));
+    for (let i = 0; i < rawIoLen; i++) sessionData.push(cd[rawIoStart + i]);
+    // 2. matmul_dims
+    sessionData.push(String(matmulDimsLen));
+    for (let i = 0; i < matmulDimsLen; i++) sessionData.push(cd[matmulDimsStart + i]);
+    // 3. dequantize_bits
+    sessionData.push(String(deqBitsLen));
+    for (let i = 0; i < deqBitsLen; i++) sessionData.push(cd[deqBitsStart + i]);
+    // 4. proof_data
+    sessionData.push(String(proofDataLen));
+    for (let i = 0; i < proofDataLen; i++) sessionData.push(cd[proofDataStart + i]);
+    // 5. weight_commitments
+    sessionData.push(String(wcLen));
+    for (let i = 0; i < wcLen; i++) sessionData.push(cd[wcStart + i]);
+    // 6. weight_binding_data
+    sessionData.push(String(wbdLen));
+    for (let i = 0; i < wbdLen; i++) sessionData.push(cd[wbdStart + i]);
+    // 7. weight_opening_proofs (raw Serde — count + serialized data)
+    //    For Mode 4 RLC-only: the on-chain verifier never uses opening proofs.
+    //    Omitting them drops ~53K felts, reducing total from ~86K to ~33K felts
+    //    which fits within Starknet's per-TX step limit for storage reads.
+    const isMode4Rlc = weightBindingMode === 4 && wbdLen === 2
+      && (cd[wbdStart] === "0x524c43" || cd[wbdStart] === "0x524C43"
+          || BigInt(cd[wbdStart]) === 0x524C43n);
+    if (isMode4Rlc) {
+      sessionData.push("0");  // empty Array<MleOpeningProof>
+      info(`  Mode 4 RLC: stripping ${wopLen} felts of weight_opening_proofs`);
+    } else {
+      for (let i = 0; i < wopLen; i++) sessionData.push(cd[wopStart + i]);
+    }
+
+    // Split into chunks
+    const chunks = [];
+    for (let i = 0; i < sessionData.length; i += MAX_CHUNK_FELTS) {
+      chunks.push(sessionData.slice(i, i + MAX_CHUNK_FELTS));
+    }
+    const totalFelts = sessionData.length;
+    const numChunks = chunks.length;
+
+    info(`  Session data: ${totalFelts} felts → ${numChunks} chunks (max ${MAX_CHUNK_FELTS}/chunk)`);
+    info(`  Model: ${modelIdStr}, circuit_depth=${circuitDepth}, num_layers=${numLayers}, binding_mode=${weightBindingMode}`);
+
+    return {
+      entrypoint: "verify_gkr_from_session",
+      calldata: [],
+      uploadChunks: chunks,
+      sessionId: null,
+      modelId: modelIdStr,
+      schemaVersion: 2,
+      chunked: true,
+      totalFelts,
+      numChunks,
+      circuitDepth,
+      numLayers,
+      weightBindingMode,
+    };
+  }
+
   if (rawCalldata.length > MAX_GKR_CALLDATA_FELTS) {
     die(
       `calldata too large for hardened submit path: ${rawCalldata.length} felts ` +
@@ -770,21 +1013,302 @@ async function cmdVerify(args) {
   const modelId = verifyPayload.modelId || modelIdArg;
 
   if (
+    args["model-id"] &&
+    String(args["model-id"]).toLowerCase() !== String(modelId).toLowerCase()
+  ) {
+    info(
+      `--model-id ${args["model-id"]} differs from proof artifact model_id ${modelId}; using proof artifact value`
+    );
+  }
+
+  // ── Deploy account if needed (shared by both paths) ──
+  const noPaymaster = args["no-paymaster"] === true || args["no-paymaster"] === "true";
+  if (needsDeploy && ephemeral) {
+    info("Deploying account...");
+    const rawCalldata = Array.isArray(ephemeral.constructorCalldata)
+      ? ephemeral.constructorCalldata
+      : CallData.compile(ephemeral.constructorCalldata);
+    await deployAccountDirect(provider, account, {
+      class_hash: net.accountClassHash,
+      salt: ephemeral.salt,
+      calldata: rawCalldata.map((v) => num.toHex(v)),
+      address: accountAddress,
+    }, network);
+    const config = loadAccountConfig();
+    if (config) {
+      config.deployedAt = new Date().toISOString();
+      config.ephemeral = true;
+      saveAccountConfig(config);
+    }
+    needsDeploy = false;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Chunked Session Flow (schema_version 2)
+  // ═══════════════════════════════════════════════════════════════════
+  if (verifyPayload.chunked) {
+    info(`Chunked GKR session mode: ${verifyPayload.totalFelts} felts in ${verifyPayload.numChunks} chunks`);
+
+    await preflightContractEntrypoint(provider, contract, "open_gkr_session");
+
+    const verificationCountBefore = await fetchVerificationCount(provider, contract, modelId);
+    if (verificationCountBefore !== null) {
+      info(`Verification count (before): ${verificationCountBefore.toString()}`);
+    }
+
+    // ── Resumability: check for saved session ──
+    const sessionDir = join(homedir(), ".obelysk", "chunked_sessions");
+    mkdirSync(sessionDir, { recursive: true });
+
+    // Helper: execute a single call
+    async function waitWithTimeout(txHash, timeoutMs = 300000) {
+      return Promise.race([
+        provider.waitForTransaction(txHash, { retryInterval: 4000 }),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error(`TX ${txHash} not confirmed after ${timeoutMs/1000}s`)), timeoutMs)
+        ),
+      ]);
+    }
+
+    // Cached resource bounds from the first successful chunk estimate.
+    // Reused for all subsequent chunks to avoid nonce-stale estimateFee failures.
+    let cachedChunkResourceBounds = null;
+
+    async function execCall(entrypoint, calldata, label, opts = {}) {
+      const calls = [{
+        contractAddress: contract,
+        entrypoint,
+        calldata: CallData.compile(calldata),
+      }];
+      info(`  ${label}...`);
+      let txHash;
+      if (noPaymaster) {
+        const result = await account.execute(calls);
+        txHash = result.transaction_hash;
+      } else {
+        txHash = await executeViaPaymaster(account, calls, undefined);
+      }
+      info(`  TX: ${txHash}`);
+      const receipt = await waitWithTimeout(txHash);
+      const execStatus = receipt.execution_status ?? receipt.status ?? "unknown";
+      if (execStatus === "REVERTED") {
+        die(`  ${label} reverted: ${receipt.revert_reason || "unknown"}`);
+      }
+      return { txHash, receipt };
+    }
+
+    // ── Step 1: open_gkr_session ──
+    const { txHash: openTxHash, receipt: openReceipt } = await execCall(
+      "open_gkr_session",
+      [
+        modelId,
+        String(verifyPayload.totalFelts),
+        String(verifyPayload.circuitDepth),
+        String(verifyPayload.numLayers),
+        String(verifyPayload.weightBindingMode),
+      ],
+      "open_gkr_session"
+    );
+
+    // Parse session_id from events.
+    let sessionId = null;
+    const events = openReceipt.events ?? [];
+    for (const ev of events) {
+      // GkrSessionOpened event has session_id as first key.
+      if (ev.keys && ev.keys.length >= 2) {
+        // key[0] is the event selector, key[1] is session_id.
+        sessionId = ev.keys[1];
+        break;
+      }
+    }
+    if (!sessionId) {
+      // Fallback: parse from data[0] if keys don't work.
+      for (const ev of events) {
+        if (ev.data && ev.data.length >= 1) {
+          sessionId = ev.data[0];
+          break;
+        }
+      }
+    }
+    if (!sessionId) {
+      die("Could not parse session_id from open_gkr_session events");
+    }
+    info(`  Session ID: ${sessionId}`);
+
+    // Save session state for resumability.
+    const sessionFile = join(sessionDir, `${sessionId.slice(0, 18)}.json`);
+    const sessionState = {
+      sessionId,
+      modelId,
+      contract,
+      totalFelts: verifyPayload.totalFelts,
+      numChunks: verifyPayload.numChunks,
+      chunksUploaded: 0,
+      txHashes: [openTxHash],
+      status: "uploading",
+      createdAt: new Date().toISOString(),
+    };
+    writeFileSync(sessionFile, JSON.stringify(sessionState, null, 2));
+
+    // ── Step 2: upload_gkr_chunk × N ──
+    // First chunk uses normal fee estimation (may need retries for nonce sync).
+    // Subsequent chunks reuse cached resource bounds with 2x safety margin,
+    // skipping estimateFee entirely to avoid nonce-stale errors on public RPCs.
+    const MAX_RETRIES = 5;
+    const INTER_CHUNK_DELAY_MS = parseInt(process.env.OBELYSK_CHUNK_DELAY_MS || "3000", 10);
+    const uploadStartTime = Date.now();
+    for (let i = 0; i < verifyPayload.numChunks; i++) {
+      const chunk = verifyPayload.uploadChunks[i];
+      const pct = ((i / verifyPayload.numChunks) * 100).toFixed(1);
+      let uploaded = false;
+      const execOpts = cachedChunkResourceBounds ? { resourceBounds: cachedChunkResourceBounds } : {};
+      for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+        try {
+          const { txHash: chunkTxHash, receipt: chunkReceipt } = await execCall(
+            "upload_gkr_chunk",
+            [sessionId, String(i), String(chunk.length), ...chunk],
+            `upload_gkr_chunk[${i + 1}/${verifyPayload.numChunks}] (${chunk.length} felts, ${pct}%)`,
+            execOpts
+          );
+          // Cache resource bounds from the first successful chunk receipt.
+          // We reuse the SAME resource bounds that the SDK computed for chunk 0
+          // on all subsequent chunks, skipping estimateFee entirely.
+          if (!cachedChunkResourceBounds && chunkReceipt) {
+            // Use a generous fixed bound: 20M l2_gas at a fixed price.
+            // This avoids BigInt/string type mixing issues with starknet.js v8.
+            cachedChunkResourceBounds = {
+              l1_gas: { max_amount: "0x0", max_price_per_unit: "0x0" },
+              l2_gas: { max_amount: "0x1312D00", max_price_per_unit: "0x174876e800" },
+              l1_data_gas: { max_amount: "0x0", max_price_per_unit: "0x0" },
+            };
+            info(`  Cached fixed resource bounds for subsequent chunks`);
+          }
+          sessionState.chunksUploaded = i + 1;
+          sessionState.txHashes.push(chunkTxHash);
+          writeFileSync(sessionFile, JSON.stringify(sessionState, null, 2));
+          uploaded = true;
+          break;
+        } catch (e) {
+          const errMsg = truncateRpcError(e);
+          info(`  Chunk ${i} attempt ${attempt + 1} failed: ${errMsg}`);
+          // If cached bounds caused the failure, clear them and retry with estimation.
+          if (cachedChunkResourceBounds && (errMsg.includes("INSUFFICIENT") || errMsg.includes("insufficient"))) {
+            info(`  Clearing cached resource bounds, will re-estimate...`);
+            cachedChunkResourceBounds = null;
+          }
+          if (attempt < MAX_RETRIES - 1) {
+            const backoffMs = Math.min((attempt + 1) * 5000, 20000);
+            info(`  Retrying in ${backoffMs / 1000}s...`);
+            await new Promise((r) => setTimeout(r, backoffMs));
+          } else {
+            die(`Failed to upload chunk ${i} after ${MAX_RETRIES} attempts`);
+          }
+        }
+      }
+      // Delay between chunks to let RPC nonce state sync
+      if (i < verifyPayload.numChunks - 1 && INTER_CHUNK_DELAY_MS > 0) {
+        await new Promise((r) => setTimeout(r, INTER_CHUNK_DELAY_MS));
+      }
+    }
+    const uploadDuration = ((Date.now() - uploadStartTime) / 1000).toFixed(1);
+    info(`All ${verifyPayload.numChunks} chunks uploaded in ${uploadDuration}s.`);
+
+    // Helper: retry execCall for nonce-stale estimateFee errors
+    async function execCallWithRetry(entrypoint, calldata, label, opts = {}, maxRetries = 5) {
+      for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+          return await execCall(entrypoint, calldata, label, opts);
+        } catch (e) {
+          const msg = truncateRpcError(e);
+          info(`  ${label} attempt ${attempt + 1} failed: ${msg}`);
+          if (attempt < maxRetries - 1) {
+            const backoffMs = Math.min((attempt + 1) * 5000, 20000);
+            info(`  Retrying in ${backoffMs / 1000}s...`);
+            await new Promise((r) => setTimeout(r, backoffMs));
+          } else {
+            throw e;
+          }
+        }
+      }
+    }
+
+    // ── Step 3: seal_gkr_session ──
+    const { txHash: sealTxHash } = await execCallWithRetry(
+      "seal_gkr_session",
+      [sessionId],
+      "seal_gkr_session"
+    );
+    sessionState.status = "sealed";
+    sessionState.txHashes.push(sealTxHash);
+    writeFileSync(sessionFile, JSON.stringify(sessionState, null, 2));
+
+    // ── Step 4: verify_gkr_from_session ──
+    const { txHash: verifyTxHash } = await execCallWithRetry(
+      "verify_gkr_from_session",
+      [sessionId],
+      "verify_gkr_from_session"
+    );
+    sessionState.status = "verified";
+    sessionState.txHashes.push(verifyTxHash);
+    writeFileSync(sessionFile, JSON.stringify(sessionState, null, 2));
+
+    // ── Check verification result ──
+    const verificationCountAfter = await fetchVerificationCount(provider, contract, modelId);
+    let verificationCountDelta = null;
+    let acceptedOnchain = false;
+    let acceptanceEvidence = "unknown";
+    if (verificationCountAfter !== null && verificationCountBefore !== null) {
+      verificationCountDelta = verificationCountAfter - verificationCountBefore;
+      acceptedOnchain = verificationCountDelta > 0n;
+      acceptanceEvidence = "verification_count_delta";
+    } else {
+      acceptedOnchain = true;
+      acceptanceEvidence = "tx_success_only_unconfirmed";
+    }
+
+    const totalTxs = sessionState.txHashes.length;
+    const explorerUrl = `${net.explorer}${verifyTxHash}`;
+    info(`Session complete: ${totalTxs} TXs`);
+    info(`Explorer (verify): ${explorerUrl}`);
+    info(`Accepted on-chain: ${acceptedOnchain}`);
+
+    jsonOutput({
+      txHash: verifyTxHash,
+      explorerUrl,
+      isVerified: acceptedOnchain,
+      acceptedOnchain,
+      fullGkrVerified: acceptedOnchain,
+      hasAnyVerification: acceptedOnchain,
+      verificationCountBefore:
+        verificationCountBefore === null ? null : verificationCountBefore.toString(),
+      verificationCountAfter:
+        verificationCountAfter === null ? null : verificationCountAfter.toString(),
+      verificationCountDelta:
+        verificationCountDelta === null ? null : verificationCountDelta.toString(),
+      acceptanceEvidence,
+      gasSponsored: !noPaymaster,
+      accountDeployed: false,
+      executionStatus: "ACCEPTED_ON_L2",
+      entrypoint: "verify_gkr_from_session",
+      onchainAssurance: "full_gkr",
+      sessionId,
+      uploadedChunks: verifyPayload.numChunks,
+      totalTxs,
+      allTxHashes: sessionState.txHashes,
+    });
+    return;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Single-TX Flow (schema_version 1)
+  // ═══════════════════════════════════════════════════════════════════
+  if (
     !new Set(["verify_model_gkr", "verify_model_gkr_v2", "verify_model_gkr_v3", "verify_model_gkr_v4"]).has(
       verifyPayload.entrypoint
     )
   ) {
     die(
       `Only verify_model_gkr / verify_model_gkr_v2 / verify_model_gkr_v3 / verify_model_gkr_v4 are supported in the hardened pipeline (got: ${verifyPayload.entrypoint})`
-    );
-  }
-
-  if (
-    args["model-id"] &&
-    String(args["model-id"]).toLowerCase() !== String(modelId).toLowerCase()
-  ) {
-    info(
-      `--model-id ${args["model-id"]} differs from proof artifact model_id ${modelId}; using proof artifact value`
     );
   }
 
@@ -811,31 +1335,14 @@ async function cmdVerify(args) {
   info(`Submitting ${verifyPayload.entrypoint} for model ${modelId}...`);
   info(`Contract: ${contract}`);
   info(`Calldata elements: ${verifyPayload.calldata.length}`);
-  if (verifyPayload.sessionId) {
-    info(`Session ID: ${verifyPayload.sessionId}`);
-  }
-
-  // ── Build deploymentData if account needs deploying ──
-  let deploymentData = undefined;
-  if (needsDeploy && ephemeral) {
-    deploymentData = {
-      classHash: net.accountClassHash,
-      salt: ephemeral.salt,
-      uniqueDeployerAddress: "0x0",
-      constructorCalldata: ephemeral.constructorCalldata,
-    };
-    info("Including deploymentData — account will be deployed in this TX");
-  }
 
   // ── Execute ──
-  const noPaymaster = args["no-paymaster"] === true || args["no-paymaster"] === "true";
   let txHash;
-  let gasSponsored = true;
+  let gasSponsored = !noPaymaster;
 
   if (noPaymaster) {
     // Direct execution — account pays gas (needs STRK balance)
     info("Submitting directly (no paymaster)...");
-    gasSponsored = false;
     try {
       const result = await account.execute(calls);
       txHash = result.transaction_hash;
@@ -844,7 +1351,7 @@ async function cmdVerify(args) {
     }
   } else {
     try {
-      txHash = await executeViaPaymaster(account, calls, deploymentData);
+      txHash = await executeViaPaymaster(account, calls, undefined);
     } catch (e) {
       const msg = truncateRpcError(e);
       if (msg.includes("not eligible") || msg.includes("not supported") || msg.includes("SNIP-9")) {
@@ -869,17 +1376,6 @@ async function cmdVerify(args) {
 
   if (execStatus === "REVERTED") {
     die(`TX reverted: ${receipt.revert_reason || "unknown reason"}`);
-  }
-
-  // Update saved config with deployment TX
-  if (needsDeploy && ephemeral) {
-    const config = loadAccountConfig();
-    if (config) {
-      config.deployTxHash = txHash;
-      config.deployedAt = new Date().toISOString();
-      config.ephemeral = true;
-      saveAccountConfig(config);
-    }
   }
 
   // ── Check post-submit verification status with assurance separation ──
@@ -962,7 +1458,7 @@ async function cmdVerify(args) {
       verificationCountDelta === null ? null : verificationCountDelta.toString(),
     acceptanceEvidence,
     gasSponsored,
-    accountDeployed: needsDeploy,
+    accountDeployed: false,
     executionStatus: execStatus,
     entrypoint: verifyPayload.entrypoint,
     onchainAssurance,

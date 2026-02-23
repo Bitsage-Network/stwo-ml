@@ -1208,9 +1208,10 @@ fn main() {
         }
         OutputFormat::MlGkr => {
             use stwo_ml::starknet::{
-                build_gkr_serializable_proof, build_verify_model_gkr_calldata,
-                build_verify_model_gkr_v2_calldata, build_verify_model_gkr_v3_calldata,
-                build_verify_model_gkr_v4_calldata,
+                build_chunked_gkr_calldata, build_gkr_serializable_proof,
+                build_verify_model_gkr_calldata, build_verify_model_gkr_v2_calldata,
+                build_verify_model_gkr_v3_calldata, build_verify_model_gkr_v4_calldata,
+                CHUNKED_GKR_THRESHOLD,
             };
 
             let gkr_proof =
@@ -1292,17 +1293,53 @@ fn main() {
                         };
                         match verify_result {
                             Ok(vc) => {
-                                eprintln!(
-                                    "  verify_calldata: {} parts (ready for submission)",
-                                    vc.total_felts
-                                );
-                                serde_json::json!({
-                                    "schema_version": 1,
-                                    "entrypoint": verify_entrypoint,
-                                    "calldata": vc.calldata_parts,
-                                    "total_felts": vc.total_felts,
-                                    "upload_chunks": Vec::<Vec<String>>::new(),
-                                })
+                                if vc.total_felts > CHUNKED_GKR_THRESHOLD && use_starknet_gkr_v4 {
+                                    // Auto-select chunked session mode for large proofs.
+                                    match build_chunked_gkr_calldata(gkr_p, &circuit, model_id, &raw_io) {
+                                        Ok(chunked) => {
+                                            eprintln!(
+                                                "  verify_calldata: {} felts → {} chunks (chunked session mode)",
+                                                chunked.total_felts, chunked.num_chunks
+                                            );
+                                            serde_json::json!({
+                                                "schema_version": 2,
+                                                "entrypoint": "verify_gkr_from_session",
+                                                "mode": "chunked",
+                                                "total_felts": chunked.total_felts,
+                                                "num_chunks": chunked.num_chunks,
+                                                "circuit_depth": chunked.circuit_depth,
+                                                "num_layers": chunked.num_layers,
+                                                "weight_binding_mode": chunked.weight_binding_mode,
+                                                "model_id": chunked.model_id,
+                                                "chunks": chunked.chunks,
+                                            })
+                                        }
+                                        Err(e) => {
+                                            eprintln!(
+                                                "  Warning: chunked calldata build failed, falling back to single-TX: {e}"
+                                            );
+                                            serde_json::json!({
+                                                "schema_version": 1,
+                                                "entrypoint": verify_entrypoint,
+                                                "calldata": vc.calldata_parts,
+                                                "total_felts": vc.total_felts,
+                                                "upload_chunks": Vec::<Vec<String>>::new(),
+                                            })
+                                        }
+                                    }
+                                } else {
+                                    eprintln!(
+                                        "  verify_calldata: {} parts (ready for submission)",
+                                        vc.total_felts
+                                    );
+                                    serde_json::json!({
+                                        "schema_version": 1,
+                                        "entrypoint": verify_entrypoint,
+                                        "calldata": vc.calldata_parts,
+                                        "total_felts": vc.total_felts,
+                                        "upload_chunks": Vec::<Vec<String>>::new(),
+                                    })
+                                }
                             }
                             Err(e) => {
                                 eprintln!(

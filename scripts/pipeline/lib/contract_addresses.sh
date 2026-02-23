@@ -61,7 +61,7 @@ RPC_SEPOLIA="https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_8/${
 RPC_MAINNET="https://starknet-mainnet.g.alchemy.com/starknet/version/rpc/v0_8/${ALCHEMY_KEY:-}"
 
 # Public fallbacks (rate-limited, no API key needed)
-RPC_SEPOLIA_PUBLIC="https://free-rpc.nethermind.io/sepolia-juno/"
+RPC_SEPOLIA_PUBLIC="https://api.cartridge.gg/x/starknet/sepolia"
 RPC_MAINNET_PUBLIC="https://free-rpc.nethermind.io/mainnet-juno/"
 
 # ─── Lookup Functions ────────────────────────────────────────────────

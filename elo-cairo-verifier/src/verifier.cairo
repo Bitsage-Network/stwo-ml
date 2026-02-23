@@ -188,6 +188,53 @@ pub trait ISumcheckVerifier<TContractState> {
 
     /// Get the number of GKR weight commitments for a model.
     fn get_model_gkr_weight_count(self: @TContractState, model_id: felt252) -> u32;
+
+    // ─── Chunked GKR Session Protocol ────────────────────────────────────
+
+    /// Open a new GKR upload session. Returns the session_id.
+    ///
+    /// The caller becomes the session owner and is the only address
+    /// allowed to upload chunks.
+    fn open_gkr_session(
+        ref self: TContractState,
+        model_id: felt252,
+        total_felts: u32,
+        circuit_depth: u32,
+        num_layers: u32,
+        weight_binding_mode: u32,
+    ) -> felt252;
+
+    /// Upload a chunk of proof data to an open session.
+    ///
+    /// Chunks must be uploaded in order (`chunk_idx == chunks_received`).
+    /// Each chunk may contain at most 4000 felt252 values.
+    fn upload_gkr_chunk(
+        ref self: TContractState,
+        session_id: felt252,
+        chunk_idx: u32,
+        data: Array<felt252>,
+    );
+
+    /// Seal a session after all chunks have been uploaded.
+    ///
+    /// Validates that the total received felts match the declared total.
+    fn seal_gkr_session(ref self: TContractState, session_id: felt252);
+
+    /// Verify a sealed session's proof data from storage.
+    ///
+    /// Reads all data back from `gkr_session_data`, deserializes into
+    /// the standard verify_model_gkr_core parameters, and runs verification.
+    fn verify_gkr_from_session(ref self: TContractState, session_id: felt252) -> bool;
+
+    /// Expire a timed-out session and clean up metadata.
+    ///
+    /// Anyone can call this after `GKR_SESSION_TIMEOUT_BLOCKS` (~1000 blocks).
+    /// Does NOT clean up data storage (too expensive); only resets metadata
+    /// so the session_id cannot be used.
+    fn expire_gkr_session(ref self: TContractState, session_id: felt252);
+
+    /// Get the status of a GKR session (0=none, 1=uploading, 2=sealed, 3=verified).
+    fn get_gkr_session_status(self: @TContractState, session_id: felt252) -> u8;
 }
 
 #[starknet::contract]
@@ -278,6 +325,33 @@ mod SumcheckVerifierContract {
         view_delegation_list: Map<(ContractAddress, u32), ContractAddress>,
         /// owner → number of delegations.
         view_delegation_count: Map<ContractAddress, u32>,
+        // ─── GKR Chunked Session Storage ─────────────────────────
+        /// session_id → session owner address.
+        gkr_session_owner: Map<felt252, ContractAddress>,
+        /// session_id → model_id.
+        gkr_session_model_id: Map<felt252, felt252>,
+        /// session_id → total felts expected.
+        gkr_session_total_felts: Map<felt252, u32>,
+        /// session_id → felts received so far.
+        gkr_session_received_felts: Map<felt252, u32>,
+        /// session_id → total number of chunks expected.
+        gkr_session_num_chunks: Map<felt252, u32>,
+        /// session_id → number of chunks received so far.
+        gkr_session_chunks_received: Map<felt252, u32>,
+        /// session_id → session status (0=none, 1=uploading, 2=sealed, 3=verified).
+        gkr_session_status: Map<felt252, u8>,
+        /// session_id → block number when session was created.
+        gkr_session_created_at: Map<felt252, u64>,
+        /// (session_id, flat_index) → felt252 data.
+        gkr_session_data: Map<(felt252, u32), felt252>,
+        /// session_id → circuit_depth parameter.
+        gkr_session_circuit_depth: Map<felt252, u32>,
+        /// session_id → num_layers parameter.
+        gkr_session_num_layers: Map<felt252, u32>,
+        /// session_id → weight_binding_mode parameter.
+        gkr_session_weight_binding_mode: Map<felt252, u32>,
+        /// Monotonic nonce for generating unique session IDs.
+        next_gkr_session_nonce: u64,
     }
 
     #[event]
@@ -286,6 +360,11 @@ mod SumcheckVerifierContract {
         ModelRegistered: ModelRegistered,
         ModelGkrRegistered: ModelGkrRegistered,
         ModelGkrVerified: ModelGkrVerified,
+        GkrSessionOpened: GkrSessionOpened,
+        GkrChunkUploaded: GkrChunkUploaded,
+        GkrSessionSealed: GkrSessionSealed,
+        GkrSessionVerified: GkrSessionVerified,
+        GkrSessionExpired: GkrSessionExpired,
         VerificationFailed: VerificationFailed,
         UpgradeProposed: UpgradeProposed,
         UpgradeExecuted: UpgradeExecuted,
@@ -349,6 +428,55 @@ mod SumcheckVerifierContract {
         cancelled_class_hash: ClassHash,
         cancelled_by: ContractAddress,
     }
+
+    #[derive(Drop, starknet::Event)]
+    struct GkrSessionOpened {
+        #[key]
+        session_id: felt252,
+        model_id: felt252,
+        owner: ContractAddress,
+        total_felts: u32,
+        num_chunks: u32,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    struct GkrChunkUploaded {
+        #[key]
+        session_id: felt252,
+        chunk_idx: u32,
+        data_len: u32,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    struct GkrSessionSealed {
+        #[key]
+        session_id: felt252,
+        total_felts: u32,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    struct GkrSessionVerified {
+        #[key]
+        session_id: felt252,
+        model_id: felt252,
+        proof_hash: felt252,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    struct GkrSessionExpired {
+        #[key]
+        session_id: felt252,
+        expired_by: ContractAddress,
+    }
+
+    // GKR session constants
+    const MAX_GKR_CHUNK_FELTS: u32 = 4000;
+    const GKR_SESSION_TIMEOUT_BLOCKS: u64 = 10000;
+    // Session status values
+    const GKR_SESSION_STATUS_NONE: u8 = 0;
+    const GKR_SESSION_STATUS_UPLOADING: u8 = 1;
+    const GKR_SESSION_STATUS_SEALED: u8 = 2;
+    const GKR_SESSION_STATUS_VERIFIED: u8 = 3;
 
     const WEIGHT_BINDING_MODE_SEQUENTIAL: u32 = 0;
     const WEIGHT_BINDING_MODE_BATCHED_SUBCHANNEL_V1: u32 = 1;
@@ -1212,6 +1340,340 @@ mod SumcheckVerifierContract {
 
         fn get_model_gkr_weight_count(self: @ContractState, model_id: felt252) -> u32 {
             self.model_gkr_weight_count.entry(model_id).read()
+        }
+
+        // ─── Chunked GKR Session Protocol ────────────────────────────────
+
+        fn open_gkr_session(
+            ref self: ContractState,
+            model_id: felt252,
+            total_felts: u32,
+            circuit_depth: u32,
+            num_layers: u32,
+            weight_binding_mode: u32,
+        ) -> felt252 {
+            assert!(total_felts > 0, "GKR_SESSION_ZERO_FELTS");
+            assert!(circuit_depth > 0, "GKR_SESSION_ZERO_CIRCUIT_DEPTH");
+            assert!(num_layers > 0, "GKR_SESSION_ZERO_NUM_LAYERS");
+            assert!(
+                weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_OPENINGS_V4_EXPERIMENTAL
+                    || weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_ORACLE_SUMCHECK,
+                "GKR_SESSION_UNSUPPORTED_BINDING_MODE",
+            );
+
+            // Note: model registration is NOT required for the session path,
+            // matching verify_model_gkr_v4 which also skips it.
+
+            // Compute number of chunks: ceil(total_felts / MAX_GKR_CHUNK_FELTS).
+            let num_chunks = (total_felts + MAX_GKR_CHUNK_FELTS - 1) / MAX_GKR_CHUNK_FELTS;
+
+            // Generate session_id via Poseidon(nonce, caller, block).
+            let nonce = self.next_gkr_session_nonce.read();
+            let caller = get_caller_address();
+            let block = get_block_number();
+            let session_id = core::poseidon::poseidon_hash_span(
+                array![nonce.into(), caller.into(), block.into(), model_id].span(),
+            );
+            self.next_gkr_session_nonce.write(nonce + 1);
+
+            // Write session metadata.
+            self.gkr_session_owner.entry(session_id).write(caller);
+            self.gkr_session_model_id.entry(session_id).write(model_id);
+            self.gkr_session_total_felts.entry(session_id).write(total_felts);
+            self.gkr_session_received_felts.entry(session_id).write(0);
+            self.gkr_session_num_chunks.entry(session_id).write(num_chunks);
+            self.gkr_session_chunks_received.entry(session_id).write(0);
+            self.gkr_session_status.entry(session_id).write(GKR_SESSION_STATUS_UPLOADING);
+            self.gkr_session_created_at.entry(session_id).write(block);
+            self.gkr_session_circuit_depth.entry(session_id).write(circuit_depth);
+            self.gkr_session_num_layers.entry(session_id).write(num_layers);
+            self.gkr_session_weight_binding_mode.entry(session_id).write(weight_binding_mode);
+
+            self.emit(GkrSessionOpened {
+                session_id, model_id, owner: caller, total_felts, num_chunks,
+            });
+
+            session_id
+        }
+
+        fn upload_gkr_chunk(
+            ref self: ContractState,
+            session_id: felt252,
+            chunk_idx: u32,
+            data: Array<felt252>,
+        ) {
+            // Session must be in uploading state.
+            let status = self.gkr_session_status.entry(session_id).read();
+            assert!(status == GKR_SESSION_STATUS_UPLOADING, "GKR_SESSION_NOT_UPLOADING");
+
+            // Only the session owner can upload.
+            let caller = get_caller_address();
+            let owner = self.gkr_session_owner.entry(session_id).read();
+            assert!(caller == owner, "GKR_SESSION_NOT_OWNER");
+
+            // Check timeout.
+            let created_at = self.gkr_session_created_at.entry(session_id).read();
+            let current_block = get_block_number();
+            assert!(
+                current_block <= created_at + GKR_SESSION_TIMEOUT_BLOCKS,
+                "GKR_SESSION_EXPIRED",
+            );
+
+            // Chunks must arrive in order.
+            let chunks_received = self.gkr_session_chunks_received.entry(session_id).read();
+            assert!(chunk_idx == chunks_received, "GKR_SESSION_CHUNK_OUT_OF_ORDER");
+
+            // Chunk must not exceed limit.
+            let data_len: u32 = data.len();
+            assert!(data_len > 0, "GKR_SESSION_EMPTY_CHUNK");
+            assert!(data_len <= MAX_GKR_CHUNK_FELTS, "GKR_SESSION_CHUNK_TOO_LARGE");
+
+            // Must not exceed total_felts.
+            let received = self.gkr_session_received_felts.entry(session_id).read();
+            let total_felts = self.gkr_session_total_felts.entry(session_id).read();
+            assert!(received + data_len <= total_felts, "GKR_SESSION_FELTS_OVERFLOW");
+
+            // Write data to flat storage.
+            let base_offset = received;
+            let data_span = data.span();
+            let mut i: u32 = 0;
+            loop {
+                if i >= data_len {
+                    break;
+                }
+                self.gkr_session_data.entry((session_id, base_offset + i)).write(*data_span.at(i));
+                i += 1;
+            };
+
+            // Update counters.
+            self.gkr_session_received_felts.entry(session_id).write(received + data_len);
+            self.gkr_session_chunks_received.entry(session_id).write(chunks_received + 1);
+
+            self.emit(GkrChunkUploaded { session_id, chunk_idx, data_len });
+        }
+
+        fn seal_gkr_session(ref self: ContractState, session_id: felt252) {
+            let status = self.gkr_session_status.entry(session_id).read();
+            assert!(status == GKR_SESSION_STATUS_UPLOADING, "GKR_SESSION_NOT_UPLOADING");
+
+            let caller = get_caller_address();
+            let owner = self.gkr_session_owner.entry(session_id).read();
+            assert!(caller == owner, "GKR_SESSION_NOT_OWNER");
+
+            // Check timeout.
+            let created_at = self.gkr_session_created_at.entry(session_id).read();
+            let current_block = get_block_number();
+            assert!(
+                current_block <= created_at + GKR_SESSION_TIMEOUT_BLOCKS,
+                "GKR_SESSION_EXPIRED",
+            );
+
+            // All felts must be received.
+            let received = self.gkr_session_received_felts.entry(session_id).read();
+            let total_felts = self.gkr_session_total_felts.entry(session_id).read();
+            assert!(received == total_felts, "GKR_SESSION_INCOMPLETE");
+
+            self.gkr_session_status.entry(session_id).write(GKR_SESSION_STATUS_SEALED);
+
+            self.emit(GkrSessionSealed { session_id, total_felts });
+        }
+
+        fn verify_gkr_from_session(ref self: ContractState, session_id: felt252) -> bool {
+            let status = self.gkr_session_status.entry(session_id).read();
+            assert!(status == GKR_SESSION_STATUS_SEALED, "GKR_SESSION_NOT_SEALED");
+
+            // Check timeout.
+            let created_at = self.gkr_session_created_at.entry(session_id).read();
+            let current_block = get_block_number();
+            assert!(
+                current_block <= created_at + GKR_SESSION_TIMEOUT_BLOCKS,
+                "GKR_SESSION_EXPIRED",
+            );
+
+            let model_id = self.gkr_session_model_id.entry(session_id).read();
+            let total_felts = self.gkr_session_total_felts.entry(session_id).read();
+            let circuit_depth = self.gkr_session_circuit_depth.entry(session_id).read();
+            let num_layers = self.gkr_session_num_layers.entry(session_id).read();
+            let weight_binding_mode = self.gkr_session_weight_binding_mode.entry(session_id).read();
+
+            // ── Read all data from flat storage into memory ──
+            // Layout: [raw_io_data_len, raw_io_data...,
+            //          matmul_dims_len, matmul_dims...,
+            //          dequantize_bits_len, dequantize_bits...,
+            //          proof_data_len, proof_data...,
+            //          weight_commitments_len, weight_commitments...,
+            //          weight_binding_data_len, weight_binding_data...,
+            //          weight_opening_proofs_len, weight_opening_proofs_flat...]
+            let mut flat: Array<felt252> = array![];
+            let mut idx: u32 = 0;
+            loop {
+                if idx >= total_felts {
+                    break;
+                }
+                flat.append(self.gkr_session_data.entry((session_id, idx)).read());
+                idx += 1;
+            };
+            let flat_span = flat.span();
+
+            // ── Parse sections from flat data ──
+            let mut off: u32 = 0;
+
+            // 1. raw_io_data
+            assert!(off < total_felts, "GKR_SESSION_DATA_TRUNCATED");
+            let raw_io_len_u256: u256 = (*flat_span.at(off)).into();
+            let raw_io_len: u32 = raw_io_len_u256.try_into().unwrap();
+            off += 1;
+            let mut raw_io_data: Array<felt252> = array![];
+            let mut i: u32 = 0;
+            loop {
+                if i >= raw_io_len {
+                    break;
+                }
+                raw_io_data.append(*flat_span.at(off + i));
+                i += 1;
+            };
+            off += raw_io_len;
+
+            // 2. matmul_dims
+            assert!(off < total_felts, "GKR_SESSION_DATA_TRUNCATED");
+            let matmul_dims_len_u256: u256 = (*flat_span.at(off)).into();
+            let matmul_dims_len: u32 = matmul_dims_len_u256.try_into().unwrap();
+            off += 1;
+            let mut matmul_dims: Array<u32> = array![];
+            i = 0;
+            loop {
+                if i >= matmul_dims_len {
+                    break;
+                }
+                let v_u256: u256 = (*flat_span.at(off + i)).into();
+                matmul_dims.append(v_u256.try_into().unwrap());
+                i += 1;
+            };
+            off += matmul_dims_len;
+
+            // 3. dequantize_bits
+            assert!(off < total_felts, "GKR_SESSION_DATA_TRUNCATED");
+            let deq_bits_len_u256: u256 = (*flat_span.at(off)).into();
+            let deq_bits_len: u32 = deq_bits_len_u256.try_into().unwrap();
+            off += 1;
+            let mut dequantize_bits: Array<u64> = array![];
+            i = 0;
+            loop {
+                if i >= deq_bits_len {
+                    break;
+                }
+                let v_u256: u256 = (*flat_span.at(off + i)).into();
+                dequantize_bits.append(v_u256.try_into().unwrap());
+                i += 1;
+            };
+            off += deq_bits_len;
+
+            // 4. proof_data
+            assert!(off < total_felts, "GKR_SESSION_DATA_TRUNCATED");
+            let proof_data_len_u256: u256 = (*flat_span.at(off)).into();
+            let proof_data_len: u32 = proof_data_len_u256.try_into().unwrap();
+            off += 1;
+            let mut proof_data: Array<felt252> = array![];
+            i = 0;
+            loop {
+                if i >= proof_data_len {
+                    break;
+                }
+                proof_data.append(*flat_span.at(off + i));
+                i += 1;
+            };
+            off += proof_data_len;
+
+            // 5. weight_commitments
+            assert!(off < total_felts, "GKR_SESSION_DATA_TRUNCATED");
+            let wc_len_u256: u256 = (*flat_span.at(off)).into();
+            let wc_len: u32 = wc_len_u256.try_into().unwrap();
+            off += 1;
+            let mut weight_commitments: Array<felt252> = array![];
+            i = 0;
+            loop {
+                if i >= wc_len {
+                    break;
+                }
+                weight_commitments.append(*flat_span.at(off + i));
+                i += 1;
+            };
+            off += wc_len;
+
+            // 6. weight_binding_data
+            assert!(off < total_felts, "GKR_SESSION_DATA_TRUNCATED");
+            let wbd_len_u256: u256 = (*flat_span.at(off)).into();
+            let wbd_len: u32 = wbd_len_u256.try_into().unwrap();
+            off += 1;
+            let mut weight_binding_data: Array<felt252> = array![];
+            i = 0;
+            loop {
+                if i >= wbd_len {
+                    break;
+                }
+                weight_binding_data.append(*flat_span.at(off + i));
+                i += 1;
+            };
+            off += wbd_len;
+
+            // 7. weight_opening_proofs (remaining felts are Serde-serialized Array<MleOpeningProof>)
+            assert!(off <= total_felts, "GKR_SESSION_DATA_TRUNCATED");
+            let wop_len = total_felts - off;
+            let mut wop_span = flat_span.slice(off, wop_len);
+            let weight_opening_proofs: Array<MleOpeningProof> =
+                Serde::deserialize(ref wop_span).expect('GKR_SESSION_WOP_DESER_FAIL');
+
+            // ── Delegate to core verifier ──
+            let result = verify_model_gkr_core(
+                ref self,
+                model_id,
+                raw_io_data,
+                circuit_depth,
+                num_layers,
+                matmul_dims,
+                dequantize_bits,
+                proof_data,
+                weight_commitments,
+                weight_binding_mode,
+                weight_binding_data.span(),
+                weight_opening_proofs,
+            );
+
+            // Mark session as verified.
+            self.gkr_session_status.entry(session_id).write(GKR_SESSION_STATUS_VERIFIED);
+
+            // proof_hash was already emitted by verify_model_gkr_core via ModelGkrVerified.
+            // Session event uses a session-derived hash for correlation.
+            let session_proof_hash = core::poseidon::poseidon_hash_span(
+                array![session_id, model_id].span(),
+            );
+            self.emit(GkrSessionVerified { session_id, model_id, proof_hash: session_proof_hash });
+
+            result
+        }
+
+        fn expire_gkr_session(ref self: ContractState, session_id: felt252) {
+            let status = self.gkr_session_status.entry(session_id).read();
+            assert!(
+                status == GKR_SESSION_STATUS_UPLOADING || status == GKR_SESSION_STATUS_SEALED,
+                "GKR_SESSION_CANNOT_EXPIRE",
+            );
+
+            let created_at = self.gkr_session_created_at.entry(session_id).read();
+            let current_block = get_block_number();
+            assert!(
+                current_block > created_at + GKR_SESSION_TIMEOUT_BLOCKS,
+                "GKR_SESSION_NOT_EXPIRED",
+            );
+
+            // Reset metadata (data storage is left — too expensive to clean).
+            self.gkr_session_status.entry(session_id).write(GKR_SESSION_STATUS_NONE);
+
+            self.emit(GkrSessionExpired { session_id, expired_by: get_caller_address() });
+        }
+
+        fn get_gkr_session_status(self: @ContractState, session_id: felt252) -> u8 {
+            self.gkr_session_status.entry(session_id).read()
         }
     }
 
