@@ -298,13 +298,14 @@ struct AuditCmd {
     #[arg(long, default_value = "sepolia")]
     network: String,
 
-    /// sncast account name for on-chain submission.
-    #[arg(long, default_value = "deployer")]
-    account: String,
+    /// Submitter account address (or set STARKNET_ACCOUNT env var).
+    #[arg(long)]
+    account: Option<String>,
 
-    /// Max fee in ETH for on-chain submission.
-    #[arg(long, default_value = "0.05")]
-    max_fee: String,
+    /// Submitter private key (or set STARKNET_PRIVATE_KEY env var).
+    /// Prefer env var over CLI to avoid leaking keys in process listings.
+    #[arg(long)]
+    private_key: Option<String>,
 
     /// Path to write the audit report JSON.
     #[arg(long, default_value = "audit_report.json")]
@@ -3198,77 +3199,122 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
                 calldata.len()
             );
 
-            // Submit via sncast
+            // Submit via Avnu paymaster (gasless)
             eprintln!();
-            eprintln!("=== On-Chain Audit Submission ===");
+            eprintln!("=== On-Chain Audit Submission (Avnu Paymaster) ===");
             eprintln!("  Contract: {}", cmd.contract);
-            eprintln!("  Account:  {}", cmd.account);
             eprintln!("  Network:  {}", cmd.network);
-            eprintln!("  Fee:      auto-estimated");
+            eprintln!("  Fee:      sponsored (gasless)");
 
-            // Write calldata to temp file (may exceed shell arg limit)
-            let calldata_txt = cmd.output.with_extension("calldata.txt");
-            let calldata_flat = calldata_strs.join(" ");
-            std::fs::write(&calldata_txt, &calldata_flat).unwrap_or_else(|e| {
-                eprintln!("Error writing calldata txt: {e}");
-                process::exit(1);
-            });
+            // Resolve account address and private key from CLI or env
+            let acct_addr = cmd
+                .account
+                .clone()
+                .or_else(|| std::env::var("STARKNET_ACCOUNT").ok())
+                .unwrap_or_default();
+            let priv_key = cmd
+                .private_key
+                .clone()
+                .or_else(|| std::env::var("STARKNET_PRIVATE_KEY").ok())
+                .unwrap_or_default();
 
-            eprintln!("  Submitting submit_audit...");
-            let submit_result = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!(
-                    "sncast --account '{}' invoke \
-                     --network '{}' \
-                     --contract-address '{}' \
-                     --function submit_audit \
-                     --calldata $(cat '{}')",
-                    cmd.account,
-                    cmd.network,
-                    cmd.contract,
-                    calldata_txt.display(),
-                ))
-                .output();
+            if acct_addr.is_empty() || priv_key.is_empty() {
+                eprintln!("  Error: --account + --private-key (or STARKNET_ACCOUNT + STARKNET_PRIVATE_KEY env vars) required for submission");
+                eprintln!("  Calldata saved to: {}", calldata_path.display());
+                eprintln!("  Submit manually:");
+                eprintln!(
+                    "    node scripts/pipeline/paymaster_submit.mjs --contract {} --calldata-file {} --account-address $STARKNET_ACCOUNT --private-key $STARKNET_PRIVATE_KEY --network {}",
+                    cmd.contract, calldata_path.display(), cmd.network
+                );
+            } else {
+                eprintln!("  Account: {}", acct_addr);
 
-            match submit_result {
-                Ok(output) if output.status.success() => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    eprintln!("  Audit submitted successfully!");
-                    eprintln!("  {}", stdout.trim());
+                // Write calldata as space-separated felts for the paymaster script
+                let calldata_txt = cmd.output.with_extension("calldata.txt");
+                let calldata_flat = calldata_strs.join(" ");
+                std::fs::write(&calldata_txt, &calldata_flat).unwrap_or_else(|e| {
+                    eprintln!("Error writing calldata txt: {e}");
+                    process::exit(1);
+                });
 
-                    // Try to extract tx hash from sncast output
-                    let stdout_str = stdout.to_string();
-                    if let Some(tx_line) =
-                        stdout_str.lines().find(|l| l.contains("transaction_hash"))
-                    {
-                        let tx_hash = tx_line.split_whitespace().last().unwrap_or("");
-                        let explorer = explorer_url(&cmd.network, tx_hash);
-                        eprintln!("  Explorer: {}", explorer);
+                // Find the paymaster script relative to the binary
+                let paymaster_script = {
+                    let exe = std::env::current_exe().unwrap_or_default();
+                    let repo_root = exe
+                        .parent() // target/release
+                        .and_then(|p| p.parent()) // target
+                        .and_then(|p| p.parent()); // repo root
+                    match repo_root {
+                        Some(root) => root.join("scripts/pipeline/paymaster_submit.mjs"),
+                        None => PathBuf::from("scripts/pipeline/paymaster_submit.mjs"),
+                    }
+                };
+
+                eprintln!("  Submitting via paymaster...");
+                let mut submit_cmd = std::process::Command::new("node");
+                submit_cmd
+                    .arg(&paymaster_script)
+                    .arg("--contract")
+                    .arg(&cmd.contract)
+                    .arg("--function")
+                    .arg("submit_audit")
+                    .arg("--calldata-file")
+                    .arg(&calldata_txt)
+                    .arg("--account-address")
+                    .arg(&acct_addr)
+                    .arg("--private-key")
+                    .arg(&priv_key)
+                    .arg("--network")
+                    .arg(&cmd.network);
+
+                // Pass Avnu API key via env if set
+                if let Ok(api_key) = std::env::var("AVNU_API_KEY") {
+                    submit_cmd.env("AVNU_API_KEY", api_key);
+                }
+
+                let submit_result = submit_cmd.output();
+
+                match submit_result {
+                    Ok(output) if output.status.success() => {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        eprintln!("{}", stderr.trim());
+                        eprintln!("  Audit submitted successfully!");
+
+                        // Parse JSON output for tx hash
+                        if let Ok(json) =
+                            serde_json::from_str::<serde_json::Value>(stdout.trim())
+                        {
+                            if let Some(tx) = json.get("transaction_hash").and_then(|v| v.as_str())
+                            {
+                                eprintln!("  TX hash: {}", tx);
+                            }
+                            if let Some(url) = json.get("explorer_url").and_then(|v| v.as_str()) {
+                                eprintln!("  Explorer: {}", url);
+                            }
+                        }
+                    }
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        eprintln!("  Warning: submission may have failed:");
+                        if !stderr.is_empty() {
+                            eprintln!("    {}", stderr.trim());
+                        }
+                        if !stdout.is_empty() {
+                            eprintln!("    {}", stdout.trim());
+                        }
+                        eprintln!("  Calldata saved to: {}", calldata_txt.display());
+                    }
+                    Err(e) => {
+                        eprintln!("  Error: could not run paymaster script: {e}");
+                        eprintln!(
+                            "  Make sure Node.js is installed and starknet package is available"
+                        );
+                        eprintln!("  Calldata saved to: {}", calldata_txt.display());
                     }
                 }
-                Ok(output) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    eprintln!("  Warning: submission may have failed:");
-                    eprintln!("    stdout: {}", stdout.trim());
-                    eprintln!("    stderr: {}", stderr.trim());
-                    eprintln!("  Calldata saved to: {}", calldata_txt.display());
-                    eprintln!("  You can retry manually with:");
-                    eprintln!("    sncast invoke --contract-address {} --function submit_audit --calldata $(cat '{}')",
-                        cmd.contract, calldata_txt.display());
-                }
-                Err(e) => {
-                    eprintln!("  Error: could not run sncast: {e}");
-                    eprintln!("  Make sure sncast is installed: curl -L https://raw.githubusercontent.com/foundry-rs/starknet-foundry/master/scripts/install.sh | sh");
-                    eprintln!("  Calldata saved to: {}", calldata_txt.display());
-                    eprintln!("  Submit manually:");
-                    eprintln!("    sncast invoke --contract-address {} --function submit_audit --calldata $(cat '{}')",
-                        cmd.contract, calldata_txt.display());
-                }
             }
-
-            // Clean up temp file on success
-            let _ = std::fs::remove_file(&calldata_txt);
         }
 
         // Storage receipt

@@ -8,6 +8,11 @@ set -euo pipefail
 #   ./run_e2e.sh --model-dir /path/to/qwen3-14b --layers 5 --gpu
 #   ./run_e2e.sh --preset qwen3-14b --gpu --submit
 #   ./run_e2e.sh --preset qwen3-14b --gpu --dry-run
+#
+# On-chain submission requires:
+#   export STARKNET_ACCOUNT=0x...
+#   export STARKNET_PRIVATE_KEY=0x...
+#   export AVNU_API_KEY=...
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -32,10 +37,15 @@ usage() {
   echo "  --layers N          Number of transformer layers to prove"
   echo "  --gpu               Use GPU acceleration"
   echo "  --count N           Number of inferences to capture (default: 3)"
-  echo "  --submit            Submit proof on-chain after audit"
+  echo "  --submit            Submit proof on-chain via Avnu paymaster (gasless)"
   echo "  --dry-run           Prove + report, skip on-chain submission"
   echo "  --output-dir PATH   Where to save reports (default: ~/.obelysk/audits)"
   echo "  -h, --help          Show this help"
+  echo ""
+  echo "On-chain submission env vars:"
+  echo "  STARKNET_ACCOUNT      Submitter account address"
+  echo "  STARKNET_PRIVATE_KEY  Submitter private key"
+  echo "  AVNU_API_KEY          Avnu paymaster API key"
   exit 0
 }
 
@@ -99,6 +109,36 @@ if [[ ! -f "$BINARY" ]]; then
   (cd "$REPO_DIR" && cargo build --release --features "$FEATURES")
 fi
 
+# ─── Check paymaster deps (only if --submit) ────────────────────────
+if [[ -n "$SUBMIT" ]]; then
+  # Verify env vars
+  if [[ -z "${STARKNET_ACCOUNT:-}" ]] || [[ -z "${STARKNET_PRIVATE_KEY:-}" ]]; then
+    echo "Error: on-chain submission requires STARKNET_ACCOUNT and STARKNET_PRIVATE_KEY env vars"
+    echo "  export STARKNET_ACCOUNT=0x..."
+    echo "  export STARKNET_PRIVATE_KEY=0x..."
+    exit 1
+  fi
+  if [[ -z "${AVNU_API_KEY:-}" ]]; then
+    echo "Error: on-chain submission requires AVNU_API_KEY env var"
+    echo "  export AVNU_API_KEY=..."
+    exit 1
+  fi
+
+  # Install Node.js deps if needed
+  if ! command -v node &>/dev/null; then
+    echo "Installing Node.js..."
+    curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+    sudo apt-get install -y nodejs
+  fi
+
+  # Install starknet.js if not present
+  PAYMASTER_DIR="$REPO_DIR/scripts/pipeline"
+  if [[ ! -d "$PAYMASTER_DIR/node_modules/starknet" ]]; then
+    echo "Installing starknet.js..."
+    (cd "$PAYMASTER_DIR" && npm init -y --silent 2>/dev/null && npm install starknet --silent)
+  fi
+fi
+
 # ─── Setup ───────────────────────────────────────────────────────────
 LOG_DIR=$(mktemp -d /tmp/obelysk_e2e_XXXXXX)
 mkdir -p "$OUTPUT_DIR"
@@ -114,6 +154,7 @@ echo "  Model:      $MODEL_DIR"
 echo "  Layers:     $LAYERS"
 echo "  Inferences: $COUNT"
 echo "  GPU:        ${GPU_FLAG:-off}"
+echo "  Submit:     ${SUBMIT:-off}"
 echo "  Output:     $REPORT"
 echo ""
 
