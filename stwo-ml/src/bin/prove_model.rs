@@ -1573,12 +1573,6 @@ fn submit_gkr_onchain(
     });
     eprintln!("  Calldata written to: {}", calldata_path.display());
 
-    // Map network name to RPC URL for sncast v0.56+
-    let rpc_url = match cli.network.as_str() {
-        "mainnet" => "https://starknet-mainnet.public.blastapi.io/rpc/v0_7",
-        "sepolia" | _ => "https://starknet-sepolia.public.blastapi.io/rpc/v0_7",
-    };
-
     // Step 2: Check if model needs registration first
     eprintln!("  Checking model registration...");
     let check_result = std::process::Command::new("sncast")
@@ -1586,8 +1580,8 @@ fn submit_gkr_onchain(
             "--account",
             &cli.account,
             "call",
-            "--url",
-            rpc_url,
+            "--network",
+            &cli.network,
             "--contract-address",
             &cli.contract,
             "--function",
@@ -1628,8 +1622,8 @@ fn submit_gkr_onchain(
                 "--account",
                 &cli.account,
                 "invoke",
-                "--url",
-                rpc_url,
+                "--network",
+                &cli.network,
                 "--contract-address",
                 &cli.contract,
                 "--function",
@@ -1675,12 +1669,12 @@ fn submit_gkr_onchain(
         .arg("-c")
         .arg(format!(
             "sncast --account '{}' invoke \
-             --url '{}' \
+             --network '{}' \
              --contract-address '{}' \
              --function {} \
              --calldata $(cat '{}')",
             cli.account,
-            rpc_url,
+            cli.network,
             cli.contract,
             verify_entrypoint,
             calldata_path.display(),
@@ -3220,23 +3214,17 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
                 process::exit(1);
             });
 
-            // Map network name to RPC URL for sncast v0.56+
-            let rpc_url = match cmd.network.as_str() {
-                "mainnet" => "https://starknet-mainnet.public.blastapi.io/rpc/v0_7",
-                "sepolia" | _ => "https://starknet-sepolia.public.blastapi.io/rpc/v0_7",
-            };
-
             eprintln!("  Submitting submit_audit...");
             let submit_result = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(format!(
                     "sncast --account '{}' invoke \
-                     --url '{}' \
+                     --network '{}' \
                      --contract-address '{}' \
                      --function submit_audit \
                      --calldata $(cat '{}')",
                     cmd.account,
-                    rpc_url,
+                    cmd.network,
                     cmd.contract,
                     calldata_txt.display(),
                 ))
