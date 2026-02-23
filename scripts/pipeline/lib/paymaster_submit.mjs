@@ -828,22 +828,37 @@ async function cmdVerify(args) {
   }
 
   // ── Execute ──
+  const noPaymaster = args["no-paymaster"] === true || args["no-paymaster"] === "true";
   let txHash;
-  try {
-    txHash = await executeViaPaymaster(account, calls, deploymentData);
-  } catch (e) {
-    const msg = truncateRpcError(e);
-    if (msg.includes("not eligible") || msg.includes("not supported")) {
-      die(
-        `Paymaster rejected transaction: ${msg}\n` +
-          "This may mean:\n" +
-          "  - The dApp is not registered with AVNU for sponsored mode\n" +
-          "  - Daily gas limit exceeded\n" +
-          "  - The account class is not whitelisted\n" +
-          "Try: STARKNET_PRIVATE_KEY=0x... ./04_verify_onchain.sh --submit --no-paymaster"
-      );
+  let gasSponsored = true;
+
+  if (noPaymaster) {
+    // Direct execution — account pays gas (needs STRK balance)
+    info("Submitting directly (no paymaster)...");
+    gasSponsored = false;
+    try {
+      const result = await account.execute(calls);
+      txHash = result.transaction_hash;
+    } catch (e) {
+      die(`Direct submission failed: ${truncateRpcError(e)}`);
     }
-    die(`Paymaster submission failed: ${msg}`);
+  } else {
+    try {
+      txHash = await executeViaPaymaster(account, calls, deploymentData);
+    } catch (e) {
+      const msg = truncateRpcError(e);
+      if (msg.includes("not eligible") || msg.includes("not supported") || msg.includes("SNIP-9")) {
+        die(
+          `Paymaster rejected transaction: ${msg}\n` +
+            "This may mean:\n" +
+            "  - Account is not SNIP-9 compatible (needed for paymaster)\n" +
+            "  - The dApp is not registered with AVNU for sponsored mode\n" +
+            "  - Daily gas limit exceeded\n" +
+            "Try: --no-paymaster (account pays gas directly)"
+        );
+      }
+      die(`Paymaster submission failed: ${msg}`);
+    }
   }
 
   info(`TX submitted: ${txHash}`);
@@ -946,7 +961,7 @@ async function cmdVerify(args) {
     verificationCountDelta:
       verificationCountDelta === null ? null : verificationCountDelta.toString(),
     acceptanceEvidence,
-    gasSponsored: true,
+    gasSponsored,
     accountDeployed: needsDeploy,
     executionStatus: execStatus,
     entrypoint: verifyPayload.entrypoint,
