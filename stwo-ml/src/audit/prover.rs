@@ -91,7 +91,19 @@ impl<'a> AuditProver<'a> {
             &window.entries
         };
 
-        // Step 5: Prove each inference with the resolved mode.
+        // Step 5: Set weight binding mode for GKR prover.
+        // AggregatedOracleSumcheck (mode 4) combines all weight claims via RLC
+        // into a single opening, reducing weight opening time dramatically.
+        if matches!(mode, ProofMode::Gkr) && !request.weight_binding.is_empty() {
+            std::env::set_var("STWO_WEIGHT_BINDING", &request.weight_binding);
+            // The full binding proof is required for on-chain soundness gates
+            // (enforce_gkr_soundness_gates checks aggregated_binding.is_some()).
+            if request.weight_binding == "aggregated" {
+                std::env::set_var("STWO_AGGREGATED_FULL_BINDING", "1");
+            }
+        }
+
+        // Step 6: Prove each inference with the resolved mode.
         let mut inference_results = Vec::with_capacity(entries.len());
 
         for entry in entries {
@@ -108,9 +120,25 @@ impl<'a> AuditProver<'a> {
 
         let total_proving_ms = total_start.elapsed().as_millis() as u64;
 
+        // Use actual entry timestamps instead of request bounds (which may be 0).
+        let actual_time_start = {
+            let ts = entries.iter().map(|e| e.timestamp_ns).min().unwrap_or(request.start_ns);
+            if ts == 0 { request.start_ns / 1_000_000_000 } else { ts / 1_000_000_000 }
+        };
+        let actual_time_end = {
+            let ts = entries.iter().map(|e| e.timestamp_ns).max().unwrap_or(request.end_ns);
+            if ts == u64::MAX { request.end_ns / 1_000_000_000 } else { ts / 1_000_000_000 }
+        };
+
+        let weight_binding_mode = if matches!(mode, ProofMode::Gkr) {
+            Some(request.weight_binding.clone())
+        } else {
+            None
+        };
+
         Ok(BatchAuditResult {
-            time_start: request.start_ns / 1_000_000_000, // Convert ns to seconds.
-            time_end: request.end_ns / 1_000_000_000,
+            time_start: actual_time_start,
+            time_end: actual_time_end,
             inference_count: inference_results.len() as u32,
             io_merkle_root: digest_to_hex(&io_merkle_root),
             log_merkle_root: digest_to_hex(&window.merkle_root),
@@ -121,6 +149,7 @@ impl<'a> AuditProver<'a> {
             proving_time_ms: total_proving_ms,
             proof_calldata,
             verification_calldata,
+            weight_binding_mode,
             tee_attestation_hash: None,
         })
     }

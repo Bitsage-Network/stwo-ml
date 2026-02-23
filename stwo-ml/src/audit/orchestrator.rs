@@ -26,7 +26,7 @@ use crate::audit::report::AuditReportBuilder;
 use crate::audit::scoring::aggregate_evaluations;
 use crate::audit::self_eval::{evaluate_batch, SelfEvalConfig};
 use crate::audit::storage::ArweaveClient;
-use crate::audit::submit::{digest_hex_to_felts, SubmitConfig};
+use crate::audit::submit::{digest_hex_to_felts, GkrVerificationConfig, SubmitConfig};
 use crate::audit::types::{
     AuditEncryption, AuditError, AuditReport, AuditRequest, ModelInfo, PrivacyInfo,
 };
@@ -88,6 +88,11 @@ pub struct AuditPipelineResult {
     pub calldata: Option<Vec<FieldElement>>,
     /// Total pipeline execution time in milliseconds.
     pub total_time_ms: u64,
+    /// Per-inference GKR verification calldata for on-chain `verify_model_gkr()`.
+    /// Each inner Vec is one inference's complete calldata. None if mode != gkr.
+    pub gkr_verification_calldata: Option<Vec<Vec<FieldElement>>>,
+    /// GKR verification config extracted from the computation graph.
+    pub gkr_verification_config: Option<GkrVerificationConfig>,
 }
 
 // ─── Main Orchestrator ─────────────────────────────────────────────────────
@@ -280,6 +285,37 @@ pub fn run_audit(
         None
     };
 
+    // ── Step 6b: Build GKR verification calldata ─────────────────────
+    let (gkr_verification_calldata, gkr_verification_config) =
+        if config.request.mode == "gkr" && audit_result.verification_calldata.is_some() {
+            match crate::audit::submit::extract_gkr_config(graph) {
+                Ok(gkr_config) => {
+                    match crate::audit::submit::build_gkr_verification_calldata(
+                        &audit_result,
+                        &gkr_config,
+                    ) {
+                        Ok(cd) => {
+                            info!(
+                                inferences = cd.len(),
+                                "Audit pipeline: GKR verification calldata built"
+                            );
+                            (Some(cd), Some(gkr_config))
+                        }
+                        Err(e) => {
+                            tracing::warn!("GKR verification calldata build failed: {e}");
+                            (None, None)
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("GKR config extraction failed: {e}");
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
+
     let total_time_ms = pipeline_start.elapsed().as_millis() as u64;
 
     info!(
@@ -293,6 +329,8 @@ pub fn run_audit(
         storage_receipt,
         calldata,
         total_time_ms,
+        gkr_verification_calldata,
+        gkr_verification_config,
     })
 }
 

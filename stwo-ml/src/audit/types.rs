@@ -114,6 +114,13 @@ pub struct AuditRequest {
     pub max_inferences: usize,
     /// GPU device index for proving (None = default device).
     pub gpu_device: Option<usize>,
+    /// Weight binding mode: "aggregated" (mode 4, default) or "sequential" (mode 0).
+    #[serde(default = "default_weight_binding")]
+    pub weight_binding: String,
+}
+
+fn default_weight_binding() -> String {
+    "aggregated".to_string()
 }
 
 impl Default for AuditRequest {
@@ -126,6 +133,7 @@ impl Default for AuditRequest {
             evaluate_semantics: true,
             max_inferences: 0,
             gpu_device: None,
+            weight_binding: default_weight_binding(),
         }
     }
 }
@@ -267,6 +275,11 @@ pub struct BatchAuditResult {
     /// None for Legacy mode (proofs are not on-chain verifiable).
     #[serde(default)]
     pub verification_calldata: Option<VerificationCalldata>,
+
+    // === Weight Binding ===
+    /// Weight binding mode used for GKR proving: "aggregated", "sequential", etc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight_binding_mode: Option<String>,
 
     // === TEE ===
     /// TEE attestation hash (None if no TEE).
@@ -453,6 +466,15 @@ pub struct ProofInfo {
     pub arweave_tx_id: Option<String>,
     /// On-chain audit record ID (hex felt252).
     pub audit_record_id: Option<String>,
+    /// Per-inference GKR verification transaction hashes (hex).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gkr_verification_txs: Vec<String>,
+    /// EloVerifier contract address used for GKR verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gkr_verifier_contract: Option<String>,
+    /// Weight binding mode used: "aggregated" (mode 4), "sequential" (mode 0), etc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight_binding_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
