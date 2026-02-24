@@ -348,18 +348,9 @@ async function deployAccountDirect(provider, account, deploymentData, network) {
   return transaction_hash;
 }
 
-async function executeViaPaymaster(account, calls, deploymentData) {
+async function executeViaPaymaster(account, calls) {
   const callsArray = Array.isArray(calls) ? calls : [calls];
-
-  // Build fee details with optional deploymentData for atomic deploy+invoke.
-  // AVNU paymaster sponsors both the account deployment and the invoke in a
-  // single TX when deploymentData is provided with small calldata (like
-  // open_gkr_session). For large calldata TXs, pass deploymentData=undefined.
   const feeDetails = { feeMode: { mode: "sponsored" } };
-  if (deploymentData) {
-    feeDetails.deploymentData = { ...deploymentData, version: 1 };
-    info("Including account deployment in this TX (atomic deploy+invoke)...");
-  }
 
   info("Estimating paymaster fee...");
   const estimation = await account.estimatePaymasterTransactionFee(
@@ -1023,20 +1014,28 @@ async function cmdVerify(args) {
     );
   }
 
-  // ── Prepare deployment data (used atomically with first invoke TX) ──
+  // ── Deploy account if needed ──
   const noPaymaster = args["no-paymaster"] === true || args["no-paymaster"] === "true";
   let pendingDeploymentData = null;
   if (needsDeploy && ephemeral) {
     const rawCalldata = Array.isArray(ephemeral.constructorCalldata)
       ? ephemeral.constructorCalldata
       : CallData.compile(ephemeral.constructorCalldata);
-    pendingDeploymentData = {
+    const deployData = {
       class_hash: net.accountClassHash,
       salt: ephemeral.salt,
       calldata: rawCalldata.map((v) => num.toHex(v)),
       address: accountAddress,
     };
-    info("Account not yet deployed — will deploy atomically with first TX");
+    info("Deploying ephemeral account...");
+    await deployAccountDirect(provider, account, deployData, network);
+    const config = loadAccountConfig();
+    if (config) {
+      config.deployedAt = new Date().toISOString();
+      config.ephemeral = true;
+      saveAccountConfig(config);
+    }
+    needsDeploy = false;
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -1082,7 +1081,7 @@ async function cmdVerify(args) {
         const result = await account.execute(calls);
         txHash = result.transaction_hash;
       } else {
-        txHash = await executeViaPaymaster(account, calls, opts.deploymentData);
+        txHash = await executeViaPaymaster(account, calls, undefined);
       }
       info(`  TX: ${txHash}`);
       const receipt = await waitWithTimeout(txHash);
@@ -1094,9 +1093,6 @@ async function cmdVerify(args) {
     }
 
     // ── Step 1: open_gkr_session ──
-    // If account needs deployment, include deploymentData so AVNU paymaster
-    // deploys the account atomically with this invoke (small calldata).
-    const openOpts = pendingDeploymentData ? { deploymentData: pendingDeploymentData } : {};
     const { txHash: openTxHash, receipt: openReceipt } = await execCall(
       "open_gkr_session",
       [
@@ -1107,19 +1103,8 @@ async function cmdVerify(args) {
         String(verifyPayload.weightBindingMode),
         verifyPayload.packed ? "1" : "0",
       ],
-      "open_gkr_session",
-      openOpts
+      "open_gkr_session"
     );
-    if (pendingDeploymentData) {
-      info("Account deployed atomically with open_gkr_session.");
-      pendingDeploymentData = null;
-      const config = loadAccountConfig();
-      if (config) {
-        config.deployedAt = new Date().toISOString();
-        config.ephemeral = true;
-        saveAccountConfig(config);
-      }
-    }
 
     // Parse session_id from events.
     let sessionId = null;
@@ -1362,17 +1347,7 @@ async function cmdVerify(args) {
     }
   } else {
     try {
-      txHash = await executeViaPaymaster(account, calls, pendingDeploymentData);
-      if (pendingDeploymentData) {
-        info("Account deployed atomically with verification TX.");
-        pendingDeploymentData = null;
-        const config = loadAccountConfig();
-        if (config) {
-          config.deployedAt = new Date().toISOString();
-          config.ephemeral = true;
-          saveAccountConfig(config);
-        }
-      }
+      txHash = await executeViaPaymaster(account, calls, undefined);
     } catch (e) {
       const msg = truncateRpcError(e);
       if (msg.includes("not eligible") || msg.includes("not supported") || msg.includes("SNIP-9")) {
