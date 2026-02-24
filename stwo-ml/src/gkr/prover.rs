@@ -2588,6 +2588,10 @@ fn reduce_activation_layer_gpu(
         .collect();
 
     // GPU MLE evaluations at claim point
+    if std::env::var("STWO_CHANNEL_TRACE").is_ok() {
+        eprintln!("[ACT GPU] n={} num_vars={} point.len={} input_mle.len={} output_mle.len={}",
+            n, num_vars, output_claim.point.len(), input_mle.len(), output_mle.len());
+    }
     let input_eval = gpu
         .evaluate_mle_gpu(&input_mle, &output_claim.point)
         .map_err(|e| GKRError::ReductionError {
@@ -2600,6 +2604,19 @@ fn reduce_activation_layer_gpu(
             layer_idx: 0,
             reason: format!("GPU eval_mle activation output: {e}"),
         })?;
+    if std::env::var("STWO_CHANNEL_TRACE").is_ok() {
+        eprintln!("[ACT GPU] input_eval={:?}", input_eval);
+        eprintln!("[ACT GPU] output_eval={:?}", output_eval);
+        eprintln!("[ACT GPU] output_claim.value={:?}", output_claim.value);
+        // CPU cross-check
+        let cpu_input_eval = evaluate_mle(&input_mle, &output_claim.point);
+        let cpu_output_eval = evaluate_mle(&output_mle, &output_claim.point);
+        eprintln!("[ACT GPU] CPU input_eval={:?}", cpu_input_eval);
+        eprintln!("[ACT GPU] CPU output_eval={:?}", cpu_output_eval);
+        if input_eval != cpu_input_eval {
+            eprintln!("[ACT GPU] MISMATCH: GPU input_eval != CPU input_eval");
+        }
+    }
 
     // Build activation table
     let table_log_size = activation_type.recommended_table_log_size();
