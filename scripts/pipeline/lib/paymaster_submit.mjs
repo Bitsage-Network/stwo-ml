@@ -26,7 +26,7 @@ import {
   Account,
   RpcProvider,
   CallData,
-  ETransactionVersion,
+  constants,
   ec,
   hash,
   num,
@@ -152,12 +152,7 @@ function saveAccountConfig(config) {
 }
 
 function getAccount(provider, privateKey, address) {
-  return new Account({
-    provider,
-    address,
-    signer: privateKey,
-    transactionVersion: ETransactionVersion.V3,
-  });
+  return new Account(provider, address, privateKey, undefined, constants.TRANSACTION_VERSION.V3);
 }
 
 function jsonOutput(obj) {
