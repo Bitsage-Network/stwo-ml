@@ -106,19 +106,19 @@ __device__ __forceinline__ CM31 cm31_sub(CM31 a, CM31 b) {
     return r;
 }
 
-// CM31 multiplication: (a + ub)(c + ud) = (ac + 2bd) + u(ad + bc)
+// CM31 multiplication: (a + bi)(c + di) = (ac - bd) + (ad + bc)i  where i^2 = -1
 __device__ __forceinline__ CM31 cm31_mul(CM31 a, CM31 b) {
     uint32_t ac = m31_mul(a.real, b.real);
     uint32_t bd = m31_mul(a.imag, b.imag);
     uint32_t ad = m31_mul(a.real, b.imag);
     uint32_t bc = m31_mul(a.imag, b.real);
     CM31 r;
-    r.real = m31_add(ac, m31_add(bd, bd));
+    r.real = m31_sub(ac, bd);
     r.imag = m31_add(ad, bc);
     return r;
 }
 
-// QM31 = (a0 + u*a1) + i*(a2 + u*a3)  with i^2 = u + 2
+// QM31 = (a0 + a1*i) + (a2 + a3*i)*u  where i^2 = -1, u^2 = 2+i
 struct QM31 {
     uint32_t a0, a1, a2, a3;
 };
@@ -157,10 +157,11 @@ __device__ __forceinline__ QM31 qm31_mul(QM31 x, QM31 y) {
     CM31 x0y1 = cm31_mul(x0, y1);
     CM31 x1y0 = cm31_mul(x1, y0);
 
-    // (u+2) * x1y1 = u*x1y1 + 2*x1y1
-    // u * (r + u*i) = 2i + u*r
-    CM31 u_x1y1 = {m31_add(x1y1.imag, x1y1.imag), x1y1.real};
-    CM31 term = cm31_add(u_x1y1, cm31_add(x1y1, x1y1));
+    // x1y1 * u^2 where u^2 = 2+i (CM31 imaginary unit)
+    // (r + s*i) * (2 + i) = (2r - s) + (r + 2s)*i
+    CM31 term;
+    term.real = m31_sub(m31_add(x1y1.real, x1y1.real), x1y1.imag);
+    term.imag = m31_add(x1y1.real, m31_add(x1y1.imag, x1y1.imag));
 
     CM31 real_part = cm31_add(x0y0, term);
     CM31 imag_part = cm31_add(x0y1, x1y0);
@@ -646,14 +647,14 @@ __device__ __forceinline__ CM31R cm31_add_r(CM31R a, CM31R b) {
     return r;
 }
 
-// CM31 multiplication: (a + ub)(c + ud) = (ac + 2bd) + u(ad + bc)
+// CM31 multiplication: (a + bi)(c + di) = (ac - bd) + (ad + bc)i  where i^2 = -1
 __device__ __forceinline__ CM31R cm31_mul_r(CM31R a, CM31R b) {
     uint32_t ac = m31_mul_r(a.real, b.real);
     uint32_t bd = m31_mul_r(a.imag, b.imag);
     uint32_t ad = m31_mul_r(a.real, b.imag);
     uint32_t bc = m31_mul_r(a.imag, b.real);
     CM31R r;
-    r.real = m31_add_r(ac, m31_add_r(bd, bd));
+    r.real = m31_sub_r(ac, bd);
     r.imag = m31_add_r(ad, bc);
     return r;
 }
@@ -687,8 +688,10 @@ __device__ __forceinline__ QM31R qm31_mul_r(QM31R x, QM31R y) {
     CM31R x0y1 = cm31_mul_r(x0, y1);
     CM31R x1y0 = cm31_mul_r(x1, y0);
 
-    CM31R u_x1y1 = {m31_add_r(x1y1.imag, x1y1.imag), x1y1.real};
-    CM31R term = cm31_add_r(u_x1y1, cm31_add_r(x1y1, x1y1));
+    // x1y1 * u^2 where u^2 = 2+i: (r + s*i)*(2+i) = (2r-s) + (r+2s)*i
+    CM31R term;
+    term.real = m31_sub_r(m31_add_r(x1y1.real, x1y1.real), x1y1.imag);
+    term.imag = m31_add_r(x1y1.real, m31_add_r(x1y1.imag, x1y1.imag));
 
     CM31R real_part = cm31_add_r(x0y0, term);
     CM31R imag_part = cm31_add_r(x0y1, x1y0);
@@ -834,12 +837,13 @@ __device__ __forceinline__ CM31L cm31_sub_l(CM31L a, CM31L b) {
     return {m31_sub_l(a.real, b.real), m31_sub_l(a.imag, b.imag)};
 }
 
+// CM31 multiplication: (a + bi)(c + di) = (ac - bd) + (ad + bc)i  where i^2 = -1
 __device__ __forceinline__ CM31L cm31_mul_l(CM31L a, CM31L b) {
     uint32_t ac = m31_mul_l(a.real, b.real);
     uint32_t bd = m31_mul_l(a.imag, b.imag);
     uint32_t ad = m31_mul_l(a.real, b.imag);
     uint32_t bc = m31_mul_l(a.imag, b.real);
-    return {m31_add_l(ac, m31_add_l(bd, bd)), m31_add_l(ad, bc)};
+    return {m31_sub_l(ac, bd), m31_add_l(ad, bc)};
 }
 
 struct QM31L { uint32_t a0, a1, a2, a3; };
@@ -863,8 +867,10 @@ __device__ __forceinline__ QM31L qm31_mul_l(QM31L x, QM31L y) {
     CM31L x1y1 = cm31_mul_l(x1, y1);
     CM31L x0y1 = cm31_mul_l(x0, y1);
     CM31L x1y0 = cm31_mul_l(x1, y0);
-    CM31L u_x1y1 = {m31_add_l(x1y1.imag, x1y1.imag), x1y1.real};
-    CM31L term = cm31_add_l(u_x1y1, cm31_add_l(x1y1, x1y1));
+    // x1y1 * u^2 where u^2 = 2+i: (r + s*i)*(2+i) = (2r-s) + (r+2s)*i
+    CM31L term;
+    term.real = m31_sub_l(m31_add_l(x1y1.real, x1y1.real), x1y1.imag);
+    term.imag = m31_add_l(x1y1.real, m31_add_l(x1y1.imag, x1y1.imag));
     CM31L rp = cm31_add_l(x0y0, term);
     CM31L ip = cm31_add_l(x0y1, x1y0);
     return {rp.real, rp.imag, ip.real, ip.imag};

@@ -1956,9 +1956,18 @@ pub fn replay_verify_serialized_proof(
 
     let mut current_claim_value = output_value;
     let mut matmul_idx = 0usize;
+    let trace = std::env::var("STWO_CHANNEL_TRACE").is_ok();
+
+    if trace {
+        eprintln!("[VERIFIER] ch after init: {:?}", ch.digest());
+        eprintln!("[VERIFIER] output_value: {:?}", output_value);
+    }
 
     for layer in 0..num_layers as usize {
         let tag = read_u32_from(proof_data, &mut off);
+        if trace {
+            eprintln!("[VERIFIER] layer {} tag={} off={} ch={:?}", layer, tag, off, ch.digest());
+        }
 
         match tag {
             0 => {
@@ -1968,10 +1977,16 @@ pub fn replay_verify_serialized_proof(
                 let n = matmul_dims[matmul_idx * 3 + 2] as usize;
                 matmul_idx += 1;
 
+                if trace {
+                    eprintln!("[VERIFIER MatMul] m={} k={} n={} claim={:?}", m, k, n, current_claim_value);
+                }
                 ch.mix_u64(m as u64);
                 ch.mix_u64(k as u64);
                 ch.mix_u64(n as u64);
                 mix_secure_field(&mut ch, current_claim_value);
+                if trace {
+                    eprintln!("[VERIFIER MatMul] ch after seeding: {:?}", ch.digest());
+                }
 
                 let num_rounds = read_u32_from(proof_data, &mut off) as usize;
                 let mut current_sum = current_claim_value;
@@ -1983,6 +1998,10 @@ pub fn replay_verify_serialized_proof(
                     let p0 = c0;
                     let p1 = c0 + c1 + c2;
                     if p0 + p1 != current_sum {
+                        if trace {
+                            eprintln!("[VERIFIER MatMul] FAIL round {} ch={:?}", round, ch.digest());
+                            eprintln!("[VERIFIER MatMul] c0={:?} c1={:?} c2={:?}", c0, c1, c2);
+                        }
                         return Err(format!(
                             "MATMUL_ROUND_SUM_MISMATCH at layer {} round {}: p(0)+p(1)={:?} != sum={:?}",
                             layer, round, p0 + p1, current_sum
@@ -1991,6 +2010,11 @@ pub fn replay_verify_serialized_proof(
                     ch.mix_poly_coeffs(c0, c1, c2);
                     let challenge = ch.draw_qm31();
                     current_sum = c0 + c1 * challenge + c2 * challenge * challenge;
+                    if trace && round < 3 {
+                        eprintln!("[VERIFIER MatMul] round {} c0={:?} c1={:?} c2={:?}", round, c0, c1, c2);
+                        eprintln!("[VERIFIER MatMul] round {} challenge={:?} new_sum={:?}", round, challenge, current_sum);
+                        eprintln!("[VERIFIER MatMul] round {} ch={:?}", round, ch.digest());
+                    }
                 }
                 let final_a = read_qm31_from(proof_data, &mut off);
                 let final_b = read_qm31_from(proof_data, &mut off);
@@ -2013,12 +2037,26 @@ pub fn replay_verify_serialized_proof(
                 off += 1; // commitment
                 let _simd = read_u32_from(proof_data, &mut off);
 
+                if trace {
+                    eprintln!("[VERIFIER RMSNorm] ch BEFORE RN: {:?}", ch.digest());
+                    eprintln!("[VERIFIER RMSNorm] rms_sq={:?}", rms_sq);
+                    eprintln!("[VERIFIER RMSNorm] rsqrt_eval={:?}", rsqrt_eval);
+                    eprintln!("[VERIFIER RMSNorm] claim={:?}", current_claim_value);
+                    eprintln!("[VERIFIER RMSNorm] input_eval={:?}", input_eval);
+                    eprintln!("[VERIFIER RMSNorm] output_eval={:?}", output_eval);
+                }
                 ch.mix_u64(0x524E); // "RN"
                 mix_secure_field(&mut ch, rms_sq);
                 mix_secure_field(&mut ch, rsqrt_eval);
                 mix_secure_field(&mut ch, current_claim_value);
+                if trace {
+                    eprintln!("[VERIFIER RMSNorm] ch after mix claim: {:?}", ch.digest());
+                }
 
                 let nrounds = read_u32_from(proof_data, &mut off) as usize;
+                if trace {
+                    eprintln!("[VERIFIER RMSNorm] nrounds={}", nrounds);
+                }
                 let mut rms_sum = current_claim_value;
                 for round in 0..nrounds {
                     let c0 = read_qm31_from(proof_data, &mut off);
@@ -2039,19 +2077,39 @@ pub fn replay_verify_serialized_proof(
                 }
                 let input_final = read_qm31_from(proof_data, &mut off);
                 let rsqrt_final = read_qm31_from(proof_data, &mut off);
+                if trace {
+                    eprintln!("[VERIFIER RMSNorm] ch after {} eq-rounds: {:?}", nrounds, ch.digest());
+                    eprintln!("[VERIFIER RMSNorm] input_final={:?}", input_final);
+                    eprintln!("[VERIFIER RMSNorm] rsqrt_final={:?}", rsqrt_final);
+                }
                 mix_secure_field(&mut ch, input_final);
                 mix_secure_field(&mut ch, rsqrt_final);
+                if trace {
+                    eprintln!("[VERIFIER RMSNorm] ch after final evals: {:?}", ch.digest());
+                }
 
                 // Optional logup
                 let has_logup = read_u32_from(proof_data, &mut off);
+                if trace {
+                    eprintln!("[VERIFIER RMSNorm] has_logup={}", has_logup);
+                }
                 if has_logup == 1 {
                     ch.mix_u64(0x4C4F47); // "LOG"
                     ch.mix_u64(0x524E); // "RN"
                     let _gamma = ch.draw_qm31();
                     let _beta = ch.draw_qm31();
                     let claimed_sum = read_qm31_from(proof_data, &mut off);
+                    if trace {
+                        eprintln!("[VERIFIER RMSNorm] claimed_sum={:?}", claimed_sum);
+                    }
                     mix_secure_field(&mut ch, claimed_sum);
+                    if trace {
+                        eprintln!("[VERIFIER RMSNorm] ch after mix claimed_sum: {:?}", ch.digest());
+                    }
                     let eq_rounds = read_u32_from(proof_data, &mut off) as usize;
+                    if trace {
+                        eprintln!("[VERIFIER RMSNorm] logup eq_rounds={}", eq_rounds);
+                    }
                     let mut logup_sum = SecureField::from(M31::from(1u32));
                     for round in 0..eq_rounds {
                         let c0 = read_qm31_from(proof_data, &mut off);
@@ -2077,9 +2135,15 @@ pub fn replay_verify_serialized_proof(
                     for _ in 0..num_mults {
                         let _ = read_u32_from(proof_data, &mut off);
                     }
+                    if trace {
+                        eprintln!("[VERIFIER RMSNorm] ch after logup: {:?}", ch.digest());
+                    }
                 }
                 mix_secure_field(&mut ch, input_eval);
                 mix_secure_field(&mut ch, output_eval);
+                if trace {
+                    eprintln!("[VERIFIER RMSNorm] ch FINAL: {:?}", ch.digest());
+                }
                 current_claim_value = input_eval;
             }
             3 => {
@@ -4400,6 +4464,72 @@ mod tests {
         println!("\nDeferred proofs: {}", num_deferred);
         println!("Remaining felts: {}", proof_data_felts.len() - off);
         println!("SUCCESS: all {} proof layers pass Cairo-compatible verification replay", num_proof_layers);
+    }
+
+    /// Test replay_verify_serialized_proof with RMSNorm → MatMul order
+    /// (the order that occurs in Qwen3-14B transformer layers).
+    #[test]
+    fn test_replay_verify_rmsnorm_then_matmul() {
+        use crate::aggregation::prove_model_pure_gkr;
+        use crate::cairo_serde::{serialize_gkr_proof_data_only, serialize_raw_io};
+        let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
+
+        // Build: linear(4) → rms_norm
+        // Walking output→input: RMSNorm first, then MatMul
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(4);
+        builder.rms_norm();
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
+
+        let mut weights = GraphWeights::new();
+        let mut w0 = M31Matrix::new(4, 4);
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from((i * 4 + j + 1) as u32));
+            }
+        }
+        weights.add_weight(0, w0);
+
+        let agg_proof =
+            prove_model_pure_gkr(&graph, &input, &weights).expect("GKR proving should succeed");
+        let gkr = agg_proof.gkr_proof.as_ref().expect("GKR proof");
+        let circuit = crate::gkr::LayeredCircuit::from_graph(&graph).expect("circuit");
+        let raw_io = serialize_raw_io(&input, &agg_proof.execution.output);
+
+        // Serialize proof_data (unpacked)
+        let mut proof_data_felts = Vec::new();
+        serialize_gkr_proof_data_only(gkr, &mut proof_data_felts);
+
+        let matmul_dims = extract_matmul_dims(&circuit);
+        let circuit_depth = circuit.layers.len() as u32;
+        let num_layers = gkr.layer_proofs.len() as u32;
+
+        println!("circuit_depth={} num_layers={} matmul_dims={:?}", circuit_depth, num_layers, matmul_dims);
+        for (i, lp) in gkr.layer_proofs.iter().enumerate() {
+            let tag = match lp {
+                crate::gkr::types::LayerProof::MatMul { .. } => 0,
+                crate::gkr::types::LayerProof::RMSNorm { .. } => 8,
+                _ => 99,
+            };
+            println!("  layer_proof[{}] tag={}", i, tag);
+        }
+
+        // This should pass — it's the same function called by build_verify_model_gkr_v4_calldata
+        let result = replay_verify_serialized_proof(
+            &proof_data_felts,
+            &raw_io,
+            &matmul_dims,
+            circuit_depth,
+            num_layers,
+            false,
+        );
+        assert!(result.is_ok(), "replay_verify failed: {:?}", result.err());
+        println!("SUCCESS: replay_verify_serialized_proof passed");
     }
 
     /// Load the actual GPU-generated proof JSON and replay channel operations.
