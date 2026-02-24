@@ -1132,29 +1132,30 @@ async function cmdVerify(args) {
       info(`  ${label}...`);
       let txHash;
       if (noPaymaster) {
-        // When skipEstimate is set, try estimation with skipValidate first
-        // (avoids full execution simulation), then fall back to hardcoded bounds.
-        let execDetails;
-        if (opts.skipEstimate) {
-          try {
-            const est = await account.estimateFee(calls, { skipValidate: true });
-            execDetails = {
-              resourceBounds: est.resourceBounds,
-            };
-            info(`  Estimated (skipValidate): l2_gas=${est.resourceBounds?.l2_gas?.max_amount}`);
-          } catch (estErr) {
-            info(`  estimateFee(skipValidate) failed, using generous fixed bounds`);
-            execDetails = {
-              resourceBounds: {
-                l1_gas: { max_amount: 0n, max_price_per_unit: 0n },
-                l2_gas: { max_amount: 100000000n, max_price_per_unit: 100000000000n },
-                l1_data_gas: { max_amount: 1024n, max_price_per_unit: 100000n },
-              },
-            };
+        try {
+          const result = await account.execute(calls);
+          txHash = result.transaction_hash;
+        } catch (execErr) {
+          // Log full error for diagnosis (truncateRpcError hides the actual reason)
+          const fullMsg = execErr.message || String(execErr);
+          // Extract just the error code/reason, skip the giant JSON params blob
+          const errMatch = fullMsg.match(/(-?\d+):\s*"([^"]{0,500})"/);
+          if (errMatch) {
+            info(`  execute() error ${errMatch[1]}: ${errMatch[2]}`);
+          } else {
+            // Look for common error patterns
+            const snippets = [
+              fullMsg.match(/Account validation failed[^"]*/)?.[0],
+              fullMsg.match(/Insufficient[^"]*/)?.[0],
+              fullMsg.match(/nonce[^"]*/i)?.[0],
+              fullMsg.match(/Transaction reverted[^"]*/)?.[0],
+            ].filter(Boolean);
+            if (snippets.length > 0) {
+              info(`  execute() error: ${snippets.join('; ')}`);
+            }
           }
+          throw execErr;
         }
-        const result = await account.execute(calls, execDetails);
-        txHash = result.transaction_hash;
       } else {
         txHash = await executeViaPaymaster(account, calls, undefined);
       }
@@ -1304,26 +1305,24 @@ async function cmdVerify(args) {
     }
 
     // ── Step 3: seal_gkr_session ──
-    // Skip fee estimation: estimateFee for seal/verify may fail on public RPCs
-    // due to computation limits (the contract reads all stored session data).
     const { txHash: sealTxHash } = await execCallWithRetry(
       "seal_gkr_session",
       [sessionId],
       "seal_gkr_session",
-      noPaymaster ? { skipEstimate: true } : {}
+      {},
+      10  // extra retries — estimation may fail due to nonce stale after 21 chunks
     );
     sessionState.status = "sealed";
     sessionState.txHashes.push(sealTxHash);
     writeFileSync(sessionFile, JSON.stringify(sessionState, null, 2));
 
     // ── Step 4: verify_gkr_from_session ──
-    // Uses generous l2_gas bounds (100M steps) to handle the full GKR
-    // verification computation without hitting simulation step limits.
     const { txHash: verifyTxHash } = await execCallWithRetry(
       "verify_gkr_from_session",
       [sessionId],
       "verify_gkr_from_session",
-      noPaymaster ? { skipEstimate: true } : {}
+      {},
+      10  // extra retries — heavy computation may need nonce sync time
     );
     sessionState.status = "verified";
     sessionState.txHashes.push(verifyTxHash);
