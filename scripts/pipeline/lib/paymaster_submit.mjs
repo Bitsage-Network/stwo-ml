@@ -521,6 +521,23 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
       }
     }
 
+    // ── Re-chunk if any chunk exceeds the on-chain TX calldata limit ──
+    // Cartridge/public RPCs silently drop TXs with calldata > ~2000 felts from
+    // the mempool (TX gets RECEIVED but never ACCEPTED_ON_L2). The Rust prover
+    // pre-chunks at 4000 felts, so we re-chunk to a smaller size here.
+    const maxChunkFelts = parseInt(process.env.OBELYSK_CHUNK_SIZE || "1500", 10);
+    const needsRechunk = finalChunks.some((c) => c.length > maxChunkFelts);
+    if (needsRechunk) {
+      const flat = [];
+      for (const c of finalChunks) for (const f of c) flat.push(f);
+      finalChunks = [];
+      for (let i = 0; i < flat.length; i += maxChunkFelts) {
+        finalChunks.push(flat.slice(i, i + maxChunkFelts));
+      }
+      finalNumChunks = finalChunks.length;
+      info(`  Re-chunked: ${numChunks} chunks @ ≤${chunks[0].length} → ${finalNumChunks} chunks @ ≤${maxChunkFelts} felts`);
+    }
+
     return {
       entrypoint,
       calldata: [],
