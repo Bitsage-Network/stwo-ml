@@ -1132,7 +1132,18 @@ async function cmdVerify(args) {
       info(`  ${label}...`);
       let txHash;
       if (noPaymaster) {
-        const result = await account.execute(calls);
+        // When skipEstimate is set, pass explicit resource bounds to bypass
+        // estimateFee (which may fail for computation-heavy contract calls
+        // like verify_gkr_from_session that exceed simulation step limits).
+        const execDetails = opts.skipEstimate ? {
+          resourceBounds: {
+            l1_gas: { max_amount: "0x0", max_price_per_unit: "0x0" },
+            l2_gas: { max_amount: "0x5F5E100", max_price_per_unit: "0x174876e800" },
+            l1_data_gas: { max_amount: "0x0", max_price_per_unit: "0x0" },
+          },
+          skipValidate: false,
+        } : undefined;
+        const result = await account.execute(calls, execDetails);
         txHash = result.transaction_hash;
       } else {
         txHash = await executeViaPaymaster(account, calls, undefined);
@@ -1283,20 +1294,26 @@ async function cmdVerify(args) {
     }
 
     // ── Step 3: seal_gkr_session ──
+    // Skip fee estimation: estimateFee for seal/verify may fail on public RPCs
+    // due to computation limits (the contract reads all stored session data).
     const { txHash: sealTxHash } = await execCallWithRetry(
       "seal_gkr_session",
       [sessionId],
-      "seal_gkr_session"
+      "seal_gkr_session",
+      noPaymaster ? { skipEstimate: true } : {}
     );
     sessionState.status = "sealed";
     sessionState.txHashes.push(sealTxHash);
     writeFileSync(sessionFile, JSON.stringify(sessionState, null, 2));
 
     // ── Step 4: verify_gkr_from_session ──
+    // Uses generous l2_gas bounds (100M steps) to handle the full GKR
+    // verification computation without hitting simulation step limits.
     const { txHash: verifyTxHash } = await execCallWithRetry(
       "verify_gkr_from_session",
       [sessionId],
-      "verify_gkr_from_session"
+      "verify_gkr_from_session",
+      noPaymaster ? { skipEstimate: true } : {}
     );
     sessionState.status = "verified";
     sessionState.txHashes.push(verifyTxHash);
