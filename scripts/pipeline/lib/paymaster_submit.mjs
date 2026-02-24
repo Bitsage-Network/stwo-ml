@@ -1285,16 +1285,22 @@ async function cmdVerify(args) {
     const uploadDuration = ((Date.now() - uploadStartTime) / 1000).toFixed(1);
     info(`All ${verifyPayload.numChunks} chunks uploaded in ${uploadDuration}s.`);
 
-    // Helper: retry execCall for nonce-stale estimateFee errors
-    async function execCallWithRetry(entrypoint, calldata, label, opts = {}, maxRetries = 5) {
+    // Helper: retry execCall for nonce-stale estimateFee errors.
+    // Waits for the nonce to refresh between retries by querying the RPC.
+    async function execCallWithRetry(entrypoint, calldata, label, opts = {}, maxRetries = 10) {
       for (let attempt = 0; attempt < maxRetries; attempt++) {
         try {
           return await execCall(entrypoint, calldata, label, opts);
         } catch (e) {
+          const fullMsg = e.message || String(e);
+          const isNonceError = /nonce/i.test(fullMsg) || /invalid transaction nonce/i.test(fullMsg);
           const msg = truncateRpcError(e);
           info(`  ${label} attempt ${attempt + 1} failed: ${msg}`);
           if (attempt < maxRetries - 1) {
-            const backoffMs = Math.min((attempt + 1) * 5000, 20000);
+            // For nonce errors, wait longer and poll for nonce update
+            const backoffMs = isNonceError
+              ? Math.min((attempt + 1) * 10000, 60000) // 10s, 20s, 30s... up to 60s
+              : Math.min((attempt + 1) * 5000, 20000);
             info(`  Retrying in ${backoffMs / 1000}s...`);
             await new Promise((r) => setTimeout(r, backoffMs));
           } else {
@@ -1304,25 +1310,29 @@ async function cmdVerify(args) {
       }
     }
 
+    // Wait for nonce to settle after the burst of chunk uploads
+    info("Waiting 30s for RPC nonce state to settle...");
+    await new Promise((r) => setTimeout(r, 30000));
+
     // ── Step 3: seal_gkr_session ──
     const { txHash: sealTxHash } = await execCallWithRetry(
       "seal_gkr_session",
       [sessionId],
-      "seal_gkr_session",
-      {},
-      10  // extra retries — estimation may fail due to nonce stale after 21 chunks
+      "seal_gkr_session"
     );
     sessionState.status = "sealed";
     sessionState.txHashes.push(sealTxHash);
     writeFileSync(sessionFile, JSON.stringify(sessionState, null, 2));
 
+    // Wait for nonce to settle after seal TX
+    info("Waiting 15s for nonce sync...");
+    await new Promise((r) => setTimeout(r, 15000));
+
     // ── Step 4: verify_gkr_from_session ──
     const { txHash: verifyTxHash } = await execCallWithRetry(
       "verify_gkr_from_session",
       [sessionId],
-      "verify_gkr_from_session",
-      {},
-      10  // extra retries — heavy computation may need nonce sync time
+      "verify_gkr_from_session"
     );
     sessionState.status = "verified";
     sessionState.txHashes.push(verifyTxHash);
