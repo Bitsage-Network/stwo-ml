@@ -175,10 +175,21 @@ function truncateRpcError(e) {
   const msg = e.message || String(e);
   // starknet.js RpcError embeds the full request params (100K+ chars of
   // calldata JSON) in the error message.  Extract just the error code.
+  //
+  // Error format: "RPC: <method> with params { <giant JSON> }\n\n <code>: "<reason>""
+  // The error code + reason is at the END, after the params JSON.
+  const codeAtEnd = msg.match(/\}\s*\n\s*(\d+):\s*"?(.{1,500})/);
+  if (codeAtEnd) return `RPC error ${codeAtEnd[1]}: ${codeAtEnd[2]}`;
   const codeMatch = msg.match(/(-\d+):\s*"?(.{1,300})/);
   if (codeMatch) return `RPC ${codeMatch[1]}: ${codeMatch[2]}`;
-  // Fallback: first 500 chars
-  return msg.length > 500 ? msg.slice(0, 500) + "..." : msg;
+  // Look for "Transaction execution error" or "Contract error" patterns
+  const execErr = msg.match(/execution error[:\s]*(.{1,500})/i);
+  if (execErr) return `Execution error: ${execErr[1]}`;
+  const contractErr = msg.match(/Contract error[:\s]*(.{1,500})/i);
+  if (contractErr) return `Contract error: ${contractErr[1]}`;
+  // Fallback: last 500 chars (often contains the actual error)
+  if (msg.length > 500) return "..." + msg.slice(-500);
+  return msg;
 }
 
 function info(msg) {
@@ -1136,24 +1147,8 @@ async function cmdVerify(args) {
           const result = await account.execute(calls);
           txHash = result.transaction_hash;
         } catch (execErr) {
-          // Log full error for diagnosis (truncateRpcError hides the actual reason)
-          const fullMsg = execErr.message || String(execErr);
-          // Extract just the error code/reason, skip the giant JSON params blob
-          const errMatch = fullMsg.match(/(-?\d+):\s*"([^"]{0,500})"/);
-          if (errMatch) {
-            info(`  execute() error ${errMatch[1]}: ${errMatch[2]}`);
-          } else {
-            // Look for common error patterns
-            const snippets = [
-              fullMsg.match(/Account validation failed[^"]*/)?.[0],
-              fullMsg.match(/Insufficient[^"]*/)?.[0],
-              fullMsg.match(/nonce[^"]*/i)?.[0],
-              fullMsg.match(/Transaction reverted[^"]*/)?.[0],
-            ].filter(Boolean);
-            if (snippets.length > 0) {
-              info(`  execute() error: ${snippets.join('; ')}`);
-            }
-          }
+          // Log the actual error reason (truncateRpcError now extracts from end)
+          info(`  execute() failed: ${truncateRpcError(execErr)}`);
           throw execErr;
         }
       } else {
