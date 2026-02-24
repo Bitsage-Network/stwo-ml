@@ -321,6 +321,38 @@ async function deployAccountDirect(provider, account, deploymentData, network) {
     info("Falling back to standard DEPLOY_ACCOUNT...");
   }
 
+  // ── Fund the ephemeral account if a funder key is available ──
+  // OBELYSK_FUNDER_KEY + OBELYSK_FUNDER_ADDRESS: a pre-deployed, funded account
+  // (e.g. the deployer) that can transfer STRK to cover deploy gas.
+  const funderKey = process.env.OBELYSK_FUNDER_KEY;
+  const funderAddress = process.env.OBELYSK_FUNDER_ADDRESS;
+  if (funderKey && funderAddress) {
+    const STRK_TOKEN = "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d";
+    const FUND_AMOUNT = "0x2386F26FC10000"; // 0.01 STRK (10^16 wei)
+    const funder = new Account({
+      provider: account.provider,
+      address: funderAddress,
+      signer: funderKey,
+      transactionVersion: ETransactionVersion.V3,
+    });
+    info(`Funding ephemeral account from ${funderAddress}...`);
+    try {
+      const fundResult = await funder.execute([{
+        contractAddress: STRK_TOKEN,
+        entrypoint: "transfer",
+        calldata: CallData.compile([deploymentData.address || account.address, FUND_AMOUNT, "0x0"]),
+      }]);
+      info(`Fund TX: ${fundResult.transaction_hash}`);
+      await account.provider.waitForTransaction(fundResult.transaction_hash);
+      info("Ephemeral account funded with 0.01 STRK.");
+    } catch (fundErr) {
+      info(`Funding failed: ${truncateRpcError(fundErr)}`);
+      die("Cannot deploy ephemeral account: paymaster rejected deploy, and funding failed. " +
+          "Set OBELYSK_FUNDER_KEY + OBELYSK_FUNDER_ADDRESS to a funded account, " +
+          "or use STARKNET_PRIVATE_KEY + STARKNET_ACCOUNT_ADDRESS for a pre-deployed account.");
+    }
+  }
+
   // Fallback: standard deploy_account (needs gas balance on the account)
   const deployPayload = {
     classHash: deploymentData.class_hash || deploymentData.classHash,
@@ -335,6 +367,11 @@ async function deployAccountDirect(provider, account, deploymentData, network) {
   } catch (deployErr) {
     const fullMsg = deployErr.message || String(deployErr);
     info(`Standard DEPLOY_ACCOUNT error (full): ${fullMsg.slice(0, 2000)}`);
+    if (!funderKey) {
+      die("Cannot deploy ephemeral account: no STRK balance and no funder key. " +
+          "Set OBELYSK_FUNDER_KEY + OBELYSK_FUNDER_ADDRESS to a funded Starknet account, " +
+          "or use STARKNET_PRIVATE_KEY + STARKNET_ACCOUNT_ADDRESS for a pre-deployed account.");
+    }
     throw deployErr;
   }
   info(`Account deploy TX (standard): ${transaction_hash}`);
@@ -1666,11 +1703,12 @@ try {
           "  verify   Submit proof via AVNU paymaster (auto-deploys account if needed)\n" +
           "  setup    Deploy agent account via factory (ERC-8004 identity)\n" +
           "  status   Check account and verification status\n\n" +
-          "Zero-config (no env vars needed):\n" +
-          "  node paymaster_submit.mjs verify --proof proof.json --contract 0x... --model-id 0x1\n\n" +
-          "With ERC-8004 identity (needs deployer key):\n" +
-          "  OBELYSK_DEPLOYER_KEY=0x... OBELYSK_DEPLOYER_ADDRESS=0x... \\\n" +
-          "    node paymaster_submit.mjs setup --network sepolia\n"
+          "With funder account (for ephemeral account deploy gas):\n" +
+          "  OBELYSK_FUNDER_KEY=0x... OBELYSK_FUNDER_ADDRESS=0x... \\\n" +
+          "    node paymaster_submit.mjs verify --proof proof.json --contract 0x... --model-id 0x1\n\n" +
+          "With pre-deployed account (skip ephemeral):\n" +
+          "  STARKNET_PRIVATE_KEY=0x... STARKNET_ACCOUNT_ADDRESS=0x... \\\n" +
+          "    node paymaster_submit.mjs verify --proof proof.json --contract 0x... --model-id 0x1\n"
       );
       process.exit(1);
   }
