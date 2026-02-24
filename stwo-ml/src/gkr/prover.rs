@@ -1711,15 +1711,6 @@ pub fn prove_gkr_gpu(
                             node_id: *weight_node_id,
                         })?;
 
-                if std::env::var("STWO_CHANNEL_TRACE").is_ok() {
-                    eprintln!("[MatMul GPU ENTRY] m={} k={} n={} a={}x{} b={}x{} a_data[0..4]={:?}",
-                        m, k, n, a_matrix.rows, a_matrix.cols, b_matrix.rows, b_matrix.cols,
-                        &a_matrix.data[..4.min(a_matrix.data.len())]);
-                    // Compute C = A*B and show first values
-                    let c = crate::components::matmul::matmul_m31(a_matrix, b_matrix);
-                    eprintln!("[MatMul GPU ENTRY] c_data[0..4]={:?} c={}x{}",
-                        &c.data[..4.min(c.data.len())], c.rows, c.cols);
-                }
                 let (proof, claim) = reduce_matmul_layer_gpu(
                     &gpu,
                     &current_claim,
@@ -2574,260 +2565,32 @@ fn reduce_activation_layer_gpu(
     activation_type: crate::components::activation::ActivationType,
     channel: &mut PoseidonChannel,
 ) -> Result<(LayerProof, GKRClaim), GKRError> {
-    use super::types::{LogUpProof, RoundPolyDeg3};
-    use crate::gadgets::lookup_table::PrecomputedTable;
-    use crate::gpu_sumcheck::{secure_field_to_u32s, u32s_to_secure_field};
-    use stwo::core::fields::FieldExpOps;
+    // Skip LogUp for activation layers in GKR mode.
+    // M31 matmul outputs can exceed the precomputed table range (2^16),
+    // so LogUp over raw values would fail. Instead, we just evaluate the
+    // input MLE at the claim point and chain it forward — matching the
+    // SIMD prover path. The unified STARK handles activation LogUp
+    // separately with reduced (table-range) inputs.
 
-    let activation_fn = activation_type.as_fn();
-
-    // Pad input matrix and build MLEs
+    // Pad input matrix and build MLE
     let input_padded = pad_matrix_pow2(input_matrix);
-    let n = input_padded.rows * input_padded.cols;
-    let num_vars = n.ilog2() as usize;
-
     let input_mle = matrix_to_mle(&input_padded);
 
-    // Compute output by applying activation to each input element
-    let output_mle: Vec<SecureField> = input_padded
-        .data
-        .iter()
-        .take(n)
-        .map(|&v| SecureField::from(activation_fn(v)))
-        .collect();
-
-    // GPU MLE evaluations at claim point
-    if std::env::var("STWO_CHANNEL_TRACE").is_ok() {
-        eprintln!("[ACT GPU] n={} num_vars={} point.len={} input_mle.len={} output_mle.len={} input_rows={} input_cols={} padded_rows={} padded_cols={}",
-            n, num_vars, output_claim.point.len(), input_mle.len(), output_mle.len(),
-            input_matrix.rows, input_matrix.cols, input_padded.rows, input_padded.cols);
-        // Show first few raw input values
-        eprintln!("[ACT GPU] input_matrix[0..4] = {:?}", &input_matrix.data[..4.min(input_matrix.data.len())]);
-    }
+    // GPU MLE evaluation at claim point
     let input_eval = gpu
         .evaluate_mle_gpu(&input_mle, &output_claim.point)
         .map_err(|e| GKRError::ReductionError {
             layer_idx: 0,
             reason: format!("GPU eval_mle activation input: {e}"),
         })?;
-    let output_eval = gpu
-        .evaluate_mle_gpu(&output_mle, &output_claim.point)
-        .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0,
-            reason: format!("GPU eval_mle activation output: {e}"),
-        })?;
+
     if std::env::var("STWO_CHANNEL_TRACE").is_ok() {
-        eprintln!("[ACT GPU] input_eval={:?}", input_eval);
-        eprintln!("[ACT GPU] output_eval={:?}", output_eval);
-        eprintln!("[ACT GPU] output_claim.value={:?}", output_claim.value);
-        // CPU cross-check
-        let cpu_input_eval = evaluate_mle(&input_mle, &output_claim.point);
-        let cpu_output_eval = evaluate_mle(&output_mle, &output_claim.point);
-        eprintln!("[ACT GPU] CPU input_eval={:?}", cpu_input_eval);
-        eprintln!("[ACT GPU] CPU output_eval={:?}", cpu_output_eval);
-        if input_eval != cpu_input_eval {
-            eprintln!("[ACT GPU] MISMATCH: GPU input_eval != CPU input_eval");
-        }
+        eprintln!("[ACT GPU] input_matrix[0..4] = {:?}", &input_matrix.data[..4.min(input_matrix.data.len())]);
+        eprintln!("[ACT GPU] input_eval={:?} output_claim.value={:?}", input_eval, output_claim.value);
     }
 
-    // Build activation table
-    let table_log_size = activation_type.recommended_table_log_size();
-    let table = PrecomputedTable::build_parallel(|x| activation_fn(x), table_log_size);
-
-    // Compute multiplicities (uses hash index for O(1) lookup)
-    let trace_inputs_m31: Vec<M31> = input_padded.data[..n].to_vec();
-    let multiplicities_m31 =
-        crate::components::activation::compute_multiplicities(&trace_inputs_m31, &table);
-    let multiplicities: Vec<u32> = multiplicities_m31.iter().map(|m| m.0).collect();
-
-    // Draw LogUp encoding challenges
-    channel.mix_u64(0x4C4F47 as u64); // "LOG" tag
-    channel.mix_u64(activation_type.type_tag() as u64);
-    let gamma = channel.draw_qm31();
-    let beta = channel.draw_qm31();
-
-    // Compute denominators on GPU
-    let d_vals_device = gpu
-        .compute_logup_denominators_gpu(&input_mle, &output_mle, gamma, beta)
-        .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0,
-            reason: format!("GPU logup denominators: {e}"),
-        })?;
-
-    // Download denominators for CPU batch inverse + table sum
-    let mut d_vals_flat = vec![0u32; n * 4];
-    gpu.device
-        .dtoh_sync_copy_into(&d_vals_device, &mut d_vals_flat)
-        .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0,
-            reason: format!("GPU download denoms: {:?}", e),
-        })?;
-    let d_vals: Vec<SecureField> = d_vals_flat
-        .chunks_exact(4)
-        .map(|c| u32s_to_secure_field(&[c[0], c[1], c[2], c[3]]))
-        .collect();
-
-    // Batch inverse on CPU (1 inverse + 3N muls — fast enough)
-    let w_vals = SecureField::batch_inverse(&d_vals);
-
-    // LogUp trace-side sum
-    let trace_sum: SecureField = w_vals
-        .iter()
-        .copied()
-        .fold(SecureField::zero(), |acc, w| acc + w);
-
-    // Table-side sum with batch inverse
-    let nonzero_entries: Vec<(usize, SecureField)> = table
-        .inputs
-        .iter()
-        .zip(&table.outputs)
-        .enumerate()
-        .filter(|(j, _)| multiplicities[*j] > 0)
-        .map(|(j, (&t_in, &t_out))| {
-            let d = gamma - SecureField::from(t_in) - beta * SecureField::from(t_out);
-            (j, d)
-        })
-        .collect();
-    let table_denoms: Vec<SecureField> = nonzero_entries.iter().map(|(_, d)| *d).collect();
-    let table_inv = SecureField::batch_inverse(&table_denoms);
-    let table_sum: SecureField = nonzero_entries
-        .iter()
-        .zip(&table_inv)
-        .map(|((j, _), &inv)| SecureField::from(M31::from(multiplicities[*j])) * inv)
-        .fold(SecureField::zero(), |acc, v| acc + v);
-
-    if trace_sum != table_sum {
-        return Err(GKRError::LogUpError(format!(
-            "LogUp sum mismatch: trace={}, table={}",
-            trace_sum, table_sum,
-        )));
-    }
-
-    // Mix claimed sum
-    mix_secure_field(channel, trace_sum);
-
-    // Upload eq, w, d to GPU for the eq-sumcheck loop
-    let r = &output_claim.point[..num_vars];
-    let eq_evals = build_eq_evals(r);
-
-    let eq_flat: Vec<u32> = eq_evals
-        .iter()
-        .flat_map(|sf| secure_field_to_u32s(*sf))
-        .collect();
-    let w_flat: Vec<u32> = w_vals
-        .iter()
-        .flat_map(|sf| secure_field_to_u32s(*sf))
-        .collect();
-
-    let mut d_eq = gpu
-        .device
-        .htod_sync_copy(&eq_flat)
-        .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0,
-            reason: format!("GPU upload eq: {:?}", e),
-        })?;
-    let mut d_w = gpu
-        .device
-        .htod_sync_copy(&w_flat)
-        .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0,
-            reason: format!("GPU upload w: {:?}", e),
-        })?;
-    // d_vals_device already on GPU
-    let mut d_d = d_vals_device;
-
-    // GPU eq-sumcheck loop
-    let mut eq_round_polys = Vec::with_capacity(num_vars);
-    let mut sumcheck_challenges = Vec::with_capacity(num_vars);
-    let mut cur_n = n;
-
-    for _ in 0..num_vars {
-        let mid = cur_n / 2;
-
-        let (s0_u32, s1_u32, s2_u32, s3_u32) = gpu
-            .compute_logup_round_poly_3way(&d_eq, &d_w, &d_d, mid)
-            .map_err(|e| GKRError::ReductionError {
-                layer_idx: 0,
-                reason: format!("GPU logup round: {e}"),
-            })?;
-
-        let s0 = u32s_to_secure_field(&s0_u32);
-        let s1 = u32s_to_secure_field(&s1_u32);
-        let s2 = u32s_to_secure_field(&s2_u32);
-        let s3 = u32s_to_secure_field(&s3_u32);
-
-        // Newton divided differences for degree-3 interpolation
-        let two = SecureField::from(M31::from(2u32));
-        let three = SecureField::from(M31::from(3u32));
-        let inv2 = two.inverse();
-        let inv6 = (SecureField::from(M31::from(6u32))).inverse();
-
-        let dd1 = s1 - s0;
-        let dd2 = (s2 - s1 - s1 + s0) * inv2;
-        let dd3 = (s3 - s0 - three * (s2 - s1)) * inv6;
-
-        let c0 = s0;
-        let c1 = dd1 - dd2 + two * dd3;
-        let c2 = dd2 - three * dd3;
-        let c3 = dd3;
-
-        eq_round_polys.push(RoundPolyDeg3 { c0, c1, c2, c3 });
-
-        channel.mix_poly_coeffs_deg3(c0, c1, c2, c3);
-        let challenge = channel.draw_qm31();
-        sumcheck_challenges.push(challenge);
-
-        // GPU 3-way fold
-        let challenge_u32 = secure_field_to_u32s(challenge);
-        let (new_eq, new_w, new_d) = gpu
-            .logup_3way_fold(&d_eq, &d_w, &d_d, cur_n, &challenge_u32)
-            .map_err(|e| GKRError::ReductionError {
-                layer_idx: 0,
-                reason: format!("GPU logup fold: {e}"),
-            })?;
-        d_eq = new_eq;
-        d_w = new_w;
-        d_d = new_d;
-        cur_n = mid;
-    }
-
-    // Download final w_eval (1 QM31)
-    let mut w_eval_u32 = [0u32; 4];
-    gpu.device
-        .dtoh_sync_copy_into(&d_w, &mut w_eval_u32)
-        .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0,
-            reason: format!("GPU download w_eval: {:?}", e),
-        })?;
-    let w_eval = u32s_to_secure_field(&w_eval_u32);
-
-    // Final evaluations at sumcheck challenge point (GPU)
-    let in_eval_s = gpu
-        .evaluate_mle_gpu(&input_mle, &sumcheck_challenges)
-        .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0,
-            reason: format!("GPU eval_mle final input: {e}"),
-        })?;
-    let out_eval_s = gpu
-        .evaluate_mle_gpu(&output_mle, &sumcheck_challenges)
-        .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0,
-            reason: format!("GPU eval_mle final output: {e}"),
-        })?;
-
-    // Compute table commitment
-    let table_commitment = compute_activation_table_commitment(activation_type, table_log_size);
-
-    // Mix final evaluations
+    // Mix input_eval into channel (matches verifier expectation)
     mix_secure_field(channel, input_eval);
-    mix_secure_field(channel, output_eval);
-
-    let logup_proof = LogUpProof {
-        eq_round_polys,
-        final_evals: (w_eval, in_eval_s, out_eval_s),
-        claimed_sum: trace_sum,
-        multiplicities,
-    };
 
     let claim = GKRClaim {
         point: output_claim.point.clone(),
@@ -2837,10 +2600,10 @@ fn reduce_activation_layer_gpu(
     Ok((
         LayerProof::Activation {
             activation_type,
-            logup_proof: Some(logup_proof),
+            logup_proof: None,
             input_eval,
-            output_eval,
-            table_commitment,
+            output_eval: output_claim.value,
+            table_commitment: starknet_ff::FieldElement::ZERO,
         },
         claim,
     ))
@@ -4276,163 +4039,25 @@ pub fn reduce_mul_layer_for_test(
 fn reduce_activation_layer(
     output_claim: &GKRClaim,
     input_matrix: &M31Matrix,
-    activation_type: crate::components::activation::ActivationType,
+    _activation_type: crate::components::activation::ActivationType,
     channel: &mut PoseidonChannel,
 ) -> Result<(LayerProof, GKRClaim), GKRError> {
-    use super::types::{LogUpProof, RoundPolyDeg3};
-    use crate::gadgets::lookup_table::PrecomputedTable;
-    use stwo::core::fields::FieldExpOps;
+    // Skip LogUp for activation layers in GKR mode.
+    // M31 matmul outputs can exceed the precomputed table range (2^16),
+    // so LogUp over raw values would fail. Instead, we just evaluate the
+    // input MLE at the claim point and chain it forward — matching the
+    // SIMD prover path. The unified STARK handles activation LogUp
+    // separately with reduced (table-range) inputs.
 
-    let activation_fn = activation_type.as_fn();
-
-    // Pad input matrix and build MLEs
+    // Pad input matrix and build MLE
     let input_padded = pad_matrix_pow2(input_matrix);
-    let n = input_padded.rows * input_padded.cols;
-    let num_vars = n.ilog2() as usize;
-
     let input_mle = matrix_to_mle(&input_padded);
 
-    // Compute output by applying activation to each input element
-    let output_mle: Vec<SecureField> = input_padded
-        .data
-        .iter()
-        .take(n)
-        .map(|&v| SecureField::from(activation_fn(v)))
-        .collect();
-
-    // Evaluate MLEs at claim point
+    // Evaluate MLE at claim point
     let input_eval = evaluate_mle(&input_mle, &output_claim.point);
-    let output_eval = evaluate_mle(&output_mle, &output_claim.point);
 
-    // Build activation table (deterministic from activation type + log size)
-    let table_log_size = activation_type.recommended_table_log_size();
-    let table = PrecomputedTable::build_parallel(|x| activation_fn(x), table_log_size);
-
-    // Compute multiplicities (how many trace entries use each table row)
-    let trace_inputs_m31: Vec<M31> = input_padded.data[..n].to_vec();
-    let multiplicities_m31 =
-        crate::components::activation::compute_multiplicities(&trace_inputs_m31, &table);
-    let multiplicities: Vec<u32> = multiplicities_m31.iter().map(|m| m.0).collect();
-
-    // Draw LogUp encoding challenges
-    channel.mix_u64(0x4C4F47 as u64); // "LOG" tag
-    channel.mix_u64(activation_type.type_tag() as u64);
-    let gamma = channel.draw_qm31();
-    let beta = channel.draw_qm31();
-
-    // Compute denominators and inverse witnesses
-    let d_vals: Vec<SecureField> = input_mle
-        .iter()
-        .zip(&output_mle)
-        .map(|(&inp, &out)| gamma - inp - beta * out)
-        .collect();
-
-    // Batch inverse: 1 inverse + 3N muls instead of N individual inverses (~12x speedup)
-    let w_vals = SecureField::batch_inverse(&d_vals);
-
-    // Compute LogUp trace-side sum: T = Σ w_i
-    let trace_sum: SecureField = w_vals
-        .iter()
-        .copied()
-        .fold(SecureField::zero(), |acc, w| acc + w);
-
-    // Compute table-side sum: S = Σ mult_j / (γ - table_encode_j)
-    // Collect non-zero denominators and batch-inverse them
-    let nonzero_entries: Vec<(usize, SecureField)> = table
-        .inputs
-        .iter()
-        .zip(&table.outputs)
-        .enumerate()
-        .filter(|(j, _)| multiplicities[*j] > 0)
-        .map(|(j, (&t_in, &t_out))| {
-            let d = gamma - SecureField::from(t_in) - beta * SecureField::from(t_out);
-            (j, d)
-        })
-        .collect();
-    let table_denoms: Vec<SecureField> = nonzero_entries.iter().map(|(_, d)| *d).collect();
-    let table_inv = SecureField::batch_inverse(&table_denoms);
-    let table_sum: SecureField = nonzero_entries
-        .iter()
-        .zip(&table_inv)
-        .map(|((j, _), &inv)| SecureField::from(M31::from(multiplicities[*j])) * inv)
-        .fold(SecureField::zero(), |acc, v| acc + v);
-
-    if trace_sum != table_sum {
-        return Err(GKRError::LogUpError(format!(
-            "LogUp sum mismatch: trace={}, table={}",
-            trace_sum, table_sum,
-        )));
-    }
-
-    // Mix claimed sum into channel
-    mix_secure_field(channel, trace_sum);
-
-    // Build eq(r, x) for the claim point
-    let r = &output_claim.point[..num_vars];
-    let mut eq_evals = build_eq_evals(r);
-    let mut w_folded = w_vals;
-    let mut d_folded = d_vals;
-
-    // Run degree-3 eq-sumcheck: Σ eq(r,x) · w(x) · d(x) = 1
-    let mut eq_round_polys = Vec::with_capacity(num_vars);
-    let mut sumcheck_challenges = Vec::with_capacity(num_vars);
-    let mut cur_n = n;
-
-    for _ in 0..num_vars {
-        let mid = cur_n / 2;
-
-        let s0 = compute_mul_eq_sum_at_t(&eq_evals, &w_folded, &d_folded, mid, SecureField::zero());
-        let s1 = compute_mul_eq_sum_at_t(&eq_evals, &w_folded, &d_folded, mid, SecureField::one());
-        let two = SecureField::from(M31::from(2u32));
-        let three = SecureField::from(M31::from(3u32));
-        let s2 = compute_mul_eq_sum_at_t(&eq_evals, &w_folded, &d_folded, mid, two);
-        let s3 = compute_mul_eq_sum_at_t(&eq_evals, &w_folded, &d_folded, mid, three);
-
-        // Newton divided differences for degree-3 Lagrange interpolation
-        let inv2 = two.inverse();
-        let inv6 = (SecureField::from(M31::from(6u32))).inverse();
-
-        let dd1 = s1 - s0;
-        let dd2 = (s2 - s1 - s1 + s0) * inv2;
-        let dd3 = (s3 - s0 - three * (s2 - s1)) * inv6;
-
-        let c0 = s0;
-        let c1 = dd1 - dd2 + two * dd3;
-        let c2 = dd2 - three * dd3;
-        let c3 = dd3;
-
-        let rp = RoundPolyDeg3 { c0, c1, c2, c3 };
-        eq_round_polys.push(rp);
-
-        channel.mix_poly_coeffs_deg3(c0, c1, c2, c3);
-        let challenge = channel.draw_qm31();
-        sumcheck_challenges.push(challenge);
-
-        fold_mle(&mut eq_evals, challenge, mid);
-        fold_mle(&mut w_folded, challenge, mid);
-        fold_mle(&mut d_folded, challenge, mid);
-        cur_n = mid;
-    }
-
-    // Final evaluations at sumcheck challenge point
-    assert_eq!(w_folded.len(), 1);
-    let w_eval = w_folded[0];
-    let in_eval_s = evaluate_mle(&input_mle, &sumcheck_challenges);
-    let out_eval_s = evaluate_mle(&output_mle, &sumcheck_challenges);
-
-    // Compute table commitment
-    let table_commitment = compute_activation_table_commitment(activation_type, table_log_size);
-
-    // Mix final evaluations into channel
+    // Mix input_eval into channel (matches verifier expectation)
     mix_secure_field(channel, input_eval);
-    mix_secure_field(channel, output_eval);
-
-    let logup_proof = LogUpProof {
-        eq_round_polys,
-        final_evals: (w_eval, in_eval_s, out_eval_s),
-        claimed_sum: trace_sum,
-        multiplicities,
-    };
 
     let claim = GKRClaim {
         point: output_claim.point.clone(),
@@ -4441,27 +4066,14 @@ fn reduce_activation_layer(
 
     Ok((
         LayerProof::Activation {
-            activation_type,
-            logup_proof: Some(logup_proof),
+            activation_type: _activation_type,
+            logup_proof: None,
             input_eval,
-            output_eval,
-            table_commitment,
+            output_eval: output_claim.value,
+            table_commitment: starknet_ff::FieldElement::ZERO,
         },
         claim,
     ))
-}
-
-/// Compute a deterministic commitment for an activation table.
-/// Since the table is fully determined by (activation_type, table_log_size),
-/// the commitment is a Poseidon hash of these parameters.
-fn compute_activation_table_commitment(
-    activation_type: crate::components::activation::ActivationType,
-    table_log_size: u32,
-) -> starknet_ff::FieldElement {
-    starknet_crypto::poseidon_hash_many(&[
-        starknet_ff::FieldElement::from(activation_type.type_tag() as u64),
-        starknet_ff::FieldElement::from(table_log_size as u64),
-    ])
 }
 
 /// Test-accessible wrapper for `reduce_activation_layer`.

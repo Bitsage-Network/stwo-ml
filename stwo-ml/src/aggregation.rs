@@ -708,31 +708,29 @@ where
                 let act_log_size = activation_type.recommended_table_log_size();
                 let table_mask = (1u32 << act_log_size) - 1;
 
-                // Reduce inputs to table range for LogUp consistency
+                // Apply activation to FULL (unreduced) inputs for GKR claim continuity
+                let output = crate::compiler::prove::apply_activation_pub(&current, &*f);
+
+                // Reduced inputs only for unified STARK activation LogUp trace
                 let reduced_inputs: Vec<M31> = current
                     .data
                     .iter()
                     .map(|&x| M31::from(x.0 & table_mask))
                     .collect();
-                let reduced_matrix = M31Matrix {
-                    rows: current.rows,
-                    cols: current.cols,
-                    data: reduced_inputs.clone(),
-                };
-                let output = crate::compiler::prove::apply_activation_pub(&reduced_matrix, &*f);
-
                 let table = PrecomputedTable::build(|x| (*f)(x), act_log_size);
+                let reduced_outputs: Vec<M31> = reduced_inputs.iter().map(|&x| (*f)(x)).collect();
 
                 activation_layers.push(ActivationLayerData {
                     node_id: node.id,
                     inputs: reduced_inputs,
-                    outputs: output.data.clone(),
+                    outputs: reduced_outputs,
                     table,
                     log_size: act_log_size,
                     type_tag: activation_type.type_tag(),
                 });
 
-                intermediates.push((node.id, reduced_matrix));
+                // Store UNREDUCED current as intermediate for GKR claim continuity
+                intermediates.push((node.id, current.clone()));
                 node_outputs.insert(node.id, output.clone());
                 current = output;
             }
@@ -2442,31 +2440,29 @@ where
                 let act_log_size = activation_type.recommended_table_log_size();
                 let table_mask = (1u32 << act_log_size) - 1;
 
-                // Reduce inputs to table range for LogUp consistency
+                // Apply activation to FULL (unreduced) inputs for GKR claim continuity
+                let output = crate::compiler::prove::apply_activation_pub(&current, &*f);
+
+                // Reduced inputs only for unified STARK activation LogUp trace
                 let reduced_inputs: Vec<M31> = current
                     .data
                     .iter()
                     .map(|&x| M31::from(x.0 & table_mask))
                     .collect();
-                let reduced_matrix = M31Matrix {
-                    rows: current.rows,
-                    cols: current.cols,
-                    data: reduced_inputs.clone(),
-                };
-                let output = crate::compiler::prove::apply_activation_pub(&reduced_matrix, &*f);
-
                 let table = PrecomputedTable::build(|x| (*f)(x), act_log_size);
+                let reduced_outputs: Vec<M31> = reduced_inputs.iter().map(|&x| (*f)(x)).collect();
 
                 activation_layers.push(ActivationLayerData {
                     node_id: node.id,
                     inputs: reduced_inputs,
-                    outputs: output.data.clone(),
+                    outputs: reduced_outputs,
                     table,
                     log_size: act_log_size,
                     type_tag: activation_type.type_tag(),
                 });
 
-                intermediates.push((node.id, reduced_matrix));
+                // Store UNREDUCED current as intermediate for GKR claim continuity
+                intermediates.push((node.id, current.clone()));
                 node_outputs.insert(node.id, output.clone());
                 current = output;
             }
@@ -3820,37 +3816,38 @@ where
                 let act_log_size = activation_type.recommended_table_log_size();
                 let table_mask = (1u32 << act_log_size) - 1;
 
-                // Reduce inputs to table range so LogUp trace entries stay within
-                // the precomputed table. M31 matmul outputs can exceed 2^16.
-                let reduced_inputs: Vec<M31> = current
-                    .data
-                    .iter()
-                    .map(|&x| M31::from(x.0 & table_mask))
-                    .collect();
-                let reduced_matrix = M31Matrix {
-                    rows: current.rows,
-                    cols: current.cols,
-                    data: reduced_inputs.clone(),
-                };
-                let output_data: Vec<M31> = reduced_matrix.data.iter().map(|&x| (*f)(x)).collect();
+                // Apply activation to the FULL (unreduced) inputs.
+                // GKR claim chaining requires data continuity: the activation
+                // intermediate must match the preceding MatMul's output exactly.
+                // Reduction to table range is only used for the unified STARK
+                // LogUp trace (activation_layers), not for GKR intermediates.
+                let output_data: Vec<M31> = current.data.iter().map(|&x| (*f)(x)).collect();
                 let output = M31Matrix {
                     rows: current.rows,
                     cols: current.cols,
                     data: output_data,
                 };
 
+                // Reduced inputs for the unified STARK activation LogUp trace
+                let reduced_inputs: Vec<M31> = current
+                    .data
+                    .iter()
+                    .map(|&x| M31::from(x.0 & table_mask))
+                    .collect();
                 let table = PrecomputedTable::build(|x| (*f)(x), act_log_size);
+                let reduced_outputs: Vec<M31> = reduced_inputs.iter().map(|&x| (*f)(x)).collect();
 
                 activation_layers.push(ActivationLayerData {
                     node_id: node.id,
                     inputs: reduced_inputs,
-                    outputs: output.data.clone(),
+                    outputs: reduced_outputs,
                     table,
                     log_size: act_log_size,
                     type_tag: activation_type.type_tag(),
                 });
 
-                intermediates.push((node.id, reduced_matrix));
+                // Store UNREDUCED current as intermediate for GKR claim continuity
+                intermediates.push((node.id, current.clone()));
                 node_outputs.insert(node.id, output.clone());
                 current = output;
             }
@@ -4621,31 +4618,29 @@ pub(crate) fn collect_forward_pass_layer_data(
                 let act_log_size = activation_type.recommended_table_log_size();
                 let table_mask = (1u32 << act_log_size) - 1;
 
-                // Reduce inputs to table range for LogUp consistency
+                // Apply activation to FULL (unreduced) inputs for GKR claim continuity
+                let output = crate::compiler::prove::apply_activation_pub(&current, &*f);
+
+                // Reduced inputs only for unified STARK activation LogUp trace
                 let reduced_inputs: Vec<M31> = current
                     .data
                     .iter()
                     .map(|&x| M31::from(x.0 & table_mask))
                     .collect();
-                let reduced_matrix = M31Matrix {
-                    rows: current.rows,
-                    cols: current.cols,
-                    data: reduced_inputs.clone(),
-                };
-                let output = crate::compiler::prove::apply_activation_pub(&reduced_matrix, &*f);
-
                 let table = PrecomputedTable::build(|x| (*f)(x), act_log_size);
+                let reduced_outputs: Vec<M31> = reduced_inputs.iter().map(|&x| (*f)(x)).collect();
 
                 activation_layers.push(ActivationLayerData {
                     node_id: node.id,
                     inputs: reduced_inputs,
-                    outputs: output.data.clone(),
+                    outputs: reduced_outputs,
                     table,
                     log_size: act_log_size,
                     type_tag: activation_type.type_tag(),
                 });
 
-                intermediates.push((node.id, reduced_matrix));
+                // Store UNREDUCED current as intermediate for GKR claim continuity
+                intermediates.push((node.id, current.clone()));
                 node_outputs.insert(node.id, output.clone());
                 current = output;
             }
@@ -6232,24 +6227,9 @@ pub fn verify_aggregated_model_proof(
                 activation_type, ..
             } => {
                 let f = activation_type.as_fn();
-                let act_log_size = activation_type.recommended_table_log_size();
-                let table_mask = (1u32 << act_log_size) - 1;
-                let reduced_data: Vec<M31> = current
-                    .data
-                    .iter()
-                    .map(|&x| M31::from(x.0 & table_mask))
-                    .collect();
-                let reduced = M31Matrix {
-                    rows: current.rows,
-                    cols: current.cols,
-                    data: reduced_data,
-                };
-                // Prover stores the masked (reduced) input for the chain commitment,
-                // not the raw input. Overwrite the entry pushed before the match.
-                if let Some(last) = verifier_intermediates.last_mut() {
-                    last.1 = reduced.clone();
-                }
-                let output = crate::compiler::prove::apply_activation_pub(&reduced, &*f);
+                // Apply activation to FULL (unreduced) inputs — matches prover
+                let output = crate::compiler::prove::apply_activation_pub(&current, &*f);
+                // verifier_intermediates already has unreduced current from push above
                 node_outputs.insert(node.id, output.clone());
                 current = output;
             }
@@ -6556,24 +6536,9 @@ pub fn verify_aggregated_model_proof_onchain(
                 activation_type, ..
             } => {
                 let f = activation_type.as_fn();
-                let act_log_size = activation_type.recommended_table_log_size();
-                let table_mask = (1u32 << act_log_size) - 1;
-                let reduced_data: Vec<M31> = current
-                    .data
-                    .iter()
-                    .map(|&x| M31::from(x.0 & table_mask))
-                    .collect();
-                let reduced = M31Matrix {
-                    rows: current.rows,
-                    cols: current.cols,
-                    data: reduced_data,
-                };
-                // Prover stores the masked (reduced) input for the chain commitment,
-                // not the raw input. Overwrite the entry pushed before the match.
-                if let Some(last) = verifier_intermediates.last_mut() {
-                    last.1 = reduced.clone();
-                }
-                let output = crate::compiler::prove::apply_activation_pub(&reduced, &*f);
+                // Apply activation to FULL (unreduced) inputs — matches prover
+                let output = crate::compiler::prove::apply_activation_pub(&current, &*f);
+                // verifier_intermediates already has unreduced current from push above
                 node_outputs.insert(node.id, output.clone());
                 current = output;
             }
