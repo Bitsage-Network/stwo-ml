@@ -330,7 +330,7 @@ async function deployAccountDirect(provider, account, deploymentData, network) {
     const STRK_TOKEN = "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d";
     const FUND_AMOUNT = "0x2386F26FC10000"; // 0.01 STRK (10^16 wei)
     const funder = new Account({
-      provider: account.provider,
+      provider,
       address: funderAddress,
       signer: funderKey,
       transactionVersion: ETransactionVersion.V3,
@@ -343,7 +343,7 @@ async function deployAccountDirect(provider, account, deploymentData, network) {
         calldata: CallData.compile([deploymentData.address || account.address, FUND_AMOUNT, "0x0"]),
       }]);
       info(`Fund TX: ${fundResult.transaction_hash}`);
-      await account.provider.waitForTransaction(fundResult.transaction_hash);
+      await provider.waitForTransaction(fundResult.transaction_hash);
       info("Ephemeral account funded with 0.01 STRK.");
     } catch (fundErr) {
       info(`Funding failed: ${truncateRpcError(fundErr)}`);
