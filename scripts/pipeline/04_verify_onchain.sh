@@ -517,52 +517,112 @@ else
                 --account "${ACCOUNT}" \
                 ${MODE_FLAG}
             ;;
-        # ─── GKR: verify_model_gkr / verify_model_gkr_v2 / verify_model_gkr_v3 / verify_model_gkr_v4 ─────────────
+        # ─── GKR: verify_model_gkr / verify_model_gkr_v2 / verify_model_gkr_v3 / verify_model_gkr_v4 / chunked session ─────────────
         gkr)
             header "GKR Proof Submission"
 
-            log "Submitting GKR proof for model ${MODEL_ID_FROM_META}..."
+            # Detect schema version early — schema v2 (chunked session) must go
+            # through the paymaster/JS path which handles multi-TX chunked sessions.
+            _SCHEMA_VERSION=$(parse_json_field "$PROOF_FILE" "verify_calldata.schema_version" 2>/dev/null || echo "1")
+            if [[ "$_SCHEMA_VERSION" == "2" ]]; then
+                _NUM_CHUNKS=$(parse_json_field "$PROOF_FILE" "verify_calldata.num_chunks" 2>/dev/null || echo "?")
+                _TOTAL_FELTS=$(parse_json_field "$PROOF_FILE" "verify_calldata.total_felts" 2>/dev/null || echo "?")
+                log "Schema v2 detected: chunked session (${_TOTAL_FELTS} felts in ${_NUM_CHUNKS} chunks)"
+                log "Routing through paymaster/JS path for chunked session support..."
 
-            VERIFY_TMP=$(mktemp -d)
-            if ! extract_verify_payload_files "$PROOF_FILE" "" "$VERIFY_TMP"; then
-                err "Failed to parse standardized verify_calldata from proof"
-                rm -rf "$VERIFY_TMP"
-                exit 1
-            fi
+                PAYMASTER_SCRIPT="${SCRIPT_DIR}/lib/paymaster_submit.mjs"
+                ensure_node || exit 1
+                ensure_starknet_js "${SCRIPT_DIR}/lib" || exit 1
 
-            ENTRYPOINT=$(cat "$VERIFY_TMP/entrypoint.txt")
-            if [[ "$ENTRYPOINT" != "verify_model_gkr" && "$ENTRYPOINT" != "verify_model_gkr_v2" && "$ENTRYPOINT" != "verify_model_gkr_v3" && "$ENTRYPOINT" != "verify_model_gkr_v4" ]]; then
-                UNSUPPORTED_REASON=$(parse_json_field "$PROOF_FILE" "verify_calldata.reason")
-                if [[ -z "$UNSUPPORTED_REASON" ]]; then
-                    UNSUPPORTED_REASON=$(parse_json_field "$PROOF_FILE" "soundness_gate_error")
+                PAYMASTER_OUTPUT=$(run_cmd node "$PAYMASTER_SCRIPT" verify \
+                    --proof "$PROOF_FILE" \
+                    --contract "$CONTRACT" \
+                    --model-id "$MODEL_ID_FROM_META" \
+                    --network "$NETWORK" 2>&1) || {
+                    err "Chunked session submission failed"
+                    echo "$PAYMASTER_OUTPUT" >&2
+                    exit 1
+                }
+
+                PAYMASTER_JSON=$(echo "$PAYMASTER_OUTPUT" | grep '^{' | head -1)
+                if [[ -z "$PAYMASTER_JSON" ]]; then
+                    PAYMASTER_JSON=$(echo "$PAYMASTER_OUTPUT" | python3 -c "
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if line.startswith('{'):
+        try:
+            json.loads(line)
+            print(line)
+            break
+        except: pass
+" 2>/dev/null || echo "")
                 fi
-                WEIGHT_OPENING_MODE=$(parse_json_field "$PROOF_FILE" "weight_opening_mode")
-                err "verify_calldata.entrypoint must be verify_model_gkr, verify_model_gkr_v2, verify_model_gkr_v3, or verify_model_gkr_v4 in gkr mode (got: ${ENTRYPOINT})"
-                err "  weight_opening_mode: ${WEIGHT_OPENING_MODE:-unknown}"
-                err "  reason: ${UNSUPPORTED_REASON:-unspecified}"
-                rm -rf "$VERIFY_TMP"
-                exit 1
-            fi
-            CALLDATA_STR=$(cat "$VERIFY_TMP/calldata.txt")
-            CHUNK_COUNT=$(cat "$VERIFY_TMP/chunks/count.txt")
-            if (( CHUNK_COUNT != 0 )); then
-                err "verify_model_gkr(*) payload must not include upload chunks"
-                rm -rf "$VERIFY_TMP"
-                exit 1
-            fi
 
-            if [[ -z "$CALLDATA_STR" ]]; then
-                err "verify_calldata.calldata is empty"
+                if [[ -n "$PAYMASTER_JSON" ]]; then
+                    TX_HASH=$(echo "$PAYMASTER_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('txHash',''))" 2>/dev/null || echo "")
+                    IS_ACCEPTED_PM=$(echo "$PAYMASTER_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(str(d.get('acceptedOnchain', d.get('isVerified','false'))).lower())" 2>/dev/null || echo "false")
+                    FULL_GKR_PM=$(echo "$PAYMASTER_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(str(d.get('fullGkrVerified', d.get('isVerified','false'))).lower())" 2>/dev/null || echo "false")
+                    ASSURANCE_PM=$(echo "$PAYMASTER_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(str(d.get('onchainAssurance','unknown')))" 2>/dev/null || echo "unknown")
+                    HAS_ANY_PM=$(echo "$PAYMASTER_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(str(d.get('hasAnyVerification','false')).lower())" 2>/dev/null || echo "false")
+                    EXPLORER_URL=$(echo "$PAYMASTER_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('explorerUrl',''))" 2>/dev/null || echo "")
+
+                    if [[ -n "$TX_HASH" ]]; then
+                        ALL_TX_HASHES+=("$TX_HASH")
+                        ok "TX submitted (chunked session): ${TX_HASH:0:20}..."
+                        log "Explorer: ${EXPLORER_URL}"
+                        log "Accepted on-chain: ${IS_ACCEPTED_PM}"
+                        log "Full GKR verified: ${FULL_GKR_PM}"
+                    fi
+                else
+                    warn "Could not parse chunked session output"
+                    echo "$PAYMASTER_OUTPUT" >&2
+                fi
+            else
+                # Schema v1: single-TX sncast path
+                log "Submitting GKR proof for model ${MODEL_ID_FROM_META}..."
+
+                VERIFY_TMP=$(mktemp -d)
+                if ! extract_verify_payload_files "$PROOF_FILE" "" "$VERIFY_TMP"; then
+                    err "Failed to parse standardized verify_calldata from proof"
+                    rm -rf "$VERIFY_TMP"
+                    exit 1
+                fi
+
+                ENTRYPOINT=$(cat "$VERIFY_TMP/entrypoint.txt")
+                if [[ "$ENTRYPOINT" != "verify_model_gkr" && "$ENTRYPOINT" != "verify_model_gkr_v2" && "$ENTRYPOINT" != "verify_model_gkr_v3" && "$ENTRYPOINT" != "verify_model_gkr_v4" ]]; then
+                    UNSUPPORTED_REASON=$(parse_json_field "$PROOF_FILE" "verify_calldata.reason")
+                    if [[ -z "$UNSUPPORTED_REASON" ]]; then
+                        UNSUPPORTED_REASON=$(parse_json_field "$PROOF_FILE" "soundness_gate_error")
+                    fi
+                    WEIGHT_OPENING_MODE=$(parse_json_field "$PROOF_FILE" "weight_opening_mode")
+                    err "verify_calldata.entrypoint must be verify_model_gkr, verify_model_gkr_v2, verify_model_gkr_v3, or verify_model_gkr_v4 in gkr mode (got: ${ENTRYPOINT})"
+                    err "  weight_opening_mode: ${WEIGHT_OPENING_MODE:-unknown}"
+                    err "  reason: ${UNSUPPORTED_REASON:-unspecified}"
+                    rm -rf "$VERIFY_TMP"
+                    exit 1
+                fi
+                CALLDATA_STR=$(cat "$VERIFY_TMP/calldata.txt")
+                CHUNK_COUNT=$(cat "$VERIFY_TMP/chunks/count.txt")
+                if (( CHUNK_COUNT != 0 )); then
+                    err "verify_model_gkr(*) payload must not include upload chunks"
+                    rm -rf "$VERIFY_TMP"
+                    exit 1
+                fi
+
+                if [[ -z "$CALLDATA_STR" ]]; then
+                    err "verify_calldata.calldata is empty"
+                    rm -rf "$VERIFY_TMP"
+                    exit 1
+                fi
+
+                # shellcheck disable=SC2206
+                CALLDATA_ARR=($CALLDATA_STR)
+                run_cmd sncast_invoke_tracked "$ENTRYPOINT" "${CALLDATA_ARR[@]}"
+
+                ok "${ENTRYPOINT} submitted"
                 rm -rf "$VERIFY_TMP"
-                exit 1
             fi
-
-            # shellcheck disable=SC2206
-            CALLDATA_ARR=($CALLDATA_STR)
-            run_cmd sncast_invoke_tracked "$ENTRYPOINT" "${CALLDATA_ARR[@]}"
-
-            ok "${ENTRYPOINT} submitted"
-            rm -rf "$VERIFY_TMP"
             ;;
     esac
 fi

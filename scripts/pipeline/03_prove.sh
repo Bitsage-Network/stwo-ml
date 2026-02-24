@@ -414,9 +414,9 @@ fi
 
 # Optional rebuild
 if [[ "$SKIP_BUILD" == "false" ]] && [[ -d "${LIBS_DIR}/stwo-ml" ]]; then
-    FEATURES="cli,audit"
+    FEATURES="cli,audit,model-loading,safetensors"
     if [[ "$USE_GPU" == "true" ]] && { command -v nvcc &>/dev/null || [[ -f /usr/local/cuda/bin/nvcc ]]; }; then
-        FEATURES="cli,audit,cuda-runtime"
+        FEATURES="cli,audit,model-loading,safetensors,cuda-runtime"
     fi
     log "Rebuilding prove-model (features: ${FEATURES})..."
     (export PATH="$HOME/.cargo/bin:$PATH" CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"; cd "${LIBS_DIR}/stwo-ml" && cargo build --release --bin prove-model --features "${FEATURES}" 2>&1 | tail -3) || true
@@ -736,12 +736,10 @@ if fmt != 'ml_gkr':
     print(f'Warning: format is {fmt}, expected ml_gkr', file=sys.stderr)
 vc = proof.get('verify_calldata')
 assert isinstance(vc, dict), 'Missing verify_calldata object'
-assert vc.get('schema_version') == 1, 'verify_calldata.schema_version must be 1'
+sv = vc.get('schema_version')
+assert sv in (1, 2), f'verify_calldata.schema_version must be 1 or 2 (got {sv})'
 entrypoint = vc.get('entrypoint')
 assert isinstance(entrypoint, str) and len(entrypoint) > 0, 'verify_calldata.entrypoint must be non-empty string'
-calldata = vc.get('calldata')
-chunks = vc.get('upload_chunks', [])
-assert isinstance(chunks, list), 'verify_calldata.upload_chunks must be an array'
 ready = bool(proof.get('submission_ready', False))
 
 def parse_nat(tok, label):
@@ -754,7 +752,28 @@ def parse_nat(tok, label):
         raise AssertionError(f'{label} must be >= 0 (got {v})')
     return v
 
-if entrypoint in ('verify_model_gkr', 'verify_model_gkr_v2', 'verify_model_gkr_v3', 'verify_model_gkr_v4'):
+if sv == 2:
+    # Schema v2: chunked session protocol
+    assert entrypoint == 'verify_gkr_from_session', \
+        f'schema_version=2 requires entrypoint=verify_gkr_from_session (got {entrypoint})'
+    assert vc.get('mode') == 'chunked', f'schema_version=2 requires mode=chunked (got {vc.get(\"mode\")})'
+    chunks = vc.get('chunks')
+    assert isinstance(chunks, list) and len(chunks) > 0, 'schema_version=2 requires non-empty chunks array'
+    total_felts = vc.get('total_felts')
+    assert isinstance(total_felts, int) and total_felts > 0, f'schema_version=2 requires total_felts > 0 (got {total_felts})'
+    circuit_depth = vc.get('circuit_depth')
+    assert isinstance(circuit_depth, int) and circuit_depth > 0, f'schema_version=2 requires circuit_depth > 0 (got {circuit_depth})'
+    num_layers = vc.get('num_layers')
+    assert isinstance(num_layers, int) and num_layers > 0, f'schema_version=2 requires num_layers > 0 (got {num_layers})'
+    wb_mode = vc.get('weight_binding_mode')
+    assert wb_mode in (3, 4), f'schema_version=2 requires weight_binding_mode in (3,4) (got {wb_mode})'
+    packed = vc.get('packed')
+    assert isinstance(packed, bool), f'schema_version=2 requires packed to be boolean (got {packed})'
+    print(f'  verify_calldata: schema_version=2, {total_felts} felts in {len(chunks)} chunks (packed={packed})', file=sys.stderr)
+elif entrypoint in ('verify_model_gkr', 'verify_model_gkr_v2', 'verify_model_gkr_v3', 'verify_model_gkr_v4'):
+    calldata = vc.get('calldata')
+    chunks = vc.get('upload_chunks', [])
+    assert isinstance(chunks, list), 'verify_calldata.upload_chunks must be an array'
     assert ready is True, f'{entrypoint} requires submission_ready=true'
     assert isinstance(calldata, list) and len(calldata) > 0, 'verify_calldata.calldata must be non-empty array'
     assert len(chunks) == 0, 'verify_model_gkr(*) should not include upload chunks'
@@ -849,6 +868,7 @@ if entrypoint in ('verify_model_gkr', 'verify_model_gkr_v2', 'verify_model_gkr_v
 else:
     # Off-chain / experimental transcript modes are serializable but not submit-ready.
     assert entrypoint == 'unsupported', f'unsupported verify_calldata.entrypoint: {entrypoint}'
+    calldata = vc.get('calldata')
     assert isinstance(calldata, list), 'verify_calldata.calldata must be an array'
     mode = proof.get('weight_opening_mode', 'unknown')
     reason = vc.get('reason') or proof.get('soundness_gate_error') or 'unspecified'

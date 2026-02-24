@@ -248,9 +248,9 @@ if [[ "$SKIP_BUILD" == "false" ]]; then
 
     # 5a: stwo-ml
     log "Building stwo-ml (GPU + CLI)..."
-    FEATURES="cli,audit"
+    FEATURES="cli,audit,model-loading,safetensors"
     if [[ "$GPU_AVAILABLE" == "true" ]] && [[ "$CUDA_AVAILABLE" == "true" ]]; then
-        FEATURES="cli,audit,cuda-runtime"
+        FEATURES="cli,audit,model-loading,safetensors,cuda-runtime"
     fi
 
     if (export CUDA_HOME="${CUDA_HOME:-${CUDA_PATH:-/usr/local/cuda}}"; cd "${LIBS_DIR}/stwo-ml" && \

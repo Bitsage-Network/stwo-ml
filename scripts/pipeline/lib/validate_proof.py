@@ -72,6 +72,11 @@ ALLOWED_ENTRYPOINTS = {
     'verify_model_gkr_v4',
 }
 
+# Schema v2 (chunked session) entrypoints
+ALLOWED_ENTRYPOINTS_V2 = {
+    'verify_gkr_from_session',
+}
+
 # weight_opening_mode string -> numeric mode ID
 WEIGHT_MODE_MAP = {
     'Sequential': 0,
@@ -80,6 +85,81 @@ WEIGHT_MODE_MAP = {
     'AggregatedOpeningsV4Experimental': 3,
     'AggregatedOracleSumcheck': 4,
 }
+
+
+def _validate_schema_v2(proof: dict, vc: dict, max_felts: int) -> dict:
+    """Validate a schema_version=2 (chunked session) proof payload."""
+
+    entrypoint = vc.get('entrypoint')
+    if not isinstance(entrypoint, str) or not entrypoint:
+        fail("verify_calldata.entrypoint must be a non-empty string")
+    if entrypoint not in ALLOWED_ENTRYPOINTS_V2:
+        fail(
+            f'Schema v2 requires entrypoint in {sorted(ALLOWED_ENTRYPOINTS_V2)} '
+            f'(got: {entrypoint})'
+        )
+
+    mode = vc.get('mode')
+    if mode != 'chunked':
+        fail(f"Schema v2 requires verify_calldata.mode='chunked' (got: {mode})")
+
+    chunks = vc.get('chunks')
+    if not isinstance(chunks, list) or len(chunks) == 0:
+        fail("Schema v2 requires verify_calldata.chunks as a non-empty array")
+    for i, chunk in enumerate(chunks):
+        if not isinstance(chunk, list):
+            fail(f'verify_calldata.chunks[{i}] must be an array')
+
+    total_felts = vc.get('total_felts')
+    if not isinstance(total_felts, int) or total_felts <= 0:
+        fail(f"Schema v2 requires verify_calldata.total_felts > 0 (got: {total_felts})")
+    if total_felts > max_felts:
+        fail(
+            f'Schema v2 total_felts too large: {total_felts} (max {max_felts}). '
+            'Regenerate proof with --submit for aggregated mode.'
+        )
+
+    circuit_depth = vc.get('circuit_depth')
+    if not isinstance(circuit_depth, int) or circuit_depth <= 0:
+        fail(f"Schema v2 requires verify_calldata.circuit_depth > 0 (got: {circuit_depth})")
+
+    num_layers = vc.get('num_layers')
+    if not isinstance(num_layers, int) or num_layers <= 0:
+        fail(f"Schema v2 requires verify_calldata.num_layers > 0 (got: {num_layers})")
+
+    weight_binding_mode = vc.get('weight_binding_mode')
+    if weight_binding_mode not in (3, 4):
+        fail(f"Schema v2 requires verify_calldata.weight_binding_mode in (3, 4) (got: {weight_binding_mode})")
+
+    packed = vc.get('packed')
+    if not isinstance(packed, bool):
+        fail(f"Schema v2 requires verify_calldata.packed to be boolean (got: {packed})")
+
+    # submission_ready flag
+    submission_ready = proof.get('submission_ready')
+    if submission_ready is False:
+        reason = vc.get('reason') or proof.get('soundness_gate_error') or 'unspecified'
+        fail(f'proof is marked submission_ready=false (reason={reason})')
+
+    num_chunks = vc.get('num_chunks', len(chunks))
+
+    return {
+        'entrypoint': entrypoint,
+        'calldata': [],  # no single-TX calldata in v2
+        'model_id': str(vc.get('model_id', proof.get('model_id', '0x1'))),
+        'valid': True,
+        'schema_version': 2,
+        'upload_chunks': [],
+        'calldata_felts': total_felts,
+        'chunks': chunks,
+        'num_chunks': num_chunks,
+        'total_felts': total_felts,
+        'circuit_depth': circuit_depth,
+        'num_layers': num_layers,
+        'weight_binding_mode': weight_binding_mode,
+        'packed': packed,
+        'mode': 'chunked',
+    }
 
 
 def validate_proof(proof_file: str, session_id: str = '') -> dict:
@@ -115,8 +195,14 @@ def validate_proof(proof_file: str, session_id: str = '') -> dict:
 
     # ── schema_version ──
     schema_version = vc.get('schema_version')
-    if schema_version != 1:
-        fail('verify_calldata.schema_version must be 1')
+    if schema_version not in (1, 2):
+        fail('verify_calldata.schema_version must be 1 or 2')
+
+    # ── Schema v2: Chunked Session Protocol ──
+    if schema_version == 2:
+        return _validate_schema_v2(proof, vc, max_gkr_calldata_felts)
+
+    # ── Schema v1: Single-TX calldata ──
 
     # ── entrypoint ──
     entrypoint = vc.get('entrypoint')
@@ -361,21 +447,45 @@ def write_output_files(result: dict, out_dir: str) -> None:
     with open(os.path.join(out_dir, 'entrypoint.txt'), 'w', encoding='utf-8') as f:
         f.write(result['entrypoint'])
 
-    with open(os.path.join(out_dir, 'calldata.txt'), 'w', encoding='utf-8') as f:
-        f.write(' '.join(result['calldata']))
+    schema_version = result.get('schema_version', 1)
 
-    chunks_dir = os.path.join(out_dir, 'chunks')
-    os.makedirs(chunks_dir, exist_ok=True)
+    if schema_version == 2:
+        # Schema v2: write chunked session data
+        chunks = result.get('chunks', [])
+        chunks_dir = os.path.join(out_dir, 'chunks')
+        os.makedirs(chunks_dir, exist_ok=True)
 
-    upload_chunks = result.get('upload_chunks', [])
-    with open(os.path.join(chunks_dir, 'count.txt'), 'w', encoding='utf-8') as f:
-        f.write(str(len(upload_chunks)))
+        with open(os.path.join(chunks_dir, 'count.txt'), 'w', encoding='utf-8') as f:
+            f.write(str(len(chunks)))
 
-    for idx, chunk in enumerate(upload_chunks):
-        if not isinstance(chunk, list):
-            fail(f'verify_calldata.upload_chunks[{idx}] must be an array')
-        with open(os.path.join(chunks_dir, f'chunk_{idx}.txt'), 'w', encoding='utf-8') as f:
-            f.write(' '.join(str(v) for v in chunk))
+        for idx, chunk in enumerate(chunks):
+            if not isinstance(chunk, list):
+                fail(f'verify_calldata.chunks[{idx}] must be an array')
+            with open(os.path.join(chunks_dir, f'chunk_{idx}.txt'), 'w', encoding='utf-8') as f:
+                f.write(' '.join(str(v) for v in chunk))
+
+        # Write schema v2 metadata
+        with open(os.path.join(out_dir, 'schema_version.txt'), 'w', encoding='utf-8') as f:
+            f.write('2')
+        with open(os.path.join(out_dir, 'calldata.txt'), 'w', encoding='utf-8') as f:
+            f.write('')  # no single-TX calldata in v2
+    else:
+        # Schema v1: write single-TX calldata
+        with open(os.path.join(out_dir, 'calldata.txt'), 'w', encoding='utf-8') as f:
+            f.write(' '.join(result['calldata']))
+
+        chunks_dir = os.path.join(out_dir, 'chunks')
+        os.makedirs(chunks_dir, exist_ok=True)
+
+        upload_chunks = result.get('upload_chunks', [])
+        with open(os.path.join(chunks_dir, 'count.txt'), 'w', encoding='utf-8') as f:
+            f.write(str(len(upload_chunks)))
+
+        for idx, chunk in enumerate(upload_chunks):
+            if not isinstance(chunk, list):
+                fail(f'verify_calldata.upload_chunks[{idx}] must be an array')
+            with open(os.path.join(chunks_dir, f'chunk_{idx}.txt'), 'w', encoding='utf-8') as f:
+                f.write(' '.join(str(v) for v in chunk))
 
 
 # ─── CLI Entry Point ─────────────────────────────────────────────────
@@ -414,7 +524,13 @@ def main() -> None:
         'model_id': result['model_id'],
         'valid': result['valid'],
         'calldata_felts': result['calldata_felts'],
+        'schema_version': result.get('schema_version', 1),
     }
+    if result.get('schema_version') == 2:
+        output['mode'] = result.get('mode', 'chunked')
+        output['num_chunks'] = result.get('num_chunks', 0)
+        output['total_felts'] = result.get('total_felts', 0)
+        output['packed'] = result.get('packed', False)
     json.dump(output, sys.stdout)
     print()  # trailing newline
 

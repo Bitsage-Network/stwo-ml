@@ -3983,10 +3983,17 @@ fn reduce_matmul_layer_with_backend<B: crate::backend::ZkmlOps>(
     let r_j = &output_claim.point[log_m..log_m + log_n];
 
     // Mix matmul dims and claimed sum into transcript.
+    if std::env::var("STWO_CHANNEL_TRACE").is_ok() {
+        eprintln!("[MatMul] ch BEFORE seeding: {:?}", channel.digest());
+        eprintln!("[MatMul] m={}, k={}, n={}, claim={:?}", m, k, n, output_claim.value);
+    }
     channel.mix_u64(m as u64);
     channel.mix_u64(k as u64);
     channel.mix_u64(n as u64);
     mix_secure_field(channel, output_claim.value);
+    if std::env::var("STWO_CHANNEL_TRACE").is_ok() {
+        eprintln!("[MatMul] ch after seeding: {:?}", channel.digest());
+    }
 
     let reduction = B::reduce_matmul_layer(a, b, r_i, r_j, pk, channel).map_err(|e| {
         GKRError::ReductionError {
@@ -5567,10 +5574,21 @@ fn reduce_rmsnorm_layer(
     let rms_sq_eval = evaluate_mle(&rms_sq_mle, &output_claim.point);
 
     // Part 1: eq-sumcheck: output = input × rsqrt
+    if std::env::var("STWO_CHANNEL_TRACE").is_ok() {
+        eprintln!("[RMSNorm] ch BEFORE RN: {:?}", channel.digest());
+        eprintln!("[RMSNorm] rms_sq_eval: {:?}", rms_sq_eval);
+        eprintln!("[RMSNorm] rsqrt_eval: {:?}", rsqrt_eval);
+        eprintln!("[RMSNorm] claim: {:?}", output_claim.value);
+        eprintln!("[RMSNorm] input_eval: {:?}", input_eval);
+        eprintln!("[RMSNorm] output_eval: {:?}", output_eval);
+    }
     channel.mix_u64(0x524E as u64); // "RN" tag
     mix_secure_field(channel, rms_sq_eval);
     mix_secure_field(channel, rsqrt_eval);
     mix_secure_field(channel, output_claim.value);
+    if std::env::var("STWO_CHANNEL_TRACE").is_ok() {
+        eprintln!("[RMSNorm] ch after mix claim: {:?}", channel.digest());
+    }
 
     let r = &output_claim.point[..num_vars];
     let mut eq_evals = build_eq_evals(r);
@@ -5625,8 +5643,16 @@ fn reduce_rmsnorm_layer(
 
     let input_final = input_folded[0];
     let rsqrt_final = rsqrt_folded[0];
+    if std::env::var("STWO_CHANNEL_TRACE").is_ok() {
+        eprintln!("[RMSNorm] ch after {} eq-rounds: {:?}", num_vars, channel.digest());
+        eprintln!("[RMSNorm] input_final: {:?}", input_final);
+        eprintln!("[RMSNorm] rsqrt_final: {:?}", rsqrt_final);
+    }
     mix_secure_field(channel, input_final);
     mix_secure_field(channel, rsqrt_final);
+    if std::env::var("STWO_CHANNEL_TRACE").is_ok() {
+        eprintln!("[RMSNorm] ch after final evals: {:?}", channel.digest());
+    }
 
     // Part 2: rsqrt LogUp eq-sumcheck
     let rms_sq_m31: Vec<M31> = rms_sq_mle.iter().map(|v| M31::from(v.0 .0 .0)).collect();
@@ -5674,6 +5700,10 @@ fn reduce_rmsnorm_layer(
         )));
     }
     mix_secure_field(channel, trace_sum);
+    if std::env::var("STWO_CHANNEL_TRACE").is_ok() {
+        eprintln!("[RMSNorm] ch after mix claimed_sum: {:?}", channel.digest());
+        eprintln!("[RMSNorm] claimed_sum (trace_sum): {:?}", trace_sum);
+    }
 
     let r_logup = &output_claim.point[..num_vars];
     let mut eq_logup = build_eq_evals(r_logup);
@@ -5726,8 +5756,16 @@ fn reduce_rmsnorm_layer(
 
     let rsqrt_table_commitment = compute_rsqrt_table_commitment(config.rsqrt_table_log_size);
 
+    if std::env::var("STWO_CHANNEL_TRACE").is_ok() {
+        eprintln!("[RMSNorm] ch after logup (before input/output mix): {:?}", channel.digest());
+        eprintln!("[RMSNorm] logup eq_rounds: {}", logup_proof.eq_round_polys.len());
+    }
+
     mix_secure_field(channel, input_eval);
     mix_secure_field(channel, output_eval);
+    if std::env::var("STWO_CHANNEL_TRACE").is_ok() {
+        eprintln!("[RMSNorm] ch FINAL: {:?}", channel.digest());
+    }
 
     Ok((
         LayerProof::RMSNorm {
