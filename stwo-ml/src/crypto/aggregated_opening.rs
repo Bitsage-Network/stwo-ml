@@ -228,6 +228,69 @@ fn merkle_root_from_leaves(leaves: &[FieldElement]) -> FieldElement {
     current[0]
 }
 
+// ─── WeightSource trait for streaming access ────────────────────────────────
+
+/// Trait for on-demand weight MLE access (avoids holding all MLEs in memory).
+///
+/// The streaming aggregated binding sumcheck loads one MLE at a time, evaluates
+/// it, then drops it. This reduces peak memory from ~640 GB (all 160 weight
+/// MLEs simultaneously) to ~4 GB (single largest matrix).
+pub trait WeightSource {
+    /// Return the SecureField MLE for the weight matrix at the given claim index.
+    /// Caller should drop the returned Vec after use to free memory.
+    fn get_mle(&self, claim_index: usize) -> Vec<SecureField>;
+    /// Return the QM31 AoS u32 MLE for GPU opening proof at the given claim index.
+    fn get_mle_u32(&self, claim_index: usize) -> Vec<u32>;
+    /// Number of weight matrices.
+    fn len(&self) -> usize;
+}
+
+/// Backward-compatible `WeightSource` wrapping pre-built `&[&[SecureField]]` slices.
+///
+/// Used by tests and the non-streaming path. Clones MLEs on access since the
+/// trait requires owned `Vec`s (the caller may drop them to free memory).
+pub struct SliceWeightSource<'a> {
+    pub mles: &'a [&'a [SecureField]],
+    pub mles_u32: &'a [&'a [u32]],
+}
+
+impl<'a> WeightSource for SliceWeightSource<'a> {
+    fn get_mle(&self, claim_index: usize) -> Vec<SecureField> {
+        self.mles[claim_index].to_vec()
+    }
+    fn get_mle_u32(&self, claim_index: usize) -> Vec<u32> {
+        self.mles_u32[claim_index].to_vec()
+    }
+    fn len(&self) -> usize {
+        self.mles.len()
+    }
+}
+
+// ─── Selector weight helper ─────────────────────────────────────────────────
+
+/// Compute the selector polynomial weight for a given matrix index.
+///
+/// `sel_weight(i, selector) = Π_j (selector_j * bit_j + (1 - selector_j) * (1 - bit_j))`
+/// where `bit_j` is the j-th bit (MSB first) of `matrix_index`.
+fn compute_selector_weight(
+    matrix_index: usize,
+    selector: &[SecureField],
+    config: &AggregatedBindingConfig,
+) -> SecureField {
+    let one = SecureField::from(M31::from(1));
+    let mut sel_weight = one;
+    for (j, &s_j) in selector.iter().enumerate() {
+        let bit_pos = config.selector_bits - 1 - j;
+        let bit_j = if (matrix_index >> bit_pos) & 1 == 1 {
+            one
+        } else {
+            SecureField::zero()
+        };
+        sel_weight = sel_weight * (s_j * bit_j + (one - s_j) * (one - bit_j));
+    }
+    sel_weight
+}
+
 // ─── eq polynomial ───────────────────────────────────────────────────────────
 
 /// Evaluate eq(a, b) = Π_i (a_i * b_i + (1 - a_i) * (1 - b_i))
@@ -293,23 +356,11 @@ fn eval_unified_oracle(
     let local = &t[config.selector_bits..];
     assert_eq!(local.len(), config.n_max);
 
-    let one = SecureField::from(M31::from(1));
-
     // Compute selector polynomial weights for each matrix
     // W_global(t) = Σ_i sel_weight(i, selector) * W_i(local)
     let mut result = SecureField::zero();
     for (i, mle) in weight_mles.iter().enumerate() {
-        // Selector weight for matrix i = Π_j (selector_j * bit_j + (1 - selector_j) * (1 - bit_j))
-        let mut sel_weight = one;
-        for (j, &s_j) in selector.iter().enumerate() {
-            let bit_pos = config.selector_bits - 1 - j;
-            let bit_j = if (i >> bit_pos) & 1 == 1 {
-                one
-            } else {
-                SecureField::zero()
-            };
-            sel_weight = sel_weight * (s_j * bit_j + (one - s_j) * (one - bit_j));
-        }
+        let sel_weight = compute_selector_weight(i, selector, config);
 
         if sel_weight == SecureField::zero() {
             continue;
@@ -724,6 +775,320 @@ pub fn prove_aggregated_binding_gpu(
          This indicates a data representation mismatch between SecureField and u32 AoS formats.",
         super_root.root,
     );
+
+    AggregatedWeightBindingProof {
+        config,
+        sumcheck_round_polys: round_polys,
+        oracle_eval_at_s: oracle_eval,
+        opening_proof,
+        super_root,
+    }
+}
+
+// ─── Streaming aggregated binding ─────────────────────────────────────────
+
+/// Evaluate the virtual unified oracle at a global point, streaming MLEs on demand.
+///
+/// Same semantics as [`eval_unified_oracle`] but loads each weight MLE from the
+/// source just-in-time and drops it immediately after evaluation. Peak memory is
+/// bounded by the single largest matrix MLE (~4 GB) instead of all MLEs (~640 GB).
+fn eval_unified_oracle_streaming(
+    t: &[SecureField],
+    source: &dyn WeightSource,
+    claim_n_vars: &[usize],
+    config: &AggregatedBindingConfig,
+) -> SecureField {
+    let selector = &t[..config.selector_bits];
+    let local = &t[config.selector_bits..];
+    assert_eq!(local.len(), config.n_max);
+
+    let mut result = SecureField::zero();
+    for i in 0..source.len() {
+        let sel_weight = compute_selector_weight(i, selector, config);
+
+        if sel_weight == SecureField::zero() {
+            continue;
+        }
+
+        let n_vars = claim_n_vars[i];
+        let local_truncated = &local[config.n_max - n_vars..];
+        let mle = source.get_mle(i); // load on demand
+        let w_val = evaluate_mle_at(&mle, local_truncated);
+        // mle dropped here — frees ~4 GB
+
+        result = result + sel_weight * w_val;
+    }
+
+    result
+}
+
+/// Evaluate the sumcheck polynomial for a specific round at a given value,
+/// using streaming weight MLE access.
+///
+/// Same semantics as [`eval_round_at_value`] but calls [`eval_unified_oracle_streaming`].
+fn eval_round_at_value_streaming(
+    value: SecureField,
+    round: usize,
+    claims: &[AggregatedWeightClaim],
+    source: &dyn WeightSource,
+    claim_n_vars: &[usize],
+    config: &AggregatedBindingConfig,
+    betas: &[SecureField],
+    global_points: &[Vec<SecureField>],
+    eq_prefix: &[SecureField],
+    challenge_point: &[SecureField],
+) -> SecureField {
+    let one = SecureField::from(M31::from(1));
+    let n = config.n_global;
+
+    let mut total = SecureField::zero();
+
+    for (i, claim) in claims.iter().enumerate() {
+        let gp = &global_points[i];
+
+        // eq factor for this round variable
+        let eq_round = gp[round] * value + (one - gp[round]) * (one - value);
+
+        // Build the full evaluation point
+        let mut eval_pt = Vec::with_capacity(n);
+        eval_pt.extend_from_slice(challenge_point); // r_0..r_{round-1}
+        eval_pt.push(value); // X_round = value
+        eval_pt.extend_from_slice(&gp[round + 1..]); // g_i[round+1:]
+
+        let w_at_pt = eval_unified_oracle_streaming(&eval_pt, source, claim_n_vars, config);
+        let mismatch = w_at_pt - claim.expected_value;
+
+        total = total + betas[i] * eq_prefix[i] * eq_round * mismatch;
+    }
+
+    total
+}
+
+/// Run the mismatch sumcheck using streaming weight MLE access.
+///
+/// Same structure as [`mismatch_sumcheck`] but loads MLEs on demand via the
+/// [`WeightSource`] trait instead of requiring all MLEs in memory.
+fn mismatch_sumcheck_streaming(
+    claims: &[AggregatedWeightClaim],
+    source: &dyn WeightSource,
+    claim_n_vars: &[usize],
+    config: &AggregatedBindingConfig,
+    betas: &[SecureField],
+    channel: &mut PoseidonChannel,
+) -> (
+    Vec<(SecureField, SecureField, SecureField)>,
+    Vec<SecureField>,
+) {
+    let n = config.n_global;
+    let one = SecureField::from(M31::from(1));
+
+    let global_points: Vec<Vec<SecureField>> =
+        claims.iter().map(|c| global_point(c, config)).collect();
+
+    let mut challenge_point = Vec::with_capacity(n);
+    let mut round_polys = Vec::with_capacity(n);
+    let mut eq_prefix: Vec<SecureField> = vec![one; claims.len()];
+
+    for round in 0..n {
+        let s0 = eval_round_at_value_streaming(
+            SecureField::zero(),
+            round,
+            claims,
+            source,
+            claim_n_vars,
+            config,
+            betas,
+            &global_points,
+            &eq_prefix,
+            &challenge_point,
+        );
+        let s1 = eval_round_at_value_streaming(
+            one,
+            round,
+            claims,
+            source,
+            claim_n_vars,
+            config,
+            betas,
+            &global_points,
+            &eq_prefix,
+            &challenge_point,
+        );
+        let two = SecureField::from(M31::from(2));
+        let s2 = eval_round_at_value_streaming(
+            two,
+            round,
+            claims,
+            source,
+            claim_n_vars,
+            config,
+            betas,
+            &global_points,
+            &eq_prefix,
+            &challenge_point,
+        );
+
+        // Degree-2 polynomial through (0, s0), (1, s1), (2, s2)
+        let c0 = s0;
+        let two_inv = two.inverse();
+        let c2 = (s0 - two * s1 + s2) * two_inv;
+        let c1 = s1 - s0 - c2;
+
+        channel.mix_poly_coeffs(c0, c1, c2);
+        round_polys.push((c0, c1, c2));
+
+        let r = channel.draw_qm31();
+        challenge_point.push(r);
+
+        for (i, gp) in global_points.iter().enumerate() {
+            let g_val = gp[round];
+            eq_prefix[i] = eq_prefix[i] * (r * g_val + (one - r) * (one - g_val));
+        }
+    }
+
+    (round_polys, challenge_point)
+}
+
+/// Build the virtual MLE u32 array slot-by-slot from a streaming source.
+///
+/// Each matrix u32 MLE is loaded, copied into its slot, and then dropped.
+/// This avoids requiring all u32 MLEs in memory simultaneously.
+#[cfg(feature = "cuda-runtime")]
+fn build_virtual_mle_u32_streaming(
+    source: &dyn WeightSource,
+    config: &AggregatedBindingConfig,
+) -> Vec<u32> {
+    let total_size = 1usize << config.n_global;
+    let slot_size = 1usize << config.n_max;
+
+    // 4 u32 words per QM31 element
+    let mut virtual_mle = vec![0u32; total_size * 4];
+
+    for i in 0..source.len() {
+        let mle_u32 = source.get_mle_u32(i);
+        let offset = i * slot_size * 4;
+        virtual_mle[offset..offset + mle_u32.len()].copy_from_slice(&mle_u32);
+        // mle_u32 dropped here
+    }
+
+    virtual_mle
+}
+
+/// Build the virtual MLE (SecureField) slot-by-slot from a streaming source.
+///
+/// Used for CPU-only (non-CUDA) path. Each matrix MLE is loaded, copied, and dropped.
+#[cfg(not(feature = "cuda-runtime"))]
+fn build_virtual_mle_streaming(
+    source: &dyn WeightSource,
+    config: &AggregatedBindingConfig,
+) -> Vec<SecureField> {
+    let total_size = 1usize << config.n_global;
+    let slot_size = 1usize << config.n_max;
+
+    let mut virtual_mle = vec![SecureField::zero(); total_size];
+
+    for i in 0..source.len() {
+        let mle = source.get_mle(i);
+        let offset = i * slot_size;
+        virtual_mle[offset..offset + mle.len()].copy_from_slice(&mle);
+        // mle dropped here
+    }
+
+    virtual_mle
+}
+
+/// Streaming aggregated weight binding prover (GPU path).
+///
+/// Same protocol as [`prove_aggregated_binding_gpu`] but loads weight MLEs
+/// on-demand from a [`WeightSource`] instead of requiring all MLEs in memory.
+/// Peak MLE memory drops from ~640 GB (all matrices) to ~4 GB (largest single matrix).
+///
+/// The sumcheck loads each MLE 3× per round (t=0,1,2) across all claim evaluations,
+/// then drops it. The final virtual MLE u32 is still fully materialized for the
+/// GPU MLE opening proof.
+#[cfg(feature = "cuda-runtime")]
+pub fn prove_aggregated_binding_streaming(
+    claims: &[AggregatedWeightClaim],
+    source: &dyn WeightSource,
+    channel: &mut PoseidonChannel,
+) -> AggregatedWeightBindingProof {
+    assert_eq!(claims.len(), source.len());
+    assert!(!claims.is_empty());
+
+    let config = AggregatedBindingConfig::from_claims(claims);
+    let claim_n_vars: Vec<usize> = claims.iter().map(|c| c.local_n_vars).collect();
+
+    // 1. Build super-root and mix into channel
+    let super_root = build_super_root(claims, &config);
+    channel.mix_felt(super_root.root);
+
+    // 2. Draw β weights
+    let betas = draw_beta_weights(channel, claims.len());
+
+    // 3. Streaming mismatch sumcheck
+    let (round_polys, challenge_point) =
+        mismatch_sumcheck_streaming(claims, source, &claim_n_vars, &config, &betas, channel);
+
+    // 4. Oracle eval at challenge point (one more streaming eval)
+    let oracle_eval =
+        eval_unified_oracle_streaming(&challenge_point, source, &claim_n_vars, &config);
+    channel.mix_felts(&[oracle_eval]);
+
+    // 5. Build virtual MLE u32 sequentially and prove opening
+    let virtual_mle_u32 = build_virtual_mle_u32_streaming(source, &config);
+    let (commitment, opening_proof) =
+        prove_mle_opening_with_commitment_qm31_u32(&virtual_mle_u32, &challenge_point, channel);
+
+    debug_assert_eq!(
+        commitment, super_root.root,
+        "GPU virtual MLE commitment ({commitment:?}) diverged from super-root ({:?}). \
+         This indicates a data representation mismatch.",
+        super_root.root,
+    );
+
+    AggregatedWeightBindingProof {
+        config,
+        sumcheck_round_polys: round_polys,
+        oracle_eval_at_s: oracle_eval,
+        opening_proof,
+        super_root,
+    }
+}
+
+/// Streaming aggregated weight binding prover (CPU path).
+///
+/// Same protocol as [`prove_aggregated_binding`] but loads weight MLEs on-demand.
+#[cfg(not(feature = "cuda-runtime"))]
+pub fn prove_aggregated_binding_streaming(
+    claims: &[AggregatedWeightClaim],
+    source: &dyn WeightSource,
+    channel: &mut PoseidonChannel,
+) -> AggregatedWeightBindingProof {
+    assert_eq!(claims.len(), source.len());
+    assert!(!claims.is_empty());
+
+    let config = AggregatedBindingConfig::from_claims(claims);
+    let claim_n_vars: Vec<usize> = claims.iter().map(|c| c.local_n_vars).collect();
+
+    // 1. Build super-root and mix into channel
+    let super_root = build_super_root(claims, &config);
+    channel.mix_felt(super_root.root);
+
+    // 2. Draw β weights
+    let betas = draw_beta_weights(channel, claims.len());
+
+    // 3. Streaming mismatch sumcheck
+    let (round_polys, challenge_point) =
+        mismatch_sumcheck_streaming(claims, source, &claim_n_vars, &config, &betas, channel);
+
+    // 4. Oracle eval at challenge point
+    let oracle_eval =
+        eval_unified_oracle_streaming(&challenge_point, source, &claim_n_vars, &config);
+    channel.mix_felts(&[oracle_eval]);
+
+    // 5. Build virtual MLE and prove opening
+    let virtual_mle = build_virtual_mle_streaming(source, &config);
+    let opening_proof = prove_mle_opening(&virtual_mle, &challenge_point, channel);
 
     AggregatedWeightBindingProof {
         config,
@@ -1374,6 +1739,217 @@ mod tests {
         let mle0_u32_len = mle0.len() * 4;
         for i in mle0_u32_len..slot_u32_size {
             assert_eq!(virt[i], 0, "intra-slot padding at u32 index {i}");
+        }
+    }
+
+    // ─── Streaming tests ────────────────────────────────────────────────
+
+    /// SliceWeightSource for tests that don't need u32 MLEs (CPU path).
+    fn make_slice_source<'a>(
+        mles: &'a [&'a [SecureField]],
+        mles_u32: &'a [&'a [u32]],
+    ) -> SliceWeightSource<'a> {
+        SliceWeightSource { mles, mles_u32 }
+    }
+
+    #[test]
+    fn test_slice_weight_source_basic() {
+        let mle0 = random_mle(3);
+        let mle1 = random_mle(4);
+        let mle_refs: Vec<&[SecureField]> = vec![&mle0, &mle1];
+        let mle0_u32 = securefield_mle_to_u32_aos(&mle0);
+        let mle1_u32 = securefield_mle_to_u32_aos(&mle1);
+        let u32_refs: Vec<&[u32]> = vec![&mle0_u32, &mle1_u32];
+
+        let source = make_slice_source(&mle_refs, &u32_refs);
+        assert_eq!(source.len(), 2);
+
+        let got0 = source.get_mle(0);
+        assert_eq!(got0, mle0);
+        let got1 = source.get_mle(1);
+        assert_eq!(got1, mle1);
+
+        let got0_u32 = source.get_mle_u32(0);
+        assert_eq!(got0_u32, mle0_u32);
+    }
+
+    #[test]
+    fn test_streaming_oracle_matches_direct() {
+        // Verify eval_unified_oracle_streaming matches eval_unified_oracle.
+        let mle0 = random_mle(3);
+        let mle1 = random_mle(4);
+        let claim0 = make_claim(0, &mle0);
+        let claim1 = make_claim(1, &mle1);
+        let claims = vec![claim0, claim1];
+        let config = AggregatedBindingConfig::from_claims(&claims);
+        let claim_n_vars: Vec<usize> = claims.iter().map(|c| c.local_n_vars).collect();
+
+        let mle_refs: Vec<&[SecureField]> = vec![&mle0, &mle1];
+        let mle0_u32 = securefield_mle_to_u32_aos(&mle0);
+        let mle1_u32 = securefield_mle_to_u32_aos(&mle1);
+        let u32_refs: Vec<&[u32]> = vec![&mle0_u32, &mle1_u32];
+        let source = make_slice_source(&mle_refs, &u32_refs);
+
+        // Random evaluation point
+        let point: Vec<SecureField> = (0..config.n_global).map(|_| random_qm31()).collect();
+
+        let direct = eval_unified_oracle(&point, &mle_refs, &config);
+        let streaming = eval_unified_oracle_streaming(&point, &source, &claim_n_vars, &config);
+        assert_eq!(direct, streaming, "streaming oracle must match direct");
+    }
+
+    #[test]
+    fn test_streaming_matches_non_streaming_2_matrices() {
+        // Prove with both paths and compare proofs field-by-field.
+        let mle0 = random_mle(3);
+        let mle1 = random_mle(3);
+        let claim0 = make_claim(0, &mle0);
+        let claim1 = make_claim(1, &mle1);
+        let claims = vec![claim0, claim1];
+
+        let mle_refs: Vec<&[SecureField]> = vec![&mle0, &mle1];
+        let mle0_u32 = securefield_mle_to_u32_aos(&mle0);
+        let mle1_u32 = securefield_mle_to_u32_aos(&mle1);
+        let u32_refs: Vec<&[u32]> = vec![&mle0_u32, &mle1_u32];
+        let source = make_slice_source(&mle_refs, &u32_refs);
+
+        // Non-streaming proof
+        let mut ch1 = PoseidonChannel::new();
+        ch1.mix_u64(77);
+        let proof_direct = prove_aggregated_binding(&claims, &mle_refs, &mut ch1);
+
+        // Streaming proof (uses SliceWeightSource for backward compat)
+        let mut ch2 = PoseidonChannel::new();
+        ch2.mix_u64(77);
+        let proof_streaming =
+            prove_aggregated_binding_streaming(&claims, &source, &mut ch2);
+
+        // Field-by-field comparison
+        assert_eq!(
+            proof_direct.sumcheck_round_polys, proof_streaming.sumcheck_round_polys,
+            "sumcheck round polynomials must match"
+        );
+        assert_eq!(
+            proof_direct.oracle_eval_at_s, proof_streaming.oracle_eval_at_s,
+            "oracle eval must match"
+        );
+        assert_eq!(
+            proof_direct.super_root.root, proof_streaming.super_root.root,
+            "super-root must match"
+        );
+    }
+
+    #[test]
+    fn test_streaming_matches_non_streaming_varying_sizes() {
+        let sizes = [3, 4, 5, 3];
+        let mles: Vec<Vec<SecureField>> = sizes.iter().map(|&n| random_mle(n)).collect();
+        let claims: Vec<AggregatedWeightClaim> = mles
+            .iter()
+            .enumerate()
+            .map(|(i, m)| make_claim(i, m))
+            .collect();
+        let mle_refs: Vec<&[SecureField]> = mles.iter().map(|m| m.as_slice()).collect();
+        let mles_u32: Vec<Vec<u32>> = mles.iter().map(|m| securefield_mle_to_u32_aos(m)).collect();
+        let u32_refs: Vec<&[u32]> = mles_u32.iter().map(|m| m.as_slice()).collect();
+        let source = make_slice_source(&mle_refs, &u32_refs);
+
+        let mut ch1 = PoseidonChannel::new();
+        ch1.mix_u64(321);
+        let proof_direct = prove_aggregated_binding(&claims, &mle_refs, &mut ch1);
+
+        let mut ch2 = PoseidonChannel::new();
+        ch2.mix_u64(321);
+        let proof_streaming =
+            prove_aggregated_binding_streaming(&claims, &source, &mut ch2);
+
+        assert_eq!(
+            proof_direct.sumcheck_round_polys, proof_streaming.sumcheck_round_polys,
+            "sumcheck round polys must match for varying sizes"
+        );
+        assert_eq!(
+            proof_direct.oracle_eval_at_s, proof_streaming.oracle_eval_at_s,
+            "oracle eval must match for varying sizes"
+        );
+    }
+
+    #[test]
+    fn test_streaming_verify() {
+        // Prove with streaming, verify with standard verifier.
+        let mle0 = random_mle(4);
+        let mle1 = random_mle(4);
+        let mle2 = random_mle(3);
+        let claim0 = make_claim(0, &mle0);
+        let claim1 = make_claim(1, &mle1);
+        let claim2 = make_claim(2, &mle2);
+        let claims = vec![claim0, claim1, claim2];
+
+        let mle_refs: Vec<&[SecureField]> = vec![&mle0, &mle1, &mle2];
+        let mles_u32: Vec<Vec<u32>> = mle_refs.iter().map(|m| securefield_mle_to_u32_aos(m)).collect();
+        let u32_refs: Vec<&[u32]> = mles_u32.iter().map(|m| m.as_slice()).collect();
+        let source = make_slice_source(&mle_refs, &u32_refs);
+
+        let mut prover_ch = PoseidonChannel::new();
+        prover_ch.mix_u64(99);
+        let mut verifier_ch = prover_ch.clone();
+
+        let proof = prove_aggregated_binding_streaming(&claims, &source, &mut prover_ch);
+
+        assert!(
+            verify_aggregated_binding(&proof, &claims, &mut verifier_ch),
+            "streaming proof must verify with standard verifier"
+        );
+    }
+
+    #[test]
+    fn test_streaming_single_matrix() {
+        let mle = random_mle(5);
+        let claim = make_claim(0, &mle);
+        let claims = vec![claim];
+
+        let mle_refs: Vec<&[SecureField]> = vec![&mle];
+        let mle_u32 = securefield_mle_to_u32_aos(&mle);
+        let u32_refs: Vec<&[u32]> = vec![&mle_u32];
+        let source = make_slice_source(&mle_refs, &u32_refs);
+
+        let mut prover_ch = PoseidonChannel::new();
+        prover_ch.mix_u64(1);
+        let mut verifier_ch = prover_ch.clone();
+
+        let proof = prove_aggregated_binding_streaming(&claims, &source, &mut prover_ch);
+        assert!(
+            verify_aggregated_binding(&proof, &claims, &mut verifier_ch),
+            "streaming single matrix must verify"
+        );
+    }
+
+    #[test]
+    fn test_compute_selector_weight_matches_inline() {
+        // Verify the extracted helper matches the original inline computation.
+        let config = AggregatedBindingConfig {
+            selector_bits: 3,
+            n_max: 5,
+            m_padded: 8,
+            n_global: 8,
+            n_claims: 5,
+        };
+        let one = SecureField::from(M31::from(1));
+        let selector: Vec<SecureField> = (0..3).map(|_| random_qm31()).collect();
+
+        for matrix_idx in 0..8 {
+            // Inline computation (from original eval_unified_oracle)
+            let mut expected = one;
+            for (j, &s_j) in selector.iter().enumerate() {
+                let bit_pos = config.selector_bits - 1 - j;
+                let bit_j = if (matrix_idx >> bit_pos) & 1 == 1 {
+                    one
+                } else {
+                    SecureField::zero()
+                };
+                expected = expected * (s_j * bit_j + (one - s_j) * (one - bit_j));
+            }
+
+            let got = compute_selector_weight(matrix_idx, &selector, &config);
+            assert_eq!(got, expected, "selector weight mismatch at index {matrix_idx}");
         }
     }
 }

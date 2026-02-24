@@ -31,10 +31,8 @@ use crate::components::matmul::{
 };
 #[cfg(test)]
 use crate::components::matmul::matrix_to_mle_col_major_pub as matrix_to_mle_col_major;
-#[cfg(feature = "cuda-runtime")]
-use crate::crypto::aggregated_opening::prove_aggregated_binding_gpu;
-#[cfg(not(feature = "cuda-runtime"))]
-use crate::crypto::aggregated_opening::prove_aggregated_binding;
+use crate::crypto::aggregated_opening::prove_aggregated_binding_streaming;
+use crate::crypto::aggregated_opening::WeightSource;
 use crate::crypto::aggregated_opening::AggregatedWeightClaim;
 use crate::crypto::poseidon_channel::PoseidonChannel;
 
@@ -247,6 +245,63 @@ fn compute_weight_mode_flags() -> WeightModeFlags {
     }
 }
 
+// ─── GraphWeightSource: streaming weight MLE access from GraphWeights ────────
+
+/// Streaming [`WeightSource`] backed by [`GraphWeights`].
+///
+/// Maps claim indices to weight node IDs. Each `get_mle` call loads the M31Matrix
+/// from `GraphWeights`, converts it to a SecureField MLE on-the-fly, and returns it.
+/// The caller drops the MLE after evaluation, keeping peak memory at ~4 GB.
+struct GraphWeightSource<'a> {
+    weights: &'a GraphWeights,
+    /// Maps claim index → weight_node_id (for get_weight lookup).
+    claim_node_ids: Vec<usize>,
+}
+
+impl<'a> WeightSource for GraphWeightSource<'a> {
+    fn get_mle(&self, claim_index: usize) -> Vec<SecureField> {
+        let node_id = self.claim_node_ids[claim_index];
+        let matrix = self
+            .weights
+            .get_weight(node_id)
+            .unwrap_or_else(|| panic!("weight not found for node_id {node_id}"));
+        matrix_to_mle_col_major_padded(matrix)
+    }
+
+    fn get_mle_u32(&self, claim_index: usize) -> Vec<u32> {
+        let node_id = self.claim_node_ids[claim_index];
+        let matrix = self
+            .weights
+            .get_weight(node_id)
+            .unwrap_or_else(|| panic!("weight not found for node_id {node_id}"));
+        #[cfg(feature = "cuda-runtime")]
+        {
+            matrix_to_mle_col_major_u32_padded(matrix)
+        }
+        #[cfg(not(feature = "cuda-runtime"))]
+        {
+            // CPU path: convert SecureField MLE to u32 AoS format.
+            let mle = matrix_to_mle_col_major_padded(matrix);
+            let mut out = vec![0u32; mle.len() * 4];
+            for (i, &sf) in mle.iter().enumerate() {
+                let stwo::core::fields::qm31::QM31(
+                    stwo::core::fields::cm31::CM31(a, b),
+                    stwo::core::fields::cm31::CM31(c, d),
+                ) = sf;
+                out[i * 4] = a.0;
+                out[i * 4 + 1] = b.0;
+                out[i * 4 + 2] = c.0;
+                out[i * 4 + 3] = d.0;
+            }
+            out
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.claim_node_ids.len()
+    }
+}
+
 /// Apply aggregated oracle sumcheck binding for all weight claims.
 ///
 /// Returns (weight_commitments, weight_claims, proof). The `deferred_proofs`
@@ -285,10 +340,9 @@ fn apply_aggregated_oracle_sumcheck(
     // GPU path: sequential per-matrix GPU Poseidon Merkle (~200ms each, ~32s total).
     // CPU fallback: 4-thread parallel pool (~3-5s each, ~5-10min total).
     //
-    // Memory optimization: check early if full binding proof is needed.
-    // If not (RLC fast path), skip storing per-matrix MLEs — they're only needed
-    // for prove_aggregated_binding_gpu(). Without this, 160 matrices × ~4GB each
-    // would require ~640 GB RAM, causing OOM on machines with ≤256 GB.
+    // Check if full binding proof is needed. MLEs are always dropped after
+    // commitment — streaming mode reloads them on demand from GraphWeights,
+    // keeping peak memory at ~4 GB (single largest matrix) instead of ~640 GB.
     let need_full_binding = std::env::var("STWO_AGGREGATED_FULL_BINDING")
         .map(|v| !v.is_empty() && v != "0" && v != "false")
         .unwrap_or(false);
@@ -337,9 +391,6 @@ fn apply_aggregated_oracle_sumcheck(
         commitment: starknet_ff::FieldElement,
         eval_point: Vec<SecureField>,
         expected_value: SecureField,
-        mle: Vec<SecureField>,
-        #[cfg(feature = "cuda-runtime")]
-        mle_u32: Vec<u32>,
         is_deferred: bool,
         deferred_idx: usize,
     }
@@ -532,26 +583,16 @@ fn apply_aggregated_oracle_sumcheck(
                             );
                         }
 
-                        // Drop MLEs immediately when full binding isn't needed,
-                        // freeing ~4 GB per matrix before the next one is prepared.
-                        let (mle_out, mle_u32_out) = if need_full_binding {
-                            (
-                                std::mem::take(&mut current_prep.mle),
-                                std::mem::take(&mut current_prep.mle_u32),
-                            )
-                        } else {
-                            drop(std::mem::take(&mut current_prep.mle));
-                            drop(std::mem::take(&mut current_prep.mle_u32));
-                            (Vec::new(), Vec::new())
-                        };
+                        // Always drop MLEs immediately — streaming mode will
+                        // reload them on demand from GraphWeights.
+                        drop(std::mem::take(&mut current_prep.mle));
+                        drop(std::mem::take(&mut current_prep.mle_u32));
                         results.push(Ok(WeightPrepResult {
                             matrix_index: input.matrix_index,
                             n_vars: current_prep.n_vars,
                             commitment,
                             eval_point: input.eval_point.to_vec(),
                             expected_value: input.expected_value,
-                            mle: mle_out,
-                            mle_u32: mle_u32_out,
                             is_deferred: input.is_deferred,
                             deferred_idx: input.deferred_idx,
                         }));
@@ -599,24 +640,15 @@ fn apply_aggregated_oracle_sumcheck(
                         t_commit.elapsed().as_secs_f64(),
                     );
 
-                    let (mle_out, mle_u32_out) = if need_full_binding {
-                        (
-                            std::mem::take(&mut current_prep.mle),
-                            std::mem::take(&mut current_prep.mle_u32),
-                        )
-                    } else {
-                        drop(std::mem::take(&mut current_prep.mle));
-                        drop(std::mem::take(&mut current_prep.mle_u32));
-                        (Vec::new(), Vec::new())
-                    };
+                    // Always drop MLEs — streaming reloads on demand.
+                    drop(std::mem::take(&mut current_prep.mle));
+                    drop(std::mem::take(&mut current_prep.mle_u32));
                     results.push(Ok(WeightPrepResult {
                         matrix_index: input.matrix_index,
                         n_vars: current_prep.n_vars,
                         commitment,
                         eval_point: input.eval_point.to_vec(),
                         expected_value: input.expected_value,
-                        mle: mle_out,
-                        mle_u32: mle_u32_out,
                         is_deferred: input.is_deferred,
                         deferred_idx: input.deferred_idx,
                     }));
@@ -690,21 +722,15 @@ fn apply_aggregated_oracle_sumcheck(
                         );
                     }
 
-                    let (mle_out, mle_u32_out) = if need_full_binding {
-                        (b_mle, mle_u32)
-                    } else {
-                        drop(b_mle);
-                        drop(mle_u32);
-                        (Vec::new(), Vec::new())
-                    };
+                    // Always drop MLEs — streaming reloads on demand.
+                    drop(b_mle);
+                    drop(mle_u32);
                     Ok(WeightPrepResult {
                         matrix_index: input.matrix_index,
                         n_vars,
                         commitment,
                         eval_point: input.eval_point.to_vec(),
                         expected_value: input.expected_value,
-                        mle: mle_out,
-                        mle_u32: mle_u32_out,
                         is_deferred: input.is_deferred,
                         deferred_idx: input.deferred_idx,
                     })
@@ -759,14 +785,14 @@ fn apply_aggregated_oracle_sumcheck(
                     );
                 }
 
-                let mle_out = if need_full_binding { b_mle } else { drop(b_mle); Vec::new() };
+                // Always drop MLEs — streaming reloads on demand.
+                drop(b_mle);
                 Ok(WeightPrepResult {
                     matrix_index: input.matrix_index,
                     n_vars,
                     commitment,
                     eval_point: input.eval_point.to_vec(),
                     expected_value: input.expected_value,
-                    mle: mle_out,
                     is_deferred: input.is_deferred,
                     deferred_idx: input.deferred_idx,
                 })
@@ -776,20 +802,11 @@ fn apply_aggregated_oracle_sumcheck(
     };
 
     // Unpack results in order.
-    // Only retain MLEs when full binding proof is needed — otherwise each
-    // ~4 GB MLE × 160 matrices would require ~640 GB RAM.
+    // MLEs are no longer accumulated — streaming mode loads them on demand from
+    // GraphWeights. Each prep result's MLE/mle_u32 fields are empty (already
+    // dropped during commitment) and we only need the metadata.
     let mut agg_claims = Vec::with_capacity(total_claims);
-    let mut all_mles: Vec<Vec<SecureField>> = if need_full_binding {
-        Vec::with_capacity(total_claims)
-    } else {
-        Vec::new()
-    };
-    #[cfg(feature = "cuda-runtime")]
-    let mut all_mles_u32: Vec<Vec<u32>> = if need_full_binding {
-        Vec::with_capacity(total_claims)
-    } else {
-        Vec::new()
-    };
+    let mut claim_node_ids = Vec::with_capacity(total_claims);
 
     for result in prep_results {
         let r = result?;
@@ -803,6 +820,8 @@ fn apply_aggregated_oracle_sumcheck(
                 }
             }
         }
+        // Track the weight_node_id for streaming source lookup
+        claim_node_ids.push(prep_inputs[r.matrix_index].weight_node_id);
         agg_claims.push(AggregatedWeightClaim {
             matrix_index: r.matrix_index,
             local_n_vars: r.n_vars,
@@ -810,39 +829,31 @@ fn apply_aggregated_oracle_sumcheck(
             expected_value: r.expected_value,
             commitment: r.commitment,
         });
-        if need_full_binding {
-            all_mles.push(r.mle);
-            #[cfg(feature = "cuda-runtime")]
-            all_mles_u32.push(r.mle_u32);
-        }
-        // When !need_full_binding, r.mle and r.mle_u32 are dropped here,
-        // freeing ~4 GB per matrix immediately.
     }
     eprintln!(
         "  [{log_tag}] all {total_claims} weight commitments ready in {:.1}s",
         t_commit.elapsed().as_secs_f64(),
     );
 
-    // Use RLC binding instead of the full aggregated binding proof.
-    // The full prove_aggregated_binding_gpu builds a virtual MLE of 2^(selector+max_vars)
-    // elements (e.g. 2^29 = 536M for 4 matrices of 134M each) and runs a 29-round
-    // MLE opening with GPU Merkle trees at each round — taking 5+ minutes even on H100.
-    // RLC binding achieves the same 2^-128 security in ~10ms by combining all expected
-    // values into a single scalar via random linear combination.
-    // For on-chain verification, the commitments themselves (mixed into Fiat-Shamir)
+    // RLC binding (fast path, default) vs full aggregated binding proof (streaming).
+    //
+    // Full binding: prove_aggregated_binding_streaming loads weight MLEs on demand
+    // from GraphWeights, keeping peak memory at ~4 GB (single largest matrix) instead
+    // of ~640 GB (all 160 matrices as SecureField MLEs simultaneously).
+    //
+    // RLC binding achieves 2^-128 security in ~10ms by combining expected values into
+    // a single scalar. For on-chain verification, the commitments (mixed into Fiat-Shamir)
     // provide the binding; the full opening proof is only needed for trustless mode.
     let binding_proof = if !agg_claims.is_empty() {
         if need_full_binding {
-            let mle_refs: Vec<&[SecureField]> = all_mles.iter().map(|m| m.as_slice()).collect();
-            #[cfg(feature = "cuda-runtime")]
-            let proof = {
-                let mle_u32_refs: Vec<&[u32]> = all_mles_u32.iter().map(|m| m.as_slice()).collect();
-                prove_aggregated_binding_gpu(&agg_claims, &mle_refs, &mle_u32_refs, channel)
+            let source = GraphWeightSource {
+                weights,
+                claim_node_ids,
             };
-            #[cfg(not(feature = "cuda-runtime"))]
-            let proof = prove_aggregated_binding(&agg_claims, &mle_refs, channel);
+            let proof =
+                prove_aggregated_binding_streaming(&agg_claims, &source, channel);
             eprintln!(
-                "  [{log_tag}] aggregated oracle sumcheck: {} claims, ~{} felts calldata (full binding proof)",
+                "  [{log_tag}] aggregated oracle sumcheck: {} claims, ~{} felts calldata (full binding proof, streaming)",
                 agg_claims.len(),
                 proof.estimated_calldata_felts(),
             );
