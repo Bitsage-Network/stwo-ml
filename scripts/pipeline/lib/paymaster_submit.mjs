@@ -1132,17 +1132,27 @@ async function cmdVerify(args) {
       info(`  ${label}...`);
       let txHash;
       if (noPaymaster) {
-        // When skipEstimate is set, pass explicit resource bounds to bypass
-        // estimateFee (which may fail for computation-heavy contract calls
-        // like verify_gkr_from_session that exceed simulation step limits).
-        const execDetails = opts.skipEstimate ? {
-          resourceBounds: {
-            l1_gas: { max_amount: 0n, max_price_per_unit: 0n },
-            l2_gas: { max_amount: 100000000n, max_price_per_unit: 100000000000n },
-            l1_data_gas: { max_amount: 0n, max_price_per_unit: 0n },
-          },
-          skipValidate: false,
-        } : undefined;
+        // When skipEstimate is set, try estimation with skipValidate first
+        // (avoids full execution simulation), then fall back to hardcoded bounds.
+        let execDetails;
+        if (opts.skipEstimate) {
+          try {
+            const est = await account.estimateFee(calls, { skipValidate: true });
+            execDetails = {
+              resourceBounds: est.resourceBounds,
+            };
+            info(`  Estimated (skipValidate): l2_gas=${est.resourceBounds?.l2_gas?.max_amount}`);
+          } catch (estErr) {
+            info(`  estimateFee(skipValidate) failed, using generous fixed bounds`);
+            execDetails = {
+              resourceBounds: {
+                l1_gas: { max_amount: 0n, max_price_per_unit: 0n },
+                l2_gas: { max_amount: 100000000n, max_price_per_unit: 100000000000n },
+                l1_data_gas: { max_amount: 1024n, max_price_per_unit: 100000n },
+              },
+            };
+          }
+        }
         const result = await account.execute(calls, execDetails);
         txHash = result.transaction_hash;
       } else {
