@@ -1137,9 +1137,9 @@ async function cmdVerify(args) {
         // like verify_gkr_from_session that exceed simulation step limits).
         const execDetails = opts.skipEstimate ? {
           resourceBounds: {
-            l1_gas: { max_amount: "0x0", max_price_per_unit: "0x0" },
-            l2_gas: { max_amount: "0x5F5E100", max_price_per_unit: "0x174876e800" },
-            l1_data_gas: { max_amount: "0x0", max_price_per_unit: "0x0" },
+            l1_gas: { max_amount: 0n, max_price_per_unit: 0n },
+            l2_gas: { max_amount: 100000000n, max_price_per_unit: 100000000000n },
+            l1_data_gas: { max_amount: 0n, max_price_per_unit: 0n },
           },
           skipValidate: false,
         } : undefined;
@@ -1238,9 +1238,9 @@ async function cmdVerify(args) {
             // Use a generous fixed bound: 20M l2_gas at a fixed price.
             // This avoids BigInt/string type mixing issues with starknet.js v8.
             cachedChunkResourceBounds = {
-              l1_gas: { max_amount: "0x0", max_price_per_unit: "0x0" },
-              l2_gas: { max_amount: "0x1312D00", max_price_per_unit: "0x174876e800" },
-              l1_data_gas: { max_amount: "0x0", max_price_per_unit: "0x0" },
+              l1_gas: { max_amount: 0n, max_price_per_unit: 0n },
+              l2_gas: { max_amount: 20000000n, max_price_per_unit: 100000000000n },
+              l1_data_gas: { max_amount: 0n, max_price_per_unit: 0n },
             };
             info(`  Cached fixed resource bounds for subsequent chunks`);
           }
