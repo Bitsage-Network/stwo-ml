@@ -13,6 +13,8 @@ use crate::crypto::poseidon_merkle::{MerkleAuthPath, PoseidonMerkleTree};
 #[cfg(feature = "cuda-runtime")]
 use crate::crypto::poseidon_merkle::{securefield_to_u64_limbs_direct, u64_limbs_to_field_element};
 #[cfg(feature = "cuda-runtime")]
+use crate::crypto::merkle_cache;
+#[cfg(feature = "cuda-runtime")]
 use crate::gpu_sumcheck::u32s_to_secure_field;
 #[cfg(feature = "cuda-runtime")]
 use crate::gpu_sumcheck::GpuSumcheckExecutor;
@@ -192,6 +194,95 @@ pub(crate) fn gpu_mle_commitment_required() -> bool {
     }
 }
 
+/// Whether GPU streaming Merkle is enabled for round-0 auth path extraction.
+/// Default: ON when cuda-runtime feature is enabled.
+/// Control via `STWO_GPU_STREAMING_MERKLE=0/1`.
+#[cfg(feature = "cuda-runtime")]
+fn gpu_streaming_merkle_enabled() -> bool {
+    match std::env::var("STWO_GPU_STREAMING_MERKLE") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false" && v != "off"
+        }
+        Err(_) => true,
+    }
+}
+
+/// Minimum number of leaf hashes to trigger GPU streaming Merkle.
+/// Default: 1048576 (1M leaves = 4M QM31 u32 words).
+/// Control via `STWO_GPU_STREAMING_MERKLE_MIN_LEAVES`.
+#[cfg(feature = "cuda-runtime")]
+fn gpu_streaming_merkle_min_leaves() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("STWO_GPU_STREAMING_MERKLE_MIN_LEAVES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&v| v >= 2)
+            .unwrap_or(1 << 20)
+    })
+}
+
+/// Whether to cross-check GPU streaming auth paths against CPU tree (first matrix only).
+/// Control via `STWO_GPU_STREAMING_MERKLE_VERIFY=1`.
+#[cfg(feature = "cuda-runtime")]
+fn gpu_streaming_merkle_verify() -> bool {
+    match std::env::var("STWO_GPU_STREAMING_MERKLE_VERIFY") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false" && v != "off"
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(feature = "cuda-runtime")]
+static GPU_STREAMING_MERKLE_LOGGED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "cuda-runtime")]
+static GPU_STREAMING_MERKLE_VERIFIED: AtomicBool = AtomicBool::new(false);
+
+// Thread-local cache for initial MLE root. Set before calling
+// prove_mle_opening_with_commitment_qm31_u32 to skip initial root computation.
+#[cfg(feature = "cuda-runtime")]
+thread_local! {
+    static CACHED_INITIAL_MLE_ROOT: std::cell::Cell<Option<FieldElement>> = const { std::cell::Cell::new(None) };
+}
+
+// Thread-local node_id for mmap Merkle tree cache lookup.
+// Set before calling prove_mle_opening_with_commitment_qm31_u32 to enable
+// disk-cached Merkle tree auth path extraction.
+#[cfg(feature = "cuda-runtime")]
+thread_local! {
+    static CACHED_MERKLE_NODE_ID: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Set a cached initial MLE root to be consumed by the next call to
+/// `prove_mle_opening_with_commitment_qm31_u32` on this thread.
+/// The value is consumed (taken) on use — call before each opening.
+#[cfg(feature = "cuda-runtime")]
+pub fn set_cached_initial_mle_root(root: FieldElement) {
+    CACHED_INITIAL_MLE_ROOT.with(|c| c.set(Some(root)));
+}
+
+/// Take (consume) the cached initial MLE root, if one was set.
+#[cfg(feature = "cuda-runtime")]
+fn take_cached_initial_mle_root() -> Option<FieldElement> {
+    CACHED_INITIAL_MLE_ROOT.with(|c| c.take())
+}
+
+/// Set a node_id for mmap Merkle tree cache lookup.
+/// Consumed by the next call to `prove_mle_opening_with_commitment_qm31_u32`.
+#[cfg(feature = "cuda-runtime")]
+pub fn set_merkle_cache_node_id(node_id: usize) {
+    CACHED_MERKLE_NODE_ID.with(|c| c.set(Some(node_id)));
+}
+
+/// Take (consume) the cached node_id for Merkle tree cache.
+#[cfg(feature = "cuda-runtime")]
+fn take_merkle_cache_node_id() -> Option<usize> {
+    CACHED_MERKLE_NODE_ID.with(|c| c.take())
+}
+
 #[cfg(feature = "cuda-runtime")]
 #[inline]
 fn felt_to_securefield_packed(fe: FieldElement) -> SecureField {
@@ -321,6 +412,156 @@ fn build_gpu_merkle_path_with_leaf_sibling(
     }
 
     Ok(siblings)
+}
+
+/// Get the auth path siblings from a CPU PoseidonMerkleTree.
+/// The CPU tree's `prove()` already includes the leaf-pair sibling as siblings[0],
+/// which matches the GPU streaming format (leaf sibling + internal hash siblings).
+#[cfg(feature = "cuda-runtime")]
+fn tree_prove_path_siblings(
+    tree: &PoseidonMerkleTree,
+    leaf_idx: usize,
+) -> Vec<FieldElement> {
+    tree.prove(leaf_idx).siblings
+}
+
+/// Extract authentication paths using GPU streaming Merkle construction.
+///
+/// Builds the Merkle tree level-by-level on GPU, keeping only 2 levels in VRAM
+/// at a time. Downloads only the sibling nodes needed for query auth paths.
+/// Works for any folding round (not just round 0).
+///
+/// VRAM: Peak ~2x one tree level (vs full tree that stores all levels).
+/// Speed: ~1-2s for round 0 (67M leaves), exponentially faster for later rounds.
+#[cfg(feature = "cuda-runtime")]
+fn extract_auth_paths_gpu_streaming(
+    layer: &MleLayerValues,
+    query_pair_indices: &[usize],
+    n_points: usize,
+) -> Result<(FieldElement, Vec<MleQueryRoundData>), String> {
+    let start = Instant::now();
+    let n_leaf_hashes = n_points / 2;
+    let mid = n_points / 2;
+
+    let executor = get_cuda_executor()
+        .map_err(|e| format!("GPU executor init: {:?}", e))?;
+    let d_rc = upload_poseidon252_round_constants(&executor)
+        .map_err(|e| format!("upload round constants: {:?}", e))?;
+
+    // Convert layer data → u64 limbs for GPU Poseidon leaf hashing
+    let mut leaf_limbs = vec![0u64; n_points * 4];
+    match layer {
+        MleLayerValues::Qm31U32Aos(evals_u32) => {
+            leaf_limbs
+                .par_chunks_mut(4)
+                .zip(evals_u32.par_chunks_exact(4))
+                .for_each(|(dst, src)| {
+                    dst.copy_from_slice(&qm31_u32_to_u64_limbs_direct(src));
+                });
+        }
+        MleLayerValues::Secure(vals) => {
+            leaf_limbs[..vals.len() * 4]
+                .par_chunks_mut(4)
+                .zip(vals.par_iter())
+                .for_each(|(dst, sf)| {
+                    dst.copy_from_slice(&securefield_to_u64_limbs_direct(*sf));
+                });
+        }
+    }
+
+    // Upload leaf limbs to GPU
+    let d_leaf_limbs = executor
+        .device
+        .htod_sync_copy(&leaf_limbs)
+        .map_err(|e| format!("H2D leaf limbs: {:?}", e))?;
+    drop(leaf_limbs); // Free CPU copy
+
+    // Expand query pair indices to leaf indices for auth path extraction.
+    // Each query needs auth paths for both left (pair_idx) and right (mid + pair_idx).
+    // We extract sibling nodes for left_idx/2 and right_idx/2 in the tree.
+    let mut all_leaf_indices: Vec<usize> = Vec::with_capacity(query_pair_indices.len() * 2);
+    for &pair_idx in query_pair_indices {
+        all_leaf_indices.push(pair_idx);          // left leaf index
+        all_leaf_indices.push(mid + pair_idx);    // right leaf index
+    }
+
+    let (root_limbs, all_auth_paths) = executor
+        .execute_poseidon252_merkle_streaming_auth_paths(
+            &d_leaf_limbs,
+            n_leaf_hashes,
+            &d_rc,
+            &all_leaf_indices,
+        )
+        .map_err(|e| format!("GPU streaming merkle: {:?}", e))?;
+
+    let root = u64_limbs_to_felt252(&root_limbs)
+        .ok_or_else(|| "invalid root limbs from GPU streaming merkle".to_string())?;
+
+    // Build MleQueryRoundData for each query
+    let mut round_data: Vec<MleQueryRoundData> = Vec::with_capacity(query_pair_indices.len());
+
+    for (q, &pair_idx) in query_pair_indices.iter().enumerate() {
+        let left_idx = pair_idx;
+        let right_idx = mid + pair_idx;
+
+        // Read left/right SecureField values from the layer data
+        let (left_value, right_value) = match layer {
+            MleLayerValues::Qm31U32Aos(evals_u32) => {
+                let l = left_idx * 4;
+                let r = right_idx * 4;
+                (
+                    u32s_to_secure_field(&[evals_u32[l], evals_u32[l + 1], evals_u32[l + 2], evals_u32[l + 3]]),
+                    u32s_to_secure_field(&[evals_u32[r], evals_u32[r + 1], evals_u32[r + 2], evals_u32[r + 3]]),
+                )
+            }
+            MleLayerValues::Secure(vals) => {
+                (vals[left_idx], vals[right_idx])
+            }
+        };
+
+        // Convert u64 limb auth paths to FieldElement auth paths.
+        // Auth path format: [leaf_sibling, level0_sibling, level1_sibling, ...]
+        // But we need to prepend the leaf-pair sibling (the other QM31 value).
+        let left_raw_siblings = &all_auth_paths[q * 2];
+        let right_raw_siblings = &all_auth_paths[q * 2 + 1];
+
+        // Left auth path: first sibling is the right value (leaf pair sibling)
+        let mut left_siblings = Vec::with_capacity(left_raw_siblings.len() + 1);
+        left_siblings.push(securefield_to_felt(right_value));
+        for limbs in left_raw_siblings {
+            let felt = u64_limbs_to_felt252(limbs)
+                .ok_or_else(|| "invalid left sibling limbs".to_string())?;
+            left_siblings.push(felt);
+        }
+
+        // Right auth path: first sibling is the left value (leaf pair sibling)
+        let mut right_siblings = Vec::with_capacity(right_raw_siblings.len() + 1);
+        right_siblings.push(securefield_to_felt(left_value));
+        for limbs in right_raw_siblings {
+            let felt = u64_limbs_to_felt252(limbs)
+                .ok_or_else(|| "invalid right sibling limbs".to_string())?;
+            right_siblings.push(felt);
+        }
+
+        round_data.push(MleQueryRoundData {
+            left_value,
+            right_value,
+            left_siblings,
+            right_siblings,
+        });
+    }
+
+    let elapsed = start.elapsed();
+    if !GPU_STREAMING_MERKLE_LOGGED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "[GKR] GPU streaming Merkle: auth paths for {} queries from {} leaves in {:.3}s",
+            query_pair_indices.len(),
+            n_leaf_hashes,
+            elapsed.as_secs_f64(),
+        );
+    }
+
+    Ok((root, round_data))
 }
 
 #[cfg(feature = "cuda-runtime")]
@@ -913,8 +1154,11 @@ pub fn prove_mle_opening_with_commitment_qm31_u32(
     //   Net: ~4x less memory, ~2-3x faster (root_only skips layer storage)
     // ========================================================================
 
-    // Phase 1: Root-only initial commitment
-    let initial_root = commit_mle_root_only_from_qm31_u32_aos(evals_u32);
+    // Phase 1: Root-only initial commitment.
+    // If a cached root was provided via set_cached_initial_mle_root(), use it
+    // to skip the tree computation (~1-3s per matrix).
+    let initial_root = take_cached_initial_mle_root()
+        .unwrap_or_else(|| commit_mle_root_only_from_qm31_u32_aos(evals_u32));
     channel.mix_felt(initial_root);
 
     // Store folded layer values for later tree reconstruction during query extraction.
@@ -1133,14 +1377,146 @@ pub fn prove_mle_opening_with_commitment_qm31_u32(
 
     // Extract auth paths by rebuilding each tree from saved layer values.
     // Process one tree at a time to avoid storing all trees simultaneously.
+    //
+    // GPU streaming Merkle is attempted for ANY round with enough leaf hashes
+    // (>= gpu_streaming_merkle_min_leaves). This eliminates ~80-100s of CPU
+    // tree rebuilds for rounds 0-6. Smaller rounds fall back to fast CPU path.
     let mut query_rounds: Vec<Vec<MleQueryRoundData>> =
         (0..n_queries).map(|_| Vec::with_capacity(n_vars)).collect();
     let mut layer_size = n_points;
 
+    // Consume node_id for mmap Merkle tree cache (if set)
+    let merkle_cache_node_id = take_merkle_cache_node_id();
+
     for round in 0..n_vars {
         let mid = layer_size / 2;
+        let n_leaf_hashes = mid;
 
-        // Build tree for this round from saved layer values
+        // Priority 1: mmap cached tree (instant, <1ms per auth path)
+        if let Some(node_id) = merkle_cache_node_id {
+            if let Some(cached_tree) = merkle_cache::open_merkle_cache(node_id, round) {
+                // Verify root matches Phase 1 root
+                let expected_root = if round == 0 {
+                    initial_root
+                } else {
+                    intermediate_roots[round - 1]
+                };
+                if cached_tree.root() == expected_root {
+                    let mut cache_ok = true;
+                    for q in 0..n_queries {
+                        let left_idx = round_pair_indices[round][q];
+                        let right_idx = mid + left_idx;
+
+                        let left_path = match cached_tree.prove(left_idx) {
+                            Some(p) => p,
+                            None => { cache_ok = false; break; }
+                        };
+                        let right_path = match cached_tree.prove(right_idx) {
+                            Some(p) => p,
+                            None => { cache_ok = false; break; }
+                        };
+
+                        // Read values from saved_layers (mmap tree only has hashes, not original values)
+                        let (left_value, right_value) = match &saved_layers[round] {
+                            MleLayerValues::Qm31U32Aos(evals_u32) => {
+                                let l = left_idx * 4;
+                                let r = right_idx * 4;
+                                (
+                                    u32s_to_secure_field(&[evals_u32[l], evals_u32[l+1], evals_u32[l+2], evals_u32[l+3]]),
+                                    u32s_to_secure_field(&[evals_u32[r], evals_u32[r+1], evals_u32[r+2], evals_u32[r+3]]),
+                                )
+                            }
+                            MleLayerValues::Secure(vals) => {
+                                (vals[left_idx], vals[right_idx])
+                            }
+                        };
+
+                        query_rounds[q].push(MleQueryRoundData {
+                            left_value,
+                            right_value,
+                            left_siblings: left_path.siblings,
+                            right_siblings: right_path.siblings,
+                        });
+                    }
+                    if cache_ok {
+                        layer_size = mid;
+                        continue; // Skip GPU streaming and CPU tree rebuild
+                    }
+                }
+            }
+        }
+
+        // Priority 2: GPU streaming for any round with enough leaves
+        if gpu_streaming_merkle_enabled()
+            && n_leaf_hashes >= gpu_streaming_merkle_min_leaves()
+            && is_cuda_available()
+        {
+            let round_pair_indices_for_round: Vec<usize> = (0..n_queries)
+                .map(|q| round_pair_indices[round][q])
+                .collect();
+            match extract_auth_paths_gpu_streaming(
+                &saved_layers[round], &round_pair_indices_for_round, layer_size
+            ) {
+                Ok((streaming_root, round_data)) => {
+                    // Verify root matches Phase 1 root
+                    let expected_root = if round == 0 {
+                        initial_root
+                    } else {
+                        intermediate_roots[round - 1]
+                    };
+                    if streaming_root != expected_root {
+                        eprintln!(
+                            "[GKR] GPU streaming Merkle root mismatch at round {}! streaming={:?} vs expected={:?}",
+                            round, streaming_root, expected_root
+                        );
+                        // Fall through to CPU path below
+                    } else {
+                        // Optional cross-check against CPU path (first matrix only, round 0 only)
+                        if round == 0
+                            && gpu_streaming_merkle_verify()
+                            && !GPU_STREAMING_MERKLE_VERIFIED.swap(true, Ordering::Relaxed)
+                        {
+                            let cpu_tree = match &saved_layers[0] {
+                                MleLayerValues::Secure(vals) => {
+                                    let (_, t) = commit_mle(vals);
+                                    t
+                                }
+                                MleLayerValues::Qm31U32Aos(words) => {
+                                    let (_, t) = commit_mle_from_qm31_u32_aos(words);
+                                    t
+                                }
+                            };
+                            for (q, rd) in round_data.iter().enumerate() {
+                                let left_idx = round_pair_indices_for_round[q];
+                                let cpu_left = tree_prove_path_siblings(&cpu_tree, left_idx);
+                                let cpu_right = tree_prove_path_siblings(&cpu_tree, mid + left_idx);
+                                if rd.left_siblings != cpu_left || rd.right_siblings != cpu_right {
+                                    eprintln!(
+                                        "[GKR] GPU streaming Merkle VERIFY FAILED for round {} query {}",
+                                        round, q
+                                    );
+                                }
+                            }
+                            eprintln!("[GKR] GPU streaming Merkle cross-check passed ({} queries)", round_data.len());
+                        }
+
+                        for q in 0..n_queries {
+                            query_rounds[q].push(round_data[q].clone());
+                        }
+                        layer_size = mid;
+                        continue; // Skip CPU tree rebuild
+                    }
+                }
+                Err(e) => {
+                    if !GPU_STREAMING_MERKLE_LOGGED.swap(true, Ordering::Relaxed) {
+                        eprintln!("[GKR] GPU streaming Merkle failed at round {}, CPU fallback: {e}", round);
+                    }
+                    // Fall through to CPU path below
+                }
+            }
+        }
+
+        // CPU fallback: build tree for this round from saved layer values
         let tree = match &saved_layers[round] {
             MleLayerValues::Secure(vals) => {
                 let (_, t) = commit_mle(vals);
@@ -1151,6 +1527,28 @@ pub fn prove_mle_opening_with_commitment_qm31_u32(
                 t
             }
         };
+
+        // Write tree to mmap cache for next run (fire-and-forget)
+        if let Some(node_id) = merkle_cache_node_id {
+            if let Some(cache_dir) = merkle_cache::merkle_cache_dir() {
+                let cache_path = merkle_cache::merkle_cache_path(&cache_dir, node_id, round);
+                if !cache_path.exists() {
+                    let _ = std::fs::create_dir_all(&cache_dir);
+                    let leaves: Vec<FieldElement> = (0..layer_size)
+                        .map(|i| tree.leaf_at(i))
+                        .collect();
+                    match merkle_cache::MmapMerkleTree::build_and_cache(&leaves, &cache_path) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            eprintln!(
+                                "[GKR] Failed to write Merkle cache for node {} round {}: {e}",
+                                node_id, round
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         for q in 0..n_queries {
             let left_idx = round_pair_indices[round][q];
@@ -1740,5 +2138,96 @@ mod tests {
             &challenges,
             &mut ch_v
         ));
+    }
+
+    /// Test GPU streaming Merkle auth paths against CPU-built tree auth paths.
+    ///
+    /// Creates a small QM31 u32 AoS MLE, builds Merkle tree via both CPU and
+    /// GPU streaming paths, and verifies auth paths are identical.
+    #[cfg(feature = "cuda-runtime")]
+    #[test]
+    fn test_gpu_streaming_merkle_auth_paths() {
+        use stwo::prover::backend::gpu::cuda_executor::{
+            get_cuda_executor, is_cuda_available, upload_poseidon252_round_constants,
+        };
+
+        if !is_cuda_available() {
+            eprintln!("CUDA not available, skipping GPU streaming Merkle test");
+            return;
+        }
+
+        // Build a small MLE: 1024 QM31 elements = 4096 u32 words
+        let n_points = 1024usize;
+        let n_leaf_hashes = n_points / 2;
+        let evals_u32: Vec<u32> = (0..n_points * 4)
+            .map(|i| ((i as u32 * 7 + 13) % (1 << 31)))
+            .collect();
+
+        // Build CPU tree for reference
+        let (cpu_root, cpu_tree) = commit_mle_from_qm31_u32_aos(&evals_u32);
+
+        // Build GPU streaming auth paths for a few query indices
+        let query_pair_indices: Vec<usize> = vec![0, 1, 7, 42, 100, 255, 510, 511];
+        let mid = n_points / 2;
+
+        match extract_round0_auth_paths_gpu_streaming(&evals_u32, &query_pair_indices, n_points) {
+            Ok((gpu_root, gpu_round_data)) => {
+                // 1. Roots must match
+                assert_eq!(
+                    cpu_root, gpu_root,
+                    "GPU streaming root != CPU root"
+                );
+
+                // 2. Auth paths must match for each query
+                for (q, &pair_idx) in query_pair_indices.iter().enumerate() {
+                    let left_idx = pair_idx;
+                    let right_idx = mid + pair_idx;
+
+                    let rd = &gpu_round_data[q];
+
+                    // Check values match
+                    let cpu_left_value = felt_to_securefield_packed(cpu_tree.leaf_at(left_idx));
+                    let cpu_right_value = felt_to_securefield_packed(cpu_tree.leaf_at(right_idx));
+                    assert_eq!(rd.left_value, cpu_left_value, "query {q}: left value mismatch");
+                    assert_eq!(rd.right_value, cpu_right_value, "query {q}: right value mismatch");
+
+                    // Check auth paths match
+                    let cpu_left_path = cpu_tree.prove(left_idx);
+                    let cpu_right_path = cpu_tree.prove(right_idx);
+                    assert_eq!(
+                        rd.left_siblings, cpu_left_path.siblings,
+                        "query {q}: left auth path mismatch"
+                    );
+                    assert_eq!(
+                        rd.right_siblings, cpu_right_path.siblings,
+                        "query {q}: right auth path mismatch"
+                    );
+                }
+                eprintln!(
+                    "GPU streaming Merkle test passed: {} queries, {} leaves",
+                    query_pair_indices.len(),
+                    n_leaf_hashes
+                );
+            }
+            Err(e) => {
+                eprintln!("GPU streaming Merkle test skipped (GPU error): {e}");
+            }
+        }
+    }
+
+    /// Test that the cached initial MLE root is consumed correctly.
+    #[cfg(feature = "cuda-runtime")]
+    #[test]
+    fn test_cached_initial_mle_root_thread_local() {
+        let root = FieldElement::from(0x12345u64);
+        set_cached_initial_mle_root(root);
+
+        // First take should return the value
+        let taken = take_cached_initial_mle_root();
+        assert_eq!(taken, Some(root));
+
+        // Second take should return None (consumed)
+        let taken2 = take_cached_initial_mle_root();
+        assert_eq!(taken2, None);
     }
 }

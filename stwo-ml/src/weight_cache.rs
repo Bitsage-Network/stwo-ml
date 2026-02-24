@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read as IoRead, Write as IoWrite};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use starknet_ff::FieldElement;
@@ -19,7 +19,10 @@ use stwo::core::fields::m31::M31;
 use stwo::core::fields::qm31::{SecureField, QM31};
 
 /// Binary format version. Bump on layout changes.
-const CACHE_VERSION: u32 = 1;
+/// v1: f_b + b_commitment + r_j
+/// v2: v1 + initial_mle_root (Optional<FieldElement>)
+/// v3: v2 + merkle_tree_cache_path (Optional<String>)
+const CACHE_VERSION: u32 = 3;
 /// Magic bytes: "SWCF" (Stwo Weight Cache File).
 const MAGIC: [u8; 4] = [b'S', b'W', b'C', b'F'];
 
@@ -43,6 +46,13 @@ pub struct CachedWeight {
     pub b_commitment: FieldElement,
     /// Challenges used for restriction (for verification).
     pub r_j: Vec<SecureField>,
+    /// Initial Poseidon Merkle root of the full weight MLE (before folding).
+    /// Cached to skip the initial root computation in MLE opening proofs.
+    pub initial_mle_root: Option<FieldElement>,
+    /// Path to mmap-backed Merkle tree cache directory for this weight's MLE.
+    /// When set, MLE opening proofs can extract auth paths via O(log n)
+    /// random mmap reads instead of rebuilding Merkle trees (~15s per matrix).
+    pub merkle_tree_cache_path: Option<PathBuf>,
 }
 
 /// In-memory cache of weight commitments for a single model.
@@ -156,6 +166,28 @@ impl WeightCommitmentCache {
             write_securefield_vec(&mut w, &val.f_b)?;
             write_fieldelement(&mut w, &val.b_commitment)?;
             write_securefield_vec(&mut w, &val.r_j)?;
+            // v2: optional initial_mle_root
+            match &val.initial_mle_root {
+                Some(root) => {
+                    w.write_all(&[1u8])?;
+                    write_fieldelement(&mut w, root)?;
+                }
+                None => {
+                    w.write_all(&[0u8])?;
+                }
+            }
+            // v3: optional merkle_tree_cache_path
+            match &val.merkle_tree_cache_path {
+                Some(path) => {
+                    let path_bytes = path.to_string_lossy().into_owned().into_bytes();
+                    w.write_all(&[1u8])?;
+                    w.write_all(&(path_bytes.len() as u32).to_le_bytes())?;
+                    w.write_all(&path_bytes)?;
+                }
+                None => {
+                    w.write_all(&[0u8])?;
+                }
+            }
         }
 
         w.flush()?;
@@ -178,12 +210,12 @@ impl WeightCommitmentCache {
             ));
         }
 
-        // Version
+        // Version — accept v1, v2, v3 (backward compatible)
         let version = read_u32(&mut r)?;
-        if version != CACHE_VERSION {
+        if version < 1 || version > CACHE_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("unsupported cache version {version}, expected {CACHE_VERSION}"),
+                format!("unsupported cache version {version}, expected 1..={CACHE_VERSION}"),
             ));
         }
 
@@ -208,6 +240,37 @@ impl WeightCommitmentCache {
             let b_commitment = read_fieldelement(&mut r)?;
             let r_j = read_securefield_vec(&mut r)?;
 
+            // v2: optional initial_mle_root
+            let initial_mle_root = if version >= 2 {
+                let mut flag = [0u8; 1];
+                r.read_exact(&mut flag)?;
+                if flag[0] != 0 {
+                    Some(read_fieldelement(&mut r)?)
+                } else {
+                    None
+                }
+            } else {
+                None // v1 files don't have this field
+            };
+
+            // v3: optional merkle_tree_cache_path
+            let merkle_tree_cache_path = if version >= 3 {
+                let mut flag = [0u8; 1];
+                r.read_exact(&mut flag)?;
+                if flag[0] != 0 {
+                    let path_len = read_u32(&mut r)? as usize;
+                    let mut path_bytes = vec![0u8; path_len];
+                    r.read_exact(&mut path_bytes)?;
+                    let path_str = String::from_utf8(path_bytes)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    Some(PathBuf::from(path_str))
+                } else {
+                    None
+                }
+            } else {
+                None // v1/v2 files don't have this field
+            };
+
             let key = CacheKey {
                 node_id,
                 m_padded,
@@ -220,6 +283,8 @@ impl WeightCommitmentCache {
                     f_b,
                     b_commitment,
                     r_j,
+                    initial_mle_root,
+                    merkle_tree_cache_path,
                 },
             );
         }
@@ -323,6 +388,8 @@ mod tests {
             f_b: (0..k).map(|i| make_sf(i as u32 * 10)).collect(),
             b_commitment: FieldElement::from(0xCAFEu64),
             r_j: (0..n_challenges).map(|i| make_sf(100 + i as u32)).collect(),
+            initial_mle_root: Some(FieldElement::from(0xDEADu64)),
+            merkle_tree_cache_path: None,
         }
     }
 
@@ -359,6 +426,8 @@ mod tests {
             f_b: vec![make_sf(999)],
             b_commitment: FieldElement::from(0xBEEFu64),
             r_j: vec![],
+            initial_mle_root: None,
+            merkle_tree_cache_path: None,
         };
         cache.insert(0, 4, 8, 16, new_entry);
 
@@ -420,6 +489,8 @@ mod tests {
             assert_eq!(orig.f_b, load.f_b);
             assert_eq!(orig.b_commitment, load.b_commitment);
             assert_eq!(orig.r_j, load.r_j);
+            assert_eq!(orig.initial_mle_root, load.initial_mle_root);
+            assert_eq!(orig.merkle_tree_cache_path, load.merkle_tree_cache_path);
         }
 
         // Cleanup

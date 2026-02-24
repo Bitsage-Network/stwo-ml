@@ -14,7 +14,7 @@ cuda-runtime = ["gpu", "stwo/cuda-runtime", "stwo-constraint-framework/cuda-runt
 multi-gpu = ["cuda-runtime"]
 tee = ["cuda-runtime"]
 onnx = ["dep:tract-onnx"]
-safetensors = ["dep:safetensors", "dep:memmap2"]
+safetensors = ["dep:safetensors"]
 model-loading = ["onnx", "safetensors"]
 audit = ["serde", "dep:serde_json", "dep:crossbeam", "dep:getrandom"]
 audit-http = ["audit", "dep:ureq", "dep:sha3"]
@@ -40,7 +40,7 @@ starknet-crypto = { version = "0.6.2", default-features = false, features = ["al
 starknet-ff = { version = "0.3.7", default-features = false, features = ["alloc"] }
 tract-onnx = { version = "0.21", optional = true, default-features = false }
 safetensors = { version = "0.4", optional = true }
-memmap2 = { version = "0.9", optional = true }
+memmap2 = "0.9"
 clap = { version = "4", features = ["derive", "env"], optional = true }
 serde_json = { version = "1", optional = true }
 axum = { version = "0.7", features = ["macros", "ws"], optional = true }

@@ -302,6 +302,18 @@ impl PoseidonMerkleTree {
         MerkleAuthPath { siblings }
     }
 
+    /// Extract all layers as vectors of FieldElements (for cache serialization).
+    ///
+    /// Layer 0 is the leaf layer, last layer has 1 element (root).
+    pub(crate) fn all_layers_as_felts(&self) -> Vec<Vec<FieldElement>> {
+        self.layers
+            .iter()
+            .map(|layer| {
+                (0..layer.len()).map(|i| layer.at(i)).collect()
+            })
+            .collect()
+    }
+
     /// Build a Poseidon Merkle tree directly from SecureField evaluations.
     ///
     /// On cuda-runtime builds with GPU available, this bypasses all FieldElement

@@ -4184,6 +4184,8 @@ pub fn prepare_batch_entry_cached(
                 f_b: entry.f_b.clone(),
                 b_commitment: entry.b_commitment,
                 r_j: entry.r_j.clone(),
+                initial_mle_root: None, // Populated during MLE opening
+                merkle_tree_cache_path: None, // Populated if STWO_MERKLE_TREE_CACHE_DIR is set
             },
         );
     }
