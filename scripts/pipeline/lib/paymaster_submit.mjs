@@ -44,8 +44,10 @@ const NETWORKS = {
     paymasterUrl: "https://sepolia.paymaster.avnu.fi",
     explorer: "https://sepolia.starkscan.co/tx/",
     factory: "0x2f69e566802910359b438ccdb3565dce304a7cc52edbf9fd246d6ad2cd89ce4",
+    // Argent Account v0.4.0 — SNIP-9 compatible (required by AVNU paymaster).
+    // Constructor: (owner: felt252, guardian: felt252).
     accountClassHash:
-      "0x14d44fb938b43e5fbcec27894670cb94898d759e2ef30e7af70058b4da57e7f",
+      "0x029927c8af6bccf3f6fda035981e765a7bdbf18a2dc0d630494f8758aa908e2b",
     identityRegistry:
       "0x72eb37b0389e570bf8b158ce7f0e1e3489de85ba43ab3876a0594df7231631",
   },
@@ -253,8 +255,8 @@ async function preflightContractEntrypoint(provider, contractAddress, entrypoint
 // need to exist on-chain yet — deploymentData in the paymaster TX will
 // deploy it atomically alongside the proof verification call.
 //
-// Constructor: (public_key: felt252, factory: ContractAddress)
-// For ephemeral accounts we pass factory = 0x0 (no identity registration).
+// Argent Account v0.4.0 constructor: (owner: felt252, guardian: felt252)
+// For ephemeral accounts we pass guardian = 0x0 (no guardian).
 
 function generateEphemeralAccount(network) {
   const net = NETWORKS[network];
@@ -264,7 +266,7 @@ function generateEphemeralAccount(network) {
   const publicKey = ec.starkCurve.getStarkKey(privateKey);
   const salt = publicKey;
 
-  // Agent account constructor calldata: [public_key, factory=0x0]
+  // Argent account constructor calldata: [owner=publicKey, guardian=0x0]
   const constructorCalldata = CallData.compile([publicKey, "0x0"]);
 
   // Deterministic address: hash(deployer=0, salt, classHash, constructorCalldata)
