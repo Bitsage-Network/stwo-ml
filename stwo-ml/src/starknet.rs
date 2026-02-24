@@ -2148,12 +2148,13 @@ pub fn replay_verify_serialized_proof(
             }
             3 => {
                 // Activation
-                let _act_type = read_u32_from(proof_data, &mut off);
+                let act_type = read_u32_from(proof_data, &mut off);
                 let input_eval = read_qm31_from(proof_data, &mut off);
                 let output_eval = read_qm31_from(proof_data, &mut off);
                 off += 1; // table_commitment
 
                 ch.mix_u64(0x4C4F47); // "LOG"
+                ch.mix_u64(act_type as u64);
                 let _gamma = ch.draw_qm31();
                 let _beta = ch.draw_qm31();
 
