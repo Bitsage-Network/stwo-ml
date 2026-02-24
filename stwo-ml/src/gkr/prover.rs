@@ -1711,6 +1711,15 @@ pub fn prove_gkr_gpu(
                             node_id: *weight_node_id,
                         })?;
 
+                if std::env::var("STWO_CHANNEL_TRACE").is_ok() {
+                    eprintln!("[MatMul GPU ENTRY] m={} k={} n={} a={}x{} b={}x{} a_data[0..4]={:?}",
+                        m, k, n, a_matrix.rows, a_matrix.cols, b_matrix.rows, b_matrix.cols,
+                        &a_matrix.data[..4.min(a_matrix.data.len())]);
+                    // Compute C = A*B and show first values
+                    let c = crate::components::matmul::matmul_m31(a_matrix, b_matrix);
+                    eprintln!("[MatMul GPU ENTRY] c_data[0..4]={:?} c={}x{}",
+                        &c.data[..4.min(c.data.len())], c.rows, c.cols);
+                }
                 let (proof, claim) = reduce_matmul_layer_gpu(
                     &gpu,
                     &current_claim,
@@ -2589,8 +2598,11 @@ fn reduce_activation_layer_gpu(
 
     // GPU MLE evaluations at claim point
     if std::env::var("STWO_CHANNEL_TRACE").is_ok() {
-        eprintln!("[ACT GPU] n={} num_vars={} point.len={} input_mle.len={} output_mle.len={}",
-            n, num_vars, output_claim.point.len(), input_mle.len(), output_mle.len());
+        eprintln!("[ACT GPU] n={} num_vars={} point.len={} input_mle.len={} output_mle.len={} input_rows={} input_cols={} padded_rows={} padded_cols={}",
+            n, num_vars, output_claim.point.len(), input_mle.len(), output_mle.len(),
+            input_matrix.rows, input_matrix.cols, input_padded.rows, input_padded.cols);
+        // Show first few raw input values
+        eprintln!("[ACT GPU] input_matrix[0..4] = {:?}", &input_matrix.data[..4.min(input_matrix.data.len())]);
     }
     let input_eval = gpu
         .evaluate_mle_gpu(&input_mle, &output_claim.point)
