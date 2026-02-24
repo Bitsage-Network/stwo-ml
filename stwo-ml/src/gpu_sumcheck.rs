@@ -2616,6 +2616,41 @@ impl GpuSumcheckExecutor {
 
         let log_k = pk.ilog2() as usize;
 
+        // Cross-check GPU restriction against CPU
+        if std::env::var("STWO_CHANNEL_TRACE").is_ok() {
+            let mut gpu_fa = vec![0u32; pk * 4];
+            let mut gpu_fb = vec![0u32; pk * 4];
+            self.device.dtoh_sync_copy_into(&d_f_a, &mut gpu_fa).ok();
+            self.device.dtoh_sync_copy_into(&d_f_b, &mut gpu_fb).ok();
+            let gpu_fa_sf: Vec<SecureField> = gpu_fa.chunks_exact(4)
+                .map(|c| u32s_to_secure_field(&[c[0], c[1], c[2], c[3]]))
+                .collect();
+            let gpu_fb_sf: Vec<SecureField> = gpu_fb.chunks_exact(4)
+                .map(|c| u32s_to_secure_field(&[c[0], c[1], c[2], c[3]]))
+                .collect();
+            // CPU restrict
+            let cpu_fa = crate::components::matmul::restrict_rows_unpadded(a, r_i, pk);
+            let cpu_fb = crate::components::matmul::restrict_cols_unpadded(b, r_j, pk);
+            let fa_match = gpu_fa_sf == cpu_fa;
+            let fb_match = gpu_fb_sf == cpu_fb;
+            eprintln!("[MatMul GPU] restrict check: fa_match={} fb_match={} pk={}", fa_match, fb_match, pk);
+            if !fa_match {
+                for i in 0..pk.min(4) {
+                    eprintln!("  fa[{}]: gpu={:?} cpu={:?}", i, gpu_fa_sf[i], cpu_fa[i]);
+                }
+            }
+            if !fb_match {
+                for i in 0..pk.min(4) {
+                    eprintln!("  fb[{}]: gpu={:?} cpu={:?}", i, gpu_fb_sf[i], cpu_fb[i]);
+                }
+            }
+            // Check sum
+            let gpu_sum: SecureField = gpu_fa_sf.iter().zip(&gpu_fb_sf)
+                .map(|(&a, &b)| a * b)
+                .fold(SecureField::zero(), |acc, v| acc + v);
+            eprintln!("[MatMul GPU] inner product = {:?}", gpu_sum);
+        }
+
         // GPU-resident sumcheck rounds:
         // - round polynomial reduction on GPU
         // - MLE folding on GPU
