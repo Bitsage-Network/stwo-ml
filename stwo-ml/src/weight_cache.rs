@@ -22,7 +22,12 @@ use stwo::core::fields::qm31::{SecureField, QM31};
 /// v1: f_b + b_commitment + r_j
 /// v2: v1 + initial_mle_root (Optional<FieldElement>)
 /// v3: v2 + merkle_tree_cache_path (Optional<String>)
-const CACHE_VERSION: u32 = 3;
+/// v4: v3 + weight_fingerprint header (32 bytes, validates weight content)
+const CACHE_VERSION: u32 = 4;
+
+/// Number of M31 elements sampled per weight matrix for fingerprinting.
+/// With 8 samples × 160 matrices = 1280 elements hashed → ~5µs total.
+const FINGERPRINT_SAMPLES_PER_MATRIX: usize = 8;
 /// Magic bytes: "SWCF" (Stwo Weight Cache File).
 const MAGIC: [u8; 4] = [b'S', b'W', b'C', b'F'];
 
@@ -61,15 +66,36 @@ pub struct CachedWeight {
 pub struct WeightCommitmentCache {
     entries: HashMap<CacheKey, CachedWeight>,
     model_id: String,
+    /// Content-based fingerprint of weight matrices. Detects weight changes
+    /// (e.g., fine-tuning) that would invalidate cached Merkle roots.
+    fingerprint: [u8; 32],
     dirty: bool,
 }
 
 impl WeightCommitmentCache {
-    /// Create an empty cache for a model.
+    /// Create an empty cache for a model (zero fingerprint).
     pub fn new(model_id: &str) -> Self {
         Self {
             entries: HashMap::new(),
             model_id: model_id.to_string(),
+            fingerprint: [0u8; 32],
+            dirty: false,
+        }
+    }
+
+    /// Create a cache with a weight fingerprint computed from `GraphWeights`.
+    ///
+    /// The fingerprint samples a fixed set of elements from each weight matrix
+    /// and hashes them. This detects weight changes (fine-tuning, corruption)
+    /// that would invalidate cached Merkle roots.
+    pub fn new_with_fingerprint(
+        model_id: &str,
+        weights: &crate::compiler::graph::GraphWeights,
+    ) -> Self {
+        Self {
+            entries: HashMap::new(),
+            model_id: model_id.to_string(),
+            fingerprint: compute_weight_fingerprint(weights),
             dirty: false,
         }
     }
@@ -132,6 +158,88 @@ impl WeightCommitmentCache {
         self.dirty
     }
 
+    /// The stored weight fingerprint.
+    pub fn fingerprint(&self) -> &[u8; 32] {
+        &self.fingerprint
+    }
+
+    /// Set the fingerprint (marks cache dirty if changed).
+    pub fn set_fingerprint(&mut self, fp: [u8; 32]) {
+        if self.fingerprint != fp {
+            self.fingerprint = fp;
+            self.dirty = true;
+        }
+    }
+
+    /// Validate that the stored fingerprint matches the given weights.
+    ///
+    /// Returns `true` if fingerprints match (cache is valid), `false` if
+    /// weights have changed and cache should be invalidated.
+    /// A zero fingerprint (from `new()`) always returns `true` — the cache
+    /// was created without fingerprinting and should be trusted.
+    pub fn validate_fingerprint(
+        &self,
+        weights: &crate::compiler::graph::GraphWeights,
+    ) -> bool {
+        // Zero fingerprint = no validation (backward compat with v1-v3 caches)
+        if self.fingerprint == [0u8; 32] {
+            return true;
+        }
+        let current = compute_weight_fingerprint(weights);
+        self.fingerprint == current
+    }
+
+    /// Look up a cached full-MLE Merkle root for a weight matrix.
+    ///
+    /// Used by the aggregated oracle sumcheck path which commits the full
+    /// weight MLE (not the restricted one). Uses `m_padded = 0` sentinel
+    /// to distinguish from regular cache entries.
+    pub fn get_root(
+        &self,
+        node_id: usize,
+        rows_padded: usize,
+        cols_padded: usize,
+    ) -> Option<FieldElement> {
+        let key = CacheKey {
+            node_id,
+            m_padded: 0, // sentinel: full-MLE root entry
+            k_padded: rows_padded,
+            n_padded: cols_padded,
+        };
+        self.entries
+            .get(&key)
+            .and_then(|e| e.initial_mle_root)
+    }
+
+    /// Store a full-MLE Merkle root for a weight matrix.
+    ///
+    /// Counterpart of [`get_root`] for the aggregated oracle sumcheck path.
+    pub fn insert_root(
+        &mut self,
+        node_id: usize,
+        rows_padded: usize,
+        cols_padded: usize,
+        root: FieldElement,
+    ) {
+        let key = CacheKey {
+            node_id,
+            m_padded: 0, // sentinel: full-MLE root entry
+            k_padded: rows_padded,
+            n_padded: cols_padded,
+        };
+        self.entries.insert(
+            key,
+            CachedWeight {
+                f_b: Vec::new(),
+                b_commitment: FieldElement::ZERO,
+                r_j: Vec::new(),
+                initial_mle_root: Some(root),
+                merkle_tree_cache_path: None,
+            },
+        );
+        self.dirty = true;
+    }
+
     /// Clear all entries.
     pub fn clear(&mut self) {
         self.entries.clear();
@@ -140,7 +248,7 @@ impl WeightCommitmentCache {
 
     /// Save cache to a binary file.
     ///
-    /// Format: MAGIC(4) | version(4) | model_id_len(4) | model_id | num_entries(4) | entries...
+    /// Format: MAGIC(4) | version(4) | model_id_len(4) | model_id | fingerprint(32) | num_entries(4) | entries...
     /// Each entry: node_id(8) | m(8) | k(8) | n(8) | f_b_len(4) | f_b(16*len) | b_commitment(32) | r_j_len(4) | r_j(16*len)
     pub fn save(&mut self, path: &Path) -> io::Result<()> {
         let file = std::fs::File::create(path)?;
@@ -153,6 +261,9 @@ impl WeightCommitmentCache {
         let id_bytes = self.model_id.as_bytes();
         w.write_all(&(id_bytes.len() as u32).to_le_bytes())?;
         w.write_all(id_bytes)?;
+
+        // v4: weight fingerprint (32 bytes)
+        w.write_all(&self.fingerprint)?;
 
         w.write_all(&(self.entries.len() as u32).to_le_bytes())?;
 
@@ -210,7 +321,7 @@ impl WeightCommitmentCache {
             ));
         }
 
-        // Version — accept v1, v2, v3 (backward compatible)
+        // Version — accept v1, v2, v3, v4 (backward compatible)
         let version = read_u32(&mut r)?;
         if version < 1 || version > CACHE_VERSION {
             return Err(io::Error::new(
@@ -225,6 +336,15 @@ impl WeightCommitmentCache {
         r.read_exact(&mut id_bytes)?;
         let model_id = String::from_utf8(id_bytes)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        // v4: weight fingerprint
+        let fingerprint = if version >= 4 {
+            let mut fp = [0u8; 32];
+            r.read_exact(&mut fp)?;
+            fp
+        } else {
+            [0u8; 32] // v1-v3 files: zero fingerprint (no validation)
+        };
 
         // Entries
         let num_entries = read_u32(&mut r)? as usize;
@@ -292,6 +412,7 @@ impl WeightCommitmentCache {
         Ok(Self {
             entries,
             model_id,
+            fingerprint,
             dirty: false,
         })
     }
@@ -301,6 +422,41 @@ impl WeightCommitmentCache {
         match Self::load(path) {
             Ok(cache) if cache.model_id == model_id => cache,
             _ => Self::new(model_id),
+        }
+    }
+
+    /// Load from file, validate fingerprint against current weights.
+    ///
+    /// Returns the cached data only if both model_id and weight fingerprint match.
+    /// If the fingerprint doesn't match (weights changed), creates a fresh cache
+    /// with the correct fingerprint.
+    pub fn load_or_new_validated(
+        path: &Path,
+        model_id: &str,
+        weights: &crate::compiler::graph::GraphWeights,
+    ) -> Self {
+        let current_fp = compute_weight_fingerprint(weights);
+        match Self::load(path) {
+            Ok(cache) if cache.model_id == model_id => {
+                if cache.fingerprint == [0u8; 32] || cache.fingerprint == current_fp {
+                    // Valid: zero fp (legacy) or matching fp
+                    let mut cache = cache;
+                    if cache.fingerprint == [0u8; 32] {
+                        // Upgrade legacy cache with fingerprint
+                        cache.fingerprint = current_fp;
+                        cache.dirty = true;
+                    }
+                    cache
+                } else {
+                    // Fingerprint mismatch — weights changed, start fresh
+                    eprintln!(
+                        "  [weight_cache] fingerprint mismatch for model '{}' — weights changed, invalidating cache",
+                        model_id,
+                    );
+                    Self::new_with_fingerprint(model_id, weights)
+                }
+            }
+            _ => Self::new_with_fingerprint(model_id, weights),
         }
     }
 }
@@ -318,6 +474,99 @@ pub fn shared_cache_from_file(path: &Path, model_id: &str) -> SharedWeightCache 
     Arc::new(RwLock::new(WeightCommitmentCache::load_or_new(
         path, model_id,
     )))
+}
+
+/// Load or create a thread-safe cache next to a model directory.
+///
+/// Cache file is stored at `<model_dir>/.stwo_weight_cache.swcf`.
+/// Creates the cache file's parent directory if needed.
+pub fn shared_cache_for_model(model_dir: &Path, model_id: &str) -> SharedWeightCache {
+    let cache_path = model_dir.join(".stwo_weight_cache.swcf");
+    shared_cache_from_file(&cache_path, model_id)
+}
+
+/// Load or create a validated cache next to a model directory.
+///
+/// Like [`shared_cache_for_model`] but also validates the weight fingerprint.
+/// If weights have changed (fine-tuning, different checkpoint), the cache
+/// is invalidated and a fresh one created with the correct fingerprint.
+pub fn shared_cache_for_model_validated(
+    model_dir: &Path,
+    model_id: &str,
+    weights: &crate::compiler::graph::GraphWeights,
+) -> SharedWeightCache {
+    let cache_path = model_dir.join(".stwo_weight_cache.swcf");
+    Arc::new(RwLock::new(WeightCommitmentCache::load_or_new_validated(
+        &cache_path, model_id, weights,
+    )))
+}
+
+/// Save a shared weight cache to its model directory.
+///
+/// Only writes if the cache has been modified since last save.
+/// Returns `Ok(true)` if written, `Ok(false)` if clean/skipped.
+pub fn save_shared_cache(
+    cache: &SharedWeightCache,
+    model_dir: &Path,
+) -> io::Result<bool> {
+    let cache_path = model_dir.join(".stwo_weight_cache.swcf");
+    let mut w = cache
+        .write()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("lock poisoned: {e}")))?;
+    if !w.is_dirty() {
+        return Ok(false);
+    }
+    w.save(&cache_path)?;
+    Ok(true)
+}
+
+// ── Weight fingerprinting ────────────────────────────────────────────────
+
+/// Compute a 32-byte fingerprint of weight matrices by sampling elements.
+///
+/// Samples [`FINGERPRINT_SAMPLES_PER_MATRIX`] elements from each weight matrix
+/// at deterministic positions (spread evenly across the data). The sampled
+/// values are mixed into a running hash using FNV-1a-like mixing.
+///
+/// For Qwen3-14B (160 matrices): ~1280 u32 reads → <10µs.
+pub fn compute_weight_fingerprint(
+    weights: &crate::compiler::graph::GraphWeights,
+) -> [u8; 32] {
+    // FNV-1a 64-bit basis and prime
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001B3;
+
+    let mut state = [FNV_OFFSET; 4]; // 4 × 64-bit = 256-bit state
+
+    for (node_id, matrix) in &weights.weights {
+        let n = matrix.data.len();
+        if n == 0 {
+            continue;
+        }
+
+        // Mix node metadata
+        state[0] = state[0].wrapping_mul(FNV_PRIME) ^ (*node_id as u64);
+        state[1] = state[1].wrapping_mul(FNV_PRIME) ^ (matrix.rows as u64);
+        state[2] = state[2].wrapping_mul(FNV_PRIME) ^ (matrix.cols as u64);
+        state[3] = state[3].wrapping_mul(FNV_PRIME) ^ (n as u64);
+
+        // Sample elements at evenly spaced positions
+        let step = n.max(1) / FINGERPRINT_SAMPLES_PER_MATRIX.max(1);
+        let step = step.max(1);
+        for i in 0..FINGERPRINT_SAMPLES_PER_MATRIX.min(n) {
+            let idx = (i * step).min(n - 1);
+            let val = matrix.data[idx].0 as u64;
+            let lane = i % 4;
+            state[lane] = state[lane].wrapping_mul(FNV_PRIME) ^ val;
+        }
+    }
+
+    // Finalize: convert 4×u64 → 32 bytes
+    let mut out = [0u8; 32];
+    for (i, &s) in state.iter().enumerate() {
+        out[i * 8..(i + 1) * 8].copy_from_slice(&s.to_le_bytes());
+    }
+    out
 }
 
 // ── Binary I/O helpers ──────────────────────────────────────────────────
@@ -567,5 +816,200 @@ mod tests {
             assert!(r.get(0, 4, 8, 16).is_some());
             assert_eq!(r.len(), 1);
         }
+    }
+
+    #[test]
+    fn test_root_cache_insert_and_get() {
+        let mut cache = WeightCommitmentCache::new("root-test");
+        let root = FieldElement::from(0xABCDu64);
+
+        // Insert root for node 5, padded 16x32
+        cache.insert_root(5, 16, 32, root);
+        assert_eq!(cache.len(), 1);
+        assert!(cache.is_dirty());
+
+        // Hit
+        let hit = cache.get_root(5, 16, 32);
+        assert_eq!(hit, Some(root));
+
+        // Miss: different node
+        assert!(cache.get_root(6, 16, 32).is_none());
+        // Miss: different dims
+        assert!(cache.get_root(5, 32, 32).is_none());
+    }
+
+    #[test]
+    fn test_root_cache_save_load_roundtrip() {
+        let dir = std::env::temp_dir().join("stwo_ml_root_cache_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("root_cache.swcf");
+
+        let mut cache = WeightCommitmentCache::new("root-model");
+        cache.insert_root(0, 8, 16, FieldElement::from(0x1111u64));
+        cache.insert_root(5, 16, 32, FieldElement::from(0x2222u64));
+        cache.insert_root(10, 32, 64, FieldElement::from(0x3333u64));
+        cache.save(&path).unwrap();
+
+        let loaded = WeightCommitmentCache::load(&path).unwrap();
+        assert_eq!(loaded.get_root(0, 8, 16), Some(FieldElement::from(0x1111u64)));
+        assert_eq!(loaded.get_root(5, 16, 32), Some(FieldElement::from(0x2222u64)));
+        assert_eq!(loaded.get_root(10, 32, 64), Some(FieldElement::from(0x3333u64)));
+        assert!(loaded.get_root(99, 8, 16).is_none());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_root_cache_does_not_collide_with_regular() {
+        let mut cache = WeightCommitmentCache::new("mixed");
+
+        // Insert regular entry at (node=0, m=4, k=8, n=16)
+        cache.insert(0, 4, 8, 16, make_cached_weight(8, 3));
+
+        // Insert root entry at (node=0, rows=8, cols=16) → uses m_padded=0
+        cache.insert_root(0, 8, 16, FieldElement::from(0xFACEu64));
+
+        // Both should exist independently
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(0, 4, 8, 16).is_some());
+        assert_eq!(cache.get_root(0, 8, 16), Some(FieldElement::from(0xFACEu64)));
+
+        // Root entry doesn't interfere with regular
+        assert!(cache.get(0, 0, 8, 16).is_some()); // m_padded=0 is the root sentinel
+        assert_eq!(cache.get(0, 0, 8, 16).unwrap().initial_mle_root, Some(FieldElement::from(0xFACEu64)));
+    }
+
+    #[test]
+    fn test_fingerprint_deterministic() {
+        use crate::components::matmul::M31Matrix;
+        use crate::compiler::graph::GraphWeights;
+
+        let w1 = GraphWeights {
+            weights: vec![
+                (0, M31Matrix { rows: 2, cols: 4, data: (0..8).map(|i| M31(i * 100)).collect() }),
+                (1, M31Matrix { rows: 4, cols: 2, data: (0..8).map(|i| M31(i * 200 + 1)).collect() }),
+            ],
+            biases: vec![],
+            named_weights: vec![],
+        };
+
+        let fp1 = compute_weight_fingerprint(&w1);
+        let fp2 = compute_weight_fingerprint(&w1);
+        assert_eq!(fp1, fp2, "fingerprint must be deterministic");
+        assert_ne!(fp1, [0u8; 32], "fingerprint must not be zero");
+    }
+
+    #[test]
+    fn test_fingerprint_changes_with_data() {
+        use crate::components::matmul::M31Matrix;
+        use crate::compiler::graph::GraphWeights;
+
+        let w1 = GraphWeights {
+            weights: vec![
+                (0, M31Matrix { rows: 2, cols: 4, data: (0..8).map(|i| M31(i * 100)).collect() }),
+            ],
+            biases: vec![],
+            named_weights: vec![],
+        };
+        let w2 = GraphWeights {
+            weights: vec![
+                (0, M31Matrix { rows: 2, cols: 4, data: (0..8).map(|i| M31(i * 100 + 1)).collect() }), // different data
+            ],
+            biases: vec![],
+            named_weights: vec![],
+        };
+
+        let fp1 = compute_weight_fingerprint(&w1);
+        let fp2 = compute_weight_fingerprint(&w2);
+        assert_ne!(fp1, fp2, "fingerprint must change when weight data changes");
+    }
+
+    #[test]
+    fn test_fingerprint_save_load_roundtrip() {
+        use crate::components::matmul::M31Matrix;
+        use crate::compiler::graph::GraphWeights;
+
+        let dir = std::env::temp_dir().join("stwo_ml_fp_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("fp_cache.swcf");
+
+        let weights = GraphWeights {
+            weights: vec![
+                (0, M31Matrix { rows: 2, cols: 4, data: (0..8).map(|i| M31(i * 100)).collect() }),
+            ],
+            biases: vec![],
+            named_weights: vec![],
+        };
+
+        // Create cache with fingerprint
+        let mut cache = WeightCommitmentCache::new_with_fingerprint("fp-model", &weights);
+        let fp = *cache.fingerprint();
+        assert_ne!(fp, [0u8; 32]);
+
+        cache.insert_root(0, 2, 4, FieldElement::from(0x1234u64));
+        cache.save(&path).unwrap();
+
+        // Load and verify fingerprint survives roundtrip
+        let loaded = WeightCommitmentCache::load(&path).unwrap();
+        assert_eq!(*loaded.fingerprint(), fp);
+        assert!(loaded.validate_fingerprint(&weights));
+
+        // Mutated weights should fail validation
+        let mutated_weights = GraphWeights {
+            weights: vec![
+                (0, M31Matrix { rows: 2, cols: 4, data: (0..8).map(|i| M31(i * 999)).collect() }),
+            ],
+            biases: vec![],
+            named_weights: vec![],
+        };
+        assert!(!loaded.validate_fingerprint(&mutated_weights));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_load_or_new_validated_invalidates_on_weight_change() {
+        use crate::components::matmul::M31Matrix;
+        use crate::compiler::graph::GraphWeights;
+
+        let dir = std::env::temp_dir().join("stwo_ml_validated_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("validated.swcf");
+
+        let original_weights = GraphWeights {
+            weights: vec![
+                (0, M31Matrix { rows: 2, cols: 4, data: (0..8).map(|i| M31(i * 100)).collect() }),
+            ],
+            biases: vec![],
+            named_weights: vec![],
+        };
+
+        // Create and save with original weights
+        let mut cache = WeightCommitmentCache::new_with_fingerprint("val-model", &original_weights);
+        cache.insert_root(0, 2, 4, FieldElement::from(0xAAAAu64));
+        cache.save(&path).unwrap();
+        assert_eq!(cache.len(), 1);
+
+        // Load with same weights → should keep entries
+        let reloaded = WeightCommitmentCache::load_or_new_validated(&path, "val-model", &original_weights);
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(reloaded.get_root(0, 2, 4), Some(FieldElement::from(0xAAAAu64)));
+
+        // Load with different weights → should invalidate
+        let new_weights = GraphWeights {
+            weights: vec![
+                (0, M31Matrix { rows: 2, cols: 4, data: (0..8).map(|i| M31(i * 999)).collect() }),
+            ],
+            biases: vec![],
+            named_weights: vec![],
+        };
+        let invalidated = WeightCommitmentCache::load_or_new_validated(&path, "val-model", &new_weights);
+        assert!(invalidated.is_empty(), "cache should be invalidated on weight change");
+        assert_ne!(*invalidated.fingerprint(), [0u8; 32], "new cache should have fingerprint");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 }
