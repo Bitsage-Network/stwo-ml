@@ -4021,6 +4021,195 @@ impl CudaFftExecutor {
         })
     }
 
+    /// Build Poseidon252 Merkle tree level-by-level on GPU, keeping only 2 levels
+    /// in VRAM at a time. Extracts only the sibling nodes needed for query
+    /// authentication paths — avoids allocating the full tree.
+    ///
+    /// Peak VRAM: ~2× one tree level (vs full tree which stores all levels).
+    /// For a 128M-leaf tree: ~12.8 GB peak vs ~20.5 GB for full tree.
+    ///
+    /// Returns `(root_limbs, per_query_auth_path_siblings)` where each auth path
+    /// is a vector of sibling `[u64; 4]` limbs from leaf level to root.
+    pub fn execute_poseidon252_merkle_streaming_auth_paths(
+        &self,
+        d_leaf_limbs: &CudaSlice<u64>,
+        n_leaf_hashes: usize,
+        d_round_constants: &CudaSlice<u64>,
+        query_leaf_indices: &[usize],
+    ) -> Result<([u64; 4], Vec<Vec<[u64; 4]>>), CudaFftError> {
+        let _span = tracing::span!(
+            tracing::Level::INFO,
+            "CUDA poseidon252_streaming_auth_paths",
+            n_leaf_hashes = n_leaf_hashes,
+            n_queries = query_leaf_indices.len(),
+        )
+        .entered();
+
+        if n_leaf_hashes == 0 {
+            return Err(CudaFftError::InvalidSize(
+                "n_leaf_hashes must be > 0".into(),
+            ));
+        }
+
+        let n_queries = query_leaf_indices.len();
+        let block_size = 256u32;
+        let n_levels = (n_leaf_hashes as f64).log2().ceil() as usize + 1;
+
+        // Per-query auth path storage: siblings[query][level]
+        let mut auth_paths: Vec<Vec<[u64; 4]>> = vec![Vec::with_capacity(n_levels); n_queries];
+
+        // Track node indices per query at the current level
+        let mut query_node_indices: Vec<usize> = query_leaf_indices
+            .iter()
+            .map(|&leaf_idx| leaf_idx / 2)
+            .collect();
+
+        // Dummy column buffer for internal levels (no column data, only prev layer)
+        let dummy_cols = unsafe { self.device.alloc::<u32>(1) }
+            .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+
+        // Level 0: hash leaf pairs from d_leaf_limbs
+        let mut d_current = {
+            let mut d_out = unsafe { self.device.alloc::<u64>(n_leaf_hashes * 4) }
+                .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+
+            let grid_size = ((n_leaf_hashes as u32) + block_size - 1) / block_size;
+            let cfg = LaunchConfig {
+                grid_dim: (grid_size, 1, 1),
+                block_dim: (block_size, 1, 1),
+                shared_mem_bytes: 0,
+            };
+
+            unsafe {
+                self.kernels
+                    .poseidon252_merkle_layer
+                    .clone()
+                    .launch(
+                        cfg,
+                        (
+                            &mut d_out,
+                            &dummy_cols,
+                            d_leaf_limbs,
+                            d_round_constants,
+                            0u32,             // n_columns (0 = no column data)
+                            n_leaf_hashes as u32,
+                            1u32,             // has_prev = 1 (leaf limbs are the "prev" layer)
+                            0u32,             // col_stride
+                        ),
+                    )
+                    .map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
+            }
+            self.device
+                .synchronize()
+                .map_err(|e| CudaFftError::KernelExecution(format!("Sync: {:?}", e)))?;
+
+            d_out
+        };
+        let mut current_n = n_leaf_hashes;
+
+        // Extract level-0 sibling hashes for each query
+        for q in 0..n_queries {
+            let sib_idx = query_node_indices[q] ^ 1;
+            if sib_idx < current_n {
+                let start = sib_idx * 4;
+                let end = start + 4;
+                let mut out = [0u64; 4];
+                self.device
+                    .dtoh_sync_copy_into(&d_current.slice(start..end), &mut out)
+                    .map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
+                auth_paths[q].push(out);
+            } else {
+                // Edge case: sibling out of bounds (odd tree), push zeroes
+                auth_paths[q].push([0u64; 4]);
+            }
+        }
+
+        // Upper levels: build from previous level, extract siblings, free old level
+        for _level in 1..n_levels {
+            let next_n = (current_n + 1) / 2;
+            if next_n == 0 {
+                break;
+            }
+
+            // Advance query node indices to parent level
+            for idx in query_node_indices.iter_mut() {
+                *idx >>= 1;
+            }
+
+            let mut d_next = unsafe { self.device.alloc::<u64>(next_n * 4) }
+                .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+
+            let grid_size = ((next_n as u32) + block_size - 1) / block_size;
+            let cfg = LaunchConfig {
+                grid_dim: (grid_size, 1, 1),
+                block_dim: (block_size, 1, 1),
+                shared_mem_bytes: 0,
+            };
+
+            unsafe {
+                self.kernels
+                    .poseidon252_merkle_layer
+                    .clone()
+                    .launch(
+                        cfg,
+                        (
+                            &mut d_next,
+                            &dummy_cols,
+                            &d_current,
+                            d_round_constants,
+                            0u32,
+                            next_n as u32,
+                            1u32,
+                            0u32,
+                        ),
+                    )
+                    .map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
+            }
+            self.device
+                .synchronize()
+                .map_err(|e| CudaFftError::KernelExecution(format!("Sync: {:?}", e)))?;
+
+            // Free the previous level before extracting (saves VRAM)
+            drop(d_current);
+
+            // Extract sibling hashes at this level
+            if next_n > 1 {
+                for q in 0..n_queries {
+                    let sib_idx = query_node_indices[q] ^ 1;
+                    if sib_idx < next_n {
+                        let start = sib_idx * 4;
+                        let end = start + 4;
+                        let mut out = [0u64; 4];
+                        self.device
+                            .dtoh_sync_copy_into(&d_next.slice(start..end), &mut out)
+                            .map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
+                        auth_paths[q].push(out);
+                    } else {
+                        auth_paths[q].push([0u64; 4]);
+                    }
+                }
+            }
+
+            d_current = d_next;
+            current_n = next_n;
+        }
+
+        // Download root
+        let mut root = [0u64; 4];
+        self.device
+            .dtoh_sync_copy_into(&d_current.slice(0..4), &mut root)
+            .map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
+
+        tracing::info!(
+            "GPU poseidon252_streaming_auth_paths: {} leaf hashes, {} queries, {} levels",
+            n_leaf_hashes,
+            n_queries,
+            n_levels,
+        );
+
+        Ok((root, auth_paths))
+    }
+
     // =========================================================================
     // GPU-Resident Column Operations (eliminate PCIe round-trips)
     // =========================================================================
