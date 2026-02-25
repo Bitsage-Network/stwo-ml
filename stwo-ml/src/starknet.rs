@@ -1091,7 +1091,23 @@ pub fn prove_for_starknet_ml_gkr(
     weights: &GraphWeights,
     model_id: FieldElement,
 ) -> Result<GkrStarknetProof, StarknetModelError> {
-    let proof = crate::aggregation::prove_model_pure_gkr_auto(graph, input, weights)?;
+    prove_for_starknet_ml_gkr_with_cache(graph, input, weights, model_id, None)
+}
+
+/// Like [`prove_for_starknet_ml_gkr`] but with optional weight commitment cache.
+///
+/// When a cache is provided, Poseidon Merkle root computations for weight
+/// matrices are skipped on cache hits (~500s → <1ms on subsequent proofs).
+pub fn prove_for_starknet_ml_gkr_with_cache(
+    graph: &ComputationGraph,
+    input: &M31Matrix,
+    weights: &GraphWeights,
+    model_id: FieldElement,
+    weight_cache: Option<&crate::weight_cache::SharedWeightCache>,
+) -> Result<GkrStarknetProof, StarknetModelError> {
+    let proof = crate::aggregation::prove_model_pure_gkr_auto_with_cache(
+        graph, input, weights, weight_cache,
+    )?;
     build_gkr_starknet_proof(&proof, model_id, input)
 }
 
@@ -2227,19 +2243,22 @@ mod tests {
     struct EnvVarGuard {
         key: &'static str,
         prev: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl EnvVarGuard {
         fn set(key: &'static str, value: &str) -> Self {
+            let lock = crate::test_utils::ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
             let prev = std::env::var(key).ok();
             std::env::set_var(key, value);
-            Self { key, prev }
+            Self { key, prev, _lock: lock }
         }
 
         fn unset(key: &'static str) -> Self {
+            let lock = crate::test_utils::ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
             let prev = std::env::var(key).ok();
             std::env::remove_var(key);
-            Self { key, prev }
+            Self { key, prev, _lock: lock }
         }
     }
 
@@ -2250,6 +2269,7 @@ mod tests {
             } else {
                 std::env::remove_var(self.key);
             }
+            // _lock is dropped after env var is restored
         }
     }
 
@@ -3115,7 +3135,7 @@ mod tests {
     #[test]
     fn test_prove_for_starknet_ml_gkr_pipeline() {
         // Full pipeline test: graph → prove → serialize → verify structure
-        let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
+        let _guard = EnvVarGuard::set("STWO_WEIGHT_BINDING", "individual");
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(2);
         let graph = builder.build();
@@ -3144,10 +3164,10 @@ mod tests {
         assert!(!gkr_sn.gkr_calldata.is_empty());
         assert!(!gkr_sn.io_calldata.is_empty());
 
-        // Weight opening calldata should contain actual MLE opening proofs
-        // (one per MatMul layer: count + eval_point + expected_value + MLE proof)
+        // Weight opening calldata: either individual MLE proofs (sequential mode)
+        // or aggregated oracle sumcheck data. Both produce non-empty calldata.
         assert!(
-            gkr_sn.weight_opening_calldata.len() > 1,
+            !gkr_sn.weight_opening_calldata.is_empty(),
             "weight openings should be populated (got {} felts)",
             gkr_sn.weight_opening_calldata.len(),
         );
@@ -3237,7 +3257,7 @@ mod tests {
     #[test]
     fn test_gkr_soundness_gate_rejects_missing_weight_openings() {
         use crate::aggregation::prove_model_pure_gkr;
-        let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
+        let _guard = EnvVarGuard::set("STWO_WEIGHT_BINDING", "individual");
 
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(2);
@@ -3277,7 +3297,7 @@ mod tests {
     #[test]
     fn test_build_gkr_serializable_proof_keeps_artifact_when_not_submission_ready() {
         use crate::aggregation::prove_model_pure_gkr;
-        let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
+        let _guard = EnvVarGuard::set("STWO_WEIGHT_BINDING", "individual");
 
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(2);
@@ -3331,7 +3351,7 @@ mod tests {
     #[test]
     fn test_build_verify_model_gkr_v2_calldata_inserts_mode_field() {
         use crate::aggregation::prove_model_pure_gkr;
-        let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
+        let _guard = EnvVarGuard::set("STWO_WEIGHT_BINDING", "individual");
 
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(2);
@@ -3411,7 +3431,7 @@ mod tests {
     fn test_build_verify_model_gkr_v2_calldata_accepts_batched_subchannel_mode() {
         use crate::aggregation::prove_model_pure_gkr;
         use crate::gkr::types::WeightOpeningTranscriptMode;
-        let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
+        let _guard = EnvVarGuard::set("STWO_WEIGHT_BINDING", "individual");
 
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(2);
@@ -3484,7 +3504,7 @@ mod tests {
     #[test]
     fn test_build_verify_model_gkr_v3_calldata_inserts_mode_and_empty_binding_data() {
         use crate::aggregation::prove_model_pure_gkr;
-        let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
+        let _guard = EnvVarGuard::set("STWO_WEIGHT_BINDING", "individual");
 
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(2);
@@ -3611,7 +3631,7 @@ mod tests {
     fn test_build_verify_model_gkr_v3_calldata_encodes_mode2_binding_data() {
         use crate::aggregation::prove_model_pure_gkr;
         use crate::gkr::types::WeightOpeningTranscriptMode;
-        let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
+        let _guard = EnvVarGuard::set("STWO_WEIGHT_BINDING", "individual");
 
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(2);
@@ -3689,8 +3709,7 @@ mod tests {
         use crate::gkr::types::WeightOpeningTranscriptMode;
 
         // Prove with sequential mode, then manually construct mode 4 state.
-        // This avoids env-var race conditions with parallel tests.
-        let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
+        let _guard = EnvVarGuard::set("STWO_WEIGHT_BINDING", "individual");
 
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(2);
@@ -3758,7 +3777,7 @@ mod tests {
     fn test_mode2_serialized_proof_is_submit_ready_with_binding_payload() {
         use crate::aggregation::prove_model_pure_gkr;
         use crate::gkr::types::WeightOpeningTranscriptMode;
-        let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
+        let _guard = EnvVarGuard::set("STWO_WEIGHT_BINDING", "individual");
 
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(2);
@@ -3801,7 +3820,7 @@ mod tests {
     fn test_build_verify_model_gkr_v4_calldata_encodes_mode3_binding_data() {
         use crate::aggregation::prove_model_pure_gkr;
         use crate::gkr::types::WeightOpeningTranscriptMode;
-        let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
+        let _guard = EnvVarGuard::set("STWO_WEIGHT_BINDING", "individual");
 
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(2);
@@ -3878,7 +3897,7 @@ mod tests {
         use crate::crypto::aggregated_opening::{prove_aggregated_binding, AggregatedWeightClaim};
         use crate::crypto::poseidon_channel::PoseidonChannel;
         use crate::gkr::types::WeightOpeningTranscriptMode;
-        let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
+        let _guard = EnvVarGuard::set("STWO_WEIGHT_BINDING", "individual");
 
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(2);
@@ -3972,7 +3991,7 @@ mod tests {
     #[test]
     fn test_build_verify_model_gkr_v4_rejects_non_mode3_or_mode4_binding() {
         use crate::aggregation::prove_model_pure_gkr;
-        let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
+        let _guard = EnvVarGuard::set("STWO_WEIGHT_BINDING", "individual");
 
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(2);

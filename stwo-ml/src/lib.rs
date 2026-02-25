@@ -106,11 +106,21 @@ pub mod prelude {
         TeeModelProver,
     };
     pub use crate::weight_cache::{
-        shared_cache, shared_cache_from_file, CachedWeight, SharedWeightCache,
-        WeightCommitmentCache,
+        compute_weight_fingerprint, save_shared_cache, shared_cache, shared_cache_for_model,
+        shared_cache_for_model_validated, shared_cache_from_file, CachedWeight,
+        SharedWeightCache, WeightCommitmentCache,
     };
 }
 
 /// Re-export GPU backend when available.
 #[cfg(feature = "gpu")]
 pub use stwo::prover::backend::gpu::GpuBackend;
+
+/// Shared test utilities for env var isolation.
+#[cfg(test)]
+pub(crate) mod test_utils {
+    /// Global mutex serializing tests that mutate process-wide env vars.
+    /// Both `starknet::tests` and `gkr::verifier::tests` use this to
+    /// prevent parallel races on `STWO_WEIGHT_BINDING` etc.
+    pub static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+}

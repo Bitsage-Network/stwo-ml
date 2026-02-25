@@ -45,10 +45,17 @@ pub mod verifier;
 
 pub use circuit::{CircuitLayer, LayerCounts, LayerType, LayeredCircuit, SIMDBatchConfig};
 pub use prover::prove_gkr;
+pub use prover::prove_gkr_auto;
+pub use prover::prove_gkr_auto_with_cache;
+pub use prover::prove_gkr_with_cache;
 #[cfg(feature = "cuda-runtime")]
 pub use prover::prove_gkr_gpu;
 #[cfg(feature = "cuda-runtime")]
+pub use prover::prove_gkr_gpu_with_cache;
+#[cfg(feature = "cuda-runtime")]
 pub use prover::prove_gkr_simd_gpu;
+#[cfg(feature = "cuda-runtime")]
+pub use prover::prove_gkr_simd_gpu_with_cache;
 pub use types::{
     DeferredProof, EmbeddingLogUpProof, GKRClaim, GKRError, GKRProof, LayerProof, LogUpProof,
     ReductionOutput, RoundPolyDeg3, WeightOpeningTranscriptMode,

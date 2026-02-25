@@ -3696,7 +3696,7 @@ pub fn prove_model_pure_gkr(
     input: &M31Matrix,
     weights: &GraphWeights,
 ) -> Result<AggregatedModelProofOnChain, AggregationError> {
-    prove_model_pure_gkr_inner::<SimdBackend>(graph, input, weights)
+    prove_model_pure_gkr_inner::<SimdBackend>(graph, input, weights, None)
 }
 
 /// Pure GKR with auto GPU dispatch for the unified STARK backend.
@@ -3705,15 +3705,29 @@ pub fn prove_model_pure_gkr_auto(
     input: &M31Matrix,
     weights: &GraphWeights,
 ) -> Result<AggregatedModelProofOnChain, AggregationError> {
+    prove_model_pure_gkr_auto_with_cache(graph, input, weights, None)
+}
+
+/// Like [`prove_model_pure_gkr_auto`] but with optional weight commitment cache.
+///
+/// When a cache is provided, Poseidon Merkle root computations for weight
+/// matrices are skipped on cache hits, reducing commitment time from ~500s
+/// to near-zero on subsequent proofs of the same model.
+pub fn prove_model_pure_gkr_auto_with_cache(
+    graph: &ComputationGraph,
+    input: &M31Matrix,
+    weights: &GraphWeights,
+    weight_cache: Option<&crate::weight_cache::SharedWeightCache>,
+) -> Result<AggregatedModelProofOnChain, AggregationError> {
     #[cfg(feature = "cuda-runtime")]
     {
         if crate::backend::gpu_is_available() {
             return prove_model_pure_gkr_inner::<stwo::prover::backend::gpu::GpuBackend>(
-                graph, input, weights,
+                graph, input, weights, weight_cache,
             );
         }
     }
-    prove_model_pure_gkr_inner::<SimdBackend>(graph, input, weights)
+    prove_model_pure_gkr_inner::<SimdBackend>(graph, input, weights, weight_cache)
 }
 
 /// Inner implementation: forward pass → GKR → unified STARK.
@@ -3721,6 +3735,7 @@ fn prove_model_pure_gkr_inner<B>(
     graph: &ComputationGraph,
     input: &M31Matrix,
     weights: &GraphWeights,
+    weight_cache: Option<&crate::weight_cache::SharedWeightCache>,
 ) -> Result<AggregatedModelProofOnChain, AggregationError>
 where
     B: BackendForChannel<Blake2sMerkleChannel> + PolyOps + ColumnOps<BaseField>,
@@ -4199,16 +4214,16 @@ where
         #[cfg(feature = "cuda-runtime")]
         {
             if gpu_active {
-                crate::gkr::prove_gkr_gpu(&circuit, &gkr_execution, weights, &mut gkr_channel)
+                crate::gkr::prove_gkr_gpu_with_cache(&circuit, &gkr_execution, weights, &mut gkr_channel, weight_cache)
                     .map_err(|e| AggregationError::ProvingError(format!("GKR GPU proving: {e}")))?
             } else {
-                crate::gkr::prove_gkr(&circuit, &gkr_execution, weights, &mut gkr_channel)
+                crate::gkr::prove_gkr_with_cache(&circuit, &gkr_execution, weights, &mut gkr_channel, weight_cache)
                     .map_err(|e| AggregationError::ProvingError(format!("GKR proving: {e}")))?
             }
         }
         #[cfg(not(feature = "cuda-runtime"))]
         {
-            crate::gkr::prove_gkr(&circuit, &gkr_execution, weights, &mut gkr_channel)
+            crate::gkr::prove_gkr_with_cache(&circuit, &gkr_execution, weights, &mut gkr_channel, weight_cache)
                 .map_err(|e| AggregationError::ProvingError(format!("GKR proving: {e}")))?
         }
     };
@@ -7828,13 +7843,15 @@ mod tests {
     struct EnvVarGuard {
         key: &'static str,
         prev: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl EnvVarGuard {
         fn set(key: &'static str, value: &str) -> Self {
+            let lock = crate::test_utils::ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
             let prev = std::env::var(key).ok();
             std::env::set_var(key, value);
-            Self { key, prev }
+            Self { key, prev, _lock: lock }
         }
     }
 

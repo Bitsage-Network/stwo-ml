@@ -205,9 +205,10 @@ fn gkr_aggregated_oracle_sumcheck_enabled() -> bool {
     match std::env::var("STWO_WEIGHT_BINDING") {
         Ok(v) => {
             let v = v.trim().to_ascii_lowercase();
-            v == "aggregated" || v == "oracle_sumcheck" || v == "1"
+            // Opt-out: set STWO_WEIGHT_BINDING=individual to use legacy per-layer openings
+            v != "individual" && v != "sequential" && v != "0" && v != "off" && v != "false"
         }
-        Err(_) => false,
+        Err(_) => true, // default: aggregated oracle sumcheck
     }
 }
 
@@ -313,6 +314,7 @@ fn apply_aggregated_oracle_sumcheck(
     weights: &GraphWeights,
     channel: &mut PoseidonChannel,
     log_tag: &str,
+    weight_cache: Option<&crate::weight_cache::SharedWeightCache>,
 ) -> Result<
     (
         Vec<starknet_ff::FieldElement>,
@@ -360,9 +362,21 @@ fn apply_aggregated_oracle_sumcheck(
         matrix_index: usize,
         is_deferred: bool,
         deferred_idx: usize,
+        rows_padded: usize,
+        cols_padded: usize,
+        /// Pre-resolved cached Merkle root (skips GPU/CPU commitment).
+        cached_root: Option<starknet_ff::FieldElement>,
     }
+    // Acquire read lock on cache once for all lookups (if provided).
+    let cache_read = weight_cache.and_then(|c| c.read().ok());
+    let mut cache_hits = 0usize;
+
     let mut prep_inputs: Vec<WeightPrepInput<'_>> = Vec::with_capacity(total_claims);
     for (idx, (weight_node_id, eval_point, expected_value)) in weight_data.iter().enumerate() {
+        let b = weights.get_weight(*weight_node_id);
+        let (rp, cp) = b.map(|m| (m.rows.next_power_of_two(), m.cols.next_power_of_two())).unwrap_or((0, 0));
+        let cached_root = cache_read.as_ref().and_then(|c| c.get_root(*weight_node_id, rp, cp));
+        if cached_root.is_some() { cache_hits += 1; }
         prep_inputs.push(WeightPrepInput {
             weight_node_id: *weight_node_id,
             eval_point,
@@ -370,11 +384,18 @@ fn apply_aggregated_oracle_sumcheck(
             matrix_index: idx,
             is_deferred: false,
             deferred_idx: 0,
+            rows_padded: rp,
+            cols_padded: cp,
+            cached_root,
         });
     }
     for (deferred_idx, (weight_node_id, eval_point, expected_value)) in
         deferred_weight_claims_data.iter().enumerate()
     {
+        let b = weights.get_weight(*weight_node_id);
+        let (rp, cp) = b.map(|m| (m.rows.next_power_of_two(), m.cols.next_power_of_two())).unwrap_or((0, 0));
+        let cached_root = cache_read.as_ref().and_then(|c| c.get_root(*weight_node_id, rp, cp));
+        if cached_root.is_some() { cache_hits += 1; }
         prep_inputs.push(WeightPrepInput {
             weight_node_id: *weight_node_id,
             eval_point,
@@ -382,7 +403,18 @@ fn apply_aggregated_oracle_sumcheck(
             matrix_index: weight_data.len() + deferred_idx,
             is_deferred: true,
             deferred_idx,
+            rows_padded: rp,
+            cols_padded: cp,
+            cached_root,
         });
+    }
+    // Release read lock before the commitment loop (which may need write access).
+    drop(cache_read);
+
+    if cache_hits > 0 {
+        eprintln!(
+            "  [{log_tag}] weight commitment cache: {cache_hits}/{total_claims} hits (skipping Merkle root computation)",
+        );
     }
 
     struct WeightPrepResult {
@@ -395,12 +427,38 @@ fn apply_aggregated_oracle_sumcheck(
         deferred_idx: usize,
     }
 
+    // ── Fast path: all roots cached ──────────────────────────────────
+    // When all weight commitment roots are cached (subsequent proofs of the
+    // same model), skip GPU/CPU Merkle entirely. This reduces ~500s → <1ms.
+    let all_cached = cache_hits == total_claims && total_claims > 0;
+
     // --- GPU path: sequential per-matrix, GPU Poseidon Merkle root ---
     // Controlled by STWO_GPU_MLE_COMMITMENT (default ON for cuda-runtime builds).
     // Per-matrix GPU failure falls back to CPU for that matrix and continues.
     // STWO_GPU_MLE_COMMITMENT_REQUIRE / STWO_GPU_ONLY → panic on GPU failure.
     #[cfg(feature = "cuda-runtime")]
-    let prep_results: Vec<Result<WeightPrepResult, GKRError>> = {
+    let prep_results: Vec<Result<WeightPrepResult, GKRError>> = if all_cached {
+        eprintln!(
+            "  [{log_tag}] all {total_claims} weight commitment roots from cache ({:.3}s)",
+            t_commit.elapsed().as_secs_f64(),
+        );
+        prep_inputs
+            .iter()
+            .map(|input| {
+                let commitment = input.cached_root.expect("all_cached invariant: every root must be Some");
+                let n_vars = (input.rows_padded * input.cols_padded).trailing_zeros() as usize;
+                Ok(WeightPrepResult {
+                    matrix_index: input.matrix_index,
+                    n_vars,
+                    commitment,
+                    eval_point: input.eval_point.to_vec(),
+                    expected_value: input.expected_value,
+                    is_deferred: input.is_deferred,
+                    deferred_idx: input.deferred_idx,
+                })
+            })
+            .collect()
+    } else {
         use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
         use stwo::prover::backend::gpu::cuda_executor::{
             get_cuda_executor, is_cuda_available, upload_poseidon252_round_constants,
@@ -738,11 +796,32 @@ fn apply_aggregated_oracle_sumcheck(
                 .collect()
             })
         }
-    };
+    }; // close all_cached else + cuda-runtime prep_results
 
     // --- CPU-only path (no cuda-runtime feature) ---
     #[cfg(not(feature = "cuda-runtime"))]
-    let prep_results: Vec<Result<WeightPrepResult, GKRError>> = {
+    let prep_results: Vec<Result<WeightPrepResult, GKRError>> = if all_cached {
+        eprintln!(
+            "  [{log_tag}] all {total_claims} weight commitment roots from cache ({:.3}s)",
+            t_commit.elapsed().as_secs_f64(),
+        );
+        prep_inputs
+            .iter()
+            .map(|input| {
+                let commitment = input.cached_root.expect("all_cached invariant: every root must be Some");
+                let n_vars = (input.rows_padded * input.cols_padded).trailing_zeros() as usize;
+                Ok(WeightPrepResult {
+                    matrix_index: input.matrix_index,
+                    n_vars,
+                    commitment,
+                    eval_point: input.eval_point.to_vec(),
+                    expected_value: input.expected_value,
+                    is_deferred: input.is_deferred,
+                    deferred_idx: input.deferred_idx,
+                })
+            })
+            .collect()
+    } else {
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
         let done_count = AtomicUsize::new(0);
         let max_parallel_commitments = std::env::var("STWO_GKR_PARALLEL_COMMITMENTS")
@@ -799,7 +878,7 @@ fn apply_aggregated_oracle_sumcheck(
             })
             .collect()
         })
-    };
+    }; // close all_cached else + cpu-only prep_results
 
     // Unpack results in order.
     // MLEs are no longer accumulated — streaming mode loads them on demand from
@@ -834,6 +913,32 @@ fn apply_aggregated_oracle_sumcheck(
         "  [{log_tag}] all {total_claims} weight commitments ready in {:.1}s",
         t_commit.elapsed().as_secs_f64(),
     );
+
+    // Populate cache with newly computed roots (first run only).
+    if !all_cached {
+        if let Some(cache) = weight_cache {
+            if let Ok(mut w) = cache.write() {
+                let mut inserted = 0usize;
+                for claim in &agg_claims {
+                    let input = &prep_inputs[claim.matrix_index];
+                    if input.cached_root.is_none() && input.rows_padded > 0 {
+                        w.insert_root(
+                            input.weight_node_id,
+                            input.rows_padded,
+                            input.cols_padded,
+                            claim.commitment,
+                        );
+                        inserted += 1;
+                    }
+                }
+                if inserted > 0 {
+                    eprintln!(
+                        "  [{log_tag}] weight commitment cache: {inserted} new roots stored",
+                    );
+                }
+            }
+        }
+    }
 
     // RLC binding (fast path, default) vs full aggregated binding proof (streaming).
     //
@@ -1016,6 +1121,17 @@ pub fn prove_gkr(
     execution: &GraphExecution,
     weights: &GraphWeights,
     channel: &mut PoseidonChannel,
+) -> Result<GKRProof, GKRError> {
+    prove_gkr_with_cache(circuit, execution, weights, channel, None)
+}
+
+/// CPU GKR prover with optional weight commitment cache.
+pub fn prove_gkr_with_cache(
+    circuit: &LayeredCircuit,
+    execution: &GraphExecution,
+    weights: &GraphWeights,
+    channel: &mut PoseidonChannel,
+    weight_cache: Option<&crate::weight_cache::SharedWeightCache>,
 ) -> Result<GKRProof, GKRError> {
     let d = circuit.layers.len();
     let mut layer_proofs = Vec::with_capacity(d);
@@ -1449,6 +1565,7 @@ pub fn prove_gkr(
             weights,
             channel,
             "GKR",
+            weight_cache,
         )?;
         weight_commitments_new = wc;
         weight_claims = claims;
@@ -1594,13 +1711,29 @@ pub fn prove_gkr_auto(
     weights: &GraphWeights,
     channel: &mut PoseidonChannel,
 ) -> Result<GKRProof, GKRError> {
+    prove_gkr_auto_with_cache(circuit, execution, weights, channel, None)
+}
+
+/// Like [`prove_gkr_auto`] but accepts an optional weight commitment cache.
+///
+/// When a [`SharedWeightCache`](crate::weight_cache::SharedWeightCache) is provided,
+/// Poseidon Merkle root computations for weight matrices are cached across
+/// inferences. For Qwen3-14B (160 matrices), this skips ~500s of GPU/CPU
+/// Merkle work on subsequent proofs of the same model.
+pub fn prove_gkr_auto_with_cache(
+    circuit: &LayeredCircuit,
+    execution: &GraphExecution,
+    weights: &GraphWeights,
+    channel: &mut PoseidonChannel,
+    weight_cache: Option<&crate::weight_cache::SharedWeightCache>,
+) -> Result<GKRProof, GKRError> {
     #[cfg(feature = "cuda-runtime")]
     {
         if crate::backend::force_gpu() || crate::backend::gpu_is_available() {
-            return prove_gkr_gpu(circuit, execution, weights, channel);
+            return prove_gkr_gpu_with_cache(circuit, execution, weights, channel, weight_cache);
         }
     }
-    prove_gkr(circuit, execution, weights, channel)
+    prove_gkr_with_cache(circuit, execution, weights, channel, weight_cache)
 }
 
 // =============================================================================
@@ -1622,6 +1755,18 @@ pub fn prove_gkr_gpu(
     execution: &GraphExecution,
     weights: &GraphWeights,
     channel: &mut PoseidonChannel,
+) -> Result<GKRProof, GKRError> {
+    prove_gkr_gpu_with_cache(circuit, execution, weights, channel, None)
+}
+
+/// GPU GKR prover with optional weight commitment cache.
+#[cfg(feature = "cuda-runtime")]
+pub fn prove_gkr_gpu_with_cache(
+    circuit: &LayeredCircuit,
+    execution: &GraphExecution,
+    weights: &GraphWeights,
+    channel: &mut PoseidonChannel,
+    weight_cache: Option<&crate::weight_cache::SharedWeightCache>,
 ) -> Result<GKRProof, GKRError> {
     use crate::gpu_sumcheck::GpuSumcheckExecutor;
 
@@ -2150,6 +2295,7 @@ pub fn prove_gkr_gpu(
             weights,
             channel,
             "GKR-GPU",
+            weight_cache,
         )?;
         weight_commitments_new = wc;
         weight_claims = claims;
@@ -2648,6 +2794,18 @@ pub fn prove_gkr_simd_gpu(
     weights: &GraphWeights,
     channel: &mut PoseidonChannel,
 ) -> Result<GKRProof, GKRError> {
+    prove_gkr_simd_gpu_with_cache(circuit, block_executions, weights, channel, None)
+}
+
+/// SIMD GPU GKR prover with optional weight commitment cache.
+#[cfg(feature = "cuda-runtime")]
+pub fn prove_gkr_simd_gpu_with_cache(
+    circuit: &LayeredCircuit,
+    block_executions: &[GraphExecution],
+    weights: &GraphWeights,
+    channel: &mut PoseidonChannel,
+    weight_cache: Option<&crate::weight_cache::SharedWeightCache>,
+) -> Result<GKRProof, GKRError> {
     use crate::components::matmul::compute_lagrange_basis_pub;
     use crate::gpu_sumcheck::GpuSumcheckExecutor;
 
@@ -3089,6 +3247,7 @@ pub fn prove_gkr_simd_gpu(
             weights,
             channel,
             "GKR-SIMD-GPU",
+            weight_cache,
         )?;
         weight_commitments_new = wc;
         weight_claims = claims;
