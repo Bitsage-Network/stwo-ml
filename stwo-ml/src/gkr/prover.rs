@@ -506,6 +506,158 @@ fn apply_aggregated_oracle_sumcheck(
                 );
             }
 
+            // ── Multi-GPU path ──────────────────────────────────────────
+            // When >1 GPU is available, partition uncached matrices across
+            // devices for parallel Merkle root computation.
+            let multi_gpu_results: Option<Vec<Result<WeightPrepResult, GKRError>>> = {
+                #[cfg(feature = "multi-gpu")]
+                {
+                    let mgpu_count = crate::multi_gpu::device_count();
+                    let uncached_count = prep_inputs.iter().filter(|i| i.cached_root.is_none()).count();
+
+                    if mgpu_count > 1 && uncached_count > 1 {
+                        eprintln!(
+                            "  [{log_tag}] multi-GPU weight commitment: {uncached_count} uncached across {mgpu_count} GPUs",
+                        );
+
+                        let uncached_indices: Vec<usize> = prep_inputs
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, i)| i.cached_root.is_none())
+                            .map(|(idx, _)| idx)
+                            .collect();
+
+                        let bins = crate::multi_gpu::partition_by_size(
+                            &uncached_indices,
+                            mgpu_count,
+                            |&idx| prep_inputs[idx].rows_padded * prep_inputs[idx].cols_padded,
+                        );
+
+                        let committed: Vec<(usize, starknet_ff::FieldElement, usize)> =
+                            std::thread::scope(|s| {
+                                let pi_ref = &prep_inputs;
+                                let w_ref = &weights;
+                                let wc_ref = &weight_cache;
+                                let handles: Vec<_> = bins
+                                    .into_iter()
+                                    .enumerate()
+                                    .filter(|(_, bin)| !bin.is_empty())
+                                    .map(|(gpu_idx, bin)| {
+                                        s.spawn(move || {
+                                            let _guard = crate::multi_gpu::DeviceGuard::new(gpu_idx);
+                                            let gpu_exec = get_cuda_executor().map_err(|e| {
+                                                format!("GPU {gpu_idx} cuda init: {e}")
+                                            })?;
+                                            let gpu_rc =
+                                                upload_poseidon252_round_constants(&gpu_exec.device)
+                                                    .map_err(|e| format!("GPU {gpu_idx} upload RC: {e}"))?;
+
+                                            let max_n = bin.iter().map(|&oi| {
+                                                pi_ref[oi].rows_padded * pi_ref[oi].cols_padded
+                                            }).max().unwrap_or(0);
+                                            let mut buf = vec![0u64; max_n * 4];
+                                            let mut out = Vec::with_capacity(bin.len());
+
+                                            for &oi in &bin {
+                                                let inp = &pi_ref[oi];
+                                                let matrix = w_ref
+                                                    .get_weight(inp.weight_node_id)
+                                                    .ok_or_else(|| format!("missing weight {}", inp.weight_node_id))?;
+                                                let n = inp.rows_padded * inp.cols_padded;
+                                                buf[..n * 4].fill(0);
+                                                let _ = crate::components::matmul::matrix_to_mle_col_major_all_padded(
+                                                    matrix, &mut buf,
+                                                );
+                                                let root = crate::crypto::mle_opening::commit_mle_root_only_gpu_from_limbs(
+                                                    &buf, n, gpu_exec, &gpu_rc,
+                                                ).map_err(|e| format!("GPU {gpu_idx} commit: {e}"))?;
+
+                                                // Incremental cache population: insert each
+                                                // root immediately so concurrent readers
+                                                // (prewarm, next proof) see it without waiting
+                                                // for the full batch to finish.
+                                                if let Some(wc) = wc_ref {
+                                                    if let Ok(mut w) = wc.write() {
+                                                        w.insert_root(
+                                                            inp.weight_node_id,
+                                                            inp.rows_padded,
+                                                            inp.cols_padded,
+                                                            root,
+                                                        );
+                                                    }
+                                                }
+
+                                                out.push((oi, root, n.trailing_zeros() as usize));
+                                            }
+                                            Ok::<_, String>(out)
+                                        })
+                                    })
+                                    .collect();
+
+                                let mut all = Vec::with_capacity(uncached_count);
+                                for h in handles {
+                                    match h.join().expect("multi-GPU thread panicked") {
+                                        Ok(batch) => all.extend(batch),
+                                        Err(e) => {
+                                            eprintln!("  [{log_tag}] multi-GPU commit failed: {e}, falling back");
+                                            return Vec::new();
+                                        }
+                                    }
+                                }
+                                all
+                            });
+
+                        if !committed.is_empty() {
+                            let cmap: std::collections::HashMap<usize, (starknet_ff::FieldElement, usize)> =
+                                committed.into_iter().map(|(i, r, nv)| (i, (r, nv))).collect();
+
+                            let multi_results: Vec<Result<WeightPrepResult, GKRError>> = prep_inputs
+                                .iter()
+                                .enumerate()
+                                .map(|(idx, input)| {
+                                    let (commitment, n_vars) = if let Some(root) = input.cached_root {
+                                        (root, (input.rows_padded * input.cols_padded).trailing_zeros() as usize)
+                                    } else if let Some(&(root, nv)) = cmap.get(&idx) {
+                                        (root, nv)
+                                    } else {
+                                        return Err(GKRError::ReductionError {
+                                            layer_idx: 0,
+                                            reason: format!("missing commitment for matrix {idx}"),
+                                        });
+                                    };
+                                    Ok(WeightPrepResult {
+                                        matrix_index: input.matrix_index,
+                                        n_vars,
+                                        commitment,
+                                        eval_point: input.eval_point.to_vec(),
+                                        expected_value: input.expected_value,
+                                        is_deferred: input.is_deferred,
+                                        deferred_idx: input.deferred_idx,
+                                    })
+                                })
+                                .collect();
+
+                            eprintln!(
+                                "  [{log_tag}] multi-GPU weight commitments: {total_claims} done ({:.1}s, {mgpu_count} GPUs)",
+                                t_commit.elapsed().as_secs_f64(),
+                            );
+                            Some(multi_results)
+                        } else {
+                            eprintln!("  [{log_tag}] multi-GPU failed, falling through to single-GPU");
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+                #[cfg(not(feature = "multi-gpu"))]
+                { None }
+            };
+
+            if let Some(results) = multi_gpu_results {
+                results
+            } else {
+
             // Optimization 1: Reusable limb buffers — allocate once for the max
             // padded matrix size, reuse across all 160+ matrices.
             // Two buffers for double-buffering (optimization 3: pipelining).
@@ -633,6 +785,19 @@ fn apply_aggregated_oracle_sumcheck(
                             return;
                         }
 
+                        // Incremental cache: insert root immediately so
+                        // subsequent proofs or prewarm threads see it.
+                        if let Some(wc) = weight_cache {
+                            if let Ok(mut w) = wc.write() {
+                                w.insert_root(
+                                    input.weight_node_id,
+                                    input.rows_padded,
+                                    input.cols_padded,
+                                    commitment,
+                                );
+                            }
+                        }
+
                         let finished = idx + 1;
                         if finished % 10 == 0 || finished == total_claims {
                             eprintln!(
@@ -692,6 +857,18 @@ fn apply_aggregated_oracle_sumcheck(
                         }
                     };
 
+                    // Incremental cache: insert last root too.
+                    if let Some(wc) = weight_cache {
+                        if let Ok(mut w) = wc.write() {
+                            w.insert_root(
+                                input.weight_node_id,
+                                input.rows_padded,
+                                input.cols_padded,
+                                commitment,
+                            );
+                        }
+                    }
+
                     eprintln!(
                         "  [{log_tag}] weight commitments: {}/{total_claims} done ({:.1}s, gpu={gpu_count} cpu={cpu_fallback_count})",
                         idx + 1,
@@ -719,6 +896,7 @@ fn apply_aggregated_oracle_sumcheck(
                 }
             }
             results
+            } // end else (single-GPU fallback from multi-GPU)
         } else {
             // GPU unavailable or disabled — use CPU parallel path
             if !GPU_COMMITMENT_FALLBACK_LOGGED.swap(true, AtomicOrdering::Relaxed) {
@@ -771,6 +949,18 @@ fn apply_aggregated_oracle_sumcheck(
                         );
                         u32_mle
                     };
+
+                    // Incremental cache population (CPU path).
+                    if let Some(wc) = weight_cache {
+                        if let Ok(mut w) = wc.write() {
+                            w.insert_root(
+                                input.weight_node_id,
+                                input.rows_padded,
+                                input.cols_padded,
+                                commitment,
+                            );
+                        }
+                    }
 
                     let finished = done_count.fetch_add(1, AtomicOrdering::Relaxed) + 1;
                     if finished % 10 == 0 || finished == total_claims {

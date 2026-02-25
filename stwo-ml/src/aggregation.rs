@@ -1283,172 +1283,222 @@ where
     // 5. RMSNorm traces: 5 cols per layer (input, rms_sq, rsqrt, output, multiplicity)
     // 6. Embedding traces: 4 cols per layer (token_id, col_idx, value, multiplicity)
     let mut tree_builder = commitment_scheme.tree_builder();
-    let mut activation_mults: Vec<Vec<M31>> = Vec::new();
-    for layer in &activation_layers {
-        let layer_size = 1usize << layer.log_size;
-        let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-        let pad_input = layer.table.inputs[0];
-        let pad_output = layer.table.outputs[0];
-        let padding_count = layer_size.saturating_sub(layer.inputs.len());
 
-        let mut mults = compute_multiplicities(&layer.inputs, &layer.table);
-        if padding_count > 0 {
-            mults[0] += M31::from(padding_count as u32);
-        }
+    // ── Parallel trace building ───────────────────────────────────────
+    // Compute all 8 trace types concurrently using rayon::join tree.
+    // tree_builder.extend_evals() must be called in the original column
+    // order, so we collect results first and extend sequentially.
+    type SimdEvals = Vec<CircleEvaluation<SimdBackend, BaseField, stwo::prover::poly::BitReversedOrder>>;
 
-        let (trace_in, trace_out, mult_col) = build_trace_columns::<SimdBackend>(
-            &layer.inputs,
-            &layer.outputs,
-            &mults,
-            pad_input,
-            pad_output,
-            layer_size,
-        );
-        let simd_evals = vec![
-            CircleEvaluation::new(layer_domain, trace_in),
-            CircleEvaluation::new(layer_domain, trace_out),
-            CircleEvaluation::new(layer_domain, mult_col),
-        ];
-        tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
-        activation_mults.push(mults);
+    let (
+        ((act_result, add_result), (mul_result, ln_result)),
+        ((rms_result, emb_result), (q_result, dq_result)),
+    ) = rayon::join(
+        || rayon::join(
+            || rayon::join(
+                // 1. Activation traces
+                || -> (Vec<SimdEvals>, Vec<Vec<M31>>) {
+                    let mut evals_all = Vec::with_capacity(activation_layers.len());
+                    let mut mults_all = Vec::with_capacity(activation_layers.len());
+                    for layer in &activation_layers {
+                        let layer_size = 1usize << layer.log_size;
+                        let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
+                        let pad_input = layer.table.inputs[0];
+                        let pad_output = layer.table.outputs[0];
+                        let padding_count = layer_size.saturating_sub(layer.inputs.len());
+                        let mut mults = compute_multiplicities(&layer.inputs, &layer.table);
+                        if padding_count > 0 {
+                            mults[0] += M31::from(padding_count as u32);
+                        }
+                        let (trace_in, trace_out, mult_col) = build_trace_columns::<SimdBackend>(
+                            &layer.inputs, &layer.outputs, &mults, pad_input, pad_output, layer_size,
+                        );
+                        evals_all.push(vec![
+                            CircleEvaluation::new(layer_domain, trace_in),
+                            CircleEvaluation::new(layer_domain, trace_out),
+                            CircleEvaluation::new(layer_domain, mult_col),
+                        ]);
+                        mults_all.push(mults);
+                    }
+                    (evals_all, mults_all)
+                },
+                // 2. Add traces
+                || -> Vec<SimdEvals> {
+                    add_layers.iter().map(|layer| {
+                        let layer_size = 1usize << layer.log_size;
+                        let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
+                        let (lhs_col, rhs_col, out_col) = build_elementwise_trace_columns::<SimdBackend>(
+                            &layer.lhs, &layer.rhs, &layer.output, layer_size,
+                        );
+                        vec![
+                            CircleEvaluation::new(layer_domain, lhs_col),
+                            CircleEvaluation::new(layer_domain, rhs_col),
+                            CircleEvaluation::new(layer_domain, out_col),
+                        ]
+                    }).collect()
+                },
+            ),
+            || rayon::join(
+                // 3. Mul traces
+                || -> Vec<SimdEvals> {
+                    mul_layers.iter().map(|layer| {
+                        let layer_size = 1usize << layer.log_size;
+                        let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
+                        let (lhs_col, rhs_col, out_col) = build_elementwise_trace_columns::<SimdBackend>(
+                            &layer.lhs, &layer.rhs, &layer.output, layer_size,
+                        );
+                        vec![
+                            CircleEvaluation::new(layer_domain, lhs_col),
+                            CircleEvaluation::new(layer_domain, rhs_col),
+                            CircleEvaluation::new(layer_domain, out_col),
+                        ]
+                    }).collect()
+                },
+                // 4. LayerNorm traces
+                || -> (Vec<SimdEvals>, Vec<Vec<M31>>) {
+                    let mut evals_all = Vec::with_capacity(layernorm_layers.len());
+                    let mut mults_all = Vec::with_capacity(layernorm_layers.len());
+                    for layer in &layernorm_layers {
+                        let layer_size = 1usize << layer.log_size;
+                        let padding = layer_size.saturating_sub(layer.variances.len());
+                        let mut mults = compute_multiplicities(&layer.variances, &layer.rsqrt_table);
+                        if padding > 0 {
+                            mults[0] += M31::from(padding as u32);
+                        }
+                        let cols = build_layernorm_trace_columns::<SimdBackend>(
+                            &layer.inputs, &layer.means, &layer.variances,
+                            &layer.rsqrt_vals, &layer.outputs, &mults,
+                            &layer.rsqrt_table, layer_size,
+                        );
+                        evals_all.push(cols);
+                        mults_all.push(mults);
+                    }
+                    (evals_all, mults_all)
+                },
+            ),
+        ),
+        || rayon::join(
+            || rayon::join(
+                // 5. RMSNorm traces
+                || -> (Vec<SimdEvals>, Vec<Vec<M31>>) {
+                    let mut evals_all = Vec::with_capacity(rmsnorm_layers.len());
+                    let mut mults_all = Vec::with_capacity(rmsnorm_layers.len());
+                    for layer in &rmsnorm_layers {
+                        let layer_size = 1usize << layer.log_size;
+                        let padding = layer_size.saturating_sub(layer.rms_sq_vals.len());
+                        let mut mults = compute_multiplicities(&layer.rms_sq_vals, &layer.rsqrt_table);
+                        if padding > 0 {
+                            mults[0] += M31::from(padding as u32);
+                        }
+                        let cols = build_rmsnorm_trace_columns::<SimdBackend>(
+                            &layer.inputs, &layer.rms_sq_vals, &layer.rsqrt_vals,
+                            &layer.outputs, &mults, &layer.rsqrt_table, layer_size,
+                        );
+                        evals_all.push(cols);
+                        mults_all.push(mults);
+                    }
+                    (evals_all, mults_all)
+                },
+                // 6. Embedding traces
+                || -> Vec<SimdEvals> {
+                    embedding_layers.iter().map(|layer| {
+                        let layer_size = 1usize << layer.log_size;
+                        let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
+                        build_embedding_trace_columns::<SimdBackend>(
+                            &layer.token_ids, &layer.col_indices, &layer.values,
+                            &layer.multiplicities, layer_size, layer_domain,
+                        )
+                    }).collect()
+                },
+            ),
+            || rayon::join(
+                // 7. Quantize traces
+                || -> (Vec<SimdEvals>, Vec<Vec<M31>>) {
+                    let mut evals_all = Vec::with_capacity(quantize_layers.len());
+                    let mut mults_all = Vec::with_capacity(quantize_layers.len());
+                    for layer in &quantize_layers {
+                        let table = build_quantize_table(&layer.params, &layer.input_values);
+                        let layer_size = 1usize << layer.log_size;
+                        let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
+                        let pad_input = table.inputs[0];
+                        let pad_output = table.outputs[0];
+                        let padding_count = layer_size.saturating_sub(layer.input_values.len());
+                        let mut mults = layer.multiplicities.clone();
+                        if padding_count > 0 {
+                            mults[0] += M31::from(padding_count as u32);
+                        }
+                        let simd_evals = build_quantize_trace_columns_2d::<SimdBackend>(
+                            &layer.input_values, &layer.values, &mults,
+                            pad_input, pad_output, layer_size, layer_domain,
+                        );
+                        evals_all.push(simd_evals);
+                        mults_all.push(mults);
+                    }
+                    (evals_all, mults_all)
+                },
+                // 8. Dequantize traces
+                || -> (Vec<SimdEvals>, Vec<Vec<M31>>) {
+                    let mut evals_all = Vec::with_capacity(dequantize_layers.len());
+                    let mut mults_all = Vec::with_capacity(dequantize_layers.len());
+                    for layer in &dequantize_layers {
+                        let table = build_dequantize_table(&layer.params);
+                        let layer_size = 1usize << layer.log_size;
+                        let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
+                        let pad_input = table.inputs[0];
+                        let pad_output = table.outputs[0];
+                        let padding_count = layer_size.saturating_sub(layer.input_values.len());
+                        let mut mults = layer.multiplicities.clone();
+                        if padding_count > 0 {
+                            mults[0] += M31::from(padding_count as u32);
+                        }
+                        let (trace_in, trace_out, mult_col) = build_trace_columns::<SimdBackend>(
+                            &layer.input_values, &layer.output_values, &mults,
+                            pad_input, pad_output, layer_size,
+                        );
+                        evals_all.push(vec![
+                            CircleEvaluation::new(layer_domain, trace_in),
+                            CircleEvaluation::new(layer_domain, trace_out),
+                            CircleEvaluation::new(layer_domain, mult_col),
+                        ]);
+                        mults_all.push(mults);
+                    }
+                    (evals_all, mults_all)
+                },
+            ),
+        ),
+    );
+
+    // Unpack results
+    let (act_evals, activation_mults) = act_result;
+    let (ln_evals, layernorm_mults) = ln_result;
+    let (rms_evals, rmsnorm_mults) = rms_result;
+    let (q_evals, quantize_mults) = q_result;
+    let (dq_evals, dequantize_mults) = dq_result;
+
+    // Extend tree builder sequentially in correct column order
+    for evals in act_evals {
+        tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(evals));
     }
-    for layer in &add_layers {
-        let layer_size = 1usize << layer.log_size;
-        let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-        let (lhs_col, rhs_col, out_col) = build_elementwise_trace_columns::<SimdBackend>(
-            &layer.lhs,
-            &layer.rhs,
-            &layer.output,
-            layer_size,
-        );
-        let simd_evals = vec![
-            CircleEvaluation::new(layer_domain, lhs_col),
-            CircleEvaluation::new(layer_domain, rhs_col),
-            CircleEvaluation::new(layer_domain, out_col),
-        ];
-        tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
+    for evals in add_result {
+        tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(evals));
     }
-    for layer in &mul_layers {
-        let layer_size = 1usize << layer.log_size;
-        let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-        let (lhs_col, rhs_col, out_col) = build_elementwise_trace_columns::<SimdBackend>(
-            &layer.lhs,
-            &layer.rhs,
-            &layer.output,
-            layer_size,
-        );
-        let simd_evals = vec![
-            CircleEvaluation::new(layer_domain, lhs_col),
-            CircleEvaluation::new(layer_domain, rhs_col),
-            CircleEvaluation::new(layer_domain, out_col),
-        ];
-        tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
+    for evals in mul_result {
+        tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(evals));
     }
-    let mut layernorm_mults: Vec<Vec<M31>> = Vec::new();
-    for layer in &layernorm_layers {
-        let layer_size = 1usize << layer.log_size;
-        let padding = layer_size.saturating_sub(layer.variances.len());
-        let mut mults = compute_multiplicities(&layer.variances, &layer.rsqrt_table);
-        if padding > 0 {
-            mults[0] += M31::from(padding as u32);
-        }
-        let cols = build_layernorm_trace_columns::<SimdBackend>(
-            &layer.inputs,
-            &layer.means,
-            &layer.variances,
-            &layer.rsqrt_vals,
-            &layer.outputs,
-            &mults,
-            &layer.rsqrt_table,
-            layer_size,
-        );
-        tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(cols));
-        layernorm_mults.push(mults);
+    for evals in ln_evals {
+        tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(evals));
     }
-    let mut rmsnorm_mults: Vec<Vec<M31>> = Vec::new();
-    for layer in &rmsnorm_layers {
-        let layer_size = 1usize << layer.log_size;
-        let padding = layer_size.saturating_sub(layer.rms_sq_vals.len());
-        let mut mults = compute_multiplicities(&layer.rms_sq_vals, &layer.rsqrt_table);
-        if padding > 0 {
-            mults[0] += M31::from(padding as u32);
-        }
-        let cols = build_rmsnorm_trace_columns::<SimdBackend>(
-            &layer.inputs,
-            &layer.rms_sq_vals,
-            &layer.rsqrt_vals,
-            &layer.outputs,
-            &mults,
-            &layer.rsqrt_table,
-            layer_size,
-        );
-        tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(cols));
-        rmsnorm_mults.push(mults);
+    for evals in rms_evals {
+        tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(evals));
     }
-    for layer in &embedding_layers {
-        let layer_size = 1usize << layer.log_size;
-        let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-        let simd_evals = build_embedding_trace_columns::<SimdBackend>(
-            &layer.token_ids,
-            &layer.col_indices,
-            &layer.values,
-            &layer.multiplicities,
-            layer_size,
-            layer_domain,
-        );
-        tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
+    for evals in emb_result {
+        tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(evals));
     }
-    let mut quantize_mults: Vec<Vec<M31>> = Vec::new();
-    for layer in &quantize_layers {
-        let table = build_quantize_table(&layer.params, &layer.input_values);
-        let layer_size = 1usize << layer.log_size;
-        let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-        let pad_input = table.inputs[0];
-        let pad_output = table.outputs[0];
-        let padding_count = layer_size.saturating_sub(layer.input_values.len());
-        let mut mults = layer.multiplicities.clone();
-        if padding_count > 0 {
-            mults[0] += M31::from(padding_count as u32);
-        }
-        let simd_evals = build_quantize_trace_columns_2d::<SimdBackend>(
-            &layer.input_values,
-            &layer.values,
-            &mults,
-            pad_input,
-            pad_output,
-            layer_size,
-            layer_domain,
-        );
-        tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
-        quantize_mults.push(mults);
+    for evals in q_evals {
+        tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(evals));
     }
-    let mut dequantize_mults: Vec<Vec<M31>> = Vec::new();
-    for layer in &dequantize_layers {
-        let table = build_dequantize_table(&layer.params);
-        let layer_size = 1usize << layer.log_size;
-        let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-        let pad_input = table.inputs[0];
-        let pad_output = table.outputs[0];
-        let padding_count = layer_size.saturating_sub(layer.input_values.len());
-        let mut mults = layer.multiplicities.clone();
-        if padding_count > 0 {
-            mults[0] += M31::from(padding_count as u32);
-        }
-        let (trace_in, trace_out, mult_col) = build_trace_columns::<SimdBackend>(
-            &layer.input_values,
-            &layer.output_values,
-            &mults,
-            pad_input,
-            pad_output,
-            layer_size,
-        );
-        let simd_evals = vec![
-            CircleEvaluation::new(layer_domain, trace_in),
-            CircleEvaluation::new(layer_domain, trace_out),
-            CircleEvaluation::new(layer_domain, mult_col),
-        ];
-        tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
-        dequantize_mults.push(mults);
+    for evals in dq_evals {
+        tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(evals));
     }
     tree_builder.commit(channel);
 

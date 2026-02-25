@@ -211,6 +211,39 @@ pub fn device_count() -> usize {
     }
 }
 
+/// Partition items by size across N bins using greedy largest-first bin-packing.
+///
+/// Returns a `Vec<Vec<usize>>` where each inner vec is the list of original
+/// indices assigned to that bin. Items are sorted by `size_fn` descending and
+/// assigned to the least-loaded bin.
+pub fn partition_by_size<T>(
+    items: &[T],
+    num_bins: usize,
+    size_fn: impl Fn(&T) -> usize,
+) -> Vec<Vec<usize>> {
+    assert!(num_bins > 0, "need at least 1 bin");
+    let mut bins: Vec<Vec<usize>> = (0..num_bins).map(|_| Vec::new()).collect();
+    let mut loads: Vec<usize> = vec![0; num_bins];
+
+    // Sort indices by size descending
+    let mut order: Vec<usize> = (0..items.len()).collect();
+    order.sort_unstable_by(|&a, &b| size_fn(&items[b]).cmp(&size_fn(&items[a])));
+
+    for idx in order {
+        let size = size_fn(&items[idx]);
+        // Find bin with minimum load
+        let min_bin = loads
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, &load)| load)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        bins[min_bin].push(idx);
+        loads[min_bin] += size;
+    }
+    bins
+}
+
 // =============================================================================
 // Chunk Workload and Assignment
 // =============================================================================
@@ -1071,5 +1104,81 @@ mod tests {
             message: "kernel launch failed".into(),
         };
         assert!(format!("{e}").contains("device 3"));
+    }
+
+    // ── partition_by_size tests ──────────────────────────────────────
+
+    #[test]
+    fn test_partition_by_size_single_bin() {
+        let items = vec![100, 200, 50];
+        let bins = partition_by_size(&items, 1, |&x| x);
+        assert_eq!(bins.len(), 1);
+        assert_eq!(bins[0].len(), 3);
+    }
+
+    #[test]
+    fn test_partition_by_size_balanced() {
+        // Two bins with items [100, 50, 10] and [80, 60, 20]
+        let items = vec![100, 80, 60, 50, 20, 10];
+        let bins = partition_by_size(&items, 2, |&x| x);
+        assert_eq!(bins.len(), 2);
+        // Largest-first: 100→bin0, 80→bin1, 60→bin0 total=160, 50→bin1 total=130,
+        // 20→bin1 total=150, 10→bin0 total=170
+        let load0: usize = bins[0].iter().map(|&i| items[i]).sum();
+        let load1: usize = bins[1].iter().map(|&i| items[i]).sum();
+        // Loads should be reasonably balanced (within 30%)
+        let max_load = load0.max(load1) as f64;
+        let min_load = load0.min(load1) as f64;
+        assert!(
+            min_load / max_load > 0.7,
+            "unbalanced: {load0} vs {load1}"
+        );
+    }
+
+    #[test]
+    fn test_partition_by_size_empty_items() {
+        let items: Vec<usize> = vec![];
+        let bins = partition_by_size(&items, 3, |&x| x);
+        assert_eq!(bins.len(), 3);
+        for b in &bins {
+            assert!(b.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_partition_by_size_more_bins_than_items() {
+        let items = vec![10, 20];
+        let bins = partition_by_size(&items, 4, |&x| x);
+        assert_eq!(bins.len(), 4);
+        // 2 items across 4 bins: each goes to a different bin
+        let nonempty: Vec<_> = bins.iter().filter(|b| !b.is_empty()).collect();
+        assert_eq!(nonempty.len(), 2);
+    }
+
+    #[test]
+    fn test_partition_by_size_preserves_indices() {
+        let items = vec![5, 3, 8, 1];
+        let bins = partition_by_size(&items, 2, |&x| x);
+        // All original indices should appear exactly once
+        let mut all_indices: Vec<usize> = bins.into_iter().flatten().collect();
+        all_indices.sort();
+        assert_eq!(all_indices, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn test_partition_by_size_with_struct() {
+        struct Matrix {
+            rows: usize,
+            cols: usize,
+        }
+        let items = vec![
+            Matrix { rows: 100, cols: 200 },
+            Matrix { rows: 50, cols: 50 },
+            Matrix { rows: 80, cols: 100 },
+        ];
+        let bins = partition_by_size(&items, 2, |m| m.rows * m.cols);
+        let load0: usize = bins[0].iter().map(|&i| items[i].rows * items[i].cols).sum();
+        let load1: usize = bins[1].iter().map(|&i| items[i].rows * items[i].cols).sum();
+        assert_eq!(load0 + load1, 100 * 200 + 50 * 50 + 80 * 100);
     }
 }

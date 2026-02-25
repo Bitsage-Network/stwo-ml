@@ -620,6 +620,243 @@ fn read_fieldelement(r: &mut impl IoRead) -> io::Result<FieldElement> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("invalid felt: {e:?}")))?)
 }
 
+// ── Background cache pre-warming ─────────────────────────────────────
+
+/// Pre-compute Poseidon Merkle roots for all uncached weight matrices.
+///
+/// Designed to run on a background thread immediately after model load.
+/// While the main thread runs forward pass + GKR walk, this function
+/// fills the cache so that `apply_aggregated_oracle_sumcheck()` finds
+/// all roots pre-computed.
+///
+/// Returns the number of newly computed roots.
+pub fn prewarm_weight_roots(
+    weights: &crate::compiler::graph::GraphWeights,
+    cache: &SharedWeightCache,
+    model_dir: Option<&std::path::Path>,
+) -> usize {
+    let uncached: Vec<(usize, usize, usize)> = {
+        let r = match cache.read() {
+            Ok(r) => r,
+            Err(_) => return 0,
+        };
+        weights
+            .weights
+            .iter()
+            .filter_map(|(node_id, matrix)| {
+                let rp = matrix.rows.next_power_of_two();
+                let cp = matrix.cols.next_power_of_two();
+                if r.get_root(*node_id, rp, cp).is_some() {
+                    None
+                } else {
+                    Some((*node_id, rp, cp))
+                }
+            })
+            .collect()
+    };
+
+    if uncached.is_empty() {
+        return 0;
+    }
+
+    let total = uncached.len();
+    eprintln!("[prewarm] starting background Merkle root computation for {total} weight matrices");
+    let t_start = std::time::Instant::now();
+
+    // GPU contention guard: on single-GPU machines, the prover's pipelined
+    // weight-commit loop also needs the CUDA executor.  Running prewarm on
+    // GPU simultaneously would cause scheduler thrashing and kernel launch
+    // contention. Use GPU prewarm only when >=2 GPUs are available (prewarm
+    // takes a secondary device); otherwise fall back to CPU so the prover
+    // gets exclusive GPU access.
+    #[cfg(feature = "cuda-runtime")]
+    let computed = {
+        let gpu_count = {
+            #[cfg(feature = "multi-gpu")]
+            { crate::multi_gpu::device_count() }
+            #[cfg(not(feature = "multi-gpu"))]
+            { 1usize }
+        };
+        if gpu_count >= 2 {
+            prewarm_gpu(weights, &uncached, cache, total, &t_start)
+        } else {
+            eprintln!("[prewarm] single-GPU detected — using CPU path to avoid GPU contention");
+            prewarm_cpu(weights, &uncached, cache, total, &t_start)
+        }
+    };
+
+    #[cfg(not(feature = "cuda-runtime"))]
+    let computed = prewarm_cpu(weights, &uncached, cache, total, &t_start);
+
+    // Save cache to disk if we computed anything.
+    if computed > 0 {
+        if let Some(dir) = model_dir {
+            match save_shared_cache(cache, dir) {
+                Ok(true) => eprintln!("[prewarm] cache saved to disk ({computed} new roots)"),
+                Ok(false) => {}
+                Err(e) => eprintln!("[prewarm] warning: cache save failed: {e}"),
+            }
+        }
+    }
+
+    eprintln!(
+        "[prewarm] completed {computed}/{total} roots in {:.1}s",
+        t_start.elapsed().as_secs_f64(),
+    );
+    computed
+}
+
+#[cfg(feature = "cuda-runtime")]
+fn prewarm_gpu(
+    weights: &crate::compiler::graph::GraphWeights,
+    uncached: &[(usize, usize, usize)],
+    cache: &SharedWeightCache,
+    total: usize,
+    t_start: &std::time::Instant,
+) -> usize {
+    use stwo::prover::backend::gpu::cuda_executor::{
+        get_cuda_executor, is_cuda_available, upload_poseidon252_round_constants,
+    };
+
+    if !is_cuda_available() || get_cuda_executor().is_err() {
+        eprintln!("[prewarm] GPU unavailable, falling back to CPU");
+        return prewarm_cpu(weights, uncached, cache, total, t_start);
+    }
+
+    let executor = match get_cuda_executor() {
+        Ok(e) => e,
+        Err(_) => return prewarm_cpu(weights, uncached, cache, total, t_start),
+    };
+    let d_rc = match upload_poseidon252_round_constants(&executor.device) {
+        Ok(rc) => rc,
+        Err(_) => return prewarm_cpu(weights, uncached, cache, total, t_start),
+    };
+
+    eprintln!("[prewarm] using GPU pipelined Merkle root computation");
+
+    // Find max padded size for reusable limb buffers (double-buffer).
+    let max_padded_n = uncached
+        .iter()
+        .map(|(_, rp, cp)| rp * cp)
+        .max()
+        .unwrap_or(0);
+    let limb_buf_size = max_padded_n * 4;
+    let mut limb_bufs = [vec![0u64; limb_buf_size], vec![0u64; limb_buf_size]];
+    let mut cur_buf_idx: usize = 0;
+    let mut computed = 0usize;
+
+    // Prepare first matrix
+    let (first_node_id, first_rp, first_cp) = uncached[0];
+    let first_matrix = match weights.get_weight(first_node_id) {
+        Some(m) => m,
+        None => return 0,
+    };
+    let first_n = first_rp * first_cp;
+    limb_bufs[0][..first_n * 4].fill(0);
+    let _ = crate::components::matmul::matrix_to_mle_col_major_all_padded(
+        first_matrix,
+        &mut limb_bufs[0],
+    );
+
+    for idx in 0..uncached.len() {
+        let (node_id, rp, cp) = uncached[idx];
+        let cur_n = rp * cp;
+        let next_buf_idx = 1 - cur_buf_idx;
+
+        if idx + 1 < uncached.len() {
+            let (next_node_id, next_rp, next_cp) = uncached[idx + 1];
+            let next_n = next_rp * next_cp;
+
+            let (buf_lo, buf_hi) = limb_bufs.split_at_mut(1);
+            let (cur_buf, next_buf) = if cur_buf_idx == 0 {
+                (&buf_lo[0][..], &mut buf_hi[0][..])
+            } else {
+                (&buf_hi[0][..], &mut buf_lo[0][..])
+            };
+            next_buf[..next_n * 4].fill(0);
+
+            std::thread::scope(|s| {
+                // CPU: prepare next matrix
+                let cpu_handle = s.spawn(|| {
+                    if let Some(m) = weights.get_weight(next_node_id) {
+                        let _ = crate::components::matmul::matrix_to_mle_col_major_all_padded(
+                            m, next_buf,
+                        );
+                    }
+                });
+
+                // GPU: commit current matrix
+                if let Ok(root) = crate::crypto::mle_opening::commit_mle_root_only_gpu_from_limbs(
+                    cur_buf, cur_n, executor, &d_rc,
+                ) {
+                    if let Ok(mut w) = cache.write() {
+                        w.insert_root(node_id, rp, cp, root);
+                        computed += 1;
+                    }
+                }
+
+                cpu_handle.join().expect("prewarm CPU prep panicked");
+            });
+        } else {
+            // Last matrix — no overlap
+            if let Ok(root) = crate::crypto::mle_opening::commit_mle_root_only_gpu_from_limbs(
+                &limb_bufs[cur_buf_idx], cur_n, executor, &d_rc,
+            ) {
+                if let Ok(mut w) = cache.write() {
+                    w.insert_root(node_id, rp, cp, root);
+                    computed += 1;
+                }
+            }
+        }
+
+        cur_buf_idx = next_buf_idx;
+
+        let finished = idx + 1;
+        if finished % 20 == 0 || finished == total {
+            eprintln!(
+                "[prewarm] {finished}/{total} ({:.1}s)",
+                t_start.elapsed().as_secs_f64(),
+            );
+        }
+    }
+    computed
+}
+
+fn prewarm_cpu(
+    weights: &crate::compiler::graph::GraphWeights,
+    uncached: &[(usize, usize, usize)],
+    cache: &SharedWeightCache,
+    total: usize,
+    t_start: &std::time::Instant,
+) -> usize {
+    eprintln!("[prewarm] using CPU parallel Merkle root computation");
+    let mut computed = 0usize;
+
+    for (idx, &(node_id, _rp, _cp)) in uncached.iter().enumerate() {
+        let matrix = match weights.get_weight(node_id) {
+            Some(m) => m,
+            None => continue,
+        };
+        let rp = matrix.rows.next_power_of_two();
+        let cp = matrix.cols.next_power_of_two();
+        let mle = crate::components::matmul::matrix_to_mle_col_major_padded_pub(matrix);
+        let root = crate::crypto::mle_opening::commit_mle_root_only(&mle);
+        if let Ok(mut w) = cache.write() {
+            w.insert_root(node_id, rp, cp, root);
+            computed += 1;
+        }
+
+        let finished = idx + 1;
+        if finished % 10 == 0 || finished == total {
+            eprintln!(
+                "[prewarm] {finished}/{total} ({:.1}s)",
+                t_start.elapsed().as_secs_f64(),
+            );
+        }
+    }
+    computed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1010,6 +1247,120 @@ mod tests {
         assert_ne!(*invalidated.fingerprint(), [0u8; 32], "new cache should have fingerprint");
 
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    // ── prewarm_weight_roots tests ──────────────────────────────────
+
+    #[test]
+    fn test_prewarm_cpu_computes_roots() {
+        use crate::compiler::graph::GraphWeights;
+        use crate::components::matmul::M31Matrix;
+
+        let weights = GraphWeights {
+            weights: vec![
+                (0, M31Matrix { rows: 4, cols: 4, data: (0..16).map(|i| M31(i + 1)).collect() }),
+                (1, M31Matrix { rows: 2, cols: 8, data: (0..16).map(|i| M31(i * 3 + 1)).collect() }),
+            ],
+            biases: vec![],
+            named_weights: vec![],
+        };
+        let cache = shared_cache("prewarm-test");
+
+        // Initially empty
+        assert_eq!(cache.read().unwrap().len(), 0);
+
+        // Prewarm without disk save (no model_dir)
+        let count = prewarm_weight_roots(&weights, &cache, None);
+        assert_eq!(count, 2, "should compute roots for both matrices");
+
+        // Cache should now have 2 root entries
+        let r = cache.read().unwrap();
+        assert!(r.get_root(0, 4, 4).is_some(), "missing root for node 0");
+        assert!(r.get_root(1, 2, 8).is_some(), "missing root for node 1");
+    }
+
+    #[test]
+    fn test_prewarm_skips_already_cached() {
+        use crate::compiler::graph::GraphWeights;
+        use crate::components::matmul::M31Matrix;
+
+        let weights = GraphWeights {
+            weights: vec![
+                (0, M31Matrix { rows: 4, cols: 4, data: (0..16).map(|i| M31(i + 1)).collect() }),
+            ],
+            biases: vec![],
+            named_weights: vec![],
+        };
+        let cache = shared_cache("prewarm-skip-test");
+
+        // Pre-insert a fake root
+        cache.write().unwrap().insert_root(0, 4, 4, FieldElement::from(0xBEEFu64));
+
+        // Prewarm should find all cached
+        let count = prewarm_weight_roots(&weights, &cache, None);
+        assert_eq!(count, 0, "should skip already-cached matrix");
+
+        // Original fake root should be unchanged
+        let r = cache.read().unwrap();
+        assert_eq!(r.get_root(0, 4, 4), Some(FieldElement::from(0xBEEFu64)));
+    }
+
+    #[test]
+    fn test_prewarm_roots_match_commit_mle_root_only() {
+        use crate::compiler::graph::GraphWeights;
+        use crate::components::matmul::M31Matrix;
+
+        let weights = GraphWeights {
+            weights: vec![
+                (0, M31Matrix { rows: 4, cols: 8, data: (0..32).map(|i| M31(i * 7 + 3)).collect() }),
+            ],
+            biases: vec![],
+            named_weights: vec![],
+        };
+
+        // Compute root via prewarm
+        let cache = shared_cache("prewarm-match-test");
+        prewarm_weight_roots(&weights, &cache, None);
+        let prewarm_root = cache.read().unwrap().get_root(0, 4, 8).unwrap();
+
+        // Compute root directly for comparison
+        let mle = crate::components::matmul::matrix_to_mle_col_major_padded_pub(
+            weights.get_weight(0).unwrap(),
+        );
+        let direct_root = crate::crypto::mle_opening::commit_mle_root_only(&mle);
+
+        assert_eq!(prewarm_root, direct_root, "prewarm root must match direct computation");
+    }
+
+    #[test]
+    fn test_prewarm_saves_to_disk() {
+        use crate::compiler::graph::GraphWeights;
+        use crate::components::matmul::M31Matrix;
+
+        let dir = std::env::temp_dir().join("prewarm_disk_test");
+        let _ = std::fs::create_dir_all(&dir);
+
+        let weights = GraphWeights {
+            weights: vec![
+                (0, M31Matrix { rows: 2, cols: 4, data: (0..8).map(|i| M31(i + 1)).collect() }),
+            ],
+            biases: vec![],
+            named_weights: vec![],
+        };
+        let cache = shared_cache("disk-test");
+        prewarm_weight_roots(&weights, &cache, Some(&dir));
+
+        // Cache file should exist
+        let cache_path = dir.join(".stwo_weight_cache.swcf");
+        assert!(cache_path.exists(), "cache file should be saved");
+
+        // Reload and verify
+        let loaded = shared_cache_from_file(&cache_path, "disk-test");
+        let r = loaded.read().unwrap();
+        assert!(r.get_root(0, 2, 4).is_some(), "loaded cache should contain root");
+
+        let _ = std::fs::remove_file(&cache_path);
         let _ = std::fs::remove_dir(&dir);
     }
 }
