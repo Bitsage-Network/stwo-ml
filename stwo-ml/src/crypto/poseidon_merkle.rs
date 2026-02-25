@@ -23,8 +23,18 @@ use stwo::prover::backend::gpu::cuda_executor::{
 /// Below this, sequential hashing is faster due to rayon overhead.
 const PARALLEL_THRESHOLD: usize = 256;
 /// Minimum leaf-pair count to attempt GPU Merkle hashing in full-tree mode.
+/// Configurable via `STWO_GPU_MERKLE_THRESHOLD` env var; defaults to 4K pairs.
 #[cfg(feature = "cuda-runtime")]
-const GPU_MERKLE_THRESHOLD_PAIRS: usize = 1 << 14; // 16K pairs
+fn gpu_merkle_threshold() -> usize {
+    use std::sync::OnceLock;
+    static THRESHOLD: OnceLock<usize> = OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        std::env::var("STWO_GPU_MERKLE_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1 << 12) // 4K pairs (was 16K)
+    })
+}
 #[cfg(feature = "cuda-runtime")]
 static GPU_MLE_MERKLE_BACKEND_LOGGED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "cuda-runtime")]
@@ -146,7 +156,7 @@ impl PoseidonMerkleTree {
                             "GPU MLE Merkle strict mode enabled, but GPU path unavailable \
                              (pairs={}, threshold={}, cuda_available={})",
                             padded.len() / 2,
-                            GPU_MERKLE_THRESHOLD_PAIRS,
+                            gpu_merkle_threshold(),
                             is_cuda_available()
                         );
                     }
@@ -154,7 +164,7 @@ impl PoseidonMerkleTree {
                         eprintln!(
                             "[GKR] MLE Merkle backend: CPU fallback (GPU unavailable; pairs={}, threshold={}, cuda_available={})",
                             padded.len() / 2,
-                            GPU_MERKLE_THRESHOLD_PAIRS,
+                            gpu_merkle_threshold(),
                             is_cuda_available()
                         );
                     }
@@ -344,7 +354,7 @@ impl PoseidonMerkleTree {
                             "GPU MLE Merkle strict mode enabled, but direct-secure GPU path unavailable \
                              (pairs={}, threshold={}, cuda_available={})",
                             evals.len() / 2,
-                            GPU_MERKLE_THRESHOLD_PAIRS,
+                            gpu_merkle_threshold(),
                             is_cuda_available()
                         );
                     }
@@ -352,7 +362,7 @@ impl PoseidonMerkleTree {
                         eprintln!(
                             "[GKR] MLE Merkle backend: CPU fallback (direct-secure unavailable; pairs={}, threshold={}, cuda_available={})",
                             evals.len() / 2,
-                            GPU_MERKLE_THRESHOLD_PAIRS,
+                            gpu_merkle_threshold(),
                             is_cuda_available()
                         );
                     }
@@ -415,7 +425,7 @@ impl PoseidonMerkleTree {
                             "GPU MLE Merkle strict mode enabled, but direct-u32 GPU path unavailable \
                              (pairs={}, threshold={}, cuda_available={})",
                             n_points / 2,
-                            GPU_MERKLE_THRESHOLD_PAIRS,
+                            gpu_merkle_threshold(),
                             is_cuda_available()
                         );
                     }
@@ -423,7 +433,7 @@ impl PoseidonMerkleTree {
                         eprintln!(
                             "[GKR] MLE Merkle backend: CPU fallback (direct-u32 unavailable; pairs={}, threshold={}, cuda_available={})",
                             n_points / 2,
-                            GPU_MERKLE_THRESHOLD_PAIRS,
+                            gpu_merkle_threshold(),
                             is_cuda_available()
                         );
                     }
@@ -599,7 +609,7 @@ fn try_build_parallel_gpu(
         return Ok(None);
     }
     let n_leaf_hashes = leaves.len() / 2;
-    if n_leaf_hashes < GPU_MERKLE_THRESHOLD_PAIRS {
+    if n_leaf_hashes < gpu_merkle_threshold() {
         return Ok(None);
     }
 
@@ -672,7 +682,7 @@ fn try_build_gpu_from_secure_fields(
         return Ok(None);
     }
     let n_leaf_hashes = evals.len() / 2;
-    if n_leaf_hashes < GPU_MERKLE_THRESHOLD_PAIRS {
+    if n_leaf_hashes < gpu_merkle_threshold() {
         return Ok(None);
     }
 
@@ -736,7 +746,7 @@ fn try_build_gpu_from_qm31_u32(words: &[u32]) -> Result<Option<Vec<MerkleLayer>>
     }
     let n_points = words.len() / 4;
     let n_leaf_hashes = n_points / 2;
-    if n_leaf_hashes < GPU_MERKLE_THRESHOLD_PAIRS {
+    if n_leaf_hashes < gpu_merkle_threshold() {
         return Ok(None);
     }
 

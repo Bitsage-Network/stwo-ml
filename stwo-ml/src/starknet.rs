@@ -1526,6 +1526,7 @@ pub fn build_verify_model_gkr_calldata(
         model_id,
         raw_io_data,
         GkrCalldataLayout::V1,
+        false,
     )
 }
 
@@ -1546,6 +1547,7 @@ pub fn build_verify_model_gkr_v2_calldata(
         model_id,
         raw_io_data,
         GkrCalldataLayout::V2,
+        false,
     )
 }
 
@@ -1567,6 +1569,7 @@ pub fn build_verify_model_gkr_v3_calldata(
         model_id,
         raw_io_data,
         GkrCalldataLayout::V3,
+        false,
     )
 }
 
@@ -1587,6 +1590,27 @@ pub fn build_verify_model_gkr_v4_calldata(
         model_id,
         raw_io_data,
         GkrCalldataLayout::V4,
+        false,
+    )
+}
+
+/// Build flat sncast calldata for `verify_model_gkr_v4_packed()`.
+///
+/// Same as v4 but uses packed QM31 format (1 felt per QM31 instead of 4),
+/// reducing calldata by ~3.3x. Maps to `verify_model_gkr_v4_packed` entrypoint.
+pub fn build_verify_model_gkr_v4_packed_calldata(
+    proof: &crate::gkr::GKRProof,
+    circuit: &crate::gkr::LayeredCircuit,
+    model_id: FieldElement,
+    raw_io_data: &[FieldElement],
+) -> Result<VerifyModelGkrCalldata, StarknetModelError> {
+    build_verify_model_gkr_calldata_inner(
+        proof,
+        circuit,
+        model_id,
+        raw_io_data,
+        GkrCalldataLayout::V4,
+        true,
     )
 }
 
@@ -1604,8 +1628,9 @@ fn build_verify_model_gkr_calldata_inner(
     model_id: FieldElement,
     raw_io_data: &[FieldElement],
     layout: GkrCalldataLayout,
+    packed: bool,
 ) -> Result<VerifyModelGkrCalldata, StarknetModelError> {
-    use crate::cairo_serde::serialize_gkr_proof_data_only;
+    use crate::cairo_serde::{serialize_gkr_proof_data_only, serialize_gkr_proof_data_only_packed};
     use crate::gkr::types::WeightOpeningTranscriptMode;
 
     enforce_gkr_soundness_gates(proof)?;
@@ -1655,7 +1680,11 @@ fn build_verify_model_gkr_calldata_inner(
 
     // 6. proof_data: Array<felt252> — tag-dispatched per-layer GKR proofs
     let mut proof_data = Vec::new();
-    serialize_gkr_proof_data_only(proof, &mut proof_data);
+    if packed {
+        serialize_gkr_proof_data_only_packed(proof, &mut proof_data);
+    } else {
+        serialize_gkr_proof_data_only(proof, &mut proof_data);
+    }
 
     // Self-verify against serialized proof data (same as chunked path).
     if std::env::var("STWO_SKIP_SELF_VERIFY").is_err() {
@@ -1665,7 +1694,7 @@ fn build_verify_model_gkr_calldata_inner(
             &matmul_dims,
             circuit_depth,
             num_layers,
-            false, // unpacked in single-TX path
+            packed,
         ).map_err(|e| StarknetModelError::SoundnessGate(
             format!("self-verification failed: {e}")
         ))?;
@@ -4070,6 +4099,76 @@ mod tests {
             .iter()
             .any(|p| p == "0x524c43");
         assert!(has_rlc_marker, "calldata should contain RLC marker");
+    }
+
+    #[test]
+    fn test_build_verify_model_gkr_v4_packed_reduces_calldata() {
+        use crate::aggregation::prove_model_pure_gkr;
+        use crate::gkr::types::WeightOpeningTranscriptMode;
+        let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
+
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(2);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
+
+        let mut weights = GraphWeights::new();
+        let mut w = M31Matrix::new(4, 2);
+        for i in 0..4 {
+            for j in 0..2 {
+                w.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
+        weights.add_weight(0, w);
+
+        let mut agg_proof =
+            prove_model_pure_gkr(&graph, &input, &weights).expect("GKR proving should succeed");
+        let gkr = agg_proof.gkr_proof.as_mut().expect("GKR proof expected");
+        gkr.weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
+        gkr.aggregated_binding = None;
+
+        let circuit = crate::gkr::LayeredCircuit::from_graph(&graph).expect("circuit compile");
+        let raw_io = crate::cairo_serde::serialize_raw_io(&input, &agg_proof.execution.output);
+        let model_id = FieldElement::from(0xBEEFu64);
+
+        // Build both packed and unpacked calldata
+        let unpacked = build_verify_model_gkr_v4_calldata(gkr, &circuit, model_id, &raw_io)
+            .expect("unpacked v4 calldata should build");
+        let packed = build_verify_model_gkr_v4_packed_calldata(gkr, &circuit, model_id, &raw_io)
+            .expect("packed v4 calldata should build");
+
+        // Packed should have fewer total felts due to QM31 packing (4→1)
+        assert!(
+            packed.total_felts < unpacked.total_felts,
+            "packed ({}) should have fewer felts than unpacked ({})",
+            packed.total_felts,
+            unpacked.total_felts,
+        );
+
+        // The proof_data section drives most of the savings. Parse and compare.
+        fn proof_data_len(parts: &[String]) -> usize {
+            let mut idx = 0;
+            idx += 1; // model_id
+            let raw_io_len: usize = parts[idx].parse().unwrap();
+            idx += 1 + raw_io_len;
+            idx += 2; // circuit_depth, num_layers
+            let matmul_len: usize = parts[idx].parse().unwrap();
+            idx += 1 + matmul_len;
+            let dequant_len: usize = parts[idx].parse().unwrap();
+            idx += 1 + dequant_len;
+            parts[idx].parse().unwrap()
+        }
+
+        let unpacked_pd = proof_data_len(&unpacked.calldata_parts);
+        let packed_pd = proof_data_len(&packed.calldata_parts);
+        assert!(
+            packed_pd < unpacked_pd,
+            "packed proof_data ({packed_pd}) should be smaller than unpacked ({unpacked_pd})"
+        );
     }
 
     #[test]

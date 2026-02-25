@@ -1010,6 +1010,12 @@ fn main() {
         cache
     });
 
+    // Pre-warming: compute Merkle roots for uncached weight matrices in the
+    // background. Runs concurrently with forward pass + GKR walk so that
+    // by the time apply_aggregated_oracle_sumcheck() checks the cache, most/all
+    // roots are already warm. Spawned inside thread::scope below.
+    let should_prewarm = cli.format == OutputFormat::MlGkr && weight_cache.is_some();
+
     let run_proof = || {
         if cli.format == OutputFormat::MlGkr {
             // Full ML GKR pipeline: all layers via GKR sumcheck (no individual matmul proofs)
@@ -1117,19 +1123,34 @@ fn main() {
     let serialize_gpu_commit =
         cached_commitment.is_none() && use_gpu && !cli.multi_gpu && !allow_parallel_gpu_commit;
 
+    // Pre-warm cache: compute Merkle roots for uncached weights on a background
+    // thread. Must start before run_proof() so roots are available when
+    // apply_aggregated_oracle_sumcheck() reads the cache.
+    let prewarm_cache = weight_cache.as_ref().filter(|_| should_prewarm).cloned();
+    let prewarm_dir = cli.model_dir.clone();
+    let prewarm_weights = &model.weights;
+
     let (proof_result, weight_commitment, commit_elapsed) = if serialize_gpu_commit {
         eprintln!(
             "[BG] Single-GPU mode: running weight commitment before proving to avoid GPU contention."
         );
         eprintln!("[BG] Set STWO_PARALLEL_GPU_COMMIT=1 to force overlapping commitment + proving.");
-        let t_commit = Instant::now();
-        let commitment = compute_weight_commitment(&model.weights, cli.model_dir.as_deref());
-        let commit_time = t_commit.elapsed();
-        let proof = run_proof();
-        (proof, commitment, commit_time)
+        std::thread::scope(|s| {
+            let _prewarm = prewarm_cache.as_ref().map(|wc| {
+                s.spawn(|| {
+                    stwo_ml::weight_cache::prewarm_weight_roots(
+                        prewarm_weights, wc, prewarm_dir.as_deref(),
+                    )
+                })
+            });
+            let t_commit = Instant::now();
+            let commitment = compute_weight_commitment(&model.weights, cli.model_dir.as_deref());
+            let commit_time = t_commit.elapsed();
+            let proof = run_proof();
+            (proof, commitment, commit_time)
+        })
     } else {
         std::thread::scope(|s| {
-            // Spawn weight commitment on background thread if not cached
             let commit_handle = if cached_commitment.is_none() {
                 Some(s.spawn(|| {
                     let t_commit = Instant::now();
@@ -1141,9 +1162,16 @@ fn main() {
                 None
             };
 
+            let _prewarm = prewarm_cache.as_ref().map(|wc| {
+                s.spawn(|| {
+                    stwo_ml::weight_cache::prewarm_weight_roots(
+                        prewarm_weights, wc, prewarm_dir.as_deref(),
+                    )
+                })
+            });
+
             let proof = run_proof();
 
-            // Collect commitment result
             let (commitment, commit_time) = match (cached_commitment, commit_handle) {
                 (Some(c), _) => (c, std::time::Duration::ZERO),
                 (None, Some(handle)) => {
@@ -1272,7 +1300,8 @@ fn main() {
                 build_chunked_gkr_calldata, build_circuit_descriptor, build_gkr_serializable_proof,
                 build_register_gkr_calldata, build_verify_model_gkr_calldata,
                 build_verify_model_gkr_v2_calldata, build_verify_model_gkr_v3_calldata,
-                build_verify_model_gkr_v4_calldata, CHUNKED_GKR_THRESHOLD,
+                build_verify_model_gkr_v4_calldata, build_verify_model_gkr_v4_packed_calldata,
+                CHUNKED_GKR_THRESHOLD,
             };
 
             let gkr_proof =
@@ -1348,14 +1377,27 @@ fn main() {
                     Ok(circuit) => {
                         let raw_io =
                             stwo_ml::cairo_serde::serialize_raw_io(&input, &proof.execution.output);
-                        let verify_result = if use_starknet_gkr_v4 {
-                            build_verify_model_gkr_v4_calldata(gkr_p, &circuit, model_id, &raw_io)
+                        // For V4, try packed first — 3.3x smaller calldata may fit in single TX
+                        let (verify_result, is_packed) = if use_starknet_gkr_v4 {
+                            match build_verify_model_gkr_v4_packed_calldata(gkr_p, &circuit, model_id, &raw_io) {
+                                Ok(packed_vc) if packed_vc.total_felts <= CHUNKED_GKR_THRESHOLD => {
+                                    eprintln!(
+                                        "  packed calldata: {} felts (fits single TX)",
+                                        packed_vc.total_felts
+                                    );
+                                    (Ok(packed_vc), true)
+                                }
+                                _ => {
+                                    // Packed didn't fit or failed — use unpacked
+                                    (build_verify_model_gkr_v4_calldata(gkr_p, &circuit, model_id, &raw_io), false)
+                                }
+                            }
                         } else if use_starknet_gkr_v3 {
-                            build_verify_model_gkr_v3_calldata(gkr_p, &circuit, model_id, &raw_io)
+                            (build_verify_model_gkr_v3_calldata(gkr_p, &circuit, model_id, &raw_io), false)
                         } else if use_starknet_gkr_v2 {
-                            build_verify_model_gkr_v2_calldata(gkr_p, &circuit, model_id, &raw_io)
+                            (build_verify_model_gkr_v2_calldata(gkr_p, &circuit, model_id, &raw_io), false)
                         } else {
-                            build_verify_model_gkr_calldata(gkr_p, &circuit, model_id, &raw_io)
+                            (build_verify_model_gkr_calldata(gkr_p, &circuit, model_id, &raw_io), false)
                         };
                         match verify_result {
                             Ok(vc) => {
@@ -1396,18 +1438,21 @@ fn main() {
                                         }
                                     }
                                 } else {
+                                    let entrypoint = if is_packed {
+                                        "verify_model_gkr_v4_packed"
+                                    } else {
+                                        verify_entrypoint
+                                    };
                                     eprintln!(
-                                        "  verify_calldata: {} parts (ready for submission)",
-                                        vc.total_felts
+                                        "  verify_calldata: {} parts (ready for submission, packed={})",
+                                        vc.total_felts, is_packed
                                     );
                                     serde_json::json!({
                                         "schema_version": 1,
-                                        "entrypoint": verify_entrypoint,
+                                        "entrypoint": entrypoint,
                                         "calldata": vc.calldata_parts,
                                         "total_felts": vc.total_felts,
-                                        // Single-TX V4 entrypoint hardcodes packed=false on-chain.
-                                        // Packed QM31 is only available via chunked session path.
-                                        "packed": false,
+                                        "packed": is_packed,
                                         "upload_chunks": Vec::<Vec<String>>::new(),
                                     })
                                 }

@@ -445,7 +445,7 @@ fn extract_auth_paths_gpu_streaming(
 
     let executor = get_cuda_executor()
         .map_err(|e| format!("GPU executor init: {:?}", e))?;
-    let d_rc = upload_poseidon252_round_constants(&executor)
+    let d_rc = upload_poseidon252_round_constants(&executor.device)
         .map_err(|e| format!("upload round constants: {:?}", e))?;
 
     // Convert layer data → u64 limbs for GPU Poseidon leaf hashing
@@ -2170,7 +2170,8 @@ mod tests {
         let query_pair_indices: Vec<usize> = vec![0, 1, 7, 42, 100, 255, 510, 511];
         let mid = n_points / 2;
 
-        match extract_round0_auth_paths_gpu_streaming(&evals_u32, &query_pair_indices, n_points) {
+        let layer = MleLayerValues::Qm31U32Aos(evals_u32.clone());
+        match extract_auth_paths_gpu_streaming(&layer, &query_pair_indices, n_points) {
             Ok((gpu_root, gpu_round_data)) => {
                 // 1. Roots must match
                 assert_eq!(
