@@ -157,7 +157,13 @@ struct Cli {
     #[arg(long)]
     submit_gkr: bool,
 
-    /// Contract address for --submit-gkr (hex).
+    /// Submit the GKR proof on-chain via the AVNU paymaster (gasless).
+    /// Invokes `paymaster_submit.mjs verify` to handle chunked sessions
+    /// and sponsored transactions automatically.
+    #[arg(long)]
+    submit_paymaster: bool,
+
+    /// Contract address for --submit-gkr / --submit-paymaster (hex).
     #[arg(
         long,
         default_value = "0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005"
@@ -168,7 +174,7 @@ struct Cli {
     #[arg(long, default_value = "deployer")]
     account: String,
 
-    /// Starknet network for --submit-gkr.
+    /// Starknet network for --submit-gkr / --submit-paymaster.
     #[arg(long, default_value = "sepolia")]
     network: String,
 
@@ -869,7 +875,14 @@ fn main() {
         }
     }
 
+    let t_e2e = Instant::now();
+    let is_e2e = cli.submit_gkr || cli.submit_paymaster;
+
     let model = load_model(&cli);
+    let model_load_elapsed = t_e2e.elapsed();
+    if is_e2e {
+        eprintln!("[E2E] Model loaded in {:.2}s", model_load_elapsed.as_secs_f64());
+    }
 
     // --inspect: print summary and exit
     if cli.inspect {
@@ -983,11 +996,28 @@ fn main() {
 
     let t0 = Instant::now();
 
+    // Load weight commitment cache for Merkle root reuse across inferences.
+    // Uses validated variant: fingerprints weight content to detect fine-tuning.
+    let weight_cache = cli.model_dir.as_ref().map(|dir| {
+        let model_id = if cli.model_id.is_empty() { "unknown".to_string() } else { cli.model_id.clone() };
+        let cache = stwo_ml::weight_cache::shared_cache_for_model_validated(
+            dir, &model_id, &model.weights,
+        );
+        let count = cache.read().map(|c| c.len()).unwrap_or(0);
+        if count > 0 {
+            eprintln!("Weight commitment cache: loaded {count} entries from {}", dir.display());
+        }
+        cache
+    });
+
     let run_proof = || {
         if cli.format == OutputFormat::MlGkr {
             // Full ML GKR pipeline: all layers via GKR sumcheck (no individual matmul proofs)
             eprintln!("Using full ML GKR pipeline (--format ml_gkr)");
-            stwo_ml::aggregation::prove_model_pure_gkr_auto(&model.graph, &input, &model.weights)
+            stwo_ml::aggregation::prove_model_pure_gkr_auto_with_cache(
+                &model.graph, &input, &model.weights,
+                weight_cache.as_ref(),
+            )
         } else if cli.multi_gpu {
             // Multi-GPU path: chunk model and distribute across GPUs
             #[cfg(feature = "multi-gpu")]
@@ -1128,11 +1158,34 @@ fn main() {
     };
 
     let prove_elapsed = t0.elapsed();
+    if is_e2e {
+        let cached = weight_cache.as_ref()
+            .and_then(|c| c.read().ok())
+            .map_or(false, |c| c.len() > 0);
+        eprintln!(
+            "[E2E] Proof generation: {:.1}s{}",
+            prove_elapsed.as_secs_f64(),
+            if cached { " (cached weights)" } else { "" },
+        );
+    }
 
     let proof = proof_result.unwrap_or_else(|e| {
         eprintln!("Error: proving failed: {e}");
         process::exit(1);
     });
+
+    // Save weight commitment cache to disk (only writes if dirty).
+    let t_post = Instant::now();
+    if let (Some(cache), Some(dir)) = (&weight_cache, &cli.model_dir) {
+        match stwo_ml::weight_cache::save_shared_cache(cache, dir) {
+            Ok(true) => {
+                let count = cache.read().map(|c| c.len()).unwrap_or(0);
+                eprintln!("Weight commitment cache: saved {count} entries to {}", dir.display());
+            }
+            Ok(false) => {} // clean, no write needed
+            Err(e) => eprintln!("Warning: failed to save weight commitment cache: {e}"),
+        }
+    }
 
     if !commit_elapsed.is_zero() {
         eprintln!(
@@ -1185,6 +1238,14 @@ fn main() {
         tee_attestation_hash: tee_hash,
     };
 
+    // Report post-proof overhead (cache save + TEE + IO commitment + metadata)
+    if is_e2e {
+        let post_elapsed = t_post.elapsed();
+        if post_elapsed.as_millis() > 100 {
+            eprintln!("[E2E] Post-proof overhead: {:.1}s (cache, TEE, IO commitment)", post_elapsed.as_secs_f64());
+        }
+    }
+
     // Serialize
     eprintln!("Serializing proof (format={:?})...", cli.format);
     let t_ser = Instant::now();
@@ -1208,10 +1269,10 @@ fn main() {
         }
         OutputFormat::MlGkr => {
             use stwo_ml::starknet::{
-                build_chunked_gkr_calldata, build_gkr_serializable_proof,
-                build_verify_model_gkr_calldata, build_verify_model_gkr_v2_calldata,
-                build_verify_model_gkr_v3_calldata, build_verify_model_gkr_v4_calldata,
-                CHUNKED_GKR_THRESHOLD,
+                build_chunked_gkr_calldata, build_circuit_descriptor, build_gkr_serializable_proof,
+                build_register_gkr_calldata, build_verify_model_gkr_calldata,
+                build_verify_model_gkr_v2_calldata, build_verify_model_gkr_v3_calldata,
+                build_verify_model_gkr_v4_calldata, CHUNKED_GKR_THRESHOLD,
             };
 
             let gkr_proof =
@@ -1242,13 +1303,18 @@ fn main() {
                 eprintln!("  Warning: Starknet soundness gate status: {reason}");
             }
 
-            let use_starknet_gkr_v4 = std::env::var("STWO_STARKNET_GKR_V4")
+            let use_starknet_gkr_v4_env = std::env::var("STWO_STARKNET_GKR_V4")
                 .ok()
                 .map(|v| {
                     let v = v.trim().to_ascii_lowercase();
                     !v.is_empty() && v != "0" && v != "false" && v != "off"
                 })
                 .unwrap_or(false);
+            // Auto-promote to V4 when aggregated oracle sumcheck is active
+            // (V1 soundness gate rejects non-Sequential weight opening modes)
+            let use_starknet_gkr_v4 = use_starknet_gkr_v4_env
+                || gkr_proof.weight_opening_mode
+                    == stwo_ml::gkr::types::WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
             let use_starknet_gkr_v3 = std::env::var("STWO_STARKNET_GKR_V3")
                 .ok()
                 .map(|v| {
@@ -1324,6 +1390,7 @@ fn main() {
                                                 "entrypoint": verify_entrypoint,
                                                 "calldata": vc.calldata_parts,
                                                 "total_felts": vc.total_felts,
+                                                "packed": false,
                                                 "upload_chunks": Vec::<Vec<String>>::new(),
                                             })
                                         }
@@ -1338,6 +1405,9 @@ fn main() {
                                         "entrypoint": verify_entrypoint,
                                         "calldata": vc.calldata_parts,
                                         "total_felts": vc.total_felts,
+                                        // Single-TX V4 entrypoint hardcodes packed=false on-chain.
+                                        // Packed QM31 is only available via chunked session path.
+                                        "packed": false,
                                         "upload_chunks": Vec::<Vec<String>>::new(),
                                     })
                                 }
@@ -1380,6 +1450,26 @@ fn main() {
                 })
             };
 
+            // Build register_model_gkr calldata so paymaster can auto-register.
+            let register_calldata_obj = if let Some(gkr_p) = proof.gkr_proof.as_ref() {
+                match stwo_ml::gkr::LayeredCircuit::from_graph(&model.graph) {
+                    Ok(circuit) => {
+                        let circuit_desc = build_circuit_descriptor(&circuit);
+                        let mut reg_wc = gkr_p.weight_commitments.clone();
+                        for deferred in &gkr_p.deferred_proofs {
+                            if let Some(wc) = deferred.weight_commitment() {
+                                reg_wc.push(wc);
+                            }
+                        }
+                        let reg_cd = build_register_gkr_calldata(model_id, &reg_wc, &circuit_desc);
+                        serde_json::json!(reg_cd)
+                    }
+                    Err(_) => serde_json::json!(null),
+                }
+            } else {
+                serde_json::json!(null)
+            };
+
             let json_obj = serde_json::json!({
                 "format": "ml_gkr",
                 "model_id": format!("0x{:064x}", gkr_proof.model_id),
@@ -1412,6 +1502,7 @@ fn main() {
                 "submission_ready": gkr_proof.submission_ready,
                 "soundness_gate_error": gkr_proof.soundness_gate_error,
                 "verify_calldata": verify_calldata_obj,
+                "register_calldata": register_calldata_obj,
             });
             let output_str = serde_json::to_string_pretty(&json_obj).unwrap();
             let len = output_str.len();
@@ -1488,6 +1579,12 @@ fn main() {
     };
 
     let ser_elapsed = t_ser.elapsed();
+    if is_e2e {
+        eprintln!(
+            "[E2E] Calldata serialization: {:.1}s ({} bytes)",
+            ser_elapsed.as_secs_f64(), output_bytes,
+        );
+    }
 
     eprintln!(
         "Proof written to {} ({} bytes, format={:?}, serialize={:.2}s)",
@@ -1521,9 +1618,43 @@ fn main() {
         eprintln!("  tee: none (zk-only)");
     }
 
+    // Sanity: --submit-gkr and --submit-paymaster are mutually exclusive.
+    if cli.submit_gkr && cli.submit_paymaster {
+        eprintln!("Error: --submit-gkr and --submit-paymaster are mutually exclusive.");
+        eprintln!("  Use --submit-gkr for sncast (requires funded account)");
+        eprintln!("  Use --submit-paymaster for AVNU gasless submission");
+        process::exit(1);
+    }
+    // Early format validation: both submission paths require --format ml_gkr.
+    // Check here BEFORE proof generation to avoid wasting compute (~540s for Qwen3-14B).
+    if (cli.submit_gkr || cli.submit_paymaster) && cli.format != OutputFormat::MlGkr {
+        eprintln!("Error: --submit-gkr/--submit-paymaster require --format ml_gkr");
+        eprintln!("  Add: --format ml_gkr");
+        process::exit(1);
+    }
+
     // --submit-gkr: submit GKR proof on-chain via sncast
     if cli.submit_gkr {
+        let t_submit = Instant::now();
         submit_gkr_onchain(&cli, &model, &proof, &input, model_id, io_commitment);
+        if is_e2e {
+            eprintln!("[E2E] Submission (sncast): {:.1}s", t_submit.elapsed().as_secs_f64());
+            let total = t_e2e.elapsed();
+            let secs = total.as_secs();
+            eprintln!("[E2E] Total: {:.1}s ({}m {}s)", total.as_secs_f64(), secs / 60, secs % 60);
+        }
+    }
+
+    // --submit-paymaster: submit GKR proof on-chain via AVNU paymaster (gasless)
+    if cli.submit_paymaster {
+        let t_submit = Instant::now();
+        submit_gkr_via_paymaster(&cli);
+        if is_e2e {
+            eprintln!("[E2E] Submission (paymaster): {:.1}s", t_submit.elapsed().as_secs_f64());
+            let total = t_e2e.elapsed();
+            let secs = total.as_secs();
+            eprintln!("[E2E] Total: {:.1}s ({}m {}s)", total.as_secs_f64(), secs / 60, secs % 60);
+        }
     }
 }
 
@@ -1545,6 +1676,7 @@ fn submit_gkr_onchain(
     use stwo_ml::starknet::{
         build_circuit_descriptor, build_register_gkr_calldata, build_verify_model_gkr_calldata,
         build_verify_model_gkr_v2_calldata, build_verify_model_gkr_v3_calldata,
+        build_verify_model_gkr_v4_calldata, CHUNKED_GKR_THRESHOLD,
     };
 
     if cli.format != OutputFormat::MlGkr {
@@ -1573,14 +1705,27 @@ fn submit_gkr_onchain(
     eprintln!("  Network:  {}", cli.network);
     eprintln!("  Fee:      auto-estimated");
 
-    let use_starknet_gkr_v3 = std::env::var("STWO_STARKNET_GKR_V3")
+    let use_starknet_gkr_v4_env = std::env::var("STWO_STARKNET_GKR_V4")
         .ok()
         .map(|v| {
             let v = v.trim().to_ascii_lowercase();
             !v.is_empty() && v != "0" && v != "false" && v != "off"
         })
         .unwrap_or(false);
-    let use_starknet_gkr_v2 = !use_starknet_gkr_v3
+    // Auto-promote to V4 when aggregated oracle sumcheck is active
+    let use_starknet_gkr_v4 = use_starknet_gkr_v4_env
+        || gkr_proof.weight_opening_transcript_mode
+            == stwo_ml::gkr::types::WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
+    let use_starknet_gkr_v3 = !use_starknet_gkr_v4
+        && std::env::var("STWO_STARKNET_GKR_V3")
+            .ok()
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                !v.is_empty() && v != "0" && v != "false" && v != "off"
+            })
+            .unwrap_or(false);
+    let use_starknet_gkr_v2 = !use_starknet_gkr_v4
+        && !use_starknet_gkr_v3
         && std::env::var("STWO_STARKNET_GKR_V2")
             .ok()
             .map(|v| {
@@ -1588,7 +1733,9 @@ fn submit_gkr_onchain(
                 !v.is_empty() && v != "0" && v != "false" && v != "off"
             })
             .unwrap_or(false);
-    let verify_entrypoint = if use_starknet_gkr_v3 {
+    let verify_entrypoint = if use_starknet_gkr_v4 {
+        "verify_model_gkr_v4"
+    } else if use_starknet_gkr_v3 {
         "verify_model_gkr_v3"
     } else if use_starknet_gkr_v2 {
         "verify_model_gkr_v2"
@@ -1599,7 +1746,9 @@ fn submit_gkr_onchain(
 
     // Step 1: Build verify_model_gkr calldata (raw IO data for on-chain recomputation)
     let raw_io_data = stwo_ml::cairo_serde::serialize_raw_io(input, &proof.execution.output);
-    let verify_calldata = if use_starknet_gkr_v3 {
+    let verify_calldata = if use_starknet_gkr_v4 {
+        build_verify_model_gkr_v4_calldata(gkr_proof, &circuit, model_id, &raw_io_data)
+    } else if use_starknet_gkr_v3 {
         build_verify_model_gkr_v3_calldata(gkr_proof, &circuit, model_id, &raw_io_data)
     } else if use_starknet_gkr_v2 {
         build_verify_model_gkr_v2_calldata(gkr_proof, &circuit, model_id, &raw_io_data)
@@ -1615,6 +1764,17 @@ fn submit_gkr_onchain(
         "  Calldata: {} parts ({} estimated felts)",
         verify_calldata.total_felts, verify_calldata.total_felts
     );
+
+    // Guard: sncast path doesn't support chunked sessions
+    if verify_calldata.total_felts > CHUNKED_GKR_THRESHOLD {
+        eprintln!(
+            "Error: proof has {} felts (>{} threshold) — requires chunked session.",
+            verify_calldata.total_felts, CHUNKED_GKR_THRESHOLD
+        );
+        eprintln!("  The --submit-gkr (sncast) path only supports single-TX proofs.");
+        eprintln!("  Use --submit-paymaster for chunked session support.");
+        process::exit(1);
+    }
 
     // Write calldata to temp file (may exceed shell arg limit for large proofs)
     let calldata_path = cli.output.with_extension("calldata.txt");
@@ -1761,6 +1921,264 @@ fn submit_gkr_onchain(
     }
 
     eprintln!("==============================");
+}
+
+/// Submit a GKR proof on-chain via the AVNU paymaster (gasless).
+///
+/// Invokes `paymaster_submit.mjs verify` as a subprocess with the proof file.
+/// The JS script handles schema v1 (single-TX) and v2 (chunked session) automatically,
+/// including ephemeral account generation and AVNU-sponsored gas.
+///
+/// Falls back to `submit_gkr_onchain` (sncast) if the paymaster script is not found.
+fn submit_gkr_via_paymaster(cli: &Cli) {
+    if cli.format != OutputFormat::MlGkr {
+        eprintln!("Error: --submit-paymaster requires --format ml_gkr");
+        process::exit(1);
+    }
+
+    // Locate paymaster_submit.mjs: check common locations.
+    // Priority: env override > relative to binary > relative to CWD > cargo manifest dir.
+    let mut script_candidates: Vec<PathBuf> = Vec::new();
+
+    // 1. Explicit env override (highest priority)
+    if let Ok(path) = std::env::var("OBELYSK_PAYMASTER_SCRIPT") {
+        if !path.is_empty() {
+            script_candidates.push(PathBuf::from(path));
+        }
+    }
+
+    // 2. Relative to the binary's own location (works on H100/EC2 after scp)
+    //    Binary is at .../target/release/prove-model or .../stwo-ml/target/...
+    //    Script is at .../scripts/pipeline/lib/paymaster_submit.mjs
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            // target/release/ → stwo-ml/ → libs/ → scripts/
+            for ancestor_depth in &["../../..", "../../../.."] {
+                let candidate = exe_dir
+                    .join(ancestor_depth)
+                    .join("scripts/pipeline/lib/paymaster_submit.mjs");
+                script_candidates.push(candidate);
+            }
+        }
+    }
+
+    // 3. Relative to CWD (common in dev: cd libs && cargo run ...)
+    script_candidates.push(PathBuf::from("scripts/pipeline/lib/paymaster_submit.mjs"));
+
+    // 4. Relative to model_dir (scripts often colocated with model on EC2)
+    if let Some(ref model_dir) = cli.model_dir {
+        let candidate = model_dir
+            .join("../../scripts/pipeline/lib/paymaster_submit.mjs");
+        script_candidates.push(candidate);
+    }
+
+    // 5. Compile-time manifest dir (dev builds only)
+    let manifest_candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../scripts/pipeline/lib/paymaster_submit.mjs");
+    script_candidates.push(manifest_candidate);
+
+    let script_path = script_candidates
+        .iter()
+        .find(|p| p.exists())
+        .cloned();
+
+    let script_path = match script_path {
+        Some(p) => p,
+        None => {
+            eprintln!("Error: paymaster_submit.mjs not found");
+            eprintln!("  Searched:");
+            for p in &script_candidates {
+                eprintln!("    {}", p.display());
+            }
+            eprintln!();
+            eprintln!("  Set OBELYSK_PAYMASTER_SCRIPT=/path/to/paymaster_submit.mjs");
+            eprintln!("  Or use --submit-gkr for sncast-based submission");
+            process::exit(1);
+        }
+    };
+
+    let proof_path = cli.output.display().to_string();
+    let model_id_str = &cli.model_id;
+
+    eprintln!();
+    eprintln!("=== On-Chain Paymaster Submission ===");
+    eprintln!("  Script:   {}", script_path.display());
+    eprintln!("  Proof:    {}", proof_path);
+    eprintln!("  Contract: {}", cli.contract);
+    eprintln!("  Model ID: {}", model_id_str);
+    eprintln!("  Network:  {}", cli.network);
+
+    // Spawn with a 20-minute timeout (chunked sessions with 22+ chunks can take 10+ min).
+    let timeout = std::time::Duration::from_secs(
+        std::env::var("OBELYSK_PAYMASTER_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1200u64),
+    );
+
+    let mut child = match std::process::Command::new("node")
+        .arg(&script_path)
+        .arg("verify")
+        .arg("--proof")
+        .arg(&proof_path)
+        .arg("--contract")
+        .arg(&cli.contract)
+        .arg("--model-id")
+        .arg(model_id_str)
+        .arg("--network")
+        .arg(&cli.network)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                eprintln!("Error: 'node' not found in PATH. Install Node.js to use --submit-paymaster.");
+                eprintln!("  Or use --submit-gkr for sncast-based submission.");
+            } else {
+                eprintln!("Error: failed to invoke paymaster script: {e}");
+            }
+            process::exit(1);
+        }
+    };
+
+    // Stream stderr in real-time on a background thread while we wait.
+    let stderr_handle = {
+        let stderr_pipe = child.stderr.take();
+        std::thread::spawn(move || {
+            let mut captured = String::new();
+            if let Some(mut pipe) = stderr_pipe {
+                use std::io::{BufRead, BufReader};
+                let reader = BufReader::new(&mut pipe);
+                for line in reader.lines() {
+                    if let Ok(line) = line {
+                        eprintln!("  [paymaster] {}", line);
+                        captured.push_str(&line);
+                        captured.push('\n');
+                    }
+                }
+            }
+            captured
+        })
+    };
+
+    // Wait with timeout.
+    let start = Instant::now();
+    let output = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Process finished — collect remaining output.
+                let mut stdout_bytes = Vec::new();
+                if let Some(mut pipe) = child.stdout.take() {
+                    use std::io::Read;
+                    let _ = pipe.read_to_end(&mut stdout_bytes);
+                }
+                let stderr_captured = stderr_handle.join().unwrap_or_default();
+                break Ok((status, stdout_bytes, stderr_captured));
+            }
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    // Reap the killed process to avoid zombie (waitpid).
+                    let _ = child.wait();
+                    let stderr_captured = stderr_handle.join().unwrap_or_default();
+                    break Err((timeout, stderr_captured));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Err(e) => {
+                eprintln!("Error: failed to wait on paymaster process: {e}");
+                let _ = child.kill();
+                let _ = child.wait(); // Reap zombie
+                process::exit(1);
+            }
+        }
+    };
+
+    match output {
+        Ok((status, stdout_bytes, stderr_captured)) if status.success() => {
+            let stdout = String::from_utf8_lossy(&stdout_bytes);
+            // Parse JSON output from paymaster script.
+            // The script may emit multiple JSON lines (e.g., intermediate progress).
+            // The LAST valid JSON line is the final result.
+            let mut tx_hash = String::new();
+            let mut is_verified = false;
+            let mut session_id = String::new();
+            let mut uploaded_chunks = 0u64;
+            let mut found_json = false;
+
+            for line in stdout.lines() {
+                let line = line.trim();
+                if !line.starts_with('{') {
+                    continue;
+                }
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
+                    found_json = true;
+                    if let Some(v) = json.get("txHash").and_then(|v| v.as_str()) {
+                        tx_hash = v.to_string();
+                    }
+                    if let Some(v) = json.get("isVerified").and_then(|v| v.as_bool()) {
+                        is_verified = v;
+                    }
+                    if let Some(v) = json.get("sessionId").and_then(|v| v.as_str()) {
+                        session_id = v.to_string();
+                    }
+                    if let Some(v) = json.get("uploadedChunks").and_then(|v| v.as_u64()) {
+                        uploaded_chunks = v;
+                    }
+                }
+            }
+
+            eprintln!();
+            if !found_json {
+                eprintln!("  WARNING: Paymaster script exited successfully but produced no JSON output.");
+                eprintln!("  This may indicate the script version is outdated or the proof was rejected.");
+                if !stdout.is_empty() {
+                    eprintln!("  stdout: {}", stdout.chars().take(500).collect::<String>());
+                }
+                if !stderr_captured.is_empty() {
+                    let preview: String = stderr_captured.chars().take(500).collect();
+                    eprintln!("  stderr: {}", preview);
+                }
+            } else {
+                if !tx_hash.is_empty() {
+                    eprintln!("  TX Hash:     {}", tx_hash);
+                }
+                if !session_id.is_empty() {
+                    eprintln!("  Session ID:  {}", session_id);
+                    eprintln!("  Chunks:      {}", uploaded_chunks);
+                }
+                eprintln!("  Verified:    {}", is_verified);
+                eprintln!("  Gas:         sponsored (AVNU paymaster)");
+            }
+            eprintln!("======================================");
+        }
+        Ok((_status, stdout_bytes, stderr_captured)) => {
+            let stdout = String::from_utf8_lossy(&stdout_bytes);
+            eprintln!("Error: paymaster submission failed (exit code {:?})", _status.code());
+            if !stdout.is_empty() {
+                eprintln!("  stdout: {}", stdout.chars().take(500).collect::<String>());
+            }
+            if !stderr_captured.is_empty() {
+                let preview: String = stderr_captured.chars().take(500).collect();
+                eprintln!("  stderr: {}", preview);
+            }
+            process::exit(1);
+        }
+        Err((timeout_dur, stderr_captured)) => {
+            eprintln!(
+                "Error: paymaster script timed out after {}s",
+                timeout_dur.as_secs()
+            );
+            eprintln!("  Override timeout: OBELYSK_PAYMASTER_TIMEOUT_SECS=3600");
+            if !stderr_captured.is_empty() {
+                let preview: String = stderr_captured.chars().take(500).collect();
+                eprintln!("  Last stderr: {}", preview);
+            }
+            process::exit(1);
+        }
+    }
 }
 
 // ─── Privacy Subcommands ─────────────────────────────────────────────────
