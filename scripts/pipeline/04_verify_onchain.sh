@@ -194,7 +194,7 @@ fi
 # Infer mode from proof artifact if metadata mode is absent.
 if [[ -z "$PROOF_MODE" ]]; then
     ENTRYPOINT_IN_PROOF=$(parse_json_field "$PROOF_FILE" "verify_calldata.entrypoint")
-    if [[ "$ENTRYPOINT_IN_PROOF" == "verify_model_gkr" || "$ENTRYPOINT_IN_PROOF" == "verify_model_gkr_v2" || "$ENTRYPOINT_IN_PROOF" == "verify_model_gkr_v3" || "$ENTRYPOINT_IN_PROOF" == "verify_model_gkr_v4" || "$ENTRYPOINT_IN_PROOF" == "verify_gkr_from_session" ]]; then
+    if [[ "$ENTRYPOINT_IN_PROOF" == "verify_model_gkr" || "$ENTRYPOINT_IN_PROOF" == "verify_model_gkr_v2" || "$ENTRYPOINT_IN_PROOF" == "verify_model_gkr_v3" || "$ENTRYPOINT_IN_PROOF" == "verify_model_gkr_v4" || "$ENTRYPOINT_IN_PROOF" == "verify_model_gkr_v4_packed" || "$ENTRYPOINT_IN_PROOF" == "verify_gkr_from_session" ]]; then
         PROOF_MODE="gkr"
         log "Inferred mode: gkr (from verify_calldata.entrypoint)"
     elif [[ "$ENTRYPOINT_IN_PROOF" == "unsupported" ]]; then
@@ -590,13 +590,13 @@ for line in sys.stdin:
                 fi
 
                 ENTRYPOINT=$(cat "$VERIFY_TMP/entrypoint.txt")
-                if [[ "$ENTRYPOINT" != "verify_model_gkr" && "$ENTRYPOINT" != "verify_model_gkr_v2" && "$ENTRYPOINT" != "verify_model_gkr_v3" && "$ENTRYPOINT" != "verify_model_gkr_v4" ]]; then
+                if [[ "$ENTRYPOINT" != "verify_model_gkr" && "$ENTRYPOINT" != "verify_model_gkr_v2" && "$ENTRYPOINT" != "verify_model_gkr_v3" && "$ENTRYPOINT" != "verify_model_gkr_v4" && "$ENTRYPOINT" != "verify_model_gkr_v4_packed" ]]; then
                     UNSUPPORTED_REASON=$(parse_json_field "$PROOF_FILE" "verify_calldata.reason")
                     if [[ -z "$UNSUPPORTED_REASON" ]]; then
                         UNSUPPORTED_REASON=$(parse_json_field "$PROOF_FILE" "soundness_gate_error")
                     fi
                     WEIGHT_OPENING_MODE=$(parse_json_field "$PROOF_FILE" "weight_opening_mode")
-                    err "verify_calldata.entrypoint must be verify_model_gkr, verify_model_gkr_v2, verify_model_gkr_v3, or verify_model_gkr_v4 in gkr mode (got: ${ENTRYPOINT})"
+                    err "verify_calldata.entrypoint must be verify_model_gkr, verify_model_gkr_v2, verify_model_gkr_v3, verify_model_gkr_v4, or verify_model_gkr_v4_packed in gkr mode (got: ${ENTRYPOINT})"
                     err "  weight_opening_mode: ${WEIGHT_OPENING_MODE:-unknown}"
                     err "  reason: ${UNSUPPORTED_REASON:-unspecified}"
                     rm -rf "$VERIFY_TMP"

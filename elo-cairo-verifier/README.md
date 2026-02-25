@@ -28,7 +28,8 @@ Verifies STWO ML proofs — GKR model walk with per-layer sumchecks, LogUp looku
 
 | Version | Address | Class Hash | Features |
 |---------|---------|------------|----------|
-| **v11 (Current)** | [`0x0121d1...c005`](https://sepolia.starkscan.co/contract/0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005) | `0x08a5b7...c527` | Subtree commitment fix, zero-tree cache, input validation, deprecated modes removed |
+| **v12 (Current)** | [`0x0121d1...c005`](https://sepolia.starkscan.co/contract/0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005) | `0x46016a...ffa7` | Packed QM31 single-TX entrypoint (`verify_model_gkr_v4_packed`), ~3.3x calldata reduction |
+| v11 | [`0x0121d1...c005`](https://sepolia.starkscan.co/contract/0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005) | `0x08a5b7...c527` | Subtree commitment fix, zero-tree cache, input validation, deprecated modes removed |
 | v10 | [`0x0121d1...c005`](https://sepolia.starkscan.co/contract/0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005) | `0x644792...e273` | GKR v4 path, deferred proofs, all layer types, 5-min upgrade |
 | v4 | [`0x0068c7...86eb7`](https://sepolia.starkscan.co/contract/0x0068c7023d6edcb1c086bed57e0ce2b3b5dd007f50f0d6beaec3e57427c86eb7) | `0x3b870a...79a56` | Sumcheck, batch, GKR, unified, direct, upgrade |
 | v3 | [`0x048070...29160`](https://sepolia.voyager.online/contract/0x048070fbd531a0192f3d4a37eb019ae3174600cae15e08c737982fae5d929160) | `0x32d1a0...d4a02` | Sumcheck, batch, GKR, unified |
@@ -46,7 +47,7 @@ The VM31Pool contract manages a shielded transaction pool using a Poseidon2-M31 
 | **Address** | [`0x07cf94...e1f9`](https://sepolia.starkscan.co/contract/0x07cf94e27a60b94658ec908a00a9bb6dfff03358e952d9d48a8ed0be080ce1f9) |
 | **Class Hash** | `0x046d316ca9ffe36adfdd3760003e9f8aa433cb34105619edcdc275315a2c8405` |
 | **Owner/Relayer** | `0x0759a4374389b0e3cfcc59d49310b6bc75bb12bbf8ce550eb5c2f026918bb344` |
-| **Verifier** | EloVerifier v11 (`0x0121d1...c005`) |
+| **Verifier** | EloVerifier v12 (`0x0121d1...c005`) |
 
 ### Batch Processing Protocol (3-step)
 
@@ -203,6 +204,7 @@ The verifier saves claim points during the walk when hitting Add layers, then us
 
 | Mode | Function | Use Case |
 |------|----------|----------|
+| **GKR Model (packed)** | `verify_model_gkr_v4_packed` | Packed QM31 format — ~3.3x calldata reduction, single TX for most models |
 | **GKR Model** | `verify_model_gkr` | 100% on-chain GKR walk — all layer types, DAG circuits |
 | **Direct** | `verify_model_direct` | Batch sumchecks + STARK hash binding (eliminates Stage 2) |
 | **Unified** | `verify_model` | All matmuls + batched + GKR in one transaction |
@@ -255,6 +257,15 @@ trait ISumcheckVerifier<TContractState> {
         num_layers: u32, matmul_dims: Array<u32>,
         dequantize_bits: Array<u64>, proof_data: Array<felt252>,
         weight_commitments: Array<felt252>,
+        weight_opening_proofs: Array<felt252>) -> bool;
+
+    // -- GKR v4 Packed (3.3x smaller calldata via QM31 packing) --
+    fn verify_model_gkr_v4_packed(ref self: TContractState, model_id: felt252,
+        raw_io_data: Array<felt252>, circuit_depth: u32,
+        num_layers: u32, matmul_dims: Array<u32>,
+        dequantize_bits: Array<u64>, proof_data: Array<felt252>,
+        weight_commitments: Array<felt252>,
+        weight_binding_mode: u32, weight_binding_data: Array<felt252>,
         weight_opening_proofs: Array<felt252>) -> bool;
 
     // -- Other verification modes --

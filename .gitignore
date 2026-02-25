@@ -20,6 +20,9 @@ findingscore.md
 scripts/pipeline/configs/.secrets.env
 secrets.env
 
+# Deployment keystores (NEVER commit)
+deployment/
+
 # Node
 node_modules/
 

@@ -770,7 +770,7 @@ if sv == 2:
     packed = vc.get('packed')
     assert isinstance(packed, bool), f'schema_version=2 requires packed to be boolean (got {packed})'
     print(f'  verify_calldata: schema_version=2, {total_felts} felts in {len(chunks)} chunks (packed={packed})', file=sys.stderr)
-elif entrypoint in ('verify_model_gkr', 'verify_model_gkr_v2', 'verify_model_gkr_v3', 'verify_model_gkr_v4'):
+elif entrypoint in ('verify_model_gkr', 'verify_model_gkr_v2', 'verify_model_gkr_v3', 'verify_model_gkr_v4', 'verify_model_gkr_v4_packed'):
     calldata = vc.get('calldata')
     chunks = vc.get('upload_chunks', [])
     assert isinstance(chunks, list), 'verify_calldata.upload_chunks must be an array'
@@ -787,12 +787,12 @@ elif entrypoint in ('verify_model_gkr', 'verify_model_gkr_v2', 'verify_model_gkr
         if mode_s is not None:
             assert mode_s in ('Sequential', 'BatchedSubchannelV1'), \
                 f'{entrypoint} requires weight_opening_mode in (Sequential, BatchedSubchannelV1) (got {mode})'
-    elif entrypoint == 'verify_model_gkr_v4':
+    elif entrypoint in ('verify_model_gkr_v4', 'verify_model_gkr_v4_packed'):
         if mode_s is not None:
             allowed_v4 = ('AggregatedOpeningsV4Experimental', 'AggregatedOracleSumcheck')
             assert mode_s in allowed_v4, \
                 f'{entrypoint} requires weight_opening_mode in {allowed_v4} (got {mode})'
-    if entrypoint in ('verify_model_gkr_v2', 'verify_model_gkr_v3', 'verify_model_gkr_v4'):
+    if entrypoint in ('verify_model_gkr_v2', 'verify_model_gkr_v3', 'verify_model_gkr_v4', 'verify_model_gkr_v4_packed'):
         # v2/v3 calldata inserts weight_binding_mode after weight_commitments array.
         idx = 0
         idx += 1  # model_id
@@ -817,7 +817,7 @@ elif entrypoint in ('verify_model_gkr', 'verify_model_gkr_v2', 'verify_model_gkr
         if entrypoint == 'verify_model_gkr_v2':
             assert wb_mode in (0, 1), \
                 f'{entrypoint} requires weight_binding_mode in (0,1) (got {wb_mode})'
-        if entrypoint == 'verify_model_gkr_v4':
+        if entrypoint in ('verify_model_gkr_v4', 'verify_model_gkr_v4_packed'):
             assert wb_mode in (3, 4), \
                 f'{entrypoint} requires weight_binding_mode in (3, 4) (got {wb_mode})'
         expected_mode = None
@@ -835,7 +835,7 @@ elif entrypoint in ('verify_model_gkr', 'verify_model_gkr_v2', 'verify_model_gkr
             assert wb_mode == expected_mode, \
                 f'{entrypoint} expected weight_binding_mode={expected_mode} for weight_opening_mode={mode_s} (got {wb_mode})'
         else:
-            allowed_modes = (0, 1, 2) if entrypoint == 'verify_model_gkr_v3' else (3, 4) if entrypoint == 'verify_model_gkr_v4' else (0, 1)
+            allowed_modes = (0, 1, 2) if entrypoint == 'verify_model_gkr_v3' else (3, 4) if entrypoint in ('verify_model_gkr_v4', 'verify_model_gkr_v4_packed') else (0, 1)
             assert wb_mode in allowed_modes, \
                 f'{entrypoint} requires weight_binding_mode in {allowed_modes} (got {wb_mode})'
         artifact_mode_id = proof.get('weight_binding_mode_id')
@@ -843,7 +843,7 @@ elif entrypoint in ('verify_model_gkr', 'verify_model_gkr_v2', 'verify_model_gkr
             artifact_mode_id = int(str(artifact_mode_id), 0)
             assert artifact_mode_id == wb_mode, \
                 f'weight_binding_mode_id mismatch: artifact={artifact_mode_id} calldata={wb_mode}'
-        if entrypoint in ('verify_model_gkr_v3', 'verify_model_gkr_v4'):
+        if entrypoint in ('verify_model_gkr_v3', 'verify_model_gkr_v4', 'verify_model_gkr_v4_packed'):
             idx += 1  # consume weight_binding_mode
             assert idx < len(calldata), f'{entrypoint} calldata truncated before weight_binding_data length'
             binding_data_len = parse_nat(calldata[idx], 'weight_binding_data length')
