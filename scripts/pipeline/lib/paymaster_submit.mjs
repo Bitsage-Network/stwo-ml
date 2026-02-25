@@ -24,6 +24,7 @@
 //
 import {
   Account,
+  PaymasterRpc,
   RpcProvider,
   CallData,
   ETransactionVersion,
@@ -32,9 +33,10 @@ import {
   num,
   byteArray,
 } from "starknet";
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, renameSync, statSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
+import { createHash } from "crypto";
 
 // ─── Constants ────────────────────────────────────────────────────────
 
@@ -87,6 +89,21 @@ const MIN_GKR_MODE4_CALLDATA_FELTS = parsePositiveIntEnv(
   "OBELYSK_MIN_GKR_MODE4_CALLDATA_FELTS",
   1000
 );
+// Per-chunk felt count for upload_gkr_chunk. The contract wraps each chunk in
+// ~3 felts overhead (session_id, chunk_idx, array_len), so the total TX calldata
+// is CHUNK_SIZE_FELTS + 3. Public RPCs (Cartridge, Nethermind) drop TXs
+// with >~2500 felt calldata from the mempool (RECEIVED but never ACCEPTED_ON_L2).
+// 2000 felts + 3 = 2003 is well within limits, while reducing chunk count by ~25%
+// vs the prior 1500 default. Use OBELYSK_CHUNK_SIZE=1500 if your RPC is flaky.
+const CHUNK_SIZE_FELTS = (() => {
+  const raw = process.env.OBELYSK_CHUNK_SIZE;
+  if (raw === undefined || raw === null || String(raw).trim() === "") return 2000;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 1) {
+    throw new Error(`OBELYSK_CHUNK_SIZE must be a positive integer (got: ${raw})`);
+  }
+  return n;
+})();
 
 // ─── Argument Parsing ─────────────────────────────────────────────────
 
@@ -153,12 +170,17 @@ function saveAccountConfig(config) {
   writeFileSync(ACCOUNT_CONFIG_FILE, JSON.stringify(config, null, 2));
 }
 
-function getAccount(provider, privateKey, address) {
+function getAccount(provider, privateKey, address, network = "sepolia") {
+  const net = NETWORKS[network];
+  const paymasterOpts = net && net.paymasterUrl
+    ? { nodeUrl: net.paymasterUrl }
+    : { default: true };
   return new Account({
     provider,
     address,
     signer: privateKey,
     transactionVersion: ETransactionVersion.V3,
+    paymaster: new PaymasterRpc(paymasterOpts),
   });
 }
 
@@ -169,6 +191,15 @@ function jsonOutput(obj) {
 function die(msg) {
   process.stderr.write(`[ERR] ${msg}\n`);
   process.exit(1);
+}
+
+// BigInt-safe JSON serialization + atomic file write (write to temp, then rename).
+// Prevents corrupted resume files from partial writes or BigInt TypeError.
+function safeWriteJson(filePath, obj) {
+  const json = JSON.stringify(obj, (_, v) => typeof v === "bigint" ? v.toString() : v, 2);
+  const tmp = filePath + `.tmp.${process.pid}`;
+  writeFileSync(tmp, json);
+  renameSync(tmp, filePath);
 }
 
 function truncateRpcError(e) {
@@ -187,8 +218,20 @@ function truncateRpcError(e) {
   if (execErr) return `Execution error: ${execErr[1]}`;
   const contractErr = msg.match(/Contract error[:\s]*(.{1,500})/i);
   if (contractErr) return `Contract error: ${contractErr[1]}`;
-  // Fallback: last 500 chars (often contains the actual error)
-  if (msg.length > 500) return "..." + msg.slice(-500);
+  // Fallback: last 500 chars (often contains the actual error).
+  // IMPORTANT: Preserve critical keywords that callers depend on for control flow.
+  // E.g., "INSUFFICIENT" triggers fee cache invalidation; if truncated away, the
+  // stale fee cache is never cleared, causing cascading failures.
+  if (msg.length > 500) {
+    const tail = msg.slice(-500);
+    // Check if critical keywords are in the full message but not in the tail.
+    const criticalKeywords = ["INSUFFICIENT", "insufficient", "rate limit", "429", "REVERTED"];
+    const preserved = criticalKeywords.filter(kw => msg.includes(kw) && !tail.includes(kw));
+    if (preserved.length > 0) {
+      return `[${preserved.join(",")}] ...${tail}`;
+    }
+    return "..." + tail;
+  }
   return msg;
 }
 
@@ -405,6 +448,9 @@ async function executeViaPaymaster(account, calls) {
     callsArray,
     feeDetails
   );
+  if (!estimation || !estimation.suggested_max_fee_in_gas_token) {
+    throw new Error("Paymaster fee estimation returned empty/invalid result");
+  }
 
   info("Executing via AVNU paymaster (sponsored mode)...");
   const result = await account.executePaymasterTransaction(
@@ -412,6 +458,11 @@ async function executeViaPaymaster(account, calls) {
     feeDetails,
     estimation.suggested_max_fee_in_gas_token
   );
+  if (!result || !result.transaction_hash) {
+    throw new Error(
+      `Paymaster executePaymasterTransaction returned invalid result: ${JSON.stringify(result)?.slice(0, 200)}`
+    );
+  }
 
   return result.transaction_hash;
 }
@@ -432,9 +483,9 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
     die("Proof file missing 'verify_calldata' object");
   }
 
-  const schemaVersion = verifyCalldata.schema_version;
+  const schemaVersion = Number(verifyCalldata.schema_version);
   if (schemaVersion !== 1 && schemaVersion !== 2) {
-    die("verify_calldata.schema_version must be 1 or 2");
+    die(`verify_calldata.schema_version must be 1 or 2 (got: ${JSON.stringify(verifyCalldata.schema_version)})`);
   }
 
   // ── Schema v2: chunked session mode ──
@@ -460,7 +511,7 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
     }
     const circuitDepth = verifyCalldata.circuit_depth;
     const numLayers = verifyCalldata.num_layers;
-    const weightBindingMode = verifyCalldata.weight_binding_mode;
+    const weightBindingMode = Number(verifyCalldata.weight_binding_mode);
     if (typeof circuitDepth !== "number" || circuitDepth <= 0) {
       die("schema_version 2 requires positive circuit_depth");
     }
@@ -468,7 +519,7 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
       die("schema_version 2 requires positive num_layers");
     }
     if (![3, 4].includes(weightBindingMode)) {
-      die(`schema_version 2 requires weight_binding_mode in {3,4} (got: ${weightBindingMode})`);
+      die(`schema_version 2 requires weight_binding_mode in {3,4} (got: ${JSON.stringify(verifyCalldata.weight_binding_mode)})`);
     }
     // Validate chunk sizes.
     let feltCount = 0;
@@ -496,33 +547,51 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
       // Flatten chunks → parse sections → check if Mode 4 RLC → strip openings
       const flat = [];
       for (const c of chunks) for (const f of c) flat.push(f);
-      const readNat = (i) => {
+      const readNatV2 = (i, label) => {
+        if (i < 0 || i >= flat.length) {
+          die(`schema v2 Mode 4: index out of bounds reading ${label}: idx=${i}, flat.length=${flat.length}`);
+        }
         const s = String(flat[i]);
-        return s.startsWith("0x") || s.startsWith("0X") ? Number(BigInt(s)) : Number(s);
+        if (s === "undefined" || s === "null" || s === "") {
+          die(`schema v2 Mode 4: empty/null value at index ${i} for ${label}`);
+        }
+        let n;
+        try {
+          n = s.startsWith("0x") || s.startsWith("0X") ? Number(BigInt(s)) : Number(s);
+        } catch (e) {
+          die(`schema v2 Mode 4: invalid number at index ${i} for ${label}: ${s}`);
+        }
+        if (!Number.isSafeInteger(n) || n < 0) {
+          die(`schema v2 Mode 4: invalid ${label} at index ${i}: ${s}`);
+        }
+        return n;
       };
       let off = 0;
-      // Skip through 6 length-prefixed sections
+      let sec6Off = 0, sec6Len = 0;
+      // Walk through 6 length-prefixed sections, capturing section 6 (weight_binding_data) position.
       for (let sec = 0; sec < 6; sec++) {
-        const secLen = readNat(off); off += 1 + secLen;
+        if (sec === 5) { sec6Off = off; }
+        const secLen = readNatV2(off, `section_${sec + 1}_len`);
+        if (sec === 5) { sec6Len = secLen; }
+        off += 1 + secLen;
+        if (off > flat.length) {
+          die(`schema v2 Mode 4: section ${sec + 1} overflows flat data (off=${off}, flat.length=${flat.length})`);
+        }
       }
       // off now points at weight_opening_proofs start
       const wopFelts = flat.length - off;
       // Check if weight_binding_data (section 6) is RLC marker
-      // Parse backwards from off to find section 6
-      let sec6Off = 0, sec6Len = 0;
-      let tmpOff = 0;
-      for (let sec = 0; sec < 6; sec++) {
-        if (sec === 5) { sec6Off = tmpOff; sec6Len = readNat(tmpOff); }
-        const len = readNat(tmpOff); tmpOff += 1 + len;
+      let isRlc = false;
+      if (sec6Len === 2 && (sec6Off + 1) < flat.length) {
+        try { isRlc = BigInt(flat[sec6Off + 1]) === 0x524C43n; } catch { /* not RLC */ }
       }
-      const isRlc = sec6Len === 2 && BigInt(flat[sec6Off + 1]) === 0x524C43n;
       if (isRlc && wopFelts > 1) {
         // Replace opening proofs with empty array [0]
         const stripped = flat.slice(0, off);
         stripped.push("0");
         info(`  Mode 4 RLC v2: stripping ${wopFelts} felts of weight_opening_proofs (${flat.length} → ${stripped.length})`);
         // Re-chunk
-        const chunkSize = parseInt(process.env.OBELYSK_CHUNK_SIZE || "1500", 10);
+        const chunkSize = CHUNK_SIZE_FELTS;
         finalChunks = [];
         for (let i = 0; i < stripped.length; i += chunkSize) {
           finalChunks.push(stripped.slice(i, i + chunkSize));
@@ -536,7 +605,7 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
     // Cartridge/public RPCs silently drop TXs with calldata > ~2000 felts from
     // the mempool (TX gets RECEIVED but never ACCEPTED_ON_L2). The Rust prover
     // pre-chunks at 4000 felts, so we re-chunk to a smaller size here.
-    const maxChunkFelts = parseInt(process.env.OBELYSK_CHUNK_SIZE || "1500", 10);
+    const maxChunkFelts = CHUNK_SIZE_FELTS;
     const needsRechunk = finalChunks.some((c) => c.length > maxChunkFelts);
     if (needsRechunk) {
       const flat = [];
@@ -592,14 +661,16 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
   // this threshold, we parse the flat v4 calldata and rebuild it as a chunked
   // session data buffer (schema_version 2) on the fly.
   const CHUNKED_THRESHOLD = 5000;
-  // Default chunk size reduced from 4000 to 1500: Cartridge/public RPCs drop
-  // large-calldata TXs from mempool (TX gets RECEIVED but never ACCEPTED_ON_L2).
-  // 1500 felts → ~1503 felt calldata per TX, well within limits.
-  const MAX_CHUNK_FELTS = parseInt(process.env.OBELYSK_CHUNK_SIZE || "1500", 10);
+  // Chunk size from CHUNK_SIZE_FELTS (default 2000). Public RPCs drop TXs with
+  // calldata >~2500 felts from mempool (RECEIVED but never ACCEPTED_ON_L2).
+  const MAX_CHUNK_FELTS = CHUNK_SIZE_FELTS;
   if (entrypoint === "verify_model_gkr_v4" && rawCalldata.length > CHUNKED_THRESHOLD) {
     info(`Auto-converting v1 calldata (${rawCalldata.length} felts) to chunked session format...`);
     const cd = rawCalldata.map((v) => String(v));
     const readNat = (idx, label) => {
+      if (idx >= cd.length) {
+        die(`auto-chunk: index out of bounds reading ${label}: idx=${idx} >= cd.length=${cd.length}`);
+      }
       const s = cd[idx];
       const n = s.startsWith("0x") || s.startsWith("0X") ? Number(BigInt(s)) : Number(s);
       if (!Number.isSafeInteger(n) || n < 0) die(`auto-chunk: invalid ${label} at idx ${idx}: ${s}`);
@@ -612,11 +683,19 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
     // proof_data_len, proof_data..., wc_len, wc..., weight_binding_mode,
     // wbd_len, wbd..., wop_count, wop_data...
     let idx = 0;
+    // Helper: advance idx by a section length, dying if it overshoots calldata.
+    const advanceSection = (len, label) => {
+      idx += len;
+      if (idx > cd.length) {
+        die(`auto-chunk: ${label} overflows calldata (idx=${idx} > cd.length=${cd.length})`);
+      }
+    };
+
     const modelIdStr = cd[idx]; idx += 1;
 
     // raw_io_data section
     const rawIoLen = readNat(idx, "raw_io_len"); idx += 1;
-    const rawIoStart = idx; idx += rawIoLen;
+    const rawIoStart = idx; advanceSection(rawIoLen, "raw_io_data");
 
     // circuit_depth, num_layers (scalars — stored in session metadata)
     const circuitDepth = readNat(idx, "circuit_depth"); idx += 1;
@@ -624,29 +703,32 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
 
     // matmul_dims section
     const matmulDimsLen = readNat(idx, "matmul_dims_len"); idx += 1;
-    const matmulDimsStart = idx; idx += matmulDimsLen;
+    const matmulDimsStart = idx; advanceSection(matmulDimsLen, "matmul_dims");
 
     // dequantize_bits section
     const deqBitsLen = readNat(idx, "deq_bits_len"); idx += 1;
-    const deqBitsStart = idx; idx += deqBitsLen;
+    const deqBitsStart = idx; advanceSection(deqBitsLen, "dequantize_bits");
 
     // proof_data section
     const proofDataLen = readNat(idx, "proof_data_len"); idx += 1;
-    const proofDataStart = idx; idx += proofDataLen;
+    const proofDataStart = idx; advanceSection(proofDataLen, "proof_data");
 
     // weight_commitments section
     const wcLen = readNat(idx, "wc_len"); idx += 1;
-    const wcStart = idx; idx += wcLen;
+    const wcStart = idx; advanceSection(wcLen, "weight_commitments");
 
     // weight_binding_mode (scalar — stored in session metadata)
     const weightBindingMode = readNat(idx, "weight_binding_mode"); idx += 1;
 
     // weight_binding_data section
     const wbdLen = readNat(idx, "wbd_len"); idx += 1;
-    const wbdStart = idx; idx += wbdLen;
+    const wbdStart = idx; advanceSection(wbdLen, "weight_binding_data");
 
     // weight_opening_proofs (rest of calldata = Serde-serialized Array<MleOpeningProof>)
     const wopStart = idx;
+    if (wopStart > cd.length) {
+      die(`auto-chunk: calldata truncated — expected weight_opening_proofs at idx ${wopStart} but cd.length=${cd.length}`);
+    }
     const wopLen = cd.length - wopStart;
 
     // Build session data: length-prefixed sections, no model_id/circuit_depth/num_layers/binding_mode
@@ -673,9 +755,11 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
     //    For Mode 4 RLC-only: the on-chain verifier never uses opening proofs.
     //    Omitting them drops ~53K felts, reducing total from ~86K to ~33K felts
     //    which fits within Starknet's per-TX step limit for storage reads.
-    const isMode4Rlc = weightBindingMode === 4 && wbdLen === 2
-      && (cd[wbdStart] === "0x524c43" || cd[wbdStart] === "0x524C43"
-          || BigInt(cd[wbdStart]) === 0x524C43n);
+    // Standardize RLC marker detection via BigInt to handle any hex casing or decimal format.
+    let isMode4Rlc = false;
+    if (weightBindingMode === 4 && wbdLen === 2 && wbdStart < cd.length) {
+      try { isMode4Rlc = BigInt(cd[wbdStart]) === 0x524C43n; } catch { /* not RLC */ }
+    }
     if (isMode4Rlc) {
       sessionData.push("0");  // empty Array<MleOpeningProof>
       info(`  Mode 4 RLC: stripping ${wopLen} felts of weight_opening_proofs`);
@@ -707,6 +791,11 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
       circuitDepth,
       numLayers,
       weightBindingMode,
+      // V4 single-TX calldata from build_verify_model_gkr_v4_calldata is UNPACKED
+      // (4 felts per QM31). The Rust chunked builder (build_chunked_gkr_calldata)
+      // does packing internally, but this JS auto-convert path works on unpacked data.
+      // Setting packed=true here would cause the Cairo verifier to misinterpret felts.
+      packed: false,
     };
   }
 
@@ -939,6 +1028,7 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
     sessionId,
     modelId,
     schemaVersion,
+    chunked: false,
   };
 }
 
@@ -995,6 +1085,25 @@ async function cmdVerify(args) {
   if (!proofPath) die("--proof is required");
   if (!contract) die("--contract is required");
 
+  // Validate model-id: must be a non-zero hex value.
+  {
+    const mid = String(modelIdArg).trim();
+    if (!mid || mid === "" || mid === "0x" || mid === "0x0" || mid === "0X" || mid === "0X0" || mid === "0") {
+      die(
+        `Invalid --model-id: "${modelIdArg}"\n` +
+          "  Model ID must be a non-zero value (e.g., 0x1, 0x2).\n" +
+          "  This typically comes from the contract's registered model index."
+      );
+    }
+    // Basic hex/decimal format check
+    if (!/^(0x[0-9a-fA-F]+|[1-9]\d*)$/.test(mid)) {
+      die(
+        `Invalid --model-id format: "${modelIdArg}"\n` +
+          "  Expected a hex string (0x...) or positive decimal integer."
+      );
+    }
+  }
+
   const provider = getProvider(network);
 
   // ── Resolve account ──
@@ -1010,7 +1119,12 @@ async function cmdVerify(args) {
       die("STARKNET_ACCOUNT_ADDRESS required when using STARKNET_PRIVATE_KEY");
     info("Using user-provided account");
   } else {
-    const config = loadAccountConfig();
+    let config = loadAccountConfig();
+    // Validate network match: a sepolia account must not be used on mainnet and vice versa.
+    if (config && config.network && config.network !== network) {
+      info(`Saved account is for ${config.network}, but current network is ${network}. Generating fresh keypair.`);
+      config = null;
+    }
     if (config) {
       // Path 2: Saved pipeline account
       privateKey = config.privateKey;
@@ -1056,10 +1170,26 @@ async function cmdVerify(args) {
     }
   }
 
-  const account = getAccount(provider, privateKey, accountAddress);
+  const account = getAccount(provider, privateKey, accountAddress, network);
 
   // ── Read proof file ──
   info(`Reading proof: ${proofPath}`);
+  // Guard against OOM: check file size before reading into memory.
+  const maxProofSizeMb = parsePositiveIntEnv("OBELYSK_MAX_PROOF_SIZE_MB", 512);
+  try {
+    const fileStat = statSync(proofPath);
+    const sizeMb = fileStat.size / (1024 * 1024);
+    if (sizeMb > maxProofSizeMb) {
+      die(
+        `Proof file is ${sizeMb.toFixed(0)}MB, exceeds ${maxProofSizeMb}MB limit.\n` +
+          "  Set OBELYSK_MAX_PROOF_SIZE_MB to increase the limit, or ensure the\n" +
+          "  proof was generated correctly (Qwen3-14B 40-layer is typically ~100-200MB)."
+      );
+    }
+  } catch (e) {
+    if (e.code === "ENOENT") die(`Proof file not found: ${proofPath}`);
+    // statSync failure on existing file — proceed and let readFileSync handle it
+  }
   let proofData;
   try {
     proofData = JSON.parse(readFileSync(proofPath, "utf-8"));
@@ -1081,7 +1211,6 @@ async function cmdVerify(args) {
 
   // ── Deploy account if needed ──
   const noPaymaster = args["no-paymaster"] === true || args["no-paymaster"] === "true";
-  let pendingDeploymentData = null;
   if (needsDeploy && ephemeral) {
     const rawCalldata = Array.isArray(ephemeral.constructorCalldata)
       ? ephemeral.constructorCalldata
@@ -1107,9 +1236,80 @@ async function cmdVerify(args) {
   // Chunked Session Flow (schema_version 2)
   // ═══════════════════════════════════════════════════════════════════
   if (verifyPayload.chunked) {
+    const e2eStart = Date.now();
+    const e2ePhase = (label) => {
+      const elapsed = ((Date.now() - e2eStart) / 1000).toFixed(1);
+      info(`[E2E] ${label} (${elapsed}s elapsed)`);
+    };
     info(`Chunked GKR session mode: ${verifyPayload.totalFelts} felts in ${verifyPayload.numChunks} chunks`);
 
     await preflightContractEntrypoint(provider, contract, "open_gkr_session");
+
+    // ── Auto-register model if needed ──
+    // Check if the model is registered by calling get_model_circuit_hash.
+    // If it returns 0x0 or the call fails, register using calldata from the proof file.
+    let needsRegistration = false;
+    try {
+      const regResult = await provider.callContract({
+        contractAddress: contract,
+        entrypoint: "get_model_circuit_hash",
+        calldata: CallData.compile([modelId]),
+      });
+      const circuitHash = regResult.result ? regResult.result[0] : "0x0";
+      try {
+        needsRegistration = !circuitHash || circuitHash === "0x0" || BigInt(circuitHash) === 0n;
+      } catch {
+        needsRegistration = true;
+      }
+      if (!needsRegistration) {
+        info(`Model already registered (circuit_hash: ${circuitHash})`);
+      }
+    } catch {
+      info("Could not check model registration (will attempt registration)");
+      needsRegistration = true;
+    }
+
+    if (needsRegistration) {
+      const registerCalldata = proofData.register_calldata;
+      if (!registerCalldata || !Array.isArray(registerCalldata) || registerCalldata.length === 0) {
+        die(
+          "Model is not registered and proof file does not contain register_calldata.\n" +
+          "  Re-generate the proof with the latest prove-model binary to include register_calldata,\n" +
+          "  or register the model manually via sncast: sncast invoke --function register_model_gkr ..."
+        );
+      }
+      info(`Registering model (${registerCalldata.length} calldata felts)...`);
+      const regCalls = [{
+        contractAddress: contract,
+        entrypoint: "register_model_gkr",
+        calldata: CallData.compile(registerCalldata),
+      }];
+      try {
+        const regTxHash = await executeViaPaymaster(account, regCalls);
+        info(`  Registration TX: ${regTxHash}`);
+        const regReceipt = await provider.waitForTransaction(regTxHash, { retryInterval: 4000 });
+        const regStatus = regReceipt.execution_status ?? regReceipt.status ?? "unknown";
+        if (regStatus === "REVERTED") {
+          const reason = regReceipt.revert_reason || "unknown";
+          // "already registered" is not an error
+          if (/already.?registered/i.test(reason)) {
+            info("  Model already registered (OK)");
+          } else {
+            die(`  Registration reverted: ${reason}`);
+          }
+        } else {
+          info(`  Model registered successfully (status: ${regStatus})`);
+        }
+      } catch (regErr) {
+        const errMsg = truncateRpcError(regErr);
+        // Tolerate "already registered" errors
+        if (/already.?registered/i.test(errMsg)) {
+          info("  Model already registered (OK)");
+        } else {
+          die(`  Registration failed: ${errMsg}`);
+        }
+      }
+    }
 
     const verificationCountBefore = await fetchVerificationCount(provider, contract, modelId);
     if (verificationCountBefore !== null) {
@@ -1120,19 +1320,94 @@ async function cmdVerify(args) {
     const sessionDir = join(homedir(), ".obelysk", "chunked_sessions");
     mkdirSync(sessionDir, { recursive: true });
 
-    // Helper: execute a single call
-    async function waitWithTimeout(txHash, timeoutMs = 300000) {
-      return Promise.race([
-        provider.waitForTransaction(txHash, { retryInterval: 4000 }),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error(`TX ${txHash} not confirmed after ${timeoutMs/1000}s`)), timeoutMs)
-        ),
-      ]);
+    // Session keyed by contract+modelId (not session_id, which we may not have yet)
+    const contractShort = contract.slice(-12).replace(/^0x/i, "");
+    const modelShort = String(modelId).slice(-8).replace(/^0x/i, "");
+    const resumeFile = join(sessionDir, `resume_${contractShort}_${modelShort}.json`);
+    const GKR_SESSION_TIMEOUT_BLOCKS = 10000; // Must match contract constant
+
+    // Compute a content hash of the proof data to detect changes between runs.
+    // Uses first 32 bytes of SHA-256 over the flattened chunk data (fast, collision-resistant).
+    const proofContentHash = (() => {
+      const h = createHash("sha256");
+      for (const chunk of verifyPayload.uploadChunks) {
+        for (const felt of chunk) h.update(String(felt));
+      }
+      return h.digest("hex").slice(0, 32);
+    })();
+
+    let resumeState = null;
+    let resumeIsSealedOnly = false; // True when resuming a sealed (but not yet verified) session
+    if (existsSync(resumeFile)) {
+      try {
+        resumeState = JSON.parse(readFileSync(resumeFile, "utf-8"));
+        const isUploadResume = resumeState.status === "uploading" && resumeState.sessionId && resumeState.chunksUploaded > 0;
+        const isSealedResume = resumeState.status === "sealed" && resumeState.sessionId;
+        if (isUploadResume || isSealedResume) {
+          if (isSealedResume) {
+            info(`Found sealed session: ${resumeState.sessionId} — resuming from verify step`);
+            resumeIsSealedOnly = true;
+          } else {
+            info(`Found resumable session: ${resumeState.sessionId} (${resumeState.chunksUploaded}/${resumeState.numChunks} chunks uploaded)`);
+          }
+          // Verify proof content matches (catches different weights with same architecture)
+          if (!isSealedResume && resumeState.proofContentHash && resumeState.proofContentHash !== proofContentHash) {
+            info(`  Proof content changed since last run (hash: ${resumeState.proofContentHash} → ${proofContentHash})`);
+            info(`  Starting fresh session (old session will be orphaned on-chain)`);
+            resumeState = null;
+          }
+          // Verify chunk count matches current proof (upload resume only)
+          if (!isSealedResume && resumeState && (resumeState.numChunks !== verifyPayload.numChunks || resumeState.totalFelts !== verifyPayload.totalFelts)) {
+            info(`  Proof changed since last run (chunks: ${resumeState.numChunks}→${verifyPayload.numChunks}, felts: ${resumeState.totalFelts}→${verifyPayload.totalFelts})`);
+            info(`  Starting fresh session (old session will be orphaned on-chain)`);
+            resumeState = null;
+          }
+          // Check session TTL: contract expires sessions after GKR_SESSION_TIMEOUT_BLOCKS
+          if (resumeState && resumeState.createdAt_block) {
+            try {
+              const currentBlock = await provider.getBlockNumber();
+              const blocksRemaining = (resumeState.createdAt_block + GKR_SESSION_TIMEOUT_BLOCKS) - currentBlock;
+              if (blocksRemaining <= 0) {
+                info(`  Session expired on-chain (created at block ${resumeState.createdAt_block}, now ${currentBlock}, TTL=${GKR_SESSION_TIMEOUT_BLOCKS})`);
+                info(`  Starting fresh session`);
+                resumeState = null;
+                resumeIsSealedOnly = false;
+              } else if (blocksRemaining < 500) {
+                info(`  WARNING: Session nearing expiry (${blocksRemaining} blocks remaining, ~${Math.round(blocksRemaining * 6 / 60)} min)`);
+              }
+            } catch {
+              info("  WARNING: Cannot verify session TTL (getBlockNumber unavailable). If session expired, contract will reject with GKR_SESSION_EXPIRED.");
+            }
+          }
+        } else {
+          resumeState = null;
+        }
+      } catch {
+        resumeState = null;
+      }
     }
 
-    // Cached resource bounds from the first successful chunk estimate.
+    // Helper: execute a single call
+    async function waitWithTimeout(txHash, timeoutMs = 300000) {
+      let timer;
+      try {
+        return await Promise.race([
+          provider.waitForTransaction(txHash, { retryInterval: 4000 }),
+          new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error(`TX ${txHash} not confirmed after ${timeoutMs/1000}s`)), timeoutMs);
+          }),
+        ]);
+      } finally {
+        // Always clear the timeout to prevent timer leaks when waitForTransaction wins the race.
+        if (timer) clearTimeout(timer);
+      }
+    }
+
+    // Cached paymaster fee estimate from the first successful chunk.
     // Reused for all subsequent chunks to avoid nonce-stale estimateFee failures.
-    let cachedChunkResourceBounds = null;
+    // For paymaster mode: caches the `suggested_max_fee_in_gas_token` value.
+    // For non-paymaster mode: not used (account.execute() handles fees).
+    let cachedPaymasterMaxFee = null;
 
     async function execCall(entrypoint, calldata, label, opts = {}) {
       const calls = [{
@@ -1145,159 +1420,373 @@ async function cmdVerify(args) {
       if (noPaymaster) {
         try {
           const result = await account.execute(calls);
+          if (!result || !result.transaction_hash) {
+            throw new Error(`account.execute() returned invalid result: ${JSON.stringify(result)?.slice(0, 200)}`);
+          }
           txHash = result.transaction_hash;
         } catch (execErr) {
-          // Log the actual error reason (truncateRpcError now extracts from end)
           info(`  execute() failed: ${truncateRpcError(execErr)}`);
           throw execErr;
         }
+      } else if (opts.cachedMaxFee) {
+        // Skip estimation — reuse cached fee from a previous successful chunk.
+        // This avoids nonce-stale errors during rapid sequential chunk uploads.
+        const feeDetails = { feeMode: { mode: "sponsored" } };
+        const result = await account.executePaymasterTransaction(
+          Array.isArray(calls) ? calls : [calls],
+          feeDetails,
+          opts.cachedMaxFee
+        );
+        if (!result || typeof result !== "object" || !result.transaction_hash) {
+          throw new Error(`executePaymasterTransaction returned invalid result: ${JSON.stringify(result)?.slice(0, 200)}`);
+        }
+        txHash = result.transaction_hash;
       } else {
-        txHash = await executeViaPaymaster(account, calls, undefined);
+        txHash = await executeViaPaymaster(account, calls);
+      }
+      // Validate txHash before proceeding — catch undefined/null from broken RPC responses.
+      if (!txHash || typeof txHash !== "string" || !/^0x[0-9a-fA-F]+$/i.test(txHash)) {
+        throw new Error(`${label}: received invalid txHash: ${JSON.stringify(txHash)}`);
       }
       info(`  TX: ${txHash}`);
       const receipt = await waitWithTimeout(txHash);
-      const execStatus = receipt.execution_status ?? receipt.status ?? "unknown";
+      const execStatus = receipt.execution_status ?? receipt.finality_status ?? receipt.status ?? "unknown";
       if (execStatus === "REVERTED") {
-        die(`  ${label} reverted: ${receipt.revert_reason || "unknown"}`);
+        const reason = receipt.revert_reason || "unknown";
+        // Nonce-related reverts are retryable — throw instead of die() so outer retry loops can handle them.
+        if (/nonce|desynchroni|already used|too (high|old)/i.test(reason)) {
+          throw new Error(`${label} reverted (retryable nonce error): ${reason}`);
+        }
+        die(`  ${label} reverted: ${reason}`);
+      }
+      if (execStatus !== "SUCCEEDED" && execStatus !== "ACCEPTED_ON_L2") {
+        // TX was RECEIVED but never confirmed, or unknown status.
+        // This indicates the RPC mempool dropped the TX (common with large calldata).
+        const msg = `${label} TX status: ${execStatus} (expected SUCCEEDED or ACCEPTED_ON_L2)`;
+        if (execStatus === "RECEIVED" || execStatus === "PENDING") {
+          // TX was accepted by RPC but never included in a block — likely mempool drop.
+          throw new Error(`${msg}. TX likely dropped by RPC mempool. Retry with smaller chunks (OBELYSK_CHUNK_SIZE).`);
+        }
+        throw new Error(msg);
       }
       return { txHash, receipt };
     }
 
-    // ── Step 1: open_gkr_session ──
-    const { txHash: openTxHash, receipt: openReceipt } = await execCall(
-      "open_gkr_session",
-      [
-        modelId,
-        String(verifyPayload.totalFelts),
-        String(verifyPayload.circuitDepth),
-        String(verifyPayload.numLayers),
-        String(verifyPayload.weightBindingMode),
-        verifyPayload.packed ? "1" : "0",
-      ],
-      "open_gkr_session"
-    );
-
-    // Parse session_id from events.
+    // ── Step 1: open_gkr_session (or resume) ──
+    e2ePhase("Opening GKR session");
     let sessionId = null;
-    const events = openReceipt.events ?? [];
-    for (const ev of events) {
-      // GkrSessionOpened event has session_id as first key.
-      if (ev.keys && ev.keys.length >= 2) {
-        // key[0] is the event selector, key[1] is session_id.
-        sessionId = ev.keys[1];
-        break;
+    let sessionState = null;
+    let sessionFile = null;
+    let resumeFromChunk = 0;
+
+    if (resumeState) {
+      // Resume existing session (uploading or sealed)
+      sessionId = resumeState.sessionId;
+      sessionState = resumeState;
+      sessionFile = resumeFile;
+      resumeFromChunk = resumeIsSealedOnly ? verifyPayload.numChunks : resumeState.chunksUploaded;
+      if (resumeIsSealedOnly) {
+        info(`  Resuming sealed session ${sessionId} — skipping to verify`);
+      } else {
+        info(`  Resuming session ${sessionId} from chunk ${resumeFromChunk}`);
       }
-    }
-    if (!sessionId) {
-      // Fallback: parse from data[0] if keys don't work.
+    } else {
+      // Open new session
+      const { txHash: openTxHash, receipt: openReceipt } = await execCall(
+        "open_gkr_session",
+        [
+          modelId,
+          String(verifyPayload.totalFelts),
+          String(verifyPayload.circuitDepth),
+          String(verifyPayload.numLayers),
+          String(verifyPayload.weightBindingMode),
+          verifyPayload.packed ? "1" : "0",
+        ],
+        "open_gkr_session"
+      );
+
+      // Parse session_id from events.
+      // Look for GkrSessionOpened event: key[0]=selector, key[1]=session_id.
+      // CRITICAL: Only accept events emitted by our contract (from_address match).
+      const events = openReceipt.events ?? [];
+      const contractNorm = contract.toLowerCase().replace(/^0x0*/, "0x");
       for (const ev of events) {
-        if (ev.data && ev.data.length >= 1) {
-          sessionId = ev.data[0];
-          break;
+        const evFrom = (ev.from_address || "").toLowerCase().replace(/^0x0*/, "0x");
+        if (evFrom !== contractNorm) continue; // Skip events from other contracts
+        if (ev.keys && ev.keys.length >= 2) {
+          const candidateId = ev.keys[1];
+          if (candidateId && candidateId !== "0x0") {
+            try { if (BigInt(candidateId) !== 0n) { sessionId = candidateId; break; } } catch { /* skip malformed */ }
+          }
         }
       }
-    }
-    if (!sessionId) {
-      die("Could not parse session_id from open_gkr_session events");
-    }
-    info(`  Session ID: ${sessionId}`);
+      if (!sessionId) {
+        // Fallback: parse from data[0] — some contract versions emit session_id in data.
+        // Still only accept events from our contract.
+        for (const ev of events) {
+          const evFrom = (ev.from_address || "").toLowerCase().replace(/^0x0*/, "0x");
+          if (evFrom !== contractNorm) continue;
+          if (ev.data && ev.data.length >= 1 && ev.data[0] !== "0x0") {
+            try { if (BigInt(ev.data[0]) !== 0n) { sessionId = ev.data[0]; break; } } catch { /* skip malformed */ }
+          }
+        }
+      }
+      if (!sessionId) {
+        die("Could not parse session_id from open_gkr_session events. " +
+            `Receipt had ${events.length} events. ` +
+            "Ensure the contract emits GkrSessionOpened with session_id in keys[1] or data[0].");
+      }
+      info(`  Session ID: ${sessionId}`);
 
-    // Save session state for resumability.
-    const sessionFile = join(sessionDir, `${sessionId.slice(0, 18)}.json`);
-    const sessionState = {
-      sessionId,
-      modelId,
-      contract,
-      totalFelts: verifyPayload.totalFelts,
-      numChunks: verifyPayload.numChunks,
-      chunksUploaded: 0,
-      txHashes: [openTxHash],
-      status: "uploading",
-      createdAt: new Date().toISOString(),
-    };
-    writeFileSync(sessionFile, JSON.stringify(sessionState, null, 2));
+      // Save session state for resumability — persist IMMEDIATELY to prevent
+      // duplicate sessions if the script crashes before the first chunk upload.
+      sessionFile = resumeFile;
+      const openBlockNumber = (() => {
+        if (!openReceipt.block_number) return null;
+        const n = Number(openReceipt.block_number);
+        return Number.isFinite(n) && n >= 0 ? n : null;
+      })();
+      sessionState = {
+        sessionId,
+        modelId,
+        contract,
+        totalFelts: verifyPayload.totalFelts,
+        numChunks: verifyPayload.numChunks,
+        chunksUploaded: 0,
+        txHashes: [openTxHash],
+        status: "uploading",
+        createdAt: new Date().toISOString(),
+        createdAt_block: openBlockNumber,
+        proofContentHash,
+      };
+      safeWriteJson(sessionFile, sessionState);
+    }
 
     // ── Step 2: upload_gkr_chunk × N ──
+    // Pre-upload integrity check: verify chunk felt counts sum to total_felts.
+    // Catches data corruption from re-chunking, truncated JSON, or version mismatches.
+    {
+      const chunkFeltSum = verifyPayload.uploadChunks.reduce((sum, c) => sum + c.length, 0);
+      if (chunkFeltSum !== verifyPayload.totalFelts) {
+        die(
+          `Chunk data integrity check failed: sum of chunk lengths (${chunkFeltSum}) !== total_felts (${verifyPayload.totalFelts}).\n` +
+          `  This indicates data corruption in the proof file or a chunking bug.`
+        );
+      }
+      info(`Chunk integrity OK: ${chunkFeltSum} felts across ${verifyPayload.numChunks} chunks`);
+    }
+
+    e2ePhase("Uploading chunks");
     // First chunk uses normal fee estimation (may need retries for nonce sync).
-    // Subsequent chunks reuse cached resource bounds with 2x safety margin,
+    // Subsequent chunks reuse cached paymaster max fee with 1.5x safety margin,
     // skipping estimateFee entirely to avoid nonce-stale errors on public RPCs.
     const MAX_RETRIES = 5;
-    const INTER_CHUNK_DELAY_MS = parseInt(process.env.OBELYSK_CHUNK_DELAY_MS || "3000", 10);
+    // Default inter-chunk delay reduced from 3s to 1.5s.
+    // Inter-chunk delay: 500ms default is sufficient — Starknet blocks arrive ~6s
+    // apart, and the retry loop handles nonce errors if we submit too fast.
+    // Override: OBELYSK_CHUNK_DELAY_MS=1500 for conservative public RPCs.
+    const INTER_CHUNK_DELAY_MS = (() => {
+      const raw = process.env.OBELYSK_CHUNK_DELAY_MS;
+      if (raw === undefined || raw === null || String(raw).trim() === "") return 500;
+      const n = parseInt(raw, 10);
+      if (!Number.isFinite(n) || n < 0) {
+        die(`OBELYSK_CHUNK_DELAY_MS must be a non-negative integer (got: "${raw}")`);
+      }
+      return n;
+    })();
     const uploadStartTime = Date.now();
-    for (let i = 0; i < verifyPayload.numChunks; i++) {
+    if (resumeFromChunk > 0) {
+      info(`Skipping ${resumeFromChunk} already-uploaded chunks...`);
+    }
+    // Re-estimate paymaster fee every N chunks. Default 30 is conservative:
+    // gas prices rarely shift enough in ~3min to cause INSUFFICIENT errors,
+    // and the INSUFFICIENT handler already clears the cache reactively.
+    const FEE_RE_ESTIMATE_INTERVAL = parsePositiveIntEnv("OBELYSK_FEE_RE_ESTIMATE_INTERVAL", 30);
+    for (let i = resumeFromChunk; i < verifyPayload.numChunks; i++) {
       const chunk = verifyPayload.uploadChunks[i];
       const pct = ((i / verifyPayload.numChunks) * 100).toFixed(1);
-      let uploaded = false;
-      const execOpts = cachedChunkResourceBounds ? { resourceBounds: cachedChunkResourceBounds } : {};
+      // ETA based on average upload time so far
+      const chunksUploaded = i - resumeFromChunk;
+      let etaStr = "";
+      if (chunksUploaded > 0) {
+        const avgMs = (Date.now() - uploadStartTime) / chunksUploaded;
+        const remainMs = avgMs * (verifyPayload.numChunks - i);
+        const remainSec = Math.round(remainMs / 1000);
+        etaStr = `, ETA ${Math.floor(remainSec / 60)}m ${remainSec % 60}s`;
+      }
+      // Periodically re-estimate fee to handle gas price spikes during long uploads
+      if (cachedPaymasterMaxFee && chunksUploaded > 0 && chunksUploaded % FEE_RE_ESTIMATE_INTERVAL === 0) {
+        info(`  Re-estimating paymaster fee (every ${FEE_RE_ESTIMATE_INTERVAL} chunks)...`);
+        cachedPaymasterMaxFee = null;
+      }
       for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+        // Rebuild execOpts on every attempt so cache clears take effect immediately.
+        const execOpts = cachedPaymasterMaxFee ? { cachedMaxFee: cachedPaymasterMaxFee } : {};
         try {
           const { txHash: chunkTxHash, receipt: chunkReceipt } = await execCall(
             "upload_gkr_chunk",
             [sessionId, String(i), String(chunk.length), ...chunk],
-            `upload_gkr_chunk[${i + 1}/${verifyPayload.numChunks}] (${chunk.length} felts, ${pct}%)`,
+            `upload_gkr_chunk[${i + 1}/${verifyPayload.numChunks}] (${chunk.length} felts, ${pct}%${etaStr})`,
             execOpts
           );
-          // Cache resource bounds from the first successful chunk receipt.
-          // We reuse the SAME resource bounds that the SDK computed for chunk 0
-          // on all subsequent chunks, skipping estimateFee entirely.
-          if (!cachedChunkResourceBounds && chunkReceipt) {
-            // Use a generous fixed bound: 20M l2_gas at a fixed price.
-            // This avoids BigInt/string type mixing issues with starknet.js v8.
-            cachedChunkResourceBounds = {
-              l1_gas: { max_amount: 0n, max_price_per_unit: 0n },
-              l2_gas: { max_amount: 20000000n, max_price_per_unit: 100000000000n },
-              l1_data_gas: { max_amount: 0n, max_price_per_unit: 0n },
-            };
-            info(`  Cached fixed resource bounds for subsequent chunks`);
+          // Cache the paymaster max fee from the first successful chunk.
+          // Subsequent chunks reuse this fee, skipping estimateFee entirely
+          // to avoid nonce-stale errors on public RPCs during rapid uploads.
+          if (!cachedPaymasterMaxFee && !noPaymaster) {
+            // Re-estimate once after first chunk succeeds to get a valid fee baseline.
+            // The first chunk went through executeViaPaymaster (full estimation),
+            // so we estimate the same call shape and cache the result.
+            try {
+              const callsArray = [{
+                contractAddress: contract,
+                entrypoint: "upload_gkr_chunk",
+                calldata: CallData.compile([sessionId, String(0), String(chunk.length), ...chunk]),
+              }];
+              const feeDetails = { feeMode: { mode: "sponsored" } };
+              const estimation = await account.estimatePaymasterTransactionFee(callsArray, feeDetails);
+              // Apply 2x safety margin on the estimated fee to handle gas price fluctuations.
+              const feeStr = estimation?.suggested_max_fee_in_gas_token;
+              if (!feeStr) throw new Error("Fee estimation missing suggested_max_fee_in_gas_token");
+              const fee = BigInt(feeStr);
+              cachedPaymasterMaxFee = "0x" + (fee * 2n).toString(16);
+              info(`  Cached paymaster max fee: ${cachedPaymasterMaxFee} (2x margin)`);
+            } catch (feeErr) {
+              info(`  Could not cache paymaster fee: ${truncateRpcError(feeErr)}`);
+              // Will continue with full estimation on each chunk (slower but safe)
+            }
           }
           sessionState.chunksUploaded = i + 1;
           sessionState.txHashes.push(chunkTxHash);
-          writeFileSync(sessionFile, JSON.stringify(sessionState, null, 2));
-          uploaded = true;
+          safeWriteJson(sessionFile, sessionState);
           break;
         } catch (e) {
           const errMsg = truncateRpcError(e);
           info(`  Chunk ${i} attempt ${attempt + 1} failed: ${errMsg}`);
-          // If cached bounds caused the failure, clear them and retry with estimation.
-          if (cachedChunkResourceBounds && (errMsg.includes("INSUFFICIENT") || errMsg.includes("insufficient"))) {
-            info(`  Clearing cached resource bounds, will re-estimate...`);
-            cachedChunkResourceBounds = null;
+          // If cached fee caused the failure, clear it and retry with full estimation.
+          if (cachedPaymasterMaxFee && (errMsg.includes("INSUFFICIENT") || errMsg.includes("insufficient"))) {
+            info(`  Clearing cached paymaster fee, will re-estimate...`);
+            cachedPaymasterMaxFee = null;
           }
           if (attempt < MAX_RETRIES - 1) {
-            const backoffMs = Math.min((attempt + 1) * 5000, 20000);
+            // Rate-limited responses (429, "too many") need much longer backoff.
+            const isRateLimit = /429|rate.?limit|too many|throttl/i.test(errMsg);
+            const backoffMs = isRateLimit
+              ? Math.min((attempt + 1) * 30000, 60000)
+              : Math.min((attempt + 1) * 5000, 20000);
+            if (isRateLimit) info(`  Rate limited — using extended backoff`);
             info(`  Retrying in ${backoffMs / 1000}s...`);
             await new Promise((r) => setTimeout(r, backoffMs));
           } else {
-            die(`Failed to upload chunk ${i} after ${MAX_RETRIES} attempts`);
+            die(
+              `Failed to upload chunk ${i} after ${MAX_RETRIES} attempts.\n` +
+              `  Session ${sessionId} is still open on-chain. You can:\n` +
+              `  1. Re-run the script to auto-resume from chunk ${i}\n` +
+              `  2. Delete ${resumeFile} to start a fresh session`
+            );
           }
         }
       }
-      // Delay between chunks to let RPC nonce state sync
+      // Inter-chunk delay: combines minimum sleep with lightweight nonce check.
+      // The retry loop handles nonce errors, so this is best-effort to reduce retries.
       if (i < verifyPayload.numChunks - 1 && INTER_CHUNK_DELAY_MS > 0) {
         await new Promise((r) => setTimeout(r, INTER_CHUNK_DELAY_MS));
+        // Quick nonce check — if stale, wait a bit more before next chunk
+        try {
+          const nonce = BigInt(await provider.getNonceForAddress(account.address, "latest"));
+          // We've submitted (i+1) chunks + open_session TX = (i+2) total TXs from this account.
+          // If the RPC nonce lags significantly, add a short extra wait.
+          if (nonce < BigInt(i + 1)) {
+            await new Promise((r) => setTimeout(r, 2000));
+          }
+        } catch { /* proceed — retry loop handles failures */ }
       }
     }
     const uploadDuration = ((Date.now() - uploadStartTime) / 1000).toFixed(1);
     info(`All ${verifyPayload.numChunks} chunks uploaded in ${uploadDuration}s.`);
+    e2ePhase(`Chunks uploaded (${uploadDuration}s for ${verifyPayload.numChunks} chunks)`);
+
+    // Helper: wait for on-chain nonce to reach or exceed a target value.
+    // Polls the RPC every 3s until nonce >= target or timeout.
+    async function waitForNonce(targetNonceStr, maxWaitMs = 90000) {
+      let target;
+      try { target = BigInt(String(targetNonceStr).trim()); }
+      catch { throw new Error(`Invalid nonce target: ${targetNonceStr}`); }
+      const start = Date.now();
+      let lastNonce = 0n;
+      while (Date.now() - start < maxWaitMs) {
+        try {
+          const nonceResult = await provider.getNonceForAddress(account.address, "latest");
+          let current;
+          try { current = BigInt(nonceResult); }
+          catch { throw new Error(`Invalid nonce from RPC: ${JSON.stringify(nonceResult)?.slice(0, 100)}`); }
+          if (current >= target) {
+            info(`  Nonce synced: ${current} (target was ${target})`);
+            return true;
+          }
+          if (current !== lastNonce) {
+            info(`  Nonce progress: ${current} → target ${target}`);
+            lastNonce = current;
+          }
+        } catch {
+          // getNonceForAddress may fail on some RPCs; fall back to time-based wait
+        }
+        // 5s aligns with Starknet block time (~6s). Polling faster wastes RPC calls.
+        await new Promise((r) => setTimeout(r, 5000));
+      }
+      info(`  Nonce wait timed out after ${maxWaitMs / 1000}s`);
+      return false;
+    }
 
     // Helper: retry execCall for nonce-stale estimateFee errors.
-    // Waits for the nonce to refresh between retries by querying the RPC.
     async function execCallWithRetry(entrypoint, calldata, label, opts = {}, maxRetries = 10) {
+      let consecutiveNonceErrors = 0;
       for (let attempt = 0; attempt < maxRetries; attempt++) {
         try {
-          return await execCall(entrypoint, calldata, label, opts);
+          const result = await execCall(entrypoint, calldata, label, opts);
+          consecutiveNonceErrors = 0;
+          return result;
         } catch (e) {
           const fullMsg = e.message || String(e);
-          const isNonceError = /nonce/i.test(fullMsg) || /invalid transaction nonce/i.test(fullMsg);
+          const isNonceError = /nonce|desynchroni|already used|too (high|old)|nonce mismatch/i.test(fullMsg);
+          const isDroppedTx = /dropped|mempool/i.test(fullMsg);
+          // Permanent errors: don't waste retries on unrecoverable failures
+          const isPermanent = /class.?not.?found|not.?deployed|entry.?point.?not.?found|invalid.?txHash/i.test(fullMsg);
+          if (isPermanent) {
+            throw new Error(`Permanent error (not retrying): ${fullMsg}`);
+          }
+          // Circuit breaker: 3 consecutive nonce errors likely means unrecoverable state
+          if (isNonceError) {
+            consecutiveNonceErrors++;
+            if (consecutiveNonceErrors > 3) {
+              throw new Error(`Nonce error persisted after ${consecutiveNonceErrors} consecutive attempts: ${fullMsg}`);
+            }
+          } else {
+            consecutiveNonceErrors = 0;
+          }
           const msg = truncateRpcError(e);
           info(`  ${label} attempt ${attempt + 1} failed: ${msg}`);
           if (attempt < maxRetries - 1) {
-            // For nonce errors, wait longer and poll for nonce update
-            const backoffMs = isNonceError
-              ? Math.min((attempt + 1) * 10000, 60000) // 10s, 20s, 30s... up to 60s
-              : Math.min((attempt + 1) * 5000, 20000);
-            info(`  Retrying in ${backoffMs / 1000}s...`);
-            await new Promise((r) => setTimeout(r, backoffMs));
+            if (isNonceError) {
+              // Active nonce polling instead of blind sleep
+              info(`  Nonce error detected — polling for nonce sync...`);
+              try {
+                const currentNonce = await provider.getNonceForAddress(account.address, "latest");
+                // Wait for nonce to advance past current value
+                const waitTarget = String(BigInt(currentNonce) + 1n);
+                await waitForNonce(waitTarget, 60000);
+              } catch {
+                // Fallback to time-based wait
+                const backoffMs = Math.min((attempt + 1) * 10000, 60000);
+                info(`  Nonce poll unavailable, waiting ${backoffMs / 1000}s...`);
+                await new Promise((r) => setTimeout(r, backoffMs));
+              }
+            } else {
+              const backoffMs = isDroppedTx
+                ? Math.min((attempt + 1) * 8000, 30000)
+                : Math.min((attempt + 1) * 5000, 20000);
+              info(`  Retrying in ${backoffMs / 1000}s...`);
+              await new Promise((r) => setTimeout(r, backoffMs));
+            }
           } else {
             throw e;
           }
@@ -1305,11 +1794,15 @@ async function cmdVerify(args) {
       }
     }
 
-    // Wait for nonce to settle after the burst of chunk uploads
-    info("Waiting 30s for RPC nonce state to settle...");
-    await new Promise((r) => setTimeout(r, 30000));
+    // Skip nonce wait + seal if resuming a sealed session.
+    if (!resumeIsSealedOnly) {
+    // Each chunk's execCall already calls waitWithTimeout, confirming block inclusion.
+    // A brief settle is sufficient before sealing — no 90s nonce poll needed.
+    info("All chunks confirmed. Brief settle before seal...");
+    await new Promise((r) => setTimeout(r, 2000));
 
     // ── Step 3: seal_gkr_session ──
+    e2ePhase("Sealing session");
     const { txHash: sealTxHash } = await execCallWithRetry(
       "seal_gkr_session",
       [sessionId],
@@ -1317,24 +1810,60 @@ async function cmdVerify(args) {
     );
     sessionState.status = "sealed";
     sessionState.txHashes.push(sealTxHash);
-    writeFileSync(sessionFile, JSON.stringify(sessionState, null, 2));
+    safeWriteJson(sessionFile, sessionState);
 
-    // Wait for nonce to settle after seal TX
-    info("Waiting 15s for nonce sync...");
-    await new Promise((r) => setTimeout(r, 15000));
+    // Seal TX is already block-confirmed by waitWithTimeout inside execCallWithRetry.
+    // A short settle delay is sufficient for RPC state propagation before verify.
+    info("Seal TX confirmed. Brief settle before verify...");
+    await new Promise((r) => setTimeout(r, 2000));
+    } // end !resumeIsSealedOnly
 
     // ── Step 4: verify_gkr_from_session ──
-    const { txHash: verifyTxHash } = await execCallWithRetry(
-      "verify_gkr_from_session",
-      [sessionId],
-      "verify_gkr_from_session"
-    );
-    sessionState.status = "verified";
-    sessionState.txHashes.push(verifyTxHash);
-    writeFileSync(sessionFile, JSON.stringify(sessionState, null, 2));
+    // After seal, the session cannot be resumed (sealed sessions are immutable).
+    // Wrap in try/catch to ensure resume file cleanup even on verify failure.
+    let verifyTxHash;
+    try {
+      e2ePhase("Verifying session");
+      const result = await execCallWithRetry(
+        "verify_gkr_from_session",
+        [sessionId],
+        "verify_gkr_from_session"
+      );
+      verifyTxHash = result.txHash;
+      sessionState.status = "verified";
+      sessionState.txHashes.push(verifyTxHash);
+      safeWriteJson(sessionFile, sessionState);
+    } catch (verifyErr) {
+      // Session is sealed — keep resume file so next run can retry verify.
+      // Only delete on permanent (non-retryable) errors.
+      const verifyErrMsg = truncateRpcError(verifyErr);
+      const isPermanentVerifyErr = /entry.?point.?not.?found|class.?not.?found|not.?deployed|session.?not.?found|invalid.?session/i.test(verifyErrMsg);
+      if (isPermanentVerifyErr) {
+        try { if (existsSync(resumeFile)) unlinkSync(resumeFile); } catch { /* ignore */ }
+        die(`verify_gkr_from_session permanently failed: ${verifyErrMsg}`);
+      }
+      // Transient error: keep resume file with "sealed" status for retry on next run
+      info(`verify_gkr_from_session failed (transient): ${verifyErrMsg}`);
+      info(`  Session ${sessionId} is sealed. Re-run the script to retry verification.`);
+      info(`  Resume file: ${resumeFile}`);
+      die(`verify_gkr_from_session failed after seal: ${verifyErrMsg}`);
+    }
 
     // ── Check verification result ──
-    const verificationCountAfter = await fetchVerificationCount(provider, contract, modelId);
+    // Retry verification count query up to 3 times (RPC may lag behind L2 state)
+    // Retry verification count query with exponential backoff.
+    // Block propagation on Starknet can take 10-60s after TX confirmation,
+    // especially on congested blocks or when using public RPCs.
+    let verificationCountAfter = null;
+    const VC_MAX_ATTEMPTS = 8;
+    for (let vcAttempt = 0; vcAttempt < VC_MAX_ATTEMPTS; vcAttempt++) {
+      verificationCountAfter = await fetchVerificationCount(provider, contract, modelId);
+      if (verificationCountAfter !== null) break;
+      const waitMs = Math.min(3000 * Math.pow(1.5, vcAttempt), 15000);
+      info(`  Verification count query attempt ${vcAttempt + 1}/${VC_MAX_ATTEMPTS} failed, retrying in ${(waitMs / 1000).toFixed(0)}s...`);
+      await new Promise((r) => setTimeout(r, waitMs));
+    }
+
     let verificationCountDelta = null;
     let acceptedOnchain = false;
     let acceptanceEvidence = "unknown";
@@ -1342,14 +1871,36 @@ async function cmdVerify(args) {
       verificationCountDelta = verificationCountAfter - verificationCountBefore;
       acceptedOnchain = verificationCountDelta > 0n;
       acceptanceEvidence = "verification_count_delta";
+    } else if (verificationCountAfter !== null) {
+      acceptedOnchain = verificationCountAfter > 0n;
+      acceptanceEvidence = "verification_count_observed";
     } else {
-      acceptedOnchain = true;
-      acceptanceEvidence = "tx_success_only_unconfirmed";
+      // Last resort: try is_proof_verified as fallback
+      const proofVerifiedFlag = await fetchProofVerifiedFlag(provider, contract, modelId);
+      if (proofVerifiedFlag !== null) {
+        acceptedOnchain = proofVerifiedFlag;
+        acceptanceEvidence = "is_proof_verified_fallback";
+      } else {
+        // Cannot confirm — DO NOT assume success
+        acceptedOnchain = false;
+        acceptanceEvidence = "unconfirmed_rpc_unavailable";
+        info("WARNING: Could not confirm on-chain acceptance. RPC view methods unavailable.");
+        info("  The verify_gkr_from_session TX succeeded, but acceptance is unconfirmed.");
+        info("  Check manually: is_proof_verified(" + modelId + ") on " + contract);
+      }
     }
 
+    // Clean up resume file on completion (success or confirmed failure)
+    try { if (existsSync(resumeFile)) unlinkSync(resumeFile); } catch { /* ignore */ }
+
     const totalTxs = sessionState.txHashes.length;
+    const e2eTotalSec = ((Date.now() - e2eStart) / 1000).toFixed(1);
+    const e2eMinutes = Math.floor(e2eTotalSec / 60);
+    const e2eRemainSec = Math.round(e2eTotalSec % 60);
     const explorerUrl = `${net.explorer}${verifyTxHash}`;
-    info(`Session complete: ${totalTxs} TXs`);
+
+    e2ePhase("Complete");
+    info(`Session complete: ${totalTxs} TXs in ${e2eTotalSec}s (${e2eMinutes}m ${e2eRemainSec}s)`);
     info(`Explorer (verify): ${explorerUrl}`);
     info(`Accepted on-chain: ${acceptedOnchain}`);
 
@@ -1369,13 +1920,14 @@ async function cmdVerify(args) {
       acceptanceEvidence,
       gasSponsored: !noPaymaster,
       accountDeployed: false,
-      executionStatus: "ACCEPTED_ON_L2",
+      executionStatus: acceptedOnchain ? "ACCEPTED_ON_L2" : "UNCONFIRMED",
       entrypoint: "verify_gkr_from_session",
-      onchainAssurance: "full_gkr",
+      onchainAssurance: acceptedOnchain ? "full_gkr" : "unconfirmed",
       sessionId,
       uploadedChunks: verifyPayload.numChunks,
       totalTxs,
       allTxHashes: sessionState.txHashes,
+      e2eDurationSeconds: parseFloat(e2eTotalSec),
     });
     return;
   }
@@ -1383,6 +1935,7 @@ async function cmdVerify(args) {
   // ═══════════════════════════════════════════════════════════════════
   // Single-TX Flow (schema_version 1)
   // ═══════════════════════════════════════════════════════════════════
+  const singleTxStart = Date.now();
   if (
     !new Set(["verify_model_gkr", "verify_model_gkr_v2", "verify_model_gkr_v3", "verify_model_gkr_v4"]).has(
       verifyPayload.entrypoint
@@ -1394,6 +1947,67 @@ async function cmdVerify(args) {
   }
 
   await preflightContractEntrypoint(provider, contract, verifyPayload.entrypoint);
+
+  // ── Auto-register model if needed (single-TX path) ──
+  {
+    let needsReg = false;
+    try {
+      const rr = await provider.callContract({
+        contractAddress: contract,
+        entrypoint: "get_model_circuit_hash",
+        calldata: CallData.compile([modelId]),
+      });
+      const ch = rr.result ? rr.result[0] : "0x0";
+      try {
+        needsReg = !ch || ch === "0x0" || BigInt(ch) === 0n;
+      } catch {
+        needsReg = true;
+      }
+      if (!needsReg) info(`Model already registered (circuit_hash: ${ch})`);
+    } catch {
+      info("Could not check model registration (will attempt registration)");
+      needsReg = true;
+    }
+    if (needsReg) {
+      const rc = proofData.register_calldata;
+      if (!rc || !Array.isArray(rc) || rc.length === 0) {
+        die(
+          "Model is not registered and proof file does not contain register_calldata.\n" +
+          "  Re-generate the proof with the latest prove-model binary, or register manually."
+        );
+      }
+      info(`Registering model (${rc.length} calldata felts)...`);
+      const regCalls = [{
+        contractAddress: contract,
+        entrypoint: "register_model_gkr",
+        calldata: CallData.compile(rc),
+      }];
+      try {
+        let rTx;
+        if (noPaymaster) {
+          const execResult = await account.execute(regCalls);
+          if (!execResult || !execResult.transaction_hash) {
+            throw new Error(`account.execute() returned invalid result: ${JSON.stringify(execResult)?.slice(0, 200)}`);
+          }
+          rTx = execResult.transaction_hash;
+        } else {
+          rTx = await executeViaPaymaster(account, regCalls);
+        }
+        info(`  Registration TX: ${rTx}`);
+        const rReceipt = await waitWithTimeout(rTx, 120000);
+        const rStatus = rReceipt.execution_status ?? rReceipt.status ?? "unknown";
+        if (rStatus === "REVERTED" && !/already.?registered/i.test(rReceipt.revert_reason || "")) {
+          die(`  Registration reverted: ${rReceipt.revert_reason || "unknown"}`);
+        }
+        info(`  Model registered (status: ${rStatus})`);
+      } catch (regErr) {
+        if (!/already.?registered/i.test(truncateRpcError(regErr))) {
+          die(`  Registration failed: ${truncateRpcError(regErr)}`);
+        }
+        info("  Model already registered (OK)");
+      }
+    }
+  }
 
   const verificationCountBefore = await fetchVerificationCount(
     provider,
@@ -1417,54 +2031,104 @@ async function cmdVerify(args) {
   info(`Contract: ${contract}`);
   info(`Calldata elements: ${verifyPayload.calldata.length}`);
 
-  // ── Execute ──
+  // ── Execute with retry (matches chunked path reliability) ──
   let txHash;
   let gasSponsored = !noPaymaster;
+  const SINGLE_TX_MAX_RETRIES = 5;
+  let consecutiveNonceErrors = 0;
 
-  if (noPaymaster) {
-    // Direct execution — account pays gas (needs STRK balance)
-    info("Submitting directly (no paymaster)...");
+  for (let attempt = 0; attempt < SINGLE_TX_MAX_RETRIES; attempt++) {
     try {
-      const result = await account.execute(calls);
-      txHash = result.transaction_hash;
-    } catch (e) {
-      die(`Direct submission failed: ${truncateRpcError(e)}`);
-    }
-  } else {
-    try {
-      txHash = await executeViaPaymaster(account, calls, undefined);
+      if (noPaymaster) {
+        if (attempt === 0) info("Submitting directly (no paymaster)...");
+        const result = await account.execute(calls);
+        if (!result || !result.transaction_hash) {
+          throw new Error(`account.execute() returned invalid result: ${JSON.stringify(result)?.slice(0, 200)}`);
+        }
+        txHash = result.transaction_hash;
+      } else {
+        txHash = await executeViaPaymaster(account, calls);
+      }
+      break; // success
     } catch (e) {
       const msg = truncateRpcError(e);
-      if (msg.includes("not eligible") || msg.includes("not supported") || msg.includes("SNIP-9")) {
-        die(
-          `Paymaster rejected transaction: ${msg}\n` +
-            "This may mean:\n" +
-            "  - Account is not SNIP-9 compatible (needed for paymaster)\n" +
-            "  - The dApp is not registered with AVNU for sponsored mode\n" +
-            "  - Daily gas limit exceeded\n" +
-            "Try: --no-paymaster (account pays gas directly)"
-        );
+      // Nonce circuit breaker: 2 consecutive nonce errors → account state is broken
+      const isNonceError = /nonce|desynchroni|already used|too (high|old)|nonce mismatch/i.test(msg);
+      if (isNonceError) {
+        consecutiveNonceErrors++;
+        if (consecutiveNonceErrors >= 2) {
+          die(
+            `Nonce error persisted after ${consecutiveNonceErrors} attempts: ${msg}\n` +
+              "  The account nonce is desynchronized. This can happen when:\n" +
+              "  - A previous TX is stuck in the mempool\n" +
+              "  - Another process submitted TXs from the same account\n" +
+              "  Wait a few minutes and retry, or use a fresh ephemeral account."
+          );
+        }
+      } else {
+        consecutiveNonceErrors = 0;
       }
-      die(`Paymaster submission failed: ${msg}`);
+      // Permanent errors: don't retry
+      const isPermanent = /not.?eligible|not.?supported|SNIP-9|class.?not.?found|entry.?point.?not.?found|insufficient.?balance|balance.?too.?low|insufficient.?funds/i.test(msg);
+      if (isPermanent) {
+        if (msg.includes("not eligible") || msg.includes("not supported") || msg.includes("SNIP-9")) {
+          die(
+            `Paymaster rejected transaction: ${msg}\n` +
+              "This may mean:\n" +
+              "  - Account is not SNIP-9 compatible (needed for paymaster)\n" +
+              "  - The dApp is not registered with AVNU for sponsored mode\n" +
+              "  - Daily gas limit exceeded\n" +
+              "Try: --no-paymaster (account pays gas directly)"
+          );
+        }
+        if (/insufficient.?balance|balance.?too.?low|insufficient.?funds/i.test(msg)) {
+          die(
+            `Account has insufficient balance: ${msg}\n` +
+              "The account does not have enough STRK/ETH for gas.\n" +
+              "  - If using --no-paymaster: fund the account before retrying\n" +
+              "  - If using paymaster: the paymaster may have rejected sponsorship;\n" +
+              "    check the AVNU dashboard or try again later"
+          );
+        }
+        die(`${noPaymaster ? "Direct" : "Paymaster"} submission failed (permanent): ${msg}`);
+      }
+      info(`  Attempt ${attempt + 1}/${SINGLE_TX_MAX_RETRIES} failed: ${msg}`);
+      if (attempt < SINGLE_TX_MAX_RETRIES - 1) {
+        const isRateLimit = /429|rate.?limit|too many|throttl/i.test(msg);
+        const backoffMs = isRateLimit
+          ? Math.min((attempt + 1) * 30000, 60000)
+          : Math.min((attempt + 1) * 5000, 20000);
+        info(`  Retrying in ${backoffMs / 1000}s...`);
+        await new Promise((r) => setTimeout(r, backoffMs));
+      } else {
+        die(`${noPaymaster ? "Direct" : "Paymaster"} submission failed after ${SINGLE_TX_MAX_RETRIES} attempts: ${msg}`);
+      }
     }
   }
 
   info(`TX submitted: ${txHash}`);
   info("Waiting for confirmation...");
 
-  const receipt = await provider.waitForTransaction(txHash);
-  const execStatus = receipt.execution_status ?? receipt.status ?? "unknown";
+  const receipt = await waitWithTimeout(txHash);
+  const execStatus = receipt.execution_status ?? receipt.finality_status ?? receipt.status ?? "unknown";
 
   if (execStatus === "REVERTED") {
     die(`TX reverted: ${receipt.revert_reason || "unknown reason"}`);
   }
 
   // ── Check post-submit verification status with assurance separation ──
-  const verificationCountAfter = await fetchVerificationCount(
-    provider,
-    contract,
-    modelId
-  );
+  // Retry verification count fetch with exponential backoff (matches chunked path).
+  let verificationCountAfter = null;
+  const VC_MAX_ATTEMPTS = 8;
+  for (let vcAttempt = 0; vcAttempt < VC_MAX_ATTEMPTS; vcAttempt++) {
+    verificationCountAfter = await fetchVerificationCount(provider, contract, modelId);
+    if (verificationCountAfter !== null) break;
+    if (vcAttempt < VC_MAX_ATTEMPTS - 1) {
+      const waitMs = Math.min(3000 * Math.pow(1.5, vcAttempt), 15000);
+      info(`  Verification count query attempt ${vcAttempt + 1}/${VC_MAX_ATTEMPTS} failed, retrying in ${(waitMs / 1000).toFixed(0)}s...`);
+      await new Promise((r) => setTimeout(r, waitMs));
+    }
+  }
   let verificationCountDelta = null;
   let hasAnyVerification = false;
   let acceptedOnchain = false;
@@ -1487,24 +2151,34 @@ async function cmdVerify(args) {
       acceptedOnchain = proofVerifiedFlag;
       acceptanceEvidence = "is_proof_verified_fallback";
     } else {
-      // Final fallback: tx executed successfully, but acceptance cannot be confirmed.
-      acceptedOnchain = true;
+      // Cannot confirm on-chain acceptance — DO NOT assume success.
+      // Match chunked flow behavior: report as unconfirmed.
+      acceptedOnchain = false;
       hasAnyVerification = false;
-      acceptanceEvidence = "tx_success_only_unconfirmed";
-      info(
-        "Could not verify acceptance via contract view methods; using tx success only."
-      );
+      acceptanceEvidence = "unconfirmed_rpc_unavailable";
+      info("WARNING: Could not confirm on-chain acceptance. RPC view methods unavailable.");
+      info("  The verify TX succeeded, but acceptance is unconfirmed.");
+      info("  Check manually: is_proof_verified(" + modelId + ") on " + contract);
     }
   }
 
+  // If verification count didn't increase, try is_proof_verified fallback before giving up.
   if (!acceptedOnchain && acceptanceEvidence === "verification_count_delta") {
-    die(
-      "On-chain acceptance check failed: verification_count did not increase. " +
-        "Likely replayed proof (already verified) or verifier-side rejection."
-    );
+    info("WARNING: verification_count did not increase. Checking is_proof_verified fallback...");
+    const proofVerifiedFallback = await fetchProofVerifiedFlag(provider, contract, modelId);
+    if (proofVerifiedFallback === true) {
+      acceptedOnchain = true;
+      hasAnyVerification = true;
+      acceptanceEvidence = "is_proof_verified_fallback";
+      info("  Confirmed via is_proof_verified fallback.");
+    } else {
+      info("WARNING: Could not confirm verification via either method.");
+      info("  This may indicate a replayed proof or verifier-side rejection.");
+      info("  Check manually: is_proof_verified(" + modelId + ") on " + contract);
+    }
   }
 
-  const onchainAssurance = "full_gkr";
+  const onchainAssurance = acceptedOnchain ? "full_gkr" : "unconfirmed";
   const fullGkrVerified = acceptedOnchain;
   const isVerified = fullGkrVerified;
 
@@ -1543,8 +2217,11 @@ async function cmdVerify(args) {
     executionStatus: execStatus,
     entrypoint: verifyPayload.entrypoint,
     onchainAssurance,
-    sessionId: verifyPayload.sessionId,
-    uploadedChunks: verifyPayload.uploadChunks.length,
+    sessionId: verifyPayload.sessionId || null,
+    uploadedChunks: verifyPayload.uploadChunks ? verifyPayload.uploadChunks.length : 0,
+    totalTxs: 1,
+    allTxHashes: [txHash],
+    e2eDurationSeconds: parseFloat(((Date.now() - singleTxStart) / 1000).toFixed(1)),
   });
 }
 
@@ -1578,7 +2255,7 @@ async function cmdSetup(args) {
   }
 
   const provider = getProvider(network);
-  const deployer = getAccount(provider, deployerKey, deployerAddress);
+  const deployer = getAccount(provider, deployerKey, deployerAddress, network);
 
   // Generate new keypair for the pipeline account
   info("Generating new Stark keypair...");
@@ -1607,36 +2284,68 @@ async function cmdSetup(args) {
   info(`TX: ${txHash}`);
 
   info("Waiting for confirmation...");
-  const receipt = await provider.waitForTransaction(txHash);
-  const execStatus = receipt.execution_status ?? receipt.status ?? "unknown";
+  const receipt = await waitWithTimeout(txHash, 180000);
+  const execStatus = receipt.execution_status ?? receipt.finality_status ?? receipt.status ?? "unknown";
   if (execStatus === "REVERTED") {
     die(`Account deployment reverted: ${receipt.revert_reason || "unknown"}`);
   }
 
-  // Parse AccountDeployed event
+  // Parse AccountDeployed event — filter by from_address to avoid matching
+  // events from other contracts (e.g. identity registry mint, ERC-721 transfer).
   let accountAddress = null;
   let agentId = null;
+  const factoryAddress = args.factory || net.factory;
   const events = receipt.events || [];
   for (const event of events) {
+    // Only consider events emitted by the factory contract
+    if (event.from_address) {
+      try {
+        if (BigInt(event.from_address) !== BigInt(factoryAddress)) continue;
+      } catch { continue; }
+    }
     if (
       event.keys &&
       event.keys.length >= 3 &&
       event.data &&
       event.data.length >= 3
     ) {
-      const possiblePubKey = event.keys[2];
-      if (possiblePubKey && BigInt(possiblePubKey) === BigInt(publicKey)) {
-        accountAddress = "0x" + BigInt(event.keys[1]).toString(16);
-        const idLow = BigInt(event.data[0] || "0");
-        const idHigh = BigInt(event.data[1] || "0");
-        agentId = (idLow + (idHigh << 128n)).toString();
-        break;
-      }
+      try {
+        const possiblePubKey = event.keys[2];
+        if (possiblePubKey && BigInt(possiblePubKey) === BigInt(publicKey)) {
+          accountAddress = "0x" + BigInt(event.keys[1]).toString(16);
+          const idLow = BigInt(event.data[0] || "0");
+          const idHigh = BigInt(event.data[1] || "0");
+          agentId = (idLow + (idHigh << 128n)).toString();
+          break;
+        }
+      } catch { /* skip malformed event data */ }
     }
   }
 
   if (!accountAddress) {
-    die("Could not parse AccountDeployed event from receipt");
+    // CRITICAL: Deploy TX succeeded but we can't find the account address.
+    // Save partial config so the private key isn't lost — the account exists on-chain.
+    const partialConfig = {
+      address: null,
+      privateKey,
+      publicKey,
+      agentId: null,
+      network,
+      ephemeral: false,
+      factory: factoryAddress,
+      deployedAt: new Date().toISOString(),
+      deployTxHash: txHash,
+      parseFailure: true,
+      eventCount: events.length,
+    };
+    saveAccountConfig(partialConfig);
+    die(
+      `Deploy TX succeeded (${txHash}) but could not parse AccountDeployed event.\n` +
+        `  ${events.length} events found in receipt, none matched factory ${factoryAddress}.\n` +
+        `  Private key SAVED to ${ACCOUNT_CONFIG_FILE} — do NOT delete this file.\n` +
+        `  To recover: inspect TX events on the explorer (${net.explorer}${txHash})\n` +
+        `  and manually set the "address" field in ${ACCOUNT_CONFIG_FILE}.`
+    );
   }
 
   // Save config
