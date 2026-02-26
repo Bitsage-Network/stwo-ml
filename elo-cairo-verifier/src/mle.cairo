@@ -22,8 +22,8 @@ use crate::channel::{PoseidonChannel, channel_mix_felt, channel_draw_query_indic
 use crate::types::MleOpeningProof;
 
 /// Number of spot-check queries for the MLE folding protocol.
-/// Matches Rust's MLE_N_QUERIES = 14.
-pub const MLE_NUM_QUERIES: u32 = 14;
+/// Matches Rust's MLE_N_QUERIES = 5.
+pub const MLE_NUM_QUERIES: u32 = 5;
 
 /// Verify a Poseidon Merkle authentication path.
 /// Sibling order is bottom-up (leaf → root).

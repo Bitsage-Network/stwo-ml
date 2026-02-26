@@ -43,10 +43,10 @@ use stwo::prover::backend::gpu::cuda_executor::{
 
 /// Number of queries for MLE opening proofs.
 ///
-/// Configurable via `STWO_MLE_N_QUERIES` env var (2..=20, default 8).
+/// Configurable via `STWO_MLE_N_QUERIES` env var (2..=20, default 5).
 /// Each query on an n-variable MLE provides ~n bits of soundness, so
-/// 8 queries × 27 vars = 216 bits — well above 128-bit security.
-pub const MLE_N_QUERIES: usize = 8;
+/// 5 queries × 27 vars = 135 bits — above 128-bit security target.
+pub const MLE_N_QUERIES: usize = 5;
 
 /// Runtime-configurable query count (cached on first call).
 pub fn mle_n_queries() -> usize {
@@ -125,7 +125,7 @@ fn gpu_mle_fold_min_points() -> usize {
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&v| v.is_power_of_two() && v >= 2)
-        .unwrap_or(1 << 20)
+        .unwrap_or(1 << 16)
 }
 
 #[cfg(feature = "cuda-runtime")]

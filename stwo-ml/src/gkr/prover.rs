@@ -139,6 +139,40 @@ fn prepare_weight_opening_mle_u32(weight: &M31Matrix) -> Vec<u32> {
     matrix_to_mle_col_major_u32_padded(weight)
 }
 
+/// Fill a reusable buffer with column-major QM31 AoS data for MLE opening.
+/// Same layout as `matrix_to_mle_col_major_u32_padded` but reuses `buf`'s allocation,
+/// eliminating per-opening malloc/free overhead (~160× for Qwen3-14B 40L).
+#[cfg(feature = "cuda-runtime")]
+fn fill_weight_mle_u32_into(weight: &M31Matrix, buf: &mut Vec<u32>) {
+    let padded_rows = weight.rows.next_power_of_two();
+    let padded_cols = weight.cols.next_power_of_two();
+    let n = padded_rows * padded_cols;
+    let needed = n * 4;
+    buf.resize(needed, 0);
+    buf[..needed].fill(0);
+    if n >= 65536 {
+        use rayon::prelude::*;
+        let src_rows = weight.rows;
+        let src_cols = weight.cols;
+        buf.par_chunks_mut(padded_rows * 4)
+            .enumerate()
+            .for_each(|(j, col_chunk)| {
+                if j < src_cols {
+                    for i in 0..src_rows {
+                        col_chunk[i * 4] = weight.data[i * src_cols + j].0;
+                    }
+                }
+            });
+    } else {
+        for i in 0..weight.rows {
+            for j in 0..weight.cols {
+                let dst = (j * padded_rows + i) * 4;
+                buf[dst] = weight.get(i, j).0;
+            }
+        }
+    }
+}
+
 #[cfg(feature = "cuda-runtime")]
 fn gkr_batch_weight_openings_enabled() -> bool {
     match std::env::var("STWO_GKR_BATCH_WEIGHT_OPENINGS") {
@@ -162,12 +196,14 @@ fn gkr_batch_weight_opening_jobs() -> usize {
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&v| v > 0)
         .unwrap_or_else(|| {
-            // Use half of available cores (capped at 8) for weight openings.
+            // Use half of available cores (capped at 16) for weight openings.
             // These are CPU-bound Merkle tree constructions that parallelize well.
+            // Memory budget: each thread holds one weight MLE (~1.5GB max for
+            // Qwen3-14B) → 16 threads = ~24GB peak, fits in H100's 80GB system RAM.
             let cpus = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4);
-            (cpus / 2).clamp(2, 8)
+            (cpus / 2).clamp(2, 16)
         })
 }
 
@@ -911,7 +947,12 @@ fn apply_aggregated_oracle_sumcheck(
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .filter(|&v| v > 0)
-                .unwrap_or(4);
+                .unwrap_or_else(|| {
+                    let cpus = std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(4);
+                    (cpus / 2).clamp(2, 16)
+                });
 
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(max_parallel_commitments)
@@ -1018,7 +1059,12 @@ fn apply_aggregated_oracle_sumcheck(
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&v| v > 0)
-            .unwrap_or(4);
+            .unwrap_or_else(|| {
+                let cpus = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4);
+                (cpus / 2).clamp(2, 16)
+            });
 
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(max_parallel_commitments)
@@ -2537,7 +2583,9 @@ pub fn prove_gkr_gpu_with_cache(
                     weight_data
                         .par_iter()
                         .enumerate()
-                        .map(|(i, (weight_node_id, eval_point, expected_value))| {
+                        .map_init(
+                            || Vec::<u32>::new(), // one scratch buffer per rayon worker thread
+                            |scratch, (i, (weight_node_id, eval_point, expected_value))| {
                             let claim = super::types::WeightClaim {
                                 weight_node_id: *weight_node_id,
                                 eval_point: eval_point.clone(),
@@ -2549,12 +2597,16 @@ pub fn prove_gkr_gpu_with_cache(
                                     .ok_or(GKRError::MissingWeight {
                                         node_id: *weight_node_id,
                                     })?;
-                            let b_mle_u32 = prepare_weight_opening_mle_u32(b_matrix);
+                            // Reuse scratch buffer across openings on the same worker thread.
+                            // The Vec grows to max weight size on the first opening and retains
+                            // capacity for subsequent ones — eliminating ~15 malloc/free cycles
+                            // per thread for Qwen3-14B 40L (160 openings ÷ 16 threads).
+                            fill_weight_mle_u32_into(b_matrix, scratch);
                             let mut sub_channel =
                                 derive_weight_opening_subchannel(opening_seed, i, &claim);
                             let (commitment, opening) =
                                 crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32(
-                                    &b_mle_u32,
+                                    scratch.as_slice(),
                                     &claim.eval_point,
                                     &mut sub_channel,
                                 );
@@ -8555,5 +8607,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Verify that `fill_weight_mle_u32_into` produces identical output to
+    /// `prepare_weight_opening_mle_u32` for various matrix sizes, including
+    /// non-power-of-two dimensions that require padding.
+    #[cfg(feature = "cuda-runtime")]
+    #[test]
+    fn test_fill_weight_mle_u32_into_matches_prepare() {
+        let test_shapes = [(4, 4), (3, 5), (7, 13), (16, 16), (31, 17), (64, 128)];
+        let mut scratch = Vec::<u32>::new();
+
+        for (rows, cols) in test_shapes {
+            let mut m = M31Matrix::new(rows, cols);
+            for i in 0..rows {
+                for j in 0..cols {
+                    m.set(i, j, M31::from((i * cols + j + 1) as u32));
+                }
+            }
+
+            let expected = prepare_weight_opening_mle_u32(&m);
+            fill_weight_mle_u32_into(&m, &mut scratch);
+
+            assert_eq!(
+                scratch.len(),
+                expected.len(),
+                "length mismatch for {rows}x{cols}"
+            );
+            assert_eq!(
+                scratch, expected,
+                "data mismatch for {rows}x{cols}"
+            );
+        }
+
+        // Verify buffer reuse: capacity should be >= the largest matrix seen
+        let largest_n = 128 * 128 * 4; // 64x128 padded to 128x128, ×4 for QM31
+        assert!(
+            scratch.capacity() >= largest_n,
+            "scratch should retain capacity from largest matrix"
+        );
+
+        // Shrink to a smaller matrix — capacity should still be retained
+        let small = M31Matrix::new(2, 2);
+        fill_weight_mle_u32_into(&small, &mut scratch);
+        assert_eq!(scratch.len(), 2 * 2 * 4); // 2x2 padded stays 2x2
+        assert!(
+            scratch.capacity() >= largest_n,
+            "scratch capacity should not shrink after smaller matrix"
+        );
     }
 }
