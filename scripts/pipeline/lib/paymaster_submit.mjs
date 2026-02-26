@@ -175,6 +175,12 @@ function getAccount(provider, privateKey, address, network = "sepolia") {
   const paymasterOpts = net && net.paymasterUrl
     ? { nodeUrl: net.paymasterUrl }
     : { default: true };
+  // AVNU requires an API key for sponsored mode (even on Sepolia).
+  // Obtain one at https://portal.avnu.fi — set AVNU_PAYMASTER_API_KEY env var.
+  const apiKey = process.env.AVNU_PAYMASTER_API_KEY;
+  if (apiKey && paymasterOpts.nodeUrl) {
+    paymasterOpts.headers = { "x-paymaster-api-key": apiKey };
+  }
   return new Account({
     provider,
     address,

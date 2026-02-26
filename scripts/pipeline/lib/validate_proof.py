@@ -70,6 +70,8 @@ ALLOWED_ENTRYPOINTS = {
     'verify_model_gkr_v2',
     'verify_model_gkr_v3',
     'verify_model_gkr_v4',
+    'verify_model_gkr_v4_packed',
+    'verify_model_gkr_v4_packed_io',
 }
 
 # Schema v2 (chunked session) entrypoints
@@ -214,7 +216,8 @@ def validate_proof(proof_file: str, session_id: str = '') -> dict:
         ready = bool(proof.get('submission_ready', False))
         fail(
             'Only verify_model_gkr / verify_model_gkr_v2 / verify_model_gkr_v3 / '
-            'verify_model_gkr_v4 are supported in the hardened pipeline '
+            'verify_model_gkr_v4 / verify_model_gkr_v4_packed / verify_model_gkr_v4_packed_io '
+            'are supported in the hardened pipeline '
             f'(got: {entrypoint}, submission_ready={ready}, '
             f'weight_opening_mode={mode}, reason={reason})'
         )
@@ -261,7 +264,7 @@ def validate_proof(proof_file: str, session_id: str = '') -> dict:
                 f'{entrypoint} requires weight_opening_mode in {sorted(allowed_modes)} '
                 f'(got: {weight_opening_mode})'
             )
-    elif entrypoint == 'verify_model_gkr_v4':
+    elif entrypoint in ('verify_model_gkr_v4', 'verify_model_gkr_v4_packed', 'verify_model_gkr_v4_packed_io'):
         allowed_v4_modes = {'AggregatedOpeningsV4Experimental', 'AggregatedOracleSumcheck'}
         if weight_opening_mode is not None and str(weight_opening_mode) not in allowed_v4_modes:
             fail(
@@ -279,7 +282,8 @@ def validate_proof(proof_file: str, session_id: str = '') -> dict:
         fail('verify_model_gkr(*) payload must not include upload_chunks')
 
     # ── Structural validation for v2/v3/v4 calldata ──
-    if entrypoint in ('verify_model_gkr_v2', 'verify_model_gkr_v3', 'verify_model_gkr_v4'):
+    if entrypoint in ('verify_model_gkr_v2', 'verify_model_gkr_v3', 'verify_model_gkr_v4',
+                       'verify_model_gkr_v4_packed', 'verify_model_gkr_v4_packed_io'):
         # Layout:
         # model_id, raw_io_data, circuit_depth, num_layers, matmul_dims,
         # dequantize_bits, proof_data, weight_commitments, weight_binding_mode,
@@ -319,7 +323,7 @@ def validate_proof(proof_file: str, session_id: str = '') -> dict:
         # Entrypoint-specific weight_binding_mode range checks
         if entrypoint == 'verify_model_gkr_v2' and weight_binding_mode not in (0, 1):
             fail(f'{entrypoint} requires weight_binding_mode in (0,1) (got {weight_binding_mode})')
-        if entrypoint == 'verify_model_gkr_v4' and weight_binding_mode not in (3, 4):
+        if entrypoint in ('verify_model_gkr_v4', 'verify_model_gkr_v4_packed', 'verify_model_gkr_v4_packed_io') and weight_binding_mode not in (3, 4):
             fail(f'{entrypoint} requires weight_binding_mode in (3, 4) (got {weight_binding_mode})')
 
         # Cross-check weight_opening_mode string vs numeric mode
@@ -333,7 +337,7 @@ def validate_proof(proof_file: str, session_id: str = '') -> dict:
         # Fallback allowed-modes check when weight_opening_mode is absent
         if entrypoint == 'verify_model_gkr_v3':
             allowed_binding_modes = (0, 1, 2)
-        elif entrypoint == 'verify_model_gkr_v4':
+        elif entrypoint in ('verify_model_gkr_v4', 'verify_model_gkr_v4_packed', 'verify_model_gkr_v4_packed_io'):
             allowed_binding_modes = (3, 4)
         else:
             allowed_binding_modes = (0, 1)
@@ -357,7 +361,8 @@ def validate_proof(proof_file: str, session_id: str = '') -> dict:
                 )
 
         # v3/v4: weight_binding_data section
-        if entrypoint in ('verify_model_gkr_v3', 'verify_model_gkr_v4'):
+        if entrypoint in ('verify_model_gkr_v3', 'verify_model_gkr_v4',
+                         'verify_model_gkr_v4_packed', 'verify_model_gkr_v4_packed_io'):
             idx += 1  # consume weight_binding_mode
             if idx >= len(resolved):
                 fail(f'{entrypoint} calldata truncated before weight_binding_data length')
@@ -377,7 +382,7 @@ def validate_proof(proof_file: str, session_id: str = '') -> dict:
                 fail(f'{entrypoint} mode 4 (aggregated oracle sumcheck) requires non-empty weight_binding_data')
 
             # v4 mode 4: size bounds
-            if entrypoint == 'verify_model_gkr_v4' and weight_binding_mode == 4:
+            if entrypoint in ('verify_model_gkr_v4', 'verify_model_gkr_v4_packed', 'verify_model_gkr_v4_packed_io') and weight_binding_mode == 4:
                 if len(resolved) > max_gkr_mode4_calldata_felts:
                     fail(
                         f'{entrypoint} mode 4 calldata unexpectedly large: {len(resolved)} felts '
