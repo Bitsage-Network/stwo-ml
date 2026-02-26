@@ -653,7 +653,8 @@ Trusted submitter model. Owner verifies recursive STARK proof off-chain, then su
 
 Fully on-chain GKR verification with Fiat-Shamir transcript replay. No token dependencies, no trusted submitter — pure cryptographic verification. Any Starknet project can use this.
 
-- **Entry points**: `verify_model_gkr()`, `verify_model_gkr_v2()`, `verify_model_gkr_v3()`, `verify_model_gkr_v4()`, `verify_model_gkr_v4_packed()`
+- **Entry points**: `verify_model_gkr()`, `verify_model_gkr_v2()`, `verify_model_gkr_v3()`, `verify_model_gkr_v4()`, `verify_model_gkr_v4_packed()`, `verify_model_gkr_v4_packed_io()`
+- **`verify_model_gkr_v4_packed_io`**: Direct calldata path — packs 8 M31 values per felt252, eliminates all storage reads, reduces calldata from ~10K to ~1.9K felts
 - **Verification flow**: ML GKR walk over full computation DAG, sumcheck per layer, deferred proofs for skip connections, weight binding via aggregated oracle sumcheck (mode 4)
 - **Field arithmetic**: Full M31/CM31/QM31 tower in Cairo using u64 to avoid overflow
 - **Events**: ModelGkrRegistered, ModelGkrVerified, VerificationFailed
@@ -735,7 +736,7 @@ prove-model pool-status
 
 | Contract | Address | Version | Features |
 |----------|---------|---------|----------|
-| **EloVerifier** | [`0x0121d1...c005`](https://sepolia.starkscan.co/contract/0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005) | v12 | GKR v4 + packed QM31 single-TX (`verify_model_gkr_v4_packed`), ~3.3x calldata reduction, deferred proofs, aggregated weight binding |
+| **EloVerifier** | [`0x0121d1...c005`](https://sepolia.starkscan.co/contract/0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005) | v14 | GKR v4 + packed QM31 single-TX, IO-packed direct calldata (`verify_model_gkr_v4_packed_io`), ~5.8x calldata reduction, deferred proofs, aggregated weight binding |
 | **VM31Pool** | [`0x07cf94...e1f9`](https://sepolia.starkscan.co/contract/0x07cf94e27a60b94658ec908a00a9bb6dfff03358e952d9d48a8ed0be080ce1f9) | v1 | Privacy pool, Poseidon2-M31 Merkle tree, batch proving, 5-min timelocked upgrade |
 | ObelyskVerifier | [`0x04f8c5...a15`](https://sepolia.starkscan.co/contract/0x04f8c5377d94baa15291832dc3821c2fc235a95f0823f86add32f828ea965a15) | v3 | Recursive proof + SAGE payment |
 | StweMlStarkVerifier | [`0x005928...fba`](https://sepolia.starkscan.co/contract/0x005928ac548dc2719ef1b34869db2b61c2a55a4b148012fad742262a8d674fba) | v1 | Multi-step STARK verify |

@@ -629,11 +629,40 @@ fn read_fieldelement(r: &mut impl IoRead) -> io::Result<FieldElement> {
 /// fills the cache so that `apply_aggregated_oracle_sumcheck()` finds
 /// all roots pre-computed.
 ///
+/// On single-GPU machines, falls back to CPU to avoid GPU contention
+/// with the prover. Use [`prewarm_weight_roots_gpu_exclusive`] when the
+/// caller guarantees no concurrent GPU usage (e.g., blocking prewarm
+/// before proving starts).
+///
 /// Returns the number of newly computed roots.
 pub fn prewarm_weight_roots(
     weights: &crate::compiler::graph::GraphWeights,
     cache: &SharedWeightCache,
     model_dir: Option<&std::path::Path>,
+) -> usize {
+    prewarm_weight_roots_inner(weights, cache, model_dir, false)
+}
+
+/// Pre-compute Poseidon Merkle roots using GPU even on single-GPU machines.
+///
+/// Use this when the caller guarantees no concurrent GPU usage — e.g.,
+/// blocking prewarm before proving starts, or `--generate-cache` mode.
+/// On single-GPU machines this is ~10x faster than the CPU fallback path.
+///
+/// Returns the number of newly computed roots.
+pub fn prewarm_weight_roots_gpu_exclusive(
+    weights: &crate::compiler::graph::GraphWeights,
+    cache: &SharedWeightCache,
+    model_dir: Option<&std::path::Path>,
+) -> usize {
+    prewarm_weight_roots_inner(weights, cache, model_dir, true)
+}
+
+fn prewarm_weight_roots_inner(
+    weights: &crate::compiler::graph::GraphWeights,
+    cache: &SharedWeightCache,
+    model_dir: Option<&std::path::Path>,
+    force_gpu: bool,
 ) -> usize {
     let uncached: Vec<(usize, usize, usize)> = {
         let r = match cache.read() {
@@ -660,7 +689,7 @@ pub fn prewarm_weight_roots(
     }
 
     let total = uncached.len();
-    eprintln!("[prewarm] starting background Merkle root computation for {total} weight matrices");
+    eprintln!("[prewarm] starting Merkle root computation for {total} weight matrices");
     let t_start = std::time::Instant::now();
 
     // GPU contention guard: on single-GPU machines, the prover's pipelined
@@ -669,6 +698,9 @@ pub fn prewarm_weight_roots(
     // contention. Use GPU prewarm only when >=2 GPUs are available (prewarm
     // takes a secondary device); otherwise fall back to CPU so the prover
     // gets exclusive GPU access.
+    //
+    // Exception: when force_gpu is true, the caller guarantees no concurrent
+    // GPU usage (blocking prewarm before proving, or --generate-cache mode).
     #[cfg(feature = "cuda-runtime")]
     let computed = {
         let gpu_count = {
@@ -677,7 +709,10 @@ pub fn prewarm_weight_roots(
             #[cfg(not(feature = "multi-gpu"))]
             { 1usize }
         };
-        if gpu_count >= 2 {
+        if gpu_count >= 2 || force_gpu {
+            if force_gpu && gpu_count < 2 {
+                eprintln!("[prewarm] GPU exclusive mode — using single GPU (no contention)");
+            }
             prewarm_gpu(weights, &uncached, cache, total, &t_start)
         } else {
             eprintln!("[prewarm] single-GPU detected — using CPU path to avoid GPU contention");
@@ -686,7 +721,10 @@ pub fn prewarm_weight_roots(
     };
 
     #[cfg(not(feature = "cuda-runtime"))]
-    let computed = prewarm_cpu(weights, &uncached, cache, total, &t_start);
+    let computed = {
+        let _ = force_gpu; // unused without cuda-runtime
+        prewarm_cpu(weights, &uncached, cache, total, &t_start)
+    };
 
     // Save cache to disk if we computed anything.
     if computed > 0 {

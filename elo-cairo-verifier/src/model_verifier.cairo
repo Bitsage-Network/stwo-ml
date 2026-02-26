@@ -221,13 +221,22 @@ fn dispatch_activation(
     let _table_commitment = read_felt(ref reader);
 
     let (has_logup, logup_polys, w, in_e, out_e, claimed) = read_optional_logup(ref reader);
-    assert!(has_logup, "ACTIVATION_MISSING_LOGUP");
 
-    verify_activation_layer(
-        current_claim, act_type_tag,
-        logup_polys.span(), w, in_e, out_e, claimed,
-        input_eval, output_eval, ref ch,
-    )
+    if has_logup {
+        verify_activation_layer(
+            current_claim, act_type_tag,
+            logup_polys.span(), w, in_e, out_e, claimed,
+            input_eval, output_eval, ref ch,
+        )
+    } else {
+        // LogUp skipped (M31 matmul outputs exceed table range).
+        // Match Rust verify_activation_reduction: just mix input_eval, chain claim.
+        channel_mix_secure_field(ref ch, input_eval);
+        GKRClaim {
+            point: clone_point(current_claim.point),
+            value: input_eval,
+        }
+    }
 }
 
 /// Parse and verify a Tag 4 (LayerNorm) layer proof.

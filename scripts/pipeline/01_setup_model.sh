@@ -350,6 +350,59 @@ if [[ -n "${MODEL_HF:-}" ]]; then
 fi
 echo ""
 
+# ─── Download Weight Commitment Cache ─────────────────────────────────
+
+CACHE_FILE="${MODEL_DIR}/.stwo_weight_cache.swcf"
+CACHE_URL="${OBELYSK_CACHE_URL:-}"
+
+if [[ -f "$CACHE_FILE" ]]; then
+    CACHE_SIZE=$(du -h "$CACHE_FILE" | cut -f1)
+    ok "Weight cache already present (${CACHE_SIZE})"
+elif [[ -n "$PRESET" ]]; then
+    header "Downloading weight commitment cache"
+    log "Pre-computed cache eliminates 20-40 min weight commitment phase on first proof."
+
+    # Try GitHub release asset first (preset-specific)
+    _CACHE_DOWNLOADED=false
+
+    if [[ -n "$CACHE_URL" ]]; then
+        # Explicit URL override
+        log "Downloading cache from ${CACHE_URL}..."
+        if curl -fsSL "$CACHE_URL" -o "$CACHE_FILE" 2>/dev/null; then
+            _CACHE_DOWNLOADED=true
+        fi
+    fi
+
+    if [[ "$_CACHE_DOWNLOADED" == "false" ]] && command -v gh &>/dev/null; then
+        # Try fetching from GitHub release assets
+        _CACHE_ASSET="${MODEL_NAME:-${PRESET}}.stwo_weight_cache.swcf"
+        log "Checking GitHub releases for ${_CACHE_ASSET}..."
+
+        # Search recent releases for the cache asset
+        for tag in $(gh release list --limit 5 --json tagName -q '.[].tagName' 2>/dev/null); do
+            if gh release download "$tag" --pattern "$_CACHE_ASSET" --dir "$MODEL_DIR" --clobber 2>/dev/null; then
+                # gh downloads with the asset name; rename to standard cache filename
+                if [[ -f "${MODEL_DIR}/${_CACHE_ASSET}" ]] && [[ "${_CACHE_ASSET}" != ".stwo_weight_cache.swcf" ]]; then
+                    mv "${MODEL_DIR}/${_CACHE_ASSET}" "$CACHE_FILE"
+                fi
+                _CACHE_DOWNLOADED=true
+                break
+            fi
+        done
+    fi
+
+    if [[ "$_CACHE_DOWNLOADED" == "true" ]] && [[ -f "$CACHE_FILE" ]]; then
+        CACHE_SIZE=$(du -h "$CACHE_FILE" | cut -f1)
+        ok "Weight cache downloaded (${CACHE_SIZE})"
+        log "First proof will skip weight commitments entirely."
+    else
+        warn "No pre-computed cache available for ${PRESET}."
+        warn "First proof will compute weight commitments (~20-40 min on GPU)."
+        warn "To generate a cache: bash scripts/pipeline/generate_weight_cache.sh --model-name ${PRESET}"
+    fi
+fi
+echo ""
+
 # ─── Save Model Config ──────────────────────────────────────────────
 
 header "Saving configuration"

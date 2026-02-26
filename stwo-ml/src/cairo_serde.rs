@@ -3856,6 +3856,79 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_serialize_raw_io_packed_commitment() {
+        use crate::aggregation::{compute_io_commitment_packed};
+        use crate::components::matmul::M31Matrix;
+        use crate::starknet::pack_m31_io_data;
+
+        let mut input = M31Matrix::new(2, 3);
+        for i in 0..2 {
+            for j in 0..3 {
+                input.set(i, j, M31::from((i * 3 + j + 1) as u32));
+            }
+        }
+
+        let mut output = M31Matrix::new(2, 2);
+        for i in 0..2 {
+            for j in 0..2 {
+                output.set(i, j, M31::from((i * 2 + j + 10) as u32));
+            }
+        }
+
+        // Packed commitment: Poseidon(original_io_len, packed_felts...)
+        let serialized = serialize_raw_io(&input, &output);
+        let packed = pack_m31_io_data(&serialized);
+        let mut hash_inputs = vec![FieldElement::from(serialized.len() as u64)];
+        hash_inputs.extend_from_slice(&packed);
+        let manual = starknet_crypto::poseidon_hash_many(&hash_inputs);
+
+        let from_fn = compute_io_commitment_packed(&input, &output);
+        assert_eq!(
+            manual, from_fn,
+            "manual packed hash must match compute_io_commitment_packed"
+        );
+
+        // Packed commitment must differ from unpacked commitment
+        let unpacked = crate::aggregation::compute_io_commitment(&input, &output);
+        assert_ne!(
+            from_fn, unpacked,
+            "packed and unpacked commitments must differ"
+        );
+    }
+
+    #[test]
+    fn test_serialize_raw_io_matches_io_commitment_packed() {
+        use crate::aggregation::compute_io_commitment_packed;
+        use crate::components::matmul::M31Matrix;
+        use crate::starknet::pack_m31_io_data;
+
+        let mut input = M31Matrix::new(1, 8);
+        for j in 0..8 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
+
+        let mut output = M31Matrix::new(1, 4);
+        for j in 0..4 {
+            output.set(0, j, M31::from((j + 100) as u32));
+        }
+
+        let serialized = serialize_raw_io(&input, &output);
+        let packed = pack_m31_io_data(&serialized);
+
+        // Packed commitment: Poseidon(original_io_len, packed_data...)
+        let mut hash_inputs = Vec::with_capacity(1 + packed.len());
+        hash_inputs.push(FieldElement::from(serialized.len() as u64));
+        hash_inputs.extend_from_slice(&packed);
+        let recomputed = starknet_crypto::poseidon_hash_many(&hash_inputs);
+
+        let commitment = compute_io_commitment_packed(&input, &output);
+        assert_eq!(
+            recomputed, commitment,
+            "packed IO hash must match compute_io_commitment_packed"
+        );
+    }
+
     // === Weight MLE Opening Serialization Tests ===
 
     #[test]

@@ -1,9 +1,9 @@
 /// Tests for A7: Contract-level GKR model verification.
 ///
-/// Tests register_model_gkr() and verify_model_gkr() through the
+/// Tests register_model_gkr() and verify_model_gkr_v4_packed() through the
 /// ISumcheckVerifier dispatcher (full contract deploy + call cycle).
 ///
-/// Note: verify_model_gkr() now recomputes IO commitment on-chain from
+/// Note: verify_model_gkr_v4_packed() recomputes IO commitment on-chain from
 /// raw_io_data and evaluates MLE(output, r_out) + MLE(input, final_point).
 /// Hand-crafted proofs cannot satisfy the MLE checks, so positive verification
 /// tests require Rust-generated test vectors (see e2e_cairo_verify.rs).
@@ -11,7 +11,7 @@
 
 use snforge_std::{declare, DeclareResultTrait, ContractClassTrait};
 use starknet::ContractAddress;
-use elo_cairo_verifier::field::{QM31, CM31, qm31_new, qm31_add};
+use elo_cairo_verifier::field::{QM31, CM31};
 use elo_cairo_verifier::verifier::{
     ISumcheckVerifierDispatcher, ISumcheckVerifierDispatcherTrait,
 };
@@ -25,11 +25,6 @@ fn deploy_verifier() -> ISumcheckVerifierDispatcher {
     let owner: ContractAddress = 0x1234_felt252.try_into().unwrap();
     let (address, _) = contract.deploy(@array![owner.into()]).unwrap();
     ISumcheckVerifierDispatcher { contract_address: address }
-}
-
-/// Real-only QM31.
-fn mk(a: u64) -> QM31 {
-    QM31 { a: CM31 { a, b: 0 }, b: CM31 { a: 0, b: 0 } }
 }
 
 /// Build a minimal raw_io_data array.
@@ -101,7 +96,7 @@ fn test_register_model_gkr_non_owner_rejected() {
 fn test_verify_model_gkr_not_registered() {
     let dispatcher = deploy_verifier();
 
-    dispatcher.verify_model_gkr(
+    dispatcher.verify_model_gkr_v4_packed(
         0xDEAD,                          // unregistered model_id
         build_raw_io_data(),             // raw_io_data
         1,                               // circuit_depth
@@ -110,6 +105,8 @@ fn test_verify_model_gkr_not_registered() {
         array![],                        // dequantize_bits
         array![],                        // proof_data
         array![],                        // weight_commitments
+        4,                               // weight_binding_mode (oracle sumcheck)
+        array![0x524C43, 0],             // weight_binding_data (RLC marker)
         array![],                        // weight_opening_proofs
     );
 }
@@ -135,7 +132,7 @@ fn test_verify_model_gkr_weight_mismatch() {
     );
 
     // Try to verify with WRONG weight commitments
-    dispatcher.verify_model_gkr(
+    dispatcher.verify_model_gkr_v4_packed(
         model_id,
         build_raw_io_data(),
         1,                               // circuit_depth
@@ -144,6 +141,8 @@ fn test_verify_model_gkr_weight_mismatch() {
         array![],
         array![],
         array![0x111, 0x999],   // 0x999 != registered 0x222
+        4,                               // weight_binding_mode
+        array![0x524C43, 0],             // weight_binding_data
         array![],                        // weight_opening_proofs
     );
 }
@@ -169,7 +168,7 @@ fn test_verify_model_gkr_weight_count_mismatch() {
     );
 
     // Try to verify with only 1 weight commitment
-    dispatcher.verify_model_gkr(
+    dispatcher.verify_model_gkr_v4_packed(
         model_id,
         build_raw_io_data(),
         1,                               // circuit_depth
@@ -178,6 +177,8 @@ fn test_verify_model_gkr_weight_count_mismatch() {
         array![],
         array![],
         array![0x111],   // count 1 != registered 2
+        4,                               // weight_binding_mode
+        array![0x524C43, 0],             // weight_binding_data
         array![],                        // weight_opening_proofs
     );
 }
@@ -213,7 +214,7 @@ fn test_verify_model_gkr_empty_io_data() {
     dispatcher.register_model_gkr(0xABC, array![], array![1]);
 
     // Empty raw_io_data should fail validation
-    dispatcher.verify_model_gkr(
+    dispatcher.verify_model_gkr_v4_packed(
         0xABC,
         array![],                        // empty raw_io_data
         1,                               // circuit_depth
@@ -222,6 +223,8 @@ fn test_verify_model_gkr_empty_io_data() {
         array![],
         array![],
         array![],
+        4,                               // weight_binding_mode
+        array![0x524C43, 0],             // weight_binding_data
         array![],                        // weight_opening_proofs
     );
 }
@@ -285,7 +288,7 @@ fn test_verify_model_gkr_short_io_data() {
     dispatcher.register_model_gkr(0xABC, array![], array![1]);
 
     // raw_io_data with only 5 elements (needs >= 6)
-    dispatcher.verify_model_gkr(
+    dispatcher.verify_model_gkr_v4_packed(
         0xABC,
         array![1, 2, 3, 4, 5],          // too short
         1,                               // circuit_depth
@@ -294,6 +297,8 @@ fn test_verify_model_gkr_short_io_data() {
         array![],
         array![],
         array![],
+        4,                               // weight_binding_mode
+        array![0x524C43, 0],             // weight_binding_data
         array![],                        // weight_opening_proofs
     );
 }
@@ -303,8 +308,6 @@ fn test_verify_model_gkr_short_io_data() {
 //
 // With v11 input validation, zero layers are rejected before reaching the
 // circuit hash check. This test now verifies the ZERO_LAYERS guard fires.
-// Circuit hash mismatch is still tested by the full GKR model tests that
-// send well-formed proofs with mismatched descriptors.
 // ============================================================================
 
 #[test]
@@ -320,7 +323,7 @@ fn test_verify_model_gkr_circuit_hash_mismatch() {
     dispatcher.register_model_gkr(model_id, array![], array![1]);
 
     // num_layers=0 now triggers early ZERO_LAYERS validation.
-    dispatcher.verify_model_gkr(
+    dispatcher.verify_model_gkr_v4_packed(
         model_id,
         build_raw_io_data(),
         2,              // wrong circuit_depth
@@ -329,6 +332,8 @@ fn test_verify_model_gkr_circuit_hash_mismatch() {
         array![],
         array![0],     // proof_data: num_deferred = 0
         array![],
+        4,                               // weight_binding_mode
+        array![0x524C43, 0],             // weight_binding_data
         array![],
     );
 }

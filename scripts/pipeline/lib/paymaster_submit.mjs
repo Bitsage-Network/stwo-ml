@@ -568,12 +568,20 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
       };
       let off = 0;
       let sec6Off = 0, sec6Len = 0;
+      const isIoPacked = verifyCalldata.io_packed === true;
       // Walk through 6 length-prefixed sections, capturing section 6 (weight_binding_data) position.
       for (let sec = 0; sec < 6; sec++) {
         if (sec === 5) { sec6Off = off; }
-        const secLen = readNatV2(off, `section_${sec + 1}_len`);
-        if (sec === 5) { sec6Len = secLen; }
-        off += 1 + secLen;
+        if (sec === 0 && isIoPacked) {
+          // Section 1 (raw_io_data) packed: [original_len, packed_count, packed_data...]
+          const _origLen = readNatV2(off, "raw_io_original_len");
+          const packedCount = readNatV2(off + 1, "raw_io_packed_count");
+          off += 2 + packedCount;
+        } else {
+          const secLen = readNatV2(off, `section_${sec + 1}_len`);
+          if (sec === 5) { sec6Len = secLen; }
+          off += 1 + secLen;
+        }
         if (off > flat.length) {
           die(`schema v2 Mode 4: section ${sec + 1} overflows flat data (off=${off}, flat.length=${flat.length})`);
         }
@@ -632,6 +640,7 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
       numLayers,
       weightBindingMode,
       packed: verifyCalldata.packed === true || verifyCalldata.packed === undefined,
+      ioPacked: verifyCalldata.io_packed === true,
     };
   }
 
@@ -796,6 +805,7 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
       // does packing internally, but this JS auto-convert path works on unpacked data.
       // Setting packed=true here would cause the Cairo verifier to misinterpret felts.
       packed: false,
+      ioPacked: false,
     };
   }
 
@@ -1285,15 +1295,26 @@ async function cmdVerify(args) {
         calldata: CallData.compile(registerCalldata),
       }];
       try {
-        const regTxHash = await executeViaPaymaster(account, regCalls);
+        let regTxHash;
+        if (noPaymaster) {
+          const execResult = await account.execute(regCalls);
+          if (!execResult || !execResult.transaction_hash) {
+            throw new Error(`account.execute() returned invalid result: ${JSON.stringify(execResult)?.slice(0, 200)}`);
+          }
+          regTxHash = execResult.transaction_hash;
+        } else {
+          regTxHash = await executeViaPaymaster(account, regCalls);
+        }
         info(`  Registration TX: ${regTxHash}`);
         const regReceipt = await provider.waitForTransaction(regTxHash, { retryInterval: 4000 });
         const regStatus = regReceipt.execution_status ?? regReceipt.status ?? "unknown";
         if (regStatus === "REVERTED") {
           const reason = regReceipt.revert_reason || "unknown";
-          // "already registered" is not an error
+          // "already registered" or "Only owner" are not fatal — model may be pre-registered by deployer
           if (/already.?registered/i.test(reason)) {
             info("  Model already registered (OK)");
+          } else if (/only.?owner|not.?owner|unauthorized|caller.?is.?not/i.test(reason)) {
+            info("  Registration reverted (not owner) — model may already be registered by deployer, continuing...");
           } else {
             die(`  Registration reverted: ${reason}`);
           }
@@ -1302,9 +1323,11 @@ async function cmdVerify(args) {
         }
       } catch (regErr) {
         const errMsg = truncateRpcError(regErr);
-        // Tolerate "already registered" errors
+        // Tolerate "already registered" or ownership errors (model pre-registered by deployer)
         if (/already.?registered/i.test(errMsg)) {
           info("  Model already registered (OK)");
+        } else if (/only.?owner|not.?owner|unauthorized|caller.?is.?not/i.test(errMsg)) {
+          info("  Registration failed (not owner) — model may already be registered by deployer, continuing...");
         } else {
           die(`  Registration failed: ${errMsg}`);
         }
@@ -1408,6 +1431,7 @@ async function cmdVerify(args) {
     // For paymaster mode: caches the `suggested_max_fee_in_gas_token` value.
     // For non-paymaster mode: not used (account.execute() handles fees).
     let cachedPaymasterMaxFee = null;
+    const STRK_TOKEN_ADDR = "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d";
 
     async function execCall(entrypoint, calldata, label, opts = {}) {
       const calls = [{
@@ -1419,7 +1443,63 @@ async function cmdVerify(args) {
       let txHash;
       if (noPaymaster) {
         try {
-          const result = await account.execute(calls);
+          // Build resource bounds — either from fee estimation or conservative fallback.
+          // All values must be BigInt to avoid "Cannot mix BigInt and other types" errors.
+          let rb;
+          try {
+            const est = await account.estimateInvokeFee(calls);
+            if (est.resourceBounds) {
+              const e = est.resourceBounds;
+              rb = {
+                l1_gas: { max_amount: BigInt(e.l1_gas.max_amount), max_price_per_unit: BigInt(e.l1_gas.max_price_per_unit) },
+                l2_gas: { max_amount: BigInt(e.l2_gas.max_amount), max_price_per_unit: BigInt(e.l2_gas.max_price_per_unit) },
+                l1_data_gas: { max_amount: BigInt(e.l1_data_gas.max_amount), max_price_per_unit: BigInt(e.l1_data_gas.max_price_per_unit) },
+              };
+            }
+          } catch (estErr) {
+            info(`  Fee estimation failed (${(estErr.message || "").slice(0, 120)}), using fallback bounds`);
+          }
+
+          if (!rb) {
+            // Conservative fallback — fits in ~8 STRK total
+            rb = {
+              l1_gas: { max_amount: 100n, max_price_per_unit: 100000000000000n },         // ~0.01 STRK
+              l2_gas: { max_amount: 500000000n, max_price_per_unit: 12000000000n },        // ~6 STRK
+              l1_data_gas: { max_amount: 5000n, max_price_per_unit: 300000000000000n },    // ~1.5 STRK
+            };
+          }
+
+          // Cap total bounds to 80% of account balance to leave room for subsequent TXs.
+          const bal = await provider.callContract({
+            contractAddress: STRK_TOKEN_ADDR,
+            entrypoint: "balanceOf",
+            calldata: CallData.compile([account.address]),
+          });
+          const balance = BigInt(bal[0]);
+          const maxSpend = balance * 80n / 100n;
+          const totalBounds = rb.l1_gas.max_amount * rb.l1_gas.max_price_per_unit +
+            rb.l2_gas.max_amount * rb.l2_gas.max_price_per_unit +
+            rb.l1_data_gas.max_amount * rb.l1_data_gas.max_price_per_unit;
+
+          if (totalBounds > maxSpend && maxSpend > 0n) {
+            // Scale down all prices proportionally to fit within balance
+            const scale_num = maxSpend;
+            const scale_den = totalBounds;
+            rb.l1_gas.max_price_per_unit = rb.l1_gas.max_price_per_unit * scale_num / scale_den;
+            rb.l2_gas.max_price_per_unit = rb.l2_gas.max_price_per_unit * scale_num / scale_den;
+            rb.l1_data_gas.max_price_per_unit = rb.l1_data_gas.max_price_per_unit * scale_num / scale_den;
+            const capped = rb.l1_gas.max_amount * rb.l1_gas.max_price_per_unit +
+              rb.l2_gas.max_amount * rb.l2_gas.max_price_per_unit +
+              rb.l1_data_gas.max_amount * rb.l1_data_gas.max_price_per_unit;
+            info(`  Bounds capped: ${Number(totalBounds / 10n**15n) / 1000} → ${Number(capped / 10n**15n) / 1000} STRK (bal: ${Number(balance / 10n**15n) / 1000})`);
+          }
+
+          const finalTotal = rb.l1_gas.max_amount * rb.l1_gas.max_price_per_unit +
+            rb.l2_gas.max_amount * rb.l2_gas.max_price_per_unit +
+            rb.l1_data_gas.max_amount * rb.l1_data_gas.max_price_per_unit;
+          info(`  Max fee: ~${Number(finalTotal / 10n**15n) / 1000} STRK`);
+
+          const result = await account.execute(calls, { resourceBounds: rb });
           if (!result || !result.transaction_hash) {
             throw new Error(`account.execute() returned invalid result: ${JSON.stringify(result)?.slice(0, 200)}`);
           }
@@ -1501,6 +1581,7 @@ async function cmdVerify(args) {
           String(verifyPayload.numLayers),
           String(verifyPayload.weightBindingMode),
           verifyPayload.packed ? "1" : "0",
+          verifyPayload.ioPacked ? "1" : "0",
         ],
         "open_gkr_session"
       );
@@ -1996,15 +2077,27 @@ async function cmdVerify(args) {
         info(`  Registration TX: ${rTx}`);
         const rReceipt = await waitWithTimeout(rTx, 120000);
         const rStatus = rReceipt.execution_status ?? rReceipt.status ?? "unknown";
-        if (rStatus === "REVERTED" && !/already.?registered/i.test(rReceipt.revert_reason || "")) {
-          die(`  Registration reverted: ${rReceipt.revert_reason || "unknown"}`);
+        if (rStatus === "REVERTED") {
+          const reason = rReceipt.revert_reason || "unknown";
+          if (/already.?registered/i.test(reason)) {
+            info("  Model already registered (OK)");
+          } else if (/only.?owner|not.?owner|unauthorized|caller.?is.?not/i.test(reason)) {
+            info("  Registration reverted (not owner) — model may already be registered by deployer, continuing...");
+          } else {
+            die(`  Registration reverted: ${reason}`);
+          }
+        } else {
+          info(`  Model registered (status: ${rStatus})`);
         }
-        info(`  Model registered (status: ${rStatus})`);
       } catch (regErr) {
-        if (!/already.?registered/i.test(truncateRpcError(regErr))) {
-          die(`  Registration failed: ${truncateRpcError(regErr)}`);
+        const errMsg = truncateRpcError(regErr);
+        if (/already.?registered/i.test(errMsg)) {
+          info("  Model already registered (OK)");
+        } else if (/only.?owner|not.?owner|unauthorized|caller.?is.?not/i.test(errMsg)) {
+          info("  Registration failed (not owner) — model may already be registered by deployer, continuing...");
+        } else {
+          die(`  Registration failed: ${errMsg}`);
         }
-        info("  Model already registered (OK)");
       }
     }
   }

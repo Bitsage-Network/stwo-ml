@@ -1127,6 +1127,50 @@ fn estimate_gkr_verification_gas(num_layers: usize) -> u64 {
 ///
 /// Returns a flat Vec of [m0, k0, n0, m1, k1, n1, ...] matching the Cairo contract's
 /// `matmul_dims: Array<u32>` parameter.
+/// Pack M31 values (31 bits each) into felt252 values (8 per felt252, 248 bits).
+///
+/// This reduces storage reads on-chain by ~8× for raw_io_data, which is typically
+/// 94%+ of the session data. Each packed felt252 contains 8 M31 values in LSB order:
+/// `packed = m31_0 + m31_1 * 2^31 + m31_2 * 2^62 + ... + m31_7 * 2^217`
+pub fn pack_m31_io_data(raw_io_data: &[FieldElement]) -> Vec<FieldElement> {
+    let mut packed = Vec::with_capacity((raw_io_data.len() + 7) / 8);
+
+    for chunk in raw_io_data.chunks(8) {
+        let mut val = [0u8; 32]; // 256-bit LE buffer
+        for (j, felt) in chunk.iter().enumerate() {
+            // Extract the M31 value (bottom 31 bits).
+            let be = felt.to_bytes_be();
+            let raw = u32::from_be_bytes([be[28], be[29], be[30], be[31]]);
+            debug_assert!(
+                raw < 0x7FFF_FFFF,
+                "raw_io_data[{}] = {} exceeds M31 range",
+                j,
+                raw
+            );
+            let m31_val = raw & 0x7FFF_FFFF; // mask to 31 bits
+            let bit_offset = j * 31;
+            let byte_offset = bit_offset / 8;
+            let bit_shift = bit_offset % 8;
+
+            // Write 31-bit value into LE byte buffer at the correct offset
+            let extended = (m31_val as u64) << bit_shift;
+            for k in 0..5 {
+                if byte_offset + k < 32 {
+                    val[byte_offset + k] |= ((extended >> (k * 8)) & 0xFF) as u8;
+                }
+            }
+        }
+        // Convert LE bytes to FieldElement (big-endian)
+        let mut be = [0u8; 32];
+        for i in 0..32 {
+            be[31 - i] = val[i];
+        }
+        packed.push(FieldElement::from_bytes_be(&be).unwrap_or_default());
+    }
+
+    packed
+}
+
 pub fn extract_matmul_dims(circuit: &crate::gkr::LayeredCircuit) -> Vec<u32> {
     let mut dims = Vec::new();
     for layer_idx in (0..circuit.layers.len()).rev() {
@@ -1245,6 +1289,8 @@ pub struct ChunkedGkrCalldata {
     pub weight_binding_mode: u32,
     /// Whether proof_data uses packed QM31 format (1 felt per QM31).
     pub packed: bool,
+    /// Whether raw_io_data is packed (8 M31 values per felt252).
+    pub io_packed: bool,
     /// Session data split into chunks of ≤ MAX_GKR_CHUNK_FELTS hex-encoded felts.
     pub chunks: Vec<Vec<String>>,
     /// Number of chunks.
@@ -1295,8 +1341,21 @@ pub fn build_chunked_gkr_calldata(
         };
     }
 
-    // 1. raw_io_data
-    push_felt_section!(raw_io_data);
+    // 1. raw_io_data — pack 8 M31 values per felt252 to reduce storage reads.
+    //    Each M31 value is 31 bits, so 8 × 31 = 248 bits fits in felt252 (252 bits).
+    //    Packed format: [original_len, packed_count, packed_data...]
+    //    Unpacked format: [len, data...]
+    let use_io_packing = std::env::var("STWO_NO_IO_PACK").is_err() && raw_io_data.len() > 16;
+    if use_io_packing {
+        let packed = pack_m31_io_data(raw_io_data);
+        flat.push(format!("{}", raw_io_data.len())); // original_len
+        flat.push(format!("{}", packed.len()));       // packed_count
+        for f in &packed {
+            flat.push(format!("0x{:x}", f));
+        }
+    } else {
+        push_felt_section!(raw_io_data);
+    }
 
     // 2. matmul_dims (as felt252 values)
     let matmul_dims = extract_matmul_dims(circuit);
@@ -1411,6 +1470,7 @@ pub fn build_chunked_gkr_calldata(
         num_layers,
         weight_binding_mode: binding_mode,
         packed: use_packed,
+        io_packed: use_io_packing,
         chunks,
         num_chunks,
     })
@@ -1612,6 +1672,58 @@ pub fn build_verify_model_gkr_v4_packed_calldata(
         GkrCalldataLayout::V4,
         true,
     )
+}
+
+/// Build calldata for `verify_model_gkr_v4_packed_io()` — passes IO-packed raw data directly
+/// as calldata (no storage reads). Reduces calldata from ~10K to ~1.9K felts.
+pub fn build_verify_model_gkr_v4_packed_io_calldata(
+    proof: &crate::gkr::GKRProof,
+    circuit: &crate::gkr::LayeredCircuit,
+    model_id: FieldElement,
+    raw_io_data: &[FieldElement],
+) -> Result<VerifyModelGkrCalldata, StarknetModelError> {
+    // Build the base calldata (with unpacked IO) then replace the IO section
+    let base = build_verify_model_gkr_calldata_inner(
+        proof,
+        circuit,
+        model_id,
+        raw_io_data,
+        GkrCalldataLayout::V4,
+        true,
+    )?;
+
+    // Pack the IO data
+    let packed_io = pack_m31_io_data(raw_io_data);
+
+    // Rebuild calldata with packed IO format:
+    // model_id, original_io_len: u32, packed_raw_io: Array<felt252>, ...rest
+    let mut parts = Vec::new();
+
+    // 1. model_id (same as first element)
+    parts.push(base.calldata_parts[0].clone());
+
+    // 2. original_io_len: u32
+    parts.push(format!("{}", raw_io_data.len()));
+
+    // 3. packed_raw_io: Array<felt252>
+    parts.push(format!("{}", packed_io.len()));
+    for f in &packed_io {
+        parts.push(format!("0x{:x}", f));
+    }
+
+    // 4+. Everything after the original raw_io_data array
+    // In base calldata: [model_id, io_len, io_data..., circuit_depth, ...]
+    // Skip: 1 (model_id) + 1 (io_len) + raw_io_data.len() (io_data)
+    let rest_start = 1 + 1 + raw_io_data.len();
+    for i in rest_start..base.calldata_parts.len() {
+        parts.push(base.calldata_parts[i].clone());
+    }
+
+    let total_felts = parts.len();
+    Ok(VerifyModelGkrCalldata {
+        calldata_parts: parts,
+        total_felts,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4169,6 +4281,149 @@ mod tests {
             packed_pd < unpacked_pd,
             "packed proof_data ({packed_pd}) should be smaller than unpacked ({unpacked_pd})"
         );
+    }
+
+    #[test]
+    fn test_pack_m31_io_data_round_trip() {
+        // Test that pack_m31_io_data correctly packs 8 M31 values per felt252
+        // and the values can be recovered by the Cairo-equivalent unpack logic.
+        let mut raw_io = Vec::new();
+        for i in 0..25u32 {
+            // Use a mix of values including edge cases
+            let val = match i {
+                0 => 0u32,
+                1 => 1,
+                2 => 0x7FFF_FFFE, // max valid M31 (2^31 - 2)
+                3 => 0x3FFF_FFFF,
+                _ => (i * 123456789 + 42) & 0x7FFF_FFFF,
+            };
+            raw_io.push(FieldElement::from(val as u64));
+        }
+
+        let packed = pack_m31_io_data(&raw_io);
+        assert_eq!(packed.len(), (25 + 7) / 8); // ceil(25/8) = 4
+
+        // Simulate Cairo unpack: extract 8 M31 values from each felt252
+        let mut result = Vec::new();
+        for felt in &packed {
+            if result.len() >= 25 {
+                break;
+            }
+            let be = felt.to_bytes_be();
+            // Convert to u256 (lo = bytes[16..32], hi = bytes[0..16])
+            let mut lo_bytes = [0u8; 16];
+            let mut hi_bytes = [0u8; 16];
+            lo_bytes.copy_from_slice(&be[16..32]);
+            hi_bytes.copy_from_slice(&be[0..16]);
+            let lo = u128::from_be_bytes(lo_bytes);
+            let hi = u128::from_be_bytes(hi_bytes);
+
+            let m31_mask: u128 = 0x7FFF_FFFF;
+
+            // Value 0: bits [0..31) from lo
+            if result.len() < 25 {
+                result.push((lo & m31_mask) as u32);
+            }
+            // Value 1: bits [31..62) from lo
+            if result.len() < 25 {
+                result.push(((lo >> 31) & m31_mask) as u32);
+            }
+            // Value 2: bits [62..93) from lo
+            if result.len() < 25 {
+                result.push(((lo >> 62) & m31_mask) as u32);
+            }
+            // Value 3: bits [93..124) from lo
+            if result.len() < 25 {
+                result.push(((lo >> 93) & m31_mask) as u32);
+            }
+            // Value 4: bits [124..155) straddles lo/hi
+            if result.len() < 25 {
+                let lo_part = lo >> 124; // 4 bits
+                let hi_part = (hi & 0x7FF_FFFF) << 4; // 27 bits shifted left 4
+                result.push(((lo_part | hi_part) & m31_mask) as u32);
+            }
+            // Value 5: bits [155..186) from hi — bits [27..58)
+            if result.len() < 25 {
+                result.push(((hi >> 27) & m31_mask) as u32);
+            }
+            // Value 6: bits [186..217) from hi — bits [58..89)
+            if result.len() < 25 {
+                result.push(((hi >> 58) & m31_mask) as u32);
+            }
+            // Value 7: bits [217..248) from hi — bits [89..120)
+            if result.len() < 25 {
+                result.push(((hi >> 89) & m31_mask) as u32);
+            }
+        }
+
+        // Compare
+        for (i, original) in raw_io.iter().enumerate() {
+            let orig_be = original.to_bytes_be();
+            let orig_val = u32::from_be_bytes([orig_be[28], orig_be[29], orig_be[30], orig_be[31]]);
+            assert_eq!(
+                result[i],
+                orig_val & 0x7FFF_FFFF,
+                "mismatch at index {i}: packed/unpacked {}, original {}",
+                result[i],
+                orig_val
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_verify_model_gkr_v4_packed_io_reduces_calldata() {
+        use crate::aggregation::prove_model_pure_gkr;
+        use crate::gkr::types::WeightOpeningTranscriptMode;
+        let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
+
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(2);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
+
+        let mut weights = GraphWeights::new();
+        let mut w = M31Matrix::new(4, 2);
+        for i in 0..4 {
+            for j in 0..2 {
+                w.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
+        weights.add_weight(0, w);
+
+        let mut agg_proof =
+            prove_model_pure_gkr(&graph, &input, &weights).expect("GKR proving should succeed");
+        let gkr = agg_proof.gkr_proof.as_mut().expect("GKR proof expected");
+        gkr.weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
+        gkr.aggregated_binding = None;
+
+        let circuit = crate::gkr::LayeredCircuit::from_graph(&graph).expect("circuit compile");
+        let raw_io = crate::cairo_serde::serialize_raw_io(&input, &agg_proof.execution.output);
+        let model_id = FieldElement::from(0xBEEFu64);
+
+        // Build IO-packed calldata
+        let io_packed = build_verify_model_gkr_v4_packed_io_calldata(gkr, &circuit, model_id, &raw_io)
+            .expect("io_packed calldata should build");
+        let regular = build_verify_model_gkr_v4_calldata(gkr, &circuit, model_id, &raw_io)
+            .expect("regular calldata should build");
+
+        // IO-packed should have fewer felts (raw_io section shrinks ~8x)
+        assert!(
+            io_packed.total_felts < regular.total_felts,
+            "io_packed ({}) should have fewer felts than regular ({})",
+            io_packed.total_felts,
+            regular.total_felts,
+        );
+
+        // First element should be model_id in both
+        assert_eq!(io_packed.calldata_parts[0], regular.calldata_parts[0]);
+
+        // Second element of io_packed should be original_io_len
+        let io_len: usize = io_packed.calldata_parts[1].parse().unwrap();
+        assert_eq!(io_len, raw_io.len());
     }
 
     #[test]

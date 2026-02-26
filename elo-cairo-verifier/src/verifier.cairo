@@ -102,95 +102,36 @@ pub trait ISumcheckVerifier<TContractState> {
     ///   - dequantize_bits: [bits0, bits1, ...] per Dequantize layer
     ///   - proof_data: flat felt252 array of tag-dispatched per-layer proofs
     ///   - weight_commitments: Poseidon Merkle roots of weight MLEs
-    fn verify_model_gkr(
-        ref self: TContractState,
-        model_id: felt252,
-        raw_io_data: Array<felt252>,
-        circuit_depth: u32,
-        num_layers: u32,
-        matmul_dims: Array<u32>,
-        dequantize_bits: Array<u64>,
-        proof_data: Array<felt252>,
-        weight_commitments: Array<felt252>,
-        weight_opening_proofs: Array<MleOpeningProof>,
-    ) -> bool;
-
-    /// Versioned full on-chain ZKML verification path.
-    ///
-    /// Supported `weight_binding_mode` values:
-    ///   - `0`: sequential opening transcript (v1-compatible)
-    ///   - `1`: batched sub-channel opening transcript
-    fn verify_model_gkr_v2(
-        ref self: TContractState,
-        model_id: felt252,
-        raw_io_data: Array<felt252>,
-        circuit_depth: u32,
-        num_layers: u32,
-        matmul_dims: Array<u32>,
-        dequantize_bits: Array<u64>,
-        proof_data: Array<felt252>,
-        weight_commitments: Array<felt252>,
-        weight_binding_mode: u32,
-        weight_opening_proofs: Array<MleOpeningProof>,
-    ) -> bool;
-
-    /// Phase-3 versioned interface for trustless aggregated weight binding.
-    ///
-    /// Supported `weight_binding_mode` values:
-    ///   - `0`: sequential opening transcript (v1-compatible)
-    ///   - `1`: batched sub-channel opening transcript
-    ///   - `2`: aggregated trustless binding (v3 payload + opening checks, sub-channel opening transcript)
-    ///
-    /// `weight_binding_data`:
-    ///   - mode `0|1`: must be empty
-    ///   - mode `2`: `[binding_digest, claim_count]`
-    fn verify_model_gkr_v3(
-        ref self: TContractState,
-        model_id: felt252,
-        raw_io_data: Array<felt252>,
-        circuit_depth: u32,
-        num_layers: u32,
-        matmul_dims: Array<u32>,
-        dequantize_bits: Array<u64>,
-        proof_data: Array<felt252>,
-        weight_commitments: Array<felt252>,
-        weight_binding_mode: u32,
-        weight_binding_data: Array<felt252>,
-        weight_opening_proofs: Array<MleOpeningProof>,
-    ) -> bool;
-
-    /// Phase-4 versioned interface for aggregated weight binding.
-    ///
-    /// Supported `weight_binding_mode` values:
-    ///   - `3`: aggregated openings experimental envelope
-    ///   - `4`: aggregated oracle mismatch sumcheck (production default)
-    ///
-    /// `weight_binding_data`:
-    ///   - mode `3`: `[binding_digest, claim_count]`
-    ///   - mode `4`: `[n_claims, n_max, m_padded, super_root, subtree_roots..., mismatch_sumcheck_proof...]`
-    fn verify_model_gkr_v4(
-        ref self: TContractState,
-        model_id: felt252,
-        raw_io_data: Array<felt252>,
-        circuit_depth: u32,
-        num_layers: u32,
-        matmul_dims: Array<u32>,
-        dequantize_bits: Array<u64>,
-        proof_data: Array<felt252>,
-        weight_commitments: Array<felt252>,
-        weight_binding_mode: u32,
-        weight_binding_data: Array<felt252>,
-        weight_opening_proofs: Array<MleOpeningProof>,
-    ) -> bool;
 
     /// Phase-4 versioned interface with packed QM31 proof data.
     ///
-    /// Identical to `verify_model_gkr_v4` except `proof_data` uses packed QM31
-    /// format (1 felt252 per QM31 instead of 4 u64s), reducing calldata by ~3.3x.
+    /// On-chain GKR verification with packed QM31 proof data.
+    /// Uses 1 felt252 per QM31 instead of 4 u64s, reducing calldata by ~3.3x.
     fn verify_model_gkr_v4_packed(
         ref self: TContractState,
         model_id: felt252,
         raw_io_data: Array<felt252>,
+        circuit_depth: u32,
+        num_layers: u32,
+        matmul_dims: Array<u32>,
+        dequantize_bits: Array<u64>,
+        proof_data: Array<felt252>,
+        weight_commitments: Array<felt252>,
+        weight_binding_mode: u32,
+        weight_binding_data: Array<felt252>,
+        weight_opening_proofs: Array<MleOpeningProof>,
+    ) -> bool;
+
+    /// Same as `verify_model_gkr_v4_packed` but with IO-packed raw_io_data.
+    ///
+    /// `packed_raw_io` contains 8 M31 values per felt252 (248 bits).
+    /// `original_io_len` is the unpacked count. This reduces calldata from
+    /// ~10K to ~1.3K felts, fitting within the 5000 felt TX limit.
+    fn verify_model_gkr_v4_packed_io(
+        ref self: TContractState,
+        model_id: felt252,
+        original_io_len: u32,
+        packed_raw_io: Array<felt252>,
         circuit_depth: u32,
         num_layers: u32,
         matmul_dims: Array<u32>,
@@ -207,54 +148,6 @@ pub trait ISumcheckVerifier<TContractState> {
 
     /// Get the number of GKR weight commitments for a model.
     fn get_model_gkr_weight_count(self: @TContractState, model_id: felt252) -> u32;
-
-    // ─── Chunked GKR Session Protocol ────────────────────────────────────
-
-    /// Open a new GKR upload session. Returns the session_id.
-    ///
-    /// The caller becomes the session owner and is the only address
-    /// allowed to upload chunks.
-    fn open_gkr_session(
-        ref self: TContractState,
-        model_id: felt252,
-        total_felts: u32,
-        circuit_depth: u32,
-        num_layers: u32,
-        weight_binding_mode: u32,
-        packed: bool,
-    ) -> felt252;
-
-    /// Upload a chunk of proof data to an open session.
-    ///
-    /// Chunks must be uploaded in order (`chunk_idx == chunks_received`).
-    /// Each chunk may contain at most 4000 felt252 values.
-    fn upload_gkr_chunk(
-        ref self: TContractState,
-        session_id: felt252,
-        chunk_idx: u32,
-        data: Array<felt252>,
-    );
-
-    /// Seal a session after all chunks have been uploaded.
-    ///
-    /// Validates that the total received felts match the declared total.
-    fn seal_gkr_session(ref self: TContractState, session_id: felt252);
-
-    /// Verify a sealed session's proof data from storage.
-    ///
-    /// Reads all data back from `gkr_session_data`, deserializes into
-    /// the standard verify_model_gkr_core parameters, and runs verification.
-    fn verify_gkr_from_session(ref self: TContractState, session_id: felt252) -> bool;
-
-    /// Expire a timed-out session and clean up metadata.
-    ///
-    /// Anyone can call this after `GKR_SESSION_TIMEOUT_BLOCKS` (~1000 blocks).
-    /// Does NOT clean up data storage (too expensive); only resets metadata
-    /// so the session_id cannot be used.
-    fn expire_gkr_session(ref self: TContractState, session_id: felt252);
-
-    /// Get the status of a GKR session (0=none, 1=uploading, 2=sealed, 3=verified).
-    fn get_gkr_session_status(self: @TContractState, session_id: felt252) -> u8;
 }
 
 #[starknet::contract]
@@ -271,7 +164,7 @@ mod SumcheckVerifierContract {
         channel_draw_felt252, channel_draw_qm31, channel_draw_qm31s, channel_mix_secure_field,
     };
     use crate::mle::verify_mle_opening;
-    use crate::model_verifier::{verify_gkr_model_with_trace, WeightClaimData};
+    use crate::model_verifier::verify_gkr_model_with_trace;
     // NOTE: verify_unified_stark + UnifiedStarkProof deserialization pulls in
     // stwo_verifier_core's FRI verifier which uses Felt252Dict (squashed_felt252_dict_entries).
     // This libfunc is not yet in Starknet's allowed list, blocking deployment.
@@ -345,35 +238,6 @@ mod SumcheckVerifierContract {
         view_delegation_list: Map<(ContractAddress, u32), ContractAddress>,
         /// owner → number of delegations.
         view_delegation_count: Map<ContractAddress, u32>,
-        // ─── GKR Chunked Session Storage ─────────────────────────
-        /// session_id → session owner address.
-        gkr_session_owner: Map<felt252, ContractAddress>,
-        /// session_id → model_id.
-        gkr_session_model_id: Map<felt252, felt252>,
-        /// session_id → total felts expected.
-        gkr_session_total_felts: Map<felt252, u32>,
-        /// session_id → felts received so far.
-        gkr_session_received_felts: Map<felt252, u32>,
-        /// session_id → total number of chunks expected.
-        gkr_session_num_chunks: Map<felt252, u32>,
-        /// session_id → number of chunks received so far.
-        gkr_session_chunks_received: Map<felt252, u32>,
-        /// session_id → session status (0=none, 1=uploading, 2=sealed, 3=verified).
-        gkr_session_status: Map<felt252, u8>,
-        /// session_id → block number when session was created.
-        gkr_session_created_at: Map<felt252, u64>,
-        /// (session_id, flat_index) → felt252 data.
-        gkr_session_data: Map<(felt252, u32), felt252>,
-        /// session_id → circuit_depth parameter.
-        gkr_session_circuit_depth: Map<felt252, u32>,
-        /// session_id → num_layers parameter.
-        gkr_session_num_layers: Map<felt252, u32>,
-        /// session_id → weight_binding_mode parameter.
-        gkr_session_weight_binding_mode: Map<felt252, u32>,
-        /// session_id → packed QM31 format flag (true = 1 felt per QM31, false = 4 felts).
-        gkr_session_packed: Map<felt252, bool>,
-        /// Monotonic nonce for generating unique session IDs.
-        next_gkr_session_nonce: u64,
     }
 
     #[event]
@@ -382,11 +246,6 @@ mod SumcheckVerifierContract {
         ModelRegistered: ModelRegistered,
         ModelGkrRegistered: ModelGkrRegistered,
         ModelGkrVerified: ModelGkrVerified,
-        GkrSessionOpened: GkrSessionOpened,
-        GkrChunkUploaded: GkrChunkUploaded,
-        GkrSessionSealed: GkrSessionSealed,
-        GkrSessionVerified: GkrSessionVerified,
-        GkrSessionExpired: GkrSessionExpired,
         VerificationFailed: VerificationFailed,
         UpgradeProposed: UpgradeProposed,
         UpgradeExecuted: UpgradeExecuted,
@@ -451,140 +310,105 @@ mod SumcheckVerifierContract {
         cancelled_by: ContractAddress,
     }
 
-    #[derive(Drop, starknet::Event)]
-    struct GkrSessionOpened {
-        #[key]
-        session_id: felt252,
-        model_id: felt252,
-        owner: ContractAddress,
-        total_felts: u32,
-        num_chunks: u32,
-    }
-
-    #[derive(Drop, starknet::Event)]
-    struct GkrChunkUploaded {
-        #[key]
-        session_id: felt252,
-        chunk_idx: u32,
-        data_len: u32,
-    }
-
-    #[derive(Drop, starknet::Event)]
-    struct GkrSessionSealed {
-        #[key]
-        session_id: felt252,
-        total_felts: u32,
-    }
-
-    #[derive(Drop, starknet::Event)]
-    struct GkrSessionVerified {
-        #[key]
-        session_id: felt252,
-        model_id: felt252,
-        proof_hash: felt252,
-    }
-
-    #[derive(Drop, starknet::Event)]
-    struct GkrSessionExpired {
-        #[key]
-        session_id: felt252,
-        expired_by: ContractAddress,
-    }
-
-    // GKR session constants
-    const MAX_GKR_CHUNK_FELTS: u32 = 4000;
-    const GKR_SESSION_TIMEOUT_BLOCKS: u64 = 10000;
-    // Session status values
-    const GKR_SESSION_STATUS_NONE: u8 = 0;
-    const GKR_SESSION_STATUS_UPLOADING: u8 = 1;
-    const GKR_SESSION_STATUS_SEALED: u8 = 2;
-    const GKR_SESSION_STATUS_VERIFIED: u8 = 3;
-
-    const WEIGHT_BINDING_MODE_SEQUENTIAL: u32 = 0;
-    const WEIGHT_BINDING_MODE_BATCHED_SUBCHANNEL_V1: u32 = 1;
-    const WEIGHT_BINDING_MODE_AGGREGATED_TRUSTLESS_V2: u32 = 2;
     const WEIGHT_BINDING_MODE_AGGREGATED_OPENINGS_V4_EXPERIMENTAL: u32 = 3;
     const WEIGHT_BINDING_MODE_AGGREGATED_ORACLE_SUMCHECK: u32 = 4;
-    const WEIGHT_BINDING_MODE2_DOMAIN_TAG: felt252 = 0x57424d32;
-    const WEIGHT_BINDING_MODE2_SCHEMA_VERSION: felt252 = 1;
-    const WEIGHT_BINDING_MODE3_DOMAIN_TAG: felt252 = 0x57424d33;
-    const WEIGHT_BINDING_MODE3_SCHEMA_VERSION: felt252 = 1;
     /// Marker tag for mode 4 RLC-only binding (0x524C43 = "RLC").
     const WEIGHT_BINDING_RLC_MARKER: felt252 = 0x524C43;
 
-    fn derive_weight_opening_subchannel(
-        opening_seed: felt252,
-        opening_index: u32,
-        claim: @WeightClaimData,
-    ) -> crate::channel::PoseidonChannel {
-        let mut ch = channel_default();
-        channel_mix_felt(ref ch, opening_seed);
-        channel_mix_u64(ref ch, opening_index.into());
-        channel_mix_felts(ref ch, claim.eval_point.span());
-        channel_mix_felt(ref ch, pack_qm31_to_felt(*claim.expected_value));
-        ch
-    }
+    // M31 packing: 8 M31 values (31 bits each) packed into one felt252 (248 bits).
+    // Layout: v0 | (v1 << 31) | (v2 << 62) | ... | (v7 << 217)
+    //
+    // Unpacking uses u128 limb arithmetic to avoid expensive u256 division.
+    // The packed value's low 128 bits contain values 0..3 (bits 0..123),
+    // and high 128 bits contain values 4..7 (bits 124..247).
+    // Value 4 straddles the boundary: bits 124..127 in low, bits 0..26 in high.
+    const M31_MASK_128: u128 = 0x7FFFFFFF; // 2^31 - 1
 
-    fn compute_mode_binding_digest(
-        commitments: Span<felt252>,
-        claims: Span<WeightClaimData>,
-        domain_tag: felt252,
-        schema_version: felt252,
-    ) -> felt252 {
-        let mut hasher_inputs: Array<felt252> = array![
-            domain_tag,
-            schema_version,
-            claims.len().into(),
-            commitments.len().into(),
-        ];
-
-        let mut c_i: u32 = 0;
+    fn unpack_m31_packed_io(packed_felts: Span<felt252>, original_len: u32) -> Array<felt252> {
+        // Optimized unpack: use cascading division to extract 8 M31 values per felt.
+        // Each division by 2^31 gives quotient=remaining and remainder=current value.
+        // This uses only 7 divisions total (vs 7 independent large-constant divisions),
+        // and each division is by the small constant 0x80000000 (2^31).
+        let mut result: Array<felt252> = array![];
+        let mut pi: u32 = 0;
+        let packed_count = packed_felts.len();
         loop {
-            if c_i >= claims.len() {
+            if pi >= packed_count {
                 break;
             }
-            let claim = claims.at(c_i);
-            hasher_inputs.append(*commitments.at(c_i));
-            hasher_inputs.append(claim.eval_point.len().into());
+            if result.len() >= original_len {
+                break;
+            }
+            let val: u256 = (*packed_felts.at(pi)).into();
+            // Treat as a single 248-bit number. We extract 31 bits at a time from the LSB.
+            // Use felt252 arithmetic for the cascading division since felt252 division
+            // by a constant is cheaper than u128 division.
+            // The packed value has at most 248 bits (8 * 31), fits in u256.
+            // We'll cascade through lo first, then hi.
 
-            let mut p_i: u32 = 0;
-            loop {
-                if p_i >= claim.eval_point.len() {
-                    break;
-                }
-                hasher_inputs.append(pack_qm31_to_felt(*claim.eval_point.at(p_i)));
-                p_i += 1;
-            };
+            // Extract from lo (128 bits → values 0,1,2,3 + 4 bits of value 4)
+            let mut rem_lo: u128 = val.low;
+            // Value 0: rem_lo % 2^31
+            if result.len() < original_len {
+                let q: u128 = rem_lo / 0x80000000;
+                let v: u128 = rem_lo - q * 0x80000000;
+                result.append(v.into());
+                rem_lo = q;
+            }
+            // Value 1
+            if result.len() < original_len {
+                let q: u128 = rem_lo / 0x80000000;
+                let v: u128 = rem_lo - q * 0x80000000;
+                result.append(v.into());
+                rem_lo = q;
+            }
+            // Value 2
+            if result.len() < original_len {
+                let q: u128 = rem_lo / 0x80000000;
+                let v: u128 = rem_lo - q * 0x80000000;
+                result.append(v.into());
+                rem_lo = q;
+            }
+            // Value 3
+            if result.len() < original_len {
+                let q: u128 = rem_lo / 0x80000000;
+                let v: u128 = rem_lo - q * 0x80000000;
+                result.append(v.into());
+                rem_lo = q;
+            }
+            // rem_lo now has bits [124..128) = 4 bits (the low 4 bits of value 4)
 
-            hasher_inputs.append(pack_qm31_to_felt(*claim.expected_value));
-            c_i += 1;
+            // Value 4 straddles lo/hi: 4 bits from rem_lo + 27 bits from hi
+            let mut rem_hi: u128 = val.high;
+            if result.len() < original_len {
+                // Combine: lo_part (4 bits) | hi_low_27 << 4
+                let hi_q: u128 = rem_hi / 0x8000000; // >> 27
+                let hi_low27: u128 = rem_hi - hi_q * 0x8000000;
+                let v4: u128 = rem_lo | (hi_low27 * 16); // rem_lo has 4 bits, shift hi_low27 left by 4
+                result.append((v4 & M31_MASK_128).into());
+                rem_hi = hi_q;
+            }
+            // Value 5: next 31 bits from rem_hi
+            if result.len() < original_len {
+                let q: u128 = rem_hi / 0x80000000;
+                let v: u128 = rem_hi - q * 0x80000000;
+                result.append(v.into());
+                rem_hi = q;
+            }
+            // Value 6
+            if result.len() < original_len {
+                let q: u128 = rem_hi / 0x80000000;
+                let v: u128 = rem_hi - q * 0x80000000;
+                result.append(v.into());
+                rem_hi = q;
+            }
+            // Value 7: remaining bits (at most 31)
+            if result.len() < original_len {
+                result.append((rem_hi & M31_MASK_128).into());
+            }
+            pi += 1;
         };
-
-        core::poseidon::poseidon_hash_span(hasher_inputs.span())
-    }
-
-    fn compute_mode2_binding_digest(
-        commitments: Span<felt252>,
-        claims: Span<WeightClaimData>,
-    ) -> felt252 {
-        compute_mode_binding_digest(
-            commitments,
-            claims,
-            WEIGHT_BINDING_MODE2_DOMAIN_TAG,
-            WEIGHT_BINDING_MODE2_SCHEMA_VERSION,
-        )
-    }
-
-    fn compute_mode3_binding_digest(
-        commitments: Span<felt252>,
-        claims: Span<WeightClaimData>,
-    ) -> felt252 {
-        compute_mode_binding_digest(
-            commitments,
-            claims,
-            WEIGHT_BINDING_MODE3_DOMAIN_TAG,
-            WEIGHT_BINDING_MODE3_SCHEMA_VERSION,
-        )
+        result
     }
 
     fn verify_model_gkr_core(
@@ -602,11 +426,46 @@ mod SumcheckVerifierContract {
         weight_opening_proofs: Array<MleOpeningProof>,
         packed: bool,
     ) -> bool {
+        // Compute IO commitment from unpacked raw data (standard path)
+        assert!(raw_io_data.len() >= 6, "IO_DATA_TOO_SHORT");
+        let io_commitment = core::poseidon::poseidon_hash_span(raw_io_data.span());
+
+        verify_model_gkr_core_with_io_commitment(
+            ref self,
+            model_id,
+            raw_io_data,
+            io_commitment,
+            circuit_depth,
+            num_layers,
+            matmul_dims,
+            dequantize_bits,
+            proof_data,
+            weight_commitments,
+            weight_binding_mode,
+            weight_binding_data,
+            weight_opening_proofs,
+            packed,
+        )
+    }
+
+    fn verify_model_gkr_core_with_io_commitment(
+        ref self: ContractState,
+        model_id: felt252,
+        raw_io_data: Array<felt252>,
+        io_commitment: felt252,
+        circuit_depth: u32,
+        num_layers: u32,
+        matmul_dims: Array<u32>,
+        dequantize_bits: Array<u64>,
+        proof_data: Array<felt252>,
+        weight_commitments: Array<felt252>,
+        weight_binding_mode: u32,
+        weight_binding_data: Span<felt252>,
+        weight_opening_proofs: Array<MleOpeningProof>,
+        packed: bool,
+    ) -> bool {
         assert!(
-            weight_binding_mode == WEIGHT_BINDING_MODE_SEQUENTIAL
-                || weight_binding_mode == WEIGHT_BINDING_MODE_BATCHED_SUBCHANNEL_V1
-                || weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_TRUSTLESS_V2
-                || weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_OPENINGS_V4_EXPERIMENTAL
+            weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_OPENINGS_V4_EXPERIMENTAL
                 || weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_ORACLE_SUMCHECK,
             "UNSUPPORTED_WEIGHT_BINDING_MODE",
         );
@@ -630,9 +489,8 @@ mod SumcheckVerifierContract {
         let circuit_hash = self.model_circuit_hash.entry(model_id).read();
         assert!(circuit_hash != 0, "Model not registered for GKR");
 
-        // 2. Recompute IO commitment from raw data — never trust caller
+        // 2. IO commitment already provided (computed from raw data or packed data by caller)
         assert!(raw_io_data.len() >= 6, "IO_DATA_TOO_SHORT");
-        let io_commitment = core::poseidon::poseidon_hash_span(raw_io_data.span());
 
         // 3. Verify weight commitments match registered
         let registered_count = self.model_gkr_weight_count.entry(model_id).read();
@@ -654,11 +512,15 @@ mod SumcheckVerifierContract {
         };
 
         // ================================================================
-        // 4. Parse raw_io_data to extract input and output matrices
+        // 4. Parse raw_io_data headers and build MLE arrays directly
         //
         // Layout (matches serialize_raw_io in cairo_serde.rs):
         //   [in_rows, in_cols, in_len, in_data...,
         //    out_rows, out_cols, out_len, out_data...]
+        //
+        // Optimization: parse headers, then build padded QM31 MLE arrays
+        // directly from io_span — avoids intermediate raw_input/raw_output
+        // arrays, eliminating ~10K array appends.
         // ================================================================
         let io_span = raw_io_data.span();
         let io_len: u32 = io_span.len();
@@ -676,19 +538,10 @@ mod SumcheckVerifierContract {
         let input_len: u32 = input_len_felt.try_into().unwrap();
         io_off += 1;
 
-        // Extract raw input M31 values
+        // Record where input data starts in io_span (skip data for now)
         assert!(io_off <= io_len, "IO_DATA_OFFSET_OOB");
         assert!(input_len <= io_len - io_off, "IO_INPUT_LENGTH_MISMATCH");
-        let mut raw_input: Array<u64> = array![];
-        let mut i: u32 = 0;
-        loop {
-            if i >= input_len {
-                break;
-            }
-            let v: u256 = (*io_span.at(io_off + i)).into();
-            raw_input.append(v.try_into().unwrap());
-            i += 1;
-        };
+        let input_data_off: u32 = io_off;
         io_off += input_len;
 
         // Parse output header
@@ -703,27 +556,19 @@ mod SumcheckVerifierContract {
         let output_len: u32 = output_len_felt.try_into().unwrap();
         io_off += 1;
 
-        // Extract raw output M31 values
+        // Record where output data starts in io_span
         assert!(io_off <= io_len, "IO_DATA_OFFSET_OOB");
         assert!(output_len <= io_len - io_off, "IO_OUTPUT_LENGTH_MISMATCH");
-        let mut raw_output: Array<u64> = array![];
-        i = 0;
-        loop {
-            if i >= output_len {
-                break;
-            }
-            let v: u256 = (*io_span.at(io_off + i)).into();
-            raw_output.append(v.try_into().unwrap());
-            i += 1;
-        };
+        let output_data_off: u32 = io_off;
         io_off += output_len;
         assert!(io_off == io_len, "IO_DATA_LENGTH_MISMATCH");
 
         // ================================================================
-        // 5. Build output MLE (pad to power-of-2 dimensions, row-major)
+        // 5. Build output MLE directly from io_span (no intermediate array)
         //
         // Matches Rust: pad_matrix_pow2(output) → matrix_to_mle()
         // The MLE has next_pow2(rows) * next_pow2(cols) entries.
+        // For batch-size-1 (padded_rows == 1), use a flat loop.
         // ================================================================
         let out_rows_u32: u32 = output_rows.try_into().unwrap();
         let out_cols_u32: u32 = output_cols.try_into().unwrap();
@@ -731,28 +576,48 @@ mod SumcheckVerifierContract {
         let padded_out_cols = next_power_of_two(out_cols_u32);
         let _padded_out_len = padded_out_rows * padded_out_cols;
 
-        // Build padded MLE: row i, col j → index i*padded_out_cols + j
         let mut output_mle: Array<QM31> = array![];
-        let mut row: u32 = 0;
-        loop {
-            if row >= padded_out_rows {
-                break;
-            }
+        if padded_out_rows == 1 {
+            // Fast path for 1-row case: flat copy + pad (avoids nested loop)
             let mut col: u32 = 0;
             loop {
                 if col >= padded_out_cols {
                     break;
                 }
-                if row < out_rows_u32 && col < out_cols_u32 {
-                    let idx: u32 = row * out_cols_u32 + col;
-                    output_mle.append(m31_to_qm31(*raw_output.at(idx)));
+                if col < out_cols_u32 {
+                    let v: u256 = (*io_span.at(output_data_off + col)).into();
+                    let v_u64: u64 = v.try_into().unwrap();
+                    output_mle.append(m31_to_qm31(v_u64));
                 } else {
                     output_mle.append(crate::field::qm31_zero());
                 }
                 col += 1;
             };
-            row += 1;
-        };
+        } else {
+            // General multi-row case: row-major with padding
+            let mut row: u32 = 0;
+            loop {
+                if row >= padded_out_rows {
+                    break;
+                }
+                let mut col: u32 = 0;
+                loop {
+                    if col >= padded_out_cols {
+                        break;
+                    }
+                    if row < out_rows_u32 && col < out_cols_u32 {
+                        let idx: u32 = row * out_cols_u32 + col;
+                        let v: u256 = (*io_span.at(output_data_off + idx)).into();
+                        let v_u64: u64 = v.try_into().unwrap();
+                        output_mle.append(m31_to_qm31(v_u64));
+                    } else {
+                        output_mle.append(crate::field::qm31_zero());
+                    }
+                    col += 1;
+                };
+                row += 1;
+            };
+        }
 
         // ================================================================
         // 6. Initialize Fiat-Shamir channel and construct output claim
@@ -817,31 +682,23 @@ mod SumcheckVerifierContract {
             weight_claims.len() == expected_weight_claims,
             "WEIGHT_CLAIM_COUNT_MISMATCH",
         );
-        if weight_binding_mode != WEIGHT_BINDING_MODE_AGGREGATED_ORACLE_SUMCHECK {
+        if weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_OPENINGS_V4_EXPERIMENTAL {
             assert!(
                 weight_opening_proofs.len() == expected_weight_claims,
                 "WEIGHT_OPENING_COUNT_MISMATCH",
             );
-        }
-        if weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_TRUSTLESS_V2
-            || weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_OPENINGS_V4_EXPERIMENTAL
-        {
             assert!(
                 weight_binding_data.len() == 2,
                 "WEIGHT_BINDING_DATA_LENGTH_MISMATCH",
             );
-        } else if weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_ORACLE_SUMCHECK {
+        } else {
             // Mode 4: either full aggregated proof or RLC-only marker (2 felts)
             assert!(weight_binding_data.len() >= 2, "AGGREGATED_BINDING_DATA_TOO_SHORT");
-        } else {
-            assert!(weight_binding_data.len() == 0, "UNEXPECTED_WEIGHT_BINDING_DATA_FOR_MODE");
         }
 
-        let opening_seed = if (
-            weight_binding_mode == WEIGHT_BINDING_MODE_BATCHED_SUBCHANNEL_V1
-                || weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_TRUSTLESS_V2
-                || weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_OPENINGS_V4_EXPERIMENTAL
-        ) && expected_weight_claims > 0 {
+        let opening_seed = if weight_binding_mode
+            == WEIGHT_BINDING_MODE_AGGREGATED_OPENINGS_V4_EXPERIMENTAL
+            && expected_weight_claims > 0 {
             channel_draw_felt252(ref ch)
         } else {
             0
@@ -879,26 +736,6 @@ mod SumcheckVerifierContract {
             resolved_weight_commitments.append(commitment);
             w_i += 1;
         };
-
-        if weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_TRUSTLESS_V2
-            || weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_OPENINGS_V4_EXPERIMENTAL
-        {
-            let advertised_claim_count_u256: u256 = (*weight_binding_data.at(1)).into();
-            let advertised_claim_count: u32 = advertised_claim_count_u256.try_into().unwrap();
-            assert!(
-                advertised_claim_count == expected_weight_claims,
-                "WEIGHT_BINDING_CLAIM_COUNT_MISMATCH",
-            );
-            let expected_digest = if weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_TRUSTLESS_V2 {
-                compute_mode2_binding_digest(resolved_weight_commitments.span(), weight_claims.span())
-            } else {
-                compute_mode3_binding_digest(resolved_weight_commitments.span(), weight_claims.span())
-            };
-            assert!(
-                expected_digest == *weight_binding_data.at(0),
-                "WEIGHT_BINDING_DIGEST_MISMATCH",
-            );
-        }
 
         if weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_ORACLE_SUMCHECK {
             // Mode 4: either full mismatch sumcheck proof or RLC-only binding.
@@ -939,7 +776,14 @@ mod SumcheckVerifierContract {
                 assert!(valid, "AGGREGATED_WEIGHT_BINDING_FAILED");
             }
         } else {
-            // Modes 0-3: Per-weight MLE opening verification loop.
+            // Mode 3: per-weight MLE opening verification with sub-channel.
+            let advertised_claim_count_u256: u256 = (*weight_binding_data.at(1)).into();
+            let advertised_claim_count: u32 = advertised_claim_count_u256.try_into().unwrap();
+            assert!(
+                advertised_claim_count == expected_weight_claims,
+                "WEIGHT_BINDING_CLAIM_COUNT_MISMATCH",
+            );
+
             w_i = 0;
             loop {
                 if w_i >= expected_weight_claims {
@@ -954,26 +798,18 @@ mod SumcheckVerifierContract {
                     "WEIGHT_OPENING_VALUE_MISMATCH",
                 );
 
-                let valid = if weight_binding_mode == WEIGHT_BINDING_MODE_BATCHED_SUBCHANNEL_V1
-                    || weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_TRUSTLESS_V2
-                    || weight_binding_mode
-                        == WEIGHT_BINDING_MODE_AGGREGATED_OPENINGS_V4_EXPERIMENTAL
-                {
-                    let mut sub_ch = derive_weight_opening_subchannel(opening_seed, w_i, claim);
-                    verify_mle_opening(
-                        commitment,
-                        opening,
-                        claim.eval_point.span(),
-                        ref sub_ch,
-                    )
-                } else {
-                    verify_mle_opening(
-                        commitment,
-                        opening,
-                        claim.eval_point.span(),
-                        ref ch,
-                    )
-                };
+                let mut sub_ch = channel_default();
+                channel_mix_felt(ref sub_ch, opening_seed);
+                channel_mix_u64(ref sub_ch, w_i.into());
+                channel_mix_felts(ref sub_ch, claim.eval_point.span());
+                channel_mix_felt(ref sub_ch, pack_qm31_to_felt(*claim.expected_value));
+
+                let valid = verify_mle_opening(
+                    commitment,
+                    opening,
+                    claim.eval_point.span(),
+                    ref sub_ch,
+                );
                 assert!(valid, "WEIGHT_MLE_OPENING_FAILED");
                 w_i += 1;
             };
@@ -982,34 +818,56 @@ mod SumcheckVerifierContract {
         // ================================================================
         // 8. INPUT CLAIM VERIFICATION: evaluate MLE(raw_input, final_claim.point)
         //    and assert it matches final_claim.value
+        //
+        // Build padded input MLE directly from io_span (no intermediate array).
         // ================================================================
         let in_rows_u32: u32 = input_rows.try_into().unwrap();
         let in_cols_u32: u32 = input_cols.try_into().unwrap();
         let padded_in_rows = next_power_of_two(in_rows_u32);
         let padded_in_cols = next_power_of_two(in_cols_u32);
 
-        // Build padded input MLE (row-major, same layout as output)
         let mut input_mle: Array<QM31> = array![];
-        row = 0;
-        loop {
-            if row >= padded_in_rows {
-                break;
-            }
+        if padded_in_rows == 1 {
+            // Fast path for 1-row case: flat copy + pad
             let mut col: u32 = 0;
             loop {
                 if col >= padded_in_cols {
                     break;
                 }
-                if row < in_rows_u32 && col < in_cols_u32 {
-                    let idx: u32 = row * in_cols_u32 + col;
-                    input_mle.append(m31_to_qm31(*raw_input.at(idx)));
+                if col < in_cols_u32 {
+                    let v: u256 = (*io_span.at(input_data_off + col)).into();
+                    let v_u64: u64 = v.try_into().unwrap();
+                    input_mle.append(m31_to_qm31(v_u64));
                 } else {
                     input_mle.append(crate::field::qm31_zero());
                 }
                 col += 1;
             };
-            row += 1;
-        };
+        } else {
+            // General multi-row case: row-major with padding
+            let mut row: u32 = 0;
+            loop {
+                if row >= padded_in_rows {
+                    break;
+                }
+                let mut col: u32 = 0;
+                loop {
+                    if col >= padded_in_cols {
+                        break;
+                    }
+                    if row < in_rows_u32 && col < in_cols_u32 {
+                        let idx: u32 = row * in_cols_u32 + col;
+                        let v: u256 = (*io_span.at(input_data_off + idx)).into();
+                        let v_u64: u64 = v.try_into().unwrap();
+                        input_mle.append(m31_to_qm31(v_u64));
+                    } else {
+                        input_mle.append(crate::field::qm31_zero());
+                    }
+                    col += 1;
+                };
+                row += 1;
+            };
+        }
 
         // Evaluate input MLE at the GKR walk's final point
         let input_value = evaluate_mle(input_mle.span(), final_claim.point.span());
@@ -1221,147 +1079,6 @@ mod SumcheckVerifierContract {
             });
         }
 
-        fn verify_model_gkr(
-            ref self: ContractState,
-            model_id: felt252,
-            raw_io_data: Array<felt252>,
-            circuit_depth: u32,
-            num_layers: u32,
-            matmul_dims: Array<u32>,
-            dequantize_bits: Array<u64>,
-            proof_data: Array<felt252>,
-            weight_commitments: Array<felt252>,
-            weight_opening_proofs: Array<MleOpeningProof>,
-        ) -> bool {
-            let empty_binding_data: Array<felt252> = array![];
-            verify_model_gkr_core(
-                ref self,
-                model_id,
-                raw_io_data,
-                circuit_depth,
-                num_layers,
-                matmul_dims,
-                dequantize_bits,
-                proof_data,
-                weight_commitments,
-                WEIGHT_BINDING_MODE_SEQUENTIAL,
-                empty_binding_data.span(),
-                weight_opening_proofs,
-                false,
-            )
-        }
-
-        fn verify_model_gkr_v2(
-            ref self: ContractState,
-            model_id: felt252,
-            raw_io_data: Array<felt252>,
-            circuit_depth: u32,
-            num_layers: u32,
-            matmul_dims: Array<u32>,
-            dequantize_bits: Array<u64>,
-            proof_data: Array<felt252>,
-            weight_commitments: Array<felt252>,
-            weight_binding_mode: u32,
-            weight_opening_proofs: Array<MleOpeningProof>,
-        ) -> bool {
-            assert!(
-                weight_binding_mode == WEIGHT_BINDING_MODE_SEQUENTIAL
-                    || weight_binding_mode == WEIGHT_BINDING_MODE_BATCHED_SUBCHANNEL_V1,
-                "UNSUPPORTED_WEIGHT_BINDING_MODE",
-            );
-            let empty_binding_data: Array<felt252> = array![];
-            verify_model_gkr_core(
-                ref self,
-                model_id,
-                raw_io_data,
-                circuit_depth,
-                num_layers,
-                matmul_dims,
-                dequantize_bits,
-                proof_data,
-                weight_commitments,
-                weight_binding_mode,
-                empty_binding_data.span(),
-                weight_opening_proofs,
-                false,
-            )
-        }
-
-        fn verify_model_gkr_v3(
-            ref self: ContractState,
-            model_id: felt252,
-            raw_io_data: Array<felt252>,
-            circuit_depth: u32,
-            num_layers: u32,
-            matmul_dims: Array<u32>,
-            dequantize_bits: Array<u64>,
-            proof_data: Array<felt252>,
-            weight_commitments: Array<felt252>,
-            weight_binding_mode: u32,
-            weight_binding_data: Array<felt252>,
-            weight_opening_proofs: Array<MleOpeningProof>,
-        ) -> bool {
-            assert!(
-                weight_binding_mode == WEIGHT_BINDING_MODE_SEQUENTIAL
-                    || weight_binding_mode == WEIGHT_BINDING_MODE_BATCHED_SUBCHANNEL_V1
-                    || weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_TRUSTLESS_V2,
-                "UNSUPPORTED_WEIGHT_BINDING_MODE",
-            );
-
-            verify_model_gkr_core(
-                ref self,
-                model_id,
-                raw_io_data,
-                circuit_depth,
-                num_layers,
-                matmul_dims,
-                dequantize_bits,
-                proof_data,
-                weight_commitments,
-                weight_binding_mode,
-                weight_binding_data.span(),
-                weight_opening_proofs,
-                false,
-            )
-        }
-
-        fn verify_model_gkr_v4(
-            ref self: ContractState,
-            model_id: felt252,
-            raw_io_data: Array<felt252>,
-            circuit_depth: u32,
-            num_layers: u32,
-            matmul_dims: Array<u32>,
-            dequantize_bits: Array<u64>,
-            proof_data: Array<felt252>,
-            weight_commitments: Array<felt252>,
-            weight_binding_mode: u32,
-            weight_binding_data: Array<felt252>,
-            weight_opening_proofs: Array<MleOpeningProof>,
-        ) -> bool {
-            assert!(
-                weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_OPENINGS_V4_EXPERIMENTAL
-                    || weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_ORACLE_SUMCHECK,
-                "UNSUPPORTED_WEIGHT_BINDING_MODE",
-            );
-
-            verify_model_gkr_core(
-                ref self,
-                model_id,
-                raw_io_data,
-                circuit_depth,
-                num_layers,
-                matmul_dims,
-                dequantize_bits,
-                proof_data,
-                weight_commitments,
-                weight_binding_mode,
-                weight_binding_data.span(),
-                weight_opening_proofs,
-                false,
-            )
-        }
-
         fn verify_model_gkr_v4_packed(
             ref self: ContractState,
             model_id: felt252,
@@ -1399,303 +1116,50 @@ mod SumcheckVerifierContract {
             )
         }
 
-        fn get_model_circuit_hash(self: @ContractState, model_id: felt252) -> felt252 {
-            self.model_circuit_hash.entry(model_id).read()
-        }
-
-        fn get_model_gkr_weight_count(self: @ContractState, model_id: felt252) -> u32 {
-            self.model_gkr_weight_count.entry(model_id).read()
-        }
-
-        // ─── Chunked GKR Session Protocol ────────────────────────────────
-
-        fn open_gkr_session(
+        fn verify_model_gkr_v4_packed_io(
             ref self: ContractState,
             model_id: felt252,
-            total_felts: u32,
+            original_io_len: u32,
+            packed_raw_io: Array<felt252>,
             circuit_depth: u32,
             num_layers: u32,
+            matmul_dims: Array<u32>,
+            dequantize_bits: Array<u64>,
+            proof_data: Array<felt252>,
+            weight_commitments: Array<felt252>,
             weight_binding_mode: u32,
-            packed: bool,
-        ) -> felt252 {
-            assert!(total_felts > 0, "GKR_SESSION_ZERO_FELTS");
-            assert!(circuit_depth > 0, "GKR_SESSION_ZERO_CIRCUIT_DEPTH");
-            assert!(num_layers > 0, "GKR_SESSION_ZERO_NUM_LAYERS");
+            weight_binding_data: Array<felt252>,
+            weight_opening_proofs: Array<MleOpeningProof>,
+        ) -> bool {
             assert!(
                 weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_OPENINGS_V4_EXPERIMENTAL
                     || weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_ORACLE_SUMCHECK,
-                "GKR_SESSION_UNSUPPORTED_BINDING_MODE",
+                "UNSUPPORTED_WEIGHT_BINDING_MODE",
             );
 
-            // Note: model registration is NOT required for the session path,
-            // matching verify_model_gkr_v4 which also skips it.
-
-            // Compute number of chunks: ceil(total_felts / MAX_GKR_CHUNK_FELTS).
-            let num_chunks = (total_felts + MAX_GKR_CHUNK_FELTS - 1) / MAX_GKR_CHUNK_FELTS;
-
-            // Generate session_id via Poseidon(nonce, caller, block).
-            let nonce = self.next_gkr_session_nonce.read();
-            let caller = get_caller_address();
-            let block = get_block_number();
-            let session_id = core::poseidon::poseidon_hash_span(
-                array![nonce.into(), caller.into(), block.into(), model_id].span(),
-            );
-            self.next_gkr_session_nonce.write(nonce + 1);
-
-            // Write session metadata.
-            self.gkr_session_owner.entry(session_id).write(caller);
-            self.gkr_session_model_id.entry(session_id).write(model_id);
-            self.gkr_session_total_felts.entry(session_id).write(total_felts);
-            self.gkr_session_received_felts.entry(session_id).write(0);
-            self.gkr_session_num_chunks.entry(session_id).write(num_chunks);
-            self.gkr_session_chunks_received.entry(session_id).write(0);
-            self.gkr_session_status.entry(session_id).write(GKR_SESSION_STATUS_UPLOADING);
-            self.gkr_session_created_at.entry(session_id).write(block);
-            self.gkr_session_circuit_depth.entry(session_id).write(circuit_depth);
-            self.gkr_session_num_layers.entry(session_id).write(num_layers);
-            self.gkr_session_weight_binding_mode.entry(session_id).write(weight_binding_mode);
-            self.gkr_session_packed.entry(session_id).write(packed);
-
-            self.emit(GkrSessionOpened {
-                session_id, model_id, owner: caller, total_felts, num_chunks,
-            });
-
-            session_id
-        }
-
-        fn upload_gkr_chunk(
-            ref self: ContractState,
-            session_id: felt252,
-            chunk_idx: u32,
-            data: Array<felt252>,
-        ) {
-            // Session must be in uploading state.
-            let status = self.gkr_session_status.entry(session_id).read();
-            assert!(status == GKR_SESSION_STATUS_UPLOADING, "GKR_SESSION_NOT_UPLOADING");
-
-            // Only the session owner can upload.
-            let caller = get_caller_address();
-            let owner = self.gkr_session_owner.entry(session_id).read();
-            assert!(caller == owner, "GKR_SESSION_NOT_OWNER");
-
-            // Check timeout.
-            let created_at = self.gkr_session_created_at.entry(session_id).read();
-            let current_block = get_block_number();
-            assert!(
-                current_block <= created_at + GKR_SESSION_TIMEOUT_BLOCKS,
-                "GKR_SESSION_EXPIRED",
-            );
-
-            // Chunks must arrive in order.
-            let chunks_received = self.gkr_session_chunks_received.entry(session_id).read();
-            assert!(chunk_idx == chunks_received, "GKR_SESSION_CHUNK_OUT_OF_ORDER");
-
-            // Chunk must not exceed limit.
-            let data_len: u32 = data.len();
-            assert!(data_len > 0, "GKR_SESSION_EMPTY_CHUNK");
-            assert!(data_len <= MAX_GKR_CHUNK_FELTS, "GKR_SESSION_CHUNK_TOO_LARGE");
-
-            // Must not exceed total_felts.
-            let received = self.gkr_session_received_felts.entry(session_id).read();
-            let total_felts = self.gkr_session_total_felts.entry(session_id).read();
-            assert!(received + data_len <= total_felts, "GKR_SESSION_FELTS_OVERFLOW");
-
-            // Write data to flat storage.
-            let base_offset = received;
-            let data_span = data.span();
-            let mut i: u32 = 0;
+            // Hash packed felts for IO commitment (1,281 felts vs 10,246)
+            // Domain-separate by prepending original_io_len to prevent
+            // different packings from producing the same commitment.
+            let mut commitment_input: Array<felt252> = array![original_io_len.into()];
+            let mut ci: u32 = 0;
             loop {
-                if i >= data_len {
+                if ci >= packed_raw_io.len() {
                     break;
                 }
-                self.gkr_session_data.entry((session_id, base_offset + i)).write(*data_span.at(i));
-                i += 1;
+                commitment_input.append(*packed_raw_io.at(ci));
+                ci += 1;
             };
+            let io_commitment = core::poseidon::poseidon_hash_span(commitment_input.span());
 
-            // Update counters.
-            self.gkr_session_received_felts.entry(session_id).write(received + data_len);
-            self.gkr_session_chunks_received.entry(session_id).write(chunks_received + 1);
+            // Unpack for MLE evaluations
+            let raw_io_data = unpack_m31_packed_io(packed_raw_io.span(), original_io_len);
 
-            self.emit(GkrChunkUploaded { session_id, chunk_idx, data_len });
-        }
-
-        fn seal_gkr_session(ref self: ContractState, session_id: felt252) {
-            let status = self.gkr_session_status.entry(session_id).read();
-            assert!(status == GKR_SESSION_STATUS_UPLOADING, "GKR_SESSION_NOT_UPLOADING");
-
-            let caller = get_caller_address();
-            let owner = self.gkr_session_owner.entry(session_id).read();
-            assert!(caller == owner, "GKR_SESSION_NOT_OWNER");
-
-            // Check timeout.
-            let created_at = self.gkr_session_created_at.entry(session_id).read();
-            let current_block = get_block_number();
-            assert!(
-                current_block <= created_at + GKR_SESSION_TIMEOUT_BLOCKS,
-                "GKR_SESSION_EXPIRED",
-            );
-
-            // All felts must be received.
-            let received = self.gkr_session_received_felts.entry(session_id).read();
-            let total_felts = self.gkr_session_total_felts.entry(session_id).read();
-            assert!(received == total_felts, "GKR_SESSION_INCOMPLETE");
-
-            self.gkr_session_status.entry(session_id).write(GKR_SESSION_STATUS_SEALED);
-
-            self.emit(GkrSessionSealed { session_id, total_felts });
-        }
-
-        fn verify_gkr_from_session(ref self: ContractState, session_id: felt252) -> bool {
-            let status = self.gkr_session_status.entry(session_id).read();
-            assert!(status == GKR_SESSION_STATUS_SEALED, "GKR_SESSION_NOT_SEALED");
-
-            // Check timeout.
-            let created_at = self.gkr_session_created_at.entry(session_id).read();
-            let current_block = get_block_number();
-            assert!(
-                current_block <= created_at + GKR_SESSION_TIMEOUT_BLOCKS,
-                "GKR_SESSION_EXPIRED",
-            );
-
-            let model_id = self.gkr_session_model_id.entry(session_id).read();
-            let total_felts = self.gkr_session_total_felts.entry(session_id).read();
-            let circuit_depth = self.gkr_session_circuit_depth.entry(session_id).read();
-            let num_layers = self.gkr_session_num_layers.entry(session_id).read();
-            let weight_binding_mode = self.gkr_session_weight_binding_mode.entry(session_id).read();
-            let packed = self.gkr_session_packed.entry(session_id).read();
-
-            // ── Read all data from flat storage into memory ──
-            // Layout: [raw_io_data_len, raw_io_data...,
-            //          matmul_dims_len, matmul_dims...,
-            //          dequantize_bits_len, dequantize_bits...,
-            //          proof_data_len, proof_data...,
-            //          weight_commitments_len, weight_commitments...,
-            //          weight_binding_data_len, weight_binding_data...,
-            //          weight_opening_proofs_len, weight_opening_proofs_flat...]
-            let mut flat: Array<felt252> = array![];
-            let mut idx: u32 = 0;
-            loop {
-                if idx >= total_felts {
-                    break;
-                }
-                flat.append(self.gkr_session_data.entry((session_id, idx)).read());
-                idx += 1;
-            };
-            let flat_span = flat.span();
-
-            // ── Parse sections from flat data ──
-            let mut off: u32 = 0;
-
-            // 1. raw_io_data
-            assert!(off < total_felts, "GKR_SESSION_DATA_TRUNCATED");
-            let raw_io_len_u256: u256 = (*flat_span.at(off)).into();
-            let raw_io_len: u32 = raw_io_len_u256.try_into().unwrap();
-            off += 1;
-            let mut raw_io_data: Array<felt252> = array![];
-            let mut i: u32 = 0;
-            loop {
-                if i >= raw_io_len {
-                    break;
-                }
-                raw_io_data.append(*flat_span.at(off + i));
-                i += 1;
-            };
-            off += raw_io_len;
-
-            // 2. matmul_dims
-            assert!(off < total_felts, "GKR_SESSION_DATA_TRUNCATED");
-            let matmul_dims_len_u256: u256 = (*flat_span.at(off)).into();
-            let matmul_dims_len: u32 = matmul_dims_len_u256.try_into().unwrap();
-            off += 1;
-            let mut matmul_dims: Array<u32> = array![];
-            i = 0;
-            loop {
-                if i >= matmul_dims_len {
-                    break;
-                }
-                let v_u256: u256 = (*flat_span.at(off + i)).into();
-                matmul_dims.append(v_u256.try_into().unwrap());
-                i += 1;
-            };
-            off += matmul_dims_len;
-
-            // 3. dequantize_bits
-            assert!(off < total_felts, "GKR_SESSION_DATA_TRUNCATED");
-            let deq_bits_len_u256: u256 = (*flat_span.at(off)).into();
-            let deq_bits_len: u32 = deq_bits_len_u256.try_into().unwrap();
-            off += 1;
-            let mut dequantize_bits: Array<u64> = array![];
-            i = 0;
-            loop {
-                if i >= deq_bits_len {
-                    break;
-                }
-                let v_u256: u256 = (*flat_span.at(off + i)).into();
-                dequantize_bits.append(v_u256.try_into().unwrap());
-                i += 1;
-            };
-            off += deq_bits_len;
-
-            // 4. proof_data
-            assert!(off < total_felts, "GKR_SESSION_DATA_TRUNCATED");
-            let proof_data_len_u256: u256 = (*flat_span.at(off)).into();
-            let proof_data_len: u32 = proof_data_len_u256.try_into().unwrap();
-            off += 1;
-            let mut proof_data: Array<felt252> = array![];
-            i = 0;
-            loop {
-                if i >= proof_data_len {
-                    break;
-                }
-                proof_data.append(*flat_span.at(off + i));
-                i += 1;
-            };
-            off += proof_data_len;
-
-            // 5. weight_commitments
-            assert!(off < total_felts, "GKR_SESSION_DATA_TRUNCATED");
-            let wc_len_u256: u256 = (*flat_span.at(off)).into();
-            let wc_len: u32 = wc_len_u256.try_into().unwrap();
-            off += 1;
-            let mut weight_commitments: Array<felt252> = array![];
-            i = 0;
-            loop {
-                if i >= wc_len {
-                    break;
-                }
-                weight_commitments.append(*flat_span.at(off + i));
-                i += 1;
-            };
-            off += wc_len;
-
-            // 6. weight_binding_data
-            assert!(off < total_felts, "GKR_SESSION_DATA_TRUNCATED");
-            let wbd_len_u256: u256 = (*flat_span.at(off)).into();
-            let wbd_len: u32 = wbd_len_u256.try_into().unwrap();
-            off += 1;
-            let mut weight_binding_data: Array<felt252> = array![];
-            i = 0;
-            loop {
-                if i >= wbd_len {
-                    break;
-                }
-                weight_binding_data.append(*flat_span.at(off + i));
-                i += 1;
-            };
-            off += wbd_len;
-
-            // 7. weight_opening_proofs (remaining felts are Serde-serialized Array<MleOpeningProof>)
-            assert!(off <= total_felts, "GKR_SESSION_DATA_TRUNCATED");
-            let wop_len = total_felts - off;
-            let mut wop_span = flat_span.slice(off, wop_len);
-            let weight_opening_proofs: Array<MleOpeningProof> =
-                Serde::deserialize(ref wop_span).expect('GKR_SESSION_WOP_DESER_FAIL');
-
-            // ── Delegate to core verifier ──
-            let result = verify_model_gkr_core(
+            // Pass pre-computed io_commitment to core
+            verify_model_gkr_core_with_io_commitment(
                 ref self,
                 model_id,
                 raw_io_data,
+                io_commitment,
                 circuit_depth,
                 num_layers,
                 matmul_dims,
@@ -1705,44 +1169,16 @@ mod SumcheckVerifierContract {
                 weight_binding_mode,
                 weight_binding_data.span(),
                 weight_opening_proofs,
-                packed,
-            );
-
-            // Mark session as verified.
-            self.gkr_session_status.entry(session_id).write(GKR_SESSION_STATUS_VERIFIED);
-
-            // proof_hash was already emitted by verify_model_gkr_core via ModelGkrVerified.
-            // Session event uses a session-derived hash for correlation.
-            let session_proof_hash = core::poseidon::poseidon_hash_span(
-                array![session_id, model_id].span(),
-            );
-            self.emit(GkrSessionVerified { session_id, model_id, proof_hash: session_proof_hash });
-
-            result
+                true,
+            )
         }
 
-        fn expire_gkr_session(ref self: ContractState, session_id: felt252) {
-            let status = self.gkr_session_status.entry(session_id).read();
-            assert!(
-                status == GKR_SESSION_STATUS_UPLOADING || status == GKR_SESSION_STATUS_SEALED,
-                "GKR_SESSION_CANNOT_EXPIRE",
-            );
-
-            let created_at = self.gkr_session_created_at.entry(session_id).read();
-            let current_block = get_block_number();
-            assert!(
-                current_block > created_at + GKR_SESSION_TIMEOUT_BLOCKS,
-                "GKR_SESSION_NOT_EXPIRED",
-            );
-
-            // Reset metadata (data storage is left — too expensive to clean).
-            self.gkr_session_status.entry(session_id).write(GKR_SESSION_STATUS_NONE);
-
-            self.emit(GkrSessionExpired { session_id, expired_by: get_caller_address() });
+        fn get_model_circuit_hash(self: @ContractState, model_id: felt252) -> felt252 {
+            self.model_circuit_hash.entry(model_id).read()
         }
 
-        fn get_gkr_session_status(self: @ContractState, session_id: felt252) -> u8 {
-            self.gkr_session_status.entry(session_id).read()
+        fn get_model_gkr_weight_count(self: @ContractState, model_id: felt252) -> u32 {
+            self.model_gkr_weight_count.entry(model_id).read()
         }
     }
 

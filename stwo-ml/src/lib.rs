@@ -53,7 +53,7 @@ pub mod prelude {
     pub use stwo::prover::backend::simd::SimdBackend;
     pub use stwo::prover::backend::BackendForChannel;
 
-    pub use crate::aggregation::compute_io_commitment;
+    pub use crate::aggregation::{compute_io_commitment, compute_io_commitment_packed};
     pub use crate::aggregation::{
         prove_model_aggregated, prove_model_aggregated_auto, prove_model_aggregated_onchain,
         prove_model_aggregated_onchain_auto, prove_model_aggregated_onchain_auto_cached,

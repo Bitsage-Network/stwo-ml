@@ -409,9 +409,11 @@ The pipeline includes a deployed privacy pool contract for shielded transactions
 | Network | Contract | Address |
 |---------|----------|---------|
 | Sepolia | VM31Pool | `0x07cf94e27a60b94658ec908a00a9bb6dfff03358e952d9d48a8ed0be080ce1f9` |
-| Sepolia | EloVerifier | `0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005` |
+| Sepolia | EloVerifier (v14) | `0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005` |
 
 Configured in `lib/contract_addresses.sh`. Override with `VM31_POOL_ADDRESS` env var.
+
+EloVerifier class: `0x67c70ac8eb20ced4c458d0719ebb1bdcbaac690f7fccf0b4e6185ab7b0fd3fe` (v14, includes `verify_model_gkr_v4_packed_io` direct calldata entrypoint).
 
 ### Privacy CLI Commands
 

@@ -250,6 +250,22 @@ pub fn compute_io_commitment(input: &M31Matrix, output: &M31Matrix) -> FieldElem
     starknet_crypto::poseidon_hash_many(&hash_inputs)
 }
 
+/// Compute IO commitment from packed IO data.
+///
+/// Matches the on-chain `verify_model_gkr_v4_packed_io` commitment:
+/// `Poseidon(original_io_len, packed_felt_0, packed_felt_1, ...)`
+///
+/// This hashes 1+ceil(N/8) felts instead of N felts, saving ~2M Cairo steps
+/// for a typical 10K-element IO vector.
+pub fn compute_io_commitment_packed(input: &M31Matrix, output: &M31Matrix) -> FieldElement {
+    let raw_io = crate::cairo_serde::serialize_raw_io(input, output);
+    let packed = crate::starknet::pack_m31_io_data(&raw_io);
+    let mut hash_inputs = Vec::with_capacity(1 + packed.len());
+    hash_inputs.push(FieldElement::from(raw_io.len() as u64)); // original_io_len
+    hash_inputs.extend_from_slice(&packed);
+    starknet_crypto::poseidon_hash_many(&hash_inputs)
+}
+
 /// Compute a Poseidon commitment over LayerNorm mean and variance values.
 ///
 /// Binds the prover to specific mean/variance choices, preventing a malicious prover
