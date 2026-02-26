@@ -653,10 +653,12 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
     "verify_model_gkr_v2",
     "verify_model_gkr_v3",
     "verify_model_gkr_v4",
+    "verify_model_gkr_v4_packed",
+    "verify_model_gkr_v4_packed_io",
   ]);
   if (!allowedEntrypoints.has(entrypoint)) {
     die(
-      `Only verify_model_gkr / verify_model_gkr_v2 / verify_model_gkr_v3 / verify_model_gkr_v4 are supported in the hardened pipeline (got: ${entrypoint})`
+      `Unsupported entrypoint in hardened pipeline (got: ${entrypoint})`
     );
   }
 
@@ -2018,12 +2020,13 @@ async function cmdVerify(args) {
   // ═══════════════════════════════════════════════════════════════════
   const singleTxStart = Date.now();
   if (
-    !new Set(["verify_model_gkr", "verify_model_gkr_v2", "verify_model_gkr_v3", "verify_model_gkr_v4"]).has(
-      verifyPayload.entrypoint
-    )
+    !new Set([
+      "verify_model_gkr", "verify_model_gkr_v2", "verify_model_gkr_v3", "verify_model_gkr_v4",
+      "verify_model_gkr_v4_packed", "verify_model_gkr_v4_packed_io",
+    ]).has(verifyPayload.entrypoint)
   ) {
     die(
-      `Only verify_model_gkr / verify_model_gkr_v2 / verify_model_gkr_v3 / verify_model_gkr_v4 are supported in the hardened pipeline (got: ${verifyPayload.entrypoint})`
+      `Unsupported entrypoint in hardened pipeline (got: ${verifyPayload.entrypoint})`
     );
   }
 
