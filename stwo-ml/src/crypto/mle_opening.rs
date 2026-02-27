@@ -20,8 +20,6 @@ use crate::gpu_sumcheck::u32s_to_secure_field;
 use crate::gpu_sumcheck::GpuSumcheckExecutor;
 #[cfg(feature = "cuda-runtime")]
 use cudarc::driver::CudaSlice;
-#[cfg(feature = "cuda-runtime")]
-use cudarc::driver::DeviceSlice;
 use rayon::prelude::*;
 use starknet_ff::FieldElement;
 #[cfg(feature = "cuda-runtime")]
