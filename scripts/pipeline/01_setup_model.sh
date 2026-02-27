@@ -223,15 +223,22 @@ if [[ -n "${MODEL_HF:-}" ]] && [[ "$SKIP_DOWNLOAD" == "false" ]]; then
         fi
         echo ""
 
+        # Disable hf-xet transfer backend — it crashes with SIGABRT on large
+        # downloads (huggingface_hub >= 1.5.0).  The standard HTTPS backend
+        # works fine and is only marginally slower.
+        export HF_HUB_ENABLE_HF_TRANSFER=0
+
         # Method 1: huggingface-cli
         if command -v huggingface-cli &>/dev/null; then
-            run_cmd huggingface-cli download "${MODEL_HF}" \
+            HF_HUB_ENABLE_HF_TRANSFER=0 run_cmd huggingface-cli download "${MODEL_HF}" \
                 --local-dir "${MODEL_DIR}" \
                 --include "*.safetensors" "*.safetensors.index.json" "config.json" "tokenizer.json" "tokenizer_config.json" "generation_config.json" \
                 --quiet
         # Method 2: Python API
         elif python3 -c "from huggingface_hub import snapshot_download" 2>/dev/null; then
-            python3 -c "
+            HF_HUB_ENABLE_HF_TRANSFER=0 python3 -c "
+import os
+os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = '0'
 from huggingface_hub import snapshot_download
 snapshot_download(
     '${MODEL_HF}',
