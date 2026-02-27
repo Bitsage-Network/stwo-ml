@@ -713,7 +713,7 @@ fn prewarm_weight_roots_inner(
             if force_gpu && gpu_count < 2 {
                 eprintln!("[prewarm] GPU exclusive mode — using single GPU (no contention)");
             }
-            prewarm_gpu(weights, &uncached, cache, total, &t_start)
+            prewarm_gpu(weights, &uncached, cache, total, &t_start, model_dir)
         } else {
             eprintln!("[prewarm] single-GPU detected — using CPU path to avoid GPU contention");
             prewarm_cpu(weights, &uncached, cache, total, &t_start)
@@ -751,6 +751,7 @@ fn prewarm_gpu(
     cache: &SharedWeightCache,
     total: usize,
     t_start: &std::time::Instant,
+    model_dir: Option<&std::path::Path>,
 ) -> usize {
     use stwo::prover::backend::gpu::cuda_executor::{
         get_cuda_executor, is_cuda_available, upload_poseidon252_round_constants,
@@ -820,6 +821,13 @@ fn prewarm_gpu(
                     t_start.elapsed().as_secs_f64(),
                     padded_n,
                 );
+            }
+            // Incremental save every 40 matrices so partial progress survives
+            // OOM kills or crashes.  save_shared_cache() is cheap (~10ms).
+            if finished % 40 == 0 {
+                if let Some(dir) = model_dir {
+                    let _ = save_shared_cache(cache, dir);
+                }
             }
         }
     }
