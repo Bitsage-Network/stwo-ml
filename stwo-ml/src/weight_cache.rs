@@ -791,35 +791,27 @@ fn prewarm_gpu(
         let limb_count = padded_n * 4;
         let group_size = group_indices.len();
 
-        // Prepare all limb buffers for this group in parallel via rayon.
-        // Each matrix gets its own buffer to enable fully parallel CPU prep.
-        use rayon::prelude::*;
-        let limb_buffers: Vec<Option<Vec<u64>>> = group_indices
-            .par_iter()
-            .map(|&idx| {
-                let (node_id, _rp, _cp) = uncached[idx];
-                weights.get_weight(node_id).map(|matrix| {
-                    let mut buf = vec![0u64; limb_count];
-                    let _ = crate::components::matmul::matrix_to_mle_col_major_all_padded(
-                        matrix, &mut buf,
-                    );
-                    buf
-                })
-            })
-            .collect();
-
-        // Sequential GPU commits for this group (shares round constants, no redundant setup).
-        for (i, &idx) in group_indices.iter().enumerate() {
+        // Process one matrix at a time to keep peak memory bounded.
+        // Each limb buffer is padded_n * 4 * 8 bytes (~2 GB for 67M-element
+        // matrices).  Materializing all 80+ buffers at once would exceed
+        // available RAM on most machines.  The GPU commit is the bottleneck
+        // anyway, so sequential prep + commit has negligible throughput impact.
+        for &idx in group_indices.iter() {
             let (node_id, rp, cp) = uncached[idx];
-            if let Some(ref buf) = limb_buffers[i] {
+            if let Some(matrix) = weights.get_weight(node_id) {
+                let mut buf = vec![0u64; limb_count];
+                let _ = crate::components::matmul::matrix_to_mle_col_major_all_padded(
+                    matrix, &mut buf,
+                );
                 if let Ok(root) = crate::crypto::mle_opening::commit_mle_root_only_gpu_from_limbs(
-                    buf, *padded_n, executor, &d_rc,
+                    &buf, *padded_n, executor, &d_rc,
                 ) {
                     if let Ok(mut w) = cache.write() {
                         w.insert_root(node_id, rp, cp, root);
                         computed += 1;
                     }
                 }
+                // buf dropped here — only one ~2 GB buffer alive at a time
             }
             finished += 1;
             if finished % 20 == 0 || finished == total {
