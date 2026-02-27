@@ -771,21 +771,27 @@ fn enforce_gkr_soundness_gates(proof: &crate::gkr::GKRProof) -> Result<(), Stark
             )));
         }
     }
-    for (i, opening) in proof.weight_openings.iter().enumerate() {
-        if opening.queries.is_empty() {
-            return Err(StarknetModelError::SoundnessGate(format!(
-                "weight opening {} has no Merkle queries",
-                i
-            )));
-        }
-    }
-    for (i, deferred) in proof.deferred_proofs.iter().enumerate() {
-        if let Some(wo) = deferred.weight_opening() {
-            if wo.queries.is_empty() {
+    // In AggregatedOracleSumcheck mode, weight openings use RLC binding
+    // (empty queries/intermediate_roots). Only check Merkle queries for
+    // modes that actually produce individual per-weight openings.
+    if proof.weight_opening_transcript_mode != WeightOpeningTranscriptMode::AggregatedOracleSumcheck
+    {
+        for (i, opening) in proof.weight_openings.iter().enumerate() {
+            if opening.queries.is_empty() {
                 return Err(StarknetModelError::SoundnessGate(format!(
-                    "deferred weight opening {} has no Merkle queries",
+                    "weight opening {} has no Merkle queries",
                     i
                 )));
+            }
+        }
+        for (i, deferred) in proof.deferred_proofs.iter().enumerate() {
+            if let Some(wo) = deferred.weight_opening() {
+                if wo.queries.is_empty() {
+                    return Err(StarknetModelError::SoundnessGate(format!(
+                        "deferred weight opening {} has no Merkle queries",
+                        i
+                    )));
+                }
             }
         }
     }
