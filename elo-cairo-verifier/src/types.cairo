@@ -14,6 +14,27 @@ pub struct RoundPoly {
     pub c2: QM31,
 }
 
+/// Compressed degree-2 round polynomial: omits c1 (verifier reconstructs it).
+/// Since p(0) + p(1) = current_sum and p(1) = c0 + c1 + c2,
+/// we get: c1 = current_sum - 2*c0 - c2.
+/// Saves 1 QM31 (1 packed felt or 4 unpacked) per sumcheck round.
+#[derive(Drop, Copy)]
+pub struct CompressedRoundPoly {
+    pub c0: QM31,
+    pub c2: QM31,
+}
+
+/// Compressed degree-3 round polynomial: omits c1 (verifier reconstructs it).
+/// Since p(0) + p(1) = current_sum and p(1) = c0 + c1 + c2 + c3,
+/// we get: c1 = current_sum - 2*c0 - c2 - c3.
+/// Saves 1 QM31 per sumcheck round.
+#[derive(Drop, Copy)]
+pub struct CompressedGkrRoundPoly {
+    pub c0: QM31,
+    pub c2: QM31,
+    pub c3: QM31,
+}
+
 /// Data for a single query at a single folding round of the MLE opening protocol.
 #[derive(Drop, Serde)]
 pub struct MleQueryRoundData {

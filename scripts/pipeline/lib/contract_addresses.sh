@@ -20,8 +20,10 @@ _OBELYSK_CONTRACTS_LOADED=1
 # StweMlStarkVerifier (recursive STARK verification)
 STARK_VERIFIER_SEPOLIA="0x005928ac548dc2719ef1b34869db2b61c2a55a4b148012fad742262a8d674fba"
 
-# Obelysk/Elo Cairo Verifier (GKR verification + audit) — v14
-# Class hash: 0x67c70ac8eb20ced4c458d0719ebb1bdcbaac690f7fccf0b4e6185ab7b0fd3fe
+# Obelysk/Elo Cairo Verifier (GKR verification + audit) — v19
+# Class hash: 0x355910b5fda51d7048354e37a812bab71502dc1ae95655019aa97b3e1f86fb6
+# Previous class hash (v18b lean): 0x9355a647a88350aef2bf44b40df0117a384872aa4c07a6fb0b3a6c292b665a
+# v19 changes: compressed round polys (c1 omitted), batched channel_mix, aggregate weight root hash
 # Entrypoints: verify_model_gkr_v4_packed, verify_model_gkr_v4_packed_io (direct calldata, no storage reads)
 ELO_VERIFIER_SEPOLIA="0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005"
 

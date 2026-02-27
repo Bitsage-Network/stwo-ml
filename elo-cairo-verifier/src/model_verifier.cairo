@@ -14,7 +14,7 @@
 
 use crate::field::{QM31, CM31, qm31_zero, log2_ceil, next_power_of_two, unpack_qm31_from_felt};
 use crate::channel::{PoseidonChannel, channel_mix_secure_field};
-use crate::types::{RoundPoly, GkrRoundPoly, GKRClaim};
+use crate::types::{GKRClaim, CompressedRoundPoly, CompressedGkrRoundPoly};
 use crate::layer_verifiers::{
     verify_add_layer, verify_mul_layer, verify_matmul_layer,
     verify_activation_layer, verify_dequantize_layer,
@@ -84,42 +84,44 @@ fn read_qm31(ref r: ProofReader) -> QM31 {
     }
 }
 
-fn read_deg2_poly(ref r: ProofReader) -> RoundPoly {
+/// Read a compressed degree-2 round polynomial (c0, c2 only — c1 omitted).
+/// The verifier reconstructs c1 = current_sum - 2*c0 - c2 during verification.
+fn read_compressed_deg2_poly(ref r: ProofReader) -> CompressedRoundPoly {
     let c0 = read_qm31(ref r);
-    let c1 = read_qm31(ref r);
     let c2 = read_qm31(ref r);
-    RoundPoly { c0, c1, c2 }
+    CompressedRoundPoly { c0, c2 }
 }
 
-fn read_deg3_poly(ref r: ProofReader) -> GkrRoundPoly {
+/// Read a compressed degree-3 round polynomial (c0, c2, c3 — c1 omitted).
+/// The verifier reconstructs c1 = current_sum - 2*c0 - c2 - c3 during verification.
+fn read_compressed_deg3_poly(ref r: ProofReader) -> CompressedGkrRoundPoly {
     let c0 = read_qm31(ref r);
-    let c1 = read_qm31(ref r);
     let c2 = read_qm31(ref r);
     let c3 = read_qm31(ref r);
-    GkrRoundPoly { c0, c1, c2, c3, num_coeffs: 4 }
+    CompressedGkrRoundPoly { c0, c2, c3 }
 }
 
-fn read_deg2_polys(ref r: ProofReader, count: u32) -> Array<RoundPoly> {
-    let mut result: Array<RoundPoly> = array![];
+fn read_compressed_deg2_polys(ref r: ProofReader, count: u32) -> Array<CompressedRoundPoly> {
+    let mut result: Array<CompressedRoundPoly> = array![];
     let mut i: u32 = 0;
     loop {
         if i >= count {
             break;
         }
-        result.append(read_deg2_poly(ref r));
+        result.append(read_compressed_deg2_poly(ref r));
         i += 1;
     };
     result
 }
 
-fn read_deg3_polys(ref r: ProofReader, count: u32) -> Array<GkrRoundPoly> {
-    let mut result: Array<GkrRoundPoly> = array![];
+fn read_compressed_deg3_polys(ref r: ProofReader, count: u32) -> Array<CompressedGkrRoundPoly> {
+    let mut result: Array<CompressedGkrRoundPoly> = array![];
     let mut i: u32 = 0;
     loop {
         if i >= count {
             break;
         }
-        result.append(read_deg3_poly(ref r));
+        result.append(read_compressed_deg3_poly(ref r));
         i += 1;
     };
     result
@@ -128,9 +130,10 @@ fn read_deg3_polys(ref r: ProofReader, count: u32) -> Array<GkrRoundPoly> {
 /// Read an optional LogUp proof from flat data.
 /// Returns (has_logup, round_polys, final_w, final_in, final_out, claimed_sum).
 /// Multiplicities are skipped (table-side verification done externally).
+/// Round polynomials use compressed format (c1 omitted).
 fn read_optional_logup(
     ref r: ProofReader,
-) -> (bool, Array<GkrRoundPoly>, QM31, QM31, QM31, QM31) {
+) -> (bool, Array<CompressedGkrRoundPoly>, QM31, QM31, QM31, QM31) {
     let has_logup = read_u32(ref r);
     if has_logup == 0 {
         return (false, array![], qm31_zero(), qm31_zero(), qm31_zero(), qm31_zero());
@@ -138,7 +141,7 @@ fn read_optional_logup(
 
     let claimed_sum = read_qm31(ref r);
     let num_rounds = read_u32(ref r);
-    let polys = read_deg3_polys(ref r, num_rounds);
+    let polys = read_compressed_deg3_polys(ref r, num_rounds);
     let final_w = read_qm31(ref r);
     let final_in = read_qm31(ref r);
     let final_out = read_qm31(ref r);
@@ -172,7 +175,7 @@ fn dispatch_matmul(
     ref ch: PoseidonChannel,
 ) -> (GKRClaim, QM31) {
     let num_rounds = read_u32(ref reader);
-    let round_polys = read_deg2_polys(ref reader, num_rounds);
+    let round_polys = read_compressed_deg2_polys(ref reader, num_rounds);
     let final_a = read_qm31(ref reader);
     let final_b = read_qm31(ref reader);
 
@@ -202,7 +205,7 @@ fn dispatch_mul(
     ref ch: PoseidonChannel,
 ) -> GKRClaim {
     let num_rounds = read_u32(ref reader);
-    let round_polys = read_deg3_polys(ref reader, num_rounds);
+    let round_polys = read_compressed_deg3_polys(ref reader, num_rounds);
     let lhs = read_qm31(ref reader);
     let rhs = read_qm31(ref reader);
 
@@ -253,7 +256,7 @@ fn dispatch_layernorm(
     let _simd_combined = read_u32(ref reader);
 
     let num_linear_rounds = read_u32(ref reader);
-    let linear_polys = read_deg3_polys(ref reader, num_linear_rounds);
+    let linear_polys = read_compressed_deg3_polys(ref reader, num_linear_rounds);
     let centered_final = read_qm31(ref reader);
     let rsqrt_final = read_qm31(ref reader);
 
@@ -303,7 +306,7 @@ fn dispatch_rmsnorm(
     let _simd_combined = read_u32(ref reader);
 
     let num_linear_rounds = read_u32(ref reader);
-    let linear_polys = read_deg3_polys(ref reader, num_linear_rounds);
+    let linear_polys = read_compressed_deg3_polys(ref reader, num_linear_rounds);
     let input_final = read_qm31(ref reader);
     let rsqrt_final = read_qm31(ref reader);
 

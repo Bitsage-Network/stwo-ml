@@ -173,20 +173,21 @@ fn test_model_verify_add_bad_sum_panics() {
 }
 
 // ============================================================================
-// Test 6: Single MatMul Layer
+// Test 6: Single MatMul Layer (v19 compressed: c1 omitted from wire format)
 // ============================================================================
 
 /// Uses "constant polynomial" trick: p(x) = 1 for all x.
+/// Wire format sends only c0 and c2; verifier reconstructs c1 = claim - 2*c0 - c2.
 /// p(0) + p(1) = 2 = claimed. final_a * final_b = 1 = p(challenge).
 #[test]
 fn test_model_verify_single_matmul() {
     // m=2, k=2, n=2, log_k=1 round
     let claimed = mk(2);
 
-    // Constant polynomial: c0=1, c1=0, c2=0
+    // Constant polynomial: c0=1, c2=0
+    // Verifier reconstructs c1 = 2 - 2*1 - 0 = 0
     // p(x) = 1 for all x, so p(0)+p(1) = 2 = claimed
     let c0 = mk(1);
-    let c1 = qm31_zero();
     let c2 = qm31_zero();
 
     // final_a * final_b = p(challenge) = 1
@@ -197,7 +198,6 @@ fn test_model_verify_single_matmul() {
     data.append(0); // tag = MatMul
     data.append(1); // num_rounds = 1
     push_qm31(ref data, c0);
-    push_qm31(ref data, c1);
     push_qm31(ref data, c2);
     push_qm31(ref data, final_a);
     push_qm31(ref data, final_b);
@@ -235,21 +235,21 @@ fn test_model_verify_two_matmuls() {
 
     let mut data: Array<felt252> = array![];
 
-    // MatMul 0: claimed=2, constant poly c0=1
+    // MatMul 0: claimed=2, constant poly c0=1, c2=0
+    // Verifier reconstructs c1 = 2 - 2*1 - 0 = 0
     data.append(0); // tag=MatMul
     data.append(1); // num_rounds=1
     push_qm31(ref data, mk(1));       // c0
-    push_qm31(ref data, qm31_zero()); // c1
     push_qm31(ref data, qm31_zero()); // c2
     push_qm31(ref data, mk(1));       // final_a
     push_qm31(ref data, mk(1));       // final_b
 
-    // MatMul 1: claimed=1 (output of MatMul 0), constant poly c0=inv2
+    // MatMul 1: claimed=1 (output of MatMul 0), constant poly c0=inv2, c2=0
+    // Verifier reconstructs c1 = 1 - 2*inv2 - 0 = 1 - 1 = 0
     // p(0)+p(1) = 2*inv2 = 1 = claimed
     data.append(0); // tag=MatMul
     data.append(1); // num_rounds=1
     push_qm31(ref data, inv2);        // c0
-    push_qm31(ref data, qm31_zero()); // c1
     push_qm31(ref data, qm31_zero()); // c2
     push_qm31(ref data, inv2);        // final_a (inv2 * 1 = inv2 = p(r))
     push_qm31(ref data, mk(1));       // final_b
@@ -277,20 +277,21 @@ fn test_model_verify_two_matmuls() {
 }
 
 // ============================================================================
-// Test 8: Single Mul Layer
+// Test 8: Single Mul Layer (v19 compressed: c1 omitted from wire format)
 // ============================================================================
 
 /// Mul with 1 variable. Uses claim point=[mk(0)] so that eq(0, s) = 1-s.
 /// Polynomial: p(x) = V - V*x = V*(1-x) where V = claimed.
 /// Then p(0)+p(1) = V+0 = V, and p(s) = V*(1-s) = eq(0,s)*1*V.
+/// Wire format sends c0, c2, c3; verifier reconstructs c1.
 #[test]
 fn test_model_verify_single_mul() {
     let claimed = mk(100);
-    let neg_claimed = qm31_sub(qm31_zero(), claimed); // -100 in M31
+    let _neg_claimed = qm31_sub(qm31_zero(), claimed); // -100 in M31
 
     // p(x) = c0 + c1*x + c2*x^2 + c3*x^3 = 100 - 100*x
+    // Wire format: c0, c2, c3 (c1 reconstructed by verifier)
     let c0 = claimed;
-    let c1 = neg_claimed;
     let c2 = qm31_zero();
     let c3 = qm31_zero();
 
@@ -303,7 +304,6 @@ fn test_model_verify_single_mul() {
     data.append(2); // tag = Mul
     data.append(1); // num_rounds = 1
     push_qm31(ref data, c0);
-    push_qm31(ref data, c1);
     push_qm31(ref data, c2);
     push_qm31(ref data, c3);
     push_qm31(ref data, lhs);
@@ -339,8 +339,8 @@ fn test_model_verify_add_then_matmul() {
     // After Add with trunk_idx=0: intermediate value = lhs = 50
     // MatMul: claimed = 50, need p(0)+p(1) = 50
     // Use c0 = 25, constant poly: p(x) = 25, so p(0)+p(1) = 50
+    // Verifier reconstructs c1 = 50 - 2*25 - 0 = 0
     let c0 = mk(25);
-    let c1 = qm31_zero();
     let c2 = qm31_zero();
 
     // final_a * final_b = p(challenge) = 25
@@ -353,11 +353,10 @@ fn test_model_verify_add_then_matmul() {
     push_qm31(ref data, lhs);
     push_qm31(ref data, rhs);
     data.append(0); // trunk_idx = 0
-    // Layer 1: MatMul
+    // Layer 1: MatMul (compressed: c0, c2 only)
     data.append(0); // tag = MatMul
     data.append(1); // num_rounds = 1
     push_qm31(ref data, c0);
-    push_qm31(ref data, c1);
     push_qm31(ref data, c2);
     push_qm31(ref data, final_a);
     push_qm31(ref data, final_b);
@@ -432,7 +431,6 @@ fn test_model_verify_matmul_complex_qm31() {
     let claimed = mk(2);
 
     let c0 = mk(1);
-    let c1 = qm31_zero();
     let c2 = qm31_zero();
 
     // final_a has all 4 components nonzero
@@ -444,7 +442,6 @@ fn test_model_verify_matmul_complex_qm31() {
     data.append(0); // tag = MatMul
     data.append(1); // num_rounds = 1
     push_qm31(ref data, c0);
-    push_qm31(ref data, c1);
     push_qm31(ref data, c2);
     push_qm31(ref data, final_a);
     push_qm31(ref data, final_b);
@@ -466,24 +463,27 @@ fn test_model_verify_matmul_complex_qm31() {
 }
 
 // ============================================================================
-// Test 12: MatMul Round Sum Mismatch Through Model Verifier
+// Test 12: MatMul Bad Coefficients → Final Mismatch
 // ============================================================================
 
+/// With v19 compressed polys, c1 is reconstructed to satisfy p(0)+p(1)=claim
+/// by construction. A bad c0 (c0=5, c2=0 with claim=2) gives reconstructed
+/// c1 = 2 - 10 - 0 = -8, so p(r) = 5 - 8*r which won't equal final_a*final_b=1.
+/// Detection occurs at MATMUL_FINAL_MISMATCH.
 #[test]
-#[should_panic(expected: "MATMUL_ROUND_SUM_MISMATCH")]
+#[should_panic(expected: "MATMUL_FINAL_MISMATCH")]
 fn test_model_verify_matmul_bad_round_sum_panics() {
     let claimed = mk(2);
 
-    // Bad poly: p(0)+p(1) = 5+5 = 10 != 2
+    // Bad poly: c0=5, c2=0 → verifier reconstructs c1 = 2-10-0 = -8
+    // p(r) = 5 - 8*r ≠ 1 = final_a*final_b for almost all r
     let c0 = mk(5);
-    let c1 = qm31_zero();
     let c2 = qm31_zero();
 
     let mut data: Array<felt252> = array![];
     data.append(0);
     data.append(1);
     push_qm31(ref data, c0);
-    push_qm31(ref data, c1);
     push_qm31(ref data, c2);
     push_qm31(ref data, mk(1)); // final_a
     push_qm31(ref data, mk(1)); // final_b

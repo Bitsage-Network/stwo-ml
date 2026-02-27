@@ -15,16 +15,11 @@ use crate::channel::{
     PoseidonChannel, channel_mix_u64, channel_mix_secure_field,
     channel_mix_poly_coeffs, channel_mix_poly_coeffs_deg3, channel_draw_qm31,
 };
-use crate::types::{RoundPoly, GkrRoundPoly, GKRClaim};
+use crate::types::{GKRClaim, CompressedRoundPoly, CompressedGkrRoundPoly};
 
 // ============================================================================
 // Helpers
 // ============================================================================
-
-/// Evaluate p(1) for a GKR degree-3 round polynomial: c0 + c1 + c2 + c3.
-fn gkr_poly_eval_at_one(poly: GkrRoundPoly) -> QM31 {
-    qm31_add(qm31_add(qm31_add(poly.c0, poly.c1), poly.c2), poly.c3)
-}
 
 /// Clone a GKRClaim's point array (Cairo arrays are move-only).
 pub fn clone_point(point: @Array<QM31>) -> Array<QM31> {
@@ -105,7 +100,7 @@ pub fn verify_add_layer(
 ///   7. Return: claim with value = alpha * lhs + (1 - alpha) * rhs
 pub fn verify_mul_layer(
     output_claim: @GKRClaim,
-    eq_round_polys: Span<GkrRoundPoly>,
+    eq_round_polys: Span<CompressedGkrRoundPoly>,
     lhs_eval: QM31,
     rhs_eval: QM31,
     ref ch: PoseidonChannel,
@@ -118,7 +113,7 @@ pub fn verify_mul_layer(
     // Step 2: Mix output claim value
     channel_mix_secure_field(ref ch, *output_claim.value);
 
-    // Step 3: Degree-3 eq-sumcheck rounds
+    // Step 3: Degree-3 eq-sumcheck rounds (compressed: reconstruct c1 from current_sum)
     let mut current_sum = *output_claim.value;
     let mut challenges: Array<QM31> = array![];
     let mut round: u32 = 0;
@@ -126,23 +121,23 @@ pub fn verify_mul_layer(
         if round >= num_vars {
             break;
         }
-        let poly = *eq_round_polys.at(round);
+        let cpoly = *eq_round_polys.at(round);
 
-        // Check: p(0) + p(1) == current_sum
-        let eval_at_0 = poly.c0;
-        let eval_at_1 = gkr_poly_eval_at_one(poly);
-        let round_sum = qm31_add(eval_at_0, eval_at_1);
-        assert!(qm31_eq(round_sum, current_sum), "MUL_ROUND_SUM_MISMATCH");
+        // Reconstruct c1 = current_sum - 2*c0 - c2 - c3
+        let c1 = qm31_sub(
+            qm31_sub(qm31_sub(current_sum, qm31_add(cpoly.c0, cpoly.c0)), cpoly.c2),
+            cpoly.c3,
+        );
 
         // Mix round polynomial (always all 4 coefficients)
-        channel_mix_poly_coeffs_deg3(ref ch, poly.c0, poly.c1, poly.c2, poly.c3);
+        channel_mix_poly_coeffs_deg3(ref ch, cpoly.c0, c1, cpoly.c2, cpoly.c3);
 
         // Draw challenge
         let challenge = channel_draw_qm31(ref ch);
         challenges.append(challenge);
 
         // Update: current_sum = p(challenge)
-        current_sum = poly_eval_degree3(poly.c0, poly.c1, poly.c2, poly.c3, challenge);
+        current_sum = poly_eval_degree3(cpoly.c0, c1, cpoly.c2, cpoly.c3, challenge);
 
         round += 1;
     };
@@ -203,7 +198,7 @@ pub fn verify_mul_layer(
 ///   6. Return: claim with point = [r_i || k_challenges], value = final_a
 pub fn verify_matmul_layer(
     output_claim: @GKRClaim,
-    round_polys: Span<RoundPoly>,
+    round_polys: Span<CompressedRoundPoly>,
     final_a_eval: QM31,
     final_b_eval: QM31,
     m: u32,
@@ -222,7 +217,7 @@ pub fn verify_matmul_layer(
     // Step 2: Mix output claim value
     channel_mix_secure_field(ref ch, *output_claim.value);
 
-    // Step 3: Degree-2 sumcheck rounds
+    // Step 3: Degree-2 sumcheck rounds (compressed: reconstruct c1 from current_sum)
     let mut current_sum = *output_claim.value;
     let mut k_challenges: Array<QM31> = array![];
     let mut round: u32 = 0;
@@ -230,23 +225,21 @@ pub fn verify_matmul_layer(
         if round >= log_k {
             break;
         }
-        let poly = *round_polys.at(round);
+        let cpoly = *round_polys.at(round);
 
-        // Check: p(0) + p(1) == current_sum
-        let eval_at_0 = poly.c0;
-        let eval_at_1 = qm31_add(qm31_add(poly.c0, poly.c1), poly.c2);
-        let round_sum = qm31_add(eval_at_0, eval_at_1);
-        assert!(qm31_eq(round_sum, current_sum), "MATMUL_ROUND_SUM_MISMATCH");
+        // Reconstruct c1 = current_sum - 2*c0 - c2
+        // From: p(0) + p(1) = current_sum, where p(0)=c0, p(1)=c0+c1+c2
+        let c1 = qm31_sub(qm31_sub(current_sum, qm31_add(cpoly.c0, cpoly.c0)), cpoly.c2);
 
-        // Mix round polynomial (degree-2)
-        channel_mix_poly_coeffs(ref ch, poly.c0, poly.c1, poly.c2);
+        // Mix round polynomial (degree-2) — all 3 coefficients for Fiat-Shamir
+        channel_mix_poly_coeffs(ref ch, cpoly.c0, c1, cpoly.c2);
 
         // Draw challenge
         let challenge = channel_draw_qm31(ref ch);
         k_challenges.append(challenge);
 
-        // Update: current_sum = p(challenge)
-        current_sum = poly_eval_degree2(poly.c0, poly.c1, poly.c2, challenge);
+        // Update: current_sum = p(challenge) = c0 + c1*t + c2*t^2
+        current_sum = poly_eval_degree2(cpoly.c0, c1, cpoly.c2, challenge);
 
         round += 1;
     };
@@ -302,7 +295,7 @@ pub fn verify_matmul_layer(
 ///   3. Assert: final_sum == eq(r, challenges) * w(s) * d(s)
 fn verify_logup_eq_sumcheck(
     output_claim_point: @Array<QM31>,
-    logup_round_polys: Span<GkrRoundPoly>,
+    logup_round_polys: Span<CompressedGkrRoundPoly>,
     final_w_eval: QM31,
     final_in_eval: QM31,
     final_out_eval: QM31,
@@ -316,7 +309,7 @@ fn verify_logup_eq_sumcheck(
     // Mix claimed sum (same as prover)
     channel_mix_secure_field(ref ch, claimed_sum);
 
-    // Degree-3 eq-sumcheck with initial sum = 1
+    // Degree-3 eq-sumcheck with initial sum = 1 (compressed: reconstruct c1)
     let mut current_sum = qm31_one();
     let mut challenges: Array<QM31> = array![];
     let mut round: u32 = 0;
@@ -324,23 +317,23 @@ fn verify_logup_eq_sumcheck(
         if round >= num_vars {
             break;
         }
-        let poly = *logup_round_polys.at(round);
+        let cpoly = *logup_round_polys.at(round);
 
-        // Check: p(0) + p(1) == current_sum
-        let eval_at_0 = poly.c0;
-        let eval_at_1 = gkr_poly_eval_at_one(poly);
-        let round_sum = qm31_add(eval_at_0, eval_at_1);
-        assert!(qm31_eq(round_sum, current_sum), "LOGUP_ROUND_SUM_MISMATCH");
+        // Reconstruct c1 = current_sum - 2*c0 - c2 - c3
+        let c1 = qm31_sub(
+            qm31_sub(qm31_sub(current_sum, qm31_add(cpoly.c0, cpoly.c0)), cpoly.c2),
+            cpoly.c3,
+        );
 
         // Mix round polynomial
-        channel_mix_poly_coeffs_deg3(ref ch, poly.c0, poly.c1, poly.c2, poly.c3);
+        channel_mix_poly_coeffs_deg3(ref ch, cpoly.c0, c1, cpoly.c2, cpoly.c3);
 
         // Draw challenge
         let challenge = channel_draw_qm31(ref ch);
         challenges.append(challenge);
 
         // Update: current_sum = p(challenge)
-        current_sum = poly_eval_degree3(poly.c0, poly.c1, poly.c2, poly.c3, challenge);
+        current_sum = poly_eval_degree3(cpoly.c0, c1, cpoly.c2, cpoly.c3, challenge);
 
         round += 1;
     };
@@ -378,7 +371,7 @@ fn verify_logup_eq_sumcheck(
 ///   Assert: final_sum == eq(r, challenges) * lhs_final * rhs_final
 fn verify_linear_eq_sumcheck(
     output_claim_point: @Array<QM31>,
-    round_polys: Span<GkrRoundPoly>,
+    round_polys: Span<CompressedGkrRoundPoly>,
     claimed: QM31,
     lhs_final: QM31,
     rhs_final: QM31,
@@ -393,23 +386,23 @@ fn verify_linear_eq_sumcheck(
         if round >= num_vars {
             break;
         }
-        let poly = *round_polys.at(round);
+        let cpoly = *round_polys.at(round);
 
-        // Check: p(0) + p(1) == current_sum
-        let eval_at_0 = poly.c0;
-        let eval_at_1 = gkr_poly_eval_at_one(poly);
-        let round_sum = qm31_add(eval_at_0, eval_at_1);
-        assert!(qm31_eq(round_sum, current_sum), "LINEAR_ROUND_SUM_MISMATCH");
+        // Reconstruct c1 = current_sum - 2*c0 - c2 - c3
+        let c1 = qm31_sub(
+            qm31_sub(qm31_sub(current_sum, qm31_add(cpoly.c0, cpoly.c0)), cpoly.c2),
+            cpoly.c3,
+        );
 
         // Mix round polynomial
-        channel_mix_poly_coeffs_deg3(ref ch, poly.c0, poly.c1, poly.c2, poly.c3);
+        channel_mix_poly_coeffs_deg3(ref ch, cpoly.c0, c1, cpoly.c2, cpoly.c3);
 
         // Draw challenge
         let challenge = channel_draw_qm31(ref ch);
         challenges.append(challenge);
 
         // Update: current_sum = p(challenge)
-        current_sum = poly_eval_degree3(poly.c0, poly.c1, poly.c2, poly.c3, challenge);
+        current_sum = poly_eval_degree3(cpoly.c0, c1, cpoly.c2, cpoly.c3, challenge);
 
         round += 1;
     };
@@ -452,7 +445,7 @@ fn verify_linear_eq_sumcheck(
 pub fn verify_activation_layer(
     output_claim: @GKRClaim,
     activation_type_tag: u64,
-    logup_round_polys: Span<GkrRoundPoly>,
+    logup_round_polys: Span<CompressedGkrRoundPoly>,
     final_w_eval: QM31,
     final_in_eval: QM31,
     final_out_eval: QM31,
@@ -513,7 +506,7 @@ pub fn verify_activation_layer(
 pub fn verify_dequantize_layer(
     output_claim: @GKRClaim,
     bits: u64,
-    logup_round_polys: Span<GkrRoundPoly>,
+    logup_round_polys: Span<CompressedGkrRoundPoly>,
     final_w_eval: QM31,
     final_in_eval: QM31,
     final_out_eval: QM31,
@@ -582,13 +575,13 @@ pub fn verify_dequantize_layer(
 ///     12. Return: claim with same point, value = input_eval
 pub fn verify_layernorm_layer(
     output_claim: @GKRClaim,
-    linear_round_polys: Span<GkrRoundPoly>,
+    linear_round_polys: Span<CompressedGkrRoundPoly>,
     centered_final: QM31,
     rsqrt_final: QM31,
     mean_eval: QM31,
     rsqrt_eval: QM31,
     has_logup: bool,
-    logup_round_polys: Span<GkrRoundPoly>,
+    logup_round_polys: Span<CompressedGkrRoundPoly>,
     logup_w_eval: QM31,
     logup_in_eval: QM31,
     logup_out_eval: QM31,
@@ -676,13 +669,13 @@ pub fn verify_layernorm_layer(
 ///     12. Return: claim with same point, value = input_eval
 pub fn verify_rmsnorm_layer(
     output_claim: @GKRClaim,
-    linear_round_polys: Span<GkrRoundPoly>,
+    linear_round_polys: Span<CompressedGkrRoundPoly>,
     input_final: QM31,
     rsqrt_final: QM31,
     rms_sq_eval: QM31,
     rsqrt_eval: QM31,
     has_logup: bool,
-    logup_round_polys: Span<GkrRoundPoly>,
+    logup_round_polys: Span<CompressedGkrRoundPoly>,
     logup_w_eval: QM31,
     logup_in_eval: QM31,
     logup_out_eval: QM31,

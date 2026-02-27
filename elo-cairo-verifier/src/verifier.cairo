@@ -14,9 +14,15 @@
 //   8. verify_mle_opening(B, assignment, channel)
 
 use crate::types::{GKRClaim, MleOpeningProof};
-use crate::field::QM31;
-use crate::vm31_merkle::PackedDigest;
+// QM31 imported only by v4_packed_io (inside module scope)
 use starknet::ClassHash;
+
+// PackedDigest moved inline (was in vm31_merkle, 724 lines stripped)
+#[derive(Drop, Copy, Serde, starknet::Store, PartialEq, Debug)]
+pub struct PackedDigest {
+    pub lo: felt252,
+    pub hi: felt252,
+}
 
 /// Minimum delay (seconds) between propose_upgrade and execute_upgrade.
 pub const UPGRADE_DELAY: u64 = 300; // 5 minutes
@@ -103,14 +109,16 @@ pub trait ISumcheckVerifier<TContractState> {
     ///   - proof_data: flat felt252 array of tag-dispatched per-layer proofs
     ///   - weight_commitments: Poseidon Merkle roots of weight MLEs
 
-    /// Phase-4 versioned interface with packed QM31 proof data.
+    /// On-chain GKR verification with IO-packed data.
     ///
-    /// On-chain GKR verification with packed QM31 proof data.
-    /// Uses 1 felt252 per QM31 instead of 4 u64s, reducing calldata by ~3.3x.
-    fn verify_model_gkr_v4_packed(
+    /// `packed_raw_io` contains 8 M31 values per felt252 (248 bits).
+    /// `original_io_len` is the unpacked count. This reduces calldata from
+    /// ~10K to ~1.3K felts, fitting within the 5000 felt TX limit.
+    fn verify_model_gkr_v4_packed_io(
         ref self: TContractState,
         model_id: felt252,
-        raw_io_data: Array<felt252>,
+        original_io_len: u32,
+        packed_raw_io: Array<felt252>,
         circuit_depth: u32,
         num_layers: u32,
         matmul_dims: Array<u32>,
@@ -122,13 +130,12 @@ pub trait ISumcheckVerifier<TContractState> {
         weight_opening_proofs: Array<MleOpeningProof>,
     ) -> bool;
 
-    /// Same as `verify_model_gkr_v4_packed` but with IO-packed raw_io_data.
-    ///
-    /// `packed_raw_io` contains 8 M31 values per felt252 (248 bits).
-    /// `original_io_len` is the unpacked count. This reduces calldata from
-    /// ~10K to ~1.3K felts, fitting within the 5000 felt TX limit.
-    fn verify_model_gkr_v4_packed_io(
-        ref self: TContractState,
+    /// View-only verification: identical to verify_model_gkr_v4_packed_io but
+    /// skips proof recording (no storage writes, no counters, no events).
+    /// Use when you only need the boolean result, not on-chain proof tracking.
+    /// Saves ~12.5K steps + ~40K gas per call.
+    fn verify_model_gkr_v4_packed_io_view(
+        self: @TContractState,
         model_id: felt252,
         original_io_len: u32,
         packed_raw_io: Array<felt252>,
@@ -153,33 +160,23 @@ pub trait ISumcheckVerifier<TContractState> {
 #[starknet::contract]
 mod SumcheckVerifierContract {
     use super::{
-        GKRClaim, MleOpeningProof, QM31, UPGRADE_DELAY,
+        GKRClaim, MleOpeningProof, UPGRADE_DELAY,
     };
     use crate::field::{
-        log2_ceil, next_power_of_two, pack_qm31_to_felt,
-        evaluate_mle, m31_to_qm31, qm31_eq,
+        log2_ceil, next_power_of_two,
+        evaluate_mle_from_packed_1row,
     };
     use crate::channel::{
-        channel_default, channel_mix_u64, channel_mix_felt, channel_mix_felts,
-        channel_draw_felt252, channel_draw_qm31, channel_draw_qm31s, channel_mix_secure_field,
+        channel_default, channel_mix_u64,
+        channel_draw_qm31, channel_draw_qm31s, channel_mix_secure_field,
     };
-    use crate::mle::verify_mle_opening;
+    // mle stripped for lean v18b
     use crate::model_verifier::verify_gkr_model_with_trace;
-    // NOTE: verify_unified_stark + UnifiedStarkProof deserialization pulls in
-    // stwo_verifier_core's FRI verifier which uses Felt252Dict (squashed_felt252_dict_entries).
-    // This libfunc is not yet in Starknet's allowed list, blocking deployment.
-    // STARK verification is done off-chain; on-chain we bind via Poseidon hash.
-    // Uncomment when Starknet adds squashed_felt252_dict_entries to allowed libfuncs:
-    //   use crate::ml_air::{MLClaim, UnifiedStarkProof, verify_unified_stark};
-    //   use stwo_verifier_core::channel::Channel as StwoChannel;
-    use crate::audit::{AuditRecord, AuditSubmitted, generate_audit_id, PackedDigest8};
-    use crate::access_control::{AuditAccess, AccessGranted, AccessRevoked};
-    use crate::view_key::{ViewKeyDelegation, ViewKeyDelegated, ViewKeyRevoked};
-    use crate::vm31_merkle::PackedDigest;
+    use super::PackedDigest;
     use starknet::storage::{
         StoragePointerReadAccess, StoragePointerWriteAccess, Map, StoragePathEntry,
     };
-    use starknet::{ClassHash, ContractAddress, get_caller_address, get_block_timestamp, get_block_number};
+    use starknet::{ClassHash, ContractAddress, get_caller_address, get_block_timestamp};
 
     #[storage]
     struct Storage {
@@ -203,41 +200,16 @@ mod SumcheckVerifierContract {
         model_gkr_weights: Map<(felt252, u32), felt252>,
         /// model_id → Poseidon hash of circuit descriptor.
         model_circuit_hash: Map<felt252, felt252>,
+        /// model_id → aggregate Poseidon hash of all weight commitment roots.
+        /// Computed during registration: poseidon_hash_span([root_0, root_1, ..., root_N-1]).
+        /// Saves N-1 storage reads during verification (1 read + hash vs N reads).
+        model_weight_root_hash: Map<felt252, felt252>,
         /// Pending upgrade class hash (zero = no pending upgrade).
         pending_upgrade: ClassHash,
         /// Timestamp when the upgrade was proposed.
         upgrade_proposed_at: u64,
-        // ─── Audit Records ──────────────────────────────────────
-        /// audit_id → AuditRecord.
-        audit_records: Map<felt252, AuditRecord>,
-        /// (model_id, index) → audit_id (append-only list per model).
-        model_audit_ids: Map<(felt252, u32), felt252>,
-        /// model_id → number of audits.
-        model_audit_count: Map<felt252, u32>,
-        /// Global audit nonce (for generating unique audit_ids).
-        next_audit_nonce: u32,
-        /// model_id → total proven inferences across all audits.
-        total_proven_inferences: Map<felt252, u64>,
-        // ─── Access Control ──────────────────────────────────────
-        /// (audit_id, grantee) → AuditAccess record.
-        audit_access: Map<(felt252, ContractAddress), AuditAccess>,
-        /// (audit_id, grantee) → wrapped encryption key.
-        audit_wrapped_keys: Map<(felt252, ContractAddress), felt252>,
-        /// (audit_id, index) → grantee address (for enumeration).
-        audit_access_list: Map<(felt252, u32), ContractAddress>,
-        /// audit_id → total grantees ever (for enumeration indexing).
-        audit_access_count: Map<felt252, u32>,
-        /// audit_id → number of currently active grantees.
-        audit_active_access_count: Map<felt252, u32>,
-        /// audit_id → owner address (set on submit_audit).
-        audit_owner: Map<felt252, ContractAddress>,
-        // ─── View Key Delegation ─────────────────────────────────
-        /// (owner, delegate) → ViewKeyDelegation.
-        view_delegations: Map<(ContractAddress, ContractAddress), ViewKeyDelegation>,
-        /// (owner, index) → delegate address.
-        view_delegation_list: Map<(ContractAddress, u32), ContractAddress>,
-        /// owner → number of delegations.
-        view_delegation_count: Map<ContractAddress, u32>,
+        // Audit/Access/ViewKey storage stripped for lean v18b deploy.
+        // Storage slots preserved on-chain. Will be restored in next version.
     }
 
     #[event]
@@ -250,11 +222,7 @@ mod SumcheckVerifierContract {
         UpgradeProposed: UpgradeProposed,
         UpgradeExecuted: UpgradeExecuted,
         UpgradeCancelled: UpgradeCancelled,
-        AuditSubmitted: AuditSubmitted,
-        AccessGranted: AccessGranted,
-        AccessRevoked: AccessRevoked,
-        ViewKeyDelegated: ViewKeyDelegated,
-        ViewKeyRevoked: ViewKeyRevoked,
+        // Audit/access/view events stripped for lean v18b deploy.
     }
 
     #[derive(Drop, starknet::Event)]
@@ -324,581 +292,16 @@ mod SumcheckVerifierContract {
     // Value 4 straddles the boundary: bits 124..127 in low, bits 0..26 in high.
     const M31_MASK_128: u128 = 0x7FFFFFFF; // 2^31 - 1
 
-    fn unpack_m31_packed_io(packed_felts: Span<felt252>, original_len: u32) -> Array<felt252> {
-        // Optimized unpack: use cascading division to extract 8 M31 values per felt.
-        // Each division by 2^31 gives quotient=remaining and remainder=current value.
-        // This uses only 7 divisions total (vs 7 independent large-constant divisions),
-        // and each division is by the small constant 0x80000000 (2^31).
-        let mut result: Array<felt252> = array![];
-        let mut pi: u32 = 0;
-        let packed_count = packed_felts.len();
-        loop {
-            if pi >= packed_count {
-                break;
-            }
-            if result.len() >= original_len {
-                break;
-            }
-            let val: u256 = (*packed_felts.at(pi)).into();
-            // Treat as a single 248-bit number. We extract 31 bits at a time from the LSB.
-            // Use felt252 arithmetic for the cascading division since felt252 division
-            // by a constant is cheaper than u128 division.
-            // The packed value has at most 248 bits (8 * 31), fits in u256.
-            // We'll cascade through lo first, then hi.
+    // unpack_m31_packed_io, verify_model_gkr_core, verify_model_gkr_core_with_io_commitment
+    // stripped for lean v18b — packed_io entrypoint is self-contained.
+    // See git history for full implementations.
+    //
 
-            // Extract from lo (128 bits → values 0,1,2,3 + 4 bits of value 4)
-            let mut rem_lo: u128 = val.low;
-            // Value 0: rem_lo % 2^31
-            if result.len() < original_len {
-                let q: u128 = rem_lo / 0x80000000;
-                let v: u128 = rem_lo - q * 0x80000000;
-                result.append(v.into());
-                rem_lo = q;
-            }
-            // Value 1
-            if result.len() < original_len {
-                let q: u128 = rem_lo / 0x80000000;
-                let v: u128 = rem_lo - q * 0x80000000;
-                result.append(v.into());
-                rem_lo = q;
-            }
-            // Value 2
-            if result.len() < original_len {
-                let q: u128 = rem_lo / 0x80000000;
-                let v: u128 = rem_lo - q * 0x80000000;
-                result.append(v.into());
-                rem_lo = q;
-            }
-            // Value 3
-            if result.len() < original_len {
-                let q: u128 = rem_lo / 0x80000000;
-                let v: u128 = rem_lo - q * 0x80000000;
-                result.append(v.into());
-                rem_lo = q;
-            }
-            // rem_lo now has bits [124..128) = 4 bits (the low 4 bits of value 4)
-
-            // Value 4 straddles lo/hi: 4 bits from rem_lo + 27 bits from hi
-            let mut rem_hi: u128 = val.high;
-            if result.len() < original_len {
-                // Combine: lo_part (4 bits) | hi_low_27 << 4
-                let hi_q: u128 = rem_hi / 0x8000000; // >> 27
-                let hi_low27: u128 = rem_hi - hi_q * 0x8000000;
-                let v4: u128 = rem_lo | (hi_low27 * 16); // rem_lo has 4 bits, shift hi_low27 left by 4
-                result.append((v4 & M31_MASK_128).into());
-                rem_hi = hi_q;
-            }
-            // Value 5: next 31 bits from rem_hi
-            if result.len() < original_len {
-                let q: u128 = rem_hi / 0x80000000;
-                let v: u128 = rem_hi - q * 0x80000000;
-                result.append(v.into());
-                rem_hi = q;
-            }
-            // Value 6
-            if result.len() < original_len {
-                let q: u128 = rem_hi / 0x80000000;
-                let v: u128 = rem_hi - q * 0x80000000;
-                result.append(v.into());
-                rem_hi = q;
-            }
-            // Value 7: remaining bits (at most 31)
-            if result.len() < original_len {
-                result.append((rem_hi & M31_MASK_128).into());
-            }
-            pi += 1;
-        };
-        result
-    }
-
-    fn verify_model_gkr_core(
-        ref self: ContractState,
-        model_id: felt252,
-        raw_io_data: Array<felt252>,
-        circuit_depth: u32,
-        num_layers: u32,
-        matmul_dims: Array<u32>,
-        dequantize_bits: Array<u64>,
-        proof_data: Array<felt252>,
-        weight_commitments: Array<felt252>,
-        weight_binding_mode: u32,
-        weight_binding_data: Span<felt252>,
-        weight_opening_proofs: Array<MleOpeningProof>,
-        packed: bool,
-    ) -> bool {
-        // Compute IO commitment from unpacked raw data (standard path)
-        assert!(raw_io_data.len() >= 6, "IO_DATA_TOO_SHORT");
-        let io_commitment = core::poseidon::poseidon_hash_span(raw_io_data.span());
-
-        verify_model_gkr_core_with_io_commitment(
-            ref self,
-            model_id,
-            raw_io_data,
-            io_commitment,
-            circuit_depth,
-            num_layers,
-            matmul_dims,
-            dequantize_bits,
-            proof_data,
-            weight_commitments,
-            weight_binding_mode,
-            weight_binding_data,
-            weight_opening_proofs,
-            packed,
-        )
-    }
-
-    fn verify_model_gkr_core_with_io_commitment(
-        ref self: ContractState,
-        model_id: felt252,
-        raw_io_data: Array<felt252>,
-        io_commitment: felt252,
-        circuit_depth: u32,
-        num_layers: u32,
-        matmul_dims: Array<u32>,
-        dequantize_bits: Array<u64>,
-        proof_data: Array<felt252>,
-        weight_commitments: Array<felt252>,
-        weight_binding_mode: u32,
-        weight_binding_data: Span<felt252>,
-        weight_opening_proofs: Array<MleOpeningProof>,
-        packed: bool,
-    ) -> bool {
-        assert!(
-            weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_OPENINGS_V4_EXPERIMENTAL
-                || weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_ORACLE_SUMCHECK,
-            "UNSUPPORTED_WEIGHT_BINDING_MODE",
-        );
-
-        // 0b. Input validation guards — catch malformed calldata early
-        assert!(matmul_dims.len() % 3 == 0, "MATMUL_DIMS_NOT_TRIPLE");
-        let mut d_i: u32 = 0;
-        loop {
-            if d_i >= matmul_dims.len() {
-                break;
-            }
-            assert!(*matmul_dims.at(d_i) > 0, "MATMUL_DIM_ZERO");
-            assert!(*matmul_dims.at(d_i + 1) > 0, "MATMUL_DIM_ZERO");
-            assert!(*matmul_dims.at(d_i + 2) > 0, "MATMUL_DIM_ZERO");
-            d_i += 3;
-        };
-        assert!(num_layers > 0, "ZERO_LAYERS");
-        assert!(circuit_depth > 0, "ZERO_CIRCUIT_DEPTH");
-
-        // 1. Validate model is registered for GKR
-        let circuit_hash = self.model_circuit_hash.entry(model_id).read();
-        assert!(circuit_hash != 0, "Model not registered for GKR");
-
-        // 2. IO commitment already provided (computed from raw data or packed data by caller)
-        assert!(raw_io_data.len() >= 6, "IO_DATA_TOO_SHORT");
-
-        // 3. Verify weight commitments match registered
-        let registered_count = self.model_gkr_weight_count.entry(model_id).read();
-        assert!(
-            weight_commitments.len() == registered_count,
-            "Weight commitment count mismatch",
-        );
-        let mut w_idx: u32 = 0;
-        loop {
-            if w_idx >= registered_count {
-                break;
-            }
-            let registered = self.model_gkr_weights.entry((model_id, w_idx)).read();
-            assert!(
-                *weight_commitments.at(w_idx) == registered,
-                "Weight commitment mismatch",
-            );
-            w_idx += 1;
-        };
-
-        // ================================================================
-        // 4. Parse raw_io_data headers and build MLE arrays directly
-        //
-        // Layout (matches serialize_raw_io in cairo_serde.rs):
-        //   [in_rows, in_cols, in_len, in_data...,
-        //    out_rows, out_cols, out_len, out_data...]
-        //
-        // Optimization: parse headers, then build padded QM31 MLE arrays
-        // directly from io_span — avoids intermediate raw_input/raw_output
-        // arrays, eliminating ~10K array appends.
-        // ================================================================
-        let io_span = raw_io_data.span();
-        let io_len: u32 = io_span.len();
-        let mut io_off: u32 = 0;
-
-        // Parse input header
-        assert!(io_off + 2 < io_len, "IO_DATA_TRUNCATED_INPUT_HEADER");
-        let input_rows_felt: u256 = (*io_span.at(io_off)).into();
-        let input_rows: u64 = input_rows_felt.try_into().unwrap();
-        io_off += 1;
-        let input_cols_felt: u256 = (*io_span.at(io_off)).into();
-        let input_cols: u64 = input_cols_felt.try_into().unwrap();
-        io_off += 1;
-        let input_len_felt: u256 = (*io_span.at(io_off)).into();
-        let input_len: u32 = input_len_felt.try_into().unwrap();
-        io_off += 1;
-
-        // Record where input data starts in io_span (skip data for now)
-        assert!(io_off <= io_len, "IO_DATA_OFFSET_OOB");
-        assert!(input_len <= io_len - io_off, "IO_INPUT_LENGTH_MISMATCH");
-        let input_data_off: u32 = io_off;
-        io_off += input_len;
-
-        // Parse output header
-        assert!(io_off + 2 < io_len, "IO_DATA_TRUNCATED_OUTPUT_HEADER");
-        let output_rows_felt: u256 = (*io_span.at(io_off)).into();
-        let output_rows: u64 = output_rows_felt.try_into().unwrap();
-        io_off += 1;
-        let output_cols_felt: u256 = (*io_span.at(io_off)).into();
-        let output_cols: u64 = output_cols_felt.try_into().unwrap();
-        io_off += 1;
-        let output_len_felt: u256 = (*io_span.at(io_off)).into();
-        let output_len: u32 = output_len_felt.try_into().unwrap();
-        io_off += 1;
-
-        // Record where output data starts in io_span
-        assert!(io_off <= io_len, "IO_DATA_OFFSET_OOB");
-        assert!(output_len <= io_len - io_off, "IO_OUTPUT_LENGTH_MISMATCH");
-        let output_data_off: u32 = io_off;
-        io_off += output_len;
-        assert!(io_off == io_len, "IO_DATA_LENGTH_MISMATCH");
-
-        // ================================================================
-        // 5. Build output MLE directly from io_span (no intermediate array)
-        //
-        // Matches Rust: pad_matrix_pow2(output) → matrix_to_mle()
-        // The MLE has next_pow2(rows) * next_pow2(cols) entries.
-        // For batch-size-1 (padded_rows == 1), use a flat loop.
-        // ================================================================
-        let out_rows_u32: u32 = output_rows.try_into().unwrap();
-        let out_cols_u32: u32 = output_cols.try_into().unwrap();
-        let padded_out_rows = next_power_of_two(out_rows_u32);
-        let padded_out_cols = next_power_of_two(out_cols_u32);
-        let _padded_out_len = padded_out_rows * padded_out_cols;
-
-        let mut output_mle: Array<QM31> = array![];
-        if padded_out_rows == 1 {
-            // Fast path for 1-row case: flat copy + pad (avoids nested loop)
-            let mut col: u32 = 0;
-            loop {
-                if col >= padded_out_cols {
-                    break;
-                }
-                if col < out_cols_u32 {
-                    let v: u256 = (*io_span.at(output_data_off + col)).into();
-                    let v_u64: u64 = v.try_into().unwrap();
-                    output_mle.append(m31_to_qm31(v_u64));
-                } else {
-                    output_mle.append(crate::field::qm31_zero());
-                }
-                col += 1;
-            };
-        } else {
-            // General multi-row case: row-major with padding
-            let mut row: u32 = 0;
-            loop {
-                if row >= padded_out_rows {
-                    break;
-                }
-                let mut col: u32 = 0;
-                loop {
-                    if col >= padded_out_cols {
-                        break;
-                    }
-                    if row < out_rows_u32 && col < out_cols_u32 {
-                        let idx: u32 = row * out_cols_u32 + col;
-                        let v: u256 = (*io_span.at(output_data_off + idx)).into();
-                        let v_u64: u64 = v.try_into().unwrap();
-                        output_mle.append(m31_to_qm31(v_u64));
-                    } else {
-                        output_mle.append(crate::field::qm31_zero());
-                    }
-                    col += 1;
-                };
-                row += 1;
-            };
-        }
-
-        // ================================================================
-        // 6. Initialize Fiat-Shamir channel and construct output claim
-        // ================================================================
-        let mut ch = channel_default();
-        channel_mix_u64(ref ch, circuit_depth.into());
-        channel_mix_u64(ref ch, input_rows);
-        channel_mix_u64(ref ch, input_cols);
-
-        let log_out_rows = log2_ceil(padded_out_rows);
-        let log_out_cols = log2_ceil(padded_out_cols);
-        let log_out_total = log_out_rows + log_out_cols;
-
-        // Draw r_out from channel — this IS the claim point (not discarded)
-        let r_out = channel_draw_qm31s(ref ch, log_out_total);
-
-        // OUTPUT CLAIM VERIFICATION: evaluate MLE(raw_output, r_out) on-chain
-        let output_value = evaluate_mle(output_mle.span(), r_out.span());
-
-        // Mix the computed output value (matches prover's mix_secure_field)
-        channel_mix_secure_field(ref ch, output_value);
-
-        // ================================================================
-        // 7. Run GKR model walk
-        // ================================================================
-        let initial_claim = GKRClaim { point: r_out, value: output_value };
-
-        let (final_claim, weight_claims, layer_tags, deferred_weight_commitments) =
-            verify_gkr_model_with_trace(
-                proof_data.span(),
-                num_layers,
-                matmul_dims.span(),
-                dequantize_bits.span(),
-                initial_claim,
-                ref ch,
-                packed,
-            );
-
-        // ================================================================
-        // 7a. CIRCUIT BINDING: hash(circuit_depth || layer_tags) must match
-        //     registered model circuit hash.
-        // ================================================================
-        let mut descriptor_felts: Array<felt252> = array![circuit_depth.into()];
-        let mut t_i: u32 = 0;
-        loop {
-            if t_i >= layer_tags.len() {
-                break;
-            }
-            let tag_felt: felt252 = (*layer_tags.at(t_i)).into();
-            descriptor_felts.append(tag_felt);
-            t_i += 1;
-        };
-        let observed_circuit_hash = core::poseidon::poseidon_hash_span(descriptor_felts.span());
-        assert!(observed_circuit_hash == circuit_hash, "CIRCUIT_HASH_MISMATCH");
-
-        // ================================================================
-        // 7b. WEIGHT BINDING: verify opening proofs for both main and
-        //     deferred matmul claims.
-        // ================================================================
-        let expected_weight_claims = registered_count + deferred_weight_commitments.len();
-        assert!(
-            weight_claims.len() == expected_weight_claims,
-            "WEIGHT_CLAIM_COUNT_MISMATCH",
-        );
-        if weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_OPENINGS_V4_EXPERIMENTAL {
-            assert!(
-                weight_opening_proofs.len() == expected_weight_claims,
-                "WEIGHT_OPENING_COUNT_MISMATCH",
-            );
-            assert!(
-                weight_binding_data.len() == 2,
-                "WEIGHT_BINDING_DATA_LENGTH_MISMATCH",
-            );
-        } else {
-            // Mode 4: either full aggregated proof or RLC-only marker (2 felts)
-            assert!(weight_binding_data.len() >= 2, "AGGREGATED_BINDING_DATA_TOO_SHORT");
-        }
-
-        let opening_seed = if weight_binding_mode
-            == WEIGHT_BINDING_MODE_AGGREGATED_OPENINGS_V4_EXPERIMENTAL
-            && expected_weight_claims > 0 {
-            channel_draw_felt252(ref ch)
-        } else {
-            0
-        };
-
-        let mut resolved_weight_commitments: Array<felt252> = array![];
-        let mut w_i: u32 = 0;
-        loop {
-            if w_i >= expected_weight_claims {
-                break;
-            }
-
-            let commitment = if w_i < registered_count {
-                self.model_gkr_weights.entry((model_id, w_i)).read()
-            } else {
-                let deferred_root = *deferred_weight_commitments.at(w_i - registered_count);
-                assert!(deferred_root != 0, "DEFERRED_WEIGHT_COMMITMENT_ZERO");
-
-                let mut found = false;
-                let mut reg_i: u32 = 0;
-                loop {
-                    if reg_i >= registered_count {
-                        break;
-                    }
-                    let reg_root = self.model_gkr_weights.entry((model_id, reg_i)).read();
-                    if reg_root == deferred_root {
-                        found = true;
-                        break;
-                    }
-                    reg_i += 1;
-                };
-                assert!(found, "DEFERRED_WEIGHT_NOT_REGISTERED");
-                deferred_root
-            };
-            resolved_weight_commitments.append(commitment);
-            w_i += 1;
-        };
-
-        if weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_ORACLE_SUMCHECK {
-            // Mode 4: either full mismatch sumcheck proof or RLC-only binding.
-            if weight_binding_data.len() == 2
-                && *weight_binding_data.at(0) == WEIGHT_BINDING_RLC_MARKER {
-                // RLC-only binding: replay prover's Fiat-Shamir transcript.
-                // Draw rho from channel, compute combined = sum(rho^i * expected_value_i),
-                // mix combined into channel. Commitments already bound via Fiat-Shamir.
-                let rho = channel_draw_qm31(ref ch);
-                let mut rho_pow = crate::field::qm31_one();
-                let mut combined = crate::field::qm31_zero();
-                let mut claim_i: u32 = 0;
-                loop {
-                    if claim_i >= expected_weight_claims {
-                        break;
-                    }
-                    let claim = weight_claims.at(claim_i);
-                    combined = crate::field::qm31_add(
-                        combined,
-                        crate::field::qm31_mul(rho_pow, *claim.expected_value),
-                    );
-                    rho_pow = crate::field::qm31_mul(rho_pow, rho);
-                    claim_i += 1;
-                };
-                channel_mix_secure_field(ref ch, combined);
-            } else {
-                // Full mismatch sumcheck proof.
-                let mut agg_data = weight_binding_data;
-                let agg_proof: crate::aggregated_binding::AggregatedWeightBindingProof =
-                    Serde::deserialize(ref agg_data).expect('AGG_BINDING_DESER_FAIL');
-
-                let valid = crate::aggregated_binding::verify_aggregated_binding(
-                    @agg_proof,
-                    weight_claims.span(),
-                    resolved_weight_commitments.span(),
-                    ref ch,
-                );
-                assert!(valid, "AGGREGATED_WEIGHT_BINDING_FAILED");
-            }
-        } else {
-            // Mode 3: per-weight MLE opening verification with sub-channel.
-            let advertised_claim_count_u256: u256 = (*weight_binding_data.at(1)).into();
-            let advertised_claim_count: u32 = advertised_claim_count_u256.try_into().unwrap();
-            assert!(
-                advertised_claim_count == expected_weight_claims,
-                "WEIGHT_BINDING_CLAIM_COUNT_MISMATCH",
-            );
-
-            w_i = 0;
-            loop {
-                if w_i >= expected_weight_claims {
-                    break;
-                }
-                let commitment = *resolved_weight_commitments.at(w_i);
-                let opening = weight_opening_proofs.at(w_i);
-                let claim = weight_claims.at(w_i);
-
-                assert!(
-                    qm31_eq(*opening.final_value, *claim.expected_value),
-                    "WEIGHT_OPENING_VALUE_MISMATCH",
-                );
-
-                let mut sub_ch = channel_default();
-                channel_mix_felt(ref sub_ch, opening_seed);
-                channel_mix_u64(ref sub_ch, w_i.into());
-                channel_mix_felts(ref sub_ch, claim.eval_point.span());
-                channel_mix_felt(ref sub_ch, pack_qm31_to_felt(*claim.expected_value));
-
-                let valid = verify_mle_opening(
-                    commitment,
-                    opening,
-                    claim.eval_point.span(),
-                    ref sub_ch,
-                );
-                assert!(valid, "WEIGHT_MLE_OPENING_FAILED");
-                w_i += 1;
-            };
-        }
-
-        // ================================================================
-        // 8. INPUT CLAIM VERIFICATION: evaluate MLE(raw_input, final_claim.point)
-        //    and assert it matches final_claim.value
-        //
-        // Build padded input MLE directly from io_span (no intermediate array).
-        // ================================================================
-        let in_rows_u32: u32 = input_rows.try_into().unwrap();
-        let in_cols_u32: u32 = input_cols.try_into().unwrap();
-        let padded_in_rows = next_power_of_two(in_rows_u32);
-        let padded_in_cols = next_power_of_two(in_cols_u32);
-
-        let mut input_mle: Array<QM31> = array![];
-        if padded_in_rows == 1 {
-            // Fast path for 1-row case: flat copy + pad
-            let mut col: u32 = 0;
-            loop {
-                if col >= padded_in_cols {
-                    break;
-                }
-                if col < in_cols_u32 {
-                    let v: u256 = (*io_span.at(input_data_off + col)).into();
-                    let v_u64: u64 = v.try_into().unwrap();
-                    input_mle.append(m31_to_qm31(v_u64));
-                } else {
-                    input_mle.append(crate::field::qm31_zero());
-                }
-                col += 1;
-            };
-        } else {
-            // General multi-row case: row-major with padding
-            let mut row: u32 = 0;
-            loop {
-                if row >= padded_in_rows {
-                    break;
-                }
-                let mut col: u32 = 0;
-                loop {
-                    if col >= padded_in_cols {
-                        break;
-                    }
-                    if row < in_rows_u32 && col < in_cols_u32 {
-                        let idx: u32 = row * in_cols_u32 + col;
-                        let v: u256 = (*io_span.at(input_data_off + idx)).into();
-                        let v_u64: u64 = v.try_into().unwrap();
-                        input_mle.append(m31_to_qm31(v_u64));
-                    } else {
-                        input_mle.append(crate::field::qm31_zero());
-                    }
-                    col += 1;
-                };
-                row += 1;
-            };
-        }
-
-        // Evaluate input MLE at the GKR walk's final point
-        let input_value = evaluate_mle(input_mle.span(), final_claim.point.span());
-
-        // THE CRITICAL CHECK: input MLE evaluation must match final claim
-        assert!(crate::field::qm31_eq(input_value, final_claim.value), "INPUT_CLAIM_MISMATCH");
-
-        // ================================================================
-        // 9. Compute proof hash and record
-        // ================================================================
-        let proof_hash = core::poseidon::poseidon_hash_span(
-            array![ch.digest, io_commitment, model_id, num_layers.into()].span(),
-        );
-
-        // Replay prevention
-        assert!(
-            !self.verified_proofs.entry(proof_hash).read(),
-            "PROOF_ALREADY_VERIFIED",
-        );
-
-        // Record verification
-        self.verified_proofs.entry(proof_hash).write(true);
-        let count = self.verification_counts.entry(model_id).read();
-        self.verification_counts.entry(model_id).write(count + 1);
-
-        self.emit(ModelGkrVerified {
-            model_id, proof_hash, io_commitment, num_layers,
-        });
-
-        true
-    }
+    // Core functions stripped for lean v18b deploy:
+    // - unpack_m31_packed_io (no longer needed — packed_io evaluates directly)
+    // - verify_model_gkr_core (only called by non-packed entrypoint)
+    // - verify_model_gkr_core_with_io_commitment (only called by core)
+    // See git history for full implementations.
 
     #[constructor]
     fn constructor(ref self: ContractState, owner: ContractAddress) {
@@ -1045,9 +448,10 @@ mod SumcheckVerifierContract {
             let existing = self.model_circuit_hash.entry(model_id).read();
             assert!(existing == 0, "Model already registered for GKR");
 
-            // Store weight commitments (one per MatMul layer)
+            // Store weight commitments (one per MatMul layer) + aggregate hash
             let num_weights: u32 = weight_commitments.len();
             self.model_gkr_weight_count.entry(model_id).write(num_weights);
+            let mut weight_hash_input: Array<felt252> = array![];
             let mut i: u32 = 0;
             loop {
                 if i >= num_weights {
@@ -1056,8 +460,12 @@ mod SumcheckVerifierContract {
                 let root = *weight_commitments.at(i);
                 assert!(root != 0, "Weight commitment cannot be zero");
                 self.model_gkr_weights.entry((model_id, i)).write(root);
+                weight_hash_input.append(root);
                 i += 1;
             };
+            // Single aggregate hash: saves N-1 storage reads during verification
+            let weight_root_hash = core::poseidon::poseidon_hash_span(weight_hash_input.span());
+            self.model_weight_root_hash.entry(model_id).write(weight_root_hash);
 
             // Store circuit descriptor hash
             let mut desc_felts: Array<felt252> = array![];
@@ -1079,43 +487,6 @@ mod SumcheckVerifierContract {
             });
         }
 
-        fn verify_model_gkr_v4_packed(
-            ref self: ContractState,
-            model_id: felt252,
-            raw_io_data: Array<felt252>,
-            circuit_depth: u32,
-            num_layers: u32,
-            matmul_dims: Array<u32>,
-            dequantize_bits: Array<u64>,
-            proof_data: Array<felt252>,
-            weight_commitments: Array<felt252>,
-            weight_binding_mode: u32,
-            weight_binding_data: Array<felt252>,
-            weight_opening_proofs: Array<MleOpeningProof>,
-        ) -> bool {
-            assert!(
-                weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_OPENINGS_V4_EXPERIMENTAL
-                    || weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_ORACLE_SUMCHECK,
-                "UNSUPPORTED_WEIGHT_BINDING_MODE",
-            );
-
-            verify_model_gkr_core(
-                ref self,
-                model_id,
-                raw_io_data,
-                circuit_depth,
-                num_layers,
-                matmul_dims,
-                dequantize_bits,
-                proof_data,
-                weight_commitments,
-                weight_binding_mode,
-                weight_binding_data.span(),
-                weight_opening_proofs,
-                true,
-            )
-        }
-
         fn verify_model_gkr_v4_packed_io(
             ref self: ContractState,
             model_id: felt252,
@@ -1131,46 +502,45 @@ mod SumcheckVerifierContract {
             weight_binding_data: Array<felt252>,
             weight_opening_proofs: Array<MleOpeningProof>,
         ) -> bool {
-            assert!(
-                weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_OPENINGS_V4_EXPERIMENTAL
-                    || weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_ORACLE_SUMCHECK,
-                "UNSUPPORTED_WEIGHT_BINDING_MODE",
+            let (proof_hash, io_commitment) = InternalImpl::verify_model_gkr_v4_packed_io_core(
+                @self, model_id, original_io_len, packed_raw_io, circuit_depth,
+                num_layers, matmul_dims, dequantize_bits, proof_data,
+                weight_commitments, weight_binding_mode, weight_binding_data,
+                weight_opening_proofs,
             );
 
-            // Hash packed felts for IO commitment (1,281 felts vs 10,246)
-            // Domain-separate by prepending original_io_len to prevent
-            // different packings from producing the same commitment.
-            let mut commitment_input: Array<felt252> = array![original_io_len.into()];
-            let mut ci: u32 = 0;
-            loop {
-                if ci >= packed_raw_io.len() {
-                    break;
-                }
-                commitment_input.append(*packed_raw_io.at(ci));
-                ci += 1;
-            };
-            let io_commitment = core::poseidon::poseidon_hash_span(commitment_input.span());
+            // Record proof on-chain
+            assert!(!self.verified_proofs.entry(proof_hash).read(), "PROOF_ALREADY_VERIFIED");
+            self.verified_proofs.entry(proof_hash).write(true);
+            let count = self.verification_counts.entry(model_id).read();
+            self.verification_counts.entry(model_id).write(count + 1);
+            self.emit(ModelGkrVerified { model_id, proof_hash, io_commitment, num_layers });
+            true
+        }
 
-            // Unpack for MLE evaluations
-            let raw_io_data = unpack_m31_packed_io(packed_raw_io.span(), original_io_len);
-
-            // Pass pre-computed io_commitment to core
-            verify_model_gkr_core_with_io_commitment(
-                ref self,
-                model_id,
-                raw_io_data,
-                io_commitment,
-                circuit_depth,
-                num_layers,
-                matmul_dims,
-                dequantize_bits,
-                proof_data,
-                weight_commitments,
-                weight_binding_mode,
-                weight_binding_data.span(),
+        fn verify_model_gkr_v4_packed_io_view(
+            self: @ContractState,
+            model_id: felt252,
+            original_io_len: u32,
+            packed_raw_io: Array<felt252>,
+            circuit_depth: u32,
+            num_layers: u32,
+            matmul_dims: Array<u32>,
+            dequantize_bits: Array<u64>,
+            proof_data: Array<felt252>,
+            weight_commitments: Array<felt252>,
+            weight_binding_mode: u32,
+            weight_binding_data: Array<felt252>,
+            weight_opening_proofs: Array<MleOpeningProof>,
+        ) -> bool {
+            // View-only: verify but skip proof recording (no storage writes/events)
+            let (_proof_hash, _io_commitment) = InternalImpl::verify_model_gkr_v4_packed_io_core(
+                self, model_id, original_io_len, packed_raw_io, circuit_depth,
+                num_layers, matmul_dims, dequantize_bits, proof_data,
+                weight_commitments, weight_binding_mode, weight_binding_data,
                 weight_opening_proofs,
-                true,
-            )
+            );
+            true
         }
 
         fn get_model_circuit_hash(self: @ContractState, model_id: felt252) -> felt252 {
@@ -1182,397 +552,174 @@ mod SumcheckVerifierContract {
         }
     }
 
-    // ─── Audit Verifier Implementation ──────────────────────────────────────
+    // ─── Audit/Access/ViewKey impls stripped for lean v18b deploy ──────────
+    // Will be restored in next version. Storage is preserved across upgrades.
+    // See git history for full audit/access-control/view-key implementations.
 
-    #[abi(embed_v0)]
-    impl AuditVerifierImpl of crate::audit::IAuditVerifier<ContractState> {
-        fn submit_audit(
-            ref self: ContractState,
-            model_id: felt252,
-            report_hash_lo: felt252,
-            report_hash_hi: felt252,
-            merkle_root_lo: felt252,
-            merkle_root_hi: felt252,
-            weight_commitment: felt252,
-            time_start: u64,
-            time_end: u64,
-            inference_count: u32,
-            tee_attestation_hash: felt252,
-            privacy_tier: u8,
-        ) -> felt252 {
-            // 1. Verify weight commitment matches registered model
-            let registered_weight = self.model_commitments.entry(model_id).read();
-            assert!(registered_weight != 0, "Model not registered");
-            assert!(weight_commitment == registered_weight, "Weight commitment mismatch");
+    // ─── Private core verification logic (shared by record + view) ────────
 
-            // 2. Validate time window
-            assert!(time_end > time_start, "Invalid time window");
-            assert!(inference_count > 0, "Empty audit");
-
-            // 3. Generate audit ID
-            let nonce = self.next_audit_nonce.read();
-            let submitter = get_caller_address();
-            let audit_id = generate_audit_id(nonce, model_id, submitter, time_start);
-            self.next_audit_nonce.write(nonce + 1);
-
-            // 4. Store audit record with PackedDigest8 fields
-            let report_hash = PackedDigest8 { lo: report_hash_lo, hi: report_hash_hi };
-            let merkle_root = PackedDigest8 { lo: merkle_root_lo, hi: merkle_root_hi };
-
-            let record = AuditRecord {
-                model_id,
-                audit_report_hash: report_hash,
-                inference_log_merkle_root: merkle_root,
-                weight_commitment,
-                time_start,
-                time_end,
-                inference_count,
-                proof_verified: false,
-                submitter,
-                submitted_at_block: get_block_number(),
-                tee_attestation_hash,
-                privacy_tier,
-            };
-            self.audit_records.entry(audit_id).write(record);
-
-            // 4b. Set audit owner for access control
-            self.audit_owner.entry(audit_id).write(submitter);
-
-            // 5. Append to model's audit list
-            let count = self.model_audit_count.entry(model_id).read();
-            self.model_audit_ids.entry((model_id, count)).write(audit_id);
-            self.model_audit_count.entry(model_id).write(count + 1);
-
-            // 6. Update total proven inferences
-            let total = self.total_proven_inferences.entry(model_id).read();
-            self.total_proven_inferences.entry(model_id).write(total + inference_count.into());
-
-            // 7. Emit event
-            self.emit(AuditSubmitted {
-                audit_id,
-                model_id,
-                submitter,
-                report_hash_lo,
-                report_hash_hi,
-                merkle_root_lo,
-                merkle_root_hi,
-                time_start,
-                time_end,
-                inference_count,
-                proof_verified: false,
-                privacy_tier,
-            });
-
-            audit_id
-        }
-
-        fn get_audit(self: @ContractState, audit_id: felt252) -> AuditRecord {
-            self.audit_records.entry(audit_id).read()
-        }
-
-        fn get_model_audits(self: @ContractState, model_id: felt252) -> Array<felt252> {
-            let count = self.model_audit_count.entry(model_id).read();
-            let mut ids: Array<felt252> = array![];
-            let mut i: u32 = 0;
-            loop {
-                if i >= count {
-                    break;
-                }
-                ids.append(self.model_audit_ids.entry((model_id, i)).read());
-                i += 1;
-            };
-            ids
-        }
-
-        fn get_audit_count(self: @ContractState, model_id: felt252) -> u32 {
-            self.model_audit_count.entry(model_id).read()
-        }
-
-        fn get_latest_audit(self: @ContractState, model_id: felt252) -> AuditRecord {
-            let count = self.model_audit_count.entry(model_id).read();
-            assert!(count > 0, "No audits for model");
-            let audit_id = self.model_audit_ids.entry((model_id, count - 1)).read();
-            self.audit_records.entry(audit_id).read()
-        }
-
-        fn is_audited_in_range(
+    #[generate_trait]
+    impl InternalImpl of InternalTrait {
+        /// Core GKR verification: runs full Fiat-Shamir transcript replay and
+        /// returns (proof_hash, io_commitment). Panics on verification failure.
+        /// Shared by verify_model_gkr_v4_packed_io (records proof) and
+        /// verify_model_gkr_v4_packed_io_view (view-only, no storage writes).
+        fn verify_model_gkr_v4_packed_io_core(
             self: @ContractState,
             model_id: felt252,
-            since: u64,
-            until: u64,
-        ) -> bool {
-            let count = self.model_audit_count.entry(model_id).read();
-            let mut i = count;
+            original_io_len: u32,
+            packed_raw_io: Array<felt252>,
+            circuit_depth: u32,
+            num_layers: u32,
+            matmul_dims: Array<u32>,
+            dequantize_bits: Array<u64>,
+            proof_data: Array<felt252>,
+            weight_commitments: Array<felt252>,
+            weight_binding_mode: u32,
+            weight_binding_data: Array<felt252>,
+            weight_opening_proofs: Array<MleOpeningProof>,
+        ) -> (felt252, felt252) {
+            assert!(
+                weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_OPENINGS_V4_EXPERIMENTAL
+                    || weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_ORACLE_SUMCHECK,
+                "UNSUPPORTED_WEIGHT_BINDING_MODE",
+            );
+
+            // Hash packed felts for IO commitment (1,281 felts vs 10,246)
+            let mut commitment_input: Array<felt252> = array![original_io_len.into()];
+            let mut ci: u32 = 0;
             loop {
-                if i == 0 {
-                    break false;
-                }
-                i -= 1;
-                let audit_id = self.model_audit_ids.entry((model_id, i)).read();
-                let record = self.audit_records.entry(audit_id).read();
-                if record.time_start >= since && record.time_end <= until {
-                    break true;
-                }
-            }
-        }
-
-        fn get_total_proven_inferences(self: @ContractState, model_id: felt252) -> u64 {
-            self.total_proven_inferences.entry(model_id).read()
-        }
-    }
-
-    // ─── Access Control Implementation ──────────────────────────────────────
-
-    #[abi(embed_v0)]
-    impl AccessControlImpl of crate::access_control::IAuditAccessControl<ContractState> {
-        fn grant_audit_access(
-            ref self: ContractState,
-            audit_id: felt252,
-            grantee: ContractAddress,
-            wrapped_key: felt252,
-            role: u8,
-        ) {
-            // Only the audit owner can grant access.
-            let caller = get_caller_address();
-            let owner = self.audit_owner.entry(audit_id).read();
-            assert!(owner == caller, "Only audit owner can grant access");
-
-            // Check grantee doesn't already have active access.
-            let existing = self.audit_access.entry((audit_id, grantee)).read();
-            assert!(!existing.is_active, "Access already granted");
-
-            // Store access record.
-            let access = AuditAccess {
-                address: grantee,
-                role,
-                granted_at_block: get_block_number(),
-                is_active: true,
-            };
-            self.audit_access.entry((audit_id, grantee)).write(access);
-            self.audit_wrapped_keys.entry((audit_id, grantee)).write(wrapped_key);
-
-            // Append to enumeration list.
-            let count = self.audit_access_count.entry(audit_id).read();
-            self.audit_access_list.entry((audit_id, count)).write(grantee);
-            self.audit_access_count.entry(audit_id).write(count + 1);
-
-            // Increment active counter.
-            let active = self.audit_active_access_count.entry(audit_id).read();
-            self.audit_active_access_count.entry(audit_id).write(active + 1);
-
-            self.emit(AccessGranted {
-                audit_id,
-                grantee,
-                role,
-                granted_by: caller,
-            });
-        }
-
-        fn revoke_audit_access(
-            ref self: ContractState,
-            audit_id: felt252,
-            revokee: ContractAddress,
-        ) {
-            let caller = get_caller_address();
-            let owner = self.audit_owner.entry(audit_id).read();
-            assert!(owner == caller, "Only audit owner can revoke access");
-
-            let mut access = self.audit_access.entry((audit_id, revokee)).read();
-            assert!(access.is_active, "Access not active");
-
-            // Deactivate and zero wrapped key.
-            access.is_active = false;
-            self.audit_access.entry((audit_id, revokee)).write(access);
-            self.audit_wrapped_keys.entry((audit_id, revokee)).write(0);
-
-            // Decrement active counter.
-            let active = self.audit_active_access_count.entry(audit_id).read();
-            self.audit_active_access_count.entry(audit_id).write(active - 1);
-
-            self.emit(AccessRevoked {
-                audit_id,
-                revokee,
-                revoked_by: caller,
-            });
-        }
-
-        fn grant_audit_access_batch(
-            ref self: ContractState,
-            audit_id: felt252,
-            grantees: Span<ContractAddress>,
-            wrapped_keys: Span<felt252>,
-            roles: Span<u8>,
-        ) {
-            assert!(grantees.len() == wrapped_keys.len(), "Length mismatch");
-            assert!(grantees.len() == roles.len(), "Length mismatch");
-
-            let caller = get_caller_address();
-            let owner = self.audit_owner.entry(audit_id).read();
-            assert!(owner == caller, "Only audit owner can grant access");
-
-            let mut i: u32 = 0;
-            loop {
-                if i >= grantees.len() {
+                if ci >= packed_raw_io.len() {
                     break;
                 }
-                let grantee = *grantees.at(i);
-                let wrapped_key = *wrapped_keys.at(i);
-                let role = *roles.at(i);
-
-                let existing = self.audit_access.entry((audit_id, grantee)).read();
-                assert!(!existing.is_active, "Access already granted");
-
-                let access = AuditAccess {
-                    address: grantee,
-                    role,
-                    granted_at_block: get_block_number(),
-                    is_active: true,
-                };
-                self.audit_access.entry((audit_id, grantee)).write(access);
-                self.audit_wrapped_keys.entry((audit_id, grantee)).write(wrapped_key);
-
-                let count = self.audit_access_count.entry(audit_id).read();
-                self.audit_access_list.entry((audit_id, count)).write(grantee);
-                self.audit_access_count.entry(audit_id).write(count + 1);
-
-                // Increment active counter.
-                let active = self.audit_active_access_count.entry(audit_id).read();
-                self.audit_active_access_count.entry(audit_id).write(active + 1);
-
-                self.emit(AccessGranted {
-                    audit_id,
-                    grantee,
-                    role,
-                    granted_by: caller,
-                });
-
-                i += 1;
+                commitment_input.append(*packed_raw_io.at(ci));
+                ci += 1;
             };
-        }
+            let io_commitment = core::poseidon::poseidon_hash_span(commitment_input.span());
 
-        fn has_audit_access(
-            self: @ContractState,
-            audit_id: felt252,
-            address: ContractAddress,
-        ) -> bool {
-            let access = self.audit_access.entry((audit_id, address)).read();
-            access.is_active
-        }
+            // Extract IO dimensions from matmul_dims
+            let in_rows: u32 = *matmul_dims.at(0);
+            let in_cols: u32 = *matmul_dims.at(1);
+            let in_len: u32 = in_rows * in_cols;
+            let last_triple_start: u32 = (num_layers - 1) * 3;
+            let out_rows: u32 = *matmul_dims.at(last_triple_start);
+            let out_cols: u32 = *matmul_dims.at(last_triple_start + 2);
+            let out_len: u32 = out_rows * out_cols;
 
-        fn get_wrapped_key(
-            self: @ContractState,
-            audit_id: felt252,
-            grantee: ContractAddress,
-        ) -> felt252 {
-            let access = self.audit_access.entry((audit_id, grantee)).read();
-            assert!(access.is_active, "No active access");
-            self.audit_wrapped_keys.entry((audit_id, grantee)).read()
-        }
+            assert!(original_io_len == 6 + in_len + out_len, "PACKED_IO_LEN_MISMATCH");
 
-        fn get_audit_owner(
-            self: @ContractState,
-            audit_id: felt252,
-        ) -> ContractAddress {
-            self.audit_owner.entry(audit_id).read()
-        }
+            let in_data_m31_start: u32 = 3;
+            let out_data_m31_start: u32 = 3 + in_len + 3;
 
-        fn get_access_count(
-            self: @ContractState,
-            audit_id: felt252,
-        ) -> u32 {
-            self.audit_active_access_count.entry(audit_id).read()
-        }
-    }
+            let padded_in_rows = next_power_of_two(in_rows);
+            let padded_in_cols = next_power_of_two(in_cols);
+            let padded_out_rows = next_power_of_two(out_rows);
+            let padded_out_cols = next_power_of_two(out_cols);
 
-    // ─── View Key Delegation Implementation ─────────────────────────────────
+            // Fiat-Shamir channel
+            let mut ch = channel_default();
+            channel_mix_u64(ref ch, circuit_depth.into());
+            channel_mix_u64(ref ch, in_rows.into());
+            channel_mix_u64(ref ch, in_cols.into());
 
-    #[abi(embed_v0)]
-    impl ViewKeyDelegationImpl of crate::view_key::IViewKeyDelegation<ContractState> {
-        fn delegate_view_key(
-            ref self: ContractState,
-            delegate: ContractAddress,
-            encrypted_view_key: felt252,
-            valid_until: u64,
-        ) {
-            let owner = get_caller_address();
+            let log_out_rows = log2_ceil(padded_out_rows);
+            let log_out_cols = log2_ceil(padded_out_cols);
+            let log_out_total = log_out_rows + log_out_cols;
+            let r_out = channel_draw_qm31s(ref ch, log_out_total);
 
-            // Check not already delegated.
-            let existing = self.view_delegations.entry((owner, delegate)).read();
-            assert!(!existing.is_active, "View key already delegated");
+            // OUTPUT MLE evaluation directly from packed data
+            let packed_span = packed_raw_io.span();
+            assert!(padded_out_rows == 1, "PACKED_IO_ONLY_1ROW");
+            let output_value = evaluate_mle_from_packed_1row(
+                packed_span, out_data_m31_start, out_cols, padded_out_cols, r_out.span(),
+            );
 
-            let delegation = ViewKeyDelegation {
-                owner,
-                delegate,
-                encrypted_view_key,
-                valid_from: get_block_number(),
-                valid_until,
-                is_active: true,
-            };
-            self.view_delegations.entry((owner, delegate)).write(delegation);
+            channel_mix_secure_field(ref ch, output_value);
 
-            // Append to enumeration list.
-            let count = self.view_delegation_count.entry(owner).read();
-            self.view_delegation_list.entry((owner, count)).write(delegate);
-            self.view_delegation_count.entry(owner).write(count + 1);
+            // GKR model walk
+            let initial_claim = GKRClaim { point: r_out, value: output_value };
+            let (final_claim, weight_claims, layer_tags, deferred_weight_commitments) =
+                verify_gkr_model_with_trace(
+                    proof_data.span(), num_layers, matmul_dims.span(),
+                    dequantize_bits.span(), initial_claim, ref ch, true,
+                );
 
-            self.emit(ViewKeyDelegated { owner, delegate, valid_until });
-        }
-
-        fn revoke_view_key(
-            ref self: ContractState,
-            delegate: ContractAddress,
-        ) {
-            let owner = get_caller_address();
-
-            let mut delegation = self.view_delegations.entry((owner, delegate)).read();
-            assert!(delegation.is_active, "View key not active");
-
-            delegation.is_active = false;
-            delegation.encrypted_view_key = 0;
-            self.view_delegations.entry((owner, delegate)).write(delegation);
-
-            self.emit(ViewKeyRevoked { owner, delegate });
-        }
-
-        fn has_view_key(
-            self: @ContractState,
-            owner: ContractAddress,
-            delegate: ContractAddress,
-        ) -> bool {
-            let delegation = self.view_delegations.entry((owner, delegate)).read();
-            if !delegation.is_active {
-                return false;
-            }
-            // Check expiry (valid_until == 0 means forever).
-            if delegation.valid_until != 0 {
-                let current_block = get_block_number();
-                if current_block > delegation.valid_until {
-                    return false;
+            // Circuit binding
+            let circuit_hash = self.model_circuit_hash.entry(model_id).read();
+            assert!(circuit_hash != 0, "Model not registered for GKR");
+            let mut descriptor_felts: Array<felt252> = array![circuit_depth.into()];
+            let mut t_i: u32 = 0;
+            loop {
+                if t_i >= layer_tags.len() {
+                    break;
                 }
-            }
-            true
-        }
+                descriptor_felts.append((*layer_tags.at(t_i)).into());
+                t_i += 1;
+            };
+            let observed_circuit_hash = core::poseidon::poseidon_hash_span(descriptor_felts.span());
+            assert!(observed_circuit_hash == circuit_hash, "CIRCUIT_HASH_MISMATCH");
 
-        fn get_view_key(
-            self: @ContractState,
-            owner: ContractAddress,
-            delegate: ContractAddress,
-        ) -> felt252 {
-            let delegation = self.view_delegations.entry((owner, delegate)).read();
-            assert!(delegation.is_active, "No active view key");
-            // Check expiry (valid_until == 0 means forever).
-            if delegation.valid_until != 0 {
-                let current_block = get_block_number();
-                assert!(current_block <= delegation.valid_until, "View key expired");
-            }
-            delegation.encrypted_view_key
-        }
+            // Weight binding — aggregate hash comparison (1 storage read vs N)
+            let registered_count = self.model_gkr_weight_count.entry(model_id).read();
+            assert!(weight_commitments.len() == registered_count, "Weight commitment count mismatch");
+            let mut weight_hash_input: Array<felt252> = array![];
+            let mut w_idx: u32 = 0;
+            loop {
+                if w_idx >= registered_count {
+                    break;
+                }
+                weight_hash_input.append(*weight_commitments.at(w_idx));
+                w_idx += 1;
+            };
+            let calldata_weight_hash = core::poseidon::poseidon_hash_span(weight_hash_input.span());
+            let registered_hash = self.model_weight_root_hash.entry(model_id).read();
+            assert!(calldata_weight_hash == registered_hash, "WEIGHT_ROOT_HASH_MISMATCH");
 
-        fn get_delegation_count(
-            self: @ContractState,
-            owner: ContractAddress,
-        ) -> u32 {
-            self.view_delegation_count.entry(owner).read()
+            let expected_weight_claims = registered_count + deferred_weight_commitments.len();
+            assert!(weight_claims.len() == expected_weight_claims, "WEIGHT_CLAIM_COUNT_MISMATCH");
+            assert!(weight_binding_data.len() >= 2, "AGGREGATED_BINDING_DATA_TOO_SHORT");
+
+            let weight_binding_span = weight_binding_data.span();
+
+            if weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_ORACLE_SUMCHECK {
+                if weight_binding_span.len() == 2
+                    && *weight_binding_span.at(0) == WEIGHT_BINDING_RLC_MARKER {
+                    let rho = channel_draw_qm31(ref ch);
+                    let mut rho_pow = crate::field::qm31_one();
+                    let mut combined = crate::field::qm31_zero();
+                    let mut claim_i: u32 = 0;
+                    loop {
+                        if claim_i >= expected_weight_claims {
+                            break;
+                        }
+                        let claim = weight_claims.at(claim_i);
+                        combined = crate::field::qm31_add(
+                            combined, crate::field::qm31_mul(rho_pow, *claim.expected_value),
+                        );
+                        rho_pow = crate::field::qm31_mul(rho_pow, rho);
+                        claim_i += 1;
+                    };
+                    channel_mix_secure_field(ref ch, combined);
+                } else {
+                    panic!("FULL_AGGREGATED_BINDING_NOT_IN_LEAN_BUILD");
+                }
+            } else {
+                panic!("MODE_3_NOT_IN_LEAN_BUILD");
+            }
+
+            // INPUT MLE evaluation directly from packed data
+            assert!(padded_in_rows == 1, "PACKED_IO_ONLY_1ROW");
+            let input_value = evaluate_mle_from_packed_1row(
+                packed_span, in_data_m31_start, in_cols, padded_in_cols,
+                final_claim.point.span(),
+            );
+            assert!(crate::field::qm31_eq(input_value, final_claim.value), "INPUT_CLAIM_MISMATCH");
+
+            // Return proof hash + io_commitment for caller to record (or discard for view)
+            let proof_hash = core::poseidon::poseidon_hash_span(
+                array![ch.digest, io_commitment, model_id, num_layers.into()].span(),
+            );
+            (proof_hash, io_commitment)
         }
     }
 }

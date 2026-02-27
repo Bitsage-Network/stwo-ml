@@ -385,6 +385,292 @@ pub fn evaluate_mle(evals: Span<QM31>, point: Span<QM31>) -> QM31 {
     *current.at(0)
 }
 
+/// Evaluate an MLE at `point` by building an eq-table, then dot-product with data
+/// read directly from a felt252 IO span. Eliminates the data QM31 array entirely
+/// (saves 8192 appends) and replaces evaluate_mle's copy+fold (saves another 8192
+/// appends + avoids the initial copy in evaluate_mle).
+///
+/// For batch-size-1 (padded_rows == 1): data is flat, `data_len` non-zero entries
+/// followed by `padded_len - data_len` zeros. We skip padding in the dot product.
+///
+/// eq_table[i] = eq(binary(i), point) = prod_j((1-r_j)(1-b_j) + r_j·b_j)
+/// Built incrementally (MSB-first to match evaluate_mle folding order):
+///   Start: [1]
+///   For each variable r_j:
+///     new[2k]   = old[k] * (1 - r_j)
+///     new[2k+1] = old[k] * r_j
+///
+/// Total: ~16K appends (eq build) vs ~25K appends (old approach)
+pub fn evaluate_mle_from_io_span_1row(
+    io_span: Span<felt252>,
+    data_off: u32,
+    data_len: u32,
+    padded_len: u32,
+    point: Span<QM31>,
+) -> QM31 {
+    let n_vars = point.len();
+    assert!(padded_len > 0, "EQ_TABLE_EMPTY");
+    let _ = padded_len; // validated by caller
+
+    // Build eq table incrementally (MSB-first to match evaluate_mle folding order)
+    let mut eq_table: Array<QM31> = array![qm31_one()];
+    let mut var_idx: u32 = 0;
+    loop {
+        if var_idx >= n_vars {
+            break;
+        }
+        let r = *point.at(var_idx);
+        let one_minus_r = qm31_sub(qm31_one(), r);
+        let old_len = eq_table.len();
+        let old_span = eq_table.span();
+
+        let mut new_table: Array<QM31> = array![];
+        let mut k: u32 = 0;
+        loop {
+            if k >= old_len {
+                break;
+            }
+            let e = *old_span.at(k);
+            new_table.append(qm31_mul(e, one_minus_r));
+            new_table.append(qm31_mul(e, r));
+            k += 1;
+        };
+        eq_table = new_table;
+        var_idx += 1;
+    };
+
+    // Dot product: sum(data[i] * eq_table[i]) for i in 0..data_len
+    // (padding entries are zero, so their eq_table contribution is skipped)
+    let eq_span = eq_table.span();
+    let mut acc = qm31_zero();
+    let mut i: u32 = 0;
+    loop {
+        if i >= data_len {
+            break;
+        }
+        let v: u256 = (*io_span.at(data_off + i)).into();
+        let v_u64: u64 = v.try_into().unwrap();
+        if v_u64 != 0 {
+            acc = qm31_add(acc, qm31_mul(m31_to_qm31(v_u64), *eq_span.at(i)));
+        }
+        i += 1;
+    };
+    acc
+}
+
+/// General multi-row version: handles row-major data with row/col padding.
+/// data layout: row-major, data_rows x data_cols entries starting at data_off.
+/// Padded to padded_rows x padded_cols (both powers of 2).
+/// point has log2(padded_rows) + log2(padded_cols) variables.
+pub fn evaluate_mle_from_io_span_2d(
+    io_span: Span<felt252>,
+    data_off: u32,
+    data_rows: u32,
+    data_cols: u32,
+    padded_rows: u32,
+    padded_cols: u32,
+    point: Span<QM31>,
+) -> QM31 {
+    let padded_len = padded_rows * padded_cols;
+    let n_vars = point.len();
+    assert!(padded_len > 0, "EQ_TABLE_EMPTY");
+
+    // Build eq table (same as 1row version)
+    let mut eq_table: Array<QM31> = array![qm31_one()];
+    let mut var_idx: u32 = 0;
+    loop {
+        if var_idx >= n_vars {
+            break;
+        }
+        let r = *point.at(var_idx);
+        let one_minus_r = qm31_sub(qm31_one(), r);
+        let old_len = eq_table.len();
+        let old_span = eq_table.span();
+
+        let mut new_table: Array<QM31> = array![];
+        let mut k: u32 = 0;
+        loop {
+            if k >= old_len {
+                break;
+            }
+            let e = *old_span.at(k);
+            new_table.append(qm31_mul(e, one_minus_r));
+            new_table.append(qm31_mul(e, r));
+            k += 1;
+        };
+        eq_table = new_table;
+        var_idx += 1;
+    };
+
+    // Dot product over non-padded entries only
+    let eq_span = eq_table.span();
+    let mut acc = qm31_zero();
+    let mut row: u32 = 0;
+    loop {
+        if row >= data_rows {
+            break;
+        }
+        let mut col: u32 = 0;
+        loop {
+            if col >= data_cols {
+                break;
+            }
+            let src_idx: u32 = row * data_cols + col;
+            let dst_idx: u32 = row * padded_cols + col;
+            let v: u256 = (*io_span.at(data_off + src_idx)).into();
+            let v_u64: u64 = v.try_into().unwrap();
+            if v_u64 != 0 {
+                acc = qm31_add(acc, qm31_mul(m31_to_qm31(v_u64), *eq_span.at(dst_idx)));
+            }
+            col += 1;
+        };
+        row += 1;
+    };
+    acc
+}
+
+/// Evaluate an MLE at `point` directly from PACKED felt252s, without any intermediate
+/// unpacking array. Extracts 8 M31 values per packed felt and multiplies by eq_table
+/// entries in a single pass.
+///
+/// This eliminates the ~10K-entry unpacked array entirely (saves ~2.5M Cairo steps
+/// from u128 unpacking + array appends that would otherwise be needed).
+///
+/// Parameters:
+/// - packed_felts: Full packed IO span (8 M31 values per felt252)
+/// - m31_start: Starting M31 position within the packed data (e.g., 3 for input data)
+/// - data_len: Number of M31 data values to evaluate
+/// - padded_len: Power-of-2 padded length for MLE
+/// - point: MLE evaluation point (log2(padded_len) QM31 values)
+pub fn evaluate_mle_from_packed_1row(
+    packed_felts: Span<felt252>,
+    m31_start: u32,
+    data_len: u32,
+    padded_len: u32,
+    point: Span<QM31>,
+) -> QM31 {
+    let n_vars = point.len();
+    assert!(padded_len > 0, "EQ_TABLE_EMPTY");
+
+    // Build eq table
+    let mut eq_table: Array<QM31> = array![qm31_one()];
+    let mut var_idx: u32 = 0;
+    loop {
+        if var_idx >= n_vars {
+            break;
+        }
+        let r = *point.at(var_idx);
+        let one_minus_r = qm31_sub(qm31_one(), r);
+        let old_len = eq_table.len();
+        let old_span = eq_table.span();
+        let mut new_table: Array<QM31> = array![];
+        let mut k: u32 = 0;
+        loop {
+            if k >= old_len {
+                break;
+            }
+            let e = *old_span.at(k);
+            new_table.append(qm31_mul(e, one_minus_r));
+            new_table.append(qm31_mul(e, r));
+            k += 1;
+        };
+        eq_table = new_table;
+        var_idx += 1;
+    };
+    let eq_span = eq_table.span();
+
+    // Compute packed felt index and offset for m31_start
+    let mut pi: u32 = m31_start / 8;
+    let skip_in_first: u32 = m31_start % 8;
+
+    let mut acc = qm31_zero();
+    let mut data_idx: u32 = 0;
+
+    loop {
+        if data_idx >= data_len {
+            break;
+        }
+        let val: u256 = (*packed_felts.at(pi)).into();
+        let mut rem_lo: u128 = val.low;
+        let mut rem_hi: u128 = val.high;
+
+        // Determine how many M31 values to skip in this packed felt
+        let skip_count = if pi == m31_start / 8 { skip_in_first } else { 0 };
+
+        // Extract all 8 M31 values from this packed felt
+        // But skip the first `skip_count` and stop when data_idx reaches data_len
+        let mut pos_in_felt: u32 = 0;
+
+        // Values 0-3 from lo limb
+        let mut vi: u32 = 0;
+        loop {
+            if vi >= 4 {
+                break;
+            }
+            let q: u128 = rem_lo / 0x80000000;
+            let v: u128 = rem_lo - q * 0x80000000;
+            if pos_in_felt >= skip_count && data_idx < data_len {
+                if v != 0 {
+                    let v_u64: u64 = v.try_into().unwrap();
+                    acc = qm31_add(acc, qm31_mul(m31_to_qm31(v_u64), *eq_span.at(data_idx)));
+                }
+                data_idx += 1;
+            }
+            rem_lo = q;
+            pos_in_felt += 1;
+            vi += 1;
+        };
+
+        // Value 4 straddles lo/hi
+        let hi_q4: u128 = rem_hi / 0x8000000;
+        let hi_low27: u128 = rem_hi - hi_q4 * 0x8000000;
+        let v4: u128 = rem_lo | (hi_low27 * 16);
+        let v4_masked: u128 = v4 & 0x7FFFFFFF;
+        if pos_in_felt >= skip_count && data_idx < data_len {
+            if v4_masked != 0 {
+                let v4_u64: u64 = v4_masked.try_into().unwrap();
+                acc = qm31_add(acc, qm31_mul(m31_to_qm31(v4_u64), *eq_span.at(data_idx)));
+            }
+            data_idx += 1;
+        }
+        rem_hi = hi_q4;
+        pos_in_felt += 1;
+
+        // Values 5-6 from hi limb
+        vi = 0;
+        loop {
+            if vi >= 2 {
+                break;
+            }
+            let q: u128 = rem_hi / 0x80000000;
+            let v: u128 = rem_hi - q * 0x80000000;
+            if pos_in_felt >= skip_count && data_idx < data_len {
+                if v != 0 {
+                    let v_u64: u64 = v.try_into().unwrap();
+                    acc = qm31_add(acc, qm31_mul(m31_to_qm31(v_u64), *eq_span.at(data_idx)));
+                }
+                data_idx += 1;
+            }
+            rem_hi = q;
+            pos_in_felt += 1;
+            vi += 1;
+        };
+
+        // Value 7: remaining bits
+        if pos_in_felt >= skip_count && data_idx < data_len {
+            let v7: u128 = rem_hi & 0x7FFFFFFF;
+            if v7 != 0 {
+                let v7_u64: u64 = v7.try_into().unwrap();
+                acc = qm31_add(acc, qm31_mul(m31_to_qm31(v7_u64), *eq_span.at(data_idx)));
+            }
+            data_idx += 1;
+        }
+
+        pi += 1;
+    };
+    acc
+}
+
 /// Embed M31 values (as u64) into QM31 and pad to a target power-of-2 length.
 ///
 /// Each M31 value v becomes QM31(v, 0, 0, 0). Padding uses QM31::zero().

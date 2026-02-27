@@ -55,19 +55,25 @@ pub fn channel_mix_felt(ref ch: PoseidonChannel, value: felt252) {
     ch.n_draws = 0;
 }
 
-/// Mix a QM31 value into the channel via 4 individual mix_u64 calls.
+/// Mix a QM31 value into the channel via packed felt252 (1 hades instead of 4).
 ///
-/// CRITICAL: This is NOT the same as channel_mix_felts([v]) which packs into felt252.
-/// This matches Rust gkr/verifier.rs:1906 mix_secure_field() exactly:
-///   channel.mix_u64(v.0.0.0 as u64);  // a.a
-///   channel.mix_u64(v.0.1.0 as u64);  // a.b
-///   channel.mix_u64(v.1.0.0 as u64);  // b.a
-///   channel.mix_u64(v.1.1.0 as u64);  // b.b
+/// Packs 4 M31 components into a single felt252 with a sentinel prefix:
+///   packed = 1 * 2^31 + a.a  (sentinel ensures injectivity)
+///   packed = packed * 2^31 + a.b
+///   packed = packed * 2^31 + b.a
+///   packed = packed * 2^31 + b.b
+///
+/// Total: 1 + 4×31 = 125 bits < 252 bits — collision-free.
+/// Saves 3 hades_permutation calls per QM31 mix (~1,500 steps each).
 pub fn channel_mix_secure_field(ref ch: PoseidonChannel, v: QM31) {
-    channel_mix_u64(ref ch, v.a.a);
-    channel_mix_u64(ref ch, v.a.b);
-    channel_mix_u64(ref ch, v.b.a);
-    channel_mix_u64(ref ch, v.b.b);
+    let mut packed: felt252 = 1; // sentinel
+    packed = packed * M31_SHIFT + v.a.a.into();
+    packed = packed * M31_SHIFT + v.a.b.into();
+    packed = packed * M31_SHIFT + v.b.a.into();
+    packed = packed * M31_SHIFT + v.b.b.into();
+    let (s0, _, _) = hades_permutation(ch.digest, packed, 2);
+    ch.digest = s0;
+    ch.n_draws = 0;
 }
 
 /// Draw a raw felt252 from the channel.

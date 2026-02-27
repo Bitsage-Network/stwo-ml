@@ -896,7 +896,7 @@ fn main() {
         eprintln!("Model loaded in {:.2}s", t_cache.elapsed().as_secs_f64());
 
         let model_id = if cli.model_id.is_empty() { "unknown".to_string() } else { cli.model_id.clone() };
-        let cache = stwo_ml::weight_cache::shared_cache_for_model_validated(
+        let cache = stwo_ml::weight_cache::shared_cache_for_model_mmap(
             model_dir, &model_id, &model.weights,
         );
 
@@ -1055,17 +1055,13 @@ fn main() {
     let t0 = Instant::now();
 
     // Load weight commitment cache for Merkle root reuse across inferences.
-    // Uses validated variant: fingerprints weight content to detect fine-tuning.
+    // Uses mmap variant: near-zero startup cost (<1ms vs ~200ms file I/O).
+    // Falls back to validated file I/O if mmap fails.
     let weight_cache = cli.model_dir.as_ref().map(|dir| {
         let model_id = if cli.model_id.is_empty() { "unknown".to_string() } else { cli.model_id.clone() };
-        let cache = stwo_ml::weight_cache::shared_cache_for_model_validated(
+        stwo_ml::weight_cache::shared_cache_for_model_mmap(
             dir, &model_id, &model.weights,
-        );
-        let count = cache.read().map(|c| c.len()).unwrap_or(0);
-        if count > 0 {
-            eprintln!("Weight commitment cache: loaded {count} entries from {}", dir.display());
-        }
-        cache
+        )
     });
 
     // Pre-warming: compute Merkle roots for uncached weight matrices in the
@@ -1387,7 +1383,8 @@ fn main() {
         }
         OutputFormat::MlGkr => {
             use stwo_ml::starknet::{
-                build_chunked_gkr_calldata, build_circuit_descriptor, build_gkr_serializable_proof,
+                build_chunked_gkr_calldata, build_circuit_descriptor,
+                build_gkr_serializable_proof_parallel,
                 build_register_gkr_calldata, build_verify_model_gkr_calldata,
                 build_verify_model_gkr_v2_calldata, build_verify_model_gkr_v3_calldata,
                 build_verify_model_gkr_v4_calldata, build_verify_model_gkr_v4_packed_calldata,
@@ -1395,8 +1392,9 @@ fn main() {
                 CHUNKED_GKR_THRESHOLD,
             };
 
+            // Use parallel serialization to overlap independent calldata components.
             let gkr_proof =
-                build_gkr_serializable_proof(&proof, model_id, &input).unwrap_or_else(|e| {
+                build_gkr_serializable_proof_parallel(&proof, model_id, &input).unwrap_or_else(|e| {
                     eprintln!("Error building GKR proof artifact: {e}");
                     eprintln!(
                         "Hint: --format ml_gkr requires the ML GKR pipeline (pure GKR proving)."

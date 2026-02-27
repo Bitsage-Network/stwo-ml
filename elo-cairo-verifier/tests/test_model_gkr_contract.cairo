@@ -1,17 +1,16 @@
 /// Tests for A7: Contract-level GKR model verification.
 ///
-/// Tests register_model_gkr() and verify_model_gkr_v4_packed() through the
+/// Tests register_model_gkr() and verify_model_gkr_v4_packed_io() through the
 /// ISumcheckVerifier dispatcher (full contract deploy + call cycle).
 ///
-/// Note: verify_model_gkr_v4_packed() recomputes IO commitment on-chain from
-/// raw_io_data and evaluates MLE(output, r_out) + MLE(input, final_point).
-/// Hand-crafted proofs cannot satisfy the MLE checks, so positive verification
-/// tests require Rust-generated test vectors (see e2e_cairo_verify.rs).
+/// Note: verify_model_gkr_v4_packed_io() processes packed IO data, runs the
+/// full GKR model walk, and only checks weight/circuit bindings AFTER verification.
+/// This means deep verification tests (weight mismatch, registration check, etc.)
+/// require Rust-generated test vectors (see e2e_cairo_verify.rs).
 /// The tests here focus on registration, access control, and early rejection.
 
 use snforge_std::{declare, DeclareResultTrait, ContractClassTrait};
 use starknet::ContractAddress;
-use elo_cairo_verifier::field::{QM31, CM31};
 use elo_cairo_verifier::verifier::{
     ISumcheckVerifierDispatcher, ISumcheckVerifierDispatcherTrait,
 };
@@ -25,21 +24,6 @@ fn deploy_verifier() -> ISumcheckVerifierDispatcher {
     let owner: ContractAddress = 0x1234_felt252.try_into().unwrap();
     let (address, _) = contract.deploy(@array![owner.into()]).unwrap();
     ISumcheckVerifierDispatcher { contract_address: address }
-}
-
-/// Build a minimal raw_io_data array.
-/// Layout: [in_rows, in_cols, in_len, in_data..., out_rows, out_cols, out_len, out_data...]
-fn build_raw_io_data() -> Array<felt252> {
-    array![
-        1,          // in_rows
-        4,          // in_cols
-        4,          // in_len
-        1, 2, 3, 4, // in_data
-        1,          // out_rows
-        2,          // out_cols
-        2,          // out_len
-        100, 200,   // out_data
-    ]
 }
 
 // ============================================================================
@@ -88,103 +72,7 @@ fn test_register_model_gkr_non_owner_rejected() {
 }
 
 // ============================================================================
-// Test 3: Cannot verify unregistered model
-// ============================================================================
-
-#[test]
-#[should_panic(expected: "Model not registered for GKR")]
-fn test_verify_model_gkr_not_registered() {
-    let dispatcher = deploy_verifier();
-
-    dispatcher.verify_model_gkr_v4_packed(
-        0xDEAD,                          // unregistered model_id
-        build_raw_io_data(),             // raw_io_data
-        1,                               // circuit_depth
-        1,                               // num_layers
-        array![],                        // matmul_dims
-        array![],                        // dequantize_bits
-        array![],                        // proof_data
-        array![],                        // weight_commitments
-        4,                               // weight_binding_mode (oracle sumcheck)
-        array![0x524C43, 0],             // weight_binding_data (RLC marker)
-        array![],                        // weight_opening_proofs
-    );
-}
-
-// ============================================================================
-// Test 4: Weight commitment mismatch rejected
-// ============================================================================
-
-#[test]
-#[should_panic(expected: "Weight commitment mismatch")]
-fn test_verify_model_gkr_weight_mismatch() {
-    let dispatcher = deploy_verifier();
-    let owner: ContractAddress = 0x1234_felt252.try_into().unwrap();
-    snforge_std::start_cheat_caller_address(dispatcher.contract_address, owner);
-
-    let model_id: felt252 = 0xABC;
-
-    // Register with weight commitments [0x111, 0x222]
-    dispatcher.register_model_gkr(
-        model_id,
-        array![0x111, 0x222],
-        array![0, 1],   // MatMul, Add
-    );
-
-    // Try to verify with WRONG weight commitments
-    dispatcher.verify_model_gkr_v4_packed(
-        model_id,
-        build_raw_io_data(),
-        1,                               // circuit_depth
-        1,
-        array![],
-        array![],
-        array![],
-        array![0x111, 0x999],   // 0x999 != registered 0x222
-        4,                               // weight_binding_mode
-        array![0x524C43, 0],             // weight_binding_data
-        array![],                        // weight_opening_proofs
-    );
-}
-
-// ============================================================================
-// Test 5: Weight commitment count mismatch rejected
-// ============================================================================
-
-#[test]
-#[should_panic(expected: "Weight commitment count mismatch")]
-fn test_verify_model_gkr_weight_count_mismatch() {
-    let dispatcher = deploy_verifier();
-    let owner: ContractAddress = 0x1234_felt252.try_into().unwrap();
-    snforge_std::start_cheat_caller_address(dispatcher.contract_address, owner);
-
-    let model_id: felt252 = 0xABC;
-
-    // Register with 2 weight commitments
-    dispatcher.register_model_gkr(
-        model_id,
-        array![0x111, 0x222],
-        array![0, 1],
-    );
-
-    // Try to verify with only 1 weight commitment
-    dispatcher.verify_model_gkr_v4_packed(
-        model_id,
-        build_raw_io_data(),
-        1,                               // circuit_depth
-        1,
-        array![],
-        array![],
-        array![],
-        array![0x111],   // count 1 != registered 2
-        4,                               // weight_binding_mode
-        array![0x524C43, 0],             // weight_binding_data
-        array![],                        // weight_opening_proofs
-    );
-}
-
-// ============================================================================
-// Test 6: Cannot re-register a model for GKR
+// Test 3: Cannot re-register a model for GKR
 // ============================================================================
 
 #[test]
@@ -201,36 +89,7 @@ fn test_register_model_gkr_duplicate_rejected() {
 }
 
 // ============================================================================
-// Test 7: Empty raw_io_data rejected (replaces old "zero io_commitment" test)
-// ============================================================================
-
-#[test]
-#[should_panic(expected: "IO_DATA_TOO_SHORT")]
-fn test_verify_model_gkr_empty_io_data() {
-    let dispatcher = deploy_verifier();
-    let owner: ContractAddress = 0x1234_felt252.try_into().unwrap();
-    snforge_std::start_cheat_caller_address(dispatcher.contract_address, owner);
-
-    dispatcher.register_model_gkr(0xABC, array![], array![1]);
-
-    // Empty raw_io_data should fail validation
-    dispatcher.verify_model_gkr_v4_packed(
-        0xABC,
-        array![],                        // empty raw_io_data
-        1,                               // circuit_depth
-        1,
-        array![],
-        array![],
-        array![],
-        array![],
-        4,                               // weight_binding_mode
-        array![0x524C43, 0],             // weight_binding_data
-        array![],                        // weight_opening_proofs
-    );
-}
-
-// ============================================================================
-// Test 8: Zero weight commitment in array rejected at registration
+// Test 4: Zero weight commitment in array rejected at registration
 // ============================================================================
 
 #[test]
@@ -248,7 +107,7 @@ fn test_register_model_gkr_zero_weight_rejected() {
 }
 
 // ============================================================================
-// Test 9: GKR and legacy model registration are independent
+// Test 5: GKR and legacy model registration are independent
 // ============================================================================
 
 #[test]
@@ -275,65 +134,34 @@ fn test_gkr_and_legacy_registration_independent() {
 }
 
 // ============================================================================
-// Test 10: Short raw_io_data rejected (< 6 elements)
+// Test 6: Unsupported weight binding mode rejected (earliest verify rejection)
 // ============================================================================
 
+/// With the IO-packed interface, UNSUPPORTED_WEIGHT_BINDING_MODE is the
+/// first assert in verify_model_gkr_v4_packed_io_core (before IO hashing,
+/// dimension extraction, or GKR walk). This is the earliest rejection point.
 #[test]
-#[should_panic(expected: "IO_DATA_TOO_SHORT")]
-fn test_verify_model_gkr_short_io_data() {
+#[should_panic(expected: "UNSUPPORTED_WEIGHT_BINDING_MODE")]
+fn test_verify_model_gkr_unsupported_binding_mode() {
     let dispatcher = deploy_verifier();
     let owner: ContractAddress = 0x1234_felt252.try_into().unwrap();
     snforge_std::start_cheat_caller_address(dispatcher.contract_address, owner);
 
     dispatcher.register_model_gkr(0xABC, array![], array![1]);
 
-    // raw_io_data with only 5 elements (needs >= 6)
-    dispatcher.verify_model_gkr_v4_packed(
+    // Use invalid weight_binding_mode=0 — triggers earliest assert
+    dispatcher.verify_model_gkr_v4_packed_io(
         0xABC,
-        array![1, 2, 3, 4, 5],          // too short
+        8,                               // original_io_len
+        array![],                        // packed_raw_io
         1,                               // circuit_depth
-        1,
-        array![],
-        array![],
-        array![],
-        array![],
-        4,                               // weight_binding_mode
-        array![0x524C43, 0],             // weight_binding_data
+        1,                               // num_layers
+        array![],                        // matmul_dims
+        array![],                        // dequantize_bits
+        array![],                        // proof_data
+        array![],                        // weight_commitments
+        0,                               // weight_binding_mode = 0 (unsupported)
+        array![],                        // weight_binding_data
         array![],                        // weight_opening_proofs
-    );
-}
-
-// ============================================================================
-// Test 11: Circuit hash mismatch rejected (proof tags/depth must match registration)
-//
-// With v11 input validation, zero layers are rejected before reaching the
-// circuit hash check. This test now verifies the ZERO_LAYERS guard fires.
-// ============================================================================
-
-#[test]
-#[should_panic(expected: "ZERO_LAYERS")]
-fn test_verify_model_gkr_circuit_hash_mismatch() {
-    let dispatcher = deploy_verifier();
-    let owner: ContractAddress = 0x1234_felt252.try_into().unwrap();
-    snforge_std::start_cheat_caller_address(dispatcher.contract_address, owner);
-
-    let model_id: felt252 = 0xABC;
-
-    // Register with descriptor [1]
-    dispatcher.register_model_gkr(model_id, array![], array![1]);
-
-    // num_layers=0 now triggers early ZERO_LAYERS validation.
-    dispatcher.verify_model_gkr_v4_packed(
-        model_id,
-        build_raw_io_data(),
-        2,              // wrong circuit_depth
-        0,              // zero layers — triggers ZERO_LAYERS guard
-        array![],
-        array![],
-        array![0],     // proof_data: num_deferred = 0
-        array![],
-        4,                               // weight_binding_mode
-        array![0x524C43, 0],             // weight_binding_data
-        array![],
     );
 }

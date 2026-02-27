@@ -1054,8 +1054,8 @@ fn serialize_logup_proof_inner(
     serialize_qm31(lup.claimed_sum, output);
     serialize_u32(lup.eq_round_polys.len() as u32, output);
     for rp in &lup.eq_round_polys {
+        // Compressed: omit c1 (verifier reconstructs from current_sum)
         serialize_qm31(rp.c0, output);
-        serialize_qm31(rp.c1, output);
         serialize_qm31(rp.c2, output);
         serialize_qm31(rp.c3, output);
     }
@@ -1082,8 +1082,8 @@ fn serialize_logup_proof_inner_packed(
     serialize_qm31_packed(lup.claimed_sum, output);
     serialize_u32(lup.eq_round_polys.len() as u32, output);
     for rp in &lup.eq_round_polys {
+        // Compressed: omit c1 (verifier reconstructs from current_sum)
         serialize_qm31_packed(rp.c0, output);
-        serialize_qm31_packed(rp.c1, output);
         serialize_qm31_packed(rp.c2, output);
         serialize_qm31_packed(rp.c3, output);
     }
@@ -1121,8 +1121,8 @@ pub fn serialize_gkr_model_proof(proof: &crate::gkr::GKRProof, output: &mut Vec<
                 serialize_u32(0, output); // tag: MatMul
                 serialize_u32(round_polys.len() as u32, output);
                 for rp in round_polys {
+                    // Compressed: omit c1 (verifier reconstructs from current_sum)
                     serialize_qm31(rp.c0, output);
-                    serialize_qm31(rp.c1, output);
                     serialize_qm31(rp.c2, output);
                 }
                 serialize_qm31(*final_a_eval, output);
@@ -1146,8 +1146,8 @@ pub fn serialize_gkr_model_proof(proof: &crate::gkr::GKRProof, output: &mut Vec<
                 serialize_u32(2, output); // tag: Mul
                 serialize_u32(eq_round_polys.len() as u32, output);
                 for rp in eq_round_polys {
+                    // Compressed: omit c1 (verifier reconstructs from current_sum)
                     serialize_qm31(rp.c0, output);
-                    serialize_qm31(rp.c1, output);
                     serialize_qm31(rp.c2, output);
                     serialize_qm31(rp.c3, output);
                 }
@@ -1198,8 +1198,8 @@ pub fn serialize_gkr_model_proof(proof: &crate::gkr::GKRProof, output: &mut Vec<
                 serialize_u32(if *simd_combined { 1 } else { 0 }, output);
                 serialize_u32(linear_round_polys.len() as u32, output);
                 for rp in linear_round_polys {
+                    // Compressed: omit c1 (verifier reconstructs from current_sum)
                     serialize_qm31(rp.c0, output);
-                    serialize_qm31(rp.c1, output);
                     serialize_qm31(rp.c2, output);
                     serialize_qm31(rp.c3, output);
                 }
@@ -1335,8 +1335,8 @@ pub fn serialize_gkr_model_proof(proof: &crate::gkr::GKRProof, output: &mut Vec<
                 serialize_u32(*n_block_vars as u32, output);
                 serialize_u32(round_polys.len() as u32, output);
                 for rp in round_polys {
+                    // Compressed: omit c1 (verifier reconstructs from current_sum)
                     serialize_qm31(rp.c0, output);
-                    serialize_qm31(rp.c1, output);
                     serialize_qm31(rp.c2, output);
                     serialize_qm31(rp.c3, output);
                 }
@@ -1364,8 +1364,8 @@ pub fn serialize_gkr_model_proof(proof: &crate::gkr::GKRProof, output: &mut Vec<
                 serialize_u32(if *simd_combined { 1 } else { 0 }, output);
                 serialize_u32(linear_round_polys.len() as u32, output);
                 for rp in linear_round_polys {
+                    // Compressed: omit c1 (verifier reconstructs from current_sum)
                     serialize_qm31(rp.c0, output);
-                    serialize_qm31(rp.c1, output);
                     serialize_qm31(rp.c2, output);
                     serialize_qm31(rp.c3, output);
                 }
@@ -1435,8 +1435,8 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
                 serialize_u32(0, output);
                 serialize_u32(round_polys.len() as u32, output);
                 for rp in round_polys {
+                    // Compressed: omit c1 (verifier reconstructs from current_sum)
                     serialize_qm31(rp.c0, output);
-                    serialize_qm31(rp.c1, output);
                     serialize_qm31(rp.c2, output);
                 }
                 serialize_qm31(*final_a_eval, output);
@@ -1460,8 +1460,8 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
                 serialize_u32(2, output);
                 serialize_u32(eq_round_polys.len() as u32, output);
                 for rp in eq_round_polys {
+                    // Compressed: omit c1 (verifier reconstructs from current_sum)
                     serialize_qm31(rp.c0, output);
-                    serialize_qm31(rp.c1, output);
                     serialize_qm31(rp.c2, output);
                     serialize_qm31(rp.c3, output);
                 }
@@ -1510,8 +1510,8 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
                 serialize_u32(if *simd_combined { 1 } else { 0 }, output);
                 serialize_u32(linear_round_polys.len() as u32, output);
                 for rp in linear_round_polys {
+                    // Compressed: omit c1 (verifier reconstructs from current_sum)
                     serialize_qm31(rp.c0, output);
-                    serialize_qm31(rp.c1, output);
                     serialize_qm31(rp.c2, output);
                     serialize_qm31(rp.c3, output);
                 }
@@ -1641,8 +1641,8 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
                 serialize_u32(*n_block_vars as u32, output);
                 serialize_u32(round_polys.len() as u32, output);
                 for rp in round_polys {
+                    // Compressed: omit c1 (verifier reconstructs from current_sum)
                     serialize_qm31(rp.c0, output);
-                    serialize_qm31(rp.c1, output);
                     serialize_qm31(rp.c2, output);
                     serialize_qm31(rp.c3, output);
                 }
@@ -1669,8 +1669,8 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
                 serialize_u32(if *simd_combined { 1 } else { 0 }, output);
                 serialize_u32(linear_round_polys.len() as u32, output);
                 for rp in linear_round_polys {
+                    // Compressed: omit c1 (verifier reconstructs from current_sum)
                     serialize_qm31(rp.c0, output);
-                    serialize_qm31(rp.c1, output);
                     serialize_qm31(rp.c2, output);
                     serialize_qm31(rp.c3, output);
                 }
@@ -1707,8 +1707,8 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
         {
             serialize_u32(round_polys.len() as u32, output);
             for rp in round_polys {
+                // Compressed: omit c1 (verifier reconstructs from current_sum)
                 serialize_qm31(rp.c0, output);
-                serialize_qm31(rp.c1, output);
                 serialize_qm31(rp.c2, output);
             }
             serialize_qm31(*final_a_eval, output);
@@ -1719,121 +1719,125 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
     }
 }
 
-/// Packed variant of `serialize_gkr_proof_data_only`: QM31 values as 1 felt each.
+/// Serialize a single GKR layer proof in packed format.
 ///
-/// Achieves ~4x compression on proof_data (75K → ~19K felts for Qwen3-14B 40 layers).
-/// Tags, u32 metadata, and felt252 commitments are unchanged.
-pub fn serialize_gkr_proof_data_only_packed(proof: &crate::gkr::GKRProof, output: &mut Vec<FieldElement>) {
-    use crate::gkr::types::LayerProof;
+/// Extracted for incremental/streaming serialization: callers can serialize
+/// layer proofs one at a time as they are produced by the GKR prover.
+pub fn serialize_layer_proof_packed(layer_proof: &crate::gkr::types::LayerProof, output: &mut Vec<FieldElement>) {
+    serialize_layer_proof_packed_inner(layer_proof, output, None);
+}
 
-    for layer_proof in &proof.layer_proofs {
-        match layer_proof {
-            LayerProof::MatMul {
-                round_polys,
-                final_a_eval,
-                final_b_eval,
-            } => {
-                serialize_u32(0, output);
-                serialize_u32(round_polys.len() as u32, output);
-                for rp in round_polys {
-                    serialize_qm31_packed(rp.c0, output);
-                    serialize_qm31_packed(rp.c1, output);
-                    serialize_qm31_packed(rp.c2, output);
-                }
-                serialize_qm31_packed(*final_a_eval, output);
-                serialize_qm31_packed(*final_b_eval, output);
+fn serialize_layer_proof_packed_inner(
+    layer_proof: &crate::gkr::types::LayerProof,
+    output: &mut Vec<FieldElement>,
+    proof_for_attention: Option<&crate::gkr::GKRProof>,
+) {
+    use crate::gkr::types::LayerProof;
+    match layer_proof {
+        LayerProof::MatMul {
+            round_polys,
+            final_a_eval,
+            final_b_eval,
+        } => {
+            serialize_u32(0, output);
+            serialize_u32(round_polys.len() as u32, output);
+            for rp in round_polys {
+                serialize_qm31_packed(rp.c0, output);
+                serialize_qm31_packed(rp.c2, output);
             }
-            LayerProof::Add {
-                lhs_eval,
-                rhs_eval,
-                trunk_idx,
-            } => {
-                serialize_u32(1, output);
-                serialize_qm31_packed(*lhs_eval, output);
-                serialize_qm31_packed(*rhs_eval, output);
-                serialize_u32(*trunk_idx as u32, output);
+            serialize_qm31_packed(*final_a_eval, output);
+            serialize_qm31_packed(*final_b_eval, output);
+        }
+        LayerProof::Add {
+            lhs_eval,
+            rhs_eval,
+            trunk_idx,
+        } => {
+            serialize_u32(1, output);
+            serialize_qm31_packed(*lhs_eval, output);
+            serialize_qm31_packed(*rhs_eval, output);
+            serialize_u32(*trunk_idx as u32, output);
+        }
+        LayerProof::Mul {
+            eq_round_polys,
+            lhs_eval,
+            rhs_eval,
+        } => {
+            serialize_u32(2, output);
+            serialize_u32(eq_round_polys.len() as u32, output);
+            for rp in eq_round_polys {
+                serialize_qm31_packed(rp.c0, output);
+                serialize_qm31_packed(rp.c2, output);
+                serialize_qm31_packed(rp.c3, output);
             }
-            LayerProof::Mul {
-                eq_round_polys,
-                lhs_eval,
-                rhs_eval,
-            } => {
-                serialize_u32(2, output);
-                serialize_u32(eq_round_polys.len() as u32, output);
-                for rp in eq_round_polys {
-                    serialize_qm31_packed(rp.c0, output);
-                    serialize_qm31_packed(rp.c1, output);
-                    serialize_qm31_packed(rp.c2, output);
-                    serialize_qm31_packed(rp.c3, output);
+            serialize_qm31_packed(*lhs_eval, output);
+            serialize_qm31_packed(*rhs_eval, output);
+        }
+        LayerProof::Activation {
+            activation_type,
+            logup_proof,
+            input_eval,
+            output_eval,
+            table_commitment,
+        } => {
+            serialize_u32(3, output);
+            serialize_u32(activation_type.type_tag(), output);
+            serialize_qm31_packed(*input_eval, output);
+            serialize_qm31_packed(*output_eval, output);
+            output.push(*table_commitment);
+            match logup_proof {
+                Some(lup) => {
+                    serialize_u32(1, output);
+                    serialize_logup_proof_inner_packed(lup, output, false);
                 }
-                serialize_qm31_packed(*lhs_eval, output);
-                serialize_qm31_packed(*rhs_eval, output);
+                None => serialize_u32(0, output),
             }
-            LayerProof::Activation {
-                activation_type,
-                logup_proof,
-                input_eval,
-                output_eval,
-                table_commitment,
-            } => {
-                serialize_u32(3, output);
-                serialize_u32(activation_type.type_tag(), output);
-                serialize_qm31_packed(*input_eval, output);
-                serialize_qm31_packed(*output_eval, output);
-                output.push(*table_commitment);
-                match logup_proof {
-                    Some(lup) => {
-                        serialize_u32(1, output);
-                        serialize_logup_proof_inner_packed(lup, output, false);
-                    }
-                    None => serialize_u32(0, output),
-                }
+        }
+        LayerProof::LayerNorm {
+            logup_proof,
+            linear_round_polys,
+            linear_final_evals,
+            input_eval,
+            output_eval,
+            mean,
+            rsqrt_var,
+            rsqrt_table_commitment,
+            simd_combined,
+        } => {
+            serialize_u32(4, output);
+            serialize_qm31_packed(*input_eval, output);
+            serialize_qm31_packed(*output_eval, output);
+            serialize_qm31_packed(*mean, output);
+            serialize_qm31_packed(*rsqrt_var, output);
+            output.push(*rsqrt_table_commitment);
+            serialize_u32(if *simd_combined { 1 } else { 0 }, output);
+            serialize_u32(linear_round_polys.len() as u32, output);
+            for rp in linear_round_polys {
+                serialize_qm31_packed(rp.c0, output);
+                serialize_qm31_packed(rp.c2, output);
+                serialize_qm31_packed(rp.c3, output);
             }
-            LayerProof::LayerNorm {
-                logup_proof,
-                linear_round_polys,
-                linear_final_evals,
-                input_eval,
-                output_eval,
-                mean,
-                rsqrt_var,
-                rsqrt_table_commitment,
-                simd_combined,
-            } => {
-                serialize_u32(4, output);
-                serialize_qm31_packed(*input_eval, output);
-                serialize_qm31_packed(*output_eval, output);
-                serialize_qm31_packed(*mean, output);
-                serialize_qm31_packed(*rsqrt_var, output);
-                output.push(*rsqrt_table_commitment);
-                serialize_u32(if *simd_combined { 1 } else { 0 }, output);
-                serialize_u32(linear_round_polys.len() as u32, output);
-                for rp in linear_round_polys {
-                    serialize_qm31_packed(rp.c0, output);
-                    serialize_qm31_packed(rp.c1, output);
-                    serialize_qm31_packed(rp.c2, output);
-                    serialize_qm31_packed(rp.c3, output);
+            let (centered_eval, rsqrt_eval) = *linear_final_evals;
+            serialize_qm31_packed(centered_eval, output);
+            serialize_qm31_packed(rsqrt_eval, output);
+            match logup_proof {
+                Some(lup) => {
+                    serialize_u32(1, output);
+                    serialize_logup_proof_inner_packed(lup, output, false);
                 }
-                let (centered_eval, rsqrt_eval) = *linear_final_evals;
-                serialize_qm31_packed(centered_eval, output);
-                serialize_qm31_packed(rsqrt_eval, output);
-                match logup_proof {
-                    Some(lup) => {
-                        serialize_u32(1, output);
-                        serialize_logup_proof_inner_packed(lup, output, false);
-                    }
-                    None => serialize_u32(0, output),
-                }
+                None => serialize_u32(0, output),
             }
-            LayerProof::Attention {
-                sub_proofs,
-                sub_claim_values,
-            } => {
-                serialize_u32(5, output);
-                serialize_u32(sub_proofs.len() as u32, output);
-                for val in sub_claim_values {
-                    serialize_qm31_packed(*val, output);
-                }
+        }
+        LayerProof::Attention {
+            sub_proofs,
+            sub_claim_values,
+        } => {
+            serialize_u32(5, output);
+            serialize_u32(sub_proofs.len() as u32, output);
+            for val in sub_claim_values {
+                serialize_qm31_packed(*val, output);
+            }
+            if let Some(proof) = proof_for_attention {
                 for sub in sub_proofs {
                     let tmp = crate::gkr::GKRProof {
                         layer_proofs: vec![sub.clone()],
@@ -1849,145 +1853,151 @@ pub fn serialize_gkr_proof_data_only_packed(proof: &crate::gkr::GKRProof, output
                         aggregated_binding: None,
                     };
                     let mut sub_buf = Vec::new();
-                    // NOTE: sub-proofs use the full serialize_gkr_model_proof (not packed)
-                    // since they're embedded recursively and the packed format only applies
-                    // to the top-level proof_data section.
                     serialize_gkr_model_proof(&tmp, &mut sub_buf);
                     output.extend_from_slice(&sub_buf[1..]);
                 }
             }
-            LayerProof::Dequantize {
-                logup_proof,
-                input_eval,
-                output_eval,
-                table_commitment,
-            } => {
-                serialize_u32(6, output);
-                serialize_qm31_packed(*input_eval, output);
-                serialize_qm31_packed(*output_eval, output);
-                output.push(*table_commitment);
-                match logup_proof {
-                    Some(lup) => {
-                        serialize_u32(1, output);
-                        serialize_logup_proof_inner_packed(lup, output, false);
-                    }
-                    None => serialize_u32(0, output),
+        }
+        LayerProof::Dequantize {
+            logup_proof,
+            input_eval,
+            output_eval,
+            table_commitment,
+        } => {
+            serialize_u32(6, output);
+            serialize_qm31_packed(*input_eval, output);
+            serialize_qm31_packed(*output_eval, output);
+            output.push(*table_commitment);
+            match logup_proof {
+                Some(lup) => {
+                    serialize_u32(1, output);
+                    serialize_logup_proof_inner_packed(lup, output, false);
                 }
-            }
-            LayerProof::Quantize {
-                logup_proof,
-                input_eval,
-                output_eval,
-                table_inputs,
-                table_outputs,
-            } => {
-                serialize_u32(9, output);
-                serialize_qm31_packed(*input_eval, output);
-                serialize_qm31_packed(*output_eval, output);
-                match logup_proof {
-                    Some(lup) => {
-                        serialize_u32(1, output);
-                        serialize_logup_proof_inner_packed(lup, output, true);
-                    }
-                    None => serialize_u32(0, output),
-                }
-                serialize_u32(table_inputs.len() as u32, output);
-                for (&inp, &out) in table_inputs.iter().zip(table_outputs.iter()) {
-                    serialize_m31(inp, output);
-                    serialize_m31(out, output);
-                }
-            }
-            LayerProof::Embedding {
-                logup_proof,
-                input_eval,
-                output_eval,
-                input_num_vars,
-            } => {
-                serialize_u32(10, output);
-                serialize_qm31_packed(*input_eval, output);
-                serialize_qm31_packed(*output_eval, output);
-                serialize_u32(*input_num_vars as u32, output);
-                match logup_proof {
-                    Some(lup) => {
-                        serialize_u32(1, output);
-                        serialize_u32(lup.eq_round_polys.len() as u32, output);
-                        for rp in &lup.eq_round_polys {
-                            serialize_qm31_packed(rp.c0, output);
-                            serialize_qm31_packed(rp.c1, output);
-                            serialize_qm31_packed(rp.c2, output);
-                            serialize_qm31_packed(rp.c3, output);
-                        }
-                        serialize_qm31_packed(lup.claimed_sum, output);
-                        let (w, tok, col, val) = lup.final_evals;
-                        serialize_qm31_packed(w, output);
-                        serialize_qm31_packed(tok, output);
-                        serialize_qm31_packed(col, output);
-                        serialize_qm31_packed(val, output);
-                        serialize_u32(lup.table_tokens.len() as u32, output);
-                        for i in 0..lup.table_tokens.len() {
-                            serialize_u32(lup.table_tokens[i], output);
-                            serialize_u32(lup.table_cols[i], output);
-                            serialize_u32(lup.multiplicities[i], output);
-                        }
-                    }
-                    None => serialize_u32(0, output),
-                }
-            }
-            LayerProof::MatMulDualSimd {
-                round_polys,
-                final_a_eval,
-                final_b_eval,
-                n_block_vars,
-            } => {
-                serialize_u32(7, output);
-                serialize_u32(*n_block_vars as u32, output);
-                serialize_u32(round_polys.len() as u32, output);
-                for rp in round_polys {
-                    serialize_qm31_packed(rp.c0, output);
-                    serialize_qm31_packed(rp.c1, output);
-                    serialize_qm31_packed(rp.c2, output);
-                    serialize_qm31_packed(rp.c3, output);
-                }
-                serialize_qm31_packed(*final_a_eval, output);
-                serialize_qm31_packed(*final_b_eval, output);
-            }
-            LayerProof::RMSNorm {
-                logup_proof,
-                linear_round_polys,
-                linear_final_evals,
-                input_eval,
-                output_eval,
-                rms_sq_eval,
-                rsqrt_eval,
-                rsqrt_table_commitment,
-                simd_combined,
-            } => {
-                serialize_u32(8, output);
-                serialize_qm31_packed(*input_eval, output);
-                serialize_qm31_packed(*output_eval, output);
-                serialize_qm31_packed(*rms_sq_eval, output);
-                serialize_qm31_packed(*rsqrt_eval, output);
-                output.push(*rsqrt_table_commitment);
-                serialize_u32(if *simd_combined { 1 } else { 0 }, output);
-                serialize_u32(linear_round_polys.len() as u32, output);
-                for rp in linear_round_polys {
-                    serialize_qm31_packed(rp.c0, output);
-                    serialize_qm31_packed(rp.c1, output);
-                    serialize_qm31_packed(rp.c2, output);
-                    serialize_qm31_packed(rp.c3, output);
-                }
-                let (input_final, rsqrt_final) = *linear_final_evals;
-                serialize_qm31_packed(input_final, output);
-                serialize_qm31_packed(rsqrt_final, output);
-                match logup_proof {
-                    Some(lup) => {
-                        serialize_u32(1, output);
-                        serialize_logup_proof_inner_packed(lup, output, false);
-                    }
-                    None => serialize_u32(0, output),
-                }
+                None => serialize_u32(0, output),
             }
         }
+        LayerProof::MatMulDualSimd {
+            round_polys,
+            final_a_eval,
+            final_b_eval,
+            n_block_vars,
+        } => {
+            serialize_u32(7, output);
+            serialize_u32(*n_block_vars as u32, output);
+            serialize_u32(round_polys.len() as u32, output);
+            for rp in round_polys {
+                serialize_qm31_packed(rp.c0, output);
+                serialize_qm31_packed(rp.c1, output);
+                serialize_qm31_packed(rp.c2, output);
+                serialize_qm31_packed(rp.c3, output);
+            }
+            serialize_qm31_packed(*final_a_eval, output);
+            serialize_qm31_packed(*final_b_eval, output);
+        }
+        LayerProof::RMSNorm {
+            logup_proof,
+            linear_round_polys,
+            linear_final_evals,
+            input_eval,
+            output_eval,
+            rms_sq_eval,
+            rsqrt_eval,
+            rsqrt_table_commitment,
+            simd_combined,
+        } => {
+            serialize_u32(8, output);
+            serialize_qm31_packed(*input_eval, output);
+            serialize_qm31_packed(*output_eval, output);
+            serialize_qm31_packed(*rms_sq_eval, output);
+            serialize_qm31_packed(*rsqrt_eval, output);
+            output.push(*rsqrt_table_commitment);
+            serialize_u32(if *simd_combined { 1 } else { 0 }, output);
+            serialize_u32(linear_round_polys.len() as u32, output);
+            for rp in linear_round_polys {
+                serialize_qm31_packed(rp.c0, output);
+                serialize_qm31_packed(rp.c2, output);
+                serialize_qm31_packed(rp.c3, output);
+            }
+            let (input_final, rsqrt_final) = *linear_final_evals;
+            serialize_qm31_packed(input_final, output);
+            serialize_qm31_packed(rsqrt_final, output);
+            match logup_proof {
+                Some(lup) => {
+                    serialize_u32(1, output);
+                    serialize_logup_proof_inner_packed(lup, output, false);
+                }
+                None => serialize_u32(0, output),
+            }
+        }
+        LayerProof::Quantize {
+            logup_proof,
+            input_eval,
+            output_eval,
+            table_inputs,
+            table_outputs,
+        } => {
+            serialize_u32(9, output);
+            serialize_qm31_packed(*input_eval, output);
+            serialize_qm31_packed(*output_eval, output);
+            match logup_proof {
+                Some(lup) => {
+                    serialize_u32(1, output);
+                    serialize_logup_proof_inner_packed(lup, output, true);
+                }
+                None => serialize_u32(0, output),
+            }
+            serialize_u32(table_inputs.len() as u32, output);
+            for (&inp, &out) in table_inputs.iter().zip(table_outputs.iter()) {
+                serialize_m31(inp, output);
+                serialize_m31(out, output);
+            }
+        }
+        LayerProof::Embedding {
+            logup_proof,
+            input_eval,
+            output_eval,
+            input_num_vars,
+        } => {
+            serialize_u32(10, output);
+            serialize_qm31_packed(*input_eval, output);
+            serialize_qm31_packed(*output_eval, output);
+            serialize_u32(*input_num_vars as u32, output);
+            match logup_proof {
+                Some(lup) => {
+                    serialize_u32(1, output);
+                    serialize_u32(lup.eq_round_polys.len() as u32, output);
+                    for rp in &lup.eq_round_polys {
+                        serialize_qm31_packed(rp.c0, output);
+                        serialize_qm31_packed(rp.c1, output);
+                        serialize_qm31_packed(rp.c2, output);
+                        serialize_qm31_packed(rp.c3, output);
+                    }
+                    serialize_qm31_packed(lup.claimed_sum, output);
+                    let (w, tok, col, val) = lup.final_evals;
+                    serialize_qm31_packed(w, output);
+                    serialize_qm31_packed(tok, output);
+                    serialize_qm31_packed(col, output);
+                    serialize_qm31_packed(val, output);
+                    serialize_u32(lup.table_tokens.len() as u32, output);
+                    for i in 0..lup.table_tokens.len() {
+                        serialize_u32(lup.table_tokens[i], output);
+                        serialize_u32(lup.table_cols[i], output);
+                        serialize_u32(lup.multiplicities[i], output);
+                    }
+                }
+                None => serialize_u32(0, output),
+            }
+        }
+    }
+}
+
+/// Packed variant of `serialize_gkr_proof_data_only`: QM31 values as 1 felt each.
+///
+/// Achieves ~4x compression on proof_data (75K → ~19K felts for Qwen3-14B 40 layers).
+/// Tags, u32 metadata, and felt252 commitments are unchanged.
+pub fn serialize_gkr_proof_data_only_packed(proof: &crate::gkr::GKRProof, output: &mut Vec<FieldElement>) {
+    for layer_proof in &proof.layer_proofs {
+        serialize_layer_proof_packed_inner(layer_proof, output, Some(proof));
     }
 
     // Serialize deferred proofs (DAG Add layer skip connections) — also packed
@@ -1998,7 +2008,7 @@ pub fn serialize_gkr_proof_data_only_packed(proof: &crate::gkr::GKRProof, output
         serialize_u32(m as u32, output);
         serialize_u32(k as u32, output);
         serialize_u32(n as u32, output);
-        if let LayerProof::MatMul {
+        if let crate::gkr::types::LayerProof::MatMul {
             round_polys,
             final_a_eval,
             final_b_eval,
@@ -2006,8 +2016,8 @@ pub fn serialize_gkr_proof_data_only_packed(proof: &crate::gkr::GKRProof, output
         {
             serialize_u32(round_polys.len() as u32, output);
             for rp in round_polys {
+                // Compressed: omit c1 (verifier reconstructs from current_sum)
                 serialize_qm31_packed(rp.c0, output);
-                serialize_qm31_packed(rp.c1, output);
                 serialize_qm31_packed(rp.c2, output);
             }
             serialize_qm31_packed(*final_a_eval, output);

@@ -6313,13 +6313,10 @@ fn fold_mle(vals: &mut Vec<SecureField>, r: SecureField, mid: usize) {
     vals.truncate(mid);
 }
 
-/// Mix a SecureField (QM31) into a PoseidonChannel.
-/// Mixes each M31 limb as a separate u64 to avoid overflow.
+/// Mix a SecureField (QM31) into a PoseidonChannel via packed felt252 (1 hades).
+/// Matches Cairo's channel_mix_secure_field: packs 4 M31s with sentinel into felt252.
 pub(crate) fn mix_secure_field(channel: &mut PoseidonChannel, v: SecureField) {
-    channel.mix_u64(v.0 .0 .0 as u64);
-    channel.mix_u64(v.0 .1 .0 as u64);
-    channel.mix_u64(v.1 .0 .0 as u64);
-    channel.mix_u64(v.1 .1 .0 as u64);
+    channel.mix_felt(crate::crypto::poseidon_channel::securefield_to_felt(v));
 }
 
 /// Bounds-checked lookup of a SIMD block's node_id at a given layer offset.

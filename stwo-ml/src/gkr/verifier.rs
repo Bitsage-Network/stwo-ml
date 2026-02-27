@@ -3810,12 +3810,10 @@ fn compute_activation_table_commitment(
     ])
 }
 
-/// Mix a SecureField into PoseidonChannel (must match prover's mix_secure_field).
+/// Mix a SecureField into PoseidonChannel via packed felt252 (1 hades instead of 4).
+/// Must match Cairo's channel_mix_secure_field and prover's mix_secure_field.
 fn mix_secure_field(channel: &mut PoseidonChannel, v: SecureField) {
-    channel.mix_u64(v.0 .0 .0 as u64);
-    channel.mix_u64(v.0 .1 .0 as u64);
-    channel.mix_u64(v.1 .0 .0 as u64);
-    channel.mix_u64(v.1 .1 .0 as u64);
+    channel.mix_felt(crate::crypto::poseidon_channel::securefield_to_felt(v));
 }
 
 #[cfg(test)]

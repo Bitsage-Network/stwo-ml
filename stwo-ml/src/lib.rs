@@ -107,8 +107,8 @@ pub mod prelude {
     };
     pub use crate::weight_cache::{
         compute_weight_fingerprint, save_shared_cache, shared_cache, shared_cache_for_model,
-        shared_cache_for_model_validated, shared_cache_from_file, CachedWeight,
-        SharedWeightCache, WeightCommitmentCache,
+        shared_cache_for_model_mmap, shared_cache_for_model_validated, shared_cache_from_file,
+        CachedWeight, SharedWeightCache, WeightCommitmentCache,
     };
 }
 

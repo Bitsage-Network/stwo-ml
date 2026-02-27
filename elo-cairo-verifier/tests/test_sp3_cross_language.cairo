@@ -8,7 +8,12 @@
 /// Artifact: stwo-ml/tests/artifacts/sp3_matmul_only_proof.json
 ///   Model: 1x4 input → MatMul(4x2) → 1x2 output
 ///   Input: [1, 2, 3, 4], Output: [50, 60]
-///   Calldata: 51 felts, 1 weight commitment, 2 sumcheck rounds
+///   Calldata: v19 compressed format (c1 omitted), 1 weight commitment, 2 sumcheck rounds
+///
+/// v19 transcript changes:
+///   - mix_secure_field uses packed felt252 (1 hades) instead of 4 mix_u64
+///   - Round polynomials compressed: c1 omitted, reconstructed by verifier
+///   - channel_mix_poly_coeffs uses batched packing
 
 use elo_cairo_verifier::field::{
     QM31, CM31, qm31_new, qm31_eq, fold_mle_eval,
@@ -69,15 +74,16 @@ fn construct_output_claim(
     }
 }
 
-/// Build the proof_data from the SP3 matmul-only artifact.
+/// Build the proof_data from the SP3 matmul-only artifact (v19 compressed format).
 ///
-/// This is calldata[1..35) from sp3_matmul_only_proof.json:
+/// v19 compressed: c1 is omitted from each round (reconstructed by verifier).
 ///   [0] tag=0 (MatMul)
 ///   [1] num_rounds=2
-///   [2..13]  round[0]: c0(4), c1(4), c2(4)
-///   [14..25] round[1]: c0(4), c1(4), c2(4)
-///   [26..29] final_a_eval (QM31)
-///   [30..33] final_b_eval (QM31)
+///   [2..9]   round[0]: c0(4), c2(4)
+///   [10..17] round[1]: c0(4), c2(4)
+///   [18..21] final_a_eval (QM31)
+///   [22..25] final_b_eval (QM31)
+///   [26]     num_deferred=0
 fn build_sp3_matmul_only_proof_data() -> Array<felt252> {
     array![
         // tag = MatMul (0)
@@ -86,20 +92,16 @@ fn build_sp3_matmul_only_proof_data() -> Array<felt252> {
         0x2,
         // round[0].c0 (QM31)
         0x4c3999da, 0x34cddf9a, 0x447004b2, 0x4b11507f,
-        // round[0].c1 (QM31)
-        0x104ccd2e, 0x1bbd2a23, 0x5eab0ee, 0xec1c0aa,
-        // round[0].c2 (QM31)
+        // round[0].c2 (QM31) — c1 omitted
         0x10, 0x0, 0x0, 0x0,
         // round[1].c0 (QM31)
-        0x79239fc, 0x5bf28cca, 0x1aa07903, 0x515b9e3d,
-        // round[1].c1 (QM31)
-        0x41374020, 0x3cc351b7, 0x5a5e480c, 0x3a5275e6,
-        // round[1].c2 (QM31)
+        0x59c30da5, 0x57a1304f, 0x61fa59de, 0x5d27936d,
+        // round[1].c2 (QM31) — c1 omitted
         0x2, 0x0, 0x0, 0x0,
         // final_a_eval (QM31)
-        0x544a5325, 0x6ae551de, 0x5205e05c, 0x6455cdd,
+        0x300af73c, 0x7b4d242b, 0x4992e6b7, 0x2b489ae1,
         // final_b_eval (QM31)
-        0x6ca7d990, 0x3cb9ee46, 0x65866cf4, 0x503b29e4,
+        0x242921be, 0x5d8992e0, 0x54a079aa, 0x1a41a5ed,
         // num_deferred = 0 (no DAG Add layers)
         0x0,
     ]
@@ -141,10 +143,9 @@ fn test_sp3_matmul_only_channel_digest() {
         ref ch,
     );
 
-    // 4. Assert channel digest matches Rust artifact
-    //    From sp3_matmul_only_proof.json → verification.final_channel_digest
+    // 4. Assert channel digest matches Rust artifact (v19 transcript)
     let expected_digest: felt252 =
-        0x00c314dd4a66faa626a7847832d30b6316c4d2005e6e8aa00c824ffa6db3239f;
+        0x0422e91b535975516578d8ab499ff4ec4750ee08dffaffce8a22628df3ce0f05;
 
     assert!(ch.digest == expected_digest, "SP3_DIGEST_MISMATCH");
 }
@@ -172,9 +173,8 @@ fn test_sp3_matmul_only_final_claim_value() {
         array![].span(), initial_claim, ref ch,
     );
 
-    // From artifact: input_claim.value = final_a_eval
-    // = QM31(0x544a5325, 0x6ae551de, 0x5205e05c, 0x6455cdd)
-    let expected_value = qm31_new(0x544a5325, 0x6ae551de, 0x5205e05c, 0x6455cdd);
+    // From artifact: input_claim.value = final_a_eval (v19)
+    let expected_value = qm31_new(0x300af73c, 0x7b4d242b, 0x4992e6b7, 0x2b489ae1);
     assert!(qm31_eq(final_claim.value, expected_value), "SP3_CLAIM_VALUE_MISMATCH");
 
     // Final claim point should have 2 elements (log_m=0 + log_k=2 sumcheck challenges)
@@ -201,10 +201,9 @@ fn test_sp3_matmul_only_final_claim_point() {
         array![].span(), initial_claim, ref ch,
     );
 
-    // From artifact: input_claim.point[0]
-    let expected_p0 = qm31_new(0x6fa4819a, 0x6aba80e5, 0x131c737a, 0x3ed440b7);
-    // From artifact: input_claim.point[1]
-    let expected_p1 = qm31_new(0x75014fee, 0x15705013, 0x2bccf968, 0x89cdb6e);
+    // From artifact: input_claim.point (v19)
+    let expected_p0 = qm31_new(0x77413964, 0x7262e408, 0x3155525d, 0x50889bd9);
+    let expected_p1 = qm31_new(0x41888471, 0x16875c1a, 0x66e841fc, 0xa37632e);
 
     let point_span = final_claim.point.span();
     assert!(qm31_eq(*point_span.at(0), expected_p0), "SP3_POINT_0_MISMATCH");
@@ -216,12 +215,11 @@ fn test_sp3_matmul_only_final_claim_point() {
 // ============================================================================
 
 /// Tamper the first round polynomial coefficient (c0) in the MatMul proof.
-/// The verifier should detect this via MATMUL_ROUND_SUM_MISMATCH.
-///
-/// This test verifies that any modification to the proof data causes
-/// a Fiat-Shamir transcript failure — proving completeness of binding.
+/// With v19 compressed polys, c1 is reconstructed to satisfy the round sum
+/// by construction, so the tampering propagates to MATMUL_FINAL_MISMATCH
+/// (final_a * final_b != evaluated poly at challenge).
 #[test]
-#[should_panic(expected: "MATMUL_ROUND_SUM_MISMATCH")]
+#[should_panic(expected: "MATMUL_FINAL_MISMATCH")]
 fn test_sp3_matmul_only_tampered_rejects() {
     let mut ch = channel_default();
     seed_channel_rust(ref ch, 1, 1, 4);
@@ -233,18 +231,20 @@ fn test_sp3_matmul_only_tampered_rejects() {
         0x2,          // num_rounds
         // round[0].c0 — TAMPERED: 0x4c3999da → 0x4c3999db (+1)
         0x4c3999db, 0x34cddf9a, 0x447004b2, 0x4b11507f,
-        0x104ccd2e, 0x1bbd2a23, 0x5eab0ee, 0xec1c0aa,
+        // round[0].c2
         0x10, 0x0, 0x0, 0x0,
-        0x79239fc, 0x5bf28cca, 0x1aa07903, 0x515b9e3d,
-        0x41374020, 0x3cc351b7, 0x5a5e480c, 0x3a5275e6,
+        // round[1].c0
+        0x59c30da5, 0x57a1304f, 0x61fa59de, 0x5d27936d,
+        // round[1].c2
         0x2, 0x0, 0x0, 0x0,
-        0x544a5325, 0x6ae551de, 0x5205e05c, 0x6455cdd,
-        0x6ca7d990, 0x3cb9ee46, 0x65866cf4, 0x503b29e4,
+        // final_a_eval
+        0x300af73c, 0x7b4d242b, 0x4992e6b7, 0x2b489ae1,
+        // final_b_eval
+        0x242921be, 0x5d8992e0, 0x54a079aa, 0x1a41a5ed,
     ];
 
     let matmul_dims: Array<u32> = array![1, 4, 2];
 
-    // This should panic with MATMUL_ROUND_SUM_MISMATCH
     let (_final_claim, _) = verify_gkr_model(
         proof_data.span(), 1, matmul_dims.span(),
         array![].span(), initial_claim, ref ch,
@@ -268,15 +268,18 @@ fn test_sp3_matmul_only_tampered_final_rejects() {
     let proof_data: Array<felt252> = array![
         0x0,
         0x2,
+        // round[0].c0
         0x4c3999da, 0x34cddf9a, 0x447004b2, 0x4b11507f,
-        0x104ccd2e, 0x1bbd2a23, 0x5eab0ee, 0xec1c0aa,
+        // round[0].c2
         0x10, 0x0, 0x0, 0x0,
-        0x79239fc, 0x5bf28cca, 0x1aa07903, 0x515b9e3d,
-        0x41374020, 0x3cc351b7, 0x5a5e480c, 0x3a5275e6,
+        // round[1].c0
+        0x59c30da5, 0x57a1304f, 0x61fa59de, 0x5d27936d,
+        // round[1].c2
         0x2, 0x0, 0x0, 0x0,
-        // final_a_eval — TAMPERED: 0x544a5325 → 0x544a5326 (+1)
-        0x544a5326, 0x6ae551de, 0x5205e05c, 0x6455cdd,
-        0x6ca7d990, 0x3cb9ee46, 0x65866cf4, 0x503b29e4,
+        // final_a_eval — TAMPERED: 0x300af73c → 0x300af73d (+1)
+        0x300af73d, 0x7b4d242b, 0x4992e6b7, 0x2b489ae1,
+        // final_b_eval
+        0x242921be, 0x5d8992e0, 0x54a079aa, 0x1a41a5ed,
     ];
 
     let matmul_dims: Array<u32> = array![1, 4, 2];
@@ -292,10 +295,11 @@ fn test_sp3_matmul_only_tampered_final_rejects() {
 // ============================================================================
 
 /// Provide wrong output values (51, 60 instead of 50, 60).
-/// The initial claim value will differ → round sum mismatch in the first
-/// sumcheck round (claim.value = p(0) + p(1) won't hold).
+/// The initial claim value will differ → with v19 compressed polys, c1 is
+/// reconstructed from the wrong claim, producing wrong Fiat-Shamir challenge,
+/// which propagates to MATMUL_FINAL_MISMATCH.
 #[test]
-#[should_panic(expected: "MATMUL_ROUND_SUM_MISMATCH")]
+#[should_panic(expected: "MATMUL_FINAL_MISMATCH")]
 fn test_sp3_matmul_only_wrong_output_rejects() {
     let mut ch = channel_default();
     seed_channel_rust(ref ch, 1, 1, 4);
@@ -313,27 +317,27 @@ fn test_sp3_matmul_only_wrong_output_rejects() {
 }
 
 // ============================================================================
-// Weight MLE Opening Proof Data (from sp3_matmul_only_proof.json)
+// Weight MLE Opening Proof Data (from sp3_matmul_only_proof.json, v19)
 // ============================================================================
 
-/// Build the MleOpeningProof calldata from the SP3 artifact.
+/// Build the MleOpeningProof calldata from the SP3 artifact (v19).
 ///
-/// This is weight_opening_calldata_hex[1..] from the artifact (skip count).
 /// 184 felts encoding a single MleOpeningProof for the 4x2 weight matrix.
-///
 /// MLE has 8 elements (4*2), log2(8)=3 folding rounds, 4 spot-check queries.
 /// Merkle tree: 2 intermediate roots, 4 queries x 3 rounds each.
+///
+/// Note: intermediate_roots[1] changed in v19 because the weight eval points
+/// changed (different Fiat-Shamir challenges from the new transcript).
 fn build_sp3_weight_opening_proof_data() -> Array<felt252> {
     array![
         // intermediate_roots: Array<felt252> (len=2)
         0x2,
         0x32af8fd28517d67b4a36b4a05b422da2d55a15a9c1d6ffd2c99bed93b1e3659,
-        0x7bfad8eeed46175876d7a4bd1bd5bec361195754ca1ea10af1ca1b157bf3153,
+        0x6fe0b662f3b2a5ca034bbebe1d6750d4bc1a4feeef133ee5db36116585e04a9,
         // queries: Array<MleQueryProof> (len=4)
         0x4,
         // ---- Query 0: initial_pair_index=0, rounds=3 ----
         0x0, 0x3,
-        // Q0 R0: left(1,0,0,0), right(2,0,0,0), left_sibs(3), right_sibs(3)
         0x1, 0x0, 0x0, 0x0,
         0x2, 0x0, 0x0, 0x0,
         0x3,
@@ -344,7 +348,7 @@ fn build_sp3_weight_opening_proof_data() -> Array<felt252> {
         0x10000000800000000000000000000000,
         0x495ab9242f2ec905679ed8d6af6414b4dc897336d31719b68e573911043c180,
         0x12a72ae943d9780522015b25a33677c130cf2e3ca7cab6111f387c0572cea41,
-        // Q0 R1: left, right, left_sibs(2), right_sibs(2)
+        // Q0 R1
         0x44133347, 0x66ef4a88, 0x417aac3b, 0x43b0702a,
         0x4413334b, 0x66ef4a88, 0x417aac3b, 0x43b0702a,
         0x2,
@@ -353,45 +357,15 @@ fn build_sp3_weight_opening_proof_data() -> Array<felt252> {
         0x2,
         0x18826669b9bbd2a220bd561dc3b0702a,
         0xf7e1013873b4fe7e32273e9ea1aa97c075a6111259f180555224f386c5510f,
-        // Q0 R2: left, right, left_sibs(1), right_sibs(1)
-        0x2a539b3, 0x11d94e20, 0xdec7a24, 0x3f017308,
-        0x2a539b5, 0x11d94e20, 0xdec7a24, 0x3f017308,
+        // Q0 R2
+        0x211818db, 0x307adaac, 0x6cff5b1, 0x5d2df91,
+        0x211818dd, 0x307adaac, 0x6cff5b1, 0x5d2df91,
         0x1,
-        0x1054a736a476538806f63d123f017308,
+        0x1423031bac1eb6ab0367fad885d2df91,
         0x1,
-        0x1054a7366476538806f63d123f017308,
-        // ---- Query 1: initial_pair_index=2, rounds=3 ----
-        0x2, 0x3,
-        // Q1 R0
-        0x5, 0x0, 0x0, 0x0,
-        0x6, 0x0, 0x0, 0x0,
-        0x3,
-        0x10000000e00000000000000000000000,
-        0x1b537b28eb8c5c619cecea97d60b41e915ab177027b4ef363162ca5742e2184,
-        0x523409a865968ce30bd0ff99140c9dc235ec925370279c43d59beb5bfe4c1ac,
-        0x3,
-        0x10000001000000000000000000000000,
-        0x7629454ecc4eaca72b489df1ec392edf4bb1df3dca0b8c3bbf5ab1d1a1cbd9f,
-        0x12a72ae943d9780522015b25a33677c130cf2e3ca7cab6111f387c0572cea41,
-        // Q1 R1
-        0x44133347, 0x66ef4a88, 0x417aac3b, 0x43b0702a,
-        0x4413334b, 0x66ef4a88, 0x417aac3b, 0x43b0702a,
-        0x2,
-        0x1882666939bbd2a220bd561dc3b0702a,
-        0x4458b2d010efa202ef05ef9980c80ca06d4d8bd4718b512a20cecc76818631,
-        0x2,
-        0x18826669b9bbd2a220bd561dc3b0702a,
-        0xf7e1013873b4fe7e32273e9ea1aa97c075a6111259f180555224f386c5510f,
-        // Q1 R2
-        0x2a539b3, 0x11d94e20, 0xdec7a24, 0x3f017308,
-        0x2a539b5, 0x11d94e20, 0xdec7a24, 0x3f017308,
-        0x1,
-        0x1054a736a476538806f63d123f017308,
-        0x1,
-        0x1054a7366476538806f63d123f017308,
-        // ---- Query 2: initial_pair_index=3, rounds=3 ----
+        0x1423031b6c1eb6ab0367fad885d2df91,
+        // ---- Query 1: initial_pair_index=3, rounds=3 ----
         0x3, 0x3,
-        // Q2 R0
         0x7, 0x0, 0x0, 0x0,
         0x8, 0x0, 0x0, 0x0,
         0x3,
@@ -401,6 +375,34 @@ fn build_sp3_weight_opening_proof_data() -> Array<felt252> {
         0x3,
         0x10000000c00000000000000000000000,
         0x7629454ecc4eaca72b489df1ec392edf4bb1df3dca0b8c3bbf5ab1d1a1cbd9f,
+        0x12a72ae943d9780522015b25a33677c130cf2e3ca7cab6111f387c0572cea41,
+        // Q1 R1
+        0x44133349, 0x66ef4a88, 0x417aac3b, 0x43b0702a,
+        0x4413334d, 0x66ef4a88, 0x417aac3b, 0x43b0702a,
+        0x2,
+        0x18826668f9bbd2a220bd561dc3b0702a,
+        0x4458b2d010efa202ef05ef9980c80ca06d4d8bd4718b512a20cecc76818631,
+        0x2,
+        0x1882666979bbd2a220bd561dc3b0702a,
+        0xf7e1013873b4fe7e32273e9ea1aa97c075a6111259f180555224f386c5510f,
+        // Q1 R2
+        0x211818db, 0x307adaac, 0x6cff5b1, 0x5d2df91,
+        0x211818dd, 0x307adaac, 0x6cff5b1, 0x5d2df91,
+        0x1,
+        0x1423031bac1eb6ab0367fad885d2df91,
+        0x1,
+        0x1423031b6c1eb6ab0367fad885d2df91,
+        // ---- Query 2: initial_pair_index=1, rounds=3 ----
+        0x1, 0x3,
+        0x3, 0x0, 0x0, 0x0,
+        0x4, 0x0, 0x0, 0x0,
+        0x3,
+        0x10000000200000000000000000000000,
+        0x237489190b283d778a874e504a4e6f70b5971003c8fbd81654e589ffb30450,
+        0x523409a865968ce30bd0ff99140c9dc235ec925370279c43d59beb5bfe4c1ac,
+        0x3,
+        0x10000000400000000000000000000000,
+        0x495ab9242f2ec905679ed8d6af6414b4dc897336d31719b68e573911043c180,
         0x12a72ae943d9780522015b25a33677c130cf2e3ca7cab6111f387c0572cea41,
         // Q2 R1
         0x44133349, 0x66ef4a88, 0x417aac3b, 0x43b0702a,
@@ -412,24 +414,23 @@ fn build_sp3_weight_opening_proof_data() -> Array<felt252> {
         0x1882666979bbd2a220bd561dc3b0702a,
         0xf7e1013873b4fe7e32273e9ea1aa97c075a6111259f180555224f386c5510f,
         // Q2 R2
-        0x2a539b3, 0x11d94e20, 0xdec7a24, 0x3f017308,
-        0x2a539b5, 0x11d94e20, 0xdec7a24, 0x3f017308,
+        0x211818db, 0x307adaac, 0x6cff5b1, 0x5d2df91,
+        0x211818dd, 0x307adaac, 0x6cff5b1, 0x5d2df91,
         0x1,
-        0x1054a736a476538806f63d123f017308,
+        0x1423031bac1eb6ab0367fad885d2df91,
         0x1,
-        0x1054a7366476538806f63d123f017308,
-        // ---- Query 3: initial_pair_index=0, rounds=3 ----
-        0x0, 0x3,
-        // Q3 R0
-        0x1, 0x0, 0x0, 0x0,
-        0x2, 0x0, 0x0, 0x0,
+        0x1423031b6c1eb6ab0367fad885d2df91,
+        // ---- Query 3: initial_pair_index=2, rounds=3 ----
+        0x2, 0x3,
+        0x5, 0x0, 0x0, 0x0,
+        0x6, 0x0, 0x0, 0x0,
         0x3,
-        0x10000000600000000000000000000000,
-        0x237489190b283d778a874e504a4e6f70b5971003c8fbd81654e589ffb30450,
+        0x10000000e00000000000000000000000,
+        0x1b537b28eb8c5c619cecea97d60b41e915ab177027b4ef363162ca5742e2184,
         0x523409a865968ce30bd0ff99140c9dc235ec925370279c43d59beb5bfe4c1ac,
         0x3,
-        0x10000000800000000000000000000000,
-        0x495ab9242f2ec905679ed8d6af6414b4dc897336d31719b68e573911043c180,
+        0x10000001000000000000000000000000,
+        0x7629454ecc4eaca72b489df1ec392edf4bb1df3dca0b8c3bbf5ab1d1a1cbd9f,
         0x12a72ae943d9780522015b25a33677c130cf2e3ca7cab6111f387c0572cea41,
         // Q3 R1
         0x44133347, 0x66ef4a88, 0x417aac3b, 0x43b0702a,
@@ -441,14 +442,14 @@ fn build_sp3_weight_opening_proof_data() -> Array<felt252> {
         0x18826669b9bbd2a220bd561dc3b0702a,
         0xf7e1013873b4fe7e32273e9ea1aa97c075a6111259f180555224f386c5510f,
         // Q3 R2
-        0x2a539b3, 0x11d94e20, 0xdec7a24, 0x3f017308,
-        0x2a539b5, 0x11d94e20, 0xdec7a24, 0x3f017308,
+        0x211818db, 0x307adaac, 0x6cff5b1, 0x5d2df91,
+        0x211818dd, 0x307adaac, 0x6cff5b1, 0x5d2df91,
         0x1,
-        0x1054a736a476538806f63d123f017308,
+        0x1423031bac1eb6ab0367fad885d2df91,
         0x1,
-        0x1054a7366476538806f63d123f017308,
-        // final_value: QM31(0x6ca7d990, 0x3cb9ee46, 0x65866cf4, 0x503b29e4)
-        0x6ca7d990, 0x3cb9ee46, 0x65866cf4, 0x503b29e4,
+        0x1423031b6c1eb6ab0367fad885d2df91,
+        // final_value: QM31(0x242921be, 0x5d8992e0, 0x54a079aa, 0x1a41a5ed)
+        0x242921be, 0x5d8992e0, 0x54a079aa, 0x1a41a5ed,
     ]
 }
 
@@ -457,11 +458,7 @@ fn build_sp3_weight_opening_proof_data() -> Array<felt252> {
 // ============================================================================
 
 /// Verify that the weight claims collected during the GKR walk match the
-/// hardcoded values from the Rust artifact.
-///
-/// Weight claim for a MatMul layer:
-///   eval_point = [r_j || sumcheck_challenges]  (column + sumcheck challenges)
-///   expected_value = final_b_eval              (weight MLE evaluation)
+/// hardcoded values from the Rust artifact (v19).
 #[test]
 fn test_sp3_weight_claims_match_artifact() {
     let mut ch = channel_default();
@@ -483,21 +480,19 @@ fn test_sp3_weight_claims_match_artifact() {
     let claim = wc_span.at(0);
 
     // eval_point should have 3 QM31s: [r_j(1), s0(1), s1(1)]
-    // For m=1 (log_m=0), n=2 (log_n=1), k=4 (log_k=2):
-    //   r_j = 1 element (col challenge), sumcheck_challenges = 2 elements
     assert!(claim.eval_point.len() == 3, "SP3_EVAL_POINT_LEN");
 
-    // From artifact: weight_claims[0].eval_point
+    // From artifact (v19): weight_claims[0].eval_point
     let ep0 = qm31_new(0x44133346, 0x66ef4a88, 0x417aac3b, 0x43b0702a);
-    let ep1 = qm31_new(0x6fa4819a, 0x6aba80e5, 0x131c737a, 0x3ed440b7);
-    let ep2 = qm31_new(0x75014fee, 0x15705013, 0x2bccf968, 0x89cdb6e);
+    let ep1 = qm31_new(0x77413964, 0x7262e408, 0x3155525d, 0x50889bd9);
+    let ep2 = qm31_new(0x41888471, 0x16875c1a, 0x66e841fc, 0xa37632e);
 
     assert!(qm31_eq(*claim.eval_point.at(0), ep0), "SP3_EVAL_POINT_0");
     assert!(qm31_eq(*claim.eval_point.at(1), ep1), "SP3_EVAL_POINT_1");
     assert!(qm31_eq(*claim.eval_point.at(2), ep2), "SP3_EVAL_POINT_2");
 
-    // From artifact: weight_claims[0].expected_value = final_b_eval
-    let expected_val = qm31_new(0x6ca7d990, 0x3cb9ee46, 0x65866cf4, 0x503b29e4);
+    // From artifact (v19): weight_claims[0].expected_value = final_b_eval
+    let expected_val = qm31_new(0x242921be, 0x5d8992e0, 0x54a079aa, 0x1a41a5ed);
     assert!(qm31_eq(*claim.expected_value, expected_val), "SP3_WEIGHT_VALUE");
 }
 
@@ -511,12 +506,6 @@ fn test_sp3_weight_claims_match_artifact() {
 ///   3. Call verify_mle_opening with the weight commitment from artifact
 ///   4. Assert verification passes
 ///   5. Assert final channel digest matches Rust's digest_after_weight_openings
-///
-/// This test proves that:
-///   - The GKR walk produces the correct weight evaluation point
-///   - The Poseidon Merkle tree commitment protocol matches Rust byte-for-byte
-///   - The MLE folding algebra is identical between Cairo and Rust
-///   - The Fiat-Shamir transcript (channel) stays synchronized through weight openings
 #[test]
 fn test_sp3_weight_opening_verification_passes() {
     let mut ch = channel_default();
@@ -531,16 +520,15 @@ fn test_sp3_weight_opening_verification_passes() {
         array![].span(), initial_claim, ref ch,
     );
 
-    // Deserialize MleOpeningProof from hardcoded artifact data
+    // Deserialize MleOpeningProof from hardcoded artifact data (v19)
     let mle_data = build_sp3_weight_opening_proof_data();
     let mut mle_span = mle_data.span();
     let proof: MleOpeningProof = Serde::deserialize(ref mle_span).unwrap();
 
-    // Weight commitment from artifact
+    // Weight commitment (same in v18/v19 — commitment is weight-only)
     let weight_commitment: felt252 =
         0x0280b62c993d021a4be8ac506a2be7e41b8f4964c23a68f58d950761e3d73ded;
 
-    // Get eval_point from weight claim
     let wc_span = weight_claims.span();
     let claim = wc_span.at(0);
 
@@ -553,10 +541,9 @@ fn test_sp3_weight_opening_verification_passes() {
     );
     assert!(valid, "SP3_WEIGHT_MLE_OPENING_FAILED");
 
-    // After weight opening verification, channel digest should match
-    // Rust's final_channel_digest from the artifact
+    // After weight opening verification, channel digest should match Rust (v19)
     let expected_final_digest: felt252 =
-        0x0702d9ae6932f6cbbb05083f0f83d63d70b95999cc9c29c5b8a6e13549ff7f38;
+        0x03abfb5efb48a85e864e492d69a551d9c16594c916b661fd247da8e30bc5d2d8;
     assert!(ch.digest == expected_final_digest, "SP3_FINAL_DIGEST_AFTER_WEIGHT_OPENING");
 }
 
@@ -565,9 +552,7 @@ fn test_sp3_weight_opening_verification_passes() {
 // ============================================================================
 
 /// Tamper the weight commitment (change last hex digit) and verify that
-/// the MLE opening proof is rejected. This proves that the weight
-/// binding is cryptographically enforced -- a cheating prover cannot
-/// substitute different weights without detection.
+/// the MLE opening proof is rejected.
 #[test]
 fn test_sp3_tampered_weight_opening_rejected() {
     let mut ch = channel_default();
@@ -582,7 +567,6 @@ fn test_sp3_tampered_weight_opening_rejected() {
         array![].span(), initial_claim, ref ch,
     );
 
-    // Deserialize MleOpeningProof (same valid proof data)
     let mle_data = build_sp3_weight_opening_proof_data();
     let mut mle_span = mle_data.span();
     let proof: MleOpeningProof = Serde::deserialize(ref mle_span).unwrap();
@@ -594,7 +578,6 @@ fn test_sp3_tampered_weight_opening_rejected() {
     let wc_span = weight_claims.span();
     let claim = wc_span.at(0);
 
-    // Verification should FAIL -- Merkle root mismatch
     let valid = verify_mle_opening(
         bad_commitment,
         @proof,
