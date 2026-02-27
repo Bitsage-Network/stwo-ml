@@ -138,7 +138,6 @@ pub(crate) fn serialize_qm31_pair_packed(a: SecureField, b: SecureField, output:
 pub(crate) fn deserialize_qm31_pair_packed(fe: FieldElement) -> (SecureField, SecureField) {
     use stwo::core::fields::qm31::QM31;
     use stwo::core::fields::cm31::CM31;
-    use stwo::core::fields::m31::M31;
     let m31s = crate::crypto::poseidon_channel::unpack_m31s(fe, 8);
     let a = QM31(CM31(m31s[0], m31s[1]), CM31(m31s[2], m31s[3]));
     let b = QM31(CM31(m31s[4], m31s[5]), CM31(m31s[6], m31s[7]));

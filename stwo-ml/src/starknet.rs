@@ -2167,7 +2167,7 @@ pub fn build_verify_model_gkr_v4_double_packed_io_calldata(
     model_id: FieldElement,
     raw_io_data: &[FieldElement],
 ) -> Result<VerifyModelGkrCalldata, StarknetModelError> {
-    use crate::cairo_serde::{serialize_gkr_proof_data_only_double_packed, serialize_u32 as serde_u32};
+    use crate::cairo_serde::serialize_gkr_proof_data_only_double_packed;
 
     // Build the base calldata (with regular packed proof) to get everything except proof_data
     let base = build_verify_model_gkr_calldata_inner(
@@ -2955,7 +2955,7 @@ pub fn replay_verify_serialized_proof(
                 }
                 let two = SecureField::from(M31::from(2u32));
                 let mut rms_sum = current_claim_value;
-                for round in 0..nrounds {
+                for _round in 0..nrounds {
                     let c0 = read_qm31_from(proof_data, &mut off);
                     // v19+: c1 always omitted (compressed round polys), reconstruct from current_sum
                     let c2 = read_qm31_from(proof_data, &mut off);
@@ -3003,7 +3003,7 @@ pub fn replay_verify_serialized_proof(
                     }
                     let two_logup = SecureField::from(M31::from(2u32));
                     let mut logup_sum = SecureField::from(M31::from(1u32));
-                    for round in 0..eq_rounds {
+                    for _round in 0..eq_rounds {
                         let c0 = read_qm31_from(proof_data, &mut off);
                         // v19+: c1 always omitted (compressed round polys)
                         let c2 = read_qm31_from(proof_data, &mut off);
@@ -3052,7 +3052,7 @@ pub fn replay_verify_serialized_proof(
                     let eq_rounds = read_u32_from(proof_data, &mut off) as usize;
                     let two_act = SecureField::from(M31::from(2u32));
                     let mut logup_sum = SecureField::from(M31::from(1u32));
-                    for round in 0..eq_rounds {
+                    for _round in 0..eq_rounds {
                         let c0 = read_qm31_from(proof_data, &mut off);
                         // v19+: c1 always omitted (compressed round polys)
                         let c2 = read_qm31_from(proof_data, &mut off);
