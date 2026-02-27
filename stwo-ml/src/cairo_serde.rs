@@ -113,6 +113,38 @@ pub(crate) fn serialize_qm31_packed(val: SecureField, output: &mut Vec<FieldElem
     output.push(crate::crypto::poseidon_channel::securefield_to_felt(val));
 }
 
+/// Pack two QM31 values into a single felt252 (248 bits, no sentinel).
+/// Layout: [a.a.a(31) | a.a.b(31) | a.b.a(31) | a.b.b(31) | b.a.a(31) | b.a.b(31) | b.b.a(31) | b.b.b(31)]
+/// Uses the same Horner-style packing as Cairo's pack_qm31_pair_to_felt.
+pub(crate) fn serialize_qm31_pair_packed(a: SecureField, b: SecureField, output: &mut Vec<FieldElement>) {
+    use stwo::core::fields::qm31::QM31;
+    use stwo::core::fields::cm31::CM31;
+    let QM31(CM31(a0, a1), CM31(a2, a3)) = a;
+    let QM31(CM31(b0, b1), CM31(b2, b3)) = b;
+    let shift = FieldElement::from(1u64 << 31); // 2^31
+    // Horner: result = a0 * 2^217 + a1 * 2^186 + ... + b3
+    let mut result = FieldElement::from(a0.0 as u64);
+    result = result * shift + FieldElement::from(a1.0 as u64);
+    result = result * shift + FieldElement::from(a2.0 as u64);
+    result = result * shift + FieldElement::from(a3.0 as u64);
+    result = result * shift + FieldElement::from(b0.0 as u64);
+    result = result * shift + FieldElement::from(b1.0 as u64);
+    result = result * shift + FieldElement::from(b2.0 as u64);
+    result = result * shift + FieldElement::from(b3.0 as u64);
+    output.push(result);
+}
+
+/// Unpack two QM31 values from a single double-packed felt252.
+pub(crate) fn deserialize_qm31_pair_packed(fe: FieldElement) -> (SecureField, SecureField) {
+    use stwo::core::fields::qm31::QM31;
+    use stwo::core::fields::cm31::CM31;
+    use stwo::core::fields::m31::M31;
+    let m31s = crate::crypto::poseidon_channel::unpack_m31s(fe, 8);
+    let a = QM31(CM31(m31s[0], m31s[1]), CM31(m31s[2], m31s[3]));
+    let b = QM31(CM31(m31s[4], m31s[5]), CM31(m31s[6], m31s[7]));
+    (a, b)
+}
+
 /// Blake2sHash([u8; 32]) → 8 × u32 words → 8 felt252.
 ///
 /// Converts the 32-byte hash into 8 little-endian u32 words,
@@ -2025,6 +2057,407 @@ pub fn serialize_gkr_proof_data_only_packed(proof: &crate::gkr::GKRProof, output
         }
         output.push(deferred.weight_commitment().unwrap());
     }
+}
+
+/// Double-packed variant: degree-2 round polys (c0, c2) packed as QM31 pairs (1 felt each),
+/// degree-3 round polys (c0, c2) as pair + c3 as single packed QM31.
+/// All other QM31 values remain single-packed. Saves ~50% on proof_data section.
+pub fn serialize_gkr_proof_data_only_double_packed(proof: &crate::gkr::GKRProof, output: &mut Vec<FieldElement>) {
+    for layer_proof in &proof.layer_proofs {
+        serialize_layer_proof_double_packed_inner(layer_proof, output, Some(proof));
+    }
+
+    // Serialize deferred proofs — also double-packed
+    serialize_u32(proof.deferred_proofs.len() as u32, output);
+    for deferred in &proof.deferred_proofs {
+        serialize_qm31_packed(deferred.claim.value, output);
+        let (m, k, n) = deferred.dims().unwrap();
+        serialize_u32(m as u32, output);
+        serialize_u32(k as u32, output);
+        serialize_u32(n as u32, output);
+        if let crate::gkr::types::LayerProof::MatMul {
+            round_polys,
+            final_a_eval,
+            final_b_eval,
+        } = &deferred.layer_proof
+        {
+            serialize_u32(round_polys.len() as u32, output);
+            for rp in round_polys {
+                // Double-packed: c0+c2 in one felt
+                serialize_qm31_pair_packed(rp.c0, rp.c2, output);
+            }
+            serialize_qm31_packed(*final_a_eval, output);
+            serialize_qm31_packed(*final_b_eval, output);
+        }
+        output.push(deferred.weight_commitment().unwrap());
+    }
+}
+
+fn serialize_layer_proof_double_packed_inner(
+    layer_proof: &crate::gkr::types::LayerProof,
+    output: &mut Vec<FieldElement>,
+    proof_for_attention: Option<&crate::gkr::GKRProof>,
+) {
+    use crate::gkr::types::LayerProof;
+    match layer_proof {
+        LayerProof::MatMul {
+            round_polys,
+            final_a_eval,
+            final_b_eval,
+        } => {
+            serialize_u32(0, output);
+            serialize_u32(round_polys.len() as u32, output);
+            for rp in round_polys {
+                // Double-packed: c0+c2 in one felt252
+                serialize_qm31_pair_packed(rp.c0, rp.c2, output);
+            }
+            serialize_qm31_packed(*final_a_eval, output);
+            serialize_qm31_packed(*final_b_eval, output);
+        }
+        LayerProof::Add {
+            lhs_eval,
+            rhs_eval,
+            trunk_idx,
+        } => {
+            serialize_u32(1, output);
+            serialize_qm31_packed(*lhs_eval, output);
+            serialize_qm31_packed(*rhs_eval, output);
+            serialize_u32(*trunk_idx as u32, output);
+        }
+        LayerProof::Mul {
+            eq_round_polys,
+            lhs_eval,
+            rhs_eval,
+        } => {
+            serialize_u32(2, output);
+            serialize_u32(eq_round_polys.len() as u32, output);
+            for rp in eq_round_polys {
+                // Double-packed: (c0, c2) as pair, c3 as single
+                serialize_qm31_pair_packed(rp.c0, rp.c2, output);
+                serialize_qm31_packed(rp.c3, output);
+            }
+            serialize_qm31_packed(*lhs_eval, output);
+            serialize_qm31_packed(*rhs_eval, output);
+        }
+        LayerProof::Activation {
+            activation_type,
+            logup_proof,
+            input_eval,
+            output_eval,
+            table_commitment,
+        } => {
+            serialize_u32(3, output);
+            serialize_u32(activation_type.type_tag(), output);
+            serialize_qm31_packed(*input_eval, output);
+            serialize_qm31_packed(*output_eval, output);
+            output.push(*table_commitment);
+            match logup_proof {
+                Some(lup) => {
+                    serialize_u32(1, output);
+                    serialize_logup_proof_inner_double_packed(lup, output, false);
+                }
+                None => serialize_u32(0, output),
+            }
+        }
+        LayerProof::LayerNorm {
+            logup_proof,
+            linear_round_polys,
+            linear_final_evals,
+            input_eval,
+            output_eval,
+            mean,
+            rsqrt_var,
+            rsqrt_table_commitment,
+            simd_combined,
+        } => {
+            serialize_u32(4, output);
+            serialize_qm31_packed(*input_eval, output);
+            serialize_qm31_packed(*output_eval, output);
+            serialize_qm31_packed(*mean, output);
+            serialize_qm31_packed(*rsqrt_var, output);
+            output.push(*rsqrt_table_commitment);
+            serialize_u32(if *simd_combined { 1 } else { 0 }, output);
+            serialize_u32(linear_round_polys.len() as u32, output);
+            for rp in linear_round_polys {
+                // Double-packed: (c0, c2) as pair, c3 as single
+                serialize_qm31_pair_packed(rp.c0, rp.c2, output);
+                serialize_qm31_packed(rp.c3, output);
+            }
+            let (centered_eval, rsqrt_eval) = *linear_final_evals;
+            serialize_qm31_packed(centered_eval, output);
+            serialize_qm31_packed(rsqrt_eval, output);
+            match logup_proof {
+                Some(lup) => {
+                    serialize_u32(1, output);
+                    serialize_logup_proof_inner_double_packed(lup, output, false);
+                }
+                None => serialize_u32(0, output),
+            }
+        }
+        LayerProof::Attention {
+            sub_proofs,
+            sub_claim_values,
+        } => {
+            // Attention not commonly used with double-packed; fall back to packed
+            serialize_u32(5, output);
+            serialize_u32(sub_proofs.len() as u32, output);
+            for val in sub_claim_values {
+                serialize_qm31_packed(*val, output);
+            }
+            if let Some(proof) = proof_for_attention {
+                for sub in sub_proofs {
+                    let tmp = crate::gkr::GKRProof {
+                        layer_proofs: vec![sub.clone()],
+                        output_claim: proof.output_claim.clone(),
+                        input_claim: proof.input_claim.clone(),
+                        weight_commitments: vec![],
+                        weight_openings: vec![],
+                        weight_claims: vec![],
+                        weight_opening_transcript_mode:
+                            crate::gkr::types::WeightOpeningTranscriptMode::Sequential,
+                        io_commitment: proof.io_commitment,
+                        deferred_proofs: vec![],
+                        aggregated_binding: None,
+                    };
+                    let mut sub_buf = Vec::new();
+                    serialize_gkr_model_proof(&tmp, &mut sub_buf);
+                    output.extend_from_slice(&sub_buf[1..]);
+                }
+            }
+        }
+        LayerProof::Dequantize {
+            logup_proof,
+            input_eval,
+            output_eval,
+            table_commitment,
+        } => {
+            serialize_u32(6, output);
+            serialize_qm31_packed(*input_eval, output);
+            serialize_qm31_packed(*output_eval, output);
+            output.push(*table_commitment);
+            match logup_proof {
+                Some(lup) => {
+                    serialize_u32(1, output);
+                    serialize_logup_proof_inner_double_packed(lup, output, false);
+                }
+                None => serialize_u32(0, output),
+            }
+        }
+        LayerProof::MatMulDualSimd {
+            round_polys,
+            final_a_eval,
+            final_b_eval,
+            n_block_vars,
+        } => {
+            serialize_u32(7, output);
+            serialize_u32(*n_block_vars as u32, output);
+            serialize_u32(round_polys.len() as u32, output);
+            for rp in round_polys {
+                // MatMulDualSimd has deg-3 polys with all 4 coeffs — pack (c0,c1) and (c2,c3)
+                serialize_qm31_pair_packed(rp.c0, rp.c1, output);
+                serialize_qm31_pair_packed(rp.c2, rp.c3, output);
+            }
+            serialize_qm31_packed(*final_a_eval, output);
+            serialize_qm31_packed(*final_b_eval, output);
+        }
+        LayerProof::RMSNorm {
+            logup_proof,
+            linear_round_polys,
+            linear_final_evals,
+            input_eval,
+            output_eval,
+            rms_sq_eval,
+            rsqrt_eval,
+            rsqrt_table_commitment,
+            simd_combined,
+        } => {
+            serialize_u32(8, output);
+            serialize_qm31_packed(*input_eval, output);
+            serialize_qm31_packed(*output_eval, output);
+            serialize_qm31_packed(*rms_sq_eval, output);
+            serialize_qm31_packed(*rsqrt_eval, output);
+            output.push(*rsqrt_table_commitment);
+            serialize_u32(if *simd_combined { 1 } else { 0 }, output);
+            serialize_u32(linear_round_polys.len() as u32, output);
+            for rp in linear_round_polys {
+                // Double-packed: (c0, c2) as pair, c3 as single
+                serialize_qm31_pair_packed(rp.c0, rp.c2, output);
+                serialize_qm31_packed(rp.c3, output);
+            }
+            let (input_final, rsqrt_final) = *linear_final_evals;
+            serialize_qm31_packed(input_final, output);
+            serialize_qm31_packed(rsqrt_final, output);
+            match logup_proof {
+                Some(lup) => {
+                    serialize_u32(1, output);
+                    serialize_logup_proof_inner_double_packed(lup, output, false);
+                }
+                None => serialize_u32(0, output),
+            }
+        }
+        LayerProof::Quantize {
+            logup_proof,
+            input_eval,
+            output_eval,
+            table_inputs,
+            table_outputs,
+        } => {
+            serialize_u32(9, output);
+            serialize_qm31_packed(*input_eval, output);
+            serialize_qm31_packed(*output_eval, output);
+            match logup_proof {
+                Some(lup) => {
+                    serialize_u32(1, output);
+                    serialize_logup_proof_inner_double_packed(lup, output, true);
+                }
+                None => serialize_u32(0, output),
+            }
+            serialize_u32(table_inputs.len() as u32, output);
+            for (&inp, &out) in table_inputs.iter().zip(table_outputs.iter()) {
+                serialize_m31(inp, output);
+                serialize_m31(out, output);
+            }
+        }
+        LayerProof::Embedding {
+            logup_proof,
+            input_eval,
+            output_eval,
+            input_num_vars,
+        } => {
+            serialize_u32(10, output);
+            serialize_qm31_packed(*input_eval, output);
+            serialize_qm31_packed(*output_eval, output);
+            serialize_u32(*input_num_vars as u32, output);
+            match logup_proof {
+                Some(lup) => {
+                    serialize_u32(1, output);
+                    serialize_u32(lup.eq_round_polys.len() as u32, output);
+                    for rp in &lup.eq_round_polys {
+                        // Embedding uses all 4 coefficients
+                        serialize_qm31_pair_packed(rp.c0, rp.c1, output);
+                        serialize_qm31_pair_packed(rp.c2, rp.c3, output);
+                    }
+                    serialize_qm31_packed(lup.claimed_sum, output);
+                    let (w, tok, col, val) = lup.final_evals;
+                    serialize_qm31_packed(w, output);
+                    serialize_qm31_packed(tok, output);
+                    serialize_qm31_packed(col, output);
+                    serialize_qm31_packed(val, output);
+                    serialize_u32(lup.table_tokens.len() as u32, output);
+                    for i in 0..lup.table_tokens.len() {
+                        serialize_u32(lup.table_tokens[i], output);
+                        serialize_u32(lup.table_cols[i], output);
+                        serialize_u32(lup.multiplicities[i], output);
+                    }
+                }
+                None => serialize_u32(0, output),
+            }
+        }
+    }
+}
+
+/// Double-packed variant of serialize_logup_proof_inner_packed.
+fn serialize_logup_proof_inner_double_packed(
+    lup: &crate::gkr::types::LogUpProof,
+    output: &mut Vec<FieldElement>,
+    include_multiplicities: bool,
+) {
+    serialize_qm31_packed(lup.claimed_sum, output);
+    serialize_u32(lup.eq_round_polys.len() as u32, output);
+    for rp in &lup.eq_round_polys {
+        // Degree-3: (c0, c2) as pair, c3 as single
+        serialize_qm31_pair_packed(rp.c0, rp.c2, output);
+        serialize_qm31_packed(rp.c3, output);
+    }
+    let (w_eval, in_eval, out_eval) = lup.final_evals;
+    serialize_qm31_packed(w_eval, output);
+    serialize_qm31_packed(in_eval, output);
+    serialize_qm31_packed(out_eval, output);
+    if include_multiplicities {
+        serialize_u32(lup.multiplicities.len() as u32, output);
+        for &mult in &lup.multiplicities {
+            serialize_u32(mult, output);
+        }
+    } else {
+        serialize_u32(0, output);
+    }
+}
+
+/// Packed variant with layer boundary tracking for streaming verification (v25).
+///
+/// Returns the felt offset at each layer boundary, enabling precise splitting
+/// of proof data into batches for streaming calldata-only verification.
+///
+/// boundaries[i] = felt offset where layer i begins (relative to output start)
+/// boundaries[len] = final offset (total felts for all layers)
+///
+/// Deferred proofs are NOT included (they go in the finalize TX).
+pub fn serialize_gkr_proof_data_only_packed_with_boundaries(
+    proof: &crate::gkr::GKRProof,
+    output: &mut Vec<FieldElement>,
+) -> Vec<usize> {
+    let base = output.len();
+    let mut boundaries = Vec::with_capacity(proof.layer_proofs.len() + 1);
+    for layer_proof in &proof.layer_proofs {
+        boundaries.push(output.len() - base);
+        serialize_layer_proof_packed_inner(layer_proof, output, Some(proof));
+    }
+    boundaries.push(output.len() - base); // final offset
+    boundaries
+}
+
+/// Split packed proof data into batches for streaming GKR verification.
+///
+/// Each batch contains consecutive layers whose total felt count fits within
+/// `max_felts_per_batch`. Returns a Vec of (start_layer, end_layer, felt_slice)
+/// tuples suitable for building streaming calldata.
+pub fn split_proof_into_stream_batches(
+    proof: &crate::gkr::GKRProof,
+    max_felts_per_batch: usize,
+) -> (Vec<FieldElement>, Vec<StreamBatchInfo>) {
+    let mut all_felts = Vec::new();
+    let boundaries = serialize_gkr_proof_data_only_packed_with_boundaries(proof, &mut all_felts);
+
+    let num_layers = proof.layer_proofs.len();
+    let mut batches = Vec::new();
+    let mut batch_start = 0;
+
+    while batch_start < num_layers {
+        let mut batch_end = batch_start + 1;
+        // Greedily pack consecutive layers
+        while batch_end < num_layers {
+            let batch_felts = boundaries[batch_end + 1] - boundaries[batch_start];
+            if batch_felts > max_felts_per_batch {
+                break;
+            }
+            batch_end += 1;
+        }
+        // If a single layer exceeds the limit, include it anyway (1 layer minimum)
+        let felt_start = boundaries[batch_start];
+        let felt_end = boundaries[batch_end];
+        batches.push(StreamBatchInfo {
+            start_layer: batch_start,
+            end_layer: batch_end,
+            felt_start,
+            felt_end,
+        });
+        batch_start = batch_end;
+    }
+
+    (all_felts, batches)
+}
+
+/// Metadata for a single streaming batch.
+#[derive(Debug, Clone)]
+pub struct StreamBatchInfo {
+    /// First layer index in this batch (inclusive).
+    pub start_layer: usize,
+    /// Last layer index in this batch (exclusive).
+    pub end_layer: usize,
+    /// Byte offset into the flat felt array where this batch starts.
+    pub felt_start: usize,
+    /// Byte offset into the flat felt array where this batch ends.
+    pub felt_end: usize,
 }
 
 /// Serialize a STWO-native `GkrBatchProof` into felt252 layout matching Cairo's
@@ -3988,5 +4421,304 @@ mod tests {
         assert_eq!(out[10], FieldElement::from(400u64));
         // Commitment
         assert_eq!(out[11], FieldElement::from(0x1234u64));
+    }
+
+    #[test]
+    fn test_serialize_qm31_pair_packed_roundtrip() {
+        use stwo::core::fields::cm31::CM31;
+        use stwo::core::fields::qm31::QM31;
+
+        let test_pairs = vec![
+            // (a, b) — both zero
+            (
+                QM31(CM31(M31::from(0), M31::from(0)), CM31(M31::from(0), M31::from(0))),
+                QM31(CM31(M31::from(0), M31::from(0)), CM31(M31::from(0), M31::from(0))),
+            ),
+            // Small values
+            (
+                QM31(CM31(M31::from(1), M31::from(2)), CM31(M31::from(3), M31::from(4))),
+                QM31(CM31(M31::from(5), M31::from(6)), CM31(M31::from(7), M31::from(8))),
+            ),
+            // Max M31 values (2^31 - 2)
+            (
+                QM31(
+                    CM31(M31::from(2147483646u32), M31::from(1000000u32)),
+                    CM31(M31::from(999999u32), M31::from(12345u32)),
+                ),
+                QM31(
+                    CM31(M31::from(2147483646u32), M31::from(2147483646u32)),
+                    CM31(M31::from(2147483646u32), M31::from(2147483646u32)),
+                ),
+            ),
+            // Mixed zero and max
+            (
+                QM31(CM31(M31::from(0), M31::from(2147483646u32)), CM31(M31::from(0), M31::from(0))),
+                QM31(CM31(M31::from(2147483646u32), M31::from(0)), CM31(M31::from(0), M31::from(2147483646u32))),
+            ),
+        ];
+
+        for (a, b) in &test_pairs {
+            let mut out = Vec::new();
+            serialize_qm31_pair_packed(*a, *b, &mut out);
+            assert_eq!(out.len(), 1, "double-packed QM31 pair should be 1 felt");
+
+            // Verify round-trip via deserialize_qm31_pair_packed
+            let (recovered_a, recovered_b) = deserialize_qm31_pair_packed(out[0]);
+            assert_eq!(recovered_a, *a, "pair pack/unpack failed for a={:?}", a);
+            assert_eq!(recovered_b, *b, "pair pack/unpack failed for b={:?}", b);
+        }
+    }
+
+    #[test]
+    fn test_double_packed_smaller_than_packed() {
+        // Verify that double-packed serialization of a MatMul round poly
+        // produces fewer felts than regular packed serialization.
+        use stwo::core::fields::cm31::CM31;
+        use stwo::core::fields::qm31::QM31;
+
+        let c0 = QM31(CM31(M31::from(100), M31::from(200)), CM31(M31::from(300), M31::from(400)));
+        let c2 = QM31(CM31(M31::from(500), M31::from(600)), CM31(M31::from(700), M31::from(800)));
+
+        // Regular packed: 2 felts (one per QM31)
+        let mut packed = Vec::new();
+        serialize_qm31_packed(c0, &mut packed);
+        serialize_qm31_packed(c2, &mut packed);
+        assert_eq!(packed.len(), 2);
+
+        // Double-packed: 1 felt (both QM31 in one)
+        let mut dp = Vec::new();
+        serialize_qm31_pair_packed(c0, c2, &mut dp);
+        assert_eq!(dp.len(), 1);
+
+        // Verify round-trip
+        let (rc0, rc2) = deserialize_qm31_pair_packed(dp[0]);
+        assert_eq!(rc0, c0);
+        assert_eq!(rc2, c2);
+    }
+
+    #[test]
+    fn test_double_packed_deg3_poly_roundtrip() {
+        use stwo::core::fields::cm31::CM31;
+        use stwo::core::fields::qm31::QM31;
+
+        // Degree-3 round polys serialize (c0, c2) as a pair + c3 as single packed
+        let c0 = QM31(
+            CM31(M31::from(111u32), M31::from(222u32)),
+            CM31(M31::from(333u32), M31::from(444u32)),
+        );
+        let c2 = QM31(
+            CM31(M31::from(555u32), M31::from(666u32)),
+            CM31(M31::from(777u32), M31::from(888u32)),
+        );
+        let c3 = QM31(
+            CM31(M31::from(999u32), M31::from(1111u32)),
+            CM31(M31::from(2222u32), M31::from(3333u32)),
+        );
+
+        // Serialize (c0, c2) as double-packed pair
+        let mut dp_pair = Vec::new();
+        serialize_qm31_pair_packed(c0, c2, &mut dp_pair);
+        assert_eq!(dp_pair.len(), 1);
+
+        // Serialize c3 as single-packed
+        let mut c3_packed = Vec::new();
+        serialize_qm31_packed(c3, &mut c3_packed);
+        assert_eq!(c3_packed.len(), 1);
+
+        // Round-trip pair
+        let (rc0, rc2) = deserialize_qm31_pair_packed(dp_pair[0]);
+        assert_eq!(rc0, c0, "deg3 pair c0 mismatch");
+        assert_eq!(rc2, c2, "deg3 pair c2 mismatch");
+
+        // Round-trip single
+        let rc3 = crate::crypto::poseidon_channel::felt_to_securefield(c3_packed[0]);
+        assert_eq!(rc3, c3, "deg3 single c3 mismatch");
+
+        // Total felts for a deg-3 round poly: 2 (pair + single) vs 3 (packed c0 + c2 + c3)
+        assert_eq!(dp_pair.len() + c3_packed.len(), 2);
+    }
+
+    #[test]
+    fn test_double_packed_edge_values() {
+        use stwo::core::fields::cm31::CM31;
+        use stwo::core::fields::qm31::QM31;
+
+        let zero = M31::from(0u32);
+        let max_m31 = M31::from(2147483646u32); // 2^31 - 2 (max valid M31)
+
+        let edge_cases = vec![
+            // All zeros
+            (
+                QM31(CM31(zero, zero), CM31(zero, zero)),
+                QM31(CM31(zero, zero), CM31(zero, zero)),
+                "all_zeros",
+            ),
+            // All max
+            (
+                QM31(CM31(max_m31, max_m31), CM31(max_m31, max_m31)),
+                QM31(CM31(max_m31, max_m31), CM31(max_m31, max_m31)),
+                "all_max",
+            ),
+            // Alternating zero/max in all 8 positions
+            (
+                QM31(CM31(zero, max_m31), CM31(zero, max_m31)),
+                QM31(CM31(zero, max_m31), CM31(zero, max_m31)),
+                "alternating_0_max",
+            ),
+            // Max in first, zero in rest
+            (
+                QM31(CM31(max_m31, zero), CM31(zero, zero)),
+                QM31(CM31(zero, zero), CM31(zero, zero)),
+                "max_first_only",
+            ),
+            // Zero in first, max in last
+            (
+                QM31(CM31(zero, zero), CM31(zero, zero)),
+                QM31(CM31(zero, zero), CM31(zero, max_m31)),
+                "max_last_only",
+            ),
+            // One value in each QM31 component
+            (
+                QM31(CM31(M31::from(1u32), zero), CM31(zero, zero)),
+                QM31(CM31(zero, zero), CM31(zero, M31::from(1u32))),
+                "sparse_ones",
+            ),
+        ];
+
+        for (a, b, label) in &edge_cases {
+            let mut buf = Vec::new();
+            serialize_qm31_pair_packed(*a, *b, &mut buf);
+            assert_eq!(buf.len(), 1, "edge case {}: expected 1 felt", label);
+            let (ra, rb) = deserialize_qm31_pair_packed(buf[0]);
+            assert_eq!(ra, *a, "edge case {}: a mismatch", label);
+            assert_eq!(rb, *b, "edge case {}: b mismatch", label);
+        }
+    }
+
+    #[test]
+    fn test_double_packed_full_proof_roundtrip() {
+        use stwo::core::fields::cm31::CM31;
+        use stwo::core::fields::qm31::QM31;
+
+        // Build a small GKR proof with multiple layer types to verify full
+        // serialize→deserialize round-trip for both packed and double-packed.
+        use crate::components::matmul::RoundPoly;
+        use crate::gkr::types::{
+            GKRClaim, GKRProof, LayerProof, RoundPolyDeg3,
+            WeightOpeningTranscriptMode,
+        };
+        use num_traits::Zero;
+
+        let q = |a: u32, b: u32, c: u32, d: u32| QM31(CM31(M31::from(a), M31::from(b)), CM31(M31::from(c), M31::from(d)));
+
+        let matmul_proof = LayerProof::MatMul {
+            round_polys: vec![
+                RoundPoly { c0: q(10, 20, 30, 40), c1: q(50, 60, 70, 80), c2: q(90, 100, 110, 120) },
+                RoundPoly { c0: q(130, 140, 150, 160), c1: q(170, 180, 190, 200), c2: q(210, 220, 230, 240) },
+            ],
+            final_a_eval: q(1000, 2000, 3000, 4000),
+            final_b_eval: q(5000, 6000, 7000, 8000),
+        };
+
+        let mul_proof = LayerProof::Mul {
+            eq_round_polys: vec![
+                RoundPolyDeg3 { c0: q(11, 22, 33, 44), c1: q(55, 66, 77, 88), c2: q(99, 111, 122, 133), c3: q(144, 155, 166, 177) },
+            ],
+            lhs_eval: q(1001, 2001, 3001, 4001),
+            rhs_eval: q(5001, 6001, 7001, 8001),
+        };
+
+        let proof = GKRProof {
+            layer_proofs: vec![matmul_proof, mul_proof],
+            output_claim: GKRClaim { point: vec![], value: QM31::zero() },
+            input_claim: GKRClaim { point: vec![], value: QM31::zero() },
+            weight_commitments: vec![],
+            weight_openings: vec![],
+            weight_claims: vec![],
+            weight_opening_transcript_mode: WeightOpeningTranscriptMode::Sequential,
+            io_commitment: FieldElement::ZERO,
+            deferred_proofs: vec![],
+            aggregated_binding: None,
+        };
+
+        // Serialize both ways
+        let mut packed = Vec::new();
+        serialize_gkr_proof_data_only_packed(&proof, &mut packed);
+
+        let mut double_packed = Vec::new();
+        serialize_gkr_proof_data_only_double_packed(&proof, &mut double_packed);
+
+        // Double-packed must be smaller
+        assert!(
+            double_packed.len() < packed.len(),
+            "double_packed ({}) should be smaller than packed ({})",
+            double_packed.len(),
+            packed.len()
+        );
+
+        // Verify round-trip of the double-packed data by walking it manually:
+        // MatMul layer: tag(1) + num_rounds(1) + 2*(pair=1) + final_a(1) + final_b(1) = 6
+        // Mul layer: tag(1) + num_rounds(1) + 1*(pair=1 + c3=1) + lhs(1) + rhs(1) = 6
+        // deferred count(1) = 1
+        // Total = 13
+        assert_eq!(
+            double_packed.len(), 13,
+            "expected 13 felts for double-packed proof, got {}",
+            double_packed.len()
+        );
+
+        // Walk the double-packed data and verify key values
+        let felt_to_u32 = |f: FieldElement| -> u32 {
+            let b = f.to_bytes_be();
+            u32::from_be_bytes([b[28], b[29], b[30], b[31]])
+        };
+        let mut off = 0usize;
+
+        // MatMul layer
+        let tag = felt_to_u32(double_packed[off]); off += 1;
+        assert_eq!(tag, 0, "MatMul tag");
+        let nrounds = felt_to_u32(double_packed[off]); off += 1;
+        assert_eq!(nrounds, 2, "MatMul rounds");
+
+        // Round 0: (c0, c2) pair
+        let (rc0, rc2) = deserialize_qm31_pair_packed(double_packed[off]); off += 1;
+        assert_eq!(rc0, q(10, 20, 30, 40), "MatMul round 0 c0");
+        assert_eq!(rc2, q(90, 100, 110, 120), "MatMul round 0 c2");
+
+        // Round 1: (c0, c2) pair
+        let (rc0, rc2) = deserialize_qm31_pair_packed(double_packed[off]); off += 1;
+        assert_eq!(rc0, q(130, 140, 150, 160), "MatMul round 1 c0");
+        assert_eq!(rc2, q(210, 220, 230, 240), "MatMul round 1 c2");
+
+        // final_a, final_b
+        let final_a = crate::crypto::poseidon_channel::felt_to_securefield(double_packed[off]); off += 1;
+        assert_eq!(final_a, q(1000, 2000, 3000, 4000), "MatMul final_a");
+        let final_b = crate::crypto::poseidon_channel::felt_to_securefield(double_packed[off]); off += 1;
+        assert_eq!(final_b, q(5000, 6000, 7000, 8000), "MatMul final_b");
+
+        // Mul layer
+        let tag = felt_to_u32(double_packed[off]); off += 1;
+        assert_eq!(tag, 2, "Mul tag");
+        let nrounds = felt_to_u32(double_packed[off]); off += 1;
+        assert_eq!(nrounds, 1, "Mul rounds");
+
+        // Round 0: (c0, c2) pair + c3 single
+        let (rc0, rc2) = deserialize_qm31_pair_packed(double_packed[off]); off += 1;
+        assert_eq!(rc0, q(11, 22, 33, 44), "Mul round 0 c0");
+        assert_eq!(rc2, q(99, 111, 122, 133), "Mul round 0 c2");
+        let rc3 = crate::crypto::poseidon_channel::felt_to_securefield(double_packed[off]); off += 1;
+        assert_eq!(rc3, q(144, 155, 166, 177), "Mul round 0 c3");
+
+        // lhs, rhs
+        let lhs = crate::crypto::poseidon_channel::felt_to_securefield(double_packed[off]); off += 1;
+        assert_eq!(lhs, q(1001, 2001, 3001, 4001), "Mul lhs");
+        let rhs = crate::crypto::poseidon_channel::felt_to_securefield(double_packed[off]); off += 1;
+        assert_eq!(rhs, q(5001, 6001, 7001, 8001), "Mul rhs");
+
+        // Deferred count
+        let deferred_count = felt_to_u32(double_packed[off]); off += 1;
+        assert_eq!(deferred_count, 0, "deferred count");
+
+        assert_eq!(off, double_packed.len(), "consumed all double-packed data");
     }
 }

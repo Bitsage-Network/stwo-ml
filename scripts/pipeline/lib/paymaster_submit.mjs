@@ -490,8 +490,90 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
   }
 
   const schemaVersion = Number(verifyCalldata.schema_version);
-  if (schemaVersion !== 1 && schemaVersion !== 2) {
-    die(`verify_calldata.schema_version must be 1 or 2 (got: ${JSON.stringify(verifyCalldata.schema_version)})`);
+  if (schemaVersion !== 1 && schemaVersion !== 2 && schemaVersion !== 3) {
+    die(`verify_calldata.schema_version must be 1, 2, or 3 (got: ${JSON.stringify(verifyCalldata.schema_version)})`);
+  }
+
+  // ── Schema v3: streaming calldata-only verification ──
+  if (schemaVersion === 3) {
+    const modelId = verifyCalldata.model_id || proofData.model_id || fallbackModelId;
+    if (!modelId) die("schema_version 3 requires model_id");
+
+    const initCalldata = verifyCalldata.init_calldata;
+    if (!Array.isArray(initCalldata) || initCalldata.length === 0) {
+      die("schema_version 3 requires non-empty init_calldata array");
+    }
+    const streamBatches = verifyCalldata.stream_batches;
+    if (!Array.isArray(streamBatches) || streamBatches.length === 0) {
+      die("schema_version 3 requires non-empty stream_batches array");
+    }
+    const finalizeCalldata = verifyCalldata.finalize_calldata;
+    if (!Array.isArray(finalizeCalldata) || finalizeCalldata.length === 0) {
+      die("schema_version 3 requires non-empty finalize_calldata array");
+    }
+
+    // Also require chunks for data integrity (upload phase)
+    const chunks = verifyCalldata.chunks;
+    if (!Array.isArray(chunks) || chunks.length === 0) {
+      die("schema_version 3 requires non-empty chunks array for data integrity");
+    }
+    const totalFelts = verifyCalldata.total_felts;
+    const numChunks = chunks.length;
+    const circuitDepth = verifyCalldata.circuit_depth;
+    const numLayers = verifyCalldata.num_layers;
+    const weightBindingMode = Number(verifyCalldata.weight_binding_mode);
+
+    if (typeof circuitDepth !== "number" || circuitDepth <= 0) {
+      die("schema_version 3 requires positive circuit_depth");
+    }
+    if (typeof numLayers !== "number" || numLayers <= 0) {
+      die("schema_version 3 requires positive num_layers");
+    }
+    if (weightBindingMode !== 4) {
+      die(`schema_version 3 requires weight_binding_mode=4 (got: ${weightBindingMode})`);
+    }
+
+    // Validate stream batches
+    let totalBatchLayers = 0;
+    for (let i = 0; i < streamBatches.length; i++) {
+      const b = streamBatches[i];
+      if (!b || typeof b.batch_idx !== "number" || typeof b.num_layers !== "number") {
+        die(`stream_batches[${i}] missing batch_idx or num_layers`);
+      }
+      if (!Array.isArray(b.calldata) || b.calldata.length === 0) {
+        die(`stream_batches[${i}] has empty calldata`);
+      }
+      // Enforce sequential batch ordering (defense-in-depth — contract also checks)
+      if (b.batch_idx !== i) {
+        die(`stream_batches[${i}] has wrong batch_idx ${b.batch_idx} (expected ${i})`);
+      }
+      totalBatchLayers += b.num_layers;
+    }
+    // Verify sum of batch layers equals total
+    if (totalBatchLayers !== numLayers) {
+      die(`stream_batches layer sum (${totalBatchLayers}) != num_layers (${numLayers})`);
+    }
+
+    return {
+      entrypoint: "verify_gkr_stream",
+      calldata: [],
+      uploadChunks: chunks,
+      sessionId: null,
+      modelId,
+      schemaVersion: 3,
+      chunked: true,
+      streaming: true,
+      totalFelts,
+      numChunks,
+      circuitDepth,
+      numLayers,
+      weightBindingMode,
+      packed: true,
+      ioPacked: true,
+      initCalldata,
+      streamBatches,
+      finalizeCalldata,
+    };
   }
 
   // ── Schema v2: chunked session mode ──
@@ -1377,7 +1459,8 @@ async function cmdVerify(args) {
         const isSealedResume = resumeState.status === "sealed" && resumeState.sessionId;
         if (isUploadResume || isSealedResume) {
           if (isSealedResume) {
-            info(`Found sealed session: ${resumeState.sessionId} — resuming from verify step`);
+            const fedInfo = resumeState.feedChunksFed ? ` (${resumeState.feedChunksFed} chunks fed)` : "";
+            info(`Found sealed session: ${resumeState.sessionId} — resuming from verify step${fedInfo}`);
             resumeIsSealedOnly = true;
           } else {
             info(`Found resumable session: ${resumeState.sessionId} (${resumeState.chunksUploaded}/${resumeState.numChunks} chunks uploaded)`);
@@ -1648,6 +1731,12 @@ async function cmdVerify(args) {
         createdAt: new Date().toISOString(),
         createdAt_block: openBlockNumber,
         proofContentHash,
+        // Streaming (v25) resume state
+        ...(verifyPayload.streaming && {
+          streamInitDone: false,
+          streamBatchesDone: 0,
+          streamFinalized: false,
+        }),
       };
       safeWriteJson(sessionFile, sessionState);
     }
@@ -1908,16 +1997,181 @@ async function cmdVerify(args) {
     await new Promise((r) => setTimeout(r, 2000));
     } // end !resumeIsSealedOnly
 
-    // ── Step 4: verify_gkr_from_session ──
-    // After seal, the session cannot be resumed (sealed sessions are immutable).
-    // Wrap in try/catch to ensure resume file cleanup even on verify failure.
+    // ── Step 4: Verification Phase ──
     let verifyTxHash;
+
+    // ── Schema v3: Streaming calldata-only verification (v25) ──
+    // No storage reads for proof data — each batch flows as fresh calldata.
+    // Protocol: stream_init → stream_layers × M → stream_finalize
+    if (verifyPayload.streaming) {
     try {
-      e2ePhase("Verifying session");
+      // Phase 4a: verify_gkr_stream_init
+      const streamResumeFrom = sessionState.streamBatchesDone || 0;
+      if (!sessionState.streamInitDone) {
+        e2ePhase("Stream init (IO commitment + initial claim)");
+        const initArgs = verifyPayload.initCalldata.map(
+          (v) => v === "__SESSION_ID__" ? sessionId : v,
+        );
+        const { txHash: initTxHash } = await execCallWithRetry(
+          "verify_gkr_stream_init",
+          initArgs,
+          "verify_gkr_stream_init",
+        );
+        sessionState.streamInitDone = true;
+        sessionState.txHashes.push(initTxHash);
+        safeWriteJson(sessionFile, sessionState);
+      } else {
+        info("  Resuming — stream_init already done");
+      }
+
+      // Phase 4b: verify_gkr_stream_layers × M
+      const batches = verifyPayload.streamBatches;
+      if (streamResumeFrom < batches.length) {
+        e2ePhase(`Streaming ${batches.length} layer batches`);
+        let cachedStreamFee = null;
+        for (let i = streamResumeFrom; i < batches.length; i++) {
+          const batch = batches[i];
+          const batchArgs = batch.calldata.map(
+            (v) => v === "__SESSION_ID__" ? sessionId : v,
+          );
+          const pct = (((i + 1) / batches.length) * 100).toFixed(1);
+          const execOpts = cachedStreamFee ? { cachedMaxFee: cachedStreamFee } : {};
+          const { txHash: streamTxHash } = await execCallWithRetry(
+            "verify_gkr_stream_layers",
+            batchArgs,
+            `verify_gkr_stream_layers[${i + 1}/${batches.length}] (${batch.num_layers} layers, ${pct}%)`,
+            execOpts,
+          );
+          // Cache fee after first successful batch
+          if (!cachedStreamFee && !noPaymaster) {
+            try {
+              const callsArray = [{
+                contractAddress: contract,
+                entrypoint: "verify_gkr_stream_layers",
+                calldata: CallData.compile(batchArgs),
+              }];
+              const feeDetails = { feeMode: { mode: "sponsored" } };
+              const estimation = await account.estimatePaymasterTransactionFee(callsArray, feeDetails);
+              const feeStr = estimation?.suggested_max_fee_in_gas_token;
+              if (feeStr) {
+                cachedStreamFee = "0x" + (BigInt(feeStr) * 2n).toString(16);
+                info(`  Cached stream batch fee: ${cachedStreamFee}`);
+              }
+            } catch { /* continue with full estimation */ }
+          }
+          sessionState.streamBatchesDone = i + 1;
+          sessionState.txHashes.push(streamTxHash);
+          safeWriteJson(sessionFile, sessionState);
+        }
+      } else {
+        info(`  Resuming — all ${batches.length} stream batches done`);
+      }
+
+      // Phase 4c: verify_gkr_stream_finalize
+      if (!sessionState.streamFinalized) {
+        e2ePhase("Stream finalize (weight binding + proof recording)");
+        const finalizeArgs = verifyPayload.finalizeCalldata.map(
+          (v) => v === "__SESSION_ID__" ? sessionId : v,
+        );
+        const result = await execCallWithRetry(
+          "verify_gkr_stream_finalize",
+          finalizeArgs,
+          "verify_gkr_stream_finalize",
+        );
+        verifyTxHash = result.txHash;
+        sessionState.streamFinalized = true;
+        sessionState.status = "verified";
+        sessionState.txHashes.push(verifyTxHash);
+        safeWriteJson(sessionFile, sessionState);
+      }
+    } catch (streamErr) {
+      const streamErrMsg = truncateRpcError(streamErr);
+      const isPermanentStreamErr = /entry.?point.?not.?found|class.?not.?found|not.?deployed/i.test(streamErrMsg);
+      if (isPermanentStreamErr) {
+        try { if (existsSync(resumeFile)) unlinkSync(resumeFile); } catch { /* ignore */ }
+        die(`Streaming verification permanently failed: ${streamErrMsg}`);
+      }
+      info(`Streaming verification failed (transient): ${streamErrMsg}`);
+      info(`  Session ${sessionId} progress: init=${sessionState.streamInitDone}, batches=${sessionState.streamBatchesDone || 0}/${verifyPayload.streamBatches.length}`);
+      info(`  Re-run the script to retry from where it left off.`);
+      die(`Streaming verification failed: ${streamErrMsg}`);
+    }
+    } else {
+    // ── Two-phase verification (v24, schema_version 2) ──
+    // Phase 4a: Feed chunks — re-submit chunk data as calldata, hash-verified against upload hashes.
+    // Phase 4b: Execute — run GKR walk from flat-indexed storage.
+    // This replaces the old single-TX verify_gkr_from_session which exceeded step limits
+    // for large proofs (14K+ felts require 14K+ storage reads in one TX).
+    try {
+      // Phase 4a: verify_gkr_feed_chunk (re-submit chunks as calldata)
+      const feedResumeFrom = sessionState.feedChunksFed || 0;
+      if (feedResumeFrom < verifyPayload.numChunks) {
+        e2ePhase("Feeding chunks for verification");
+        let cachedFeedFee = null;
+        for (let i = feedResumeFrom; i < verifyPayload.numChunks; i++) {
+          const chunk = verifyPayload.uploadChunks[i];
+          const pct = ((i / verifyPayload.numChunks) * 100).toFixed(1);
+          const execOpts = cachedFeedFee ? { cachedMaxFee: cachedFeedFee } : {};
+          for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+            try {
+              const { txHash: feedTxHash } = await execCall(
+                "verify_gkr_feed_chunk",
+                [sessionId, String(i), String(chunk.length), ...chunk],
+                `verify_gkr_feed_chunk[${i + 1}/${verifyPayload.numChunks}] (${chunk.length} felts, ${pct}%)`,
+                execOpts
+              );
+              // Cache fee after first successful feed
+              if (!cachedFeedFee && !noPaymaster) {
+                try {
+                  const callsArray = [{
+                    contractAddress: contract,
+                    entrypoint: "verify_gkr_feed_chunk",
+                    calldata: CallData.compile([sessionId, String(0), String(chunk.length), ...chunk]),
+                  }];
+                  const feeDetails = { feeMode: { mode: "sponsored" } };
+                  const estimation = await account.estimatePaymasterTransactionFee(callsArray, feeDetails);
+                  const feeStr = estimation?.suggested_max_fee_in_gas_token;
+                  if (feeStr) {
+                    cachedFeedFee = "0x" + (BigInt(feeStr) * 2n).toString(16);
+                    info(`  Cached feed phase fee: ${cachedFeedFee}`);
+                  }
+                } catch { /* continue with full estimation */ }
+              }
+              sessionState.feedChunksFed = i + 1;
+              sessionState.txHashes.push(feedTxHash);
+              safeWriteJson(sessionFile, sessionState);
+              break;
+            } catch (e) {
+              const errMsg = truncateRpcError(e);
+              info(`  Feed chunk ${i} attempt ${attempt + 1} failed: ${errMsg}`);
+              if (cachedFeedFee && /INSUFFICIENT|insufficient/i.test(errMsg)) {
+                cachedFeedFee = null;
+              }
+              if (attempt < MAX_RETRIES - 1) {
+                const isRateLimit = /429|rate.?limit|too many|throttl/i.test(errMsg);
+                const backoffMs = isRateLimit ? Math.min((attempt + 1) * 30000, 60000) : Math.min((attempt + 1) * 5000, 20000);
+                await new Promise((r) => setTimeout(r, backoffMs));
+              } else {
+                throw e;
+              }
+            }
+          }
+          if (i < verifyPayload.numChunks - 1) {
+            await new Promise((r) => setTimeout(r, INTER_CHUNK_DELAY_MS));
+          }
+        }
+        info("All chunks fed. Brief settle before execute...");
+        await new Promise((r) => setTimeout(r, 2000));
+      } else {
+        info(`  Resuming — all ${verifyPayload.numChunks} chunks already fed`);
+      }
+
+      // Phase 4b: verify_gkr_execute
+      e2ePhase("Executing GKR verification");
       const result = await execCallWithRetry(
-        "verify_gkr_from_session",
+        "verify_gkr_execute",
         [sessionId],
-        "verify_gkr_from_session"
+        "verify_gkr_execute"
       );
       verifyTxHash = result.txHash;
       sessionState.status = "verified";
@@ -1930,14 +2184,16 @@ async function cmdVerify(args) {
       const isPermanentVerifyErr = /entry.?point.?not.?found|class.?not.?found|not.?deployed|session.?not.?found|invalid.?session/i.test(verifyErrMsg);
       if (isPermanentVerifyErr) {
         try { if (existsSync(resumeFile)) unlinkSync(resumeFile); } catch { /* ignore */ }
-        die(`verify_gkr_from_session permanently failed: ${verifyErrMsg}`);
+        die(`Two-phase verification permanently failed: ${verifyErrMsg}`);
       }
       // Transient error: keep resume file with "sealed" status for retry on next run
-      info(`verify_gkr_from_session failed (transient): ${verifyErrMsg}`);
-      info(`  Session ${sessionId} is sealed. Re-run the script to retry verification.`);
+      info(`Two-phase verification failed (transient): ${verifyErrMsg}`);
+      info(`  Session ${sessionId} is sealed (${sessionState.feedChunksFed || 0}/${verifyPayload.numChunks} chunks fed).`);
+      info(`  Re-run the script to retry from where it left off.`);
       info(`  Resume file: ${resumeFile}`);
-      die(`verify_gkr_from_session failed after seal: ${verifyErrMsg}`);
+      die(`Two-phase verification failed after seal: ${verifyErrMsg}`);
     }
+    } // end else (two-phase v24 path)
 
     // ── Check verification result ──
     // Retry verification count query up to 3 times (RPC may lag behind L2 state)

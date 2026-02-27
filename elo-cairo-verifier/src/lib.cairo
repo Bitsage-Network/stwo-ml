@@ -12,9 +12,9 @@ pub mod model_verifier;
 // pub mod audit;           // stripped for lean v18b
 // pub mod access_control;  // stripped for lean v18b
 // pub mod view_key;        // stripped for lean v18b
-// pub mod vm31_merkle;  // stripped for lean v18b (PackedDigest inlined in verifier)
-// pub mod vm31_verifier;  // only used by vm31_pool
-// pub mod vm31_pool;      // separate contract, 1556 lines
+pub mod vm31_merkle;
+pub mod vm31_verifier;
+pub mod vm31_pool;
 // pub mod mock_proof_verifier;
 // pub mod mock_erc20;
 // pub mod aggregated_binding;  // stripped for lean v18b (RLC-only path used)

@@ -20,11 +20,12 @@ _OBELYSK_CONTRACTS_LOADED=1
 # StweMlStarkVerifier (recursive STARK verification)
 STARK_VERIFIER_SEPOLIA="0x005928ac548dc2719ef1b34869db2b61c2a55a4b148012fad742262a8d674fba"
 
-# Obelysk/Elo Cairo Verifier (GKR verification + audit) — v19
-# Class hash: 0x355910b5fda51d7048354e37a812bab71502dc1ae95655019aa97b3e1f86fb6
-# Previous class hash (v18b lean): 0x9355a647a88350aef2bf44b40df0117a384872aa4c07a6fb0b3a6c292b665a
-# v19 changes: compressed round polys (c1 omitted), batched channel_mix, aggregate weight root hash
-# Entrypoints: verify_model_gkr_v4_packed, verify_model_gkr_v4_packed_io (direct calldata, no storage reads)
+# Obelysk/Elo Cairo Verifier (GKR verification + audit) — v24
+# Class hash: 0x77ccc67d7ba2bc1102d7c5c5d1ddf1bc697c709721ac452529c1bb1002fd1f3
+# Previous class hash (v23): 0x4bf2ec8f53c88f64c3d72e07b788b3cf932df9fea8177ca5d8171f1672f36f
+# v24 fix: hash-based upload (no per-felt storage), two-phase verify (feed+execute) for step budget
+# Entrypoints: verify_model_gkr_v4_packed_io, open_gkr_session, upload_gkr_chunk, seal_gkr_session,
+#   verify_gkr_from_session, verify_gkr_feed_chunk, verify_gkr_execute
 ELO_VERIFIER_SEPOLIA="0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005"
 
 # VM31 Privacy Pool

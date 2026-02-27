@@ -12,7 +12,7 @@
 //   0=MatMul, 1=Add, 2=Mul, 3=Activation, 4=LayerNorm,
 //   5=Attention, 6=Dequantize, 7=MatMulDualSimd, 8=RMSNorm
 
-use crate::field::{QM31, CM31, qm31_zero, log2_ceil, next_power_of_two, unpack_qm31_from_felt};
+use crate::field::{QM31, CM31, qm31_zero, log2_ceil, next_power_of_two, unpack_qm31_from_felt, unpack_qm31_pair_from_felt, pack_qm31_to_felt};
 use crate::channel::{PoseidonChannel, channel_mix_secure_field};
 use crate::types::{GKRClaim, CompressedRoundPoly, CompressedGkrRoundPoly};
 use crate::layer_verifiers::{
@@ -41,25 +41,32 @@ pub struct WeightClaimData {
 /// Advances through the data one field at a time.
 /// When `packed` is true, QM31 values are read from a single packed felt252
 /// (4x compression) instead of 4 separate felt252s.
+/// When `double_packed` is true, degree-2 round polys (c0, c2) are read as
+/// a single felt252 containing two QM31 values (8x compression per pair).
 #[derive(Drop, Copy)]
-struct ProofReader {
-    data: Span<felt252>,
-    offset: u32,
-    packed: bool,
+pub struct ProofReader {
+    pub data: Span<felt252>,
+    pub offset: u32,
+    pub packed: bool,
+    pub double_packed: bool,
 }
 
-fn reader_new(data: Span<felt252>, packed: bool) -> ProofReader {
-    ProofReader { data, offset: 0, packed }
+pub fn reader_new(data: Span<felt252>, packed: bool) -> ProofReader {
+    ProofReader { data, offset: 0, packed, double_packed: false }
 }
 
-fn read_felt(ref r: ProofReader) -> felt252 {
+pub fn reader_new_double_packed(data: Span<felt252>) -> ProofReader {
+    ProofReader { data, offset: 0, packed: true, double_packed: true }
+}
+
+pub fn read_felt(ref r: ProofReader) -> felt252 {
     assert!(r.offset < r.data.len(), "PROOF_DATA_TRUNCATED");
     let v = *r.data.at(r.offset);
     r.offset += 1;
     v
 }
 
-fn read_u32(ref r: ProofReader) -> u32 {
+pub fn read_u32(ref r: ProofReader) -> u32 {
     let f = read_felt(ref r);
     let v: u256 = f.into();
     v.try_into().unwrap()
@@ -71,7 +78,7 @@ fn read_u64(ref r: ProofReader) -> u64 {
     v.try_into().unwrap()
 }
 
-fn read_qm31(ref r: ProofReader) -> QM31 {
+pub fn read_qm31(ref r: ProofReader) -> QM31 {
     if r.packed {
         let f = read_felt(ref r);
         unpack_qm31_from_felt(f)
@@ -84,9 +91,20 @@ fn read_qm31(ref r: ProofReader) -> QM31 {
     }
 }
 
+/// Read two QM31 values from a single double-packed felt252.
+pub fn read_qm31_pair(ref r: ProofReader) -> (QM31, QM31) {
+    let f = read_felt(ref r);
+    unpack_qm31_pair_from_felt(f)
+}
+
 /// Read a compressed degree-2 round polynomial (c0, c2 only — c1 omitted).
 /// The verifier reconstructs c1 = current_sum - 2*c0 - c2 during verification.
 fn read_compressed_deg2_poly(ref r: ProofReader) -> CompressedRoundPoly {
+    if r.double_packed {
+        // Double-packed: c0 and c2 in a single felt252
+        let (c0, c2) = read_qm31_pair(ref r);
+        return CompressedRoundPoly { c0, c2 };
+    }
     let c0 = read_qm31(ref r);
     let c2 = read_qm31(ref r);
     CompressedRoundPoly { c0, c2 }
@@ -95,6 +113,12 @@ fn read_compressed_deg2_poly(ref r: ProofReader) -> CompressedRoundPoly {
 /// Read a compressed degree-3 round polynomial (c0, c2, c3 — c1 omitted).
 /// The verifier reconstructs c1 = current_sum - 2*c0 - c2 - c3 during verification.
 fn read_compressed_deg3_poly(ref r: ProofReader) -> CompressedGkrRoundPoly {
+    if r.double_packed {
+        // Double-packed: (c0, c2) in one felt, c3 as single packed QM31
+        let (c0, c2) = read_qm31_pair(ref r);
+        let c3 = read_qm31(ref r);
+        return CompressedGkrRoundPoly { c0, c2, c3 };
+    }
     let c0 = read_qm31(ref r);
     let c2 = read_qm31(ref r);
     let c3 = read_qm31(ref r);
@@ -166,7 +190,7 @@ fn read_optional_logup(
 
 /// Parse and verify a Tag 0 (MatMul) layer proof.
 /// Returns (new_claim, final_b_eval) — final_b_eval is needed for weight opening verification.
-fn dispatch_matmul(
+pub fn dispatch_matmul(
     current_claim: @GKRClaim,
     m: u32,
     k: u32,
@@ -370,6 +394,10 @@ pub fn verify_gkr_model(
 /// packed felt252s (4x compression). All other data (tags, u32, felt252)
 /// is read identically.
 ///
+/// When `double_packed` is true (implies packed), degree-2 round polys
+/// are read as paired QM31 values from a single felt252 (c0+c2 in 248 bits),
+/// and degree-3 round polys read (c0,c2) paired + c3 single.
+///
 /// Returns:
 ///   - final_input_claim
 ///   - weight_claims (main + deferred)
@@ -384,7 +412,28 @@ pub fn verify_gkr_model_with_trace(
     ref ch: PoseidonChannel,
     packed: bool,
 ) -> (GKRClaim, Array<WeightClaimData>, Array<u32>, Array<felt252>) {
-    let mut reader = reader_new(proof_data, packed);
+    verify_gkr_model_with_trace_dp(
+        proof_data, num_layers, matmul_dims, dequantize_bits,
+        initial_claim, ref ch, packed, false,
+    )
+}
+
+/// Double-pack-aware variant of verify_gkr_model_with_trace.
+pub fn verify_gkr_model_with_trace_dp(
+    proof_data: Span<felt252>,
+    num_layers: u32,
+    matmul_dims: Span<u32>,
+    dequantize_bits: Span<u64>,
+    initial_claim: GKRClaim,
+    ref ch: PoseidonChannel,
+    packed: bool,
+    double_packed: bool,
+) -> (GKRClaim, Array<WeightClaimData>, Array<u32>, Array<felt252>) {
+    let mut reader = if double_packed {
+        reader_new_double_packed(proof_data)
+    } else {
+        reader_new(proof_data, packed)
+    };
     let mut current_claim = initial_claim;
     let mut weight_claims: Array<WeightClaimData> = array![];
     let mut layer_tags: Array<u32> = array![];
@@ -561,4 +610,155 @@ pub fn verify_gkr_model_with_trace(
 
     assert!(reader.offset == reader.data.len(), "PROOF_DATA_TRAILING");
     (current_claim, weight_claims, layer_tags, deferred_weight_commitments)
+}
+
+// ============================================================================
+// Streaming Batch Verifier (v25)
+// ============================================================================
+
+/// Intermediate state returned by verify_gkr_layers_batch.
+/// All hashes are incremental Poseidon hashes to avoid accumulating arrays.
+#[derive(Drop)]
+pub struct GKRBatchResult {
+    /// Updated claim after processing this batch of layers
+    pub next_claim: GKRClaim,
+    /// Running Poseidon hash of packed weight expected_values
+    pub weight_hash: felt252,
+    /// Running Poseidon hash of layer tags
+    pub tags_hash: felt252,
+    /// Total weight claims seen so far (across all batches)
+    pub weight_count: u32,
+    /// Updated matmul dimension index (for next batch)
+    pub matmul_idx: u32,
+    /// Updated dequantize bits index (for next batch)
+    pub dequantize_idx: u32,
+    /// Claim points saved at each Add layer in this batch (for deferred proofs).
+    /// Each Add layer (tag=1) produces a point snapshot used later for deferred
+    /// matmul sumcheck verification of skip connections.
+    pub deferred_add_points: Array<Array<QM31>>,
+}
+
+/// Verify a batch of N consecutive GKR layers and return intermediate state.
+///
+/// Unlike verify_gkr_model_with_trace, this processes only `num_layers_in_batch`
+/// layers and uses incremental hashing instead of accumulating full arrays.
+/// Weight claims are hashed: weight_hash = poseidon(prev_hash, packed_expected_value).
+/// Layer tags are hashed: tags_hash = poseidon(prev_hash, tag).
+///
+/// The caller is responsible for:
+///   1. Providing the correct initial_claim (from init TX or previous batch)
+///   2. Providing only this batch's matmul_dims / dequantize_bits slices
+///   3. Passing the running hashes from the previous batch
+///   4. Processing deferred proofs in the finalize TX (not here)
+///
+/// Parameters:
+///   - proof_data: flat felt252 proof data for THIS batch only
+///   - num_layers_in_batch: layers to process in this batch
+///   - matmul_dims_batch: [m0,k0,n0, ...] only for MatMuls in this batch
+///   - dequantize_bits_batch: [bits0, ...] only for Dequantizes in this batch
+///   - initial_claim: claim entering this batch
+///   - ch: Fiat-Shamir channel (mutated, checkpoint between TXs)
+///   - packed: whether QM31 values are packed
+///   - prev_weight_hash: running Poseidon hash from previous batch
+///   - prev_tags_hash: running Poseidon hash from previous batch
+///   - prev_weight_count: weight claims from previous batches
+///   - prev_matmul_idx: matmul dim index offset from previous batches
+///   - prev_dequantize_idx: dequantize bits index offset from previous batches
+pub fn verify_gkr_layers_batch(
+    proof_data: Span<felt252>,
+    num_layers_in_batch: u32,
+    matmul_dims_batch: Span<u32>,
+    dequantize_bits_batch: Span<u64>,
+    initial_claim: GKRClaim,
+    ref ch: PoseidonChannel,
+    packed: bool,
+    prev_weight_hash: felt252,
+    prev_tags_hash: felt252,
+    prev_weight_count: u32,
+) -> GKRBatchResult {
+    let mut reader = reader_new(proof_data, packed);
+    let mut current_claim = initial_claim;
+    let mut weight_hash = prev_weight_hash;
+    let mut tags_hash = prev_tags_hash;
+    let mut weight_count = prev_weight_count;
+    let mut deferred_add_points: Array<Array<QM31>> = array![];
+
+    // Local counters for THIS batch's dimension arrays
+    let mut matmul_idx: u32 = 0;
+    let mut dequantize_idx: u32 = 0;
+
+    let mut layer_idx: u32 = 0;
+    loop {
+        if layer_idx >= num_layers_in_batch {
+            break;
+        }
+
+        let tag = read_u32(ref reader);
+        // Incrementally hash the tag
+        tags_hash = core::poseidon::poseidon_hash_span(
+            array![tags_hash, tag.into()].span(),
+        );
+
+        if tag == 0 {
+            // MatMul
+            let dims_base = matmul_idx * 3;
+            assert!(dims_base + 2 < matmul_dims_batch.len(), "BATCH_MATMUL_DIMS_UNDERRUN");
+            let m = *matmul_dims_batch.at(dims_base);
+            let k = *matmul_dims_batch.at(dims_base + 1);
+            let n = *matmul_dims_batch.at(dims_base + 2);
+            matmul_idx += 1;
+
+            let (new_claim, final_b_eval) = dispatch_matmul(
+                @current_claim, m, k, n, ref reader, ref ch,
+            );
+
+            // Incrementally hash the packed expected_value
+            let packed_ev = pack_qm31_to_felt(final_b_eval);
+            weight_hash = core::poseidon::poseidon_hash_span(
+                array![weight_hash, packed_ev].span(),
+            );
+            weight_count += 1;
+
+            current_claim = new_claim;
+        } else if tag == 1 {
+            // Add — save claim point for deferred proof (skip connections)
+            let claim_snap = @current_claim;
+            deferred_add_points.append(clone_point(claim_snap.point));
+            current_claim = dispatch_add(@current_claim, ref reader, ref ch);
+        } else if tag == 2 {
+            // Mul
+            current_claim = dispatch_mul(@current_claim, ref reader, ref ch);
+        } else if tag == 3 {
+            // Activation
+            current_claim = dispatch_activation(@current_claim, ref reader, ref ch);
+        } else if tag == 4 {
+            // LayerNorm
+            current_claim = dispatch_layernorm(@current_claim, ref reader, ref ch);
+        } else if tag == 6 {
+            // Dequantize
+            assert!(dequantize_idx < dequantize_bits_batch.len(), "BATCH_DEQUANTIZE_BITS_UNDERRUN");
+            let bits = *dequantize_bits_batch.at(dequantize_idx);
+            dequantize_idx += 1;
+            current_claim = dispatch_dequantize(@current_claim, bits, ref reader, ref ch);
+        } else if tag == 8 {
+            // RMSNorm
+            current_claim = dispatch_rmsnorm(@current_claim, ref reader, ref ch);
+        } else {
+            assert!(false, "UNKNOWN_LAYER_TAG");
+        }
+
+        layer_idx += 1;
+    };
+
+    assert!(reader.offset == reader.data.len(), "BATCH_PROOF_DATA_TRAILING");
+
+    GKRBatchResult {
+        next_claim: current_claim,
+        weight_hash,
+        tags_hash,
+        weight_count,
+        matmul_idx,
+        dequantize_idx,
+        deferred_add_points,
+    }
 }

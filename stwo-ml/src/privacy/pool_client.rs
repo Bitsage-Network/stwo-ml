@@ -226,10 +226,18 @@ impl PoolClient {
     }
 
     /// Get the current Merkle root of the pool.
+    ///
+    /// Cairo returns `PackedDigest` (lo, hi) — 2 felt252 values.
     #[cfg(feature = "audit-http")]
     pub fn get_merkle_root(&self) -> Result<[M31; RATE], PoolClientError> {
         let result = self.starknet_call("get_merkle_root", &[])?;
-        parse_m31_digest_from_result(&result)
+        if result.len() < 2 {
+            return Err(PoolClientError::Parse(format!(
+                "get_merkle_root: expected 2 values (lo, hi), got {}",
+                result.len()
+            )));
+        }
+        parse_lo_hi_commitment(&result[0], &result[1])
     }
 
     /// Get the tree size (number of leaves inserted).
@@ -244,20 +252,22 @@ impl PoolClient {
     }
 
     /// Check if a nullifier has been spent.
+    ///
+    /// Cairo expects `PackedDigest` (lo, hi) — 2 felt252 calldata values.
     #[cfg(feature = "audit-http")]
     pub fn is_nullifier_spent(&self, nullifier: &[M31; RATE]) -> Result<bool, PoolClientError> {
-        let calldata: Vec<String> = nullifier.iter().map(|m| format!("0x{:x}", m.0)).collect();
-        let calldata_refs: Vec<&str> = calldata.iter().map(|s| s.as_str()).collect();
-        let result = self.starknet_call("is_nullifier_spent", &calldata_refs)?;
+        let (lo, hi) = pack_m31x8_to_lo_hi(nullifier);
+        let result = self.starknet_call("is_nullifier_spent", &[&lo, &hi])?;
         Ok(!result.is_empty() && result[0] != "0x0")
     }
 
     /// Check if a root is a known historical root.
+    ///
+    /// Cairo expects `PackedDigest` (lo, hi) — 2 felt252 calldata values.
     #[cfg(feature = "audit-http")]
     pub fn is_known_root(&self, root: &[M31; RATE]) -> Result<bool, PoolClientError> {
-        let calldata: Vec<String> = root.iter().map(|m| format!("0x{:x}", m.0)).collect();
-        let calldata_refs: Vec<&str> = calldata.iter().map(|s| s.as_str()).collect();
-        let result = self.starknet_call("is_known_root", &calldata_refs)?;
+        let (lo, hi) = pack_m31x8_to_lo_hi(root);
+        let result = self.starknet_call("is_known_root", &[&lo, &hi])?;
         Ok(!result.is_empty() && result[0] != "0x0")
     }
 
@@ -296,8 +306,7 @@ impl PoolClient {
             });
         }
 
-        let calldata: Vec<String> = root.iter().map(|m| format!("0x{:x}", m.0)).collect();
-        let calldata_refs: Vec<&str> = calldata.iter().map(|s| s.as_str()).collect();
+        let (lo, hi) = pack_m31x8_to_lo_hi(root);
 
         let mut confirmed = 0u32;
         let mut unreachable = 0u32;
@@ -307,7 +316,7 @@ impl PoolClient {
                 url,
                 &self.config.pool_address,
                 "is_known_root",
-                &calldata_refs,
+                &[&lo, &hi],
             ) {
                 Ok(result) => {
                     if !result.is_empty() && result[0] != "0x0" {
@@ -506,6 +515,24 @@ impl PoolClient {
 fn parse_felt_u64(hex: &str) -> Result<u64, PoolClientError> {
     let hex = hex.strip_prefix("0x").unwrap_or(hex);
     u64::from_str_radix(hex, 16).map_err(|e| PoolClientError::Parse(format!("felt u64: {e}")))
+}
+
+/// Pack [M31; 8] into (lo, hi) felt252 pair for contract calldata.
+///
+/// Inverse of `parse_lo_hi_commitment`. Matches `pack_m31x8` in vm31_merkle.cairo:
+///   lo = v[0] + v[1]*2^31 + v[2]*2^62 + v[3]*2^93
+///   hi = v[4] + v[5]*2^31 + v[6]*2^62 + v[7]*2^93
+#[cfg(feature = "audit-http")]
+fn pack_m31x8_to_lo_hi(digest: &[M31; RATE]) -> (String, String) {
+    let pack_half = |vals: &[M31]| -> u128 {
+        (vals[0].0 as u128)
+            | ((vals[1].0 as u128) << 31)
+            | ((vals[2].0 as u128) << 62)
+            | ((vals[3].0 as u128) << 93)
+    };
+    let lo = pack_half(&digest[0..4]);
+    let hi = pack_half(&digest[4..8]);
+    (format!("0x{lo:x}"), format!("0x{hi:x}"))
 }
 
 /// Parse (lo, hi) felt252 pair to [M31; 8] commitment.

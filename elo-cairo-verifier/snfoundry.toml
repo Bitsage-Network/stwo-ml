@@ -1,0 +1,3 @@
+[sncast.mainnet]
+account = "mainnet-deployer"
+accounts-file = "../../Obelysk-Protocol/contracts/deployment/sncast_accounts.json"

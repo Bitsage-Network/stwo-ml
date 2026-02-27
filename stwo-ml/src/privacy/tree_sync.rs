@@ -139,6 +139,17 @@ impl TreeSync {
         let local_size = self.tree.size();
 
         if local_size == on_chain_size {
+            // Empty pool has no finalized roots yet — skip verification
+            if on_chain_size == 0 {
+                return Ok(SyncResult {
+                    total_leaves: 0,
+                    events_added: 0,
+                    root_verified: true,
+                    cross_verified: false,
+                    verify_confirmed: 0,
+                    verify_total: 0,
+                });
+            }
             let local_root = self.tree.root();
             let cv = Self::verify_root_cross_rpc(pool, &local_root)?;
             if !cv.is_confirmed() {

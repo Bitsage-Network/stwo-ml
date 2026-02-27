@@ -1401,6 +1401,8 @@ pub struct ChunkedGkrCalldata {
     pub weight_binding_mode: u32,
     /// Whether proof_data uses packed QM31 format (1 felt per QM31).
     pub packed: bool,
+    /// Whether proof_data uses double-packed QM31 format (c0+c2 pair in 1 felt).
+    pub double_packed: bool,
     /// Whether raw_io_data is packed (8 M31 values per felt252).
     pub io_packed: bool,
     /// Session data split into chunks of ≤ MAX_GKR_CHUNK_FELTS hex-encoded felts.
@@ -1483,29 +1485,49 @@ pub fn build_chunked_gkr_calldata(
         flat.push(format!("{}", b));
     }
 
-    // 4. proof_data — packed (1 felt/QM31) unless STWO_NO_PACKED is set
+    // 4. proof_data — try double-packed first, then packed, then unpacked
     let use_packed = std::env::var("STWO_NO_PACKED").is_err();
+    let use_double_packed = use_packed && std::env::var("STWO_NO_DOUBLE_PACK").is_err();
     let mut proof_data = Vec::new();
-    if use_packed {
+    let actually_double_packed;
+    if use_double_packed {
+        crate::cairo_serde::serialize_gkr_proof_data_only_double_packed(proof, &mut proof_data);
+        actually_double_packed = true;
+    } else if use_packed {
         crate::cairo_serde::serialize_gkr_proof_data_only_packed(proof, &mut proof_data);
+        actually_double_packed = false;
     } else {
         crate::cairo_serde::serialize_gkr_proof_data_only(proof, &mut proof_data);
+        actually_double_packed = false;
     }
 
     // Self-verify: replay Fiat-Shamir channel against serialized proof to catch
     // prover/serializer mismatches before saving. This prevents stale-binary bugs
     // from producing proofs that fail on-chain verification.
     if std::env::var("STWO_SKIP_SELF_VERIFY").is_err() {
-        replay_verify_serialized_proof(
-            &proof_data,
-            raw_io_data,
-            &matmul_dims,
-            circuit_depth,
-            num_layers,
-            use_packed,
-        ).map_err(|e| StarknetModelError::SoundnessGate(
-            format!("self-verification failed: {e}")
-        ))?;
+        if actually_double_packed {
+            replay_verify_double_packed_proof(
+                &proof_data,
+                raw_io_data,
+                &matmul_dims,
+                circuit_depth,
+                num_layers,
+                proof,
+            ).map_err(|e| StarknetModelError::SoundnessGate(
+                format!("chunked double-packed self-verification failed: {e}")
+            ))?;
+        } else {
+            replay_verify_serialized_proof(
+                &proof_data,
+                raw_io_data,
+                &matmul_dims,
+                circuit_depth,
+                num_layers,
+                use_packed,
+            ).map_err(|e| StarknetModelError::SoundnessGate(
+                format!("self-verification failed: {e}")
+            ))?;
+        }
     }
 
     push_felt_section!(&proof_data);
@@ -1582,9 +1604,307 @@ pub fn build_chunked_gkr_calldata(
         num_layers,
         weight_binding_mode: binding_mode,
         packed: use_packed,
+        double_packed: actually_double_packed,
         io_packed: use_io_packing,
         chunks,
         num_chunks,
+    })
+}
+
+// ============================================================================
+// Streaming GKR Calldata Builder (v25)
+// ============================================================================
+
+/// Maximum proof data felts per streaming layer batch.
+/// Leaves ~500 felts for dims/bits/overhead within the 4500 total TX limit.
+pub const MAX_STREAM_BATCH_FELTS: usize = 3500;
+
+/// Streaming GKR calldata for calldata-only verification.
+///
+/// Protocol: open_gkr_session → upload chunks → seal →
+///   stream_init → stream_layers × M → stream_finalize.
+#[derive(Debug, Clone)]
+pub struct StreamingGkrCalldata {
+    /// Calldata for verify_gkr_stream_init (IO data + metadata).
+    pub init_calldata: Vec<String>,
+    /// Batches of layer proof data for verify_gkr_stream_layers.
+    pub stream_batches: Vec<StreamBatch>,
+    /// Calldata for verify_gkr_stream_finalize (weight claims + binding).
+    pub finalize_calldata: Vec<String>,
+    /// Session metadata for open_gkr_session (reuse existing session flow).
+    pub session_metadata: StreamSessionMetadata,
+    /// Upload chunks (for data integrity commitment via existing session flow).
+    pub upload_chunks: Vec<Vec<String>>,
+}
+
+/// A single streaming batch of layer proofs.
+#[derive(Debug, Clone)]
+pub struct StreamBatch {
+    /// Batch index (0-based).
+    pub batch_idx: u32,
+    /// Number of layers in this batch.
+    pub num_layers: u32,
+    /// Flat calldata for verify_gkr_stream_layers.
+    pub calldata: Vec<String>,
+}
+
+/// Session metadata for stream init.
+#[derive(Debug, Clone)]
+pub struct StreamSessionMetadata {
+    pub model_id: String,
+    pub total_felts: usize,
+    pub circuit_depth: u32,
+    pub num_layers: u32,
+    pub weight_binding_mode: u32,
+    /// Layer tags in GKR walk order (output → input) for circuit hash registration.
+    pub layer_tags: Vec<u32>,
+}
+
+/// Build streaming GKR calldata for calldata-only verification (v25).
+///
+/// Splits the proof into:
+/// 1. init TX: IO data + metadata (~1500 felts)
+/// 2. N stream TXs: batches of layer proofs (~3500 felts each)
+/// 3. finalize TX: weight claims + binding (~200 felts)
+pub fn build_streaming_gkr_calldata(
+    proof: &crate::gkr::GKRProof,
+    circuit: &crate::gkr::LayeredCircuit,
+    model_id: FieldElement,
+    raw_io_data: &[FieldElement],
+) -> Result<StreamingGkrCalldata, StarknetModelError> {
+    enforce_gkr_soundness_gates(proof)?;
+
+    let binding_mode = starknet_weight_binding_mode(proof.weight_opening_transcript_mode)?;
+    let circuit_depth = circuit.layers.len() as u32;
+    let num_layers = proof.layer_proofs.len() as u32;
+
+    // ── Build init calldata ──
+    // session_id is filled in by the caller after open_gkr_session
+    // Format: [original_io_len, packed_count, packed_io..., circuit_depth, num_layers]
+    let mut init_calldata: Vec<String> = Vec::new();
+    // session_id placeholder
+    init_calldata.push("__SESSION_ID__".to_string());
+
+    let packed_io = pack_m31_io_data(raw_io_data);
+    init_calldata.push(format!("{}", raw_io_data.len())); // original_io_len
+    // packed_raw_io: Array<felt252> [len, data...]
+    init_calldata.push(format!("{}", packed_io.len()));
+    for f in &packed_io {
+        init_calldata.push(format!("0x{:x}", f));
+    }
+    init_calldata.push(format!("{}", circuit_depth));
+    init_calldata.push(format!("{}", num_layers));
+
+    // ── Split proof data into batches with boundary tracking ──
+    let (all_proof_felts, batch_infos) =
+        crate::cairo_serde::split_proof_into_stream_batches(proof, MAX_STREAM_BATCH_FELTS);
+
+    // Extract per-layer metadata for batch slicing
+    let all_matmul_dims = extract_matmul_dims(circuit);
+    let all_dequantize_bits = extract_dequantize_bits(circuit);
+
+    // Build per-layer metadata for batch slicing and circuit hash registration.
+    // Walk layers in GKR order (output → input, same as circuit reversed).
+    let mut layer_is_matmul = Vec::new();
+    let mut layer_is_dequantize = Vec::new();
+    let mut layer_tags_vec: Vec<u32> = Vec::new();
+    for layer_idx in (0..circuit.layers.len()).rev() {
+        let tag = match &circuit.layers[layer_idx].layer_type {
+            crate::gkr::circuit::LayerType::MatMul { .. } => {
+                layer_is_matmul.push(true);
+                layer_is_dequantize.push(false);
+                0u32
+            }
+            crate::gkr::circuit::LayerType::Dequantize { .. } => {
+                layer_is_matmul.push(false);
+                layer_is_dequantize.push(true);
+                6
+            }
+            crate::gkr::circuit::LayerType::Input
+            | crate::gkr::circuit::LayerType::Identity => continue,
+            crate::gkr::circuit::LayerType::Add { .. } => {
+                layer_is_matmul.push(false);
+                layer_is_dequantize.push(false);
+                1
+            }
+            crate::gkr::circuit::LayerType::Mul { .. } => {
+                layer_is_matmul.push(false);
+                layer_is_dequantize.push(false);
+                2
+            }
+            crate::gkr::circuit::LayerType::Activation { .. } => {
+                layer_is_matmul.push(false);
+                layer_is_dequantize.push(false);
+                3
+            }
+            crate::gkr::circuit::LayerType::LayerNorm { .. } => {
+                layer_is_matmul.push(false);
+                layer_is_dequantize.push(false);
+                4
+            }
+            crate::gkr::circuit::LayerType::Attention { .. } => {
+                layer_is_matmul.push(false);
+                layer_is_dequantize.push(false);
+                5
+            }
+            crate::gkr::circuit::LayerType::RMSNorm { .. } => {
+                layer_is_matmul.push(false);
+                layer_is_dequantize.push(false);
+                8
+            }
+            _ => {
+                layer_is_matmul.push(false);
+                layer_is_dequantize.push(false);
+                continue;
+            }
+        };
+        layer_tags_vec.push(tag);
+    }
+
+    let mut stream_batches = Vec::new();
+    let mut matmul_dim_offset = 0usize;
+    let mut dequantize_bit_offset = 0usize;
+
+    for (batch_idx, info) in batch_infos.iter().enumerate() {
+        let mut calldata: Vec<String> = Vec::new();
+
+        // session_id placeholder
+        calldata.push("__SESSION_ID__".to_string());
+        // batch_idx
+        calldata.push(format!("{}", batch_idx));
+        // num_layers_in_batch
+        let num_in_batch = (info.end_layer - info.start_layer) as u32;
+        calldata.push(format!("{}", num_in_batch));
+
+        // Count matmul dims and dequantize bits needed for this batch
+        let mut batch_matmul_count = 0usize;
+        let mut batch_dequantize_count = 0usize;
+        for layer_i in info.start_layer..info.end_layer {
+            if layer_i < layer_is_matmul.len() && layer_is_matmul[layer_i] {
+                batch_matmul_count += 1;
+            }
+            if layer_i < layer_is_dequantize.len() && layer_is_dequantize[layer_i] {
+                batch_dequantize_count += 1;
+            }
+        }
+
+        // matmul_dims for this batch: Array<u32> [len, m0,k0,n0, ...]
+        let matmul_dim_count = batch_matmul_count * 3;
+        calldata.push(format!("{}", matmul_dim_count));
+        for i in 0..matmul_dim_count {
+            calldata.push(format!("{}", all_matmul_dims[matmul_dim_offset + i]));
+        }
+        matmul_dim_offset += matmul_dim_count;
+
+        // dequantize_bits for this batch: Array<u64> [len, bits0, ...]
+        calldata.push(format!("{}", batch_dequantize_count));
+        for i in 0..batch_dequantize_count {
+            calldata.push(format!("{}", all_dequantize_bits[dequantize_bit_offset + i]));
+        }
+        dequantize_bit_offset += batch_dequantize_count;
+
+        // proof_data for this batch: Array<felt252> [len, data...]
+        let batch_felts = &all_proof_felts[info.felt_start..info.felt_end];
+        calldata.push(format!("{}", batch_felts.len()));
+        for f in batch_felts {
+            calldata.push(format!("0x{:x}", f));
+        }
+
+        stream_batches.push(StreamBatch {
+            batch_idx: batch_idx as u32,
+            num_layers: num_in_batch,
+            calldata,
+        });
+    }
+
+    // ── Build finalize calldata ──
+    let mut finalize_calldata: Vec<String> = Vec::new();
+    // session_id placeholder
+    finalize_calldata.push("__SESSION_ID__".to_string());
+
+    // weight_expected_values: packed QM31 as felt252
+    // These are the final_b_eval values from each MatMul sumcheck
+    finalize_calldata.push(format!("{}", proof.weight_claims.len()));
+    for wc in &proof.weight_claims {
+        let packed = crate::crypto::poseidon_channel::securefield_to_felt(wc.expected_value);
+        finalize_calldata.push(format!("0x{:x}", packed));
+    }
+
+    // weight_binding_mode
+    finalize_calldata.push(format!("{}", binding_mode));
+
+    // weight_binding_data
+    let binding_data = starknet_weight_binding_data(proof)?;
+    finalize_calldata.push(format!("{}", binding_data.len()));
+    for bd in &binding_data {
+        finalize_calldata.push(bd.clone());
+    }
+
+    // deferred_proof_data: serialized deferred matmul proofs (for DAG Add skip connections)
+    {
+        let mut deferred_felts: Vec<FieldElement> = Vec::new();
+        crate::cairo_serde::serialize_u32(proof.deferred_proofs.len() as u32, &mut deferred_felts);
+        for deferred in &proof.deferred_proofs {
+            crate::cairo_serde::serialize_qm31_packed(deferred.claim.value, &mut deferred_felts);
+            // MatMul dims are passed separately in deferred_matmul_dims, but claim value and
+            // layer proof go in deferred_proof_data
+            if let crate::gkr::types::LayerProof::MatMul {
+                round_polys,
+                final_a_eval,
+                final_b_eval,
+            } = &deferred.layer_proof
+            {
+                crate::cairo_serde::serialize_u32(round_polys.len() as u32, &mut deferred_felts);
+                for rp in round_polys {
+                    crate::cairo_serde::serialize_qm31_packed(rp.c0, &mut deferred_felts);
+                    crate::cairo_serde::serialize_qm31_packed(rp.c2, &mut deferred_felts);
+                }
+                crate::cairo_serde::serialize_qm31_packed(*final_a_eval, &mut deferred_felts);
+                crate::cairo_serde::serialize_qm31_packed(*final_b_eval, &mut deferred_felts);
+            }
+        }
+        finalize_calldata.push(format!("{}", deferred_felts.len()));
+        for f in &deferred_felts {
+            finalize_calldata.push(format!("0x{:x}", f));
+        }
+    }
+
+    // deferred_matmul_dims: [m0, k0, n0, ...] for each deferred proof
+    {
+        let mut deferred_dims: Vec<u32> = Vec::new();
+        for deferred in &proof.deferred_proofs {
+            if let Some((m, k, n)) = deferred.dims() {
+                deferred_dims.push(m as u32);
+                deferred_dims.push(k as u32);
+                deferred_dims.push(n as u32);
+            }
+        }
+        finalize_calldata.push(format!("{}", deferred_dims.len()));
+        for d in &deferred_dims {
+            finalize_calldata.push(format!("{}", d));
+        }
+    }
+
+    // ── Build upload chunks for data integrity ──
+    // Reuse existing chunked session format for hash commitment
+    let chunked = build_chunked_gkr_calldata(proof, circuit, model_id, raw_io_data)?;
+
+    // ── Total felts for session metadata ──
+    let total_felts = chunked.total_felts;
+
+    Ok(StreamingGkrCalldata {
+        init_calldata,
+        stream_batches,
+        finalize_calldata,
+        session_metadata: StreamSessionMetadata {
+            model_id: format!("0x{:x}", model_id),
+            total_felts,
+            circuit_depth,
+            num_layers,
+            weight_binding_mode: binding_mode,
+            layer_tags: layer_tags_vec,
+        },
+        upload_chunks: chunked.chunks,
     })
 }
 
@@ -1832,6 +2152,152 @@ pub fn build_verify_model_gkr_v4_packed_io_calldata(
     }
 
     let total_felts = parts.len();
+    Ok(VerifyModelGkrCalldata {
+        calldata_parts: parts,
+        total_felts,
+    })
+}
+
+/// Build calldata for `verify_model_gkr_v4_packed_io_dp()` — double-packed proof data
+/// where degree-2 round polys (c0, c2) fit in a single felt252 as QM31 pair.
+/// Reduces proof_data section by ~50%, enabling single-TX for Qwen3-14B.
+pub fn build_verify_model_gkr_v4_double_packed_io_calldata(
+    proof: &crate::gkr::GKRProof,
+    circuit: &crate::gkr::LayeredCircuit,
+    model_id: FieldElement,
+    raw_io_data: &[FieldElement],
+) -> Result<VerifyModelGkrCalldata, StarknetModelError> {
+    use crate::cairo_serde::{serialize_gkr_proof_data_only_double_packed, serialize_u32 as serde_u32};
+
+    // Build the base calldata (with regular packed proof) to get everything except proof_data
+    let base = build_verify_model_gkr_calldata_inner(
+        proof,
+        circuit,
+        model_id,
+        raw_io_data,
+        GkrCalldataLayout::V4,
+        true, // packed
+    )?;
+
+    // Pack the IO data
+    let packed_io = pack_m31_io_data(raw_io_data);
+
+    // Serialize proof_data with double-packing
+    let mut dp_proof_data = Vec::new();
+    serialize_gkr_proof_data_only_double_packed(proof, &mut dp_proof_data);
+
+    // Self-verify: round-trip each double-packed QM31 pair to catch packing bugs
+    if std::env::var("STWO_SKIP_SELF_VERIFY").is_err() {
+        let matmul_dims = extract_matmul_dims(circuit);
+        let circuit_depth = circuit.layers.len() as u32;
+        let num_layers = proof.layer_proofs.len() as u32;
+        replay_verify_double_packed_proof(
+            &dp_proof_data,
+            raw_io_data,
+            &matmul_dims,
+            circuit_depth,
+            num_layers,
+            proof,
+        )
+        .map_err(|e| {
+            StarknetModelError::SoundnessGate(format!(
+                "double-packed self-verification failed: {e}"
+            ))
+        })?;
+    }
+
+    // Rebuild calldata with packed IO + double-packed proof_data
+    let mut parts = Vec::new();
+
+    // 1. model_id
+    parts.push(base.calldata_parts[0].clone());
+
+    // 2. original_io_len: u32
+    parts.push(format!("{}", raw_io_data.len()));
+
+    // 3. packed_raw_io: Array<felt252>
+    parts.push(format!("{}", packed_io.len()));
+    for f in &packed_io {
+        parts.push(format!("0x{:x}", f));
+    }
+
+    // 4+. circuit_depth, num_layers, matmul_dims, dequantize_bits from base
+    // In base calldata: [model_id, io_len, io_data..., circuit_depth, ...]
+    let rest_start = 1 + 1 + raw_io_data.len();
+    // Find where proof_data starts in the base calldata
+    // After rest_start: circuit_depth(1), num_layers(1), matmul_dims(1+len), dequantize_bits(1+len), proof_data(1+len), ...
+    // We need to copy up to (but not including) the proof_data array, then substitute our own
+
+    // Extract circuit_depth, num_layers
+    let circuit_depth_idx = rest_start;
+    let num_layers_idx = rest_start + 1;
+    parts.push(base.calldata_parts[circuit_depth_idx].clone()); // circuit_depth
+    parts.push(base.calldata_parts[num_layers_idx].clone()); // num_layers
+
+    // matmul_dims array
+    let md_len_idx = rest_start + 2;
+    let md_len: usize = base.calldata_parts[md_len_idx].parse::<usize>().map_err(|_| {
+        StarknetModelError::SoundnessGate(format!(
+            "bad calldata at index {} (expected matmul_dims length): {:?}",
+            md_len_idx, base.calldata_parts[md_len_idx]
+        ))
+    })?;
+    parts.push(base.calldata_parts[md_len_idx].clone()); // array length
+    for i in 0..md_len {
+        parts.push(base.calldata_parts[md_len_idx + 1 + i].clone());
+    }
+
+    // dequantize_bits array
+    let dq_len_idx = md_len_idx + 1 + md_len;
+    let dq_len: usize = base.calldata_parts[dq_len_idx].parse::<usize>().map_err(|_| {
+        StarknetModelError::SoundnessGate(format!(
+            "bad calldata at index {} (expected dequantize_bits length): {:?}",
+            dq_len_idx, base.calldata_parts[dq_len_idx]
+        ))
+    })?;
+    parts.push(base.calldata_parts[dq_len_idx].clone()); // array length
+    for i in 0..dq_len {
+        parts.push(base.calldata_parts[dq_len_idx + 1 + i].clone());
+    }
+
+    // proof_data: substitute with double-packed version
+    parts.push(format!("{}", dp_proof_data.len()));
+    for f in &dp_proof_data {
+        parts.push(format!("0x{:x}", f));
+    }
+
+    // Rest: weight_commitments, weight_binding_mode, weight_binding_data, weight_opening_proofs
+    // Find where proof_data ends in base
+    let base_pd_len_idx = dq_len_idx + 1 + dq_len;
+    let base_pd_len: usize = base.calldata_parts[base_pd_len_idx].parse::<usize>().map_err(|_| {
+        StarknetModelError::SoundnessGate(format!(
+            "bad calldata at index {} (expected proof_data length): {:?}",
+            base_pd_len_idx, base.calldata_parts[base_pd_len_idx]
+        ))
+    })?;
+    let after_pd_idx = base_pd_len_idx + 1 + base_pd_len;
+    for i in after_pd_idx..base.calldata_parts.len() {
+        parts.push(base.calldata_parts[i].clone());
+    }
+
+    // Validate total_felts: model_id(1) + original_io_len(1) + packed_io(1+len) +
+    // circuit_depth(1) + num_layers(1) + matmul_dims(1+len) + dequantize_bits(1+len) +
+    // dp_proof_data(1+len) + rest_from_base
+    let rest_from_base = base.calldata_parts.len() - after_pd_idx;
+    let expected = 1 + 1 + 1 + packed_io.len()
+        + 1 + 1
+        + 1 + md_len
+        + 1 + dq_len
+        + 1 + dp_proof_data.len()
+        + rest_from_base;
+    let total_felts = parts.len();
+    if total_felts != expected {
+        return Err(StarknetModelError::SoundnessGate(format!(
+            "double-packed calldata total_felts mismatch: got {} but expected {}",
+            total_felts, expected
+        )));
+    }
+
     Ok(VerifyModelGkrCalldata {
         calldata_parts: parts,
         total_felts,
@@ -2135,14 +2601,191 @@ pub fn estimate_gas_from_proof(proof: &StarknetModelProof) -> u64 {
     base + da_cost
 }
 
-/// Replay Fiat-Shamir channel verification against serialized proof data.
+/// Verify double-packed proof data by round-tripping each QM31 pair.
 ///
-/// This catches prover/serializer mismatches immediately after proof generation,
-/// preventing stale-binary issues where the serialized proof doesn't match the
-/// channel state the verifier expects. It exercises the exact same channel
-/// operations as the Cairo on-chain verifier.
+/// Walks the proof's layer_proofs and deferred_proofs, re-serializes each
+/// double-packed element, then deserializes via `deserialize_qm31_pair_packed`
+/// and compares against the proof's original QM31 values. This catches
+/// packing bugs in `serialize_qm31_pair_packed` that the Fiat-Shamir replay
+/// cannot detect (since it verifies *packed*, not double-packed encoding).
 ///
-/// Returns `Ok(())` if all layers pass, or `Err(msg)` with the first mismatch.
+/// Also verifies dp_proof_data is strictly smaller than regular packed.
+pub fn replay_verify_double_packed_proof(
+    dp_proof_data: &[FieldElement],
+    _raw_io: &[FieldElement],
+    _matmul_dims: &[u32],
+    _circuit_depth: u32,
+    _num_layers: u32,
+    proof: &crate::gkr::GKRProof,
+) -> Result<(), String> {
+    use crate::cairo_serde::{
+        deserialize_qm31_pair_packed, serialize_qm31_pair_packed, serialize_qm31_packed,
+    };
+    use crate::crypto::poseidon_channel::felt_to_securefield;
+    use crate::gkr::types::LayerProof;
+
+    // Helper: verify a double-packed QM31 pair round-trips correctly
+    let verify_pair = |a: stwo::core::fields::qm31::SecureField,
+                       b: stwo::core::fields::qm31::SecureField,
+                       ctx: &str|
+     -> Result<(), String> {
+        let mut buf = Vec::new();
+        serialize_qm31_pair_packed(a, b, &mut buf);
+        let (ra, rb) = deserialize_qm31_pair_packed(buf[0]);
+        if ra != a || rb != b {
+            return Err(format!(
+                "double-packed round-trip mismatch at {}: expected ({:?},{:?}), got ({:?},{:?})",
+                ctx, a, b, ra, rb
+            ));
+        }
+        Ok(())
+    };
+
+    // Helper: verify a single-packed QM31 round-trips correctly
+    let verify_single =
+        |v: stwo::core::fields::qm31::SecureField, ctx: &str| -> Result<(), String> {
+            let mut buf = Vec::new();
+            serialize_qm31_packed(v, &mut buf);
+            let rv = felt_to_securefield(buf[0]);
+            if rv != v {
+                return Err(format!(
+                    "single-packed round-trip mismatch at {}: expected {:?}, got {:?}",
+                    ctx, v, rv
+                ));
+            }
+            Ok(())
+        };
+
+    // Walk layer proofs and verify each double-packed element
+    for (li, lp) in proof.layer_proofs.iter().enumerate() {
+        match lp {
+            LayerProof::MatMul {
+                round_polys,
+                final_a_eval,
+                final_b_eval,
+            } => {
+                for (ri, rp) in round_polys.iter().enumerate() {
+                    verify_pair(
+                        rp.c0,
+                        rp.c2,
+                        &format!("layer[{}].MatMul.round[{}].(c0,c2)", li, ri),
+                    )?;
+                }
+                verify_single(*final_a_eval, &format!("layer[{}].MatMul.final_a", li))?;
+                verify_single(*final_b_eval, &format!("layer[{}].MatMul.final_b", li))?;
+            }
+            LayerProof::Mul {
+                eq_round_polys,
+                lhs_eval,
+                rhs_eval,
+            } => {
+                for (ri, rp) in eq_round_polys.iter().enumerate() {
+                    verify_pair(
+                        rp.c0,
+                        rp.c2,
+                        &format!("layer[{}].Mul.round[{}].(c0,c2)", li, ri),
+                    )?;
+                    verify_single(
+                        rp.c3,
+                        &format!("layer[{}].Mul.round[{}].c3", li, ri),
+                    )?;
+                }
+                verify_single(*lhs_eval, &format!("layer[{}].Mul.lhs", li))?;
+                verify_single(*rhs_eval, &format!("layer[{}].Mul.rhs", li))?;
+            }
+            LayerProof::LayerNorm {
+                linear_round_polys,
+                linear_final_evals,
+                ..
+            }
+            | LayerProof::RMSNorm {
+                linear_round_polys,
+                linear_final_evals,
+                ..
+            } => {
+                let tag = if matches!(lp, LayerProof::LayerNorm { .. }) {
+                    "LayerNorm"
+                } else {
+                    "RMSNorm"
+                };
+                for (ri, rp) in linear_round_polys.iter().enumerate() {
+                    verify_pair(
+                        rp.c0,
+                        rp.c2,
+                        &format!("layer[{}].{}.round[{}].(c0,c2)", li, tag, ri),
+                    )?;
+                    verify_single(
+                        rp.c3,
+                        &format!("layer[{}].{}.round[{}].c3", li, tag, ri),
+                    )?;
+                }
+                let (a, b) = *linear_final_evals;
+                verify_single(a, &format!("layer[{}].{}.final_eval_0", li, tag))?;
+                verify_single(b, &format!("layer[{}].{}.final_eval_1", li, tag))?;
+            }
+            LayerProof::MatMulDualSimd {
+                round_polys,
+                final_a_eval,
+                final_b_eval,
+                ..
+            } => {
+                for (ri, rp) in round_polys.iter().enumerate() {
+                    verify_pair(
+                        rp.c0,
+                        rp.c1,
+                        &format!("layer[{}].DualSimd.round[{}].(c0,c1)", li, ri),
+                    )?;
+                    verify_pair(
+                        rp.c2,
+                        rp.c3,
+                        &format!("layer[{}].DualSimd.round[{}].(c2,c3)", li, ri),
+                    )?;
+                }
+                verify_single(*final_a_eval, &format!("layer[{}].DualSimd.final_a", li))?;
+                verify_single(*final_b_eval, &format!("layer[{}].DualSimd.final_b", li))?;
+            }
+            // Add, Activation, Dequantize, Quantize, Embedding, Attention —
+            // these don't use double-packed pairs for round polys (only single-packed),
+            // so no additional pair verification needed
+            _ => {}
+        }
+    }
+
+    // Walk deferred proofs (MatMul only)
+    for (di, deferred) in proof.deferred_proofs.iter().enumerate() {
+        if let LayerProof::MatMul {
+            round_polys,
+            final_a_eval,
+            final_b_eval,
+        } = &deferred.layer_proof
+        {
+            for (ri, rp) in round_polys.iter().enumerate() {
+                verify_pair(
+                    rp.c0,
+                    rp.c2,
+                    &format!("deferred[{}].round[{}].(c0,c2)", di, ri),
+                )?;
+            }
+            verify_single(*final_a_eval, &format!("deferred[{}].final_a", di))?;
+            verify_single(*final_b_eval, &format!("deferred[{}].final_b", di))?;
+        }
+    }
+
+    // Verify that double-packed is strictly smaller than regular packed
+    let mut packed_data = Vec::new();
+    crate::cairo_serde::serialize_gkr_proof_data_only_packed(proof, &mut packed_data);
+    let dp_len = dp_proof_data.len();
+    let packed_len = packed_data.len();
+    if dp_len >= packed_len {
+        return Err(format!(
+            "Double-packed should be smaller: dp={} >= packed={}",
+            dp_len, packed_len
+        ));
+    }
+
+    Ok(())
+}
+
 pub fn replay_verify_serialized_proof(
     proof_data: &[FieldElement],
     raw_io: &[FieldElement],

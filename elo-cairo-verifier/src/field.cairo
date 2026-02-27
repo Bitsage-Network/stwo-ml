@@ -537,6 +537,33 @@ pub fn evaluate_mle_from_io_span_2d(
 /// from u128 unpacking + array appends that would otherwise be needed).
 ///
 /// Parameters:
+/// Extract a single M31 value from packed felt252 data.
+/// Each felt252 holds 8 M31 values (31 bits each) in its low 248 bits.
+pub fn extract_m31_from_packed(packed_felts: Span<felt252>, m31_index: u32) -> u32 {
+    let felt_idx: u32 = m31_index / 8;
+    let slot: u32 = m31_index % 8;
+    let val: u256 = (*packed_felts.at(felt_idx)).into();
+    // M31 values are packed LSB-first: slot 0 in bits 0..31, slot 1 in bits 31..62, etc.
+    let shift_bits: u32 = slot * 31;
+    let shifted = if shift_bits == 0 {
+        val
+    } else {
+        let mut divisor: u256 = 1;
+        let mut s: u32 = 0;
+        loop {
+            if s >= shift_bits {
+                break;
+            }
+            divisor = divisor * 2;
+            s += 1;
+        };
+        val / divisor
+    };
+    let mask: u256 = 0x7FFFFFFF; // (1 << 31) - 1
+    let result: u256 = shifted & mask;
+    result.try_into().unwrap()
+}
+
 /// - packed_felts: Full packed IO span (8 M31 values per felt252)
 /// - m31_start: Starting M31 position within the packed data (e.g., 3 for input data)
 /// - data_len: Number of M31 data values to evaluate
@@ -771,6 +798,50 @@ pub fn next_power_of_two(n: u32) -> u32 {
     v = v | (v / 256);
     v = v | (v / 65536);
     v + 1
+}
+
+/// Pack two QM31 values into a single felt252 (double-pack).
+/// Layout: [a.a.a(31) | a.a.b(31) | a.b.a(31) | a.b.b(31) | b.a.a(31) | b.a.b(31) | b.b.a(31) | b.b.b(31)]
+/// = 248 bits total. No sentinel needed — the format is indicated by context (double_packed flag).
+pub fn pack_qm31_pair_to_felt(a: QM31, b: QM31) -> felt252 {
+    let shift: felt252 = M31_SHIFT; // 2^31
+    let mut result: felt252 = a.a.a.into();
+    result = result * shift + a.a.b.into();
+    result = result * shift + a.b.a.into();
+    result = result * shift + a.b.b.into();
+    result = result * shift + b.a.a.into();
+    result = result * shift + b.a.b.into();
+    result = result * shift + b.b.a.into();
+    result = result * shift + b.b.b.into();
+    result
+}
+
+/// Unpack two QM31 values from a single felt252 (reverse of pack_qm31_pair_to_felt).
+/// Layout: [31-bit a.a.a | 31-bit a.a.b | ... | 31-bit b.b.b] = 248 bits, no sentinel.
+/// Uses sequential division by 2^31 to extract 8 M31 components (LSB-first).
+pub fn unpack_qm31_pair_from_felt(fe: felt252) -> (QM31, QM31) {
+    let val: u256 = fe.into();
+    let divisor: u256 = 0x80000000; // 2^31
+    let mask: u256 = 0x7FFFFFFF; // 2^31 - 1
+    // Extract 8 components from LSB to MSB via sequential division
+    let b_bb: u64 = (val & mask).try_into().unwrap();
+    let r1 = val / divisor;
+    let b_ba: u64 = (r1 & mask).try_into().unwrap();
+    let r2 = r1 / divisor;
+    let b_ab: u64 = (r2 & mask).try_into().unwrap();
+    let r3 = r2 / divisor;
+    let b_aa: u64 = (r3 & mask).try_into().unwrap();
+    let r4 = r3 / divisor;
+    let a_bb: u64 = (r4 & mask).try_into().unwrap();
+    let r5 = r4 / divisor;
+    let a_ba: u64 = (r5 & mask).try_into().unwrap();
+    let r6 = r5 / divisor;
+    let a_ab: u64 = (r6 & mask).try_into().unwrap();
+    let r7 = r6 / divisor;
+    let a_aa: u64 = (r7 & mask).try_into().unwrap();
+    let a = QM31 { a: CM31 { a: a_aa, b: a_ab }, b: CM31 { a: a_ba, b: a_bb } };
+    let b = QM31 { a: CM31 { a: b_aa, b: b_ab }, b: CM31 { a: b_ba, b: b_bb } };
+    (a, b)
 }
 
 /// Compute 2^n.

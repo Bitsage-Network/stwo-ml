@@ -1389,6 +1389,7 @@ fn main() {
                 build_verify_model_gkr_v2_calldata, build_verify_model_gkr_v3_calldata,
                 build_verify_model_gkr_v4_calldata, build_verify_model_gkr_v4_packed_calldata,
                 build_verify_model_gkr_v4_packed_io_calldata,
+                build_verify_model_gkr_v4_double_packed_io_calldata,
                 CHUNKED_GKR_THRESHOLD,
             };
 
@@ -1472,29 +1473,41 @@ fn main() {
                             .ok()
                             .map(|v| !v.is_empty() && v != "0")
                             .unwrap_or(false);
-                        let (verify_result, is_packed, is_io_packed) = if use_starknet_gkr_v4 {
-                            // Try IO-packed calldata (8 M31 per felt) — smallest, fits single TX
+                        let (verify_result, is_packed, is_io_packed, is_double_packed) = if use_starknet_gkr_v4 {
+                            // Try double-packed-io first (c0+c2 QM31 pairs in 1 felt) — smallest possible
                             if !no_io_pack {
-                                match build_verify_model_gkr_v4_packed_io_calldata(gkr_p, &circuit, model_id, &raw_io) {
-                                    Ok(io_packed_vc) if io_packed_vc.total_felts <= CHUNKED_GKR_THRESHOLD => {
+                                match build_verify_model_gkr_v4_double_packed_io_calldata(gkr_p, &circuit, model_id, &raw_io) {
+                                    Ok(dp_vc) if dp_vc.total_felts <= CHUNKED_GKR_THRESHOLD => {
                                         eprintln!(
-                                            "  io_packed calldata: {} felts (fits single TX, no storage reads)",
-                                            io_packed_vc.total_felts
+                                            "  double_packed_io calldata: {} felts (fits single TX, v25.1)",
+                                            dp_vc.total_felts
                                         );
-                                        (Ok(io_packed_vc), true, true)
+                                        (Ok(dp_vc), true, true, true)
                                     }
                                     _ => {
-                                        // IO-packed didn't fit — try regular packed
-                                        match build_verify_model_gkr_v4_packed_calldata(gkr_p, &circuit, model_id, &raw_io) {
-                                            Ok(packed_vc) if packed_vc.total_felts <= CHUNKED_GKR_THRESHOLD => {
+                                        // Fall back to regular IO-packed
+                                        match build_verify_model_gkr_v4_packed_io_calldata(gkr_p, &circuit, model_id, &raw_io) {
+                                            Ok(io_packed_vc) if io_packed_vc.total_felts <= CHUNKED_GKR_THRESHOLD => {
                                                 eprintln!(
-                                                    "  packed calldata: {} felts (fits single TX)",
-                                                    packed_vc.total_felts
+                                                    "  io_packed calldata: {} felts (fits single TX, no storage reads)",
+                                                    io_packed_vc.total_felts
                                                 );
-                                                (Ok(packed_vc), true, false)
+                                                (Ok(io_packed_vc), true, true, false)
                                             }
                                             _ => {
-                                                (build_verify_model_gkr_v4_calldata(gkr_p, &circuit, model_id, &raw_io), false, false)
+                                                // IO-packed didn't fit — try regular packed
+                                                match build_verify_model_gkr_v4_packed_calldata(gkr_p, &circuit, model_id, &raw_io) {
+                                                    Ok(packed_vc) if packed_vc.total_felts <= CHUNKED_GKR_THRESHOLD => {
+                                                        eprintln!(
+                                                            "  packed calldata: {} felts (fits single TX)",
+                                                            packed_vc.total_felts
+                                                        );
+                                                        (Ok(packed_vc), true, false, false)
+                                                    }
+                                                    _ => {
+                                                        (build_verify_model_gkr_v4_calldata(gkr_p, &circuit, model_id, &raw_io), false, false, false)
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -1506,19 +1519,19 @@ fn main() {
                                             "  packed calldata: {} felts (fits single TX)",
                                             packed_vc.total_felts
                                         );
-                                        (Ok(packed_vc), true, false)
+                                        (Ok(packed_vc), true, false, false)
                                     }
                                     _ => {
-                                        (build_verify_model_gkr_v4_calldata(gkr_p, &circuit, model_id, &raw_io), false, false)
+                                        (build_verify_model_gkr_v4_calldata(gkr_p, &circuit, model_id, &raw_io), false, false, false)
                                     }
                                 }
                             }
                         } else if use_starknet_gkr_v3 {
-                            (build_verify_model_gkr_v3_calldata(gkr_p, &circuit, model_id, &raw_io), false, false)
+                            (build_verify_model_gkr_v3_calldata(gkr_p, &circuit, model_id, &raw_io), false, false, false)
                         } else if use_starknet_gkr_v2 {
-                            (build_verify_model_gkr_v2_calldata(gkr_p, &circuit, model_id, &raw_io), false, false)
+                            (build_verify_model_gkr_v2_calldata(gkr_p, &circuit, model_id, &raw_io), false, false, false)
                         } else {
-                            (build_verify_model_gkr_calldata(gkr_p, &circuit, model_id, &raw_io), false, false)
+                            (build_verify_model_gkr_calldata(gkr_p, &circuit, model_id, &raw_io), false, false, false)
                         };
                         match verify_result {
                             Ok(vc) => {
@@ -1541,6 +1554,7 @@ fn main() {
                                                 "weight_binding_mode": chunked.weight_binding_mode,
                                                 "packed": chunked.packed,
                                                 "io_packed": chunked.io_packed,
+                                                "double_packed": chunked.double_packed,
                                                 "model_id": chunked.model_id,
                                                 "chunks": chunked.chunks,
                                             })
@@ -1560,16 +1574,27 @@ fn main() {
                                         }
                                     }
                                 } else {
-                                    let entrypoint = if is_io_packed {
+                                    let entrypoint = if is_double_packed {
+                                        "verify_model_gkr_v4_packed_io_dp"
+                                    } else if is_io_packed {
                                         "verify_model_gkr_v4_packed_io"
                                     } else if is_packed {
                                         "verify_model_gkr_v4_packed"
                                     } else {
                                         verify_entrypoint
                                     };
+                                    let format_label = if is_double_packed {
+                                        "double_packed"
+                                    } else if is_io_packed {
+                                        "io_packed"
+                                    } else if is_packed {
+                                        "packed"
+                                    } else {
+                                        "unpacked"
+                                    };
                                     eprintln!(
-                                        "  verify_calldata: {} parts (ready for submission, packed={})",
-                                        vc.total_felts, is_packed
+                                        "  verify_calldata: {} parts (ready for submission, format={})",
+                                        vc.total_felts, format_label
                                     );
                                     serde_json::json!({
                                         "schema_version": 1,
@@ -1577,6 +1602,8 @@ fn main() {
                                         "calldata": vc.calldata_parts,
                                         "total_felts": vc.total_felts,
                                         "packed": is_packed,
+                                        "io_packed": is_io_packed,
+                                        "double_packed": is_double_packed,
                                         "upload_chunks": Vec::<Vec<String>>::new(),
                                     })
                                 }
