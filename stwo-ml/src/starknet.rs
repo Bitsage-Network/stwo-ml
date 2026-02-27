@@ -2257,23 +2257,9 @@ pub fn replay_verify_serialized_proof(
 
                 for round in 0..num_rounds {
                     let c0 = read_qm31_from(proof_data, &mut off);
-                    let (c1, c2) = if packed {
-                        // Compressed: c1 omitted, reconstruct from current_sum
-                        let c2 = read_qm31_from(proof_data, &mut off);
-                        let c1 = current_sum - two * c0 - c2;
-                        (c1, c2)
-                    } else {
-                        let c1 = read_qm31_from(proof_data, &mut off);
-                        let c2 = read_qm31_from(proof_data, &mut off);
-                        let p0 = c0;
-                        let p1 = c0 + c1 + c2;
-                        if p0 + p1 != current_sum {
-                            return Err(format!(
-                                "MATMUL_ROUND_SUM_MISMATCH at layer {} round {}", layer, round
-                            ));
-                        }
-                        (c1, c2)
-                    };
+                    // v19+: c1 always omitted (compressed round polys), reconstruct from current_sum
+                    let c2 = read_qm31_from(proof_data, &mut off);
+                    let c1 = current_sum - two * c0 - c2;
                     ch.mix_poly_coeffs(c0, c1, c2);
                     let challenge = ch.draw_qm31();
                     current_sum = c0 + c1 * challenge + c2 * challenge * challenge;
@@ -2328,24 +2314,10 @@ pub fn replay_verify_serialized_proof(
                 let mut rms_sum = current_claim_value;
                 for round in 0..nrounds {
                     let c0 = read_qm31_from(proof_data, &mut off);
-                    let (c1, c2, c3) = if packed {
-                        let c2 = read_qm31_from(proof_data, &mut off);
-                        let c3 = read_qm31_from(proof_data, &mut off);
-                        let c1 = rms_sum - two * c0 - c2 - c3;
-                        (c1, c2, c3)
-                    } else {
-                        let c1 = read_qm31_from(proof_data, &mut off);
-                        let c2 = read_qm31_from(proof_data, &mut off);
-                        let c3 = read_qm31_from(proof_data, &mut off);
-                        let p0 = c0;
-                        let p1 = c0 + c1 + c2 + c3;
-                        if p0 + p1 != rms_sum {
-                            return Err(format!(
-                                "RMSNORM_ROUND_SUM at layer {} round {}", layer, round
-                            ));
-                        }
-                        (c1, c2, c3)
-                    };
+                    // v19+: c1 always omitted (compressed round polys), reconstruct from current_sum
+                    let c2 = read_qm31_from(proof_data, &mut off);
+                    let c3 = read_qm31_from(proof_data, &mut off);
+                    let c1 = rms_sum - two * c0 - c2 - c3;
                     ch.mix_poly_coeffs_deg3(c0, c1, c2, c3);
                     let challenge = ch.draw_qm31();
                     rms_sum = c0 + c1 * challenge + c2 * challenge * challenge
@@ -2390,24 +2362,10 @@ pub fn replay_verify_serialized_proof(
                     let mut logup_sum = SecureField::from(M31::from(1u32));
                     for round in 0..eq_rounds {
                         let c0 = read_qm31_from(proof_data, &mut off);
-                        let (c1, c2, c3) = if packed {
-                            let c2 = read_qm31_from(proof_data, &mut off);
-                            let c3 = read_qm31_from(proof_data, &mut off);
-                            let c1 = logup_sum - two_logup * c0 - c2 - c3;
-                            (c1, c2, c3)
-                        } else {
-                            let c1 = read_qm31_from(proof_data, &mut off);
-                            let c2 = read_qm31_from(proof_data, &mut off);
-                            let c3 = read_qm31_from(proof_data, &mut off);
-                            let p0 = c0;
-                            let p1 = c0 + c1 + c2 + c3;
-                            if p0 + p1 != logup_sum {
-                                return Err(format!(
-                                    "LOGUP_ROUND_SUM at layer {} round {}", layer, round
-                                ));
-                            }
-                            (c1, c2, c3)
-                        };
+                        // v19+: c1 always omitted (compressed round polys)
+                        let c2 = read_qm31_from(proof_data, &mut off);
+                        let c3 = read_qm31_from(proof_data, &mut off);
+                        let c1 = logup_sum - two_logup * c0 - c2 - c3;
                         ch.mix_poly_coeffs_deg3(c0, c1, c2, c3);
                         let challenge = ch.draw_qm31();
                         logup_sum = c0 + c1 * challenge + c2 * challenge * challenge
@@ -2453,24 +2411,10 @@ pub fn replay_verify_serialized_proof(
                     let mut logup_sum = SecureField::from(M31::from(1u32));
                     for round in 0..eq_rounds {
                         let c0 = read_qm31_from(proof_data, &mut off);
-                        let (c1, c2, c3) = if packed {
-                            let c2 = read_qm31_from(proof_data, &mut off);
-                            let c3 = read_qm31_from(proof_data, &mut off);
-                            let c1 = logup_sum - two_act * c0 - c2 - c3;
-                            (c1, c2, c3)
-                        } else {
-                            let c1 = read_qm31_from(proof_data, &mut off);
-                            let c2 = read_qm31_from(proof_data, &mut off);
-                            let c3 = read_qm31_from(proof_data, &mut off);
-                            let p0 = c0;
-                            let p1 = c0 + c1 + c2 + c3;
-                            if p0 + p1 != logup_sum {
-                                return Err(format!(
-                                    "ACT_LOGUP_ROUND at layer {} round {}", layer, round
-                                ));
-                            }
-                            (c1, c2, c3)
-                        };
+                        // v19+: c1 always omitted (compressed round polys)
+                        let c2 = read_qm31_from(proof_data, &mut off);
+                        let c3 = read_qm31_from(proof_data, &mut off);
+                        let c1 = logup_sum - two_act * c0 - c2 - c3;
                         ch.mix_poly_coeffs_deg3(c0, c1, c2, c3);
                         let challenge = ch.draw_qm31();
                         logup_sum = c0 + c1 * challenge + c2 * challenge * challenge
