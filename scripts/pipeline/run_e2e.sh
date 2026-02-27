@@ -214,6 +214,12 @@ if [[ "$DO_SUBMIT" == "false" ]] && [[ "$DO_DRY_RUN" == "false" ]]; then
     DO_DRY_RUN=true
 fi
 
+# --submit fast path: skip llama.cpp inference test (disconnected from proof pipeline)
+# and model validation (prove step validates internally). Saves ~50s + avoids llama.cpp build.
+if [[ "$DO_SUBMIT" == "true" ]]; then
+    SKIP_INFERENCE=true
+fi
+
 # --submit defaults to aggregated oracle sumcheck (mode 4) unless --legacy-gkr-v1 is set.
 USE_AGGREGATED_SUBMIT=false
 if [[ "$DO_SUBMIT" == "true" ]] && [[ "$MODE" == "gkr" ]]; then
@@ -324,6 +330,9 @@ fi
 if [[ "$SKIP_INFERENCE" == "true" ]]; then
     (( TOTAL_STEPS-- )) || true
 fi
+if [[ "$DO_SUBMIT" == "true" ]]; then
+    (( TOTAL_STEPS-- )) || true  # skip validation
+fi
 CURRENT=1
 
 # ─── Step 1: GPU Setup ──────────────────────────────────────────────
@@ -359,7 +368,7 @@ fi
 
 # ─── Step 3: Model Validation ───────────────────────────────────────
 
-if (( START_IDX <= 2 )); then
+if (( START_IDX <= 2 )) && [[ "$DO_SUBMIT" != "true" ]]; then
     _VALIDATE_SCRIPT="${SCRIPT_DIR}/02_validate_model.sh"
     if [[ -f "$_VALIDATE_SCRIPT" ]]; then
         _VALIDATE_ARGS=()
@@ -373,6 +382,9 @@ if (( START_IDX <= 2 )); then
         log "02_validate_model.sh not found, skipping validation"
         STEP_RESULTS+=("Model Validation: SKIP")
     fi
+elif [[ "$DO_SUBMIT" == "true" ]]; then
+    log "Skipping validation (--submit: prove step validates internally)"
+    STEP_RESULTS+=("Model Validation: SKIP (--submit)")
     (( CURRENT++ ))
 fi
 
