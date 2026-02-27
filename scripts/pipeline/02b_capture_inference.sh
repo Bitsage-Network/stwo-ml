@@ -30,7 +30,7 @@ NUM_LAYERS=""
 CAPTURE_COUNT=3
 MODEL_ID="0x1"
 INPUT_FILE=""
-SKIP_COMMITMENT=false
+SKIP_COMMITMENT=true   # Legacy packed commitment not used by GKR pipeline; use --no-skip-commitment to force
 SKIP_BUILD=false
 LOG_DIR_OVERRIDE=""
 CAPTURE_TIMEOUT_SEC="${CAPTURE_TIMEOUT_SEC:-3600}"
@@ -46,6 +46,7 @@ while [[ $# -gt 0 ]]; do
         --model-id)         MODEL_ID="$2"; shift 2 ;;
         --input)            INPUT_FILE="$2"; shift 2 ;;
         --skip-commitment)  SKIP_COMMITMENT=true; shift ;;
+        --no-skip-commitment) SKIP_COMMITMENT=false; shift ;;
         --skip-build)       SKIP_BUILD=true; shift ;;
         --log-dir)          LOG_DIR_OVERRIDE="$2"; shift 2 ;;
         -h|--help)
