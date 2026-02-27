@@ -663,8 +663,9 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
     "verify_model_gkr_v4_packed_io",
   ]);
   if (!allowedEntrypoints.has(entrypoint)) {
+    const reason = verifyCalldata.reason || "(no reason recorded)";
     die(
-      `Unsupported entrypoint in hardened pipeline (got: ${entrypoint})`
+      `Unsupported entrypoint in hardened pipeline (got: ${entrypoint}). Reason: ${reason}`
     );
   }
 
