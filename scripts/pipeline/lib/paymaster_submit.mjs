@@ -1495,6 +1495,31 @@ async function cmdVerify(args) {
               info("  WARNING: Cannot verify session TTL (getBlockNumber unavailable). If session expired, contract will reject with GKR_SESSION_EXPIRED.");
             }
           }
+          // Check class hash: contract upgrades invalidate all existing sessions.
+          // Sessions created under a previous class are stale and must be discarded.
+          if (resumeState) {
+            try {
+              const currentClassHash = await provider.getClassHashAt(contract);
+              if (resumeState.classHash) {
+                const savedNorm = resumeState.classHash.toLowerCase().replace(/^0x0*/, "0x");
+                const currentNorm = currentClassHash.toLowerCase().replace(/^0x0*/, "0x");
+                if (savedNorm !== currentNorm) {
+                  info(`  Contract upgraded since session was created (class: ${resumeState.classHash.slice(0, 14)}… → ${currentClassHash.slice(0, 14)}…)`);
+                  info(`  Starting fresh session (old session is invalid after upgrade)`);
+                  resumeState = null;
+                  resumeIsSealedOnly = false;
+                }
+              } else {
+                // Legacy session file without classHash — cannot verify, warn and discard
+                info(`  Session ${resumeState.sessionId} was saved without class hash (pre-upgrade format)`);
+                info(`  Starting fresh session to be safe`);
+                resumeState = null;
+                resumeIsSealedOnly = false;
+              }
+            } catch {
+              info("  WARNING: Cannot verify contract class hash. If contract was upgraded, session may fail.");
+            }
+          }
         } else {
           resumeState = null;
         }
@@ -1720,10 +1745,14 @@ async function cmdVerify(args) {
         const n = Number(openReceipt.block_number);
         return Number.isFinite(n) && n >= 0 ? n : null;
       })();
+      // Capture current class hash so we can detect contract upgrades on resume.
+      let openClassHash = null;
+      try { openClassHash = await provider.getClassHashAt(contract); } catch { /* non-fatal */ }
       sessionState = {
         sessionId,
         modelId,
         contract,
+        classHash: openClassHash,
         totalFelts: verifyPayload.totalFelts,
         numChunks: verifyPayload.numChunks,
         chunksUploaded: 0,
