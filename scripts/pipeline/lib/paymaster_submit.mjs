@@ -743,6 +743,7 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
     "verify_model_gkr_v4",
     "verify_model_gkr_v4_packed",
     "verify_model_gkr_v4_packed_io",
+    "verify_model_gkr_v4_packed_io_dp",
   ]);
   if (!allowedEntrypoints.has(entrypoint)) {
     const reason = verifyCalldata.reason || "(no reason recorded)";

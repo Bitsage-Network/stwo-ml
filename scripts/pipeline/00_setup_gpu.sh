@@ -119,6 +119,24 @@ if [[ "$SKIP_DEPS" == "false" ]]; then
     pip3 install --quiet --upgrade huggingface_hub filelock 2>/dev/null || \
         pip3 install --quiet --upgrade --user huggingface_hub filelock 2>/dev/null || true
     ok "huggingface_hub available"
+
+    # Node.js 20+ (required for on-chain paymaster submission)
+    NODE_VER=$(node --version 2>/dev/null | sed 's/^v//' | cut -d. -f1)
+    if [[ -z "$NODE_VER" ]] || (( NODE_VER < 18 )); then
+        log "Installing Node.js 20 (needed for paymaster submission)..."
+        if command -v apt-get &>/dev/null; then
+            curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - 2>&1 | tail -3
+            run_cmd sudo apt-get install -y -qq nodejs 2>&1 | tail -3
+        elif command -v yum &>/dev/null; then
+            curl -fsSL https://rpm.nodesource.com/setup_20.x | sudo bash - 2>&1 | tail -3
+            run_cmd sudo yum install -y nodejs 2>&1 | tail -3
+        else
+            warn "Cannot auto-install Node.js — install Node.js 18+ manually for paymaster submission"
+        fi
+        ok "Node.js $(node --version 2>/dev/null || echo 'not installed')"
+    else
+        ok "Node.js v${NODE_VER} already installed"
+    fi
 else
     log "Skipping (--skip-deps)"
 fi
@@ -295,6 +313,18 @@ if [[ "$SKIP_BUILD" == "false" ]]; then
         if command -v scarb &>/dev/null && [[ -d "${LIBS_DIR}/stwo-cairo/stwo_cairo_verifier" ]]; then
             (cd "${LIBS_DIR}/stwo-cairo/stwo_cairo_verifier" && scarb build 2>&1 | tail -3) || true
         fi
+    fi
+
+    # 5d: Node.js pipeline dependencies (for on-chain submission)
+    if command -v node &>/dev/null && command -v npm &>/dev/null; then
+        PIPELINE_LIB_DIR="${LIBS_DIR}/scripts/pipeline/lib"
+        if [[ -f "${PIPELINE_LIB_DIR}/package.json" ]]; then
+            log "Installing pipeline JS dependencies..."
+            (cd "${PIPELINE_LIB_DIR}" && npm install --no-audit --no-fund 2>&1 | tail -3) && \
+                ok "Pipeline JS deps installed (starknet.js)" || warn "npm install failed"
+        fi
+    else
+        warn "Node.js not available — on-chain paymaster submission will not work"
     fi
 else
     log "Skipping (--skip-build)"

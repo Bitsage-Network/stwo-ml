@@ -417,7 +417,11 @@ if [[ "$USE_PAYMASTER" == "true" ]] && [[ "$PROOF_MODE" != "recursive" ]]; then
 
     # Detect schema version for logging
     SCHEMA_VERSION=$(parse_json_field "$PROOF_FILE" "verify_calldata.schema_version" 2>/dev/null || echo "1")
-    if [[ "$SCHEMA_VERSION" == "2" ]]; then
+    if [[ "$SCHEMA_VERSION" == "3" ]]; then
+        NUM_BATCHES=$(parse_json_field "$PROOF_FILE" "verify_calldata.stream_batches" 2>/dev/null | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "?")
+        TOTAL_FELTS=$(parse_json_field "$PROOF_FILE" "verify_calldata.total_felts" 2>/dev/null || echo "?")
+        log "Streaming v25 mode: ${TOTAL_FELTS} felts in ${NUM_BATCHES} stream batches"
+    elif [[ "$SCHEMA_VERSION" == "2" ]]; then
         NUM_CHUNKS=$(parse_json_field "$PROOF_FILE" "verify_calldata.num_chunks" 2>/dev/null || echo "?")
         TOTAL_FELTS=$(parse_json_field "$PROOF_FILE" "verify_calldata.total_felts" 2>/dev/null || echo "?")
         log "Chunked session mode: ${TOTAL_FELTS} felts in ${NUM_CHUNKS} chunks"
@@ -524,11 +528,15 @@ else
             # Detect schema version early — schema v2 (chunked session) must go
             # through the paymaster/JS path which handles multi-TX chunked sessions.
             _SCHEMA_VERSION=$(parse_json_field "$PROOF_FILE" "verify_calldata.schema_version" 2>/dev/null || echo "1")
-            if [[ "$_SCHEMA_VERSION" == "2" ]]; then
-                _NUM_CHUNKS=$(parse_json_field "$PROOF_FILE" "verify_calldata.num_chunks" 2>/dev/null || echo "?")
+            if [[ "$_SCHEMA_VERSION" == "2" ]] || [[ "$_SCHEMA_VERSION" == "3" ]]; then
                 _TOTAL_FELTS=$(parse_json_field "$PROOF_FILE" "verify_calldata.total_felts" 2>/dev/null || echo "?")
-                log "Schema v2 detected: chunked session (${_TOTAL_FELTS} felts in ${_NUM_CHUNKS} chunks)"
-                log "Routing through paymaster/JS path for chunked session support..."
+                if [[ "$_SCHEMA_VERSION" == "3" ]]; then
+                    log "Schema v3 detected: streaming v25 verification (${_TOTAL_FELTS} felts)"
+                else
+                    _NUM_CHUNKS=$(parse_json_field "$PROOF_FILE" "verify_calldata.num_chunks" 2>/dev/null || echo "?")
+                    log "Schema v2 detected: chunked session (${_TOTAL_FELTS} felts in ${_NUM_CHUNKS} chunks)"
+                fi
+                log "Routing through paymaster/JS path for multi-TX session support..."
 
                 PAYMASTER_SCRIPT="${SCRIPT_DIR}/lib/paymaster_submit.mjs"
                 ensure_node || exit 1
