@@ -1474,9 +1474,13 @@ fn main() {
                             .ok()
                             .map(|v| !v.is_empty() && v != "0")
                             .unwrap_or(false);
+                        let force_streaming = std::env::var("STWO_FORCE_STREAMING")
+                            .ok()
+                            .map(|v| !v.is_empty() && v != "0")
+                            .unwrap_or(false);
                         let (verify_result, is_packed, is_io_packed, is_double_packed) = if use_starknet_gkr_v4 {
                             // Try double-packed-io first (c0+c2 QM31 pairs in 1 felt) — smallest possible
-                            if !no_io_pack {
+                            if !no_io_pack && !force_streaming {
                                 match build_verify_model_gkr_v4_double_packed_io_calldata(gkr_p, &circuit, model_id, &raw_io) {
                                     Ok(dp_vc) if dp_vc.total_felts <= CHUNKED_GKR_THRESHOLD => {
                                         eprintln!(
@@ -1513,7 +1517,7 @@ fn main() {
                                         }
                                     }
                                 }
-                            } else {
+                            } else if !force_streaming {
                                 match build_verify_model_gkr_v4_packed_calldata(gkr_p, &circuit, model_id, &raw_io) {
                                     Ok(packed_vc) if packed_vc.total_felts <= CHUNKED_GKR_THRESHOLD => {
                                         eprintln!(
@@ -1526,6 +1530,9 @@ fn main() {
                                         (build_verify_model_gkr_v4_calldata(gkr_p, &circuit, model_id, &raw_io), false, false, false)
                                     }
                                 }
+                            } else {
+                                // force_streaming: build unpacked calldata (will be routed to streaming below)
+                                (build_verify_model_gkr_v4_calldata(gkr_p, &circuit, model_id, &raw_io), false, false, false)
                             }
                         } else if use_starknet_gkr_v3 {
                             (build_verify_model_gkr_v3_calldata(gkr_p, &circuit, model_id, &raw_io), false, false, false)
@@ -1536,7 +1543,7 @@ fn main() {
                         };
                         match verify_result {
                             Ok(vc) => {
-                                if vc.total_felts > CHUNKED_GKR_THRESHOLD && use_starknet_gkr_v4 {
+                                if (vc.total_felts > CHUNKED_GKR_THRESHOLD || force_streaming) && use_starknet_gkr_v4 {
                                     // Auto-select streaming verification (v25) for large proofs.
                                     // Streaming passes proof data as calldata (no storage reads),
                                     // avoiding the step limit hit by verify_gkr_execute.

@@ -539,29 +539,41 @@ pub fn evaluate_mle_from_io_span_2d(
 /// Parameters:
 /// Extract a single M31 value from packed felt252 data.
 /// Each felt252 holds 8 M31 values (31 bits each) in its low 248 bits.
+///
+/// Uses u128 lo/hi limb splitting instead of u256 division loops.
+/// Slot positions: 0-3 in low limb, 4 straddles lo/hi, 5-7 in high limb.
 pub fn extract_m31_from_packed(packed_felts: Span<felt252>, m31_index: u32) -> u32 {
     let felt_idx: u32 = m31_index / 8;
     let slot: u32 = m31_index % 8;
     let val: u256 = (*packed_felts.at(felt_idx)).into();
-    // M31 values are packed LSB-first: slot 0 in bits 0..31, slot 1 in bits 31..62, etc.
-    let shift_bits: u32 = slot * 31;
-    let shifted = if shift_bits == 0 {
-        val
+    let lo = val.low;
+    let hi = val.high;
+
+    let v: u128 = if slot == 0 {
+        lo & 0x7FFFFFFF
+    } else if slot == 1 {
+        (lo / 0x80000000) & 0x7FFFFFFF
+    } else if slot == 2 {
+        (lo / 0x4000000000000000) & 0x7FFFFFFF
+    } else if slot == 3 {
+        // bits 93..124 of lo: lo >> 93 = lo / 2^93
+        (lo / 0x200000000000000000000000) & 0x7FFFFFFF
+    } else if slot == 4 {
+        // bits 124..155 straddle lo/hi: 4 bits from lo top, 27 bits from hi bottom
+        let lo_top: u128 = lo / 0x10000000000000000000000000000000; // lo >> 124
+        let hi_low27: u128 = hi & 0x7FFFFFF; // 27 bits
+        (lo_top | (hi_low27 * 16)) & 0x7FFFFFFF
+    } else if slot == 5 {
+        // bits 155..186: hi >> 27
+        (hi / 0x8000000) & 0x7FFFFFFF
+    } else if slot == 6 {
+        // bits 186..217: hi >> 58
+        (hi / 0x400000000000000) & 0x7FFFFFFF
     } else {
-        let mut divisor: u256 = 1;
-        let mut s: u32 = 0;
-        loop {
-            if s >= shift_bits {
-                break;
-            }
-            divisor = divisor * 2;
-            s += 1;
-        };
-        val / divisor
+        // slot == 7: bits 217..248: hi >> 89
+        (hi / 0x20000000000000000000000) & 0x7FFFFFFF
     };
-    let mask: u256 = 0x7FFFFFFF; // (1 << 31) - 1
-    let result: u256 = shifted & mask;
-    result.try_into().unwrap()
+    v.try_into().unwrap()
 }
 
 /// - packed_felts: Full packed IO span (8 M31 values per felt252)
@@ -569,6 +581,15 @@ pub fn extract_m31_from_packed(packed_felts: Span<felt252>, m31_index: u32) -> u
 /// - data_len: Number of M31 data values to evaluate
 /// - padded_len: Power-of-2 padded length for MLE
 /// - point: MLE evaluation point (log2(padded_len) QM31 values)
+///
+/// Uses the MLE fold algorithm instead of eq_table + dot product:
+///   1. Unpack M31 values from packed felts into a QM31 array
+///   2. Fold: for each variable r, arr[j] = arr[2j]*(1-r) + arr[2j+1]*r
+///   3. After log2(padded_len) folds, arr[0] is the result
+///
+/// This uses ~data_len QM31 multiply-adds total (geometric sum) instead of
+/// ~2*padded_len for eq_table construction, saving ~60% of Cairo steps for
+/// non-power-of-2 data lengths like Qwen3-14B's 5120-dim output.
 pub fn evaluate_mle_from_packed_1row(
     packed_felts: Span<felt252>,
     m31_start: u32,
@@ -577,40 +598,13 @@ pub fn evaluate_mle_from_packed_1row(
     point: Span<QM31>,
 ) -> QM31 {
     let n_vars = point.len();
-    assert!(padded_len > 0, "EQ_TABLE_EMPTY");
+    assert!(padded_len > 0, "MLE_PADDED_EMPTY");
 
-    // Build eq table
-    let mut eq_table: Array<QM31> = array![qm31_one()];
-    let mut var_idx: u32 = 0;
-    loop {
-        if var_idx >= n_vars {
-            break;
-        }
-        let r = *point.at(var_idx);
-        let one_minus_r = qm31_sub(qm31_one(), r);
-        let old_len = eq_table.len();
-        let old_span = eq_table.span();
-        let mut new_table: Array<QM31> = array![];
-        let mut k: u32 = 0;
-        loop {
-            if k >= old_len {
-                break;
-            }
-            let e = *old_span.at(k);
-            new_table.append(qm31_mul(e, one_minus_r));
-            new_table.append(qm31_mul(e, r));
-            k += 1;
-        };
-        eq_table = new_table;
-        var_idx += 1;
-    };
-    let eq_span = eq_table.span();
-
-    // Compute packed felt index and offset for m31_start
+    // Step 1: Unpack M31 values from packed felts into QM31 array.
+    // Pad to padded_len with QM31 zeros for the fold.
+    let mut coeffs: Array<QM31> = array![];
     let mut pi: u32 = m31_start / 8;
     let skip_in_first: u32 = m31_start % 8;
-
-    let mut acc = qm31_zero();
     let mut data_idx: u32 = 0;
 
     loop {
@@ -620,12 +614,7 @@ pub fn evaluate_mle_from_packed_1row(
         let val: u256 = (*packed_felts.at(pi)).into();
         let mut rem_lo: u128 = val.low;
         let mut rem_hi: u128 = val.high;
-
-        // Determine how many M31 values to skip in this packed felt
         let skip_count = if pi == m31_start / 8 { skip_in_first } else { 0 };
-
-        // Extract all 8 M31 values from this packed felt
-        // But skip the first `skip_count` and stop when data_idx reaches data_len
         let mut pos_in_felt: u32 = 0;
 
         // Values 0-3 from lo limb
@@ -637,10 +626,8 @@ pub fn evaluate_mle_from_packed_1row(
             let q: u128 = rem_lo / 0x80000000;
             let v: u128 = rem_lo - q * 0x80000000;
             if pos_in_felt >= skip_count && data_idx < data_len {
-                if v != 0 {
-                    let v_u64: u64 = v.try_into().unwrap();
-                    acc = qm31_add(acc, qm31_mul(m31_to_qm31(v_u64), *eq_span.at(data_idx)));
-                }
+                let v_u64: u64 = v.try_into().unwrap();
+                coeffs.append(m31_to_qm31(v_u64));
                 data_idx += 1;
             }
             rem_lo = q;
@@ -654,10 +641,8 @@ pub fn evaluate_mle_from_packed_1row(
         let v4: u128 = rem_lo | (hi_low27 * 16);
         let v4_masked: u128 = v4 & 0x7FFFFFFF;
         if pos_in_felt >= skip_count && data_idx < data_len {
-            if v4_masked != 0 {
-                let v4_u64: u64 = v4_masked.try_into().unwrap();
-                acc = qm31_add(acc, qm31_mul(m31_to_qm31(v4_u64), *eq_span.at(data_idx)));
-            }
+            let v4_u64: u64 = v4_masked.try_into().unwrap();
+            coeffs.append(m31_to_qm31(v4_u64));
             data_idx += 1;
         }
         rem_hi = hi_q4;
@@ -672,10 +657,8 @@ pub fn evaluate_mle_from_packed_1row(
             let q: u128 = rem_hi / 0x80000000;
             let v: u128 = rem_hi - q * 0x80000000;
             if pos_in_felt >= skip_count && data_idx < data_len {
-                if v != 0 {
-                    let v_u64: u64 = v.try_into().unwrap();
-                    acc = qm31_add(acc, qm31_mul(m31_to_qm31(v_u64), *eq_span.at(data_idx)));
-                }
+                let v_u64: u64 = v.try_into().unwrap();
+                coeffs.append(m31_to_qm31(v_u64));
                 data_idx += 1;
             }
             rem_hi = q;
@@ -686,16 +669,58 @@ pub fn evaluate_mle_from_packed_1row(
         // Value 7: remaining bits
         if pos_in_felt >= skip_count && data_idx < data_len {
             let v7: u128 = rem_hi & 0x7FFFFFFF;
-            if v7 != 0 {
-                let v7_u64: u64 = v7.try_into().unwrap();
-                acc = qm31_add(acc, qm31_mul(m31_to_qm31(v7_u64), *eq_span.at(data_idx)));
-            }
+            let v7_u64: u64 = v7.try_into().unwrap();
+            coeffs.append(m31_to_qm31(v7_u64));
             data_idx += 1;
         }
 
         pi += 1;
     };
-    acc
+
+    // Step 2: Fold — for each variable r_i (from first to last),
+    // fold the array in half: new[j] = old[j]*(1-r_i) + old[j+half]*r_i
+    //
+    // Handles non-power-of-2 data: entries beyond coeffs.len() are treated
+    // as QM31::zero() (implicit padding). This avoids allocating 3K+ zero
+    // entries and skips ~3K QM31 muls in the first fold round.
+    let mut current_len = padded_len;
+    let mut var_idx: u32 = 0;
+    loop {
+        if var_idx >= n_vars {
+            break;
+        }
+        let r = *point.at(var_idx);
+        let one_minus_r = qm31_sub(qm31_one(), r);
+        let half = current_len / 2;
+        let old_span = coeffs.span();
+        let actual_len = old_span.len();
+        let mut new_coeffs: Array<QM31> = array![];
+        let mut j: u32 = 0;
+        loop {
+            if j >= half {
+                break;
+            }
+            if j >= actual_len {
+                // Both lo and hi are implicit zeros → result is zero
+                new_coeffs.append(qm31_zero());
+            } else if j + half >= actual_len {
+                // hi is implicit zero: lo + r * (0 - lo) = lo * (1 - r)
+                new_coeffs.append(qm31_mul(*old_span.at(j), one_minus_r));
+            } else {
+                // Both lo and hi present: lo + r * (hi - lo)
+                let lo = *old_span.at(j);
+                let hi = *old_span.at(j + half);
+                new_coeffs.append(qm31_add(lo, qm31_mul(r, qm31_sub(hi, lo))));
+            }
+            j += 1;
+        };
+        coeffs = new_coeffs;
+        current_len = half;
+        var_idx += 1;
+    };
+
+    assert!(coeffs.len() == 1, "MLE_FOLD_NOT_SCALAR");
+    *coeffs.span().at(0)
 }
 
 /// Embed M31 values (as u64) into QM31 and pad to a target power-of-2 length.
