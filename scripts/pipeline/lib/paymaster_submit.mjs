@@ -2286,7 +2286,7 @@ async function cmdVerify(args) {
   if (
     !new Set([
       "verify_model_gkr", "verify_model_gkr_v2", "verify_model_gkr_v3", "verify_model_gkr_v4",
-      "verify_model_gkr_v4_packed", "verify_model_gkr_v4_packed_io",
+      "verify_model_gkr_v4_packed", "verify_model_gkr_v4_packed_io", "verify_model_gkr_v4_packed_io_dp",
     ]).has(verifyPayload.entrypoint)
   ) {
     die(
