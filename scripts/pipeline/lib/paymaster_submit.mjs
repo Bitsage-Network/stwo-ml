@@ -177,7 +177,9 @@ function getAccount(provider, privateKey, address, network = "sepolia") {
     : { default: true };
   // AVNU requires an API key for sponsored mode (even on Sepolia).
   // Obtain one at https://portal.avnu.fi — set AVNU_PAYMASTER_API_KEY env var.
-  const apiKey = process.env.AVNU_PAYMASTER_API_KEY;
+  // Sepolia testnet fallback — no risk, mainnet users must provide their own key.
+  const apiKey = process.env.AVNU_PAYMASTER_API_KEY
+    || (network === "sepolia" ? "2333fbdd-999c-49d0-a44c-87f6f290b0a6" : null);
   if (apiKey && paymasterOpts.nodeUrl) {
     paymasterOpts.headers = { "x-paymaster-api-key": apiKey };
   }
@@ -197,6 +199,104 @@ function jsonOutput(obj) {
 function die(msg) {
   process.stderr.write(`[ERR] ${msg}\n`);
   process.exit(1);
+}
+
+function getDeployerAccountIfAvailable(provider, network) {
+  const key = process.env.OBELYSK_DEPLOYER_KEY;
+  const addr = process.env.OBELYSK_DEPLOYER_ADDRESS;
+  if (!key || !addr) return null;
+  return getAccount(provider, key, addr, network);
+}
+
+async function registerWithDeployerFallback(
+  provider, contract, entrypoint, calldata, primaryAccount, noPaymaster, network, waitFn
+) {
+  const calls = [{
+    contractAddress: contract,
+    entrypoint,
+    calldata: CallData.compile(calldata),
+  }];
+
+  const waitForReceipt = waitFn || (async (txHash) => provider.waitForTransaction(txHash, { retryInterval: 4000 }));
+
+  const tryRegister = async (acct, label) => {
+    let txHash;
+    if (noPaymaster) {
+      const execResult = await acct.execute(calls);
+      if (!execResult || !execResult.transaction_hash) {
+        throw new Error(`account.execute() returned invalid result: ${JSON.stringify(execResult)?.slice(0, 200)}`);
+      }
+      txHash = execResult.transaction_hash;
+    } else {
+      txHash = await executeViaPaymaster(acct, calls);
+    }
+    info(`  ${label} registration TX: ${txHash}`);
+    const receipt = await waitForReceipt(txHash);
+    const status = receipt.execution_status ?? receipt.status ?? "unknown";
+    if (status === "REVERTED") {
+      const reason = receipt.revert_reason || "unknown";
+      return { reverted: true, reason, status };
+    }
+    return { reverted: false, status };
+  };
+
+  // Try with primary account first
+  try {
+    const result = await tryRegister(primaryAccount, "Primary");
+    if (!result.reverted) {
+      info(`  ${entrypoint} registered successfully (status: ${result.status})`);
+      return;
+    }
+    if (/already.?registered/i.test(result.reason)) {
+      info(`  Already registered (OK)`);
+      return;
+    }
+    if (/only.?owner|not.?owner|unauthorized|caller.?is.?not/i.test(result.reason)) {
+      info(`  Registration reverted (not owner) — retrying with deployer account...`);
+    } else {
+      die(`  Registration reverted: ${result.reason}`);
+    }
+  } catch (err) {
+    const errMsg = truncateRpcError(err);
+    if (/already.?registered/i.test(errMsg)) {
+      info(`  Already registered (OK)`);
+      return;
+    }
+    if (!/only.?owner|not.?owner|unauthorized|caller.?is.?not/i.test(errMsg)) {
+      die(`  Registration failed: ${errMsg}`);
+    }
+    info(`  Registration failed (not owner) — retrying with deployer account...`);
+  }
+
+  // Fallback: retry with deployer account
+  const deployerAccount = getDeployerAccountIfAvailable(provider, network);
+  if (!deployerAccount) {
+    die(
+      `Registration requires the deployer account (owner-only entrypoint).\n` +
+      `  Set OBELYSK_DEPLOYER_KEY and OBELYSK_DEPLOYER_ADDRESS env vars,\n` +
+      `  or run: curl -fsSL .../bootstrap.sh | bash -s -- ...`
+    );
+  }
+
+  try {
+    const result = await tryRegister(deployerAccount, "Deployer");
+    if (!result.reverted) {
+      info(`  ${entrypoint} registered via deployer (status: ${result.status})`);
+      return;
+    }
+    if (/already.?registered/i.test(result.reason)) {
+      info(`  Already registered (OK)`);
+      return;
+    }
+    die(`  Deployer registration reverted: ${result.reason}`);
+  } catch (deployerErr) {
+    const errMsg = truncateRpcError(deployerErr);
+    if (/already.?registered/i.test(errMsg)) {
+      info(`  Already registered (OK)`);
+      return;
+    }
+    die(`  Deployer registration failed: ${errMsg}`);
+  }
 }
 
 // BigInt-safe JSON serialization + atomic file write (write to temp, then rename).
@@ -1392,49 +1492,10 @@ async function cmdVerify(args) {
         );
       }
       info(`Registering model (${registerCalldata.length} calldata felts)...`);
-      const regCalls = [{
-        contractAddress: contract,
-        entrypoint: "register_model_gkr",
-        calldata: CallData.compile(registerCalldata),
-      }];
-      try {
-        let regTxHash;
-        if (noPaymaster) {
-          const execResult = await account.execute(regCalls);
-          if (!execResult || !execResult.transaction_hash) {
-            throw new Error(`account.execute() returned invalid result: ${JSON.stringify(execResult)?.slice(0, 200)}`);
-          }
-          regTxHash = execResult.transaction_hash;
-        } else {
-          regTxHash = await executeViaPaymaster(account, regCalls);
-        }
-        info(`  Registration TX: ${regTxHash}`);
-        const regReceipt = await provider.waitForTransaction(regTxHash, { retryInterval: 4000 });
-        const regStatus = regReceipt.execution_status ?? regReceipt.status ?? "unknown";
-        if (regStatus === "REVERTED") {
-          const reason = regReceipt.revert_reason || "unknown";
-          // "already registered" or "Only owner" are not fatal — model may be pre-registered by deployer
-          if (/already.?registered/i.test(reason)) {
-            info("  Model already registered (OK)");
-          } else if (/only.?owner|not.?owner|unauthorized|caller.?is.?not/i.test(reason)) {
-            info("  Registration reverted (not owner) — model may already be registered by deployer, continuing...");
-          } else {
-            die(`  Registration reverted: ${reason}`);
-          }
-        } else {
-          info(`  Model registered successfully (status: ${regStatus})`);
-        }
-      } catch (regErr) {
-        const errMsg = truncateRpcError(regErr);
-        // Tolerate "already registered" or ownership errors (model pre-registered by deployer)
-        if (/already.?registered/i.test(errMsg)) {
-          info("  Model already registered (OK)");
-        } else if (/only.?owner|not.?owner|unauthorized|caller.?is.?not/i.test(errMsg)) {
-          info("  Registration failed (not owner) — model may already be registered by deployer, continuing...");
-        } else {
-          die(`  Registration failed: ${errMsg}`);
-        }
-      }
+      await registerWithDeployerFallback(
+        provider, contract, "register_model_gkr", registerCalldata,
+        account, noPaymaster, network, null
+      );
     }
 
     // ── Auto-register streaming circuit hash if needed ──
@@ -1443,46 +1504,15 @@ async function cmdVerify(args) {
     // register_model_gkr_streaming_circuit overwrites the circuit_hash with the streaming variant.
     if (verifyPayload.streaming && verifyPayload.layerTags && verifyPayload.layerTags.length > 0) {
       info(`Registering streaming circuit hash (${verifyPayload.layerTags.length} layer tags)...`);
-      const streamRegCalls = [{
-        contractAddress: contract,
-        entrypoint: "register_model_gkr_streaming_circuit",
-        calldata: CallData.compile([
-          modelId,
-          String(verifyPayload.circuitDepth),
-          verifyPayload.layerTags.map(String),
-        ]),
-      }];
-      try {
-        let streamRegTxHash;
-        if (noPaymaster) {
-          const execResult = await account.execute(streamRegCalls);
-          streamRegTxHash = execResult.transaction_hash;
-        } else {
-          streamRegTxHash = await executeViaPaymaster(account, streamRegCalls);
-        }
-        info(`  Streaming circuit registration TX: ${streamRegTxHash}`);
-        const streamRegReceipt = await provider.waitForTransaction(streamRegTxHash, { retryInterval: 4000 });
-        const streamRegStatus = streamRegReceipt.execution_status ?? streamRegReceipt.status ?? "unknown";
-        if (streamRegStatus === "REVERTED") {
-          const reason = streamRegReceipt.revert_reason || "unknown";
-          if (/not.?registered/i.test(reason)) {
-            die(`  Cannot register streaming circuit: model not registered for GKR. Register model first.`);
-          } else if (/only.?owner|not.?owner/i.test(reason)) {
-            info("  Streaming circuit registration failed (not owner) — may already be registered, continuing...");
-          } else {
-            info(`  Streaming circuit registration reverted: ${reason} — continuing (will fail at finalize if hash mismatches)`);
-          }
-        } else {
-          info(`  Streaming circuit hash registered (status: ${streamRegStatus})`);
-        }
-      } catch (streamRegErr) {
-        const errMsg = truncateRpcError(streamRegErr);
-        if (/only.?owner|not.?owner/i.test(errMsg)) {
-          info("  Streaming circuit registration failed (not owner) — continuing...");
-        } else {
-          info(`  Streaming circuit registration failed: ${errMsg} — continuing (will fail at finalize if hash mismatches)`);
-        }
-      }
+      const streamRegCalldata = [
+        modelId,
+        String(verifyPayload.circuitDepth),
+        verifyPayload.layerTags.map(String),
+      ];
+      await registerWithDeployerFallback(
+        provider, contract, "register_model_gkr_streaming_circuit", streamRegCalldata,
+        account, noPaymaster, network, null
+      );
     }
 
     const verificationCountBefore = await fetchVerificationCount(provider, contract, modelId);
@@ -2499,47 +2529,11 @@ async function cmdVerify(args) {
         );
       }
       info(`Registering model (${rc.length} calldata felts)...`);
-      const regCalls = [{
-        contractAddress: contract,
-        entrypoint: "register_model_gkr",
-        calldata: CallData.compile(rc),
-      }];
-      try {
-        let rTx;
-        if (noPaymaster) {
-          const execResult = await account.execute(regCalls);
-          if (!execResult || !execResult.transaction_hash) {
-            throw new Error(`account.execute() returned invalid result: ${JSON.stringify(execResult)?.slice(0, 200)}`);
-          }
-          rTx = execResult.transaction_hash;
-        } else {
-          rTx = await executeViaPaymaster(account, regCalls);
-        }
-        info(`  Registration TX: ${rTx}`);
-        const rReceipt = await waitWithTimeout(rTx, 120000);
-        const rStatus = rReceipt.execution_status ?? rReceipt.status ?? "unknown";
-        if (rStatus === "REVERTED") {
-          const reason = rReceipt.revert_reason || "unknown";
-          if (/already.?registered/i.test(reason)) {
-            info("  Model already registered (OK)");
-          } else if (/only.?owner|not.?owner|unauthorized|caller.?is.?not/i.test(reason)) {
-            info("  Registration reverted (not owner) — model may already be registered by deployer, continuing...");
-          } else {
-            die(`  Registration reverted: ${reason}`);
-          }
-        } else {
-          info(`  Model registered (status: ${rStatus})`);
-        }
-      } catch (regErr) {
-        const errMsg = truncateRpcError(regErr);
-        if (/already.?registered/i.test(errMsg)) {
-          info("  Model already registered (OK)");
-        } else if (/only.?owner|not.?owner|unauthorized|caller.?is.?not/i.test(errMsg)) {
-          info("  Registration failed (not owner) — model may already be registered by deployer, continuing...");
-        } else {
-          die(`  Registration failed: ${errMsg}`);
-        }
-      }
+      await registerWithDeployerFallback(
+        provider, contract, "register_model_gkr", rc,
+        account, noPaymaster, network,
+        (txHash) => waitWithTimeout(txHash, 120000)
+      );
     }
   }
 

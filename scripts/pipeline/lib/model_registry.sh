@@ -30,6 +30,26 @@ PRESET_gemma2_9b="google/gemma-2-9b|42|18|symmetric8|4|3584|16|8|gelu|Gemma 2 9B
 # All known preset names
 _PRESETS=("qwen3-14b" "llama3-8b" "llama3-70b" "mistral-7b" "phi3-mini" "gemma2-9b")
 
+# ─── Preset → Model ID Mapping ──────────────────────────────────────
+#
+# Each preset maps to a unique on-chain model_id. Different architectures
+# MUST use different IDs to avoid STREAM_WEIGHT_COUNT_VS_REGISTERED or
+# CIRCUIT_HASH_MISMATCH errors.
+
+declare -A MODEL_ID_MAP=(
+    ["qwen3-14b"]="0xc"
+    ["llama3-8b"]="0xd"
+    ["llama3-70b"]="0xe"
+    ["mistral-7b"]="0xf"
+    ["phi3-mini"]="0x10"
+    ["gemma2-9b"]="0x11"
+)
+
+get_preset_model_id() {
+    local name="$1"
+    echo "${MODEL_ID_MAP[$name]:-0x1}"
+}
+
 # ─── Preset Functions ────────────────────────────────────────────────
 
 list_presets() {
@@ -77,6 +97,12 @@ get_preset() {
     export MODEL_NAME MODEL_HF MODEL_LAYERS MODEL_SIZE_GB MODEL_QUANT MODEL_SHARDS
     export MODEL_HIDDEN MODEL_HEADS MODEL_KV_HEADS MODEL_ACTIVATION MODEL_DESCRIPTION
     export MODEL_NUM_ATTENTION_HEADS MODEL_NUM_KEY_VALUE_HEADS
+
+    # Auto-assign model_id from preset unless explicitly overridden
+    if [[ -z "${MODEL_ID_OVERRIDE:-}" ]]; then
+        MODEL_ID="${MODEL_ID_MAP[$name]:-0x1}"
+        export MODEL_ID
+    fi
 
     debug "Loaded preset: ${name} → ${MODEL_HF} (${MODEL_LAYERS} layers, ${MODEL_SIZE_GB}GB)"
     return 0

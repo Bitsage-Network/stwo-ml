@@ -78,6 +78,13 @@ init_obelysk_dir() {
     mkdir -p "${OBELYSK_DIR}"/{models,proofs,configs,logs}
     debug "Obelysk dir initialized: ${OBELYSK_DIR}"
 
+    # Auto-load pipeline env config
+    local _env_file="${OBELYSK_DIR}/.env"
+    if [[ -f "$_env_file" ]]; then
+        set -a; source "$_env_file"; set +a
+        debug "Loaded env from ${_env_file}"
+    fi
+
     # Auto-load encrypted secrets (HF_TOKEN, IRYS_TOKEN, etc.)
     local _secrets_sh="${SCRIPT_DIR:-$(cd "$(dirname "$0")" && pwd)}/lib/secrets.sh"
     if [[ -f "$_secrets_sh" ]]; then

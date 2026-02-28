@@ -364,6 +364,16 @@ if (( START_IDX <= 1 )); then
     run_step "Model Download" "$CURRENT" "$TOTAL_STEPS" \
         bash "${SCRIPT_DIR}/01_setup_model.sh" "${_MODEL_ARGS[@]}" || exit 1
     (( CURRENT++ ))
+
+    # Auto-resolve model_id from preset (if still at default 0x1)
+    if [[ "$MODEL_ID" == "0x1" ]] && [[ -n "$PRESET" ]]; then
+        source "${SCRIPT_DIR}/lib/model_registry.sh"
+        AUTO_MODEL_ID=$(get_preset_model_id "$PRESET")
+        if [[ "$AUTO_MODEL_ID" != "0x1" ]]; then
+            MODEL_ID="$AUTO_MODEL_ID"
+            log "Auto-assigned model_id: ${MODEL_ID} (preset: ${PRESET})"
+        fi
+    fi
 fi
 
 # ─── Step 3: Model Validation ───────────────────────────────────────
@@ -492,12 +502,9 @@ fi
 # ─── Step 8: Audit ─────────────────────────────────────────────────
 
 if (( START_IDX <= 7 )) && [[ "$DO_AUDIT" == "true" ]]; then
-    _AUDIT_ARGS=("--evaluate")
-    if [[ "$DO_SUBMIT" == "true" ]]; then
-        _AUDIT_ARGS+=("--submit")
-    else
-        _AUDIT_ARGS+=("--dry-run")
-    fi
+    _AUDIT_ARGS=("--evaluate" "--dry-run" "--encryption" "none")
+    # Audit runs locally: produces the JSON report without on-chain audit
+    # record submission or Arweave dependency. Full audit submission is v2.
 
     if [[ "$DO_SUBMIT" == "true" ]]; then
         run_step "Inference Audit" "$CURRENT" "$TOTAL_STEPS" \
