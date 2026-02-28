@@ -503,22 +503,14 @@ fi
 
 if (( START_IDX <= 7 )) && [[ "$DO_AUDIT" == "true" ]]; then
     _AUDIT_ARGS=("--evaluate" "--dry-run" "--encryption" "none")
-    # Audit runs locally: produces the JSON report without on-chain audit
-    # record submission or Arweave dependency. Full audit submission is v2.
+    # Audit runs locally — produces JSON report only, no Arweave/on-chain dependency.
+    # Non-fatal: proof is already verified on-chain at this point.
 
-    if [[ "$DO_SUBMIT" == "true" ]]; then
-        run_step "Inference Audit" "$CURRENT" "$TOTAL_STEPS" \
-            bash "${SCRIPT_DIR}/05_audit.sh" "${_AUDIT_ARGS[@]}" || {
-            err "Audit step failed during submission — aborting"
-            exit 1
-        }
-    else
-        run_step "Inference Audit" "$CURRENT" "$TOTAL_STEPS" \
-            bash "${SCRIPT_DIR}/05_audit.sh" "${_AUDIT_ARGS[@]}" || {
-            warn "Audit step failed (non-critical in dry-run mode)"
-            STEP_RESULTS+=("Inference Audit: WARN")
-        }
-    fi
+    run_step "Inference Audit" "$CURRENT" "$TOTAL_STEPS" \
+        bash "${SCRIPT_DIR}/05_audit.sh" "${_AUDIT_ARGS[@]}" || {
+        warn "Audit step failed (non-critical — proof already verified on-chain)"
+        STEP_RESULTS+=("Inference Audit: WARN")
+    }
 fi
 
 # ═══════════════════════════════════════════════════════════════════════

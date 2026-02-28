@@ -123,9 +123,9 @@ fi
 
 # Optional rebuild with audit feature
 if [[ "$SKIP_BUILD" == "false" ]] && [[ -d "${LIBS_DIR}/stwo-ml" ]]; then
-    FEATURES="cli,audit"
+    FEATURES="cli,audit,model-loading,safetensors"
     if command -v nvcc &>/dev/null || [[ -f /usr/local/cuda/bin/nvcc ]]; then
-        FEATURES="cli,audit,cuda-runtime"
+        FEATURES="cli,audit,model-loading,safetensors,cuda-runtime"
     fi
     log "Rebuilding prove-model (features: ${FEATURES})..."
     if (export PATH="$HOME/.cargo/bin:$PATH" CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"; cd "${LIBS_DIR}/stwo-ml" && cargo build --release --bin prove-model --features "${FEATURES}" 2>&1 | tail -3); then
