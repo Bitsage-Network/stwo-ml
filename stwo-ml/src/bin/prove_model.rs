@@ -1577,6 +1577,7 @@ fn main() {
                                                 "init_calldata": streaming.init_calldata,
                                                 "stream_batches": batch_json,
                                                 "finalize_calldata": streaming.finalize_calldata,
+                                                "layer_tags": streaming.session_metadata.layer_tags,
                                             })
                                         }
                                         Err(e) => {

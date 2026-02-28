@@ -554,6 +554,9 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
       die(`stream_batches layer sum (${totalBatchLayers}) != num_layers (${numLayers})`);
     }
 
+    // Layer tags for streaming circuit hash registration
+    const layerTags = verifyCalldata.layer_tags || [];
+
     return {
       entrypoint: "verify_gkr_stream",
       calldata: [],
@@ -573,6 +576,7 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
       initCalldata,
       streamBatches,
       finalizeCalldata,
+      layerTags,
     };
   }
 
@@ -1422,6 +1426,54 @@ async function cmdVerify(args) {
           info("  Registration failed (not owner) — model may already be registered by deployer, continuing...");
         } else {
           die(`  Registration failed: ${errMsg}`);
+        }
+      }
+    }
+
+    // ── Auto-register streaming circuit hash if needed ──
+    // For schema v3 (streaming), the contract needs the incremental circuit hash
+    // (poseidon(circuit_depth, tags_hash)) which differs from the standard circuit hash.
+    // register_model_gkr_streaming_circuit overwrites the circuit_hash with the streaming variant.
+    if (verifyPayload.streaming && verifyPayload.layerTags && verifyPayload.layerTags.length > 0) {
+      info(`Registering streaming circuit hash (${verifyPayload.layerTags.length} layer tags)...`);
+      const streamRegCalls = [{
+        contractAddress: contract,
+        entrypoint: "register_model_gkr_streaming_circuit",
+        calldata: CallData.compile([
+          modelId,
+          String(verifyPayload.circuitDepth),
+          verifyPayload.layerTags.map(String),
+        ]),
+      }];
+      try {
+        let streamRegTxHash;
+        if (noPaymaster) {
+          const execResult = await account.execute(streamRegCalls);
+          streamRegTxHash = execResult.transaction_hash;
+        } else {
+          streamRegTxHash = await executeViaPaymaster(account, streamRegCalls);
+        }
+        info(`  Streaming circuit registration TX: ${streamRegTxHash}`);
+        const streamRegReceipt = await provider.waitForTransaction(streamRegTxHash, { retryInterval: 4000 });
+        const streamRegStatus = streamRegReceipt.execution_status ?? streamRegReceipt.status ?? "unknown";
+        if (streamRegStatus === "REVERTED") {
+          const reason = streamRegReceipt.revert_reason || "unknown";
+          if (/not.?registered/i.test(reason)) {
+            die(`  Cannot register streaming circuit: model not registered for GKR. Register model first.`);
+          } else if (/only.?owner|not.?owner/i.test(reason)) {
+            info("  Streaming circuit registration failed (not owner) — may already be registered, continuing...");
+          } else {
+            info(`  Streaming circuit registration reverted: ${reason} — continuing (will fail at finalize if hash mismatches)`);
+          }
+        } else {
+          info(`  Streaming circuit hash registered (status: ${streamRegStatus})`);
+        }
+      } catch (streamRegErr) {
+        const errMsg = truncateRpcError(streamRegErr);
+        if (/only.?owner|not.?owner/i.test(errMsg)) {
+          info("  Streaming circuit registration failed (not owner) — continuing...");
+        } else {
+          info(`  Streaming circuit registration failed: ${errMsg} — continuing (will fail at finalize if hash mismatches)`);
         }
       }
     }
