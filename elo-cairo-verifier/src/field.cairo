@@ -723,6 +723,158 @@ pub fn evaluate_mle_from_packed_1row(
     *coeffs.span().at(0)
 }
 
+/// Evaluate a partial MLE sum over a contiguous chunk of packed M31 values using
+/// eq-table dot product. Designed for chunked output MLE evaluation across
+/// multiple TXs.
+///
+/// For a chunk covering M31 indices [chunk_offset .. chunk_offset + chunk_len):
+/// 1. Build eq-table entries for the chunk's index range using factored construction:
+///    - Split n_vars into low_bits (for chunk-local indices) and high_bits
+///    - Build eq-table for low_bits via butterfly (2^low_bits muls)
+///    - Compute high_eq factor from high bits of chunk_offset
+///    - Multiply each entry by high_eq
+/// 2. Unpack M31 values from packed felts
+/// 3. Dot product: sum(coeff[i] * eq_table[i]) for non-zero coefficients
+///
+/// Parameters:
+/// - packed_felts: packed output data (8 M31 per felt252)
+/// - m31_start: starting M31 index within packed_felts to read from
+/// - chunk_len: number of M31 values in this chunk
+/// - chunk_offset: starting M31 index in the full padded output array
+/// - padded_len: total padded length (power of 2) of the full MLE
+/// - r_points: the n_vars QM31 random evaluation points
+///
+/// Returns the partial sum contribution from this chunk.
+pub fn evaluate_mle_eq_dot_partial(
+    packed_felts: Span<felt252>,
+    m31_start: u32,
+    chunk_len: u32,
+    chunk_offset: u32,
+    padded_len: u32,
+    r_points: Span<QM31>,
+) -> QM31 {
+    let n_vars = r_points.len();
+    assert!(padded_len > 0, "EQ_PARTIAL_PADDED_EMPTY");
+
+    // Build eq-table for indices [chunk_offset .. chunk_offset + chunk_len)
+    // Each eq(i, r) = prod_j( if bit_j(i) then r_j else (1-r_j) )
+    //
+    // Strategy: for a contiguous chunk of `chunk_len` indices starting at
+    // `chunk_offset`, we compute eq values by iterating over each index
+    // and computing the product of per-bit contributions.
+    //
+    // Precompute per-variable contributions: r_j and (1 - r_j)
+    let mut r_vals: Array<QM31> = array![];
+    let mut one_minus_r_vals: Array<QM31> = array![];
+    let one = qm31_one();
+    let mut vi: u32 = 0;
+    loop {
+        if vi >= n_vars {
+            break;
+        }
+        let r = *r_points.at(vi);
+        r_vals.append(r);
+        one_minus_r_vals.append(qm31_sub(one, r));
+        vi += 1;
+    };
+    let r_span = r_vals.span();
+    let omr_span = one_minus_r_vals.span();
+
+    // Build eq-table entries for this chunk using butterfly within the chunk.
+    // We decompose each global index as: global_idx = chunk_offset + local_idx.
+    //
+    // For power-of-2 aligned chunks (chunk_offset is multiple of chunk_len,
+    // chunk_len is power of 2), we can use an efficient factored approach:
+    // - high bits of chunk_offset contribute a constant factor (high_eq)
+    // - low bits are built via butterfly
+    //
+    // For general chunks, we use per-index computation with the precomputed
+    // r and (1-r) arrays. This costs chunk_len * n_vars QM31 muls, which
+    // for chunk_len=1024 and n_vars=13 is 13312 muls ~ 16M steps.
+    // BUT we can optimize: since indices are contiguous, consecutive indices
+    // differ in only the lowest bits. We use a hybrid approach:
+    //
+    // Factored butterfly: decompose n_vars into high_bits and low_bits.
+    // chunk_offset >> low_bits gives the high index, local index uses low bits.
+    // Build eq for low bits via butterfly (2^low_bits entries), multiply by
+    // the high-bit eq factor.
+    //
+    // Choose low_bits = log2(next_pow2(chunk_len)) so butterfly covers the chunk.
+    let low_bits = log2_ceil(if chunk_len > 1 { chunk_len } else { 2 });
+    let low_size = pow2(low_bits); // >= chunk_len
+    let high_bits = n_vars - low_bits;
+
+    // Compute high_eq: product of eq factors for the top `high_bits` variables.
+    // The high index is chunk_offset >> low_bits.
+    let high_idx = chunk_offset / low_size;
+    let mut high_eq = qm31_one();
+    let mut hi: u32 = 0;
+    loop {
+        if hi >= high_bits {
+            break;
+        }
+        // Variable index: MSB-first (matching evaluate_mle folding order).
+        // Variable hi corresponds to bit position (n_vars - 1 - hi) in the index.
+        // But for eq-table with MSB-first variable ordering, variable 0 is the
+        // most significant bit. The high bits correspond to variables 0..high_bits-1.
+        let bit_pos = high_bits - 1 - hi;
+        let bit_val = (high_idx / pow2(bit_pos)) % 2;
+        if bit_val == 1 {
+            high_eq = qm31_mul(high_eq, *r_span.at(hi));
+        } else {
+            high_eq = qm31_mul(high_eq, *omr_span.at(hi));
+        }
+        hi += 1;
+    };
+
+    // Build eq-table for low bits via butterfly (MSB-first within low bits).
+    // Low-bit variables are at indices high_bits..n_vars-1 in r_points.
+    let mut eq_table: Array<QM31> = array![qm31_one()];
+    let mut li: u32 = 0;
+    loop {
+        if li >= low_bits {
+            break;
+        }
+        let var_idx = high_bits + li;
+        let r = *r_span.at(var_idx);
+        let omr = *omr_span.at(var_idx);
+        let old_len = eq_table.len();
+        let old_span = eq_table.span();
+        let mut new_table: Array<QM31> = array![];
+        let mut k: u32 = 0;
+        loop {
+            if k >= old_len {
+                break;
+            }
+            let e = *old_span.at(k);
+            new_table.append(qm31_mul(e, omr));
+            new_table.append(qm31_mul(e, r));
+            k += 1;
+        };
+        eq_table = new_table;
+        li += 1;
+    };
+
+    // Multiply each eq-table entry by high_eq and dot-product with unpacked data.
+    // We combine the high_eq multiplication with the dot product to save a pass.
+    let eq_span = eq_table.span();
+    let mut acc = qm31_zero();
+    let mut i: u32 = 0;
+    loop {
+        if i >= chunk_len {
+            break;
+        }
+        // Unpack M31 value from packed felts
+        let v: u32 = extract_m31_from_packed(packed_felts, m31_start + i);
+        if v != 0 {
+            let eq_val = qm31_mul(*eq_span.at(i), high_eq);
+            acc = qm31_add(acc, qm31_mul(m31_to_qm31(v.into()), eq_val));
+        }
+        i += 1;
+    };
+    acc
+}
+
 /// Embed M31 values (as u64) into QM31 and pad to a target power-of-2 length.
 ///
 /// Each M31 value v becomes QM31(v, 0, 0, 0). Padding uses QM31::zero().

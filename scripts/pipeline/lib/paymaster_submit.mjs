@@ -503,6 +503,8 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
     if (!Array.isArray(initCalldata) || initCalldata.length === 0) {
       die("schema_version 3 requires non-empty init_calldata array");
     }
+    const outputMleChunks = verifyCalldata.output_mle_chunks || null;
+    // Legacy single-calldata support
     const outputMleCalldata = verifyCalldata.output_mle_calldata || null;
     const streamBatches = verifyCalldata.stream_batches;
     if (!Array.isArray(streamBatches) || streamBatches.length === 0) {
@@ -575,6 +577,7 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
       packed: true,
       ioPacked: true,
       initCalldata,
+      outputMleChunks,
       outputMleCalldata,
       streamBatches,
       finalizeCalldata,
@@ -2108,10 +2111,35 @@ async function cmdVerify(args) {
         info("  Resuming — stream_init already done");
       }
 
-      // Phase 4a.1: verify_gkr_stream_init_output_mle (split from init to fit gas limit)
+      // Phase 4a.1: verify_gkr_stream_init_output_mle (chunked for gas safety)
       if (!sessionState.streamOutputMleDone) {
-        if (verifyPayload.outputMleCalldata) {
-          e2ePhase("Stream output MLE evaluation");
+        if (verifyPayload.outputMleChunks && verifyPayload.outputMleChunks.length > 0) {
+          // New chunked output MLE evaluation
+          const mleChunks = verifyPayload.outputMleChunks;
+          const mleResumeFrom = sessionState.outputMleChunksDone || 0;
+          if (mleResumeFrom < mleChunks.length) {
+            e2ePhase(`Stream output MLE evaluation (${mleChunks.length} chunks)`);
+            for (let ci = mleResumeFrom; ci < mleChunks.length; ci++) {
+              const chunk = mleChunks[ci];
+              const chunkArgs = chunk.calldata.map(
+                (v) => v === "__SESSION_ID__" ? sessionId : v,
+              );
+              const pct = (((ci + 1) / mleChunks.length) * 100).toFixed(0);
+              const { txHash: chunkTxHash } = await execCallWithRetry(
+                "verify_gkr_stream_init_output_mle",
+                chunkArgs,
+                `verify_gkr_stream_init_output_mle[${ci + 1}/${mleChunks.length}] (${pct}%)`,
+              );
+              sessionState.outputMleChunksDone = ci + 1;
+              sessionState.txHashes.push(chunkTxHash);
+              safeWriteJson(sessionFile, sessionState);
+            }
+          }
+          sessionState.streamOutputMleDone = true;
+          safeWriteJson(sessionFile, sessionState);
+        } else if (verifyPayload.outputMleCalldata) {
+          // Legacy single-TX output MLE evaluation
+          e2ePhase("Stream output MLE evaluation (legacy single TX)");
           const outputMleArgs = verifyPayload.outputMleCalldata.map(
             (v) => v === "__SESSION_ID__" ? sessionId : v,
           );
@@ -2124,7 +2152,7 @@ async function cmdVerify(args) {
           sessionState.txHashes.push(outputMleTxHash);
           safeWriteJson(sessionFile, sessionState);
         } else {
-          // Legacy proof without output_mle_calldata — assume it's embedded in init
+          // No output MLE data — assume it's embedded in init
           sessionState.streamOutputMleDone = true;
           safeWriteJson(sessionFile, sessionState);
         }

@@ -251,12 +251,26 @@ pub trait ISumcheckVerifier<TContractState> {
         out_cols: u32,
     );
 
-    /// Evaluate output MLE in a separate TX (splits expensive computation from init).
+    /// Evaluate output MLE in chunked TXs (splits expensive computation across
+    /// multiple TXs to fit within Starknet's gas limit).
     /// Must be called after stream_init and before stream_layers.
+    ///
+    /// First call: draws r-points from channel, stores them, processes first chunk.
+    /// Subsequent calls: reads stored r-points, processes chunk, accumulates.
+    /// Last call (is_last_chunk=true): mixes final sum into channel, stores initial claim.
+    ///
+    /// Parameters:
+    /// - packed_output_data: packed felt252s for this chunk (8 M31 per felt)
+    /// - chunk_offset: starting M31 index in the full output array
+    /// - chunk_len: number of M31 values in this chunk
+    /// - is_last_chunk: if true, finalize the output MLE evaluation
     fn verify_gkr_stream_init_output_mle(
         ref self: TContractState,
         session_id: u64,
         packed_output_data: Array<felt252>,
+        chunk_offset: u32,
+        chunk_len: u32,
+        is_last_chunk: bool,
     );
 
     /// Verify a batch of GKR layers. Proof data for this batch arrives
@@ -295,6 +309,7 @@ mod SumcheckVerifierContract {
     use crate::field::{
         QM31, log2_ceil, next_power_of_two,
         evaluate_mle_from_packed_1row,
+        evaluate_mle_eq_dot_partial,
         extract_m31_from_packed,
         pack_qm31_to_felt, unpack_qm31_from_felt,
         qm31_zero, qm31_one, qm31_add, qm31_mul,
@@ -427,6 +442,14 @@ mod SumcheckVerifierContract {
         stream_out_data_m31_start: Map<u64, u32>,
         /// session_id → whether output MLE has been evaluated.
         stream_output_mle_done: Map<u64, bool>,
+        /// session_id → number of output MLE chunks processed so far.
+        stream_output_mle_chunks_done: Map<u64, u32>,
+        /// session_id → number of r-points stored (= n_vars = log2(padded_out_cols)).
+        stream_output_mle_r_count: Map<u64, u32>,
+        /// (session_id, var_idx) → packed QM31 r-point for output MLE evaluation.
+        stream_output_mle_r_point: Map<(u64, u32), felt252>,
+        /// session_id → packed QM31 running partial sum for output MLE.
+        stream_output_mle_partial_sum: Map<u64, felt252>,
         /// session_id → expected next batch index (for sequential enforcement).
         stream_next_batch_idx: Map<u64, u32>,
         /// session_id → total deferred Add points accumulated across batches.
@@ -1489,12 +1512,19 @@ mod SumcheckVerifierContract {
             self.emit(GkrStreamStarted { session_id, model_id, num_layers });
         }
 
-        /// Evaluate output MLE in a separate TX (splits expensive computation from init).
-        /// Receives only the output portion of packed IO data.
+        /// Evaluate output MLE in chunked TXs using eq-table dot product.
+        ///
+        /// First call (chunks_done == 0): draws r-points from channel, stores them,
+        /// processes first chunk.
+        /// Subsequent calls: reads stored r-points, processes chunk, accumulates.
+        /// Last call (is_last_chunk): mixes final sum into channel, stores initial claim.
         fn verify_gkr_stream_init_output_mle(
             ref self: ContractState,
             session_id: u64,
             packed_output_data: Array<felt252>,
+            chunk_offset: u32,
+            chunk_len: u32,
+            is_last_chunk: bool,
         ) {
             assert!(self.stream_initialized.entry(session_id).read(), "STREAM_NOT_INITIALIZED");
             assert!(!self.stream_output_mle_done.entry(session_id).read(), "OUTPUT_MLE_ALREADY_DONE");
@@ -1502,44 +1532,117 @@ mod SumcheckVerifierContract {
             let owner = self.session_owner.entry(session_id).read();
             assert!(caller == owner, "NOT_SESSION_OWNER");
 
-            // Restore channel state from init
-            let mut ch = PoseidonChannel {
-                digest: self.stream_channel_digest.entry(session_id).read(),
-                n_draws: self.stream_channel_counter.entry(session_id).read(),
-            };
-
             let out_cols = self.stream_out_cols.entry(session_id).read();
             let padded_out_cols = next_power_of_two(out_cols);
-            let log_out_total = log2_ceil(padded_out_cols); // padded_out_rows == 1, so log_out_rows == 0
+            let n_vars = log2_ceil(padded_out_cols);
 
-            let r_out = channel_draw_qm31s(ref ch, log_out_total);
+            let chunks_done = self.stream_output_mle_chunks_done.entry(session_id).read();
 
-            // Evaluate output MLE from the output-only packed data
-            let output_value = evaluate_mle_from_packed_1row(
-                packed_output_data.span(), 0, out_cols, padded_out_cols, r_out.span(),
-            );
+            // First chunk: draw r-points from channel and store them
+            let r_out = if chunks_done == 0 {
+                // Restore channel state from init
+                let mut ch = PoseidonChannel {
+                    digest: self.stream_channel_digest.entry(session_id).read(),
+                    n_draws: self.stream_channel_counter.entry(session_id).read(),
+                };
 
-            channel_mix_secure_field(ref ch, output_value);
+                let r_out = channel_draw_qm31s(ref ch, n_vars);
 
-            // Store initial claim
-            let initial_claim = GKRClaim { point: r_out, value: output_value };
-            self.stream_channel_digest.entry(session_id).write(ch.digest);
-            self.stream_channel_counter.entry(session_id).write(ch.n_draws);
-            self.stream_claim_value.entry(session_id).write(pack_qm31_to_felt(initial_claim.value));
-            let point_len = initial_claim.point.len();
-            self.stream_claim_point_len.entry(session_id).write(point_len);
-            let mut pi: u32 = 0;
-            loop {
-                if pi >= point_len {
-                    break;
-                }
-                self.stream_claim_point.entry((session_id, pi)).write(
-                    pack_qm31_to_felt(*initial_claim.point.at(pi)),
+                // Store channel state after drawing (before mixing output value)
+                self.stream_channel_digest.entry(session_id).write(ch.digest);
+                self.stream_channel_counter.entry(session_id).write(ch.n_draws);
+
+                // Store r-points for subsequent chunk TXs
+                self.stream_output_mle_r_count.entry(session_id).write(n_vars);
+                let mut ri: u32 = 0;
+                loop {
+                    if ri >= n_vars {
+                        break;
+                    }
+                    self.stream_output_mle_r_point.entry((session_id, ri)).write(
+                        pack_qm31_to_felt(*r_out.at(ri)),
+                    );
+                    ri += 1;
+                };
+
+                // Initialize partial sum to zero
+                self.stream_output_mle_partial_sum.entry(session_id).write(
+                    pack_qm31_to_felt(qm31_zero()),
                 );
-                pi += 1;
+
+                r_out
+            } else {
+                // Subsequent chunks: reload stored r-points
+                let stored_n = self.stream_output_mle_r_count.entry(session_id).read();
+                assert!(stored_n == n_vars, "R_POINTS_MISMATCH");
+                let mut r_out: Array<QM31> = array![];
+                let mut ri: u32 = 0;
+                loop {
+                    if ri >= n_vars {
+                        break;
+                    }
+                    r_out.append(unpack_qm31_from_felt(
+                        self.stream_output_mle_r_point.entry((session_id, ri)).read(),
+                    ));
+                    ri += 1;
+                };
+                r_out
             };
 
-            self.stream_output_mle_done.entry(session_id).write(true);
+            // Compute partial sum for this chunk using eq-table dot product
+            let partial = evaluate_mle_eq_dot_partial(
+                packed_output_data.span(),
+                0,              // m31_start within this chunk's packed data
+                chunk_len,
+                chunk_offset,   // global offset in padded output
+                padded_out_cols,
+                r_out.span(),
+            );
+
+            // Accumulate into running partial sum
+            let prev_sum = unpack_qm31_from_felt(
+                self.stream_output_mle_partial_sum.entry(session_id).read(),
+            );
+            let new_sum = qm31_add(prev_sum, partial);
+            self.stream_output_mle_partial_sum.entry(session_id).write(
+                pack_qm31_to_felt(new_sum),
+            );
+            self.stream_output_mle_chunks_done.entry(session_id).write(chunks_done + 1);
+
+            // Last chunk: finalize — mix output value into channel and store initial claim
+            if is_last_chunk {
+                let output_value = new_sum;
+
+                // Restore channel state (after r-point drawing, before output mix)
+                let mut ch = PoseidonChannel {
+                    digest: self.stream_channel_digest.entry(session_id).read(),
+                    n_draws: self.stream_channel_counter.entry(session_id).read(),
+                };
+
+                channel_mix_secure_field(ref ch, output_value);
+
+                // Store initial claim
+                let initial_claim = GKRClaim { point: r_out, value: output_value };
+                self.stream_channel_digest.entry(session_id).write(ch.digest);
+                self.stream_channel_counter.entry(session_id).write(ch.n_draws);
+                self.stream_claim_value.entry(session_id).write(
+                    pack_qm31_to_felt(initial_claim.value),
+                );
+                let point_len = initial_claim.point.len();
+                self.stream_claim_point_len.entry(session_id).write(point_len);
+                let mut pi: u32 = 0;
+                loop {
+                    if pi >= point_len {
+                        break;
+                    }
+                    self.stream_claim_point.entry((session_id, pi)).write(
+                        pack_qm31_to_felt(*initial_claim.point.at(pi)),
+                    );
+                    pi += 1;
+                };
+
+                self.stream_output_mle_done.entry(session_id).write(true);
+            }
         }
 
         fn verify_gkr_stream_layers(

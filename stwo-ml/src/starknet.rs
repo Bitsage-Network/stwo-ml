@@ -1627,8 +1627,9 @@ pub const MAX_STREAM_BATCH_FELTS: usize = 3500;
 pub struct StreamingGkrCalldata {
     /// Calldata for verify_gkr_stream_init (IO data + metadata).
     pub init_calldata: Vec<String>,
-    /// Calldata for verify_gkr_stream_init_output_mle (packed output values only).
-    pub output_mle_calldata: Vec<String>,
+    /// Chunked calldata for verify_gkr_stream_init_output_mle.
+    /// Each chunk contains packed output data for a portion of the output MLE.
+    pub output_mle_chunks: Vec<OutputMleChunk>,
     /// Batches of layer proof data for verify_gkr_stream_layers.
     pub stream_batches: Vec<StreamBatch>,
     /// Calldata for verify_gkr_stream_finalize (weight claims + binding).
@@ -1637,6 +1638,19 @@ pub struct StreamingGkrCalldata {
     pub session_metadata: StreamSessionMetadata,
     /// Upload chunks (for data integrity commitment via existing session flow).
     pub upload_chunks: Vec<Vec<String>>,
+}
+
+/// A single chunk of output MLE evaluation data.
+#[derive(Debug, Clone)]
+pub struct OutputMleChunk {
+    /// Starting M31 index in the full output array.
+    pub chunk_offset: u32,
+    /// Number of M31 values in this chunk.
+    pub chunk_len: u32,
+    /// Whether this is the last chunk.
+    pub is_last: bool,
+    /// Flat calldata for verify_gkr_stream_init_output_mle.
+    pub calldata: Vec<String>,
 }
 
 /// A single streaming batch of layer proofs.
@@ -1718,17 +1732,45 @@ pub fn build_streaming_gkr_calldata(
     init_calldata.push(format!("{}", io_in_cols));  // in_cols
     init_calldata.push(format!("{}", io_out_cols));  // out_cols
 
-    // ── Build output_mle calldata ──
-    // Pack only the raw output values (no header) for verify_gkr_stream_init_output_mle
+    // ── Build chunked output_mle calldata ──
+    // Split output data into chunks of CHUNK_SIZE M31 values for gas-safe MLE evaluation.
+    // Each chunk carries its own packed felt252 data, chunk_offset, chunk_len, and is_last flag.
+    const OUTPUT_MLE_CHUNK_SIZE: u32 = 1024;
     let output_start = 3 + io_in_len + 3; // skip input header + data + output header
     let output_end = output_start + io_out_len_val as usize;
-    let packed_output = pack_m31_io_data(&raw_io_data[output_start..output_end]);
-    let mut output_mle_calldata: Vec<String> = Vec::new();
-    output_mle_calldata.push("__SESSION_ID__".to_string());
-    // packed_output_data: Array<felt252> [len, data...]
-    output_mle_calldata.push(format!("{}", packed_output.len()));
-    for f in &packed_output {
-        output_mle_calldata.push(format!("0x{:x}", f));
+    let output_data = &raw_io_data[output_start..output_end];
+    let out_len = io_out_len_val;
+    let num_output_chunks = (out_len + OUTPUT_MLE_CHUNK_SIZE - 1) / OUTPUT_MLE_CHUNK_SIZE;
+
+    let mut output_mle_chunks: Vec<OutputMleChunk> = Vec::new();
+    for chunk_idx in 0..num_output_chunks {
+        let chunk_offset = chunk_idx * OUTPUT_MLE_CHUNK_SIZE;
+        let chunk_len = std::cmp::min(OUTPUT_MLE_CHUNK_SIZE, out_len - chunk_offset);
+        let is_last = chunk_idx == num_output_chunks - 1;
+
+        // Pack only this chunk's M31 values
+        let chunk_start = chunk_offset as usize;
+        let chunk_end = (chunk_offset + chunk_len) as usize;
+        let packed_chunk = pack_m31_io_data(&output_data[chunk_start..chunk_end]);
+
+        let mut calldata: Vec<String> = Vec::new();
+        calldata.push("__SESSION_ID__".to_string());
+        // packed_output_data: Array<felt252>
+        calldata.push(format!("{}", packed_chunk.len()));
+        for f in &packed_chunk {
+            calldata.push(format!("0x{:x}", f));
+        }
+        // chunk_offset, chunk_len, is_last_chunk
+        calldata.push(format!("{}", chunk_offset));
+        calldata.push(format!("{}", chunk_len));
+        calldata.push(if is_last { "1".to_string() } else { "0".to_string() });
+
+        output_mle_chunks.push(OutputMleChunk {
+            chunk_offset,
+            chunk_len,
+            is_last,
+            calldata,
+        });
     }
     let _ = io_in_rows; // used above for io_in_len calculation
 
@@ -1938,7 +1980,7 @@ pub fn build_streaming_gkr_calldata(
 
     Ok(StreamingGkrCalldata {
         init_calldata,
-        output_mle_calldata,
+        output_mle_chunks,
         stream_batches,
         finalize_calldata,
         session_metadata: StreamSessionMetadata {
