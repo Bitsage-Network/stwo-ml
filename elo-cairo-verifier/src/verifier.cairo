@@ -263,6 +263,7 @@ pub trait ISumcheckVerifier<TContractState> {
 
     /// Finalize streaming verification: verify weight binding, input MLE,
     /// circuit hash, and record the proof on-chain.
+    /// packed_raw_io is re-passed as calldata (verified against stored IO commitment).
     fn verify_gkr_stream_finalize(
         ref self: TContractState,
         session_id: u64,
@@ -271,6 +272,8 @@ pub trait ISumcheckVerifier<TContractState> {
         weight_binding_data: Array<felt252>,
         deferred_proof_data: Array<felt252>,
         deferred_matmul_dims: Array<u32>,
+        original_io_len: u32,
+        packed_raw_io: Array<felt252>,
     ) -> bool;
 }
 
@@ -1484,18 +1487,9 @@ mod SumcheckVerifierContract {
             self.stream_next_batch_idx.entry(session_id).write(0);
             self.stream_deferred_count.entry(session_id).write(0);
 
-            // Store packed IO data for input MLE check in finalize
-            let packed_io_len = packed_raw_io.len();
-            self.stream_packed_io_len.entry(session_id).write(packed_io_len);
+            // Store IO metadata for finalize (IO data re-passed as calldata, verified via commitment)
             self.stream_original_io_len.entry(session_id).write(original_io_len);
-            let mut io_i: u32 = 0;
-            loop {
-                if io_i >= packed_io_len {
-                    break;
-                }
-                self.stream_packed_io.entry((session_id, io_i)).write(*packed_raw_io.at(io_i));
-                io_i += 1;
-            };
+            self.stream_packed_io_len.entry(session_id).write(packed_raw_io.len());
 
             self.stream_initialized.entry(session_id).write(true);
             self.stream_finalized.entry(session_id).write(false);
@@ -1649,6 +1643,8 @@ mod SumcheckVerifierContract {
             weight_binding_data: Array<felt252>,
             deferred_proof_data: Array<felt252>,
             deferred_matmul_dims: Array<u32>,
+            original_io_len: u32,
+            packed_raw_io: Array<felt252>,
         ) -> bool {
             // Auth
             assert!(self.stream_initialized.entry(session_id).read(), "STREAM_NOT_INITIALIZED");
@@ -1852,23 +1848,32 @@ mod SumcheckVerifierContract {
             channel_mix_secure_field(ref ch, combined);
 
             // ── Input MLE verification ──
-            // Re-read stored packed IO data and verify final claim against input MLE.
-            // This is the critical soundness check: the GKR walk's final claim must match
-            // the MLE evaluation of the actual input data at the final claim point.
-            let original_io_len = self.stream_original_io_len.entry(session_id).read();
-            let packed_io_len = self.stream_packed_io_len.entry(session_id).read();
-            let mut packed_raw_io: Array<felt252> = array![];
-            let mut io_i: u32 = 0;
+            // Packed IO data is re-passed as calldata (no storage reads).
+            // Verify length matches what was stored in init, then check commitment.
+            let stored_original_io_len = self.stream_original_io_len.entry(session_id).read();
+            let stored_packed_io_len = self.stream_packed_io_len.entry(session_id).read();
+            assert!(original_io_len == stored_original_io_len, "FINALIZE_IO_LEN_MISMATCH");
+            assert!(packed_raw_io.len() == stored_packed_io_len, "FINALIZE_PACKED_IO_LEN_MISMATCH");
+            let packed_span = packed_raw_io.span();
+
+            // Verify IO commitment FIRST (cheap Poseidon check before expensive MLE)
+            let stored_io_commitment = self.stream_io_commitment.entry(session_id).read();
+            let mut commitment_input: Array<felt252> = array![original_io_len.into()];
+            let mut ci: u32 = 0;
             loop {
-                if io_i >= packed_io_len {
+                if ci >= stored_packed_io_len {
                     break;
                 }
-                packed_raw_io.append(
-                    self.stream_packed_io.entry((session_id, io_i)).read(),
-                );
-                io_i += 1;
+                commitment_input.append(*packed_span.at(ci));
+                ci += 1;
             };
-            let packed_span = packed_raw_io.span();
+            let recomputed_io_commitment = core::poseidon::poseidon_hash_span(
+                commitment_input.span(),
+            );
+            assert!(
+                recomputed_io_commitment == stored_io_commitment,
+                "STREAM_IO_COMMITMENT_MISMATCH",
+            );
 
             // Extract input dimensions from packed IO layout:
             // [in_rows, in_cols, in_len, in_data..., out_rows, out_cols, out_len, out_data...]
@@ -1888,25 +1893,6 @@ mod SumcheckVerifierContract {
             assert!(
                 crate::field::qm31_eq(input_value, final_claim.value),
                 "STREAM_INPUT_CLAIM_MISMATCH",
-            );
-
-            // Verify IO commitment matches what was stored in init
-            let stored_io_commitment = self.stream_io_commitment.entry(session_id).read();
-            let mut commitment_input: Array<felt252> = array![original_io_len.into()];
-            let mut ci: u32 = 0;
-            loop {
-                if ci >= packed_io_len {
-                    break;
-                }
-                commitment_input.append(*packed_raw_io.at(ci));
-                ci += 1;
-            };
-            let recomputed_io_commitment = core::poseidon::poseidon_hash_span(
-                commitment_input.span(),
-            );
-            assert!(
-                recomputed_io_commitment == stored_io_commitment,
-                "STREAM_IO_COMMITMENT_MISMATCH",
             );
 
             // Compute proof hash

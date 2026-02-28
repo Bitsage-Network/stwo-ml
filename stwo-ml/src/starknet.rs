@@ -1885,6 +1885,13 @@ pub fn build_streaming_gkr_calldata(
         }
     }
 
+    // original_io_len + packed_raw_io (re-passed for input MLE verification)
+    finalize_calldata.push(format!("{}", raw_io_data.len()));
+    finalize_calldata.push(format!("{}", packed_io.len()));
+    for f in &packed_io {
+        finalize_calldata.push(format!("0x{:x}", f));
+    }
+
     // ── Build upload chunks for data integrity ──
     // Reuse existing chunked session format for hash commitment
     let chunked = build_chunked_gkr_calldata(proof, circuit, model_id, raw_io_data)?;
