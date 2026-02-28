@@ -1390,6 +1390,7 @@ fn main() {
                 build_verify_model_gkr_v4_calldata, build_verify_model_gkr_v4_packed_calldata,
                 build_verify_model_gkr_v4_packed_io_calldata,
                 build_verify_model_gkr_v4_double_packed_io_calldata,
+                build_streaming_gkr_calldata,
                 CHUNKED_GKR_THRESHOLD,
             };
 
@@ -1536,41 +1537,82 @@ fn main() {
                         match verify_result {
                             Ok(vc) => {
                                 if vc.total_felts > CHUNKED_GKR_THRESHOLD && use_starknet_gkr_v4 {
-                                    // Auto-select chunked session mode for large proofs.
-                                    match build_chunked_gkr_calldata(gkr_p, &circuit, model_id, &raw_io) {
-                                        Ok(chunked) => {
+                                    // Auto-select streaming verification (v25) for large proofs.
+                                    // Streaming passes proof data as calldata (no storage reads),
+                                    // avoiding the step limit hit by verify_gkr_execute.
+                                    match build_streaming_gkr_calldata(gkr_p, &circuit, model_id, &raw_io) {
+                                        Ok(streaming) => {
+                                            let num_batches = streaming.stream_batches.len();
                                             eprintln!(
-                                                "  verify_calldata: {} felts → {} chunks (chunked session mode)",
-                                                chunked.total_felts, chunked.num_chunks
+                                                "  verify_calldata: {} felts → {} stream batches (streaming v25 mode)",
+                                                streaming.session_metadata.total_felts, num_batches
                                             );
+                                            let batch_json: Vec<serde_json::Value> = streaming.stream_batches.iter().map(|b| {
+                                                serde_json::json!({
+                                                    "batch_idx": b.batch_idx,
+                                                    "num_layers": b.num_layers,
+                                                    "calldata": b.calldata,
+                                                })
+                                            }).collect();
                                             serde_json::json!({
-                                                "schema_version": 2,
-                                                "entrypoint": "verify_gkr_from_session",
-                                                "mode": "chunked",
-                                                "total_felts": chunked.total_felts,
-                                                "num_chunks": chunked.num_chunks,
-                                                "circuit_depth": chunked.circuit_depth,
-                                                "num_layers": chunked.num_layers,
-                                                "weight_binding_mode": chunked.weight_binding_mode,
-                                                "packed": chunked.packed,
-                                                "io_packed": chunked.io_packed,
-                                                "double_packed": chunked.double_packed,
-                                                "model_id": chunked.model_id,
-                                                "chunks": chunked.chunks,
+                                                "schema_version": 3,
+                                                "entrypoint": "verify_gkr_stream",
+                                                "mode": "streaming",
+                                                "total_felts": streaming.session_metadata.total_felts,
+                                                "num_chunks": streaming.upload_chunks.len(),
+                                                "circuit_depth": streaming.session_metadata.circuit_depth,
+                                                "num_layers": streaming.session_metadata.num_layers,
+                                                "weight_binding_mode": streaming.session_metadata.weight_binding_mode,
+                                                "packed": true,
+                                                "io_packed": true,
+                                                "model_id": streaming.session_metadata.model_id,
+                                                "chunks": streaming.upload_chunks,
+                                                "init_calldata": streaming.init_calldata,
+                                                "stream_batches": batch_json,
+                                                "finalize_calldata": streaming.finalize_calldata,
                                             })
                                         }
                                         Err(e) => {
                                             eprintln!(
-                                                "  Warning: chunked calldata build failed, falling back to single-TX: {e}"
+                                                "  Warning: streaming calldata build failed, falling back to chunked v2: {e}"
                                             );
-                                            serde_json::json!({
-                                                "schema_version": 1,
-                                                "entrypoint": verify_entrypoint,
-                                                "calldata": vc.calldata_parts,
-                                                "total_felts": vc.total_felts,
-                                                "packed": false,
-                                                "upload_chunks": Vec::<Vec<String>>::new(),
-                                            })
+                                            // Fall back to chunked v2 (may hit step limit for large proofs)
+                                            match build_chunked_gkr_calldata(gkr_p, &circuit, model_id, &raw_io) {
+                                                Ok(chunked) => {
+                                                    eprintln!(
+                                                        "  verify_calldata: {} felts → {} chunks (chunked session mode)",
+                                                        chunked.total_felts, chunked.num_chunks
+                                                    );
+                                                    serde_json::json!({
+                                                        "schema_version": 2,
+                                                        "entrypoint": "verify_gkr_from_session",
+                                                        "mode": "chunked",
+                                                        "total_felts": chunked.total_felts,
+                                                        "num_chunks": chunked.num_chunks,
+                                                        "circuit_depth": chunked.circuit_depth,
+                                                        "num_layers": chunked.num_layers,
+                                                        "weight_binding_mode": chunked.weight_binding_mode,
+                                                        "packed": chunked.packed,
+                                                        "io_packed": chunked.io_packed,
+                                                        "double_packed": chunked.double_packed,
+                                                        "model_id": chunked.model_id,
+                                                        "chunks": chunked.chunks,
+                                                    })
+                                                }
+                                                Err(e2) => {
+                                                    eprintln!(
+                                                        "  Warning: chunked calldata build also failed: {e2}"
+                                                    );
+                                                    serde_json::json!({
+                                                        "schema_version": 1,
+                                                        "entrypoint": verify_entrypoint,
+                                                        "calldata": vc.calldata_parts,
+                                                        "total_felts": vc.total_felts,
+                                                        "packed": false,
+                                                        "upload_chunks": Vec::<Vec<String>>::new(),
+                                                    })
+                                                }
+                                            }
                                         }
                                     }
                                 } else {
