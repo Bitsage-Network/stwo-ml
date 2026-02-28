@@ -1363,7 +1363,7 @@ async function cmdVerify(args) {
         entrypoint: "get_model_circuit_hash",
         calldata: CallData.compile([modelId]),
       });
-      const circuitHash = regResult.result ? regResult.result[0] : "0x0";
+      const circuitHash = Array.isArray(regResult) ? regResult[0] : (regResult.result ? regResult.result[0] : "0x0");
       try {
         needsRegistration = !circuitHash || circuitHash === "0x0" || BigInt(circuitHash) === 0n;
       } catch {
@@ -2412,7 +2412,7 @@ async function cmdVerify(args) {
         entrypoint: "get_model_circuit_hash",
         calldata: CallData.compile([modelId]),
       });
-      const ch = rr.result ? rr.result[0] : "0x0";
+      const ch = Array.isArray(rr) ? rr[0] : (rr.result ? rr.result[0] : "0x0");
       try {
         needsReg = !ch || ch === "0x0" || BigInt(ch) === 0n;
       } catch {
