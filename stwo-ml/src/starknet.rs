@@ -1632,7 +1632,11 @@ pub struct StreamingGkrCalldata {
     pub output_mle_chunks: Vec<OutputMleChunk>,
     /// Batches of layer proof data for verify_gkr_stream_layers.
     pub stream_batches: Vec<StreamBatch>,
-    /// Calldata for verify_gkr_stream_finalize (weight claims + binding).
+    /// Chunked calldata for verify_gkr_stream_finalize_input_mle.
+    /// First chunk includes weight binding + IO commitment data.
+    /// Subsequent chunks are pure input MLE partial evaluation.
+    pub input_mle_chunks: Vec<InputMleChunk>,
+    /// Calldata for verify_gkr_stream_finalize (just session_id).
     pub finalize_calldata: Vec<String>,
     /// Session metadata for open_gkr_session (reuse existing session flow).
     pub session_metadata: StreamSessionMetadata,
@@ -1650,6 +1654,20 @@ pub struct OutputMleChunk {
     /// Whether this is the last chunk.
     pub is_last: bool,
     /// Flat calldata for verify_gkr_stream_init_output_mle.
+    pub calldata: Vec<String>,
+}
+
+/// A single chunk of input MLE evaluation data (mirrors OutputMleChunk).
+/// First chunk includes weight binding + deferred proofs + IO commitment data.
+#[derive(Debug, Clone)]
+pub struct InputMleChunk {
+    /// Starting M31 index in the full input array.
+    pub chunk_offset: u32,
+    /// Number of M31 values in this chunk.
+    pub chunk_len: u32,
+    /// Whether this is the last chunk.
+    pub is_last: bool,
+    /// Flat calldata for verify_gkr_stream_finalize_input_mle.
     pub calldata: Vec<String>,
 }
 
@@ -1896,37 +1914,31 @@ pub fn build_streaming_gkr_calldata(
         });
     }
 
-    // ── Build finalize calldata ──
-    let mut finalize_calldata: Vec<String> = Vec::new();
-    // session_id placeholder
-    finalize_calldata.push("__SESSION_ID__".to_string());
-
+    // ── Build weight binding + deferred proof data (shared by first input MLE chunk) ──
     // weight_expected_values: packed QM31 as felt252
-    // These are the final_b_eval values from each MatMul sumcheck
-    finalize_calldata.push(format!("{}", proof.weight_claims.len()));
+    let mut weight_expected_values: Vec<String> = Vec::new();
+    weight_expected_values.push(format!("{}", proof.weight_claims.len()));
     for wc in &proof.weight_claims {
         let packed = crate::crypto::poseidon_channel::securefield_to_felt(wc.expected_value);
-        finalize_calldata.push(format!("0x{:x}", packed));
+        weight_expected_values.push(format!("0x{:x}", packed));
     }
 
-    // weight_binding_mode
-    finalize_calldata.push(format!("{}", binding_mode));
-
-    // weight_binding_data
+    // weight_binding_mode + data
     let binding_data = starknet_weight_binding_data(proof)?;
-    finalize_calldata.push(format!("{}", binding_data.len()));
+    let mut weight_binding_calldata: Vec<String> = Vec::new();
+    weight_binding_calldata.push(format!("{}", binding_mode));
+    weight_binding_calldata.push(format!("{}", binding_data.len()));
     for bd in &binding_data {
-        finalize_calldata.push(bd.clone());
+        weight_binding_calldata.push(bd.clone());
     }
 
-    // deferred_proof_data: serialized deferred matmul proofs (for DAG Add skip connections)
+    // deferred_proof_data
+    let mut deferred_proof_calldata: Vec<String> = Vec::new();
     {
         let mut deferred_felts: Vec<FieldElement> = Vec::new();
         crate::cairo_serde::serialize_u32(proof.deferred_proofs.len() as u32, &mut deferred_felts);
         for deferred in &proof.deferred_proofs {
             crate::cairo_serde::serialize_qm31_packed(deferred.claim.value, &mut deferred_felts);
-            // MatMul dims are passed separately in deferred_matmul_dims, but claim value and
-            // layer proof go in deferred_proof_data
             if let crate::gkr::types::LayerProof::MatMul {
                 round_polys,
                 final_a_eval,
@@ -1942,13 +1954,14 @@ pub fn build_streaming_gkr_calldata(
                 crate::cairo_serde::serialize_qm31_packed(*final_b_eval, &mut deferred_felts);
             }
         }
-        finalize_calldata.push(format!("{}", deferred_felts.len()));
+        deferred_proof_calldata.push(format!("{}", deferred_felts.len()));
         for f in &deferred_felts {
-            finalize_calldata.push(format!("0x{:x}", f));
+            deferred_proof_calldata.push(format!("0x{:x}", f));
         }
     }
 
-    // deferred_matmul_dims: [m0, k0, n0, ...] for each deferred proof
+    // deferred_matmul_dims
+    let mut deferred_dims_calldata: Vec<String> = Vec::new();
     {
         let mut deferred_dims: Vec<u32> = Vec::new();
         for deferred in &proof.deferred_proofs {
@@ -1958,18 +1971,82 @@ pub fn build_streaming_gkr_calldata(
                 deferred_dims.push(n as u32);
             }
         }
-        finalize_calldata.push(format!("{}", deferred_dims.len()));
+        deferred_dims_calldata.push(format!("{}", deferred_dims.len()));
         for d in &deferred_dims {
-            finalize_calldata.push(format!("{}", d));
+            deferred_dims_calldata.push(format!("{}", d));
         }
     }
 
-    // original_io_len + packed_raw_io (re-passed for input MLE verification)
-    finalize_calldata.push(format!("{}", raw_io_data.len()));
-    finalize_calldata.push(format!("{}", packed_io.len()));
+    // IO data for commitment re-verification (first input MLE chunk only)
+    let mut io_commitment_calldata: Vec<String> = Vec::new();
+    io_commitment_calldata.push(format!("{}", raw_io_data.len())); // original_io_len
+    io_commitment_calldata.push(format!("{}", packed_io.len()));   // packed_raw_io len
     for f in &packed_io {
-        finalize_calldata.push(format!("0x{:x}", f));
+        io_commitment_calldata.push(format!("0x{:x}", f));
     }
+
+    // ── Build chunked input MLE calldata ──
+    // Split input data into chunks of INPUT_MLE_CHUNK_SIZE M31 values.
+    // First chunk carries weight binding + IO commitment data.
+    // Subsequent chunks are pure input MLE partial evaluation.
+    const INPUT_MLE_CHUNK_SIZE: u32 = 1024;
+    let input_start = 3usize; // skip [in_rows, in_cols, in_len] header
+    let input_end = input_start + io_in_len;
+    let input_data = &raw_io_data[input_start..input_end];
+    let in_len_u32 = io_in_len as u32;
+    let num_input_chunks = (in_len_u32 + INPUT_MLE_CHUNK_SIZE - 1) / INPUT_MLE_CHUNK_SIZE;
+
+    let mut input_mle_chunks: Vec<InputMleChunk> = Vec::new();
+    for chunk_idx in 0..num_input_chunks {
+        let chunk_offset = chunk_idx * INPUT_MLE_CHUNK_SIZE;
+        let chunk_len = std::cmp::min(INPUT_MLE_CHUNK_SIZE, in_len_u32 - chunk_offset);
+        let is_last = chunk_idx == num_input_chunks - 1;
+
+        // Pack only this chunk's M31 values
+        let chunk_start = chunk_offset as usize;
+        let chunk_end = (chunk_offset + chunk_len) as usize;
+        let packed_chunk = pack_m31_io_data(&input_data[chunk_start..chunk_end]);
+
+        let mut calldata: Vec<String> = Vec::new();
+        calldata.push("__SESSION_ID__".to_string());
+        // packed_input_data: Array<felt252>
+        calldata.push(format!("{}", packed_chunk.len()));
+        for f in &packed_chunk {
+            calldata.push(format!("0x{:x}", f));
+        }
+        // chunk_offset, chunk_len, is_last_chunk
+        calldata.push(format!("{}", chunk_offset));
+        calldata.push(format!("{}", chunk_len));
+        calldata.push(if is_last { "1".to_string() } else { "0".to_string() });
+
+        if chunk_idx == 0 {
+            // First chunk: include weight binding + deferred proofs + IO commitment
+            calldata.extend(weight_expected_values.clone());
+            calldata.extend(weight_binding_calldata.clone());
+            calldata.extend(deferred_proof_calldata.clone());
+            calldata.extend(deferred_dims_calldata.clone());
+            calldata.extend(io_commitment_calldata.clone());
+        } else {
+            // Subsequent chunks: empty weight/deferred/IO arrays
+            calldata.push("0".to_string()); // weight_expected_values: empty array
+            calldata.push("0".to_string()); // weight_binding_mode: 0 (ignored)
+            calldata.push("0".to_string()); // weight_binding_data: empty array
+            calldata.push("0".to_string()); // deferred_proof_data: empty array
+            calldata.push("0".to_string()); // deferred_matmul_dims: empty array
+            calldata.push("0".to_string()); // original_io_len: 0 (ignored)
+            calldata.push("0".to_string()); // packed_raw_io: empty array
+        }
+
+        input_mle_chunks.push(InputMleChunk {
+            chunk_offset,
+            chunk_len,
+            is_last,
+            calldata,
+        });
+    }
+
+    // ── Build finalize calldata (lightweight — just session_id) ──
+    let finalize_calldata = vec!["__SESSION_ID__".to_string()];
 
     // ── Build upload chunks for data integrity ──
     // Reuse existing chunked session format for hash commitment
@@ -1982,6 +2059,7 @@ pub fn build_streaming_gkr_calldata(
         init_calldata,
         output_mle_chunks,
         stream_batches,
+        input_mle_chunks,
         finalize_calldata,
         session_metadata: StreamSessionMetadata {
             model_id: format!("0x{:x}", model_id),

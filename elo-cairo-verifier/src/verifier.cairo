@@ -285,12 +285,20 @@ pub trait ISumcheckVerifier<TContractState> {
         proof_data: Array<felt252>,
     );
 
-    /// Finalize streaming verification: verify weight binding, input MLE,
-    /// circuit hash, and record the proof on-chain.
-    /// packed_raw_io is re-passed as calldata (verified against stored IO commitment).
-    fn verify_gkr_stream_finalize(
+    /// Chunked input MLE evaluation for finalize step.
+    /// First call: performs weight binding + deferred proofs + IO commitment check,
+    ///   draws no extra randomness (input MLE uses final_claim.point from walk),
+    ///   stores r-points from final_claim.point, processes first chunk.
+    /// Subsequent calls: reload stored r-points, process chunk, accumulate partial sum.
+    /// Last call: store final input MLE value for finalize to read.
+    fn verify_gkr_stream_finalize_input_mle(
         ref self: TContractState,
         session_id: u64,
+        packed_input_data: Array<felt252>,
+        chunk_offset: u32,
+        chunk_len: u32,
+        is_last_chunk: bool,
+        // Only needed on first call (weight binding + IO commitment):
         weight_expected_values: Array<felt252>,
         weight_binding_mode: u32,
         weight_binding_data: Array<felt252>,
@@ -298,6 +306,13 @@ pub trait ISumcheckVerifier<TContractState> {
         deferred_matmul_dims: Array<u32>,
         original_io_len: u32,
         packed_raw_io: Array<felt252>,
+    );
+
+    /// Finalize streaming verification: reads pre-computed input MLE value,
+    /// asserts it matches the final GKR claim, and records the proof on-chain.
+    fn verify_gkr_stream_finalize(
+        ref self: TContractState,
+        session_id: u64,
     ) -> bool;
 }
 
@@ -438,6 +453,8 @@ mod SumcheckVerifierContract {
         stream_original_io_len: Map<u64, u32>,
         /// session_id → output column count (for output MLE step).
         stream_out_cols: Map<u64, u32>,
+        /// session_id → input column count (for input MLE step).
+        stream_in_cols: Map<u64, u32>,
         /// session_id → M31 start index of output data in packed IO.
         stream_out_data_m31_start: Map<u64, u32>,
         /// session_id → whether output MLE has been evaluated.
@@ -450,6 +467,20 @@ mod SumcheckVerifierContract {
         stream_output_mle_r_point: Map<(u64, u32), felt252>,
         /// session_id → packed QM31 running partial sum for output MLE.
         stream_output_mle_partial_sum: Map<u64, felt252>,
+        /// session_id → whether input MLE chunked evaluation is done.
+        stream_input_mle_done: Map<u64, bool>,
+        /// session_id → number of input MLE chunks processed so far.
+        stream_input_mle_chunks_done: Map<u64, u32>,
+        /// session_id → number of r-points stored for input MLE.
+        stream_input_mle_r_count: Map<u64, u32>,
+        /// (session_id, var_idx) → packed QM31 r-point for input MLE.
+        stream_input_mle_r_point: Map<(u64, u32), felt252>,
+        /// session_id → packed QM31 running partial sum for input MLE.
+        stream_input_mle_partial_sum: Map<u64, felt252>,
+        /// session_id → packed QM31 final input MLE value (set when all chunks done).
+        stream_input_mle_value: Map<u64, felt252>,
+        /// session_id → whether weight binding has been done in finalize_input_mle.
+        stream_weight_binding_done: Map<u64, bool>,
         /// session_id → expected next batch index (for sequential enforcement).
         stream_next_batch_idx: Map<u64, u32>,
         /// session_id → total deferred Add points accumulated across batches.
@@ -1500,8 +1531,9 @@ mod SumcheckVerifierContract {
             self.stream_original_io_len.entry(session_id).write(original_io_len);
             self.stream_packed_io_len.entry(session_id).write(packed_raw_io.len());
 
-            // Store dimensions for output MLE step
+            // Store dimensions for output MLE + input MLE steps
             self.stream_out_cols.entry(session_id).write(out_cols);
+            self.stream_in_cols.entry(session_id).write(in_cols);
             self.stream_out_data_m31_start.entry(session_id).write(3 + in_len + 3);
 
             self.stream_initialized.entry(session_id).write(true);
@@ -1783,9 +1815,13 @@ mod SumcheckVerifierContract {
             });
         }
 
-        fn verify_gkr_stream_finalize(
+        fn verify_gkr_stream_finalize_input_mle(
             ref self: ContractState,
             session_id: u64,
+            packed_input_data: Array<felt252>,
+            chunk_offset: u32,
+            chunk_len: u32,
+            is_last_chunk: bool,
             weight_expected_values: Array<felt252>,
             weight_binding_mode: u32,
             weight_binding_data: Array<felt252>,
@@ -1793,260 +1829,314 @@ mod SumcheckVerifierContract {
             deferred_matmul_dims: Array<u32>,
             original_io_len: u32,
             packed_raw_io: Array<felt252>,
-        ) -> bool {
-            // Auth
+        ) {
             assert!(self.stream_initialized.entry(session_id).read(), "STREAM_NOT_INITIALIZED");
             assert!(!self.stream_finalized.entry(session_id).read(), "STREAM_ALREADY_FINALIZED");
+            assert!(!self.stream_input_mle_done.entry(session_id).read(), "INPUT_MLE_ALREADY_DONE");
             let caller = get_caller_address();
             let owner = self.session_owner.entry(session_id).read();
             assert!(caller == owner, "NOT_SESSION_OWNER");
 
-            // Verify all layers processed
             let layers_verified = self.stream_layers_verified.entry(session_id).read();
             let total_layers = self.stream_total_layers.entry(session_id).read();
             assert!(layers_verified == total_layers, "STREAM_LAYERS_INCOMPLETE");
 
+            let chunks_done = self.stream_input_mle_chunks_done.entry(session_id).read();
+
+            // First chunk: weight binding + IO commitment + store r-points
+            let r_in = if chunks_done == 0 {
+                assert!(!self.stream_weight_binding_done.entry(session_id).read(), "WEIGHT_BINDING_ALREADY_DONE");
+
+                let model_id = self.session_model_id.entry(session_id).read();
+
+                // Restore checkpoint state
+                let mut ch = PoseidonChannel {
+                    digest: self.stream_channel_digest.entry(session_id).read(),
+                    n_draws: self.stream_channel_counter.entry(session_id).read(),
+                };
+
+                let stream_weight_hash = self.stream_weight_hash.entry(session_id).read();
+                let stream_tags_hash = self.stream_tags_hash.entry(session_id).read();
+                let stream_weight_count = self.stream_weight_count.entry(session_id).read();
+
+                // ── Circuit binding ──
+                let circuit_depth = self.stream_circuit_depth.entry(session_id).read();
+                let registered_circuit_hash = self.model_circuit_hash.entry(model_id).read();
+                let observed_circuit_hash = core::poseidon::poseidon_hash_span(
+                    array![circuit_depth.into(), stream_tags_hash].span(),
+                );
+                if registered_circuit_hash != 0 {
+                    assert!(
+                        observed_circuit_hash == registered_circuit_hash,
+                        "STREAM_CIRCUIT_HASH_MISMATCH",
+                    );
+                }
+
+                // ── Weight hash verification ──
+                let expected_weight_count = weight_expected_values.len();
+                assert!(expected_weight_count == stream_weight_count, "STREAM_WEIGHT_COUNT_MISMATCH");
+
+                let mut recomputed_weight_hash: felt252 = 0;
+                let mut wi: u32 = 0;
+                loop {
+                    if wi >= expected_weight_count {
+                        break;
+                    }
+                    recomputed_weight_hash = core::poseidon::poseidon_hash_span(
+                        array![recomputed_weight_hash, *weight_expected_values.at(wi)].span(),
+                    );
+                    wi += 1;
+                };
+                assert!(recomputed_weight_hash == stream_weight_hash, "STREAM_WEIGHT_HASH_MISMATCH");
+
+                // ── Deferred proof verification ──
+                let deferred_count = self.stream_deferred_count.entry(session_id).read();
+                let deferred_proof_span = deferred_proof_data.span();
+                let deferred_dims_span = deferred_matmul_dims.span();
+
+                let mut deferred_reader = mv_reader_new(deferred_proof_span, true);
+                let num_deferred = if deferred_proof_span.len() > 0 {
+                    mv_read_u32(ref deferred_reader)
+                } else {
+                    0_u32
+                };
+                assert!(num_deferred <= deferred_count, "DEFERRED_COUNT_EXCEEDS_ADDS");
+
+                let mut deferred_weight_evs: Array<felt252> = array![];
+                let mut deferred_dims_idx: u32 = 0;
+                let mut def_idx: u32 = 0;
+                loop {
+                    if def_idx >= num_deferred {
+                        break;
+                    }
+                    let claim_value = mv_read_qm31(ref deferred_reader);
+                    let pt_len = self.stream_deferred_point_len.entry((session_id, def_idx)).read();
+                    let mut deferred_point: Array<QM31> = array![];
+                    let mut ci: u32 = 0;
+                    loop {
+                        if ci >= pt_len {
+                            break;
+                        }
+                        deferred_point.append(
+                            unpack_qm31_from_felt(
+                                self.stream_deferred_point.entry((session_id, def_idx, ci)).read(),
+                            ),
+                        );
+                        ci += 1;
+                    };
+                    channel_mix_secure_field(ref ch, claim_value);
+                    let dims_base = deferred_dims_idx * 3;
+                    assert!(dims_base + 2 < deferred_dims_span.len(), "DEFERRED_DIMS_UNDERRUN");
+                    let m = *deferred_dims_span.at(dims_base);
+                    let k = *deferred_dims_span.at(dims_base + 1);
+                    let n = *deferred_dims_span.at(dims_base + 2);
+                    deferred_dims_idx += 1;
+                    let deferred_claim = GKRClaim { point: deferred_point, value: claim_value };
+                    let (_new_claim, final_b_eval) = mv_dispatch_matmul(
+                        @deferred_claim, m, k, n, ref deferred_reader, ref ch,
+                    );
+                    deferred_weight_evs.append(pack_qm31_to_felt(final_b_eval));
+                    def_idx += 1;
+                };
+
+                // ── Weight commitment verification ──
+                let registered_weight_count = self.model_gkr_weight_count.entry(model_id).read();
+                let total_weight_count = stream_weight_count + num_deferred;
+                assert!(
+                    total_weight_count == registered_weight_count,
+                    "STREAM_WEIGHT_COUNT_VS_REGISTERED",
+                );
+
+                // ── Weight binding (RLC mode 4) ──
+                assert!(
+                    weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_ORACLE_SUMCHECK,
+                    "STREAM_ONLY_SUPPORTS_RLC_MODE",
+                );
+                let weight_binding_span = weight_binding_data.span();
+                assert!(weight_binding_span.len() == 2, "STREAM_BINDING_DATA_LEN");
+                assert!(*weight_binding_span.at(0) == WEIGHT_BINDING_RLC_MARKER, "STREAM_BINDING_NOT_RLC");
+
+                let rho = channel_draw_qm31(ref ch);
+                let mut rho_pow = qm31_one();
+                let mut combined = qm31_zero();
+                let mut claim_i: u32 = 0;
+                loop {
+                    if claim_i >= expected_weight_count {
+                        break;
+                    }
+                    let ev = unpack_qm31_from_felt(*weight_expected_values.at(claim_i));
+                    combined = qm31_add(combined, qm31_mul(rho_pow, ev));
+                    rho_pow = qm31_mul(rho_pow, rho);
+                    claim_i += 1;
+                };
+                let deferred_evs_span = deferred_weight_evs.span();
+                let mut def_wi: u32 = 0;
+                loop {
+                    if def_wi >= deferred_evs_span.len() {
+                        break;
+                    }
+                    let ev = unpack_qm31_from_felt(*deferred_evs_span.at(def_wi));
+                    combined = qm31_add(combined, qm31_mul(rho_pow, ev));
+                    rho_pow = qm31_mul(rho_pow, rho);
+                    def_wi += 1;
+                };
+                channel_mix_secure_field(ref ch, combined);
+
+                // ── IO commitment verification ──
+                let stored_original_io_len = self.stream_original_io_len.entry(session_id).read();
+                let stored_packed_io_len = self.stream_packed_io_len.entry(session_id).read();
+                assert!(original_io_len == stored_original_io_len, "FINALIZE_IO_LEN_MISMATCH");
+                assert!(packed_raw_io.len() == stored_packed_io_len, "FINALIZE_PACKED_IO_LEN_MISMATCH");
+                let packed_span = packed_raw_io.span();
+
+                let stored_io_commitment = self.stream_io_commitment.entry(session_id).read();
+                let mut commitment_input: Array<felt252> = array![original_io_len.into()];
+                let mut ci2: u32 = 0;
+                loop {
+                    if ci2 >= stored_packed_io_len {
+                        break;
+                    }
+                    commitment_input.append(*packed_span.at(ci2));
+                    ci2 += 1;
+                };
+                let recomputed_io_commitment = core::poseidon::poseidon_hash_span(
+                    commitment_input.span(),
+                );
+                assert!(
+                    recomputed_io_commitment == stored_io_commitment,
+                    "STREAM_IO_COMMITMENT_MISMATCH",
+                );
+
+                // Save channel state after weight binding (before input MLE assertion)
+                self.stream_channel_digest.entry(session_id).write(ch.digest);
+                self.stream_channel_counter.entry(session_id).write(ch.n_draws);
+                self.stream_weight_binding_done.entry(session_id).write(true);
+
+                // Extract input dimensions and store r-points from final_claim.point
+                let in_cols: u32 = extract_m31_from_packed(packed_span, 1);
+                let padded_in_cols = next_power_of_two(in_cols);
+                let n_vars = log2_ceil(padded_in_cols);
+
+                // r-points for input MLE = final_claim.point (from the GKR walk)
+                let point_len = self.stream_claim_point_len.entry(session_id).read();
+                let mut r_in: Array<QM31> = array![];
+                let mut pi: u32 = 0;
+                loop {
+                    if pi >= point_len {
+                        break;
+                    }
+                    let rp = unpack_qm31_from_felt(
+                        self.stream_claim_point.entry((session_id, pi)).read(),
+                    );
+                    r_in.append(rp);
+                    pi += 1;
+                };
+
+                // Store r-points for subsequent chunk TXs
+                self.stream_input_mle_r_count.entry(session_id).write(n_vars);
+                let mut ri: u32 = 0;
+                loop {
+                    if ri >= n_vars {
+                        break;
+                    }
+                    self.stream_input_mle_r_point.entry((session_id, ri)).write(
+                        pack_qm31_to_felt(*r_in.at(ri)),
+                    );
+                    ri += 1;
+                };
+
+                // Initialize partial sum to zero
+                self.stream_input_mle_partial_sum.entry(session_id).write(
+                    pack_qm31_to_felt(qm31_zero()),
+                );
+
+                r_in
+            } else {
+                // Subsequent chunks: reload stored r-points
+                let stored_n = self.stream_input_mle_r_count.entry(session_id).read();
+                let mut r_in: Array<QM31> = array![];
+                let mut ri: u32 = 0;
+                loop {
+                    if ri >= stored_n {
+                        break;
+                    }
+                    r_in.append(unpack_qm31_from_felt(
+                        self.stream_input_mle_r_point.entry((session_id, ri)).read(),
+                    ));
+                    ri += 1;
+                };
+                r_in
+            };
+
+            // Compute partial sum for this chunk
+            // in_cols is stored during stream_init — packed_input_data contains
+            // only the chunk's M31 values (no raw IO header).
+            let in_cols = self.stream_in_cols.entry(session_id).read();
+            let padded_in_cols = next_power_of_two(in_cols);
+
+            let partial = evaluate_mle_eq_dot_partial(
+                packed_input_data.span(),
+                0,
+                chunk_len,
+                chunk_offset,
+                padded_in_cols,
+                r_in.span(),
+            );
+
+            // Accumulate
+            let prev_sum = unpack_qm31_from_felt(
+                self.stream_input_mle_partial_sum.entry(session_id).read(),
+            );
+            let new_sum = qm31_add(prev_sum, partial);
+            self.stream_input_mle_partial_sum.entry(session_id).write(
+                pack_qm31_to_felt(new_sum),
+            );
+            self.stream_input_mle_chunks_done.entry(session_id).write(chunks_done + 1);
+
+            if is_last_chunk {
+                self.stream_input_mle_value.entry(session_id).write(
+                    pack_qm31_to_felt(new_sum),
+                );
+                self.stream_input_mle_done.entry(session_id).write(true);
+            }
+        }
+
+        fn verify_gkr_stream_finalize(
+            ref self: ContractState,
+            session_id: u64,
+        ) -> bool {
+            assert!(self.stream_initialized.entry(session_id).read(), "STREAM_NOT_INITIALIZED");
+            assert!(!self.stream_finalized.entry(session_id).read(), "STREAM_ALREADY_FINALIZED");
+            assert!(self.stream_input_mle_done.entry(session_id).read(), "INPUT_MLE_NOT_DONE");
+            assert!(self.stream_weight_binding_done.entry(session_id).read(), "WEIGHT_BINDING_NOT_DONE");
+            let caller = get_caller_address();
+            let owner = self.session_owner.entry(session_id).read();
+            assert!(caller == owner, "NOT_SESSION_OWNER");
+
             let model_id = self.session_model_id.entry(session_id).read();
 
-            // Restore checkpoint state
-            let mut ch = PoseidonChannel {
-                digest: self.stream_channel_digest.entry(session_id).read(),
-                n_draws: self.stream_channel_counter.entry(session_id).read(),
-            };
+            // Read pre-computed input MLE value
+            let input_value = unpack_qm31_from_felt(
+                self.stream_input_mle_value.entry(session_id).read(),
+            );
 
-            let point_len = self.stream_claim_point_len.entry(session_id).read();
-            let mut final_point: Array<QM31> = array![];
-            let mut pi: u32 = 0;
-            loop {
-                if pi >= point_len {
-                    break;
-                }
-                final_point.append(
-                    unpack_qm31_from_felt(
-                        self.stream_claim_point.entry((session_id, pi)).read(),
-                    ),
-                );
-                pi += 1;
-            };
+            // Read final claim from GKR walk
             let final_value = unpack_qm31_from_felt(
                 self.stream_claim_value.entry(session_id).read(),
             );
-            let final_claim = GKRClaim { point: final_point, value: final_value };
 
-            let stream_weight_hash = self.stream_weight_hash.entry(session_id).read();
-            let stream_tags_hash = self.stream_tags_hash.entry(session_id).read();
-            let stream_weight_count = self.stream_weight_count.entry(session_id).read();
-
-            // ── Circuit binding (incremental tags hash) ──
-            // The stream_tags_hash was built as poseidon(poseidon(...poseidon(0, tag_0), tag_1)..., tag_N).
-            // The registered circuit_hash uses poseidon_hash_span([circuit_depth, tag0, tag1, ...]).
-            // We re-register using the incremental scheme during model registration via
-            // register_model_gkr_streaming. For v25, verify against the stored incremental hash.
-            let circuit_depth = self.stream_circuit_depth.entry(session_id).read();
-            let registered_circuit_hash = self.model_circuit_hash.entry(model_id).read();
-            // Build the incremental circuit hash: start with poseidon(0, circuit_depth),
-            // then the tags hash continues from there. However the stream_tags_hash was
-            // seeded from 0 (not from circuit_depth). We verify by checking:
-            // poseidon(circuit_depth_hash, stream_tags_hash) where circuit_depth_hash incorporates depth.
-            // Actually, the simplest compatible approach: recompute the expected incremental hash.
-            // The tags_hash starts at 0 and folds each tag. The circuit_hash should incorporate
-            // circuit_depth as well. We do: observed = poseidon(circuit_depth, stream_tags_hash).
-            let observed_circuit_hash = core::poseidon::poseidon_hash_span(
-                array![circuit_depth.into(), stream_tags_hash].span(),
-            );
-            if registered_circuit_hash != 0 {
-                assert!(
-                    observed_circuit_hash == registered_circuit_hash,
-                    "STREAM_CIRCUIT_HASH_MISMATCH",
-                );
-            }
-
-            // ── Weight hash verification ──
-            // Recompute weight hash from provided expected_values and compare
-            let expected_weight_count = weight_expected_values.len();
-            assert!(expected_weight_count == stream_weight_count, "STREAM_WEIGHT_COUNT_MISMATCH");
-
-            let mut recomputed_weight_hash: felt252 = 0;
-            let mut wi: u32 = 0;
-            loop {
-                if wi >= expected_weight_count {
-                    break;
-                }
-                recomputed_weight_hash = core::poseidon::poseidon_hash_span(
-                    array![recomputed_weight_hash, *weight_expected_values.at(wi)].span(),
-                );
-                wi += 1;
-            };
-            assert!(recomputed_weight_hash == stream_weight_hash, "STREAM_WEIGHT_HASH_MISMATCH");
-
-            // ── Deferred proof verification (DAG Add skip connections) ──
-            // Deferred proofs must be processed BEFORE weight RLC binding
-            // because their weight claims are included in the combined RLC.
-            // Fiat-Shamir order: walk → deferred proofs → weight RLC → input MLE.
-            let deferred_count = self.stream_deferred_count.entry(session_id).read();
-            let deferred_proof_span = deferred_proof_data.span();
-            let deferred_dims_span = deferred_matmul_dims.span();
-
-            // Parse deferred proof data: num_deferred followed by per-deferred entries
-            let mut deferred_reader = mv_reader_new(deferred_proof_span, true);
-            let num_deferred = if deferred_proof_span.len() > 0 {
-                mv_read_u32(ref deferred_reader)
-            } else {
-                0_u32
-            };
-            assert!(num_deferred <= deferred_count, "DEFERRED_COUNT_EXCEEDS_ADDS");
-
-            // Collect deferred weight expected_values to append to main RLC
-            let mut deferred_weight_evs: Array<felt252> = array![];
-            let mut deferred_dims_idx: u32 = 0;
-            let mut def_idx: u32 = 0;
-            loop {
-                if def_idx >= num_deferred {
-                    break;
-                }
-
-                // Read deferred claim value
-                let claim_value = mv_read_qm31(ref deferred_reader);
-
-                // Reconstruct deferred claim point from stored Add layer point
-                let pt_len = self.stream_deferred_point_len.entry((session_id, def_idx)).read();
-                let mut deferred_point: Array<QM31> = array![];
-                let mut ci: u32 = 0;
-                loop {
-                    if ci >= pt_len {
-                        break;
-                    }
-                    deferred_point.append(
-                        unpack_qm31_from_felt(
-                            self.stream_deferred_point.entry((session_id, def_idx, ci)).read(),
-                        ),
-                    );
-                    ci += 1;
-                };
-
-                // Mix claim value into Fiat-Shamir channel
-                channel_mix_secure_field(ref ch, claim_value);
-
-                // Read MatMul dimensions from deferred_matmul_dims
-                let dims_base = deferred_dims_idx * 3;
-                assert!(dims_base + 2 < deferred_dims_span.len(), "DEFERRED_DIMS_UNDERRUN");
-                let m = *deferred_dims_span.at(dims_base);
-                let k = *deferred_dims_span.at(dims_base + 1);
-                let n = *deferred_dims_span.at(dims_base + 2);
-                deferred_dims_idx += 1;
-
-                // Verify deferred matmul sumcheck
-                let deferred_claim = GKRClaim { point: deferred_point, value: claim_value };
-                let (_new_claim, final_b_eval) = mv_dispatch_matmul(
-                    @deferred_claim, m, k, n, ref deferred_reader, ref ch,
-                );
-
-                // Collect deferred weight expected_value for RLC
-                let packed_ev = pack_qm31_to_felt(final_b_eval);
-                deferred_weight_evs.append(packed_ev);
-
-                def_idx += 1;
-            };
-
-            // ── Weight commitment verification ──
-            // Total weight claims = main (from walk) + deferred (from skip connections)
-            let registered_weight_count = self.model_gkr_weight_count.entry(model_id).read();
-            let total_weight_count = stream_weight_count + num_deferred;
+            // Verify input MLE matches final GKR claim
             assert!(
-                total_weight_count == registered_weight_count,
-                "STREAM_WEIGHT_COUNT_VS_REGISTERED",
-            );
-
-            // ── Weight binding (RLC mode 4) ──
-            // Combines main weight claims + deferred weight claims
-            assert!(
-                weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_ORACLE_SUMCHECK,
-                "STREAM_ONLY_SUPPORTS_RLC_MODE",
-            );
-            let weight_binding_span = weight_binding_data.span();
-            assert!(weight_binding_span.len() == 2, "STREAM_BINDING_DATA_LEN");
-            assert!(*weight_binding_span.at(0) == WEIGHT_BINDING_RLC_MARKER, "STREAM_BINDING_NOT_RLC");
-
-            let rho = channel_draw_qm31(ref ch);
-            let mut rho_pow = qm31_one();
-            let mut combined = qm31_zero();
-            // Main weight claims
-            let mut claim_i: u32 = 0;
-            loop {
-                if claim_i >= expected_weight_count {
-                    break;
-                }
-                let ev = unpack_qm31_from_felt(*weight_expected_values.at(claim_i));
-                combined = qm31_add(combined, qm31_mul(rho_pow, ev));
-                rho_pow = qm31_mul(rho_pow, rho);
-                claim_i += 1;
-            };
-            // Deferred weight claims
-            let deferred_evs_span = deferred_weight_evs.span();
-            let mut def_wi: u32 = 0;
-            loop {
-                if def_wi >= deferred_evs_span.len() {
-                    break;
-                }
-                let ev = unpack_qm31_from_felt(*deferred_evs_span.at(def_wi));
-                combined = qm31_add(combined, qm31_mul(rho_pow, ev));
-                rho_pow = qm31_mul(rho_pow, rho);
-                def_wi += 1;
-            };
-            channel_mix_secure_field(ref ch, combined);
-
-            // ── Input MLE verification ──
-            // Packed IO data is re-passed as calldata (no storage reads).
-            // Verify length matches what was stored in init, then check commitment.
-            let stored_original_io_len = self.stream_original_io_len.entry(session_id).read();
-            let stored_packed_io_len = self.stream_packed_io_len.entry(session_id).read();
-            assert!(original_io_len == stored_original_io_len, "FINALIZE_IO_LEN_MISMATCH");
-            assert!(packed_raw_io.len() == stored_packed_io_len, "FINALIZE_PACKED_IO_LEN_MISMATCH");
-            let packed_span = packed_raw_io.span();
-
-            // Verify IO commitment FIRST (cheap Poseidon check before expensive MLE)
-            let stored_io_commitment = self.stream_io_commitment.entry(session_id).read();
-            let mut commitment_input: Array<felt252> = array![original_io_len.into()];
-            let mut ci: u32 = 0;
-            loop {
-                if ci >= stored_packed_io_len {
-                    break;
-                }
-                commitment_input.append(*packed_span.at(ci));
-                ci += 1;
-            };
-            let recomputed_io_commitment = core::poseidon::poseidon_hash_span(
-                commitment_input.span(),
-            );
-            assert!(
-                recomputed_io_commitment == stored_io_commitment,
-                "STREAM_IO_COMMITMENT_MISMATCH",
-            );
-
-            // Extract input dimensions from packed IO layout:
-            // [in_rows, in_cols, in_len, in_data..., out_rows, out_cols, out_len, out_data...]
-            let in_rows: u32 = extract_m31_from_packed(packed_span, 0);
-            let in_cols: u32 = extract_m31_from_packed(packed_span, 1);
-            let in_len: u32 = extract_m31_from_packed(packed_span, 2);
-            assert!(in_len == in_rows * in_cols, "FINALIZE_IN_LEN_MISMATCH");
-            let in_data_m31_start: u32 = 3;
-            let padded_in_cols = next_power_of_two(in_cols);
-
-            // Verify input MLE: final_claim.value must equal MLE(input, final_claim.point)
-            assert!(next_power_of_two(in_rows) == 1, "PACKED_IO_ONLY_1ROW");
-            let input_value = evaluate_mle_from_packed_1row(
-                packed_span, in_data_m31_start, in_cols, padded_in_cols,
-                final_claim.point.span(),
-            );
-            assert!(
-                crate::field::qm31_eq(input_value, final_claim.value),
+                crate::field::qm31_eq(input_value, final_value),
                 "STREAM_INPUT_CLAIM_MISMATCH",
             );
 
-            // Compute proof hash
+            // Compute proof hash using channel state after weight binding
+            let ch_digest = self.stream_channel_digest.entry(session_id).read();
+            let stored_io_commitment = self.stream_io_commitment.entry(session_id).read();
             let num_layers = self.stream_total_layers.entry(session_id).read();
             let proof_hash = core::poseidon::poseidon_hash_span(
-                array![ch.digest, stored_io_commitment, model_id, num_layers.into()].span(),
+                array![ch_digest, stored_io_commitment, model_id, num_layers.into()].span(),
             );
 
             // Record proof on-chain

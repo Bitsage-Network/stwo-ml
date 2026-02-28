@@ -506,6 +506,7 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
     const outputMleChunks = verifyCalldata.output_mle_chunks || null;
     // Legacy single-calldata support
     const outputMleCalldata = verifyCalldata.output_mle_calldata || null;
+    const inputMleChunks = verifyCalldata.input_mle_chunks || null;
     const streamBatches = verifyCalldata.stream_batches;
     if (!Array.isArray(streamBatches) || streamBatches.length === 0) {
       die("schema_version 3 requires non-empty stream_batches array");
@@ -579,6 +580,7 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
       initCalldata,
       outputMleChunks,
       outputMleCalldata,
+      inputMleChunks,
       streamBatches,
       finalizeCalldata,
       layerTags,
@@ -2203,9 +2205,46 @@ async function cmdVerify(args) {
         info(`  Resuming — all ${batches.length} stream batches done`);
       }
 
-      // Phase 4c: verify_gkr_stream_finalize
+      // Phase 4c: verify_gkr_stream_finalize_input_mle (chunked for gas safety)
+      if (!sessionState.streamInputMleDone) {
+        if (verifyPayload.inputMleChunks && verifyPayload.inputMleChunks.length > 0) {
+          const inputChunks = verifyPayload.inputMleChunks;
+          const inputResumeFrom = sessionState.inputMleChunksDone || 0;
+          if (inputResumeFrom < inputChunks.length) {
+            e2ePhase(`Stream input MLE + weight binding (${inputChunks.length} chunks)`);
+            for (let ci = inputResumeFrom; ci < inputChunks.length; ci++) {
+              const chunk = inputChunks[ci];
+              const chunkArgs = chunk.calldata.map(
+                (v) => v === "__SESSION_ID__" ? sessionId : v,
+              );
+              const pct = (((ci + 1) / inputChunks.length) * 100).toFixed(0);
+              const label = ci === 0
+                ? `verify_gkr_stream_finalize_input_mle[1/${inputChunks.length}] (weight binding + chunk, ${pct}%)`
+                : `verify_gkr_stream_finalize_input_mle[${ci + 1}/${inputChunks.length}] (${pct}%)`;
+              const { txHash: chunkTxHash } = await execCallWithRetry(
+                "verify_gkr_stream_finalize_input_mle",
+                chunkArgs,
+                label,
+              );
+              sessionState.inputMleChunksDone = ci + 1;
+              sessionState.txHashes.push(chunkTxHash);
+              safeWriteJson(sessionFile, sessionState);
+            }
+          }
+          sessionState.streamInputMleDone = true;
+          safeWriteJson(sessionFile, sessionState);
+        } else {
+          // No chunked input MLE — legacy path (shouldn't happen with v25+)
+          sessionState.streamInputMleDone = true;
+          safeWriteJson(sessionFile, sessionState);
+        }
+      } else {
+        info("  Resuming — stream_input_mle already done");
+      }
+
+      // Phase 4d: verify_gkr_stream_finalize (lightweight — assert + record proof)
       if (!sessionState.streamFinalized) {
-        e2ePhase("Stream finalize (weight binding + proof recording)");
+        e2ePhase("Stream finalize (assert input MLE + record proof)");
         const finalizeArgs = verifyPayload.finalizeCalldata.map(
           (v) => v === "__SESSION_ID__" ? sessionId : v,
         );
@@ -2228,7 +2267,7 @@ async function cmdVerify(args) {
         die(`Streaming verification permanently failed: ${streamErrMsg}`);
       }
       info(`Streaming verification failed (transient): ${streamErrMsg}`);
-      info(`  Session ${sessionId} progress: init=${sessionState.streamInitDone}, batches=${sessionState.streamBatchesDone || 0}/${verifyPayload.streamBatches.length}`);
+      info(`  Session ${sessionId} progress: init=${sessionState.streamInitDone}, batches=${sessionState.streamBatchesDone || 0}/${verifyPayload.streamBatches.length}, inputMle=${sessionState.streamInputMleDone || false}`);
       info(`  Re-run the script to retry from where it left off.`);
       die(`Streaming verification failed: ${streamErrMsg}`);
     }

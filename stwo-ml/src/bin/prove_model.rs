@@ -1584,6 +1584,14 @@ fn main() {
                                                     })
                                                 }).collect::<Vec<_>>(),
                                                 "stream_batches": batch_json,
+                                                "input_mle_chunks": streaming.input_mle_chunks.iter().map(|c| {
+                                                    serde_json::json!({
+                                                        "chunk_offset": c.chunk_offset,
+                                                        "chunk_len": c.chunk_len,
+                                                        "is_last": c.is_last,
+                                                        "calldata": c.calldata,
+                                                    })
+                                                }).collect::<Vec<_>>(),
                                                 "finalize_calldata": streaming.finalize_calldata,
                                                 "layer_tags": streaming.session_metadata.layer_tags,
                                             })
