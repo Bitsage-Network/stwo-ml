@@ -323,7 +323,6 @@ mod SumcheckVerifierContract {
     };
     use crate::field::{
         QM31, log2_ceil, next_power_of_two,
-        evaluate_mle_from_packed_1row,
         evaluate_mle_eq_dot_partial,
         extract_m31_from_packed,
         pack_qm31_to_felt, unpack_qm31_from_felt,
@@ -334,9 +333,7 @@ mod SumcheckVerifierContract {
         channel_default, channel_mix_u64,
         channel_draw_qm31, channel_draw_qm31s, channel_mix_secure_field,
     };
-    // mle stripped for lean v18b
     use crate::model_verifier::{
-        verify_gkr_model_with_trace_dp,
         verify_gkr_layers_batch,
         reader_new as mv_reader_new, read_u32 as mv_read_u32,
         read_qm31 as mv_read_qm31, dispatch_matmul as mv_dispatch_matmul,
@@ -842,6 +839,10 @@ mod SumcheckVerifierContract {
             self.model_circuit_hash.entry(model_id).write(streaming_circuit_hash);
         }
 
+        // ─── Legacy single-TX entrypoints stubbed for lean v20 deploy ──────
+        // Superseded by streaming verification (v25). Use stream_init → stream_layers → finalize.
+        // Storage is preserved across upgrades; these can be restored from git history.
+
         fn verify_model_gkr_v4_packed_io(
             ref self: ContractState,
             model_id: felt252,
@@ -857,20 +858,7 @@ mod SumcheckVerifierContract {
             weight_binding_data: Array<felt252>,
             weight_opening_proofs: Array<MleOpeningProof>,
         ) -> bool {
-            let (proof_hash, io_commitment) = InternalImpl::verify_model_gkr_v4_packed_io_core(
-                @self, model_id, original_io_len, packed_raw_io, circuit_depth,
-                num_layers, matmul_dims, dequantize_bits, proof_data,
-                weight_commitments, weight_binding_mode, weight_binding_data,
-                weight_opening_proofs,
-            );
-
-            // Record proof on-chain
-            assert!(!self.verified_proofs.entry(proof_hash).read(), "PROOF_ALREADY_VERIFIED");
-            self.verified_proofs.entry(proof_hash).write(true);
-            let count = self.verification_counts.entry(model_id).read();
-            self.verification_counts.entry(model_id).write(count + 1);
-            self.emit(ModelGkrVerified { model_id, proof_hash, io_commitment, num_layers });
-            true
+            panic!("USE_STREAMING_V25")
         }
 
         fn verify_model_gkr_v4_packed_io_dp(
@@ -888,20 +876,7 @@ mod SumcheckVerifierContract {
             weight_binding_data: Array<felt252>,
             weight_opening_proofs: Array<MleOpeningProof>,
         ) -> bool {
-            let (proof_hash, io_commitment) = InternalImpl::verify_model_gkr_v4_packed_io_core_dp(
-                @self, model_id, original_io_len, packed_raw_io, circuit_depth,
-                num_layers, matmul_dims, dequantize_bits, proof_data,
-                weight_commitments, weight_binding_mode, weight_binding_data,
-                weight_opening_proofs, true,
-            );
-
-            // Record proof on-chain
-            assert!(!self.verified_proofs.entry(proof_hash).read(), "PROOF_ALREADY_VERIFIED");
-            self.verified_proofs.entry(proof_hash).write(true);
-            let count = self.verification_counts.entry(model_id).read();
-            self.verification_counts.entry(model_id).write(count + 1);
-            self.emit(ModelGkrVerified { model_id, proof_hash, io_commitment, num_layers });
-            true
+            panic!("USE_STREAMING_V25")
         }
 
         fn verify_model_gkr_v4_packed_io_view(
@@ -919,14 +894,7 @@ mod SumcheckVerifierContract {
             weight_binding_data: Array<felt252>,
             weight_opening_proofs: Array<MleOpeningProof>,
         ) -> bool {
-            // View-only: verify but skip proof recording (no storage writes/events)
-            let (_proof_hash, _io_commitment) = InternalImpl::verify_model_gkr_v4_packed_io_core(
-                self, model_id, original_io_len, packed_raw_io, circuit_depth,
-                num_layers, matmul_dims, dequantize_bits, proof_data,
-                weight_commitments, weight_binding_mode, weight_binding_data,
-                weight_opening_proofs,
-            );
-            true
+            panic!("USE_STREAMING_V25")
         }
 
         fn get_model_circuit_hash(self: @ContractState, model_id: felt252) -> felt252 {
@@ -937,7 +905,8 @@ mod SumcheckVerifierContract {
             self.model_gkr_weight_count.entry(model_id).read()
         }
 
-        // ─── Chunked GKR Session Entrypoints ─────────────────────────────
+        // ─── Chunked GKR Session Entrypoints (stubbed for lean v20) ───────
+        // Superseded by streaming verification (v25). Storage preserved across upgrades.
 
         fn open_gkr_session(
             ref self: ContractState,
@@ -949,6 +918,7 @@ mod SumcheckVerifierContract {
             packed: u32,
             io_packed: u32,
         ) -> u64 {
+            // Still needed by streaming flow for session ID + hash commitment
             let caller = get_caller_address();
             let session_id = self.next_session_id.read() + 1;
             self.next_session_id.write(session_id);
@@ -977,6 +947,7 @@ mod SumcheckVerifierContract {
             chunk_idx: u32,
             chunk_data: Array<felt252>,
         ) {
+            // Still needed by streaming flow for hash commitment
             let caller = get_caller_address();
             let owner = self.session_owner.entry(session_id).read();
             let owner_felt: felt252 = owner.into();
@@ -990,8 +961,6 @@ mod SumcheckVerifierContract {
             let chunk_felt_count = chunk_data.len();
             assert!(chunk_felt_count > 0, "EMPTY_CHUNK");
 
-            // v24: Store only Poseidon hash of chunk data (not individual felts).
-            // Data is re-submitted as calldata during verify_gkr_feed_chunk.
             let chunk_hash = core::poseidon::poseidon_hash_span(chunk_data.span());
             self.session_chunk_hash.entry((session_id, chunk_idx)).write(chunk_hash);
             self.session_chunk_len.entry((session_id, chunk_idx)).write(chunk_felt_count);
@@ -999,6 +968,7 @@ mod SumcheckVerifierContract {
         }
 
         fn seal_gkr_session(ref self: ContractState, session_id: u64) {
+            // Still needed by streaming flow for hash commitment
             let caller = get_caller_address();
             let owner = self.session_owner.entry(session_id).read();
             let owner_felt: felt252 = owner.into();
@@ -1006,7 +976,6 @@ mod SumcheckVerifierContract {
             assert!(caller == owner, "NOT_SESSION_OWNER");
             assert!(!self.session_sealed.entry(session_id).read(), "SESSION_ALREADY_SEALED");
 
-            // Verify total felt count matches sum of chunk lengths
             let num_chunks = self.session_chunks_uploaded.entry(session_id).read();
             let expected_total = self.session_total_felts.entry(session_id).read();
             let mut actual_total: u32 = 0;
@@ -1027,211 +996,10 @@ mod SumcheckVerifierContract {
         }
 
         fn verify_gkr_from_session(ref self: ContractState, session_id: u64) -> bool {
-            assert!(self.session_sealed.entry(session_id).read(), "SESSION_NOT_SEALED");
-
-            // Read session metadata
-            let model_id = self.session_model_id.entry(session_id).read();
-            let circuit_depth = self.session_circuit_depth.entry(session_id).read();
-            let num_layers = self.session_num_layers.entry(session_id).read();
-            let weight_binding_mode = self.session_weight_binding_mode.entry(session_id).read();
-            let _is_packed = self.session_packed.entry(session_id).read();
-            let is_io_packed = self.session_io_packed.entry(session_id).read();
-            let num_chunks = self.session_num_chunks.entry(session_id).read();
-
-            // Reassemble flat data array from chunks
-            let mut flat: Array<felt252> = array![];
-            let mut c: u32 = 0;
-            loop {
-                if c >= num_chunks {
-                    break;
-                }
-                let chunk_len = self.session_chunk_len.entry((session_id, c)).read();
-                let mut i: u32 = 0;
-                loop {
-                    if i >= chunk_len {
-                        break;
-                    }
-                    flat.append(self.session_data.entry((session_id, c, i)).read());
-                    i += 1;
-                };
-                c += 1;
-            };
-
-            let flat_span = flat.span();
-            let flat_len: u32 = flat_span.len();
-            let mut off: u32 = 0;
-
-            // Parse 7 length-prefixed sections from flat data.
-            // Layout matches paymaster_submit.mjs sessionData builder:
-            //   1. raw_io (IO-packed: [original_len, packed_count, packed_data...])
-            //   2. matmul_dims: [len, data...]
-            //   3. dequantize_bits: [len, data...]
-            //   4. proof_data: [len, data...]
-            //   5. weight_commitments: [len, data...]
-            //   6. weight_binding_data: [len, data...]
-            //   7. weight_opening_proofs: [count, ...]
-
-            // Section 1: raw_io
-            assert!(off < flat_len, "SESSION_DATA_TRUNCATED_IO");
-            let mut original_io_len: u32 = 0;
-            let mut packed_raw_io: Array<felt252> = array![];
-
-            if is_io_packed {
-                // IO-packed: [original_io_len, packed_count, packed_data...]
-                let orig_len_felt: u256 = (*flat_span.at(off)).into();
-                original_io_len = orig_len_felt.try_into().unwrap();
-                off += 1;
-                assert!(off < flat_len, "SESSION_DATA_TRUNCATED_IO_PACKED_COUNT");
-                let packed_count_felt: u256 = (*flat_span.at(off)).into();
-                let packed_count: u32 = packed_count_felt.try_into().unwrap();
-                off += 1;
-                let mut pi: u32 = 0;
-                loop {
-                    if pi >= packed_count {
-                        break;
-                    }
-                    assert!(off < flat_len, "SESSION_DATA_TRUNCATED_IO_PACKED_DATA");
-                    packed_raw_io.append(*flat_span.at(off));
-                    off += 1;
-                    pi += 1;
-                };
-            } else {
-                // Non-packed: [len, raw_io_data...]
-                let sec_len_felt: u256 = (*flat_span.at(off)).into();
-                let sec_len: u32 = sec_len_felt.try_into().unwrap();
-                off += 1;
-                original_io_len = sec_len;
-                let mut ri: u32 = 0;
-                loop {
-                    if ri >= sec_len {
-                        break;
-                    }
-                    assert!(off < flat_len, "SESSION_DATA_TRUNCATED_RAW_IO");
-                    packed_raw_io.append(*flat_span.at(off));
-                    off += 1;
-                    ri += 1;
-                };
-            };
-
-            // Section 2: matmul_dims
-            assert!(off < flat_len, "SESSION_DATA_TRUNCATED_MATMUL_DIMS");
-            let md_len_felt: u256 = (*flat_span.at(off)).into();
-            let md_len: u32 = md_len_felt.try_into().unwrap();
-            off += 1;
-            let mut matmul_dims: Array<u32> = array![];
-            let mut mi: u32 = 0;
-            loop {
-                if mi >= md_len {
-                    break;
-                }
-                assert!(off < flat_len, "SESSION_DATA_TRUNCATED_MATMUL_DIMS_DATA");
-                let v: u256 = (*flat_span.at(off)).into();
-                matmul_dims.append(v.try_into().unwrap());
-                off += 1;
-                mi += 1;
-            };
-
-            // Section 3: dequantize_bits
-            assert!(off < flat_len, "SESSION_DATA_TRUNCATED_DEQ");
-            let db_len_felt: u256 = (*flat_span.at(off)).into();
-            let db_len: u32 = db_len_felt.try_into().unwrap();
-            off += 1;
-            let mut dequantize_bits: Array<u64> = array![];
-            let mut di: u32 = 0;
-            loop {
-                if di >= db_len {
-                    break;
-                }
-                assert!(off < flat_len, "SESSION_DATA_TRUNCATED_DEQ_DATA");
-                let v: u256 = (*flat_span.at(off)).into();
-                dequantize_bits.append(v.try_into().unwrap());
-                off += 1;
-                di += 1;
-            };
-
-            // Section 4: proof_data
-            assert!(off < flat_len, "SESSION_DATA_TRUNCATED_PROOF");
-            let pd_len_felt: u256 = (*flat_span.at(off)).into();
-            let pd_len: u32 = pd_len_felt.try_into().unwrap();
-            off += 1;
-            let mut proof_data: Array<felt252> = array![];
-            let mut pdi: u32 = 0;
-            loop {
-                if pdi >= pd_len {
-                    break;
-                }
-                assert!(off < flat_len, "SESSION_DATA_TRUNCATED_PROOF_DATA");
-                proof_data.append(*flat_span.at(off));
-                off += 1;
-                pdi += 1;
-            };
-
-            // Section 5: weight_commitments
-            assert!(off < flat_len, "SESSION_DATA_TRUNCATED_WC");
-            let wc_len_felt: u256 = (*flat_span.at(off)).into();
-            let wc_len: u32 = wc_len_felt.try_into().unwrap();
-            off += 1;
-            let mut weight_commitments: Array<felt252> = array![];
-            let mut wi: u32 = 0;
-            loop {
-                if wi >= wc_len {
-                    break;
-                }
-                assert!(off < flat_len, "SESSION_DATA_TRUNCATED_WC_DATA");
-                weight_commitments.append(*flat_span.at(off));
-                off += 1;
-                wi += 1;
-            };
-
-            // Section 6: weight_binding_data
-            assert!(off < flat_len, "SESSION_DATA_TRUNCATED_WBD");
-            let wbd_len_felt: u256 = (*flat_span.at(off)).into();
-            let wbd_len: u32 = wbd_len_felt.try_into().unwrap();
-            off += 1;
-            let mut weight_binding_data: Array<felt252> = array![];
-            let mut wbi: u32 = 0;
-            loop {
-                if wbi >= wbd_len {
-                    break;
-                }
-                assert!(off < flat_len, "SESSION_DATA_TRUNCATED_WBD_DATA");
-                weight_binding_data.append(*flat_span.at(off));
-                off += 1;
-                wbi += 1;
-            };
-
-            // Section 7: weight_opening_proofs
-            // For Mode 4 RLC, this is just [0] (empty array).
-            // Full MLE opening proofs would require Serde deserialization
-            // from flat felts, but we only support RLC mode in this entrypoint.
-            assert!(off < flat_len, "SESSION_DATA_TRUNCATED_WOP");
-            let wop_count_felt: u256 = (*flat_span.at(off)).into();
-            let wop_count: u32 = wop_count_felt.try_into().unwrap();
-            off += 1;
-            let weight_opening_proofs: Array<MleOpeningProof> = array![];
-            assert!(wop_count == 0, "SESSION_VERIFY_ONLY_SUPPORTS_RLC_MODE");
-            // For wop_count == 0, no further data to parse.
-
-            assert!(off == flat_len, "SESSION_DATA_TRAILING");
-
-            // Run core verification (same as verify_model_gkr_v4_packed_io)
-            let (proof_hash, io_commitment) = InternalImpl::verify_model_gkr_v4_packed_io_core(
-                @self, model_id, original_io_len, packed_raw_io, circuit_depth,
-                num_layers, matmul_dims, dequantize_bits, proof_data,
-                weight_commitments, weight_binding_mode, weight_binding_data,
-                weight_opening_proofs,
-            );
-
-            // Record proof on-chain
-            assert!(!self.verified_proofs.entry(proof_hash).read(), "PROOF_ALREADY_VERIFIED");
-            self.verified_proofs.entry(proof_hash).write(true);
-            let count = self.verification_counts.entry(model_id).read();
-            self.verification_counts.entry(model_id).write(count + 1);
-            self.emit(ModelGkrVerified { model_id, proof_hash, io_commitment, num_layers });
-            true
+            panic!("USE_STREAMING_V25")
         }
 
-        // ─── Two-Phase Verification (v24+) ───────────────────────────────
+        // ─── Two-Phase Verification (stubbed for lean v20) ───────────────
 
         fn verify_gkr_feed_chunk(
             ref self: ContractState,
@@ -1239,228 +1007,11 @@ mod SumcheckVerifierContract {
             chunk_idx: u32,
             chunk_data: Array<felt252>,
         ) {
-            assert!(self.session_sealed.entry(session_id).read(), "SESSION_NOT_SEALED");
-            let caller = get_caller_address();
-            let owner = self.session_owner.entry(session_id).read();
-            assert!(caller == owner, "NOT_SESSION_OWNER");
-
-            // Verify chunk is fed in order
-            let expected_idx = self.session_verify_chunks_fed.entry(session_id).read();
-            assert!(chunk_idx == expected_idx, "FEED_CHUNK_IDX_OUT_OF_ORDER");
-
-            // Verify chunk hash matches what was stored during upload
-            let stored_hash = self.session_chunk_hash.entry((session_id, chunk_idx)).read();
-            assert!(stored_hash != 0, "CHUNK_HASH_NOT_FOUND");
-            let data_hash = core::poseidon::poseidon_hash_span(chunk_data.span());
-            assert!(data_hash == stored_hash, "FEED_CHUNK_HASH_MISMATCH");
-
-            // Verify chunk length matches
-            let stored_len = self.session_chunk_len.entry((session_id, chunk_idx)).read();
-            assert!(chunk_data.len() == stored_len, "FEED_CHUNK_LEN_MISMATCH");
-
-            // Store data with flat index for efficient reading during execute
-            let flat_offset = self.session_verify_fed_total.entry(session_id).read();
-            let chunk_len = chunk_data.len();
-            let mut i: u32 = 0;
-            loop {
-                if i >= chunk_len {
-                    break;
-                }
-                self.session_verify_data.entry((session_id, flat_offset + i)).write(*chunk_data.at(i));
-                i += 1;
-            };
-
-            self.session_verify_fed_total.entry(session_id).write(flat_offset + chunk_len);
-            self.session_verify_chunks_fed.entry(session_id).write(expected_idx + 1);
+            panic!("USE_STREAMING_V25")
         }
 
         fn verify_gkr_execute(ref self: ContractState, session_id: u64) -> bool {
-            assert!(self.session_sealed.entry(session_id).read(), "SESSION_NOT_SEALED");
-
-            // Verify all chunks have been fed
-            let num_chunks = self.session_num_chunks.entry(session_id).read();
-            let chunks_fed = self.session_verify_chunks_fed.entry(session_id).read();
-            assert!(chunks_fed == num_chunks, "NOT_ALL_CHUNKS_FED");
-
-            let total_felts = self.session_verify_fed_total.entry(session_id).read();
-            let expected_total = self.session_total_felts.entry(session_id).read();
-            assert!(total_felts == expected_total, "FED_TOTAL_MISMATCH");
-
-            // Read session metadata
-            let model_id = self.session_model_id.entry(session_id).read();
-            let circuit_depth = self.session_circuit_depth.entry(session_id).read();
-            let num_layers = self.session_num_layers.entry(session_id).read();
-            let weight_binding_mode = self.session_weight_binding_mode.entry(session_id).read();
-            let is_io_packed = self.session_io_packed.entry(session_id).read();
-
-            // Read all data from flat-indexed storage into array
-            let mut flat: Array<felt252> = array![];
-            let mut fi: u32 = 0;
-            loop {
-                if fi >= total_felts {
-                    break;
-                }
-                flat.append(self.session_verify_data.entry((session_id, fi)).read());
-                fi += 1;
-            };
-
-            // Parse sections and verify (same as verify_gkr_from_session)
-            let flat_span = flat.span();
-            let flat_len: u32 = flat_span.len();
-            let mut off: u32 = 0;
-
-            // Section 1: raw_io
-            assert!(off < flat_len, "SESSION_DATA_TRUNCATED_IO");
-            let mut original_io_len: u32 = 0;
-            let mut packed_raw_io: Array<felt252> = array![];
-
-            if is_io_packed {
-                let orig_len_felt: u256 = (*flat_span.at(off)).into();
-                original_io_len = orig_len_felt.try_into().unwrap();
-                off += 1;
-                assert!(off < flat_len, "SESSION_DATA_TRUNCATED_IO_PACKED_COUNT");
-                let packed_count_felt: u256 = (*flat_span.at(off)).into();
-                let packed_count: u32 = packed_count_felt.try_into().unwrap();
-                off += 1;
-                let mut pi: u32 = 0;
-                loop {
-                    if pi >= packed_count {
-                        break;
-                    }
-                    assert!(off < flat_len, "SESSION_DATA_TRUNCATED_IO_PACKED_DATA");
-                    packed_raw_io.append(*flat_span.at(off));
-                    off += 1;
-                    pi += 1;
-                };
-            } else {
-                let sec_len_felt: u256 = (*flat_span.at(off)).into();
-                let sec_len: u32 = sec_len_felt.try_into().unwrap();
-                off += 1;
-                original_io_len = sec_len;
-                let mut ri: u32 = 0;
-                loop {
-                    if ri >= sec_len {
-                        break;
-                    }
-                    assert!(off < flat_len, "SESSION_DATA_TRUNCATED_RAW_IO");
-                    packed_raw_io.append(*flat_span.at(off));
-                    off += 1;
-                    ri += 1;
-                };
-            };
-
-            // Section 2: matmul_dims
-            assert!(off < flat_len, "SESSION_DATA_TRUNCATED_MATMUL_DIMS");
-            let md_len_felt: u256 = (*flat_span.at(off)).into();
-            let md_len: u32 = md_len_felt.try_into().unwrap();
-            off += 1;
-            let mut matmul_dims: Array<u32> = array![];
-            let mut mi: u32 = 0;
-            loop {
-                if mi >= md_len {
-                    break;
-                }
-                assert!(off < flat_len, "SESSION_DATA_TRUNCATED_MATMUL_DIMS_DATA");
-                let v: u256 = (*flat_span.at(off)).into();
-                matmul_dims.append(v.try_into().unwrap());
-                off += 1;
-                mi += 1;
-            };
-
-            // Section 3: dequantize_bits
-            assert!(off < flat_len, "SESSION_DATA_TRUNCATED_DEQ");
-            let db_len_felt: u256 = (*flat_span.at(off)).into();
-            let db_len: u32 = db_len_felt.try_into().unwrap();
-            off += 1;
-            let mut dequantize_bits: Array<u64> = array![];
-            let mut di: u32 = 0;
-            loop {
-                if di >= db_len {
-                    break;
-                }
-                assert!(off < flat_len, "SESSION_DATA_TRUNCATED_DEQ_DATA");
-                let v: u256 = (*flat_span.at(off)).into();
-                dequantize_bits.append(v.try_into().unwrap());
-                off += 1;
-                di += 1;
-            };
-
-            // Section 4: proof_data
-            assert!(off < flat_len, "SESSION_DATA_TRUNCATED_PROOF");
-            let pd_len_felt: u256 = (*flat_span.at(off)).into();
-            let pd_len: u32 = pd_len_felt.try_into().unwrap();
-            off += 1;
-            let mut proof_data: Array<felt252> = array![];
-            let mut pdi: u32 = 0;
-            loop {
-                if pdi >= pd_len {
-                    break;
-                }
-                assert!(off < flat_len, "SESSION_DATA_TRUNCATED_PROOF_DATA");
-                proof_data.append(*flat_span.at(off));
-                off += 1;
-                pdi += 1;
-            };
-
-            // Section 5: weight_commitments
-            assert!(off < flat_len, "SESSION_DATA_TRUNCATED_WC");
-            let wc_len_felt: u256 = (*flat_span.at(off)).into();
-            let wc_len: u32 = wc_len_felt.try_into().unwrap();
-            off += 1;
-            let mut weight_commitments: Array<felt252> = array![];
-            let mut wi: u32 = 0;
-            loop {
-                if wi >= wc_len {
-                    break;
-                }
-                assert!(off < flat_len, "SESSION_DATA_TRUNCATED_WC_DATA");
-                weight_commitments.append(*flat_span.at(off));
-                off += 1;
-                wi += 1;
-            };
-
-            // Section 6: weight_binding_data
-            assert!(off < flat_len, "SESSION_DATA_TRUNCATED_WBD");
-            let wbd_len_felt: u256 = (*flat_span.at(off)).into();
-            let wbd_len: u32 = wbd_len_felt.try_into().unwrap();
-            off += 1;
-            let mut weight_binding_data: Array<felt252> = array![];
-            let mut wbi: u32 = 0;
-            loop {
-                if wbi >= wbd_len {
-                    break;
-                }
-                assert!(off < flat_len, "SESSION_DATA_TRUNCATED_WBD_DATA");
-                weight_binding_data.append(*flat_span.at(off));
-                off += 1;
-                wbi += 1;
-            };
-
-            // Section 7: weight_opening_proofs
-            assert!(off < flat_len, "SESSION_DATA_TRUNCATED_WOP");
-            let wop_count_felt: u256 = (*flat_span.at(off)).into();
-            let wop_count: u32 = wop_count_felt.try_into().unwrap();
-            off += 1;
-            let weight_opening_proofs: Array<MleOpeningProof> = array![];
-            assert!(wop_count == 0, "SESSION_VERIFY_ONLY_SUPPORTS_RLC_MODE");
-
-            assert!(off == flat_len, "SESSION_DATA_TRAILING");
-
-            // Run core verification
-            let (proof_hash, io_commitment) = InternalImpl::verify_model_gkr_v4_packed_io_core(
-                @self, model_id, original_io_len, packed_raw_io, circuit_depth,
-                num_layers, matmul_dims, dequantize_bits, proof_data,
-                weight_commitments, weight_binding_mode, weight_binding_data,
-                weight_opening_proofs,
-            );
-
-            // Record proof on-chain
-            assert!(!self.verified_proofs.entry(proof_hash).read(), "PROOF_ALREADY_VERIFIED");
-            self.verified_proofs.entry(proof_hash).write(true);
-            let count = self.verification_counts.entry(model_id).read();
-            self.verification_counts.entry(model_id).write(count + 1);
-            self.emit(ModelGkrVerified { model_id, proof_hash, io_commitment, num_layers });
-            true
+            panic!("USE_STREAMING_V25")
         }
 
         // ─── Streaming GKR Verification (v25) ───────────────────────────
@@ -2161,200 +1712,7 @@ mod SumcheckVerifierContract {
     // Will be restored in next version. Storage is preserved across upgrades.
     // See git history for full audit/access-control/view-key implementations.
 
-    // ─── Private core verification logic (shared by record + view) ────────
-
-    #[generate_trait]
-    impl InternalImpl of InternalTrait {
-        /// Core GKR verification: runs full Fiat-Shamir transcript replay and
-        /// returns (proof_hash, io_commitment). Panics on verification failure.
-        /// Shared by verify_model_gkr_v4_packed_io (records proof) and
-        /// verify_model_gkr_v4_packed_io_view (view-only, no storage writes).
-        fn verify_model_gkr_v4_packed_io_core(
-            self: @ContractState,
-            model_id: felt252,
-            original_io_len: u32,
-            packed_raw_io: Array<felt252>,
-            circuit_depth: u32,
-            num_layers: u32,
-            matmul_dims: Array<u32>,
-            dequantize_bits: Array<u64>,
-            proof_data: Array<felt252>,
-            weight_commitments: Array<felt252>,
-            weight_binding_mode: u32,
-            weight_binding_data: Array<felt252>,
-            weight_opening_proofs: Array<MleOpeningProof>,
-        ) -> (felt252, felt252) {
-            Self::verify_model_gkr_v4_packed_io_core_dp(
-                self, model_id, original_io_len, packed_raw_io, circuit_depth,
-                num_layers, matmul_dims, dequantize_bits, proof_data,
-                weight_commitments, weight_binding_mode, weight_binding_data,
-                weight_opening_proofs, false,
-            )
-        }
-
-        /// Core GKR verification with optional double-packed proof data.
-        /// When `double_packed` is true, degree-2 round polys read (c0,c2) from
-        /// one felt252 and degree-3 polys read (c0,c2) paired + c3 single.
-        fn verify_model_gkr_v4_packed_io_core_dp(
-            self: @ContractState,
-            model_id: felt252,
-            original_io_len: u32,
-            packed_raw_io: Array<felt252>,
-            circuit_depth: u32,
-            num_layers: u32,
-            matmul_dims: Array<u32>,
-            dequantize_bits: Array<u64>,
-            proof_data: Array<felt252>,
-            weight_commitments: Array<felt252>,
-            weight_binding_mode: u32,
-            weight_binding_data: Array<felt252>,
-            weight_opening_proofs: Array<MleOpeningProof>,
-            double_packed: bool,
-        ) -> (felt252, felt252) {
-            assert!(
-                weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_OPENINGS_V4_EXPERIMENTAL
-                    || weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_ORACLE_SUMCHECK,
-                "UNSUPPORTED_WEIGHT_BINDING_MODE",
-            );
-
-            // Hash packed felts for IO commitment (1,281 felts vs 10,246)
-            let mut commitment_input: Array<felt252> = array![original_io_len.into()];
-            let mut ci: u32 = 0;
-            loop {
-                if ci >= packed_raw_io.len() {
-                    break;
-                }
-                commitment_input.append(*packed_raw_io.at(ci));
-                ci += 1;
-            };
-            let io_commitment = core::poseidon::poseidon_hash_span(commitment_input.span());
-
-            // Extract IO dimensions from packed raw_io data.
-            // raw_io layout: [in_rows, in_cols, in_len, in_data..., out_rows, out_cols, out_len, out_data...]
-            // Each value is an M31 packed 8 per felt252.
-            let packed_span = packed_raw_io.span();
-            let in_rows: u32 = extract_m31_from_packed(packed_span, 0);
-            let in_cols: u32 = extract_m31_from_packed(packed_span, 1);
-            let in_len: u32 = extract_m31_from_packed(packed_span, 2);
-            assert!(in_len == in_rows * in_cols, "IN_LEN_MISMATCH");
-            let out_rows: u32 = extract_m31_from_packed(packed_span, 3 + in_len);
-            let out_cols: u32 = extract_m31_from_packed(packed_span, 3 + in_len + 1);
-            let out_len: u32 = extract_m31_from_packed(packed_span, 3 + in_len + 2);
-            assert!(out_len == out_rows * out_cols, "OUT_LEN_MISMATCH");
-
-            assert!(original_io_len == 6 + in_len + out_len, "PACKED_IO_LEN_MISMATCH");
-
-            let in_data_m31_start: u32 = 3;
-            let out_data_m31_start: u32 = 3 + in_len + 3;
-
-            let padded_in_rows = next_power_of_two(in_rows);
-            let padded_in_cols = next_power_of_two(in_cols);
-            let padded_out_rows = next_power_of_two(out_rows);
-            let padded_out_cols = next_power_of_two(out_cols);
-
-            // Fiat-Shamir channel
-            let mut ch = channel_default();
-            channel_mix_u64(ref ch, circuit_depth.into());
-            channel_mix_u64(ref ch, in_rows.into());
-            channel_mix_u64(ref ch, in_cols.into());
-
-            let log_out_rows = log2_ceil(padded_out_rows);
-            let log_out_cols = log2_ceil(padded_out_cols);
-            let log_out_total = log_out_rows + log_out_cols;
-            let r_out = channel_draw_qm31s(ref ch, log_out_total);
-
-            // OUTPUT MLE evaluation directly from packed data
-            assert!(padded_out_rows == 1, "PACKED_IO_ONLY_1ROW");
-            let output_value = evaluate_mle_from_packed_1row(
-                packed_span, out_data_m31_start, out_cols, padded_out_cols, r_out.span(),
-            );
-
-            channel_mix_secure_field(ref ch, output_value);
-
-            // GKR model walk
-            let initial_claim = GKRClaim { point: r_out, value: output_value };
-            let (final_claim, weight_claims, layer_tags, deferred_weight_commitments) =
-                verify_gkr_model_with_trace_dp(
-                    proof_data.span(), num_layers, matmul_dims.span(),
-                    dequantize_bits.span(), initial_claim, ref ch, true, double_packed,
-                );
-
-            // Circuit binding
-            let circuit_hash = self.model_circuit_hash.entry(model_id).read();
-            assert!(circuit_hash != 0, "Model not registered for GKR");
-            let mut descriptor_felts: Array<felt252> = array![circuit_depth.into()];
-            let mut t_i: u32 = 0;
-            loop {
-                if t_i >= layer_tags.len() {
-                    break;
-                }
-                descriptor_felts.append((*layer_tags.at(t_i)).into());
-                t_i += 1;
-            };
-            let observed_circuit_hash = core::poseidon::poseidon_hash_span(descriptor_felts.span());
-            assert!(observed_circuit_hash == circuit_hash, "CIRCUIT_HASH_MISMATCH");
-
-            // Weight binding — aggregate hash comparison (1 storage read vs N)
-            let registered_count = self.model_gkr_weight_count.entry(model_id).read();
-            assert!(weight_commitments.len() == registered_count, "Weight commitment count mismatch");
-            let mut weight_hash_input: Array<felt252> = array![];
-            let mut w_idx: u32 = 0;
-            loop {
-                if w_idx >= registered_count {
-                    break;
-                }
-                weight_hash_input.append(*weight_commitments.at(w_idx));
-                w_idx += 1;
-            };
-            let calldata_weight_hash = core::poseidon::poseidon_hash_span(weight_hash_input.span());
-            let registered_hash = self.model_weight_root_hash.entry(model_id).read();
-            assert!(calldata_weight_hash == registered_hash, "WEIGHT_ROOT_HASH_MISMATCH");
-
-            let expected_weight_claims = registered_count + deferred_weight_commitments.len();
-            assert!(weight_claims.len() == expected_weight_claims, "WEIGHT_CLAIM_COUNT_MISMATCH");
-            assert!(weight_binding_data.len() >= 2, "AGGREGATED_BINDING_DATA_TOO_SHORT");
-
-            let weight_binding_span = weight_binding_data.span();
-
-            if weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_ORACLE_SUMCHECK {
-                if weight_binding_span.len() == 2
-                    && *weight_binding_span.at(0) == WEIGHT_BINDING_RLC_MARKER {
-                    let rho = channel_draw_qm31(ref ch);
-                    let mut rho_pow = crate::field::qm31_one();
-                    let mut combined = crate::field::qm31_zero();
-                    let mut claim_i: u32 = 0;
-                    loop {
-                        if claim_i >= expected_weight_claims {
-                            break;
-                        }
-                        let claim = weight_claims.at(claim_i);
-                        combined = crate::field::qm31_add(
-                            combined, crate::field::qm31_mul(rho_pow, *claim.expected_value),
-                        );
-                        rho_pow = crate::field::qm31_mul(rho_pow, rho);
-                        claim_i += 1;
-                    };
-                    channel_mix_secure_field(ref ch, combined);
-                } else {
-                    panic!("FULL_AGGREGATED_BINDING_NOT_IN_LEAN_BUILD");
-                }
-            } else {
-                panic!("MODE_3_NOT_IN_LEAN_BUILD");
-            }
-
-            // INPUT MLE evaluation directly from packed data
-            assert!(padded_in_rows == 1, "PACKED_IO_ONLY_1ROW");
-            let input_value = evaluate_mle_from_packed_1row(
-                packed_span, in_data_m31_start, in_cols, padded_in_cols,
-                final_claim.point.span(),
-            );
-            assert!(crate::field::qm31_eq(input_value, final_claim.value), "INPUT_CLAIM_MISMATCH");
-
-            // Return proof hash + io_commitment for caller to record (or discard for view)
-            let proof_hash = core::poseidon::poseidon_hash_span(
-                array![ch.digest, io_commitment, model_id, num_layers.into()].span(),
-            );
-            (proof_hash, io_commitment)
-        }
-    }
+    // ─── Private core verification logic (stubbed for lean v20) ────────
+    // Single-TX core functions removed — streaming verification handles all verification.
+    // See git history for full implementations.
 }
