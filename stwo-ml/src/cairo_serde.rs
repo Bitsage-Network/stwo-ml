@@ -2414,6 +2414,18 @@ pub fn split_proof_into_stream_batches(
     proof: &crate::gkr::GKRProof,
     max_felts_per_batch: usize,
 ) -> (Vec<FieldElement>, Vec<StreamBatchInfo>) {
+    split_proof_into_stream_batches_with_layer_cap(
+        proof,
+        max_felts_per_batch,
+        crate::starknet::MAX_STREAM_BATCH_LAYERS,
+    )
+}
+
+pub fn split_proof_into_stream_batches_with_layer_cap(
+    proof: &crate::gkr::GKRProof,
+    max_felts_per_batch: usize,
+    max_layers_per_batch: usize,
+) -> (Vec<FieldElement>, Vec<StreamBatchInfo>) {
     let mut all_felts = Vec::new();
     let boundaries = serialize_gkr_proof_data_only_packed_with_boundaries(proof, &mut all_felts);
 
@@ -2423,15 +2435,16 @@ pub fn split_proof_into_stream_batches(
 
     while batch_start < num_layers {
         let mut batch_end = batch_start + 1;
-        // Greedily pack consecutive layers
+        // Greedily pack consecutive layers (respecting both felt and layer limits)
         while batch_end < num_layers {
             let batch_felts = boundaries[batch_end + 1] - boundaries[batch_start];
-            if batch_felts > max_felts_per_batch {
+            let batch_layers = batch_end - batch_start + 1;
+            if batch_felts > max_felts_per_batch || batch_layers > max_layers_per_batch {
                 break;
             }
             batch_end += 1;
         }
-        // If a single layer exceeds the limit, include it anyway (1 layer minimum)
+        // If a single layer exceeds the felt limit, include it anyway (1 layer minimum)
         let felt_start = boundaries[batch_start];
         let felt_end = boundaries[batch_end];
         batches.push(StreamBatchInfo {

@@ -1619,6 +1619,11 @@ pub fn build_chunked_gkr_calldata(
 /// Leaves ~500 felts for dims/bits/overhead within the 4500 total TX limit.
 pub const MAX_STREAM_BATCH_FELTS: usize = 3500;
 
+/// Maximum layers per streaming batch.
+/// Each layer costs ~34M gas on average (sumcheck verification).
+/// Starknet gas limit is 1.2B, so cap at 30 layers (~1.0B gas) for safety margin.
+pub const MAX_STREAM_BATCH_LAYERS: usize = 30;
+
 /// Streaming GKR calldata for calldata-only verification.
 ///
 /// Protocol: open_gkr_session → upload chunks → seal →
