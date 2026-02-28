@@ -238,8 +238,8 @@ pub trait ISumcheckVerifier<TContractState> {
     // Only ~28 felts of checkpoint state stored between TXs.
 
     /// Initialize a streaming GKR verification session.
-    /// Computes IO commitment, builds initial claim, seeds channel,
-    /// stores initial checkpoint state.
+    /// Computes IO commitment, validates dimensions, seeds channel,
+    /// stores initial checkpoint state. Does NOT evaluate output MLE.
     fn verify_gkr_stream_init(
         ref self: TContractState,
         session_id: u64,
@@ -247,6 +247,16 @@ pub trait ISumcheckVerifier<TContractState> {
         packed_raw_io: Array<felt252>,
         circuit_depth: u32,
         num_layers: u32,
+        in_cols: u32,
+        out_cols: u32,
+    );
+
+    /// Evaluate output MLE in a separate TX (splits expensive computation from init).
+    /// Must be called after stream_init and before stream_layers.
+    fn verify_gkr_stream_init_output_mle(
+        ref self: TContractState,
+        session_id: u64,
+        packed_output_data: Array<felt252>,
     );
 
     /// Verify a batch of GKR layers. Proof data for this batch arrives
@@ -411,6 +421,12 @@ mod SumcheckVerifierContract {
         stream_packed_io_len: Map<u64, u32>,
         /// session_id → original_io_len (M31 element count).
         stream_original_io_len: Map<u64, u32>,
+        /// session_id → output column count (for output MLE step).
+        stream_out_cols: Map<u64, u32>,
+        /// session_id → M31 start index of output data in packed IO.
+        stream_out_data_m31_start: Map<u64, u32>,
+        /// session_id → whether output MLE has been evaluated.
+        stream_output_mle_done: Map<u64, bool>,
         /// session_id → expected next batch index (for sequential enforcement).
         stream_next_batch_idx: Map<u64, u32>,
         /// session_id → total deferred Add points accumulated across batches.
@@ -1402,6 +1418,8 @@ mod SumcheckVerifierContract {
             packed_raw_io: Array<felt252>,
             circuit_depth: u32,
             num_layers: u32,
+            in_cols: u32,
+            out_cols: u32,
         ) {
             // Auth: must be session owner, session must be sealed
             assert!(self.session_sealed.entry(session_id).read(), "SESSION_NOT_SEALED");
@@ -1422,45 +1440,89 @@ mod SumcheckVerifierContract {
             };
             let io_commitment = core::poseidon::poseidon_hash_span(commitment_input.span());
 
-            // Extract IO dimensions from packed data
+            // Validate dimensions against packed data
             let packed_span = packed_raw_io.span();
-            let in_rows: u32 = extract_m31_from_packed(packed_span, 0);
-            let in_cols: u32 = extract_m31_from_packed(packed_span, 1);
+            let in_rows_v: u32 = extract_m31_from_packed(packed_span, 0);
+            let in_cols_v: u32 = extract_m31_from_packed(packed_span, 1);
             let in_len: u32 = extract_m31_from_packed(packed_span, 2);
-            assert!(in_len == in_rows * in_cols, "IN_LEN_MISMATCH");
-            let out_rows: u32 = extract_m31_from_packed(packed_span, 3 + in_len);
-            let out_cols: u32 = extract_m31_from_packed(packed_span, 3 + in_len + 1);
+            assert!(in_cols_v == in_cols, "IN_COLS_MISMATCH");
+            assert!(in_len == in_rows_v * in_cols_v, "IN_LEN_MISMATCH");
+            let out_rows_v: u32 = extract_m31_from_packed(packed_span, 3 + in_len);
+            let out_cols_v: u32 = extract_m31_from_packed(packed_span, 3 + in_len + 1);
             let out_len: u32 = extract_m31_from_packed(packed_span, 3 + in_len + 2);
-            assert!(out_len == out_rows * out_cols, "OUT_LEN_MISMATCH");
+            assert!(out_cols_v == out_cols, "OUT_COLS_MISMATCH");
+            assert!(out_len == out_rows_v * out_cols_v, "OUT_LEN_MISMATCH");
             assert!(original_io_len == 6 + in_len + out_len, "PACKED_IO_LEN_MISMATCH");
 
-            let out_data_m31_start: u32 = 3 + in_len + 3;
-            let padded_out_rows = next_power_of_two(out_rows);
-            let padded_out_cols = next_power_of_two(out_cols);
-
-            // Seed Fiat-Shamir channel
+            // Seed Fiat-Shamir channel (deterministic, no MLE eval here)
+            let _padded_out_cols = next_power_of_two(out_cols);
             let mut ch = channel_default();
             channel_mix_u64(ref ch, circuit_depth.into());
-            channel_mix_u64(ref ch, in_rows.into());
+            channel_mix_u64(ref ch, in_rows_v.into());
             channel_mix_u64(ref ch, in_cols.into());
 
-            let log_out_rows = log2_ceil(padded_out_rows);
-            let log_out_cols = log2_ceil(padded_out_cols);
-            let log_out_total = log_out_rows + log_out_cols;
+            // Save checkpoint state — output MLE will be evaluated in stream_init_output_mle
+            self.stream_channel_digest.entry(session_id).write(ch.digest);
+            self.stream_channel_counter.entry(session_id).write(ch.n_draws);
+
+            self.stream_layers_verified.entry(session_id).write(0);
+            self.stream_weight_hash.entry(session_id).write(0);
+            self.stream_tags_hash.entry(session_id).write(0);
+            self.stream_weight_count.entry(session_id).write(0);
+            self.stream_io_commitment.entry(session_id).write(io_commitment);
+            self.stream_total_layers.entry(session_id).write(num_layers);
+            self.stream_circuit_depth.entry(session_id).write(circuit_depth);
+            self.stream_next_batch_idx.entry(session_id).write(0);
+            self.stream_deferred_count.entry(session_id).write(0);
+            self.stream_original_io_len.entry(session_id).write(original_io_len);
+            self.stream_packed_io_len.entry(session_id).write(packed_raw_io.len());
+
+            // Store dimensions for output MLE step
+            self.stream_out_cols.entry(session_id).write(out_cols);
+            self.stream_out_data_m31_start.entry(session_id).write(3 + in_len + 3);
+
+            self.stream_initialized.entry(session_id).write(true);
+            self.stream_output_mle_done.entry(session_id).write(false);
+            self.stream_finalized.entry(session_id).write(false);
+
+            let model_id = self.session_model_id.entry(session_id).read();
+            self.emit(GkrStreamStarted { session_id, model_id, num_layers });
+        }
+
+        /// Evaluate output MLE in a separate TX (splits expensive computation from init).
+        /// Receives only the output portion of packed IO data.
+        fn verify_gkr_stream_init_output_mle(
+            ref self: ContractState,
+            session_id: u64,
+            packed_output_data: Array<felt252>,
+        ) {
+            assert!(self.stream_initialized.entry(session_id).read(), "STREAM_NOT_INITIALIZED");
+            assert!(!self.stream_output_mle_done.entry(session_id).read(), "OUTPUT_MLE_ALREADY_DONE");
+            let caller = get_caller_address();
+            let owner = self.session_owner.entry(session_id).read();
+            assert!(caller == owner, "NOT_SESSION_OWNER");
+
+            // Restore channel state from init
+            let mut ch = PoseidonChannel {
+                digest: self.stream_channel_digest.entry(session_id).read(),
+                n_draws: self.stream_channel_counter.entry(session_id).read(),
+            };
+
+            let out_cols = self.stream_out_cols.entry(session_id).read();
+            let padded_out_cols = next_power_of_two(out_cols);
+            let log_out_total = log2_ceil(padded_out_cols); // padded_out_rows == 1, so log_out_rows == 0
+
             let r_out = channel_draw_qm31s(ref ch, log_out_total);
 
-            // Output MLE evaluation directly from packed data
-            assert!(padded_out_rows == 1, "PACKED_IO_ONLY_1ROW");
+            // Evaluate output MLE from the output-only packed data
             let output_value = evaluate_mle_from_packed_1row(
-                packed_span, out_data_m31_start, out_cols, padded_out_cols, r_out.span(),
+                packed_output_data.span(), 0, out_cols, padded_out_cols, r_out.span(),
             );
 
             channel_mix_secure_field(ref ch, output_value);
 
-            // Build initial claim
+            // Store initial claim
             let initial_claim = GKRClaim { point: r_out, value: output_value };
-
-            // Save checkpoint state
             self.stream_channel_digest.entry(session_id).write(ch.digest);
             self.stream_channel_counter.entry(session_id).write(ch.n_draws);
             self.stream_claim_value.entry(session_id).write(pack_qm31_to_felt(initial_claim.value));
@@ -1477,25 +1539,7 @@ mod SumcheckVerifierContract {
                 pi += 1;
             };
 
-            self.stream_layers_verified.entry(session_id).write(0);
-            self.stream_weight_hash.entry(session_id).write(0);
-            self.stream_tags_hash.entry(session_id).write(0);
-            self.stream_weight_count.entry(session_id).write(0);
-            self.stream_io_commitment.entry(session_id).write(io_commitment);
-            self.stream_total_layers.entry(session_id).write(num_layers);
-            self.stream_circuit_depth.entry(session_id).write(circuit_depth);
-            self.stream_next_batch_idx.entry(session_id).write(0);
-            self.stream_deferred_count.entry(session_id).write(0);
-
-            // Store IO metadata for finalize (IO data re-passed as calldata, verified via commitment)
-            self.stream_original_io_len.entry(session_id).write(original_io_len);
-            self.stream_packed_io_len.entry(session_id).write(packed_raw_io.len());
-
-            self.stream_initialized.entry(session_id).write(true);
-            self.stream_finalized.entry(session_id).write(false);
-
-            let model_id = self.session_model_id.entry(session_id).read();
-            self.emit(GkrStreamStarted { session_id, model_id, num_layers });
+            self.stream_output_mle_done.entry(session_id).write(true);
         }
 
         fn verify_gkr_stream_layers(
@@ -1509,6 +1553,7 @@ mod SumcheckVerifierContract {
         ) {
             // Auth
             assert!(self.stream_initialized.entry(session_id).read(), "STREAM_NOT_INITIALIZED");
+            assert!(self.stream_output_mle_done.entry(session_id).read(), "OUTPUT_MLE_NOT_DONE");
             assert!(!self.stream_finalized.entry(session_id).read(), "STREAM_ALREADY_FINALIZED");
             let caller = get_caller_address();
             let owner = self.session_owner.entry(session_id).read();

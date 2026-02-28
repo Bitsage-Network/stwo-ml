@@ -1575,6 +1575,7 @@ fn main() {
                                                 "model_id": streaming.session_metadata.model_id,
                                                 "chunks": streaming.upload_chunks,
                                                 "init_calldata": streaming.init_calldata,
+                                                "output_mle_calldata": streaming.output_mle_calldata,
                                                 "stream_batches": batch_json,
                                                 "finalize_calldata": streaming.finalize_calldata,
                                                 "layer_tags": streaming.session_metadata.layer_tags,

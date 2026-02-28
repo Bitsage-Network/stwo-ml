@@ -1627,6 +1627,8 @@ pub const MAX_STREAM_BATCH_FELTS: usize = 3500;
 pub struct StreamingGkrCalldata {
     /// Calldata for verify_gkr_stream_init (IO data + metadata).
     pub init_calldata: Vec<String>,
+    /// Calldata for verify_gkr_stream_init_output_mle (packed output values only).
+    pub output_mle_calldata: Vec<String>,
     /// Batches of layer proof data for verify_gkr_stream_layers.
     pub stream_batches: Vec<StreamBatch>,
     /// Calldata for verify_gkr_stream_finalize (weight claims + binding).
@@ -1694,6 +1696,41 @@ pub fn build_streaming_gkr_calldata(
     }
     init_calldata.push(format!("{}", circuit_depth));
     init_calldata.push(format!("{}", num_layers));
+
+    // Extract IO dimensions from raw_io_data header for init + output_mle split
+    let io_in_rows = {
+        let be = raw_io_data[0].to_bytes_be();
+        u32::from_be_bytes([be[28], be[29], be[30], be[31]])
+    };
+    let io_in_cols = {
+        let be = raw_io_data[1].to_bytes_be();
+        u32::from_be_bytes([be[28], be[29], be[30], be[31]])
+    };
+    let io_in_len = (io_in_rows * io_in_cols) as usize;
+    let io_out_cols = {
+        let be = raw_io_data[3 + io_in_len + 1].to_bytes_be();
+        u32::from_be_bytes([be[28], be[29], be[30], be[31]])
+    };
+    let io_out_len_val = {
+        let be = raw_io_data[3 + io_in_len + 2].to_bytes_be();
+        u32::from_be_bytes([be[28], be[29], be[30], be[31]])
+    };
+    init_calldata.push(format!("{}", io_in_cols));  // in_cols
+    init_calldata.push(format!("{}", io_out_cols));  // out_cols
+
+    // ── Build output_mle calldata ──
+    // Pack only the raw output values (no header) for verify_gkr_stream_init_output_mle
+    let output_start = 3 + io_in_len + 3; // skip input header + data + output header
+    let output_end = output_start + io_out_len_val as usize;
+    let packed_output = pack_m31_io_data(&raw_io_data[output_start..output_end]);
+    let mut output_mle_calldata: Vec<String> = Vec::new();
+    output_mle_calldata.push("__SESSION_ID__".to_string());
+    // packed_output_data: Array<felt252> [len, data...]
+    output_mle_calldata.push(format!("{}", packed_output.len()));
+    for f in &packed_output {
+        output_mle_calldata.push(format!("0x{:x}", f));
+    }
+    let _ = io_in_rows; // used above for io_in_len calculation
 
     // ── Split proof data into batches with boundary tracking ──
     let (all_proof_felts, batch_infos) =
@@ -1901,6 +1938,7 @@ pub fn build_streaming_gkr_calldata(
 
     Ok(StreamingGkrCalldata {
         init_calldata,
+        output_mle_calldata,
         stream_batches,
         finalize_calldata,
         session_metadata: StreamSessionMetadata {

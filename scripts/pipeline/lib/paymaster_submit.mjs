@@ -503,6 +503,7 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
     if (!Array.isArray(initCalldata) || initCalldata.length === 0) {
       die("schema_version 3 requires non-empty init_calldata array");
     }
+    const outputMleCalldata = verifyCalldata.output_mle_calldata || null;
     const streamBatches = verifyCalldata.stream_batches;
     if (!Array.isArray(streamBatches) || streamBatches.length === 0) {
       die("schema_version 3 requires non-empty stream_batches array");
@@ -574,6 +575,7 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
       packed: true,
       ioPacked: true,
       initCalldata,
+      outputMleCalldata,
       streamBatches,
       finalizeCalldata,
       layerTags,
@@ -2090,7 +2092,7 @@ async function cmdVerify(args) {
       // Phase 4a: verify_gkr_stream_init
       const streamResumeFrom = sessionState.streamBatchesDone || 0;
       if (!sessionState.streamInitDone) {
-        e2ePhase("Stream init (IO commitment + initial claim)");
+        e2ePhase("Stream init (IO commitment + channel seed)");
         const initArgs = verifyPayload.initCalldata.map(
           (v) => v === "__SESSION_ID__" ? sessionId : v,
         );
@@ -2104,6 +2106,30 @@ async function cmdVerify(args) {
         safeWriteJson(sessionFile, sessionState);
       } else {
         info("  Resuming — stream_init already done");
+      }
+
+      // Phase 4a.1: verify_gkr_stream_init_output_mle (split from init to fit gas limit)
+      if (!sessionState.streamOutputMleDone) {
+        if (verifyPayload.outputMleCalldata) {
+          e2ePhase("Stream output MLE evaluation");
+          const outputMleArgs = verifyPayload.outputMleCalldata.map(
+            (v) => v === "__SESSION_ID__" ? sessionId : v,
+          );
+          const { txHash: outputMleTxHash } = await execCallWithRetry(
+            "verify_gkr_stream_init_output_mle",
+            outputMleArgs,
+            "verify_gkr_stream_init_output_mle",
+          );
+          sessionState.streamOutputMleDone = true;
+          sessionState.txHashes.push(outputMleTxHash);
+          safeWriteJson(sessionFile, sessionState);
+        } else {
+          // Legacy proof without output_mle_calldata — assume it's embedded in init
+          sessionState.streamOutputMleDone = true;
+          safeWriteJson(sessionFile, sessionState);
+        }
+      } else {
+        info("  Resuming — stream_output_mle already done");
       }
 
       // Phase 4b: verify_gkr_stream_layers × M
