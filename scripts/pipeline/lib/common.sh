@@ -341,19 +341,19 @@ format_duration() {
     fi
 }
 
-# Store start times by label
-declare -A _OBELYSK_TIMERS 2>/dev/null || true
+# Store start times by label (uses eval for bash 3.2 compat — no associative arrays)
 
 timer_start() {
     local label="${1:-default}"
-    _OBELYSK_TIMERS[$label]=$(date +%s)
+    eval "_OBELYSK_TIMER_${label}=$(date +%s)"
 }
 
 timer_elapsed() {
     local label="${1:-default}"
-    local start="${_OBELYSK_TIMERS[$label]:-$(date +%s)}"
-    local now=$(date +%s)
-    echo $(( now - start ))
+    local _varname="_OBELYSK_TIMER_${label}"
+    local _start="${!_varname:-$(date +%s)}"
+    local _now=$(date +%s)
+    echo $(( _now - _start ))
 }
 
 timer_elapsed_fmt() {

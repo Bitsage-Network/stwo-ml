@@ -36,18 +36,18 @@ _PRESETS=("qwen3-14b" "llama3-8b" "llama3-70b" "mistral-7b" "phi3-mini" "gemma2-
 # MUST use different IDs to avoid STREAM_WEIGHT_COUNT_VS_REGISTERED or
 # CIRCUIT_HASH_MISMATCH errors.
 
-declare -A MODEL_ID_MAP=(
-    ["qwen3-14b"]="0xc"
-    ["llama3-8b"]="0xd"
-    ["llama3-70b"]="0xe"
-    ["mistral-7b"]="0xf"
-    ["phi3-mini"]="0x10"
-    ["gemma2-9b"]="0x11"
-)
-
+# Preset → model_id mapping (case statement for bash 3.2 compat)
 get_preset_model_id() {
     local name="$1"
-    echo "${MODEL_ID_MAP[$name]:-0x1}"
+    case "$name" in
+        qwen3-14b)  echo "0xc" ;;
+        llama3-8b)  echo "0xd" ;;
+        llama3-70b) echo "0xe" ;;
+        mistral-7b) echo "0xf" ;;
+        phi3-mini)  echo "0x10" ;;
+        gemma2-9b)  echo "0x11" ;;
+        *)          echo "0x1" ;;
+    esac
 }
 
 # ─── Preset Functions ────────────────────────────────────────────────
@@ -100,7 +100,7 @@ get_preset() {
 
     # Auto-assign model_id from preset unless explicitly overridden
     if [[ -z "${MODEL_ID_OVERRIDE:-}" ]]; then
-        MODEL_ID="${MODEL_ID_MAP[$name]:-0x1}"
+        MODEL_ID="$(get_preset_model_id "$name")"
         export MODEL_ID
     fi
 
