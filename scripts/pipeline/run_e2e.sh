@@ -338,14 +338,14 @@ CURRENT=1
 # ─── Step 1: GPU Setup ──────────────────────────────────────────────
 
 if (( START_IDX <= 0 )); then
-    _SETUP_ARGS=("${SETUP_ARGS[@]}")
+    _SETUP_ARGS=(${SETUP_ARGS[@]+"${SETUP_ARGS[@]}"})
     if [[ "$SKIP_INFERENCE" == "true" ]]; then
         _SETUP_ARGS+=("--skip-llama")
         log "Skipping llama.cpp build in setup (--skip-inference enabled)."
     fi
     run_step "GPU Setup" "$CURRENT" "$TOTAL_STEPS" \
         env OBELYSK_REQUIRE_GPU="${DO_GPU}" \
-        bash "${SCRIPT_DIR}/00_setup_gpu.sh" "${_SETUP_ARGS[@]}" || exit 1
+        bash "${SCRIPT_DIR}/00_setup_gpu.sh" ${_SETUP_ARGS[@]+"${_SETUP_ARGS[@]}"} || exit 1
     (( CURRENT++ ))
 fi
 
@@ -387,7 +387,7 @@ if (( START_IDX <= 2 )) && [[ "$DO_SUBMIT" != "true" ]]; then
             warn "Validation test-proof enabled (--validate-test-proof). This is a debug check, not the production proof."
         fi
         run_step "Model Validation" "$CURRENT" "$TOTAL_STEPS" \
-            bash "$_VALIDATE_SCRIPT" "${_VALIDATE_ARGS[@]}" || exit 1
+            bash "$_VALIDATE_SCRIPT" ${_VALIDATE_ARGS[@]+"${_VALIDATE_ARGS[@]}"} || exit 1
     else
         log "02_validate_model.sh not found, skipping validation"
         STEP_RESULTS+=("Model Validation: SKIP")
@@ -407,7 +407,7 @@ if (( START_IDX <= 3 )) && [[ "$SKIP_INFERENCE" != "true" ]]; then
     fi
 
     run_step "Inference Test" "$CURRENT" "$TOTAL_STEPS" \
-        bash "${SCRIPT_DIR}/02a_test_inference.sh" "${_INFER_ARGS[@]}" || {
+        bash "${SCRIPT_DIR}/02a_test_inference.sh" ${_INFER_ARGS[@]+"${_INFER_ARGS[@]}"} || {
         warn "Inference test failed (non-critical, continuing)"
         STEP_RESULTS+=("Inference Test: WARN")
     }
@@ -422,7 +422,7 @@ if (( START_IDX <= 4 )); then
     [[ -n "$MODEL_ID" ]] && _CAPTURE_ARGS+=("--model-id" "$MODEL_ID")
 
     run_step "Inference Capture" "$CURRENT" "$TOTAL_STEPS" \
-        bash "${SCRIPT_DIR}/02b_capture_inference.sh" "${_CAPTURE_ARGS[@]}" || exit 1
+        bash "${SCRIPT_DIR}/02b_capture_inference.sh" ${_CAPTURE_ARGS[@]+"${_CAPTURE_ARGS[@]}"} || exit 1
     (( CURRENT++ ))
 fi
 
@@ -471,7 +471,7 @@ if (( START_IDX <= 5 )); then
     fi
 
     run_step "Proof Generation" "$CURRENT" "$TOTAL_STEPS" \
-        env "${_PROVE_ENV[@]}" bash "${SCRIPT_DIR}/03_prove.sh" "${_PROVE_ARGS[@]}" || exit 1
+        env ${_PROVE_ENV[@]+"${_PROVE_ENV[@]}"} bash "${SCRIPT_DIR}/03_prove.sh" "${_PROVE_ARGS[@]}" || exit 1
     (( CURRENT++ ))
 fi
 
@@ -572,7 +572,7 @@ printf "  ║  Model:       %-36s ║\n" "${PRESET:-${HF_MODEL:-custom}}"
 printf "  ║  Mode:        %-36s ║\n" "${MODE}"
 printf "  ║  Duration:    %-36s ║\n" "$(format_duration $TOTAL_ELAPSED)"
 echo "  ╠══════════════════════════════════════════════════════╣"
-for result in "${STEP_RESULTS[@]}"; do
+for result in ${STEP_RESULTS[@]+"${STEP_RESULTS[@]}"}; do
     printf "  ║  %-49s ║\n" "$result"
 done
 echo "  ╠══════════════════════════════════════════════════════╣"
