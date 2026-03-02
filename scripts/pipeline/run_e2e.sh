@@ -156,7 +156,7 @@ if [[ "$MODE" != "gkr" ]]; then
     exit 1
 fi
 
-case "${GKR_V2_MODE,,}" in
+case "$(to_lower "$GKR_V2_MODE")" in
     auto|sequential|batched|mode2|mode3) ;;
     *)
         err "Invalid --gkr-v2-mode: ${GKR_V2_MODE} (expected: auto|sequential|batched|mode2|mode3)"
@@ -177,7 +177,7 @@ if [[ "$GKR_V4" == "true" && "$GKR_V2" == "true" ]]; then
 fi
 
 if [[ "$DO_SUBMIT" == "true" ]] && [[ "$LEGACY_GKR_V1" != "true" ]]; then
-    if [[ "$GKR_V2" == "true" || "$GKR_V3" == "true" || "$GKR_V4" == "true" || "${GKR_V2_MODE,,}" != "auto" ]]; then
+    if [[ "$GKR_V2" == "true" || "$GKR_V3" == "true" || "$GKR_V4" == "true" || "$(to_lower "$GKR_V2_MODE")" != "auto" ]]; then
         err "--submit uses verify_model_gkr_v4 mode4 (aggregated oracle sumcheck) by default."
         err "The following flags conflict with --submit: --gkr-v2, --gkr-v3, --gkr-v4, --gkr-v2-mode"
         err ""
@@ -187,19 +187,19 @@ if [[ "$DO_SUBMIT" == "true" ]] && [[ "$LEGACY_GKR_V1" != "true" ]]; then
     fi
 fi
 
-if [[ "${GKR_V2_MODE,,}" != "auto" ]] && [[ "$GKR_V2" != "true" ]] && [[ "$GKR_V3" != "true" ]] && [[ "$GKR_V4" != "true" ]]; then
+if [[ "$(to_lower "$GKR_V2_MODE")" != "auto" ]] && [[ "$GKR_V2" != "true" ]] && [[ "$GKR_V3" != "true" ]] && [[ "$GKR_V4" != "true" ]]; then
     err "--gkr-v2-mode requires --gkr-v2, --gkr-v3, or --gkr-v4"
     exit 1
 fi
-if [[ "${GKR_V2_MODE,,}" == "mode2" ]] && [[ "$GKR_V3" != "true" ]]; then
+if [[ "$(to_lower "$GKR_V2_MODE")" == "mode2" ]] && [[ "$GKR_V3" != "true" ]]; then
     err "--gkr-v2-mode mode2 requires --gkr-v3"
     exit 1
 fi
-if [[ "${GKR_V2_MODE,,}" == "mode3" ]] && [[ "$GKR_V4" != "true" ]]; then
+if [[ "$(to_lower "$GKR_V2_MODE")" == "mode3" ]] && [[ "$GKR_V4" != "true" ]]; then
     err "--gkr-v2-mode mode3 requires --gkr-v4"
     exit 1
 fi
-if [[ "$GKR_V4" == "true" ]] && [[ "${GKR_V2_MODE,,}" == "sequential" || "${GKR_V2_MODE,,}" == "batched" || "${GKR_V2_MODE,,}" == "mode2" ]]; then
+if [[ "$GKR_V4" == "true" ]] && [[ "$(to_lower "$GKR_V2_MODE")" == "sequential" || "$(to_lower "$GKR_V2_MODE")" == "batched" || "$(to_lower "$GKR_V2_MODE")" == "mode2" ]]; then
     err "--gkr-v4 only supports --gkr-v2-mode auto|mode3"
     exit 1
 fi
@@ -233,11 +233,11 @@ fi
 
 # Legacy v2/v3/v4 flag compatibility
 if [[ "$USE_AGGREGATED_SUBMIT" != "true" ]]; then
-    if [[ "$DO_SUBMIT" == "true" ]] && [[ "$GKR_V3" == "true" ]] && [[ "${GKR_V2_MODE,,}" == "auto" ]] && [[ "$LEGACY_GKR_V1" != "true" ]]; then
+    if [[ "$DO_SUBMIT" == "true" ]] && [[ "$GKR_V3" == "true" ]] && [[ "$(to_lower "$GKR_V2_MODE")" == "auto" ]] && [[ "$LEGACY_GKR_V1" != "true" ]]; then
         warn "--submit + --gkr-v3 with auto mode: defaulting to mode2 trustless binding."
         GKR_V2_MODE="mode2"
     fi
-    if [[ "$DO_SUBMIT" == "true" ]] && [[ "$GKR_V4" == "true" ]] && [[ "${GKR_V2_MODE,,}" == "auto" ]] && [[ "$LEGACY_GKR_V1" != "true" ]]; then
+    if [[ "$DO_SUBMIT" == "true" ]] && [[ "$GKR_V4" == "true" ]] && [[ "$(to_lower "$GKR_V2_MODE")" == "auto" ]] && [[ "$LEGACY_GKR_V1" != "true" ]]; then
         warn "--submit + --gkr-v4 with auto mode: defaulting to mode3 (latest binding envelope)."
         GKR_V2_MODE="mode3"
     fi
@@ -449,7 +449,7 @@ if (( START_IDX <= 5 )); then
         [[ "$LEGACY_GKR_V1" == "true" ]] && _PROVE_ARGS+=("--legacy-gkr-v1")
 
         if [[ "$GKR_V2" == "true" || "$GKR_V3" == "true" || "$GKR_V4" == "true" ]]; then
-            case "${GKR_V2_MODE,,}" in
+            case "$(to_lower "$GKR_V2_MODE")" in
                 sequential)
                     _PROVE_ENV+=("STWO_GKR_BATCH_WEIGHT_OPENINGS=off")
                     ;;

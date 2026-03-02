@@ -246,7 +246,7 @@ if [[ -z "${STWO_PURE_GKR_SKIP_UNIFIED_STARK:-}" ]]; then
     export STWO_PURE_GKR_SKIP_UNIFIED_STARK=1
 fi
 PURE_GKR_SKIP_UNIFIED_STARK="${STWO_PURE_GKR_SKIP_UNIFIED_STARK:-off}"
-case "${PURE_GKR_SKIP_UNIFIED_STARK,,}" in
+case "$(to_lower "$PURE_GKR_SKIP_UNIFIED_STARK")" in
     1|true|on|yes) PURE_GKR_SKIP_UNIFIED_STARK="on" ;;
     *) PURE_GKR_SKIP_UNIFIED_STARK="off" ;;
 esac
@@ -266,7 +266,7 @@ else
     fi
     GKR_AGG_WEIGHT_BINDING="${STWO_GKR_AGGREGATE_WEIGHT_BINDING:-${GKR_AGG_WEIGHT_BINDING_DEFAULT}}"
 
-    case "${GKR_AGG_WEIGHT_BINDING,,}" in
+    case "$(to_lower "$GKR_AGG_WEIGHT_BINDING")" in
         1|true|on|yes) GKR_AGG_WEIGHT_BINDING="on" ;;
         *) GKR_AGG_WEIGHT_BINDING="off" ;;
     esac
@@ -303,7 +303,7 @@ if [[ "$USE_GPU" == "true" ]] && [[ "$STARKNET_READY" == "true" ]] && { [[ "$GKR
     GKR_BATCH_WEIGHT_OPENINGS_DEFAULT="on"
 fi
 GKR_BATCH_WEIGHT_OPENINGS="${STWO_GKR_BATCH_WEIGHT_OPENINGS:-${GKR_BATCH_WEIGHT_OPENINGS_DEFAULT}}"
-case "${GKR_BATCH_WEIGHT_OPENINGS,,}" in
+case "$(to_lower "$GKR_BATCH_WEIGHT_OPENINGS")" in
     1|true|on|yes) GKR_BATCH_WEIGHT_OPENINGS="on" ;;
     *) GKR_BATCH_WEIGHT_OPENINGS="off" ;;
 esac
@@ -381,7 +381,7 @@ fi
 # Optional protocol-level speed mode (off by default).
 # This removes per-weight Merkle openings and uses a batched RLC weight-binding check.
 # Proof artifacts remain serializable, but Starknet submission is disabled by soundness gates.
-if [[ "${GKR_AGG_WEIGHT_BINDING,,}" == "1" || "${GKR_AGG_WEIGHT_BINDING,,}" == "true" || "${GKR_AGG_WEIGHT_BINDING,,}" == "on" ]]; then
+if [[ "$(to_lower "$GKR_AGG_WEIGHT_BINDING")" == "1" || "$(to_lower "$GKR_AGG_WEIGHT_BINDING")" == "true" || "$(to_lower "$GKR_AGG_WEIGHT_BINDING")" == "on" ]]; then
     warn "STWO_GKR_AGGREGATE_WEIGHT_BINDING is enabled."
     warn "This mode is off-chain only today: artifact is serialized, but Starknet submission is rejected by soundness gates."
 fi
@@ -432,7 +432,7 @@ if [[ -n "${STWO_PARALLEL_GPU_COMMIT:-}" ]]; then
     GPU_COMMIT_PARALLEL="on"
 fi
 UNIFIED_STARK_FALLBACK="on"
-if [[ "${UNIFIED_STARK_NO_FALLBACK,,}" =~ ^(1|true|on|yes)$ ]]; then
+if [[ "$(to_lower "$UNIFIED_STARK_NO_FALLBACK")" =~ ^(1|true|on|yes)$ ]]; then
     UNIFIED_STARK_FALLBACK="off"
 fi
 log "Mode:           ${MODE}"

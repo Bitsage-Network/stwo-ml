@@ -390,6 +390,9 @@ require_bash4() {
     fi
 }
 
+# POSIX-compatible lowercase (works on bash 3.2 / macOS default shell)
+to_lower() { echo "$1" | tr '[:upper:]' '[:lower:]'; }
+
 # ─── Prove-Server Helpers ───────────────────────────────────────────
 #
 # curl-based helpers for submitting prove jobs to a remote prove-server.
