@@ -619,25 +619,6 @@ fn event_key(name: &str) -> String {
     function_selector(name)
 }
 
-#[cfg(feature = "audit-http")]
-fn parse_m31_digest_from_result(result: &[String]) -> Result<[M31; RATE], PoolClientError> {
-    if result.len() < RATE {
-        return Err(PoolClientError::Parse(format!(
-            "expected {} values, got {}",
-            RATE,
-            result.len()
-        )));
-    }
-    let mut digest = [M31::from_u32_unchecked(0); RATE];
-    for i in 0..RATE {
-        let hex = result[i].strip_prefix("0x").unwrap_or(&result[i]);
-        let val = u32::from_str_radix(hex, 16)
-            .map_err(|e| PoolClientError::Parse(format!("invalid hex '{}': {}", result[i], e)))?;
-        digest[i] = M31::from_u32_unchecked(val);
-    }
-    Ok(digest)
-}
-
 // ─── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
