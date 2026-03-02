@@ -194,7 +194,11 @@ if [[ -n "${MODEL_HF:-}" ]] && [[ "$SKIP_DOWNLOAD" == "false" ]]; then
             _REQUIRED=$(( _REQUIRED_GB + _REQUIRED_GB / 10 ))
             _DF_TARGET="${MODEL_DIR:-$HOME}"
             [[ -d "$_DF_TARGET" ]] || _DF_TARGET="$HOME"
-            _AVAILABLE_GB=$(df -BG "$_DF_TARGET" 2>/dev/null | awk 'NR==2{print $4}' | tr -d 'G' || echo "")
+            if [[ "$(uname -s)" == "Darwin" ]]; then
+                _AVAILABLE_GB=$(df -g "$_DF_TARGET" 2>/dev/null | awk 'NR==2{print $4}' || echo "")
+            else
+                _AVAILABLE_GB=$(df -BG "$_DF_TARGET" 2>/dev/null | awk 'NR==2{print $4}' | tr -d 'G' || echo "")
+            fi
             if [[ -n "$_AVAILABLE_GB" ]] && (( _AVAILABLE_GB < _REQUIRED )); then
                 err "Insufficient disk space: need ~${_REQUIRED}GB, only ${_AVAILABLE_GB}GB available."
                 err "Free up space or use a larger disk."
@@ -251,7 +255,7 @@ print('Download complete')
         else
             if ! git lfs version &>/dev/null; then
                 err "huggingface_hub not available and git-lfs is not installed."
-                err "Install git-lfs: sudo apt-get install git-lfs  (or run 00_setup_gpu.sh first)"
+                err "Install: pip3 install huggingface_hub  (or: brew install git-lfs on macOS)"
                 exit 1
             fi
             warn "huggingface_hub not available, falling back to git lfs..."

@@ -22,6 +22,8 @@ _OBELYSK_COMMON_LOADED=1
 [[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env" 2>/dev/null || true
 # Ensure persisted CUDA env is loaded for all pipeline scripts
 [[ -f "$HOME/.obelysk/cuda_env.sh" ]] && source "$HOME/.obelysk/cuda_env.sh" 2>/dev/null || true
+# Ensure pip --user binaries are reachable (macOS installs to ~/.local/bin)
+[[ -d "$HOME/.local/bin" ]] && export PATH="$HOME/.local/bin:$PATH"
 
 # ─── Colors ───────────────────────────────────────────────────────────
 
