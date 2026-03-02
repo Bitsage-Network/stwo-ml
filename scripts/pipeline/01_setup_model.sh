@@ -232,6 +232,17 @@ if [[ -n "${MODEL_HF:-}" ]] && [[ "$SKIP_DOWNLOAD" == "false" ]]; then
         # works fine and is only marginally slower.
         export HF_HUB_ENABLE_HF_TRANSFER=0
 
+        # Ensure huggingface_hub is installed (macOS PEP 668 may block pip in setup step)
+        if ! command -v huggingface-cli &>/dev/null && \
+           ! python3 -c "from huggingface_hub import snapshot_download" 2>/dev/null; then
+            log "Installing huggingface_hub..."
+            python3 -m pip install --user --quiet --break-system-packages huggingface_hub 2>/dev/null || \
+                python3 -m pip install --user --quiet huggingface_hub 2>/dev/null || \
+                pip3 install --user --quiet huggingface_hub 2>/dev/null || true
+            # Refresh PATH to pick up newly installed CLI
+            export PATH="$HOME/.local/bin:$(python3 -c 'import sysconfig; print(sysconfig.get_path("scripts"))' 2>/dev/null || echo ''):$PATH"
+        fi
+
         # Method 1: huggingface-cli
         if command -v huggingface-cli &>/dev/null; then
             HF_HUB_ENABLE_HF_TRANSFER=0 run_cmd huggingface-cli download "${MODEL_HF}" \
