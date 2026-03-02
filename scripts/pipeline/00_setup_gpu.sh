@@ -164,7 +164,11 @@ echo ""
 
 # ─── Disk Space Check ────────────────────────────────────────────────
 
-FREE_GB=$(df -BG / 2>/dev/null | awk 'NR==2{print $4}' | tr -d 'G')
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    FREE_GB=$(df -g / 2>/dev/null | awk 'NR==2{print $4}')
+else
+    FREE_GB=$(df -BG / 2>/dev/null | awk 'NR==2{print $4}' | tr -d 'G')
+fi
 if [[ -n "$FREE_GB" ]] && (( FREE_GB < 50 )); then
     warn "Low disk space: ${FREE_GB}GB free. Recommend 50GB+ for model downloads + builds."
 fi
@@ -216,13 +220,19 @@ if [[ "$CC_CAPABLE" == "true" ]]; then
 fi
 
 if [[ "$REQUIRE_GPU" == "true" ]]; then
-    if [[ "$GPU_AVAILABLE" != "true" ]]; then
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        # macOS has no NVIDIA GPU support — fall back to CPU gracefully
+        warn "macOS detected — NVIDIA GPUs not available. Falling back to CPU mode."
+        warn "Proving will work but be slower. For production speeds, use a Linux GPU instance."
+        REQUIRE_GPU=false
+        GPU_AVAILABLE=false
+        CUDA_AVAILABLE=false
+    elif [[ "$GPU_AVAILABLE" != "true" ]]; then
         err "GPU detection failed but GPU is required for this run."
         err "If you just installed drivers, reboot first: sudo reboot"
         err "Then rerun: ./scripts/pipeline/run_e2e.sh --preset <model> --gpu --dry-run"
         exit 1
-    fi
-    if [[ "$CUDA_AVAILABLE" != "true" ]]; then
+    elif [[ "$CUDA_AVAILABLE" != "true" ]]; then
         err "CUDA toolkit not detected but GPU mode is required."
         err "Install CUDA toolkit, then rerun setup (or pass --cuda-path)."
         err "Guide: https://developer.nvidia.com/cuda-downloads"
