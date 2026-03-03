@@ -176,19 +176,22 @@ if [[ -z "$CONVERSATION_FILE" ]]; then
     log "Command: ${GEN_CMD[*]}"
     echo ""
 
-    GEN_LOG="/tmp/obelysk_gen_conv_$(date +%s).log"
-    if "${GEN_CMD[@]}" >"$GEN_LOG" 2>&1; then
-        # Show stderr output (progress)
-        grep '^\[' "$GEN_LOG" >&2 || true
-        CONVERSATION_FILE=$(grep '^CONVERSATION_FILE=' "$GEN_LOG" | head -1 | cut -d= -f2-)
-        CONV_ID=$(grep '^CONVERSATION_ID=' "$GEN_LOG" | head -1 | cut -d= -f2-)
-        CONV_TURNS=$(grep '^CONVERSATION_TURNS=' "$GEN_LOG" | head -1 | cut -d= -f2-)
-        rm -f "$GEN_LOG" 2>/dev/null || true
+    # stderr streams to terminal in real time (progress), stdout captured for parsing
+    GEN_STDOUT="/tmp/obelysk_gen_conv_stdout_$(date +%s).log"
+    set +e
+    "${GEN_CMD[@]}" >"$GEN_STDOUT"
+    GEN_RC=$?
+    set -e
+    if (( GEN_RC == 0 )); then
+        CONVERSATION_FILE=$(grep '^CONVERSATION_FILE=' "$GEN_STDOUT" | head -1 | cut -d= -f2-)
+        CONV_ID=$(grep '^CONVERSATION_ID=' "$GEN_STDOUT" | head -1 | cut -d= -f2-)
+        CONV_TURNS=$(grep '^CONVERSATION_TURNS=' "$GEN_STDOUT" | head -1 | cut -d= -f2-)
+        rm -f "$GEN_STDOUT" 2>/dev/null || true
         ok "Conversation generated: ${CONV_TURNS} turns (id: ${CONV_ID})"
     else
-        err "Conversation generation failed"
-        cat "$GEN_LOG" >&2 || true
-        rm -f "$GEN_LOG" 2>/dev/null || true
+        err "Conversation generation failed (exit code: ${GEN_RC})"
+        cat "$GEN_STDOUT" >&2 || true
+        rm -f "$GEN_STDOUT" 2>/dev/null || true
         exit 1
     fi
 
