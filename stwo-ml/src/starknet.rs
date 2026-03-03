@@ -2977,12 +2977,47 @@ pub fn replay_verify_serialized_proof(
         u64::from_be_bytes([b[24], b[25], b[26], b[27], b[28], b[29], b[30], b[31]])
     }
 
+    if raw_io.len() < 6 {
+        return Err(format!(
+            "truncated raw_io: need at least 6 header felts, got {}",
+            raw_io.len()
+        ));
+    }
+
     let input_rows = felt_to_u64(&raw_io[0]);
     let input_cols = felt_to_u64(&raw_io[1]);
     let input_len = felt_to_u64(&raw_io[2]) as usize;
-    let out_start = 3 + input_len;
+    let out_start = 3usize.checked_add(input_len).ok_or_else(|| {
+        format!("integer overflow computing out_start: 3 + {input_len}")
+    })?;
+
+    if raw_io.len() < out_start + 3 {
+        return Err(format!(
+            "truncated raw_io: need at least {} felts for output header, got {}",
+            out_start + 3,
+            raw_io.len()
+        ));
+    }
+
     let output_rows = felt_to_u64(&raw_io[out_start]) as usize;
     let output_cols = felt_to_u64(&raw_io[out_start + 1]) as usize;
+    let output_len = felt_to_u64(&raw_io[out_start + 2]) as usize;
+
+    let output_data_end = out_start.checked_add(3).and_then(|s| s.checked_add(output_len))
+        .ok_or_else(|| format!("integer overflow computing output data end"))?;
+    if raw_io.len() < output_data_end {
+        return Err(format!(
+            "truncated raw_io: need {} felts for output data, got {}",
+            output_data_end,
+            raw_io.len()
+        ));
+    }
+
+    if output_rows.checked_mul(output_cols) != Some(output_len) {
+        return Err(format!(
+            "output dimension mismatch: {output_rows} * {output_cols} != {output_len}"
+        ));
+    }
 
     let padded_rows = output_rows.next_power_of_two();
     let padded_cols = output_cols.next_power_of_two();

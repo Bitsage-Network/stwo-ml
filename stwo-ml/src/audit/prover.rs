@@ -295,16 +295,16 @@ impl<'a> AuditProver<'a> {
 
         // Cross-check: proof's io_commitment vs the log entry's.
         // The proof's commitment is authoritative (derived from the prover's own
-        // forward pass). If the log entry used a different forward-pass implementation
-        // (e.g., CPU replay vs GPU prover), the values may diverge. Log a warning
-        // but don't fail — the proof is valid regardless.
+        // forward pass). Divergence indicates the logged inference produced different
+        // results — this is a verification failure, not a benign mismatch.
         let proof_io_hex = format!("{:#066x}", proof.io_commitment);
         if let Ok(logged_io) = FieldElement::from_hex_be(&entry.io_commitment) {
             if proof.io_commitment != logged_io {
-                eprintln!(
-                    "  [warn] io_commitment divergence at seq {}: logged={}, proof={}",
-                    entry.sequence_number, entry.io_commitment, proof_io_hex,
-                );
+                return Err(AuditError::ReplayMismatch {
+                    sequence: entry.sequence_number,
+                    expected: entry.io_commitment.clone(),
+                    actual: proof_io_hex,
+                });
             }
         }
 

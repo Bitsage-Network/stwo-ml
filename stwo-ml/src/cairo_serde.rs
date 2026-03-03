@@ -2596,6 +2596,10 @@ pub fn felt_to_receipt_hash(felt: &FieldElement) -> [u8; 32] {
 }
 
 /// Convert a FieldElement to M31 (truncating to 31 bits).
+///
+/// NOTE: This silently reduces values mod P. For verification paths where
+/// out-of-range values must be rejected, use `deserialize_raw_io` instead.
+#[cfg(test)]
 pub fn felt_to_m31(felt: &FieldElement) -> M31 {
     let bytes = felt.to_bytes_be();
     // Take the last 4 bytes as u32, then mod P
@@ -2632,6 +2636,113 @@ pub fn serialize_raw_io(
         buf.push(FieldElement::from(v.0 as u64));
     }
     buf
+}
+
+/// Deserialize raw input and output matrices from a felt252 array.
+///
+/// Inverse of `serialize_raw_io`. Parses the layout:
+/// `[input_rows, input_cols, input_len, input_data..., output_rows, output_cols, output_len, output_data...]`
+///
+/// Hard-fails on truncated data, dimension mismatch, or out-of-range M31 values.
+pub fn deserialize_raw_io(
+    felts: &[FieldElement],
+) -> Result<(crate::components::matmul::M31Matrix, crate::components::matmul::M31Matrix), String> {
+    use crate::components::matmul::M31Matrix;
+
+    const P: u32 = (1u32 << 31) - 1;
+
+    let felt_to_usize = |f: &FieldElement| -> Result<usize, String> {
+        let bytes = f.to_bytes_be();
+        // Check upper bytes are zero (value must fit in usize)
+        if bytes[..24] != [0u8; 24] {
+            return Err(format!("dimension value too large: {f:#066x}"));
+        }
+        let val = u64::from_be_bytes(bytes[24..32].try_into().unwrap());
+        Ok(val as usize)
+    };
+
+    let felt_to_m31_checked = |f: &FieldElement| -> Result<M31, String> {
+        let bytes = f.to_bytes_be();
+        let val = u32::from_be_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
+        // Check upper bytes are zero and value is in M31 range
+        if bytes[..28] != [0u8; 28] || val >= P {
+            return Err(format!("M31 value out of range: {f:#066x}"));
+        }
+        Ok(M31::from(val))
+    };
+
+    if felts.len() < 6 {
+        return Err(format!(
+            "truncated IO data: need at least 6 header felts, got {}",
+            felts.len()
+        ));
+    }
+
+    // Parse input header
+    let input_rows = felt_to_usize(&felts[0])?;
+    let input_cols = felt_to_usize(&felts[1])?;
+    let input_len = felt_to_usize(&felts[2])?;
+
+    if input_rows * input_cols != input_len {
+        return Err(format!(
+            "input dimension mismatch: {input_rows} * {input_cols} != {input_len}"
+        ));
+    }
+
+    let input_data_end = 3 + input_len;
+    if felts.len() < input_data_end + 3 {
+        return Err(format!(
+            "truncated IO data: need {} felts for input + output header, got {}",
+            input_data_end + 3,
+            felts.len()
+        ));
+    }
+
+    // Parse input data
+    let mut input_data = Vec::with_capacity(input_len);
+    for f in &felts[3..input_data_end] {
+        input_data.push(felt_to_m31_checked(f)?);
+    }
+
+    // Parse output header
+    let output_rows = felt_to_usize(&felts[input_data_end])?;
+    let output_cols = felt_to_usize(&felts[input_data_end + 1])?;
+    let output_len = felt_to_usize(&felts[input_data_end + 2])?;
+
+    if output_rows * output_cols != output_len {
+        return Err(format!(
+            "output dimension mismatch: {output_rows} * {output_cols} != {output_len}"
+        ));
+    }
+
+    let output_data_start = input_data_end + 3;
+    let output_data_end = output_data_start + output_len;
+    if felts.len() < output_data_end {
+        return Err(format!(
+            "truncated IO data: need {} felts total, got {}",
+            output_data_end,
+            felts.len()
+        ));
+    }
+
+    // Parse output data
+    let mut output_data = Vec::with_capacity(output_len);
+    for f in &felts[output_data_start..output_data_end] {
+        output_data.push(felt_to_m31_checked(f)?);
+    }
+
+    let input_matrix = M31Matrix {
+        rows: input_rows,
+        cols: input_cols,
+        data: input_data,
+    };
+    let output_matrix = M31Matrix {
+        rows: output_rows,
+        cols: output_cols,
+        data: output_data,
+    };
+
+    Ok((input_matrix, output_matrix))
 }
 
 // ============================================================================
@@ -4382,6 +4493,144 @@ mod tests {
             recomputed, commitment,
             "packed IO hash must match compute_io_commitment_packed"
         );
+    }
+
+    // === deserialize_raw_io Round-Trip Tests ===
+
+    #[test]
+    fn test_deserialize_raw_io_roundtrip_basic() {
+        use crate::components::matmul::M31Matrix;
+
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
+        let mut output = M31Matrix::new(1, 2);
+        output.set(0, 0, M31::from(10));
+        output.set(0, 1, M31::from(20));
+
+        let serialized = serialize_raw_io(&input, &output);
+        let (din, dout) = deserialize_raw_io(&serialized).unwrap();
+
+        assert_eq!(din.rows, input.rows);
+        assert_eq!(din.cols, input.cols);
+        assert_eq!(din.data, input.data);
+        assert_eq!(dout.rows, output.rows);
+        assert_eq!(dout.cols, output.cols);
+        assert_eq!(dout.data, output.data);
+    }
+
+    #[test]
+    fn test_deserialize_raw_io_roundtrip_multi_row() {
+        use crate::components::matmul::M31Matrix;
+
+        let mut input = M31Matrix::new(2, 3);
+        for i in 0..2 {
+            for j in 0..3 {
+                input.set(i, j, M31::from((i * 3 + j + 1) as u32));
+            }
+        }
+        let mut output = M31Matrix::new(2, 2);
+        for i in 0..2 {
+            for j in 0..2 {
+                output.set(i, j, M31::from((i * 2 + j + 10) as u32));
+            }
+        }
+
+        let serialized = serialize_raw_io(&input, &output);
+        let (din, dout) = deserialize_raw_io(&serialized).unwrap();
+
+        assert_eq!(din.rows, 2);
+        assert_eq!(din.cols, 3);
+        assert_eq!(din.data, input.data);
+        assert_eq!(dout.rows, 2);
+        assert_eq!(dout.cols, 2);
+        assert_eq!(dout.data, output.data);
+    }
+
+    #[test]
+    fn test_deserialize_raw_io_roundtrip_max_m31() {
+        use crate::components::matmul::M31Matrix;
+
+        let max_val = M31::from((1u32 << 31) - 2); // P-1 = 2^31-2
+        let mut input = M31Matrix::new(1, 1);
+        input.set(0, 0, max_val);
+        let mut output = M31Matrix::new(1, 1);
+        output.set(0, 0, M31::from(0));
+
+        let serialized = serialize_raw_io(&input, &output);
+        let (din, dout) = deserialize_raw_io(&serialized).unwrap();
+
+        assert_eq!(din.data[0], max_val);
+        assert_eq!(dout.data[0], M31::from(0));
+    }
+
+    #[test]
+    fn test_deserialize_raw_io_commitment_roundtrip() {
+        use crate::aggregation::compute_io_commitment;
+        use crate::components::matmul::M31Matrix;
+
+        let mut input = M31Matrix::new(2, 3);
+        for i in 0..2 {
+            for j in 0..3 {
+                input.set(i, j, M31::from((i * 3 + j + 7) as u32));
+            }
+        }
+        let mut output = M31Matrix::new(2, 4);
+        for i in 0..2 {
+            for j in 0..4 {
+                output.set(i, j, M31::from((i * 4 + j + 100) as u32));
+            }
+        }
+
+        let commitment_before = compute_io_commitment(&input, &output);
+        let serialized = serialize_raw_io(&input, &output);
+        let (din, dout) = deserialize_raw_io(&serialized).unwrap();
+        let commitment_after = compute_io_commitment(&din, &dout);
+
+        assert_eq!(commitment_before, commitment_after);
+    }
+
+    #[test]
+    fn test_deserialize_raw_io_error_truncated() {
+        let felts = vec![FieldElement::from(1u64), FieldElement::from(2u64)];
+        let result = deserialize_raw_io(&felts);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("truncated"));
+    }
+
+    #[test]
+    fn test_deserialize_raw_io_error_dimension_mismatch() {
+        let felts = vec![
+            FieldElement::from(2u64), // rows=2
+            FieldElement::from(3u64), // cols=3
+            FieldElement::from(5u64), // len=5, but 2*3=6
+            FieldElement::from(0u64),
+            FieldElement::from(0u64),
+            FieldElement::from(0u64),
+        ];
+        let result = deserialize_raw_io(&felts);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("dimension mismatch"));
+    }
+
+    #[test]
+    fn test_deserialize_raw_io_error_out_of_range() {
+        // Value >= P (2^31 - 1)
+        let p = FieldElement::from((1u64 << 31) - 1);
+        let felts = vec![
+            FieldElement::from(1u64),
+            FieldElement::from(1u64),
+            FieldElement::from(1u64),
+            p, // value == P, out of range
+            FieldElement::from(1u64),
+            FieldElement::from(1u64),
+            FieldElement::from(1u64),
+            FieldElement::from(0u64),
+        ];
+        let result = deserialize_raw_io(&felts);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("out of range"));
     }
 
     // === Weight MLE Opening Serialization Tests ===

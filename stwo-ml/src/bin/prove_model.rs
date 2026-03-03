@@ -38,8 +38,8 @@ use stwo::prover::backend::gpu::cuda_executor::{
 
 use stwo_ml::aggregation::compute_io_commitment;
 use stwo_ml::cairo_serde::{
-    serialize_ml_proof_for_recursive, serialize_ml_proof_to_file, DirectProofMetadata,
-    MLClaimMetadata,
+    deserialize_raw_io, serialize_ml_proof_for_recursive, serialize_ml_proof_to_file,
+    DirectProofMetadata, MLClaimMetadata,
 };
 use stwo_ml::compiler::inspect::summarize_model;
 use stwo_ml::compiler::onnx::{load_onnx, OnnxModel};
@@ -837,7 +837,7 @@ fn main() {
         _ => {}
     }
 
-    // --verify-proof: verify an existing proof file and exit
+    // --verify-proof: cryptographic verification of an existing proof file
     if let Some(ref proof_path) = cli.verify_proof {
         eprintln!("Verifying proof: {}", proof_path.display());
         let contents = std::fs::read_to_string(proof_path).unwrap_or_else(|e| {
@@ -858,43 +858,176 @@ fn main() {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        match format {
-            "ml_gkr" => {
-                // Verify GKR proof structure
-                let calldata = proof_json.get("gkr_calldata").and_then(|v| v.as_array());
-                let io = proof_json.get("io_calldata").and_then(|v| v.as_array());
-                match (calldata, io) {
-                    (Some(c), Some(i)) if !c.is_empty() && !i.is_empty() => {
-                        eprintln!("  format: ml_gkr");
-                        eprintln!("  gkr_calldata: {} felts", c.len());
-                        eprintln!("  io_calldata: {} felts", i.len());
-                        eprintln!("Proof structure valid.");
-                        process::exit(0);
-                    }
-                    _ => {
-                        eprintln!("Error: GKR proof missing or empty calldata");
-                        process::exit(1);
-                    }
-                }
-            }
-            _ => {
-                // Generic: check it has expected top-level fields
-                let has_matmul = proof_json.get("batched_calldata").is_some()
-                    || proof_json.get("gkr_calldata").is_some()
-                    || proof_json.get("model_id").is_some();
-                if has_matmul {
-                    eprintln!(
-                        "  format: {}",
-                        if format.is_empty() { "unknown" } else { format }
-                    );
-                    eprintln!("Proof structure valid.");
-                    process::exit(0);
-                } else {
-                    eprintln!("Error: proof file does not contain recognized proof fields");
-                    process::exit(1);
-                }
+        if format != "ml_gkr" {
+            // Non-GKR formats: structural check only (legacy path)
+            let has_matmul = proof_json.get("batched_calldata").is_some()
+                || proof_json.get("gkr_calldata").is_some()
+                || proof_json.get("model_id").is_some();
+            if has_matmul {
+                eprintln!(
+                    "  format: {}",
+                    if format.is_empty() { "unknown" } else { format }
+                );
+                eprintln!("Proof structure valid (structural check only).");
+                process::exit(0);
+            } else {
+                eprintln!("Error: proof file does not contain recognized proof fields");
+                process::exit(1);
             }
         }
+
+        // --- ml_gkr: cryptographic verification ---
+        let gkr_calldata = proof_json.get("gkr_calldata").and_then(|v| v.as_array());
+        let io_calldata = proof_json.get("io_calldata").and_then(|v| v.as_array());
+
+        let (gkr_arr, io_arr) = match (gkr_calldata, io_calldata) {
+            (Some(c), Some(i)) if !c.is_empty() && !i.is_empty() => (c, i),
+            _ => {
+                eprintln!("Error: GKR proof missing or empty calldata");
+                process::exit(1);
+            }
+        };
+
+        eprintln!("  format: ml_gkr");
+        eprintln!("  gkr_calldata: {} felts", gkr_arr.len());
+        eprintln!("  io_calldata:  {} felts", io_arr.len());
+
+        // Step A: Parse io_calldata → M31 matrices
+        let io_felts: Vec<FieldElement> = io_arr
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let hex = v.as_str().unwrap_or_else(|| {
+                    eprintln!("Error: io_calldata[{i}] is not a string");
+                    process::exit(1);
+                });
+                FieldElement::from_hex_be(hex).unwrap_or_else(|e| {
+                    eprintln!("Error: io_calldata[{i}] invalid hex '{hex}': {e}");
+                    process::exit(1);
+                })
+            })
+            .collect();
+
+        let (input_matrix, output_matrix) = deserialize_raw_io(&io_felts).unwrap_or_else(|e| {
+            eprintln!("Error: failed to parse IO data: {e}");
+            process::exit(1);
+        });
+
+        eprintln!(
+            "  input:  {}x{} ({} elements)",
+            input_matrix.rows,
+            input_matrix.cols,
+            input_matrix.data.len()
+        );
+        eprintln!(
+            "  output: {}x{} ({} elements)",
+            output_matrix.rows,
+            output_matrix.cols,
+            output_matrix.data.len()
+        );
+
+        // Step B: Recompute io_commitment and cross-check
+        let recomputed = compute_io_commitment(&input_matrix, &output_matrix);
+        let recomputed_hex = format!("{:#066x}", recomputed);
+
+        let proof_commitment = proof_json
+            .get("io_commitment")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| {
+                eprintln!("Error: proof file missing 'io_commitment' field");
+                process::exit(1);
+            });
+
+        // Normalize both to compare (strip leading zeros after 0x)
+        let normalize_hex = |s: &str| -> String {
+            let s = s.trim();
+            if let Some(stripped) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                format!("0x{}", stripped.trim_start_matches('0'))
+            } else {
+                s.to_string()
+            }
+        };
+
+        if normalize_hex(&recomputed_hex) != normalize_hex(proof_commitment) {
+            eprintln!("VERIFICATION FAILED: io_commitment mismatch");
+            eprintln!("  recomputed: {recomputed_hex}");
+            eprintln!("  in proof:   {proof_commitment}");
+            process::exit(1);
+        }
+
+        eprintln!("  io_commitment: verified ✓");
+
+        // Step C: Full forward-pass re-execution when --model-dir is provided
+        if cli.model_dir.is_some() {
+            eprintln!("Loading model for forward-pass verification...");
+            let model = load_model(&cli);
+
+            let replay_output = stwo_ml::audit::replay::execute_forward_pass(
+                &model.graph,
+                &input_matrix,
+                &model.weights,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("Error: forward-pass replay failed: {e}");
+                process::exit(1);
+            });
+
+            // Element-by-element comparison
+            if replay_output.rows != output_matrix.rows
+                || replay_output.cols != output_matrix.cols
+                || replay_output.data.len() != output_matrix.data.len()
+            {
+                eprintln!("VERIFICATION FAILED: output shape mismatch");
+                eprintln!(
+                    "  proof:    {}x{} ({} elements)",
+                    output_matrix.rows,
+                    output_matrix.cols,
+                    output_matrix.data.len()
+                );
+                eprintln!(
+                    "  replayed: {}x{} ({} elements)",
+                    replay_output.rows,
+                    replay_output.cols,
+                    replay_output.data.len()
+                );
+                process::exit(1);
+            }
+
+            let mut mismatches = 0usize;
+            for (idx, (proof_val, replay_val)) in output_matrix
+                .data
+                .iter()
+                .zip(replay_output.data.iter())
+                .enumerate()
+            {
+                if proof_val != replay_val {
+                    if mismatches < 5 {
+                        eprintln!(
+                            "  mismatch at [{idx}]: proof={}, replayed={}",
+                            proof_val.0, replay_val.0
+                        );
+                    }
+                    mismatches += 1;
+                }
+            }
+
+            if mismatches > 0 {
+                eprintln!(
+                    "VERIFICATION FAILED: {mismatches} output element(s) differ from forward-pass replay"
+                );
+                process::exit(1);
+            }
+
+            eprintln!("  forward pass: verified ✓");
+        } else {
+            // Step D: No model — commitment-only verification
+            eprintln!(
+                "Proof commitment verified. For full cryptographic verification, provide --model-dir."
+            );
+        }
+
+        eprintln!("Proof verified.");
+        process::exit(0);
     }
 
     // --validate: run validation only and exit
