@@ -308,6 +308,23 @@ function safeWriteJson(filePath, obj) {
   renameSync(tmp, filePath);
 }
 
+// Decode hex-encoded felt252 short strings (up to 31 bytes) from Starknet error messages.
+// Starknet contracts emit revert reasons as felt252 short strings, which appear in RPC
+// error messages as hex values like 0x50524f4f465f414c52454144595f564552494649.
+// This function finds and decodes them to ASCII so regex checks can match.
+function decodeStarknetFelts(msg) {
+  return msg.replace(/0x([0-9a-fA-F]{2,62})(?!\w)/g, (match, hex) => {
+    // Only decode if all bytes are printable ASCII (0x20-0x7e)
+    const bytes = hex.match(/.{2}/g);
+    if (!bytes) return match;
+    const chars = bytes.map((b) => parseInt(b, 16));
+    if (chars.every((c) => c >= 0x20 && c <= 0x7e)) {
+      return match + "('" + chars.map((c) => String.fromCharCode(c)).join("") + "')";
+    }
+    return match;
+  });
+}
+
 function truncateRpcError(e) {
   const msg = e.message || String(e);
   // starknet.js RpcError embeds the full request params (100K+ chars of
@@ -331,7 +348,7 @@ function truncateRpcError(e) {
   if (msg.length > 500) {
     const tail = msg.slice(-500);
     // Check if critical keywords are in the full message but not in the tail.
-    const criticalKeywords = ["INSUFFICIENT", "insufficient", "rate limit", "429", "REVERTED"];
+    const criticalKeywords = ["INSUFFICIENT", "insufficient", "rate limit", "429", "REVERTED", "PROOF_ALREADY", "STREAM_ALREADY_FINALIZED"];
     const preserved = criticalKeywords.filter(kw => msg.includes(kw) && !tail.includes(kw));
     if (preserved.length > 0) {
       return `[${preserved.join(",")}] ...${tail}`;
@@ -1331,6 +1348,12 @@ async function cmdVerify(args) {
     if (!accountAddress)
       die("STARKNET_ACCOUNT_ADDRESS required when using STARKNET_PRIVATE_KEY");
     info("Using user-provided account");
+  } else if (process.env.OBELYSK_DEPLOYER_KEY && process.env.OBELYSK_DEPLOYER_ADDRESS) {
+    // Path 2: Deployer account — pre-deployed, funded, SNIP-9 compatible.
+    // Preferred over ephemeral accounts which may not pass paymaster SNIP-9 checks.
+    privateKey = process.env.OBELYSK_DEPLOYER_KEY;
+    accountAddress = process.env.OBELYSK_DEPLOYER_ADDRESS;
+    info(`Using deployer account: ${accountAddress}`);
   } else {
     let config = loadAccountConfig();
     // Validate network match: a sepolia account must not be used on mainnet and vice versa.
@@ -1545,6 +1568,41 @@ async function cmdVerify(args) {
     if (existsSync(resumeFile)) {
       try {
         resumeState = JSON.parse(readFileSync(resumeFile, "utf-8"));
+
+        // Already-verified session: the proof is on-chain from a previous run.
+        // Clean up the resume file and report success immediately — no new session needed.
+        if (resumeState.status === "verified" || resumeState.streamFinalized === true) {
+          info(`Previous session ${resumeState.sessionId || "?"} already verified on-chain. Skipping.`);
+          try { unlinkSync(resumeFile); } catch { /* ignore */ }
+
+          // Confirm on-chain via is_proof_verified as a sanity check
+          const alreadyVerified = await fetchProofVerifiedFlag(provider, contract, modelId);
+          const lastTx = (resumeState.txHashes || []).slice(-1)[0] || null;
+          const e2eTotalSec = ((Date.now() - e2eStart) / 1000).toFixed(1);
+          e2ePhase("Complete (already verified)");
+          info(`Proof was already verified on-chain from a previous session.`);
+          info(`  on-chain confirmed: ${alreadyVerified}`);
+
+          jsonOutput({
+            txHash: lastTx,
+            explorerUrl: lastTx ? `${net.explorer}${lastTx}` : null,
+            isVerified: alreadyVerified !== false,
+            acceptedOnchain: alreadyVerified !== false,
+            fullGkrVerified: alreadyVerified !== false,
+            hasAnyVerification: alreadyVerified !== false,
+            acceptanceEvidence: "resume_file_verified",
+            gasSponsored: !noPaymaster,
+            accountDeployed: false,
+            executionStatus: "ALREADY_VERIFIED",
+            entrypoint: "verify_gkr_stream_finalize",
+            onchainAssurance: "full_gkr",
+            sessionId: resumeState.sessionId || null,
+            allTxHashes: resumeState.txHashes || [],
+            e2eDurationSeconds: parseFloat(e2eTotalSec),
+          });
+          return;
+        }
+
         const isUploadResume = resumeState.status === "uploading" && resumeState.sessionId && resumeState.chunksUploaded > 0;
         const isSealedResume = resumeState.status === "sealed" && resumeState.sessionId;
         if (isUploadResume || isSealedResume) {
@@ -1960,6 +2018,14 @@ async function cmdVerify(args) {
         } catch (e) {
           const errMsg = truncateRpcError(e);
           info(`  Chunk ${i} attempt ${attempt + 1} failed: ${errMsg}`);
+          // CHUNK_IDX_OUT_OF_ORDER means this chunk was already accepted on-chain
+          // (TX succeeded but script didn't record it). Skip to next chunk.
+          if (/CHUNK_IDX_OUT/i.test(errMsg)) {
+            info(`  Chunk ${i} already uploaded on-chain — skipping.`);
+            sessionState.chunksUploaded = i + 1;
+            safeWriteJson(sessionFile, sessionState);
+            break;
+          }
           // If cached fee caused the failure, clear it and retry with full estimation.
           if (cachedPaymasterMaxFee && (errMsg.includes("INSUFFICIENT") || errMsg.includes("insufficient"))) {
             info(`  Clearing cached paymaster fee, will re-estimate...`);
@@ -2045,10 +2111,12 @@ async function cmdVerify(args) {
           return result;
         } catch (e) {
           const fullMsg = e.message || String(e);
-          const isNonceError = /nonce|desynchroni|already used|too (high|old)|nonce mismatch/i.test(fullMsg);
-          const isDroppedTx = /dropped|mempool/i.test(fullMsg);
+          // Decode hex-encoded felt252 short strings so regex can match ASCII error names
+          const decodedMsg = decodeStarknetFelts(fullMsg);
+          const isNonceError = /nonce|desynchroni|already used|too (high|old)|nonce mismatch/i.test(decodedMsg);
+          const isDroppedTx = /dropped|mempool/i.test(decodedMsg);
           // Permanent errors: don't waste retries on unrecoverable failures
-          const isPermanent = /class.?not.?found|not.?deployed|entry.?point.?not.?found|invalid.?txHash/i.test(fullMsg);
+          const isPermanent = /class.?not.?found|not.?deployed|entry.?point.?not.?found|invalid.?txHash|PROOF_ALREADY|STREAM_ALREADY_FINALIZED/i.test(decodedMsg);
           if (isPermanent) {
             throw new Error(`Permanent error (not retrying): ${fullMsg}`);
           }
@@ -2278,20 +2346,34 @@ async function cmdVerify(args) {
         const finalizeArgs = verifyPayload.finalizeCalldata.map(
           (v) => v === "__SESSION_ID__" ? sessionId : v,
         );
-        const result = await execCallWithRetry(
-          "verify_gkr_stream_finalize",
-          finalizeArgs,
-          "verify_gkr_stream_finalize",
-        );
-        verifyTxHash = result.txHash;
+        try {
+          const result = await execCallWithRetry(
+            "verify_gkr_stream_finalize",
+            finalizeArgs,
+            "verify_gkr_stream_finalize",
+          );
+          verifyTxHash = result.txHash;
+        } catch (finalizeErr) {
+          const finalizeMsg = (finalizeErr.message || String(finalizeErr));
+          // Decode hex felt252 short strings so regex can match ASCII error names
+          const decodedFinalizeMsg = decodeStarknetFelts(finalizeMsg);
+          // PROOF_ALREADY_VERIFIED or STREAM_ALREADY_FINALIZED means a previous
+          // run (or prior session with identical IO) already recorded this proof.
+          // Treat as success — the proof is on-chain.
+          if (/PROOF_ALREADY|STREAM_ALREADY_FINALIZED/i.test(decodedFinalizeMsg)) {
+            info(`  Proof already verified on-chain (duplicate IO commitment). Treating as success.`);
+          } else {
+            throw finalizeErr;
+          }
+        }
         sessionState.streamFinalized = true;
         sessionState.status = "verified";
-        sessionState.txHashes.push(verifyTxHash);
+        if (verifyTxHash) sessionState.txHashes.push(verifyTxHash);
         safeWriteJson(sessionFile, sessionState);
       }
     } catch (streamErr) {
-      const streamErrMsg = truncateRpcError(streamErr);
-      const isPermanentStreamErr = /entry.?point.?not.?found|class.?not.?found|not.?deployed/i.test(streamErrMsg);
+      const streamErrMsg = decodeStarknetFelts(truncateRpcError(streamErr));
+      const isPermanentStreamErr = /entry.?point.?not.?found|class.?not.?found|not.?deployed|PROOF_ALREADY|STREAM_ALREADY_FINALIZED/i.test(streamErrMsg);
       if (isPermanentStreamErr) {
         try { if (existsSync(resumeFile)) unlinkSync(resumeFile); } catch { /* ignore */ }
         die(`Streaming verification permanently failed: ${streamErrMsg}`);
