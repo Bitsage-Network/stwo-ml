@@ -489,6 +489,7 @@ fn test_verify_activation_layer_single_var() {
         final_in_eval,
         final_out_eval,
         claimed_sum,
+        false, 0, array![].span(), array![].span(), qm31_zero(), qm31_zero(),
         input_eval,
         output_eval,
         ref ch,
@@ -524,6 +525,7 @@ fn test_verify_activation_layer_bad_round_poly() {
         qm31_zero(),
         qm31_zero(),
         qm31_one(),
+        false, 0, array![].span(), array![].span(), qm31_zero(), qm31_zero(),
         qm31_zero(),
         qm31_zero(),
         ref ch,
@@ -564,6 +566,7 @@ fn test_activation_channel_state_changes() {
         @output_claim, 1,
         array![round_poly].span(),
         final_w_eval, zero, zero, claimed_sum,
+        false, 0, array![].span(), array![].span(), qm31_zero(), qm31_zero(),
         qm31_new(1, 0, 0, 0), qm31_new(2, 0, 0, 0),
         ref ch,
     );
@@ -612,6 +615,7 @@ fn test_verify_dequantize_layer_single_var() {
         @output_claim, bits,
         array![round_poly].span(),
         final_w_eval, zero, zero, claimed_sum,
+        false, 0, array![].span(), array![].span(), qm31_zero(), qm31_zero(),
         qm31_new(10, 0, 0, 0), qm31_new(20, 0, 0, 0),
         ref ch,
     );
@@ -645,7 +649,9 @@ fn test_dequantize_differs_from_activation_transcript() {
     let _r1 = verify_activation_layer(
         @output_claim, 1,
         array![round_poly].span(),
-        w1, zero, zero, one, zero, zero,
+        w1, zero, zero, one,
+        false, 0, array![].span(), array![].span(), qm31_zero(), qm31_zero(),
+        zero, zero,
         ref ch1,
     );
 
@@ -666,7 +672,9 @@ fn test_dequantize_differs_from_activation_transcript() {
     let _r2 = verify_dequantize_layer(
         @output_claim2, 8,
         array![round_poly2].span(),
-        w2, zero, zero, one, zero, zero,
+        w2, zero, zero, one,
+        false, 0, array![].span(), array![].span(), qm31_zero(), qm31_zero(),
+        zero, zero,
         ref ch2,
     );
 
@@ -740,6 +748,7 @@ fn test_verify_layernorm_layer_part1_only() {
         false,
         empty_logup_polys.span(),
         zero, zero, zero, zero,
+        false, 0, array![].span(), array![].span(), qm31_zero(), qm31_zero(),
         input_eval, output_eval,
         ref ch,
     );
@@ -776,6 +785,7 @@ fn test_verify_layernorm_layer_bad_linear_poly() {
         array![bad_poly].span(),
         zero, zero, zero, zero,
         false, empty.span(), zero, zero, zero, zero,
+        false, 0, array![].span(), array![].span(), qm31_zero(), qm31_zero(),
         zero, zero,
         ref ch,
     );
@@ -845,6 +855,7 @@ fn test_verify_rmsnorm_layer_part1_only() {
         rms_sq_eval, rsqrt_eval,
         false,
         empty.span(), zero, zero, zero, zero,
+        false, 0, array![].span(), array![].span(), qm31_zero(), qm31_zero(),
         qm31_new(100, 0, 0, 0), qm31_new(200, 0, 0, 0),
         ref ch,
     );
@@ -887,6 +898,7 @@ fn test_layernorm_rmsnorm_different_tags() {
         array![poly1].span(), centered_final1, rsqrt_final1,
         zero, zero,
         false, empty1.span(), zero, zero, zero, zero,
+        false, 0, array![].span(), array![].span(), qm31_zero(), qm31_zero(),
         zero, zero,
         ref ch1,
     );
@@ -900,6 +912,7 @@ fn test_layernorm_rmsnorm_different_tags() {
         array![poly2].span(), one, one,
         zero, zero,
         false, empty2.span(), zero, zero, zero, zero,
+        false, 0, array![].span(), array![].span(), qm31_zero(), qm31_zero(),
         zero, zero,
         ref ch2,
     );
@@ -932,6 +945,7 @@ fn test_verify_rmsnorm_layer_bad_linear_poly() {
         array![bad_poly].span(),
         zero, zero, zero, zero,
         false, empty.span(), zero, zero, zero, zero,
+        false, 0, array![].span(), array![].span(), qm31_zero(), qm31_zero(),
         zero, zero,
         ref ch,
     );

@@ -36,6 +36,64 @@ pub fn clone_point(point: @Array<QM31>) -> Array<QM31> {
 }
 
 // ============================================================================
+// Multiplicity Sumcheck Verifier
+// ============================================================================
+
+/// Verify a degree-1 sumcheck proof over a multiplicity MLE.
+///
+/// Proves that `sum(multiplicities) == claimed_sum` via interactive sumcheck.
+/// Each round polynomial is `p(t) = c0 + c1*t`, where:
+///   - `p(0) = c0`, `p(1) = c0 + c1`
+///   - Verifier checks: `p(0) + p(1) == current_sum`
+///   - Challenge `r_i` drawn from channel, `new_sum = p(r_i) = c0 + c1 * r_i`
+///
+/// After all rounds, asserts `final_eval == current_sum`.
+///
+/// `has_sumcheck`: if false, this is a no-op (Activation layers skip this).
+pub fn verify_multiplicity_sumcheck(
+    has_sumcheck: bool,
+    n_rounds: u32,
+    round_c0s: Span<QM31>,
+    round_c1s: Span<QM31>,
+    final_eval: QM31,
+    claimed_sum: QM31,
+    ref ch: PoseidonChannel,
+) {
+    if !has_sumcheck {
+        return;
+    }
+
+    let mut current_sum = claimed_sum;
+    let mut i: u32 = 0;
+    loop {
+        if i >= n_rounds {
+            break;
+        }
+        let c0 = *round_c0s.at(i);
+        let c1 = *round_c1s.at(i);
+
+        // Verify: p(0) + p(1) == current_sum
+        // p(0) = c0, p(1) = c0 + c1
+        let sum_01 = qm31_add(c0, qm31_add(c0, c1));
+        assert!(qm31_eq(sum_01, current_sum), "MULT_SUMCHECK_ROUND_FAIL");
+
+        // Mix c0, c1 into Fiat-Shamir channel
+        channel_mix_secure_field(ref ch, c0);
+        channel_mix_secure_field(ref ch, c1);
+
+        // Draw challenge
+        let r = channel_draw_qm31(ref ch);
+
+        // Update: current_sum = c0 + c1 * r
+        current_sum = qm31_add(c0, qm31_mul(c1, r));
+        i += 1;
+    };
+
+    // After all rounds, the remaining sum should equal the final MLE evaluation
+    assert!(qm31_eq(current_sum, final_eval), "MULT_SUMCHECK_FINAL_EVAL_MISMATCH");
+}
+
+// ============================================================================
 // Add Layer Verifier (Tag 1)
 // ============================================================================
 
@@ -450,6 +508,12 @@ pub fn verify_activation_layer(
     final_in_eval: QM31,
     final_out_eval: QM31,
     claimed_sum: QM31,
+    ms_has: bool,
+    ms_n_rounds: u32,
+    ms_c0s: Span<QM31>,
+    ms_c1s: Span<QM31>,
+    ms_final_eval: QM31,
+    ms_claimed_sum: QM31,
     input_eval: QM31,
     output_eval: QM31,
     ref ch: PoseidonChannel,
@@ -473,6 +537,11 @@ pub fn verify_activation_layer(
         gamma,
         beta,
         ref ch,
+    );
+
+    // Verify multiplicity sumcheck (table-side LogUp verification)
+    verify_multiplicity_sumcheck(
+        ms_has, ms_n_rounds, ms_c0s, ms_c1s, ms_final_eval, ms_claimed_sum, ref ch,
     );
 
     // Step 8: Mix final evals
@@ -511,6 +580,12 @@ pub fn verify_dequantize_layer(
     final_in_eval: QM31,
     final_out_eval: QM31,
     claimed_sum: QM31,
+    ms_has: bool,
+    ms_n_rounds: u32,
+    ms_c0s: Span<QM31>,
+    ms_c1s: Span<QM31>,
+    ms_final_eval: QM31,
+    ms_claimed_sum: QM31,
     input_eval: QM31,
     output_eval: QM31,
     ref ch: PoseidonChannel,
@@ -534,6 +609,11 @@ pub fn verify_dequantize_layer(
         gamma,
         beta,
         ref ch,
+    );
+
+    // Verify multiplicity sumcheck (table-side LogUp verification)
+    verify_multiplicity_sumcheck(
+        ms_has, ms_n_rounds, ms_c0s, ms_c1s, ms_final_eval, ms_claimed_sum, ref ch,
     );
 
     // Step 8: Mix final evals
@@ -586,6 +666,12 @@ pub fn verify_layernorm_layer(
     logup_in_eval: QM31,
     logup_out_eval: QM31,
     logup_claimed_sum: QM31,
+    ms_has: bool,
+    ms_n_rounds: u32,
+    ms_c0s: Span<QM31>,
+    ms_c1s: Span<QM31>,
+    ms_final_eval: QM31,
+    ms_claimed_sum: QM31,
     input_eval: QM31,
     output_eval: QM31,
     ref ch: PoseidonChannel,
@@ -628,6 +714,11 @@ pub fn verify_layernorm_layer(
             ref ch,
         );
     }
+
+    // Verify multiplicity sumcheck (table-side LogUp verification)
+    verify_multiplicity_sumcheck(
+        ms_has, ms_n_rounds, ms_c0s, ms_c1s, ms_final_eval, ms_claimed_sum, ref ch,
+    );
 
     // Mix final evals
     channel_mix_secure_field(ref ch, input_eval);
@@ -680,6 +771,12 @@ pub fn verify_rmsnorm_layer(
     logup_in_eval: QM31,
     logup_out_eval: QM31,
     logup_claimed_sum: QM31,
+    ms_has: bool,
+    ms_n_rounds: u32,
+    ms_c0s: Span<QM31>,
+    ms_c1s: Span<QM31>,
+    ms_final_eval: QM31,
+    ms_claimed_sum: QM31,
     input_eval: QM31,
     output_eval: QM31,
     ref ch: PoseidonChannel,
@@ -722,6 +819,11 @@ pub fn verify_rmsnorm_layer(
             ref ch,
         );
     }
+
+    // Verify multiplicity sumcheck (table-side LogUp verification)
+    verify_multiplicity_sumcheck(
+        ms_has, ms_n_rounds, ms_c0s, ms_c1s, ms_final_eval, ms_claimed_sum, ref ch,
+    );
 
     // Mix final evals
     channel_mix_secure_field(ref ch, input_eval);

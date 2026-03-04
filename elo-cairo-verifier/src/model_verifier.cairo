@@ -184,6 +184,36 @@ fn read_optional_logup(
     (true, polys, final_w, final_in, final_out, claimed_sum)
 }
 
+/// Read an optional multiplicity sumcheck proof from the proof data.
+///
+/// Returns (has_sumcheck, n_rounds, round_c0s, round_c1s, final_eval, claimed_sum).
+/// If has_sumcheck == false, the arrays are empty and scalars are zero.
+fn read_optional_multiplicity_sumcheck(
+    ref r: ProofReader,
+) -> (bool, u32, Array<QM31>, Array<QM31>, QM31, QM31) {
+    let has_sumcheck = read_u32(ref r);
+    if has_sumcheck == 0 {
+        return (false, 0, array![], array![], qm31_zero(), qm31_zero());
+    }
+
+    let n_rounds = read_u32(ref r);
+    let mut c0s: Array<QM31> = array![];
+    let mut c1s: Array<QM31> = array![];
+    let mut i: u32 = 0;
+    loop {
+        if i >= n_rounds {
+            break;
+        }
+        c0s.append(read_qm31(ref r));
+        c1s.append(read_qm31(ref r));
+        i += 1;
+    };
+    let final_eval = read_qm31(ref r);
+    let claimed_sum = read_qm31(ref r);
+
+    (true, n_rounds, c0s, c1s, final_eval, claimed_sum)
+}
+
 // ============================================================================
 // Per-Layer Dispatch
 // ============================================================================
@@ -248,16 +278,19 @@ fn dispatch_activation(
     let _table_commitment = read_felt(ref reader);
 
     let (has_logup, logup_polys, w, in_e, out_e, claimed) = read_optional_logup(ref reader);
+    let (ms_has, ms_n, ms_c0s, ms_c1s, ms_final, ms_claimed) =
+        read_optional_multiplicity_sumcheck(ref reader);
 
     if has_logup {
         verify_activation_layer(
             current_claim, act_type_tag,
             logup_polys.span(), w, in_e, out_e, claimed,
+            ms_has, ms_n, ms_c0s.span(), ms_c1s.span(), ms_final, ms_claimed,
             input_eval, output_eval, ref ch,
         )
     } else {
         // LogUp skipped (M31 matmul outputs exceed table range).
-        // Match Rust verify_activation_reduction: just mix input_eval, chain claim.
+        // Still consume the mult sumcheck flag (always 0 here).
         channel_mix_secure_field(ref ch, input_eval);
         GKRClaim {
             point: clone_point(current_claim.point),
@@ -285,12 +318,15 @@ fn dispatch_layernorm(
     let rsqrt_final = read_qm31(ref reader);
 
     let (has_logup, logup_polys, w, in_e, out_e, claimed) = read_optional_logup(ref reader);
+    let (ms_has, ms_n, ms_c0s, ms_c1s, ms_final, ms_claimed) =
+        read_optional_multiplicity_sumcheck(ref reader);
 
     verify_layernorm_layer(
         current_claim,
         linear_polys.span(), centered_final, rsqrt_final,
         mean, rsqrt_var,
         has_logup, logup_polys.span(), w, in_e, out_e, claimed,
+        ms_has, ms_n, ms_c0s.span(), ms_c1s.span(), ms_final, ms_claimed,
         input_eval, output_eval, ref ch,
     )
 }
@@ -308,10 +344,13 @@ fn dispatch_dequantize(
 
     let (has_logup, logup_polys, w, in_e, out_e, claimed) = read_optional_logup(ref reader);
     assert!(has_logup, "DEQUANTIZE_MISSING_LOGUP");
+    let (ms_has, ms_n, ms_c0s, ms_c1s, ms_final, ms_claimed) =
+        read_optional_multiplicity_sumcheck(ref reader);
 
     verify_dequantize_layer(
         current_claim, bits,
         logup_polys.span(), w, in_e, out_e, claimed,
+        ms_has, ms_n, ms_c0s.span(), ms_c1s.span(), ms_final, ms_claimed,
         input_eval, output_eval, ref ch,
     )
 }
@@ -335,12 +374,15 @@ fn dispatch_rmsnorm(
     let rsqrt_final = read_qm31(ref reader);
 
     let (has_logup, logup_polys, w, in_e, out_e, claimed) = read_optional_logup(ref reader);
+    let (ms_has, ms_n, ms_c0s, ms_c1s, ms_final, ms_claimed) =
+        read_optional_multiplicity_sumcheck(ref reader);
 
     verify_rmsnorm_layer(
         current_claim,
         linear_polys.span(), input_final, rsqrt_final,
         rms_sq, rsqrt_eval,
         has_logup, logup_polys.span(), w, in_e, out_e, claimed,
+        ms_has, ms_n, ms_c0s.span(), ms_c1s.span(), ms_final, ms_claimed,
         input_eval, output_eval, ref ch,
     )
 }
