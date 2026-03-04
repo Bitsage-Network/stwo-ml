@@ -14,6 +14,7 @@ pub type SecureField = QM31;
 
 /// A claim in the GKR protocol: "the MLE evaluated at `point` equals `value`."
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct GKRClaim {
     pub point: Vec<SecureField>,
     pub value: SecureField,
@@ -25,6 +26,7 @@ pub struct GKRClaim {
 /// Used when the sumcheck involves eq(r,x)·a(x)·b(x) — three degree-1 factors
 /// give a degree-3 univariate in each round.
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RoundPolyDeg3 {
     pub c0: SecureField,
     pub c1: SecureField,
@@ -56,6 +58,7 @@ impl RoundPolyDeg3 {
 /// Saves 4 felt252s (1 QM31) per sumcheck round — 25% reduction in round poly calldata.
 /// Verifier reconstructs: `c1 = current_sum - 2*c0 - c2 - c3`.
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CompressedRoundPolyDeg3 {
     pub c0: SecureField,
     pub c2: SecureField,
@@ -89,6 +92,7 @@ impl CompressedRoundPolyDeg3 {
 /// 5. Eq-sumcheck proves: Σ_{x} eq(r,x)·w(x)·d(x) = 1
 ///    (i.e., w(x)·d(x) = 1 for all boolean x — fractions are correctly formed)
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct LogUpProof {
     /// Degree-3 eq-sumcheck round polynomials.
     /// Proves Σ eq(r,x) · w(x) · (γ - Ṽ_in(x) - β·Ṽ_out(x)) = 1.
@@ -106,11 +110,29 @@ pub struct LogUpProof {
     pub multiplicities: Vec<u32>,
 }
 
+/// Multiplicity sumcheck proof for large-table LogUp layers.
+///
+/// Instead of sending raw multiplicities (up to 65K entries), the prover runs
+/// a degree-1 sumcheck over the multiplicity MLE to prove that the table-side
+/// sum is consistent with the trace-side claimed sum. ~35 felts per layer.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct MultiplicitySumcheckProof {
+    /// Degree-1 round polynomials (n_vars rounds, 2 coefficients each).
+    /// p(t) = c0 + c1*t, so p(0)=c0, p(1)=c0+c1.
+    pub round_polys: Vec<(SecureField, SecureField)>,
+    /// Final evaluation of multiplicity MLE at the challenge point.
+    pub final_eval: SecureField,
+    /// Claimed sum: should equal the trace-side LogUp sum for balanced LogUp.
+    pub claimed_sum: SecureField,
+}
+
 /// LogUp proof for embedding lookups: (token_id, column, value) relation.
 ///
 /// Unlike activation/dequantize, the embedding table is model-dependent, so the
 /// proof carries sparse table multiplicities keyed by `(token_id, column)`.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct EmbeddingLogUpProof {
     /// Degree-3 eq-sumcheck round polynomials proving w(x) * d(x) = 1 over the trace domain.
     pub eq_round_polys: Vec<RoundPolyDeg3>,
@@ -124,8 +146,38 @@ pub struct EmbeddingLogUpProof {
     pub multiplicities: Vec<u32>,
 }
 
+/// Algebraic product+binary eq-sumcheck proof for activation layers (ReLU).
+///
+/// Proves that `output = input * indicator` where `indicator ∈ {0,1}^n` via a
+/// single degree-3 sumcheck combining:
+///   1. Product constraint: `Σ eq(r,x)·b(x)·in(x) = V_out(r)`
+///   2. Binary constraint:  `Σ eq(r,x)·b(x)·(1-b(x)) = 0`
+///
+/// Phase B extends this with sign consistency via bit decomposition:
+///   3. Decomposition: `input - Σ 2^j·bit_j - 2^30·(1-indicator) = 0`
+///   4. Binary bits:   `bit_j·(1-bit_j) = 0` for j=0..29
+///
+/// Combined with random linear combination powers `η^0..η^32`:
+///   `Σ eq(r,x) · [b·in + η·b·(1-b) + η²·decomp + Σ η^{j+3}·bit_j·(1-bit_j)] = V_out(r)`
+///
+/// Degree 3: eq × bit × (1-bit) — three linear factors after folding.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ActivationProductProof {
+    /// Degree-3 round polynomials from the combined eq-sumcheck.
+    pub round_polys: Vec<RoundPolyDeg3>,
+    /// V_input(s) — input MLE evaluated at sumcheck challenge point.
+    pub input_eval: SecureField,
+    /// V_b(s) — indicator MLE evaluated at sumcheck challenge point.
+    pub indicator_eval: SecureField,
+    /// Phase B: 30 bit MLE evaluations at the sumcheck challenge point.
+    /// `None` = Phase A-only (backward compat). `Some(vec![...])` = Phase A+B.
+    pub bit_evals: Option<Vec<SecureField>>,
+}
+
 /// Per-layer proof in the GKR protocol.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum LayerProof {
     /// Sumcheck proof for matmul layer.
     /// Reduces claim on C = A×B to claims on A and B.
@@ -161,6 +213,13 @@ pub enum LayerProof {
     Activation {
         activation_type: ActivationType,
         logup_proof: Option<LogUpProof>,
+        /// Multiplicity sumcheck proof for table-side sum verification.
+        /// Present when the table is too large to inline multiplicities.
+        multiplicity_sumcheck: Option<MultiplicitySumcheckProof>,
+        /// Algebraic product+binary eq-sumcheck proof (Phase A soundness).
+        /// Present for ReLU: proves `output = input * indicator` with `indicator ∈ {0,1}`.
+        /// `None` for non-ReLU activations and legacy proofs.
+        activation_proof: Option<ActivationProductProof>,
         input_eval: SecureField,
         output_eval: SecureField,
         table_commitment: starknet_ff::FieldElement,
@@ -173,6 +232,8 @@ pub enum LayerProof {
     /// 2. rsqrt lookup (LogUp): proves (variance, rsqrt) ∈ rsqrt_table.
     LayerNorm {
         logup_proof: Option<LogUpProof>,
+        /// Multiplicity sumcheck proof for table-side sum verification.
+        multiplicity_sumcheck: Option<MultiplicitySumcheckProof>,
         /// Degree-3 eq-sumcheck for output = centered × rsqrt.
         linear_round_polys: Vec<RoundPolyDeg3>,
         /// Final evaluations at the linear sumcheck challenge point s:
@@ -198,6 +259,8 @@ pub enum LayerProof {
     /// 2. rsqrt lookup (LogUp): proves (rms_sq, rsqrt) ∈ rsqrt_table
     RMSNorm {
         logup_proof: Option<LogUpProof>,
+        /// Multiplicity sumcheck proof for table-side sum verification.
+        multiplicity_sumcheck: Option<MultiplicitySumcheckProof>,
         /// Degree-3 eq-sumcheck for output = input × rsqrt.
         linear_round_polys: Vec<RoundPolyDeg3>,
         /// Final evaluations at the linear sumcheck challenge point s:
@@ -219,6 +282,8 @@ pub enum LayerProof {
     /// Same protocol as Activation but with a 2-element relation (input, output).
     Dequantize {
         logup_proof: Option<LogUpProof>,
+        /// Multiplicity sumcheck proof for table-side sum verification.
+        multiplicity_sumcheck: Option<MultiplicitySumcheckProof>,
         input_eval: SecureField,
         output_eval: SecureField,
         table_commitment: starknet_ff::FieldElement,
@@ -284,6 +349,7 @@ pub enum LayerProof {
 /// Weight claim from a MatMul layer: the evaluation point and expected value
 /// for the weight MLE. Used to bind the sumcheck to the registered weight matrix.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct WeightClaim {
     /// MatMul weight node id in the compiled circuit graph.
     pub weight_node_id: usize,
@@ -314,6 +380,7 @@ pub struct WeightClaim {
 ///   weight claims aggregated into one sumcheck + one MLE opening. Produces
 ///   ~17K felts calldata instead of ~2.4M. This is the production submit mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum WeightOpeningTranscriptMode {
     Sequential,
     BatchedSubchannelV1,
@@ -344,6 +411,7 @@ pub(crate) fn derive_weight_opening_subchannel(
 
 /// Complete GKR proof for a full model forward pass.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct GKRProof {
     /// Per-layer proofs, ordered output → input.
     pub layer_proofs: Vec<LayerProof>,
@@ -386,6 +454,7 @@ pub struct GKRProof {
 /// Discriminant for deferred proof kind: weight-bearing (MatMul) vs weightless
 /// (Quantize/Dequantize — LogUp layers with no weight matrix).
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum DeferredProofKind {
     /// MatMul deferred proof — carries weight data (commitment, opening, claim, dims).
     MatMul {
@@ -415,6 +484,7 @@ pub enum DeferredProofKind {
 /// For Quantize/Dequantize branches, this is a LogUp proof with no weight
 /// data (weightless).
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DeferredProof {
     /// The deferred claim: "rhs branch MLE at point r equals rhs_eval"
     pub claim: GKRClaim,
@@ -537,6 +607,9 @@ pub enum GKRError {
 
     #[error("lookup table error: {0}")]
     LookupTableError(String),
+
+    #[error("verification failed: {0}")]
+    VerificationFailed(String),
 }
 
 #[cfg(test)]
