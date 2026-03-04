@@ -15,6 +15,137 @@ use super::poseidon2_m31::{poseidon2_hash, poseidon2_permutation, RATE, STATE_WI
 const DOMAIN_ENCRYPT: M31 = M31::from_u32_unchecked(0x656E6372); // "encr"
 const DOMAIN_KDF: M31 = M31::from_u32_unchecked(0x6B646600); // "kdf\0"
 const DOMAIN_MAC: M31 = M31::from_u32_unchecked(0x6D616300); // "mac\0"
+const DOMAIN_SIV: M31 = M31::from_u32_unchecked(0x73697600); // "siv\0"
+
+/// Maximum message length in M31 elements for counter-mode encryption.
+/// RATE * u32::MAX ≈ 34 billion elements — checked before the encrypt loop.
+const MAX_MESSAGE_LEN: usize = RATE * (u32::MAX as usize);
+
+/// Maximum encryptions per key before rotation is needed (~1 trillion).
+const MAX_ENCRYPTIONS_PER_KEY: u64 = 1 << 40;
+
+/// Encryption error type.
+#[derive(Debug, thiserror::Error)]
+pub enum EncryptError {
+    #[error("empty plaintext")]
+    EmptyPlaintext,
+    #[error("message too large: {0} elements exceeds counter space")]
+    MessageTooLarge(usize),
+    #[error("key rotation needed: {0} encryptions performed")]
+    KeyRotationNeeded(u64),
+    #[error("RNG failure")]
+    RngFailed,
+}
+
+/// SIV ciphertext: nonce derived from content, ciphertext, and MAC tag.
+pub struct SivCiphertext {
+    pub nonce: [M31; 4],
+    pub ciphertext: Vec<M31>,
+    pub mac: [M31; 4],
+}
+
+/// Tracks how many encryptions have been performed with a key.
+///
+/// After `MAX_ENCRYPTIONS_PER_KEY` (~1 trillion) encryptions, the tracker
+/// returns an error signaling the caller should rotate the key.
+pub struct KeyUsageTracker {
+    encryptions: u64,
+}
+
+impl KeyUsageTracker {
+    pub fn new() -> Self {
+        Self { encryptions: 0 }
+    }
+
+    /// Record one encryption. Returns `Err` if the key has been used too many times.
+    pub fn record_encryption(&mut self) -> Result<(), EncryptError> {
+        self.encryptions += 1;
+        if self.encryptions > MAX_ENCRYPTIONS_PER_KEY {
+            return Err(EncryptError::KeyRotationNeeded(self.encryptions));
+        }
+        Ok(())
+    }
+
+    /// Number of remaining encryptions before rotation is needed.
+    pub fn remaining(&self) -> u64 {
+        MAX_ENCRYPTIONS_PER_KEY.saturating_sub(self.encryptions)
+    }
+}
+
+/// Generate a cryptographically secure random nonce (4 M31 elements, ~124 bits).
+///
+/// Uses `getrandom` crate for OS-level entropy.
+/// Available when `audit`, `cli`, or `server` features are enabled.
+#[cfg(any(feature = "audit", feature = "cli", feature = "server"))]
+pub fn generate_secure_nonce() -> Result<[M31; 4], EncryptError> {
+    let mut buf = [0u8; 16];
+    getrandom::getrandom(&mut buf).map_err(|_| EncryptError::RngFailed)?;
+    let p: u32 = 0x7FFFFFFF; // M31 prime = 2^31 - 1
+    Ok([
+        M31::from_u32_unchecked(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) % p),
+        M31::from_u32_unchecked(u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) % p),
+        M31::from_u32_unchecked(u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]) % p),
+        M31::from_u32_unchecked(u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]) % p),
+    ])
+}
+
+/// Derive a synthetic nonce from key + plaintext (SIV construction).
+///
+/// nonce = Poseidon2(DOMAIN_SIV || key || plaintext)[0..4]
+fn derive_synthetic_nonce(key: &[M31; RATE], plaintext: &[M31]) -> [M31; 4] {
+    let mut input = Vec::with_capacity(1 + RATE + plaintext.len());
+    input.push(DOMAIN_SIV);
+    input.extend_from_slice(key);
+    input.extend_from_slice(plaintext);
+    let hash = poseidon2_hash(&input);
+    [hash[0], hash[1], hash[2], hash[3]]
+}
+
+/// SIV encrypt: derive nonce from content, then counter-mode encrypt.
+///
+/// Returns `SivCiphertext` containing the derived nonce, ciphertext, and MAC.
+/// Nonce reuse is structurally impossible since the nonce is derived from
+/// `Hash(key, plaintext)` — identical plaintext produces the same ciphertext
+/// (deterministic), but different plaintext always gets a unique nonce.
+pub fn poseidon2_encrypt_siv(
+    key: &[M31; RATE],
+    plaintext: &[M31],
+) -> Result<SivCiphertext, EncryptError> {
+    if plaintext.is_empty() {
+        return Err(EncryptError::EmptyPlaintext);
+    }
+    if plaintext.len() > MAX_MESSAGE_LEN {
+        return Err(EncryptError::MessageTooLarge(plaintext.len()));
+    }
+    let nonce = derive_synthetic_nonce(key, plaintext);
+    let ciphertext = poseidon2_encrypt_checked(key, &nonce, plaintext)?;
+    let mac = compute_mac(key, &nonce, &ciphertext);
+    Ok(SivCiphertext {
+        nonce,
+        ciphertext,
+        mac,
+    })
+}
+
+/// Decrypt a SIV ciphertext. Verifies MAC, then decrypts, then verifies the
+/// nonce matches `Hash(key, recovered_plaintext)`.
+pub fn poseidon2_decrypt_siv(
+    key: &[M31; RATE],
+    siv: &SivCiphertext,
+) -> Option<Vec<M31>> {
+    // Verify MAC before decryption
+    let expected_mac = compute_mac(key, &siv.nonce, &siv.ciphertext);
+    if !verify_mac(&expected_mac, &siv.mac) {
+        return None;
+    }
+    let plaintext = poseidon2_decrypt(key, &siv.nonce, &siv.ciphertext);
+    // Verify nonce matches derived nonce (SIV integrity)
+    let expected_nonce = derive_synthetic_nonce(key, &plaintext);
+    if expected_nonce != siv.nonce {
+        return None;
+    }
+    Some(plaintext)
+}
 
 /// Derive an encryption key from a shared secret.
 /// key = Poseidon2("kdf" || secret[0..n])[0..8]
@@ -51,20 +182,21 @@ fn keystream_block(key: &[M31; RATE], nonce: &[M31; 4], counter: u32) -> [M31; R
     block
 }
 
-/// Encrypt M31 elements using Poseidon2-M31 counter mode.
+/// Encrypt M31 elements using Poseidon2-M31 counter mode (checked variant).
 ///
-/// Ciphertext = plaintext + keystream (addition in M31 field).
-/// Returns ciphertext of same length as plaintext.
-///
-/// Callers MUST use a unique nonce per encryption with the same key;
-/// use `getrandom` for random nonces. Nonce reuse breaks counter-mode security.
-///
-/// # Panics
-///
-/// Panics if `plaintext` is empty. All legitimate callers pass fixed-size payloads
-/// (e.g., `encrypt_note_memo` always passes 8 elements).
-pub fn poseidon2_encrypt(key: &[M31; RATE], nonce: &[M31; 4], plaintext: &[M31]) -> Vec<M31> {
-    assert!(!plaintext.is_empty(), "BUG: encrypting empty plaintext");
+/// Returns `Err` on empty plaintext or if the message exceeds counter space.
+/// Prefer `poseidon2_encrypt_siv()` for new code to eliminate nonce management.
+pub fn poseidon2_encrypt_checked(
+    key: &[M31; RATE],
+    nonce: &[M31; 4],
+    plaintext: &[M31],
+) -> Result<Vec<M31>, EncryptError> {
+    if plaintext.is_empty() {
+        return Err(EncryptError::EmptyPlaintext);
+    }
+    if plaintext.len() > MAX_MESSAGE_LEN {
+        return Err(EncryptError::MessageTooLarge(plaintext.len()));
+    }
     let mut ciphertext = Vec::with_capacity(plaintext.len());
     let mut counter = 0u32;
 
@@ -73,10 +205,31 @@ pub fn poseidon2_encrypt(key: &[M31; RATE], nonce: &[M31; 4], plaintext: &[M31])
         for (i, &pt) in chunk.iter().enumerate() {
             ciphertext.push(pt + ks[i]);
         }
-        counter += 1;
+        counter = counter.checked_add(1).ok_or_else(|| {
+            EncryptError::MessageTooLarge(plaintext.len())
+        })?;
     }
 
-    ciphertext
+    Ok(ciphertext)
+}
+
+/// Encrypt M31 elements using Poseidon2-M31 counter mode.
+///
+/// Ciphertext = plaintext + keystream (addition in M31 field).
+/// Returns ciphertext of same length as plaintext.
+///
+/// Callers MUST use a unique nonce per encryption with the same key;
+/// use `getrandom` for random nonces. Nonce reuse breaks counter-mode security.
+///
+/// **Deprecated**: prefer `poseidon2_encrypt_siv()` which derives nonces from
+/// content, making nonce reuse structurally impossible.
+///
+/// # Panics
+///
+/// Panics if `plaintext` is empty.
+pub fn poseidon2_encrypt(key: &[M31; RATE], nonce: &[M31; 4], plaintext: &[M31]) -> Vec<M31> {
+    poseidon2_encrypt_checked(key, nonce, plaintext)
+        .expect("BUG: encrypting empty or oversized plaintext")
 }
 
 /// Decrypt M31 elements using Poseidon2-M31 counter mode.
@@ -135,6 +288,10 @@ fn verify_mac(expected: &[M31; 4], actual: &[M31; 4]) -> bool {
 /// `decrypt_note_memo` before decryption is returned.
 ///
 /// The `nonce` MUST be unique per encryption with the same key.
+///
+/// **Deprecated**: prefer `poseidon2_encrypt_siv()` which derives nonces from
+/// content, making nonce reuse structurally impossible. Combine
+/// `siv.ciphertext` + `siv.mac` for the same 11-element format.
 pub fn encrypt_note_memo(
     key: &[M31; RATE],
     nonce: &[M31; 4],
@@ -335,7 +492,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "BUG: encrypting empty plaintext")]
+    #[should_panic(expected = "EmptyPlaintext")]
     fn test_encrypt_empty_panics() {
         let key = test_key();
         let nonce = test_nonce();
@@ -562,5 +719,130 @@ mod tests {
             ct1, ct2,
             "Different nonces must produce different ciphertexts"
         );
+    }
+
+    // ── SIV tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_siv_encrypt_decrypt_roundtrip() {
+        let key = test_key();
+        let plaintext: Vec<M31> = (1..=10).map(|i| M31::from_u32_unchecked(i)).collect();
+
+        let siv = poseidon2_encrypt_siv(&key, &plaintext).expect("encrypt");
+        let recovered = poseidon2_decrypt_siv(&key, &siv);
+        assert_eq!(recovered, Some(plaintext));
+    }
+
+    #[test]
+    fn test_siv_deterministic() {
+        let key = test_key();
+        let plaintext: Vec<M31> = (1..=5).map(|i| M31::from_u32_unchecked(i)).collect();
+
+        let siv1 = poseidon2_encrypt_siv(&key, &plaintext).expect("encrypt 1");
+        let siv2 = poseidon2_encrypt_siv(&key, &plaintext).expect("encrypt 2");
+
+        assert_eq!(siv1.nonce, siv2.nonce, "SIV nonces should be deterministic");
+        assert_eq!(siv1.ciphertext, siv2.ciphertext);
+        assert_eq!(siv1.mac, siv2.mac);
+    }
+
+    #[test]
+    fn test_siv_different_plaintext_different_nonce() {
+        let key = test_key();
+        let pt1: Vec<M31> = (1..=5).map(|i| M31::from_u32_unchecked(i)).collect();
+        let pt2: Vec<M31> = (10..=14).map(|i| M31::from_u32_unchecked(i)).collect();
+
+        let siv1 = poseidon2_encrypt_siv(&key, &pt1).expect("encrypt 1");
+        let siv2 = poseidon2_encrypt_siv(&key, &pt2).expect("encrypt 2");
+
+        assert_ne!(siv1.nonce, siv2.nonce, "Different plaintext → different nonce");
+    }
+
+    #[test]
+    fn test_siv_tampered_ciphertext_fails() {
+        let key = test_key();
+        let plaintext: Vec<M31> = (1..=5).map(|i| M31::from_u32_unchecked(i)).collect();
+
+        let mut siv = poseidon2_encrypt_siv(&key, &plaintext).expect("encrypt");
+        siv.ciphertext[0] = siv.ciphertext[0] + M31::from_u32_unchecked(1);
+
+        assert!(poseidon2_decrypt_siv(&key, &siv).is_none(), "Tampered ciphertext must fail");
+    }
+
+    #[test]
+    fn test_siv_tampered_mac_fails() {
+        let key = test_key();
+        let plaintext: Vec<M31> = (1..=5).map(|i| M31::from_u32_unchecked(i)).collect();
+
+        let mut siv = poseidon2_encrypt_siv(&key, &plaintext).expect("encrypt");
+        siv.mac[0] = siv.mac[0] + M31::from_u32_unchecked(1);
+
+        assert!(poseidon2_decrypt_siv(&key, &siv).is_none(), "Tampered MAC must fail");
+    }
+
+    #[test]
+    fn test_siv_wrong_key_fails() {
+        let key1 = test_key();
+        let key2 = [5, 6, 7, 8, 9, 10, 11, 12].map(M31::from_u32_unchecked);
+        let plaintext: Vec<M31> = (1..=5).map(|i| M31::from_u32_unchecked(i)).collect();
+
+        let siv = poseidon2_encrypt_siv(&key1, &plaintext).expect("encrypt");
+        assert!(poseidon2_decrypt_siv(&key2, &siv).is_none(), "Wrong key must fail");
+    }
+
+    #[test]
+    fn test_siv_empty_plaintext_error() {
+        let key = test_key();
+        let result = poseidon2_encrypt_siv(&key, &[]);
+        assert!(matches!(result, Err(EncryptError::EmptyPlaintext)));
+    }
+
+    // ── Checked encrypt tests ──────────────────────────────────
+
+    #[test]
+    fn test_checked_encrypt_empty_error() {
+        let key = test_key();
+        let nonce = test_nonce();
+        let result = poseidon2_encrypt_checked(&key, &nonce, &[]);
+        assert!(matches!(result, Err(EncryptError::EmptyPlaintext)));
+    }
+
+    #[test]
+    fn test_checked_encrypt_roundtrip() {
+        let key = test_key();
+        let nonce = test_nonce();
+        let plaintext: Vec<M31> = (1..=20).map(|i| M31::from_u32_unchecked(i)).collect();
+
+        let ct = poseidon2_encrypt_checked(&key, &nonce, &plaintext).expect("encrypt");
+        let recovered = poseidon2_decrypt(&key, &nonce, &ct);
+        assert_eq!(plaintext, recovered);
+    }
+
+    // ── Key rotation tracker tests ─────────────────────────────
+
+    #[test]
+    fn test_key_usage_tracker_basic() {
+        let mut tracker = KeyUsageTracker::new();
+        assert!(tracker.remaining() > 0);
+        tracker.record_encryption().expect("first use ok");
+        assert_eq!(tracker.remaining(), MAX_ENCRYPTIONS_PER_KEY - 1);
+    }
+
+    #[test]
+    fn test_key_usage_tracker_limit() {
+        let mut tracker = KeyUsageTracker { encryptions: MAX_ENCRYPTIONS_PER_KEY };
+        let result = tracker.record_encryption();
+        assert!(matches!(result, Err(EncryptError::KeyRotationNeeded(_))));
+    }
+
+    // ── Secure nonce tests ─────────────────────────────────────
+
+    #[cfg(any(feature = "audit", feature = "cli", feature = "server"))]
+    #[test]
+    fn test_generate_secure_nonce() {
+        let n1 = generate_secure_nonce().expect("nonce 1");
+        let n2 = generate_secure_nonce().expect("nonce 2");
+        // With 124 bits of entropy, collision probability is negligible
+        assert_ne!(n1, n2, "Two random nonces should differ");
     }
 }

@@ -56,6 +56,15 @@ pub struct MmapMerkleTree {
     root: FieldElement,
 }
 
+impl std::fmt::Debug for MmapMerkleTree {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MmapMerkleTree")
+            .field("layers", &self.layer_offsets.len())
+            .field("root", &self.root)
+            .finish()
+    }
+}
+
 impl MmapMerkleTree {
     /// Open an existing cached tree file.
     pub fn open(path: &Path) -> io::Result<Self> {
@@ -116,6 +125,31 @@ impl MmapMerkleTree {
             ) as usize;
             // offset is relative to data section start
             layer_offsets.push((data_section_start + offset, count));
+        }
+
+        // Validate that every layer's data range fits within the mmap file.
+        for (i, &(byte_off, count)) in layer_offsets.iter().enumerate() {
+            let layer_bytes = count.checked_mul(ELEMENT_SIZE).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("layer {i}: count overflow ({count} * {ELEMENT_SIZE})"),
+                )
+            })?;
+            let end = byte_off.checked_add(layer_bytes).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("layer {i}: offset overflow ({byte_off} + {layer_bytes})"),
+                )
+            })?;
+            if end > mmap.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "layer {i}: data extends beyond file (end={end}, file={})",
+                        mmap.len()
+                    ),
+                ));
+            }
         }
 
         Ok(Self {
@@ -387,6 +421,39 @@ mod tests {
         assert!(cached.element_at(100, 0).is_none());
         // Out of bounds index
         assert!(cached.element_at(0, 10000).is_none());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_crafted_smtc_bad_offsets() {
+        let dir = std::env::temp_dir().join("stwo_merkle_cache_test_bounds");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("bad_offsets.smtc");
+
+        // Build a valid file header + 1 layer entry that claims huge count
+        let mut data = Vec::new();
+        data.extend_from_slice(&MAGIC);
+        data.extend_from_slice(&VERSION.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes()); // n_layers = 1
+        data.extend_from_slice(&0u32.to_le_bytes()); // padding
+        data.extend_from_slice(&999u64.to_le_bytes()); // total_u64s (bogus)
+        data.extend_from_slice(&[0u8; 32]); // root hash (zeroed)
+
+        // Layer table: offset=0, count=0xFFFFFFFF (huge — will exceed file)
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&0xFFFFFFFFu64.to_le_bytes());
+
+        std::fs::write(&path, &data).unwrap();
+
+        let result = MmapMerkleTree::open(&path);
+        assert!(result.is_err(), "crafted .smtc with bad offsets must fail");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("layer 0") || err_msg.contains("overflow") || err_msg.contains("extends beyond"),
+            "error should mention layer bounds issue: {err_msg}"
+        );
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
