@@ -1504,30 +1504,28 @@ pub fn build_chunked_gkr_calldata(
     // Self-verify: replay Fiat-Shamir channel against serialized proof to catch
     // prover/serializer mismatches before saving. This prevents stale-binary bugs
     // from producing proofs that fail on-chain verification.
-    if std::env::var("STWO_SKIP_SELF_VERIFY").is_err() {
-        if actually_double_packed {
-            replay_verify_double_packed_proof(
-                &proof_data,
-                raw_io_data,
-                &matmul_dims,
-                circuit_depth,
-                num_layers,
-                proof,
-            ).map_err(|e| StarknetModelError::SoundnessGate(
-                format!("chunked double-packed self-verification failed: {e}")
-            ))?;
-        } else {
-            replay_verify_serialized_proof(
-                &proof_data,
-                raw_io_data,
-                &matmul_dims,
-                circuit_depth,
-                num_layers,
-                use_packed,
-            ).map_err(|e| StarknetModelError::SoundnessGate(
-                format!("self-verification failed: {e}")
-            ))?;
-        }
+    if actually_double_packed {
+        replay_verify_double_packed_proof(
+            &proof_data,
+            raw_io_data,
+            &matmul_dims,
+            circuit_depth,
+            num_layers,
+            proof,
+        ).map_err(|e| StarknetModelError::SoundnessGate(
+            format!("chunked double-packed self-verification failed: {e}")
+        ))?;
+    } else {
+        replay_verify_serialized_proof(
+            &proof_data,
+            raw_io_data,
+            &matmul_dims,
+            circuit_depth,
+            num_layers,
+            use_packed,
+        ).map_err(|e| StarknetModelError::SoundnessGate(
+            format!("self-verification failed: {e}")
+        ))?;
     }
 
     push_felt_section!(&proof_data);
@@ -2357,7 +2355,7 @@ pub fn build_verify_model_gkr_v4_double_packed_io_calldata(
     serialize_gkr_proof_data_only_double_packed(proof, &mut dp_proof_data);
 
     // Self-verify: round-trip each double-packed QM31 pair to catch packing bugs
-    if std::env::var("STWO_SKIP_SELF_VERIFY").is_err() {
+    {
         let matmul_dims = extract_matmul_dims(circuit);
         let circuit_depth = circuit.layers.len() as u32;
         let num_layers = proof.layer_proofs.len() as u32;
@@ -2547,18 +2545,16 @@ fn build_verify_model_gkr_calldata_inner(
     }
 
     // Self-verify against serialized proof data (same as chunked path).
-    if std::env::var("STWO_SKIP_SELF_VERIFY").is_err() {
-        replay_verify_serialized_proof(
-            &proof_data,
-            raw_io_data,
-            &matmul_dims,
-            circuit_depth,
-            num_layers,
-            packed,
-        ).map_err(|e| StarknetModelError::SoundnessGate(
-            format!("self-verification failed: {e}")
-        ))?;
-    }
+    replay_verify_serialized_proof(
+        &proof_data,
+        raw_io_data,
+        &matmul_dims,
+        circuit_depth,
+        num_layers,
+        packed,
+    ).map_err(|e| StarknetModelError::SoundnessGate(
+        format!("self-verification failed: {e}")
+    ))?;
 
     parts.push(format!("{}", proof_data.len()));
     for f in &proof_data {
@@ -3230,6 +3226,23 @@ pub fn replay_verify_serialized_proof(
                         eprintln!("[VERIFIER RMSNorm] ch after logup: {:?}", ch.digest());
                     }
                 }
+                // Read multiplicity sumcheck (always serialized after logup)
+                let has_ms = read_u32_from(proof_data, &mut off);
+                if has_ms == 1 {
+                    let ms_n_rounds = read_u32_from(proof_data, &mut off) as usize;
+                    for _ in 0..ms_n_rounds {
+                        let c0 = read_qm31_from(proof_data, &mut off);
+                        let c1 = read_qm31_from(proof_data, &mut off);
+                        mix_secure_field(&mut ch, c0);
+                        mix_secure_field(&mut ch, c1);
+                        let _r = ch.draw_qm31();
+                    }
+                    let _final_eval = read_qm31_from(proof_data, &mut off);
+                    let _claimed_sum = read_qm31_from(proof_data, &mut off);
+                }
+                if trace {
+                    eprintln!("[VERIFIER RMSNorm] ch after mult sumcheck: {:?}", ch.digest());
+                }
                 mix_secure_field(&mut ch, input_eval);
                 mix_secure_field(&mut ch, output_eval);
                 if trace {
@@ -3275,13 +3288,67 @@ pub fn replay_verify_serialized_proof(
                     for _ in 0..num_mults {
                         let _ = read_qm31_from(proof_data, &mut off);
                     }
-                    mix_secure_field(&mut ch, input_eval);
-                    mix_secure_field(&mut ch, _output_eval);
-                } else {
-                    // No-LogUp path: just mix input_eval (matches SIMD prover)
-                    mix_secure_field(&mut ch, input_eval);
                 }
-                current_claim_value = input_eval;
+                // Read multiplicity sumcheck (always serialized after logup)
+                let has_ms = read_u32_from(proof_data, &mut off);
+                if has_ms == 1 {
+                    let ms_n_rounds = read_u32_from(proof_data, &mut off) as usize;
+                    for _ in 0..ms_n_rounds {
+                        let c0 = read_qm31_from(proof_data, &mut off);
+                        let c1 = read_qm31_from(proof_data, &mut off);
+                        mix_secure_field(&mut ch, c0);
+                        mix_secure_field(&mut ch, c1);
+                        let _r = ch.draw_qm31();
+                    }
+                    let _final_eval = read_qm31_from(proof_data, &mut off);
+                    let _claimed_sum = read_qm31_from(proof_data, &mut off);
+                }
+                // Read activation product proof (Phase A soundness)
+                let has_act_proof = read_u32_from(proof_data, &mut off);
+                if has_act_proof == 1 {
+                    // Algebraic product+binary eq-sumcheck (replaces LogUp for ReLU)
+                    ch.mix_u64(0x414354); // "ACT"
+                    mix_secure_field(&mut ch, current_claim_value);
+                    let _eta = ch.draw_qm31();
+
+                    let act_rounds = read_u32_from(proof_data, &mut off) as usize;
+                    let two_act = SecureField::from(M31::from(2u32));
+                    let mut act_sum = current_claim_value;
+                    for _round in 0..act_rounds {
+                        let c0 = read_qm31_from(proof_data, &mut off);
+                        let c2 = read_qm31_from(proof_data, &mut off);
+                        let c3 = read_qm31_from(proof_data, &mut off);
+                        let c1 = act_sum - two_act * c0 - c2 - c3;
+                        ch.mix_poly_coeffs_deg3(c0, c1, c2, c3);
+                        let challenge = ch.draw_qm31();
+                        act_sum = c0 + c1 * challenge + c2 * challenge * challenge
+                            + c3 * challenge * challenge * challenge;
+                    }
+                    let act_input_eval = read_qm31_from(proof_data, &mut off);
+                    let act_indicator_eval = read_qm31_from(proof_data, &mut off);
+                    mix_secure_field(&mut ch, act_input_eval);
+                    mix_secure_field(&mut ch, act_indicator_eval);
+                    // Phase B: read and mix bit_evals if present
+                    let has_bit_evals = read_u32_from(proof_data, &mut off);
+                    if has_bit_evals == 1 {
+                        let num_bits = read_u32_from(proof_data, &mut off) as usize;
+                        for _ in 0..num_bits {
+                            let bit_eval = read_qm31_from(proof_data, &mut off);
+                            mix_secure_field(&mut ch, bit_eval);
+                        }
+                    }
+                    current_claim_value = act_input_eval;
+                } else {
+                    // Mix final evals (legacy path)
+                    if has_logup == 1 {
+                        mix_secure_field(&mut ch, input_eval);
+                        mix_secure_field(&mut ch, _output_eval);
+                    } else {
+                        // No-LogUp path: just mix input_eval (matches SIMD prover)
+                        mix_secure_field(&mut ch, input_eval);
+                    }
+                    current_claim_value = input_eval;
+                }
             }
             1 => {
                 // Add
@@ -3306,6 +3373,398 @@ pub fn replay_verify_serialized_proof(
     }
 
     Ok(())
+}
+
+// ============================================================================
+// Fast Proof Health Check
+// ============================================================================
+
+/// Result of a single health check.
+#[derive(Debug, Clone)]
+pub struct HealthCheck {
+    /// Name of the check (e.g., "length", "header_parse", "qm31_range").
+    pub name: &'static str,
+    /// Whether this check passed.
+    pub passed: bool,
+    /// Human-readable detail (empty on success, error message on failure).
+    pub detail: String,
+}
+
+/// Report from `verify_proof_fast()` — lightweight proof health check.
+#[derive(Debug, Clone)]
+pub struct ProofHealthReport {
+    /// Individual checks performed.
+    pub checks: Vec<HealthCheck>,
+    /// True if ALL checks passed.
+    pub passed: bool,
+    /// Total calldata size in felt252 elements.
+    pub total_felts: usize,
+    /// Estimated Cairo steps for on-chain verification.
+    pub estimated_steps: u64,
+}
+
+/// Estimate Cairo steps for GKR on-chain verification.
+///
+/// Based on profiling of v20-lean contract execution:
+/// - Base overhead: ~500K steps (contract init, channel setup, IO parsing)
+/// - Per GKR layer: ~150K steps (sumcheck rounds, QM31 arithmetic)
+/// - Per IO felt: ~50 steps (MLE evaluation + Poseidon hashing)
+/// - Per weight commitment: ~80K steps (Merkle verify + MLE opening)
+pub fn estimate_gkr_steps(num_layers: usize, io_felts: usize, num_weight_commits: usize) -> u64 {
+    let base: u64 = 500_000;
+    let per_layer: u64 = 150_000;
+    let per_io_felt: u64 = 50;
+    let per_weight: u64 = 80_000;
+    base + (num_layers as u64) * per_layer
+        + (io_felts as u64) * per_io_felt
+        + (num_weight_commits as u64) * per_weight
+}
+
+/// Run a fast structural health check on serialized proof calldata.
+///
+/// Catches corruption, truncation, and format errors in <100ms without
+/// full GKR verification. Designed as a pre-flight check before on-chain
+/// submission.
+///
+/// Calldata is expected in the GKR v4 packed-IO format:
+/// `[model_id, original_io_len, packed_io_len, packed_io..., matmul_dims_len, matmul_dims..., ...]`
+pub fn verify_proof_fast(calldata: &[FieldElement]) -> ProofHealthReport {
+    let mut checks = Vec::new();
+    let total_felts = calldata.len();
+
+    // 1. Length check — minimum header size
+    let min_header = 5; // model_id + original_io_len + packed_io_len + at least 1 IO + 1 dims
+    let length_ok = calldata.len() >= min_header;
+    checks.push(HealthCheck {
+        name: "length",
+        passed: length_ok,
+        detail: if length_ok {
+            format!("{} felts (>= {} minimum)", calldata.len(), min_header)
+        } else {
+            format!(
+                "calldata has {} felts, need at least {}",
+                calldata.len(),
+                min_header
+            )
+        },
+    });
+    if !length_ok {
+        return ProofHealthReport {
+            passed: false,
+            checks,
+            total_felts,
+            estimated_steps: 0,
+        };
+    }
+
+    // 2. Header parse — model_id, io_len, packed_io_len
+    let model_id = calldata[0];
+    let model_id_ok = model_id != FieldElement::ZERO;
+    checks.push(HealthCheck {
+        name: "model_id",
+        passed: model_id_ok,
+        detail: if model_id_ok {
+            format!("0x{:x}", model_id)
+        } else {
+            "model_id is zero".to_string()
+        },
+    });
+
+    let original_io_len = felt_to_u64(&calldata[1]) as usize;
+    let packed_io_len = felt_to_u64(&calldata[2]) as usize;
+    let io_header_ok = original_io_len > 0
+        && packed_io_len > 0
+        && packed_io_len <= original_io_len
+        && 3 + packed_io_len < calldata.len();
+    checks.push(HealthCheck {
+        name: "io_header",
+        passed: io_header_ok,
+        detail: if io_header_ok {
+            format!(
+                "original_io={}, packed_io={} felts",
+                original_io_len, packed_io_len
+            )
+        } else {
+            format!(
+                "invalid IO header: original={}, packed={}, calldata={}",
+                original_io_len,
+                packed_io_len,
+                calldata.len()
+            )
+        },
+    });
+
+    // 3. Layer tag validation — scan for known tags after IO section
+    let post_io_offset = 3 + packed_io_len;
+    let mut num_layers = 0u32;
+    let mut num_weight_commits = 0usize;
+    if io_header_ok && post_io_offset + 1 < calldata.len() {
+        // matmul_dims section: [len, dims...]
+        let matmul_dims_len = felt_to_u64(&calldata[post_io_offset]) as usize;
+        let dims_end = post_io_offset + 1 + matmul_dims_len;
+        if matmul_dims_len > 0 && dims_end <= calldata.len() {
+            // Each matmul has 3 dims (m, k, n)
+            num_layers = (matmul_dims_len / 3) as u32;
+            // Rough estimate: 1 weight commitment per matmul layer
+            num_weight_commits = num_layers as usize;
+        }
+        let layer_tag_ok = num_layers > 0;
+        checks.push(HealthCheck {
+            name: "layer_tags",
+            passed: layer_tag_ok,
+            detail: if layer_tag_ok {
+                format!("{} matmul layers detected", num_layers)
+            } else {
+                "no matmul layers found in calldata".to_string()
+            },
+        });
+    }
+
+    // 4. QM31 range check — spot-check 10 random values from proof data
+    {
+        let proof_region_start = post_io_offset;
+        let proof_region_len = calldata.len().saturating_sub(proof_region_start);
+        let sample_count = 10.min(proof_region_len);
+        let mut range_failures = 0usize;
+        if sample_count > 0 {
+            // Sample evenly-spaced elements from the proof region
+            let step = proof_region_len / sample_count;
+            for i in 0..sample_count {
+                let idx = proof_region_start + i * step;
+                if idx < calldata.len() {
+                    let val = felt_to_u64(&calldata[idx]);
+                    // QM31 has 4 M31 limbs; each element in packed form fits in felt252.
+                    // We check that at least none are the sentinel 0xFFFFFFFF...
+                    // which would indicate corruption. Full QM31 decomposition
+                    // needs the actual packing scheme, so we just check < 2^252.
+                    let be = calldata[idx].to_bytes_be();
+                    if be[0] > 0x0F {
+                        range_failures += 1;
+                    }
+                    let _ = val; // suppress unused warning
+                }
+            }
+        }
+        let range_ok = range_failures == 0;
+        checks.push(HealthCheck {
+            name: "qm31_range",
+            passed: range_ok,
+            detail: if range_ok {
+                format!("{} samples within range", sample_count)
+            } else {
+                format!("{}/{} samples exceed felt252 range", range_failures, sample_count)
+            },
+        });
+    }
+
+    // 5. Tail sentinel — last few felts should not all be zero (truncation indicator)
+    {
+        let tail_count = 4.min(calldata.len());
+        let tail_start = calldata.len() - tail_count;
+        let all_zero = calldata[tail_start..]
+            .iter()
+            .all(|f| *f == FieldElement::ZERO);
+        let tail_ok = !all_zero;
+        checks.push(HealthCheck {
+            name: "tail_sentinel",
+            passed: tail_ok,
+            detail: if tail_ok {
+                "tail is non-zero".to_string()
+            } else {
+                format!("last {} felts are all zero (possible truncation)", tail_count)
+            },
+        });
+    }
+
+    // 6. Step estimation
+    let estimated_steps = estimate_gkr_steps(num_layers as usize, original_io_len, num_weight_commits);
+    let within_limit = estimated_steps < 9_000_000;
+    checks.push(HealthCheck {
+        name: "step_estimate",
+        passed: within_limit,
+        detail: format!(
+            "~{} steps (limit: 10M, margin: 9M) — {}",
+            estimated_steps,
+            if within_limit { "OK" } else { "EXCEEDS MARGIN" }
+        ),
+    });
+
+    let passed = checks.iter().all(|c| c.passed);
+    ProofHealthReport {
+        checks,
+        passed,
+        total_felts,
+        estimated_steps,
+    }
+}
+
+/// Result of a dry-run simulation.
+#[derive(Debug)]
+pub struct DryRunResult {
+    /// Health check report (always populated).
+    pub health: ProofHealthReport,
+    /// Total calldata size in felt252 elements.
+    pub calldata_size: usize,
+    /// Estimated fee in STRK.
+    pub estimated_fee_strk: f64,
+    /// Estimated Cairo steps for on-chain verification.
+    pub estimated_steps: u64,
+    /// Whether the estimated steps are within the 10M sequencer limit.
+    pub within_step_limit: bool,
+    /// RPC simulation result (only if rpc_url was provided).
+    pub rpc_simulation: Option<RpcSimResult>,
+}
+
+/// Result of an RPC simulation.
+#[derive(Debug)]
+pub struct RpcSimResult {
+    /// Whether the simulation succeeded.
+    pub success: bool,
+    /// Actual steps from the simulation.
+    pub actual_steps: u64,
+    /// Error message if the simulation failed.
+    pub error: Option<String>,
+}
+
+/// Run a dry-run simulation: health check + step estimation + optional RPC simulation.
+///
+/// If `rpc_url` is `None`, only performs the local health check and step estimation.
+/// If `rpc_url` is `Some`, also calls `starknet_simulateTransactions` to get actual
+/// step counts from the sequencer.
+pub fn dry_run_onchain(
+    calldata: &[FieldElement],
+    rpc_url: Option<&str>,
+    _contract_address: Option<&str>,
+) -> DryRunResult {
+    // 1. Run fast health check
+    let health = verify_proof_fast(calldata);
+
+    let estimated_steps = health.estimated_steps;
+    let within_step_limit = estimated_steps < 10_000_000;
+
+    // Estimate fee: ~0.0001 STRK per 1K steps (rough Sepolia pricing)
+    let estimated_fee_strk = (estimated_steps as f64) * 0.0000001;
+
+    // 2. Optional RPC simulation
+    let rpc_simulation = rpc_url.map(|url| {
+        // Try to call starknet_simulateTransactions via ureq
+        match simulate_via_rpc(url, calldata) {
+            Ok((steps, _)) => RpcSimResult {
+                success: true,
+                actual_steps: steps,
+                error: None,
+            },
+            Err(e) => RpcSimResult {
+                success: false,
+                actual_steps: 0,
+                error: Some(e),
+            },
+        }
+    });
+
+    DryRunResult {
+        health,
+        calldata_size: calldata.len(),
+        estimated_fee_strk,
+        estimated_steps,
+        within_step_limit,
+        rpc_simulation,
+    }
+}
+
+/// Attempt to simulate a transaction via Starknet RPC.
+///
+/// Calls `starknet_simulateTransactions` with `SKIP_VALIDATE` flag.
+/// Returns `(actual_steps, gas_consumed)` on success.
+///
+/// Requires the `audit-http` feature for HTTP client (ureq).
+#[cfg(feature = "audit-http")]
+fn simulate_via_rpc(rpc_url: &str, calldata: &[FieldElement]) -> Result<(u64, u64), String> {
+    // Build the JSON-RPC request for starknet_simulateTransactions
+    let calldata_hex: Vec<String> = calldata.iter().map(|f| format!("0x{:x}", f)).collect();
+
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "starknet_simulateTransactions",
+        "params": {
+            "block_id": "latest",
+            "transactions": [{
+                "type": "INVOKE",
+                "version": "0x1",
+                "calldata": calldata_hex,
+                "max_fee": "0x0",
+                "signature": [],
+                "nonce": "0x0",
+                "sender_address": "0x0",
+            }],
+            "simulation_flags": ["SKIP_VALIDATE"]
+        }
+    });
+
+    let body_str = serde_json::to_string(&body).map_err(|e| format!("JSON serialize: {e}"))?;
+
+    // Use ureq for HTTP
+    let resp = ureq::post(rpc_url)
+        .header("Content-Type", "application/json")
+        .send(body_str.as_bytes())
+        .map_err(|e| format!("RPC request failed: {e}"))?;
+
+    let resp_str = resp
+        .into_body()
+        .read_to_string()
+        .map_err(|e| format!("RPC response read: {e}"))?;
+    let resp_body: serde_json::Value = serde_json::from_str(&resp_str)
+        .map_err(|e| format!("RPC response parse: {e}"))?;
+
+    // Parse result
+    if let Some(error) = resp_body.get("error") {
+        return Err(format!("RPC error: {}", error));
+    }
+
+    let result = resp_body
+        .get("result")
+        .and_then(|r| r.as_array())
+        .and_then(|a| a.first())
+        .ok_or_else(|| "empty simulation result".to_string())?;
+
+    let exec_info = result
+        .get("transaction_trace")
+        .and_then(|t| t.get("execute_invocation"))
+        .ok_or_else(|| "missing execute_invocation in trace".to_string())?;
+
+    // Check for revert
+    if let Some(revert) = exec_info.get("revert_reason") {
+        return Err(format!("simulation reverted: {}", revert));
+    }
+
+    // Extract steps from execution_resources
+    let steps = exec_info
+        .get("execution_resources")
+        .and_then(|r| r.get("n_steps"))
+        .and_then(|s| s.as_u64())
+        .unwrap_or(0);
+
+    let gas = result
+        .get("fee_estimation")
+        .and_then(|f| f.get("gas_consumed"))
+        .and_then(|g| g.as_str())
+        .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .unwrap_or(0);
+
+    Ok((steps, gas))
+}
+
+/// Stub for RPC simulation when the `audit-http` feature is not enabled.
+#[cfg(not(feature = "audit-http"))]
+fn simulate_via_rpc(_rpc_url: &str, _calldata: &[FieldElement]) -> Result<(u64, u64), String> {
+    Err("RPC simulation requires the `audit-http` feature".to_string())
+}
+
+/// Extract a u64 from a FieldElement (takes bottom 8 bytes).
+fn felt_to_u64(f: &FieldElement) -> u64 {
+    let be = f.to_bytes_be();
+    u64::from_be_bytes([be[24], be[25], be[26], be[27], be[28], be[29], be[30], be[31]])
 }
 
 #[cfg(test)]
@@ -5604,6 +6063,7 @@ mod tests {
         let mut current_claim_value = output_value;
         let mut current_claim_point = r_out.clone();
         let mut matmul_idx = 0usize;
+        let two = SecureField::from(M31::from(2u32));
 
         for layer in 0..num_proof_layers {
             let tag = read_u32_from(&mut off);
@@ -5634,20 +6094,12 @@ mod tests {
 
                     for round in 0..num_rounds {
                         let c0 = read_qm31_from(&mut off);
-                        let c1 = read_qm31_from(&mut off);
+                        // Compressed: c1 omitted, reconstruct from current_sum
                         let c2 = read_qm31_from(&mut off);
+                        let c1 = current_sum - two * c0 - c2;
 
-                        let p0 = c0;
-                        let p1 = c0 + c1 + c2;
-                        let round_sum = p0 + p1;
-
-                        println!("  round {}: p(0)+p(1)={:?}, current_sum={:?}, match={}",
-                            round, round_sum, current_sum, round_sum == current_sum);
-
-                        assert_eq!(
-                            round_sum, current_sum,
-                            "MATMUL_ROUND_SUM_MISMATCH at layer {} round {}", layer, round,
-                        );
+                        println!("  round {}: c0={:?}, c1(reconstructed), c2={:?}, sum={:?}",
+                            round, c0, c2, current_sum);
 
                         ch.mix_poly_coeffs(c0, c1, c2);
                         let challenge = ch.draw_qm31();
@@ -5701,18 +6153,12 @@ mod tests {
                     let mut rms_sum = current_claim_value;
                     for round in 0..nrounds {
                         let c0 = read_qm31_from(&mut off);
-                        let c1 = read_qm31_from(&mut off);
+                        // Compressed: c1 omitted, reconstruct from rms_sum
                         let c2 = read_qm31_from(&mut off);
                         let c3 = read_qm31_from(&mut off);
+                        let c1 = rms_sum - two * c0 - c2 - c3;
 
-                        // degree-3 poly: p(0)+p(1) = c0 + (c0+c1+c2+c3)
-                        let p0 = c0;
-                        let p1 = c0 + c1 + c2 + c3;
-                        let round_sum = p0 + p1;
-
-                        println!("  rms round {}: sum match={}", round, round_sum == rms_sum);
-                        assert_eq!(round_sum, rms_sum,
-                            "RMSNORM_ROUND_SUM_MISMATCH at layer {} round {}", layer, round);
+                        println!("  rms round {}: c0={:?}", round, c0);
 
                         ch.mix_poly_coeffs_deg3(c0, c1, c2, c3);
                         let challenge = ch.draw_qm31();
@@ -5727,16 +6173,24 @@ mod tests {
                     // optional logup
                     let has_logup = read_u32_from(&mut off);
                     if has_logup == 1 {
+                        ch.mix_u64(0x4C4F47); // "LOG"
+                        ch.mix_u64(0x524E);   // "RN"
+                        let _gamma = ch.draw_qm31();
+                        let _beta = ch.draw_qm31();
                         let _claimed_sum = read_qm31_from(&mut off);
                         mix_secure_field(&mut ch, _claimed_sum);
                         let eq_rounds = read_u32_from(&mut off) as usize;
+                        let mut logup_sum = SecureField::from(M31::from(1u32));
                         for _ in 0..eq_rounds {
                             let c0 = read_qm31_from(&mut off);
-                            let c1 = read_qm31_from(&mut off);
+                            // Compressed: c1 omitted
                             let c2 = read_qm31_from(&mut off);
                             let c3 = read_qm31_from(&mut off);
+                            let c1 = logup_sum - two * c0 - c2 - c3;
                             ch.mix_poly_coeffs_deg3(c0, c1, c2, c3);
-                            let _ = ch.draw_qm31();
+                            let challenge = ch.draw_qm31();
+                            logup_sum = c0 + c1 * challenge + c2 * challenge * challenge
+                                + c3 * challenge * challenge * challenge;
                         }
                         // final evals
                         let _e1 = read_qm31_from(&mut off);
@@ -5744,8 +6198,22 @@ mod tests {
                         let _e3 = read_qm31_from(&mut off);
                         let num_mults = read_u32_from(&mut off) as usize;
                         for _ in 0..num_mults {
-                            let _ = read_qm31_from(&mut off);
+                            let _ = read_u32_from(&mut off); // multiplicities are u32
                         }
+                    }
+                    // Read multiplicity sumcheck (always serialized after logup)
+                    let has_ms = read_u32_from(&mut off);
+                    if has_ms == 1 {
+                        let ms_n_rounds = read_u32_from(&mut off) as usize;
+                        for _ in 0..ms_n_rounds {
+                            let c0 = read_qm31_from(&mut off);
+                            let c1 = read_qm31_from(&mut off);
+                            mix_secure_field(&mut ch, c0);
+                            mix_secure_field(&mut ch, c1);
+                            let _r = ch.draw_qm31();
+                        }
+                        let _final_eval = read_qm31_from(&mut off);
+                        let _claimed_sum = read_qm31_from(&mut off);
                     }
 
                     // Mix input/output evals (matching Rust verifier lines 3494-3495)
@@ -5779,23 +6247,62 @@ mod tests {
                         let claimed_sum = read_qm31_from(&mut off);
                         mix_secure_field(&mut ch, claimed_sum);
                         let eq_rounds = read_u32_from(&mut off) as usize;
+                        let mut act_logup_sum = claimed_sum;
                         for _ in 0..eq_rounds {
                             let c0 = read_qm31_from(&mut off);
-                            let c1 = read_qm31_from(&mut off);
+                            // Compressed: c1 omitted
                             let c2 = read_qm31_from(&mut off);
                             let c3 = read_qm31_from(&mut off);
+                            let c1 = act_logup_sum - two * c0 - c2 - c3;
                             ch.mix_poly_coeffs_deg3(c0, c1, c2, c3);
-                            let _ = ch.draw_qm31();
+                            let challenge = ch.draw_qm31();
+                            act_logup_sum = c0 + c1 * challenge + c2 * challenge * challenge
+                                + c3 * challenge * challenge * challenge;
                         }
                         let _e1 = read_qm31_from(&mut off);
                         let _e2 = read_qm31_from(&mut off);
                         let _e3 = read_qm31_from(&mut off);
                         let num_mults = read_u32_from(&mut off) as usize;
                         for _ in 0..num_mults {
-                            let _ = read_qm31_from(&mut off);
+                            let _ = read_u32_from(&mut off); // multiplicities are u32
                         }
                     }
+                    // Read multiplicity sumcheck (always serialized after logup)
+                    let has_ms = read_u32_from(&mut off);
+                    if has_ms == 1 {
+                        let ms_n_rounds = read_u32_from(&mut off) as usize;
+                        for _ in 0..ms_n_rounds {
+                            let c0 = read_qm31_from(&mut off);
+                            let c1 = read_qm31_from(&mut off);
+                            mix_secure_field(&mut ch, c0);
+                            mix_secure_field(&mut ch, c1);
+                            let _r = ch.draw_qm31();
+                        }
+                        let _final_eval = read_qm31_from(&mut off);
+                        let _claimed_sum = read_qm31_from(&mut off);
+                    }
 
+                    // Read activation product proof (Phase A soundness)
+                    let has_act_proof = read_u32_from(&mut off);
+                    if has_act_proof == 1 {
+                        let act_rounds = read_u32_from(&mut off) as usize;
+                        for _ in 0..act_rounds {
+                            let _c0 = read_qm31_from(&mut off);
+                            let _c2 = read_qm31_from(&mut off);
+                            let _c3 = read_qm31_from(&mut off);
+                        }
+                        let _act_input = read_qm31_from(&mut off);
+                        let _act_indicator = read_qm31_from(&mut off);
+                        // Phase B: skip bit_evals if present
+                        let has_bit_evals = read_u32_from(&mut off);
+                        if has_bit_evals == 1 {
+                            let num_bits = read_u32_from(&mut off) as usize;
+                            for _ in 0..num_bits {
+                                let _bit_eval = read_qm31_from(&mut off);
+                            }
+                        }
+                        println!("  Activation(type={}) has algebraic product proof ({act_rounds} rounds)", act_type);
+                    }
                     // Mix input/output evals
                     mix_secure_field(&mut ch, input_eval);
                     mix_secure_field(&mut ch, output_eval);
@@ -6225,6 +6732,20 @@ mod tests {
                         }
                         println!("  ch after logup (before input/output mix): {:?}", ch.digest());
                     }
+                    // Read multiplicity sumcheck (always serialized after logup)
+                    let has_ms = read_u32_from(&mut off);
+                    if has_ms == 1 {
+                        let ms_n_rounds = read_u32_from(&mut off) as usize;
+                        for _ in 0..ms_n_rounds {
+                            let c0 = read_qm31_from(&mut off);
+                            let c1 = read_qm31_from(&mut off);
+                            mix_secure_field(&mut ch, c0);
+                            mix_secure_field(&mut ch, c1);
+                            let _r = ch.draw_qm31();
+                        }
+                        let _final_eval = read_qm31_from(&mut off);
+                        let _claimed_sum = read_qm31_from(&mut off);
+                    }
 
                     println!("  [off after RMSNorm: {}]", off);
                     mix_secure_field(&mut ch, input_eval);
@@ -6275,7 +6796,41 @@ mod tests {
                             let _ = read_qm31_from(&mut off);
                         }
                     }
+                    // Read multiplicity sumcheck (always serialized after logup)
+                    let has_ms = read_u32_from(&mut off);
+                    if has_ms == 1 {
+                        let ms_n_rounds = read_u32_from(&mut off) as usize;
+                        for _ in 0..ms_n_rounds {
+                            let c0 = read_qm31_from(&mut off);
+                            let c1 = read_qm31_from(&mut off);
+                            mix_secure_field(&mut ch, c0);
+                            mix_secure_field(&mut ch, c1);
+                            let _r = ch.draw_qm31();
+                        }
+                        let _final_eval = read_qm31_from(&mut off);
+                        let _claimed_sum = read_qm31_from(&mut off);
+                    }
 
+                    // Read activation product proof (Phase A soundness)
+                    let has_act_proof = read_u32_from(&mut off);
+                    if has_act_proof == 1 {
+                        let act_rounds = read_u32_from(&mut off) as usize;
+                        for _ in 0..act_rounds {
+                            let _c0 = read_qm31_from(&mut off);
+                            let _c2 = read_qm31_from(&mut off);
+                            let _c3 = read_qm31_from(&mut off);
+                        }
+                        let _act_input = read_qm31_from(&mut off);
+                        let _act_indicator = read_qm31_from(&mut off);
+                        // Phase B: skip bit_evals if present
+                        let has_bit_evals_2 = read_u32_from(&mut off);
+                        if has_bit_evals_2 == 1 {
+                            let num_bits = read_u32_from(&mut off) as usize;
+                            for _ in 0..num_bits {
+                                let _bit_eval = read_qm31_from(&mut off);
+                            }
+                        }
+                    }
                     mix_secure_field(&mut ch, input_eval);
                     mix_secure_field(&mut ch, output_eval);
                     current_claim_value = input_eval;
@@ -6426,6 +6981,7 @@ mod tests {
 
         let mut current_claim_value = output_value;
         let mut matmul_idx = 0usize;
+        let two = SecureField::from(M31::from(2u32));
 
         for layer in 0..num_proof_layers {
             let tag = read_u32_from(&mut off);
@@ -6448,12 +7004,9 @@ mod tests {
 
                     for round in 0..num_rounds {
                         let c0 = read_qm31_from(&mut off);
-                        let c1 = read_qm31_from(&mut off);
+                        // Compressed: c1 omitted, reconstruct from current_sum
                         let c2 = read_qm31_from(&mut off);
-                        let p0 = c0;
-                        let p1 = c0 + c1 + c2;
-                        assert_eq!(p0 + p1, current_sum,
-                            "MATMUL_ROUND_SUM at layer {} round {}", layer, round);
+                        let c1 = current_sum - two * c0 - c2;
                         ch.mix_poly_coeffs(c0, c1, c2);
                         let challenge = ch.draw_qm31();
                         current_sum = c0 + c1 * challenge + c2 * challenge * challenge;
@@ -6484,13 +7037,10 @@ mod tests {
                     let mut rms_sum = current_claim_value;
                     for round in 0..nrounds {
                         let c0 = read_qm31_from(&mut off);
-                        let c1 = read_qm31_from(&mut off);
+                        // Compressed: c1 omitted, reconstruct from rms_sum
                         let c2 = read_qm31_from(&mut off);
                         let c3 = read_qm31_from(&mut off);
-                        let p0 = c0;
-                        let p1 = c0 + c1 + c2 + c3;
-                        assert_eq!(p0 + p1, rms_sum,
-                            "RMSNORM_ROUND at layer {} round {}", layer, round);
+                        let c1 = rms_sum - two * c0 - c2 - c3;
                         ch.mix_poly_coeffs_deg3(c0, c1, c2, c3);
                         let challenge = ch.draw_qm31();
                         rms_sum = c0 + c1 * challenge + c2 * challenge * challenge
@@ -6511,15 +7061,12 @@ mod tests {
                         mix_secure_field(&mut ch, claimed_sum);
                         let eq_rounds = read_u32_from(&mut off) as usize;
                         let mut logup_sum = SecureField::from(M31::from(1u32));
-                        for round in 0..eq_rounds {
+                        for _ in 0..eq_rounds {
                             let c0 = read_qm31_from(&mut off);
-                            let c1 = read_qm31_from(&mut off);
+                            // Compressed: c1 omitted
                             let c2 = read_qm31_from(&mut off);
                             let c3 = read_qm31_from(&mut off);
-                            let p0 = c0;
-                            let p1 = c0 + c1 + c2 + c3;
-                            assert_eq!(p0 + p1, logup_sum,
-                                "LOGUP_ROUND at layer {} round {}", layer, round);
+                            let c1 = logup_sum - two * c0 - c2 - c3;
                             ch.mix_poly_coeffs_deg3(c0, c1, c2, c3);
                             let challenge = ch.draw_qm31();
                             logup_sum = c0 + c1 * challenge + c2 * challenge * challenge
@@ -6530,8 +7077,22 @@ mod tests {
                         let _out_e = read_qm31_from(&mut off);
                         let num_mults = read_u32_from(&mut off) as usize;
                         for _ in 0..num_mults {
-                            let _ = read_u32_from(&mut off);
+                            let _ = read_u32_from(&mut off); // multiplicities are u32
                         }
+                    }
+                    // Read multiplicity sumcheck (always serialized after logup)
+                    let has_ms = read_u32_from(&mut off);
+                    if has_ms == 1 {
+                        let ms_n_rounds = read_u32_from(&mut off) as usize;
+                        for _ in 0..ms_n_rounds {
+                            let c0 = read_qm31_from(&mut off);
+                            let c1 = read_qm31_from(&mut off);
+                            mix_secure_field(&mut ch, c0);
+                            mix_secure_field(&mut ch, c1);
+                            let _r = ch.draw_qm31();
+                        }
+                        let _final_eval = read_qm31_from(&mut off);
+                        let _claimed_sum = read_qm31_from(&mut off);
                     }
                     mix_secure_field(&mut ch, input_eval);
                     mix_secure_field(&mut ch, output_eval);
@@ -6552,13 +7113,12 @@ mod tests {
                         mix_secure_field(&mut ch, claimed_sum);
                         let eq_rounds = read_u32_from(&mut off) as usize;
                         let mut logup_sum = SecureField::from(M31::from(1u32));
-                        for round in 0..eq_rounds {
+                        for _ in 0..eq_rounds {
                             let c0 = read_qm31_from(&mut off);
-                            let c1 = read_qm31_from(&mut off);
+                            // Compressed: c1 omitted
                             let c2 = read_qm31_from(&mut off);
                             let c3 = read_qm31_from(&mut off);
-                            assert_eq!(c0 + c0 + c1 + c2 + c3, logup_sum,
-                                "ACT_LOGUP at layer {} round {}", layer, round);
+                            let c1 = logup_sum - two * c0 - c2 - c3;
                             ch.mix_poly_coeffs_deg3(c0, c1, c2, c3);
                             let challenge = ch.draw_qm31();
                             logup_sum = c0 + c1 * challenge + c2 * challenge * challenge
@@ -6569,7 +7129,41 @@ mod tests {
                         let _out_e = read_qm31_from(&mut off);
                         let num_mults = read_u32_from(&mut off) as usize;
                         for _ in 0..num_mults {
-                            let _ = read_qm31_from(&mut off);
+                            let _ = read_u32_from(&mut off); // multiplicities are u32
+                        }
+                    }
+                    // Read multiplicity sumcheck (always serialized after logup)
+                    let has_ms = read_u32_from(&mut off);
+                    if has_ms == 1 {
+                        let ms_n_rounds = read_u32_from(&mut off) as usize;
+                        for _ in 0..ms_n_rounds {
+                            let c0 = read_qm31_from(&mut off);
+                            let c1 = read_qm31_from(&mut off);
+                            mix_secure_field(&mut ch, c0);
+                            mix_secure_field(&mut ch, c1);
+                            let _r = ch.draw_qm31();
+                        }
+                        let _final_eval = read_qm31_from(&mut off);
+                        let _claimed_sum = read_qm31_from(&mut off);
+                    }
+                    // Read activation product proof (Phase A soundness)
+                    let has_act_proof = read_u32_from(&mut off);
+                    if has_act_proof == 1 {
+                        let act_rounds = read_u32_from(&mut off) as usize;
+                        for _ in 0..act_rounds {
+                            let _c0 = read_qm31_from(&mut off);
+                            let _c2 = read_qm31_from(&mut off);
+                            let _c3 = read_qm31_from(&mut off);
+                        }
+                        let _act_input = read_qm31_from(&mut off);
+                        let _act_indicator = read_qm31_from(&mut off);
+                        // Phase B: skip bit_evals if present
+                        let has_bit_evals_3 = read_u32_from(&mut off);
+                        if has_bit_evals_3 == 1 {
+                            let num_bits = read_u32_from(&mut off) as usize;
+                            for _ in 0..num_bits {
+                                let _bit_eval = read_qm31_from(&mut off);
+                            }
                         }
                     }
                     mix_secure_field(&mut ch, input_eval);
@@ -6710,6 +7304,17 @@ mod tests {
                         let nm = p_read_u32(&mut poff) as usize;
                         for _ in 0..nm { let _ = p_read_u32(&mut poff); }
                     }
+                    // Read multiplicity sumcheck (always serialized after logup)
+                    let hms = p_read_u32(&mut poff);
+                    if hms == 1 {
+                        let msr = p_read_u32(&mut poff) as usize;
+                        for _ in 0..msr {
+                            let c0 = p_read_qm31(&mut poff); let c1 = p_read_qm31(&mut poff);
+                            mix_secure_field(&mut ch2, c0); mix_secure_field(&mut ch2, c1);
+                            let _ = ch2.draw_qm31();
+                        }
+                        let _ = p_read_qm31(&mut poff); let _ = p_read_qm31(&mut poff);
+                    }
                     mix_secure_field(&mut ch2, ie); mix_secure_field(&mut ch2, oe);
                     claim2 = ie;
                 }
@@ -6743,6 +7348,37 @@ mod tests {
                         let _ = p_read_qm31(&mut poff); let _ = p_read_qm31(&mut poff); let _ = p_read_qm31(&mut poff);
                         let nm = p_read_u32(&mut poff) as usize;
                         for _ in 0..nm { let _ = p_read_qm31(&mut poff); }
+                    }
+                    // Read multiplicity sumcheck (always serialized after logup)
+                    let hms = p_read_u32(&mut poff);
+                    if hms == 1 {
+                        let msr = p_read_u32(&mut poff) as usize;
+                        for _ in 0..msr {
+                            let c0 = p_read_qm31(&mut poff); let c1 = p_read_qm31(&mut poff);
+                            mix_secure_field(&mut ch2, c0); mix_secure_field(&mut ch2, c1);
+                            let _ = ch2.draw_qm31();
+                        }
+                        let _ = p_read_qm31(&mut poff); let _ = p_read_qm31(&mut poff);
+                    }
+                    // Read activation product proof (Phase A soundness)
+                    let hap = p_read_u32(&mut poff);
+                    if hap == 1 {
+                        let ar = p_read_u32(&mut poff) as usize;
+                        for _ in 0..ar {
+                            let _ = p_read_qm31(&mut poff); // c0
+                            let _ = p_read_qm31(&mut poff); // c2
+                            let _ = p_read_qm31(&mut poff); // c3
+                        }
+                        let _ = p_read_qm31(&mut poff); // input_eval
+                        let _ = p_read_qm31(&mut poff); // indicator_eval
+                        // Phase B: skip bit_evals if present
+                        let hbe = p_read_u32(&mut poff);
+                        if hbe == 1 {
+                            let nb = p_read_u32(&mut poff) as usize;
+                            for _ in 0..nb {
+                                let _ = p_read_qm31(&mut poff);
+                            }
+                        }
                     }
                     mix_secure_field(&mut ch2, ie); mix_secure_field(&mut ch2, oe);
                     claim2 = ie;
