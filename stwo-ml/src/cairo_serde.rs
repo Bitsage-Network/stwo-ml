@@ -1132,6 +1132,108 @@ fn serialize_logup_proof_inner_packed(
     }
 }
 
+/// Serialize a `MultiplicitySumcheckProof` (unpacked QM31).
+///
+/// Format: `[has_sumcheck: u32] [n_rounds: u32] [c0, c1: QM31 × n_rounds] [final_eval: QM31] [claimed_sum: QM31]`
+fn serialize_multiplicity_sumcheck(
+    proof: &Option<crate::gkr::types::MultiplicitySumcheckProof>,
+    output: &mut Vec<FieldElement>,
+) {
+    match proof {
+        Some(p) => {
+            serialize_u32(1, output);
+            serialize_u32(p.round_polys.len() as u32, output);
+            for &(c0, c1) in &p.round_polys {
+                serialize_qm31(c0, output);
+                serialize_qm31(c1, output);
+            }
+            serialize_qm31(p.final_eval, output);
+            serialize_qm31(p.claimed_sum, output);
+        }
+        None => serialize_u32(0, output),
+    }
+}
+
+/// Serialize a `MultiplicitySumcheckProof` (packed QM31 — 1 felt each).
+fn serialize_multiplicity_sumcheck_packed(
+    proof: &Option<crate::gkr::types::MultiplicitySumcheckProof>,
+    output: &mut Vec<FieldElement>,
+) {
+    match proof {
+        Some(p) => {
+            serialize_u32(1, output);
+            serialize_u32(p.round_polys.len() as u32, output);
+            for &(c0, c1) in &p.round_polys {
+                serialize_qm31_packed(c0, output);
+                serialize_qm31_packed(c1, output);
+            }
+            serialize_qm31_packed(p.final_eval, output);
+            serialize_qm31_packed(p.claimed_sum, output);
+        }
+        None => serialize_u32(0, output),
+    }
+}
+
+/// Serialize an `ActivationProductProof` (Phase A+B activation soundness).
+///
+/// Format:
+///   has_activation_proof: u32 (0 or 1)
+///   if 1:
+///     num_rounds: u32
+///     round_polys: [c0, c2, c3] × num_rounds  (c1 omitted — verifier reconstructs)
+///     input_eval: QM31
+///     indicator_eval: QM31
+///     has_bit_evals: u32 (0 or 1)
+///     if 1:
+///       num_bits: u32 (30)
+///       bit_evals: QM31 × num_bits
+fn serialize_activation_product_proof(
+    proof: &Option<crate::gkr::types::ActivationProductProof>,
+    output: &mut Vec<FieldElement>,
+    packed: bool,
+) {
+    match proof {
+        Some(p) => {
+            serialize_u32(1, output);
+            serialize_u32(p.round_polys.len() as u32, output);
+            for rp in &p.round_polys {
+                if packed {
+                    serialize_qm31_packed(rp.c0, output);
+                    serialize_qm31_packed(rp.c2, output);
+                    serialize_qm31_packed(rp.c3, output);
+                } else {
+                    serialize_qm31(rp.c0, output);
+                    serialize_qm31(rp.c2, output);
+                    serialize_qm31(rp.c3, output);
+                }
+            }
+            if packed {
+                serialize_qm31_packed(p.input_eval, output);
+                serialize_qm31_packed(p.indicator_eval, output);
+            } else {
+                serialize_qm31(p.input_eval, output);
+                serialize_qm31(p.indicator_eval, output);
+            }
+            // Phase B: bit_evals
+            match &p.bit_evals {
+                Some(bit_evals) => {
+                    serialize_u32(1, output);
+                    serialize_u32(bit_evals.len() as u32, output);
+                    for &be in bit_evals {
+                        if packed {
+                            serialize_qm31_packed(be, output);
+                        } else {
+                            serialize_qm31(be, output);
+                        }
+                    }
+                }
+                None => serialize_u32(0, output),
+            }
+        }
+        None => serialize_u32(0, output),
+    }
+}
+
 /// Serialize a complete GKR model proof for on-chain verification.
 ///
 /// Layout: `num_layers, [layer_proof]×num_layers, input_claim, weight_commitments, io_commitment`
@@ -1188,6 +1290,8 @@ pub fn serialize_gkr_model_proof(proof: &crate::gkr::GKRProof, output: &mut Vec<
             LayerProof::Activation {
                 activation_type,
                 logup_proof,
+                multiplicity_sumcheck: _,
+                activation_proof,
                 input_eval,
                 output_eval,
                 table_commitment,
@@ -1207,9 +1311,12 @@ pub fn serialize_gkr_model_proof(proof: &crate::gkr::GKRProof, output: &mut Vec<
                         serialize_u32(0, output);
                     }
                 }
+                // Activation product proof (Phase A soundness)
+                serialize_activation_product_proof(activation_proof, output, false);
             }
             LayerProof::LayerNorm {
                 logup_proof,
+                multiplicity_sumcheck: _,
                 linear_round_polys,
                 linear_final_evals,
                 input_eval,
@@ -1279,6 +1386,7 @@ pub fn serialize_gkr_model_proof(proof: &crate::gkr::GKRProof, output: &mut Vec<
             }
             LayerProof::Dequantize {
                 logup_proof,
+                multiplicity_sumcheck: _,
                 input_eval,
                 output_eval,
                 table_commitment,
@@ -1377,6 +1485,7 @@ pub fn serialize_gkr_model_proof(proof: &crate::gkr::GKRProof, output: &mut Vec<
 
             LayerProof::RMSNorm {
                 logup_proof,
+                multiplicity_sumcheck: _,
                 linear_round_polys,
                 linear_final_evals,
                 input_eval,
@@ -1502,6 +1611,8 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
             LayerProof::Activation {
                 activation_type,
                 logup_proof,
+                multiplicity_sumcheck,
+                activation_proof,
                 input_eval,
                 output_eval,
                 table_commitment,
@@ -1520,9 +1631,12 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
                     }
                     None => serialize_u32(0, output),
                 }
+                serialize_multiplicity_sumcheck(multiplicity_sumcheck, output);
+                serialize_activation_product_proof(activation_proof, output, false);
             }
             LayerProof::LayerNorm {
                 logup_proof,
+                multiplicity_sumcheck,
                 linear_round_polys,
                 linear_final_evals,
                 input_eval,
@@ -1556,6 +1670,7 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
                     }
                     None => serialize_u32(0, output),
                 }
+                serialize_multiplicity_sumcheck(multiplicity_sumcheck, output);
             }
             LayerProof::Attention {
                 sub_proofs,
@@ -1587,6 +1702,7 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
             }
             LayerProof::Dequantize {
                 logup_proof,
+                multiplicity_sumcheck,
                 input_eval,
                 output_eval,
                 table_commitment,
@@ -1598,10 +1714,11 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
                 match logup_proof {
                     Some(lup) => {
                         serialize_u32(1, output);
-                        serialize_logup_proof_inner(lup, output, false);
+                        serialize_logup_proof_inner(lup, output, lup.multiplicities.len() <= 256);
                     }
                     None => serialize_u32(0, output),
                 }
+                serialize_multiplicity_sumcheck(multiplicity_sumcheck, output);
             }
             LayerProof::Quantize {
                 logup_proof,
@@ -1682,6 +1799,7 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
             }
             LayerProof::RMSNorm {
                 logup_proof,
+                multiplicity_sumcheck,
                 linear_round_polys,
                 linear_final_evals,
                 input_eval,
@@ -1715,6 +1833,7 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
                     }
                     None => serialize_u32(0, output),
                 }
+                serialize_multiplicity_sumcheck(multiplicity_sumcheck, output);
             }
         }
     }
@@ -1807,6 +1926,8 @@ fn serialize_layer_proof_packed_inner(
         LayerProof::Activation {
             activation_type,
             logup_proof,
+            multiplicity_sumcheck,
+            activation_proof,
             input_eval,
             output_eval,
             table_commitment,
@@ -1823,9 +1944,12 @@ fn serialize_layer_proof_packed_inner(
                 }
                 None => serialize_u32(0, output),
             }
+            serialize_multiplicity_sumcheck_packed(multiplicity_sumcheck, output);
+            serialize_activation_product_proof(activation_proof, output, true);
         }
         LayerProof::LayerNorm {
             logup_proof,
+            multiplicity_sumcheck,
             linear_round_polys,
             linear_final_evals,
             input_eval,
@@ -1858,6 +1982,7 @@ fn serialize_layer_proof_packed_inner(
                 }
                 None => serialize_u32(0, output),
             }
+            serialize_multiplicity_sumcheck_packed(multiplicity_sumcheck, output);
         }
         LayerProof::Attention {
             sub_proofs,
@@ -1891,6 +2016,7 @@ fn serialize_layer_proof_packed_inner(
         }
         LayerProof::Dequantize {
             logup_proof,
+            multiplicity_sumcheck,
             input_eval,
             output_eval,
             table_commitment,
@@ -1902,10 +2028,11 @@ fn serialize_layer_proof_packed_inner(
             match logup_proof {
                 Some(lup) => {
                     serialize_u32(1, output);
-                    serialize_logup_proof_inner_packed(lup, output, false);
+                    serialize_logup_proof_inner_packed(lup, output, lup.multiplicities.len() <= 256);
                 }
                 None => serialize_u32(0, output),
             }
+            serialize_multiplicity_sumcheck_packed(multiplicity_sumcheck, output);
         }
         LayerProof::MatMulDualSimd {
             round_polys,
@@ -1927,6 +2054,7 @@ fn serialize_layer_proof_packed_inner(
         }
         LayerProof::RMSNorm {
             logup_proof,
+            multiplicity_sumcheck,
             linear_round_polys,
             linear_final_evals,
             input_eval,
@@ -1959,6 +2087,7 @@ fn serialize_layer_proof_packed_inner(
                 }
                 None => serialize_u32(0, output),
             }
+            serialize_multiplicity_sumcheck_packed(multiplicity_sumcheck, output);
         }
         LayerProof::Quantize {
             logup_proof,
@@ -2141,6 +2270,8 @@ fn serialize_layer_proof_double_packed_inner(
         LayerProof::Activation {
             activation_type,
             logup_proof,
+            multiplicity_sumcheck,
+            activation_proof,
             input_eval,
             output_eval,
             table_commitment,
@@ -2157,9 +2288,12 @@ fn serialize_layer_proof_double_packed_inner(
                 }
                 None => serialize_u32(0, output),
             }
+            serialize_multiplicity_sumcheck_packed(multiplicity_sumcheck, output);
+            serialize_activation_product_proof(activation_proof, output, true);
         }
         LayerProof::LayerNorm {
             logup_proof,
+            multiplicity_sumcheck,
             linear_round_polys,
             linear_final_evals,
             input_eval,
@@ -2192,6 +2326,7 @@ fn serialize_layer_proof_double_packed_inner(
                 }
                 None => serialize_u32(0, output),
             }
+            serialize_multiplicity_sumcheck_packed(multiplicity_sumcheck, output);
         }
         LayerProof::Attention {
             sub_proofs,
@@ -2226,6 +2361,7 @@ fn serialize_layer_proof_double_packed_inner(
         }
         LayerProof::Dequantize {
             logup_proof,
+            multiplicity_sumcheck,
             input_eval,
             output_eval,
             table_commitment,
@@ -2237,10 +2373,11 @@ fn serialize_layer_proof_double_packed_inner(
             match logup_proof {
                 Some(lup) => {
                     serialize_u32(1, output);
-                    serialize_logup_proof_inner_double_packed(lup, output, false);
+                    serialize_logup_proof_inner_double_packed(lup, output, lup.multiplicities.len() <= 256);
                 }
                 None => serialize_u32(0, output),
             }
+            serialize_multiplicity_sumcheck_packed(multiplicity_sumcheck, output);
         }
         LayerProof::MatMulDualSimd {
             round_polys,
@@ -2261,6 +2398,7 @@ fn serialize_layer_proof_double_packed_inner(
         }
         LayerProof::RMSNorm {
             logup_proof,
+            multiplicity_sumcheck,
             linear_round_polys,
             linear_final_evals,
             input_eval,
@@ -2293,6 +2431,7 @@ fn serialize_layer_proof_double_packed_inner(
                 }
                 None => serialize_u32(0, output),
             }
+            serialize_multiplicity_sumcheck_packed(multiplicity_sumcheck, output);
         }
         LayerProof::Quantize {
             logup_proof,
