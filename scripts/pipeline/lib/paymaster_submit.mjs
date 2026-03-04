@@ -262,10 +262,14 @@ async function registerWithDeployerFallback(
       info(`  Already registered (OK)`);
       return;
     }
-    if (!/only.?owner|not.?owner|unauthorized|caller.?is.?not/i.test(errMsg)) {
+    // Paymaster estimation failures often hide the contract revert reason ("Only owner").
+    // Treat estimation failures for owner-only entrypoints as potential "not owner" errors.
+    const isOwnerError = /only.?owner|not.?owner|unauthorized|caller.?is.?not/i.test(errMsg);
+    const isEstimationFailure = /estimation.?fail|buildTransaction|simulation.?fail|contract.?error/i.test(errMsg);
+    if (!isOwnerError && !isEstimationFailure) {
       die(`  Registration failed: ${errMsg}`);
     }
-    info(`  Registration failed (not owner) — retrying with deployer account...`);
+    info(`  Registration failed (${isOwnerError ? "not owner" : "estimation error — likely not owner"}) — retrying with deployer account...`);
   }
 
   // Fallback: retry with deployer account
@@ -278,17 +282,33 @@ async function registerWithDeployerFallback(
     );
   }
 
+  // Deployer uses direct execution (no paymaster) — its account type may not
+  // be supported by the AVNU paymaster, and it has its own STRK balance.
   try {
-    const result = await tryRegister(deployerAccount, "Deployer");
-    if (!result.reverted) {
-      info(`  ${entrypoint} registered via deployer (status: ${result.status})`);
-      return;
+    info(`  Using deployer direct execution (no paymaster)...`);
+    const deployerCalls = [{
+      contractAddress: contract,
+      entrypoint,
+      calldata: CallData.compile(calldata),
+    }];
+    const execResult = await deployerAccount.execute(deployerCalls);
+    if (!execResult || !execResult.transaction_hash) {
+      throw new Error(`deployer execute() returned invalid result: ${JSON.stringify(execResult)?.slice(0, 200)}`);
     }
-    if (/already.?registered/i.test(result.reason)) {
-      info(`  Already registered (OK)`);
-      return;
+    const txHash = execResult.transaction_hash;
+    info(`  Deployer registration TX: ${txHash}`);
+    const receipt = await (waitFn || (async (h) => provider.waitForTransaction(h, { retryInterval: 4000 })))(txHash);
+    const status = receipt.execution_status ?? receipt.status ?? "unknown";
+    if (status === "REVERTED") {
+      const reason = receipt.revert_reason || "unknown";
+      if (/already.?registered/i.test(reason)) {
+        info(`  Already registered (OK)`);
+        return;
+      }
+      die(`  Deployer registration reverted: ${reason}`);
     }
-    die(`  Deployer registration reverted: ${result.reason}`);
+    info(`  ${entrypoint} registered via deployer (status: ${status})`);
+    return;
   } catch (deployerErr) {
     const errMsg = truncateRpcError(deployerErr);
     if (/already.?registered/i.test(errMsg)) {
@@ -1353,6 +1373,7 @@ async function cmdVerify(args) {
   let privateKey, accountAddress;
   let needsDeploy = false;
   let ephemeral = null;
+  let isDeployerPrimary = false;
 
   if (process.env.STARKNET_PRIVATE_KEY) {
     // Path 1: User-provided key
@@ -1366,6 +1387,7 @@ async function cmdVerify(args) {
     // Preferred over ephemeral accounts which may not pass paymaster SNIP-9 checks.
     privateKey = process.env.OBELYSK_DEPLOYER_KEY;
     accountAddress = process.env.OBELYSK_DEPLOYER_ADDRESS;
+    isDeployerPrimary = true;
     info(`Using deployer account: ${accountAddress}`);
   } else {
     let config = loadAccountConfig();
@@ -1459,7 +1481,12 @@ async function cmdVerify(args) {
   }
 
   // ── Deploy account if needed ──
-  const noPaymaster = args["no-paymaster"] === true || args["no-paymaster"] === "true";
+  // Auto-enable no-paymaster when deployer is the primary account — its account
+  // class may not be AVNU-compatible, and it has its own STRK balance.
+  const noPaymaster = args["no-paymaster"] === true || args["no-paymaster"] === "true" || isDeployerPrimary;
+  if (isDeployerPrimary && !(args["no-paymaster"] === true || args["no-paymaster"] === "true")) {
+    info("Auto-enabled --no-paymaster (deployer account is primary)");
+  }
   if (needsDeploy && ephemeral) {
     const rawCalldata = Array.isArray(ephemeral.constructorCalldata)
       ? ephemeral.constructorCalldata
@@ -1512,6 +1539,28 @@ async function cmdVerify(args) {
       }
       if (!needsRegistration) {
         info(`Model already registered (circuit_hash: ${circuitHash})`);
+        // Pre-flight: verify on-chain weight count matches proof's expected count
+        try {
+          const wcResult = await provider.callContract({
+            contractAddress: contract,
+            entrypoint: "get_model_gkr_weight_count",
+            calldata: CallData.compile([modelId]),
+          });
+          const onChainWC = Number(Array.isArray(wcResult) ? wcResult[0] : (wcResult.result ? wcResult.result[0] : "0"));
+          const rc = proofData.register_calldata;
+          if (rc && Array.isArray(rc) && rc.length >= 2) {
+            const proofWC = Number(rc[1]);
+            if (onChainWC > 0 && proofWC > 0 && onChainWC !== proofWC) {
+              die(
+                `Model ${modelId} is registered with ${onChainWC} weight commitments, but this proof has ${proofWC}.\n` +
+                `  Use a different --model-id (e.g., --model-id 0x${(Number(modelId) + 7).toString(16)}) or generate a proof matching\n` +
+                `  the registered model configuration (${onChainWC} weights).`
+              );
+            }
+          }
+        } catch {
+          // Non-fatal: contract may not support get_model_gkr_weight_count
+        }
       }
     } catch {
       info("Could not check model registration (will attempt registration)");
@@ -2610,7 +2659,31 @@ async function cmdVerify(args) {
       } catch {
         needsReg = true;
       }
-      if (!needsReg) info(`Model already registered (circuit_hash: ${ch})`);
+      if (!needsReg) {
+        info(`Model already registered (circuit_hash: ${ch})`);
+        // Pre-flight: verify on-chain weight count matches proof's expected count
+        try {
+          const wcResult = await provider.callContract({
+            contractAddress: contract,
+            entrypoint: "get_model_gkr_weight_count",
+            calldata: CallData.compile([modelId]),
+          });
+          const onChainWC = Number(Array.isArray(wcResult) ? wcResult[0] : (wcResult.result ? wcResult.result[0] : "0"));
+          const rc = proofData.register_calldata;
+          if (rc && Array.isArray(rc) && rc.length >= 2) {
+            const proofWC = Number(rc[1]);
+            if (onChainWC > 0 && proofWC > 0 && onChainWC !== proofWC) {
+              die(
+                `Model ${modelId} is registered with ${onChainWC} weight commitments, but this proof has ${proofWC}.\n` +
+                `  Use a different --model-id (e.g., --model-id 0x${(Number(modelId) + 7).toString(16)}) or generate a proof matching\n` +
+                `  the registered model configuration (${onChainWC} weights).`
+              );
+            }
+          }
+        } catch {
+          // Non-fatal: contract may not support get_model_gkr_weight_count
+        }
+      }
     } catch {
       info("Could not check model registration (will attempt registration)");
       needsReg = true;
@@ -2642,17 +2715,44 @@ async function cmdVerify(args) {
   }
 
   // ── Build verification call (GKR only) ──
+  const compiledCalldata = CallData.compile(verifyPayload.calldata);
   const calls = [
     {
       contractAddress: contract,
       entrypoint: verifyPayload.entrypoint,
-      calldata: CallData.compile(verifyPayload.calldata),
+      calldata: compiledCalldata,
     },
   ];
 
   info(`Submitting ${verifyPayload.entrypoint} for model ${modelId}...`);
   info(`Contract: ${contract}`);
   info(`Calldata elements: ${verifyPayload.calldata.length}`);
+
+  // ── Pre-flight: read-only starknet_call to catch reverts before spending gas ──
+  try {
+    info("Running pre-flight verification (starknet_call)...");
+    await provider.callContract({
+      contractAddress: contract,
+      entrypoint: verifyPayload.entrypoint,
+      calldata: compiledCalldata,
+    });
+    info("Pre-flight passed (no revert).");
+  } catch (preflightErr) {
+    const errMsg = preflightErr?.message || String(preflightErr);
+    // Some entrypoints are state-modifying and can't be called as view — skip those
+    if (/entry point.*not found|no entry/i.test(errMsg)) {
+      info("Pre-flight skipped (entrypoint not callable as view).");
+    } else if (/execution.*(reverted|failed)|error/i.test(errMsg)) {
+      die(
+        `Pre-flight verification FAILED. The proof will revert on-chain.\n` +
+        `  Entrypoint: ${verifyPayload.entrypoint}\n` +
+        `  Error: ${errMsg.slice(0, 500)}\n` +
+        `  Hint: Re-run with prove-model --dry-run to diagnose.`
+      );
+    } else {
+      info(`Pre-flight inconclusive (${errMsg.slice(0, 200)}), proceeding...`);
+    }
+  }
 
   // ── Execute with retry (matches chunked path reliability) ──
   let txHash;
