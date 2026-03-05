@@ -711,6 +711,9 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
     // Layer tags for streaming circuit hash registration
     const layerTags = verifyCalldata.layer_tags || [];
 
+    // Weight binding calldata (packed QM31, separate TX before input MLE)
+    const weightBindingCalldata = verifyCalldata.weight_binding_calldata || null;
+
     return {
       entrypoint: "verify_gkr_stream",
       calldata: [],
@@ -730,6 +733,7 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
       initCalldata,
       outputMleChunks,
       outputMleCalldata,
+      weightBindingCalldata,
       inputMleChunks,
       streamBatches,
       finalizeCalldata,
@@ -2365,22 +2369,44 @@ async function cmdVerify(args) {
         info(`  Resuming — all ${batches.length} stream batches done`);
       }
 
-      // Phase 4c: verify_gkr_stream_finalize_input_mle (chunked for gas safety)
+      // Phase 4c: verify_gkr_stream_weight_binding (packed QM31, separate TX)
+      if (!sessionState.streamWeightBindingDone) {
+        if (verifyPayload.weightBindingCalldata && verifyPayload.weightBindingCalldata.length > 0) {
+          e2ePhase(`Stream weight binding (${verifyPayload.weightBindingCalldata.length} felts)`);
+          const wbArgs = verifyPayload.weightBindingCalldata.map(
+            (v) => v === "__SESSION_ID__" ? sessionId : v,
+          );
+          const { txHash: wbTxHash } = await execCallWithRetry(
+            "verify_gkr_stream_weight_binding",
+            wbArgs,
+            "verify_gkr_stream_weight_binding",
+          );
+          sessionState.streamWeightBindingDone = true;
+          sessionState.txHashes.push(wbTxHash);
+          safeWriteJson(sessionFile, sessionState);
+        } else {
+          // No separate weight binding — legacy path (binding was in first input_mle chunk)
+          sessionState.streamWeightBindingDone = true;
+          safeWriteJson(sessionFile, sessionState);
+        }
+      } else {
+        info("  Resuming — stream_weight_binding already done");
+      }
+
+      // Phase 4d: verify_gkr_stream_finalize_input_mle (chunked for gas safety)
       if (!sessionState.streamInputMleDone) {
         if (verifyPayload.inputMleChunks && verifyPayload.inputMleChunks.length > 0) {
           const inputChunks = verifyPayload.inputMleChunks;
           const inputResumeFrom = sessionState.inputMleChunksDone || 0;
           if (inputResumeFrom < inputChunks.length) {
-            e2ePhase(`Stream input MLE + weight binding (${inputChunks.length} chunks)`);
+            e2ePhase(`Stream input MLE (${inputChunks.length} chunks)`);
             for (let ci = inputResumeFrom; ci < inputChunks.length; ci++) {
               const chunk = inputChunks[ci];
               const chunkArgs = chunk.calldata.map(
                 (v) => v === "__SESSION_ID__" ? sessionId : v,
               );
               const pct = (((ci + 1) / inputChunks.length) * 100).toFixed(0);
-              const label = ci === 0
-                ? `verify_gkr_stream_finalize_input_mle[1/${inputChunks.length}] (weight binding + chunk, ${pct}%)`
-                : `verify_gkr_stream_finalize_input_mle[${ci + 1}/${inputChunks.length}] (${pct}%)`;
+              const label = `verify_gkr_stream_finalize_input_mle[${ci + 1}/${inputChunks.length}] (${pct}%)`;
               const { txHash: chunkTxHash } = await execCallWithRetry(
                 "verify_gkr_stream_finalize_input_mle",
                 chunkArgs,
@@ -2402,7 +2428,7 @@ async function cmdVerify(args) {
         info("  Resuming — stream_input_mle already done");
       }
 
-      // Phase 4d: verify_gkr_stream_finalize (lightweight — assert + record proof)
+      // Phase 4e: verify_gkr_stream_finalize (lightweight — assert + record proof)
       if (!sessionState.streamFinalized) {
         e2ePhase("Stream finalize (assert input MLE + record proof)");
         const finalizeArgs = verifyPayload.finalizeCalldata.map(
