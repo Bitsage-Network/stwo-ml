@@ -27,6 +27,7 @@ proof-stream = ["dep:proof-stream"]
 proof-stream-rerun = ["proof-stream", "proof-stream/rerun"]
 proof-stream-ws = ["proof-stream", "proof-stream/ws-server"]
 server-stream   = ["server", "proof-stream-ws", "dep:ureq"]
+multi-query     = ["server"]
 
 [dependencies]
 stwo = { path = "../stwo/crates/stwo", features = ["prover"] }

@@ -44,6 +44,9 @@ pub mod gpu_sumcheck;
 #[cfg(feature = "multi-gpu")]
 pub mod multi_gpu;
 
+#[cfg(feature = "multi-query")]
+pub mod gpu_scheduler;
+
 /// Re-export core STWO types used throughout stwo-ml.
 pub mod prelude {
     pub use stwo::core::fields::m31::M31;

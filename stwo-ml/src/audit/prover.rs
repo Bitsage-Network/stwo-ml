@@ -106,6 +106,43 @@ impl<'a> AuditProver<'a> {
         // Step 6: Prove each inference with the resolved mode.
         let mut inference_results = Vec::with_capacity(entries.len());
 
+        #[cfg(feature = "multi-query")]
+        {
+            use rayon::prelude::*;
+
+            #[cfg(feature = "multi-gpu")]
+            let gpu_count = crate::multi_gpu::device_count().max(1);
+            #[cfg(not(feature = "multi-gpu"))]
+            let gpu_count = 1;
+
+            let parallelism = entries.len().min(gpu_count);
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(parallelism)
+                .build()
+                .map_err(|e| AuditError::Internal(format!("Failed to build rayon pool: {e}")))?;
+
+            let results: Vec<(usize, Result<InferenceProofResult, AuditError>)> =
+                pool.install(|| {
+                    entries
+                        .par_iter()
+                        .enumerate()
+                        .map(|(idx, entry)| {
+                            #[cfg(feature = "multi-gpu")]
+                            let _guard = crate::multi_gpu::DeviceGuard::new(idx % gpu_count);
+                            (idx, self.prove_inference(entry, log, &mode))
+                        })
+                        .collect()
+                });
+
+            // Sort by original index and collect, propagating first error
+            let mut sorted = results;
+            sorted.sort_by_key(|(idx, _)| *idx);
+            for (_idx, result) in sorted {
+                inference_results.push(result?);
+            }
+        }
+
+        #[cfg(not(feature = "multi-query"))]
         for entry in entries {
             let result = self.prove_inference(entry, log, &mode)?;
             inference_results.push(result);

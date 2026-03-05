@@ -162,6 +162,10 @@ struct AppState {
     #[cfg(feature = "proof-stream")]
     ws_sink: proof_stream::WsBroadcastSink,
     validator_url: Option<String>,
+    #[cfg(feature = "multi-query")]
+    scheduler: stwo_ml::gpu_scheduler::GpuScheduler,
+    #[cfg(feature = "multi-query")]
+    weight_caches: RwLock<HashMap<String, stwo_ml::weight_cache::SharedWeightCache>>,
 }
 
 // =============================================================================
@@ -492,7 +496,28 @@ async fn load_model(
         capture_hook: create_capture_hook(&model_id, &weight_commitment, desc),
     };
 
-    state.models.write().await.insert(model_id, loaded);
+    state.models.write().await.insert(model_id.clone(), loaded);
+
+    #[cfg(feature = "multi-query")]
+    {
+        let model_dir = req
+            .model_dir
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(&req.model_path)
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .to_path_buf()
+            });
+        let cache = stwo_ml::weight_cache::shared_cache_for_model(&model_dir, &model_id);
+        state
+            .weight_caches
+            .write()
+            .await
+            .insert(model_id, cache);
+    }
+
     Ok((StatusCode::CREATED, Json(resp)))
 }
 
@@ -533,7 +558,19 @@ async fn load_hf_model_handler(
         capture_hook: create_capture_hook(&model_id, &weight_commitment, desc),
     };
 
-    state.models.write().await.insert(model_id, loaded);
+    state.models.write().await.insert(model_id.clone(), loaded);
+
+    #[cfg(feature = "multi-query")]
+    {
+        let model_dir = std::path::PathBuf::from(&req.model_dir);
+        let cache = stwo_ml::weight_cache::shared_cache_for_model(&model_dir, &model_id);
+        state
+            .weight_caches
+            .write()
+            .await
+            .insert(model_id, cache);
+    }
+
     Ok((StatusCode::CREATED, Json(resp)))
 }
 
@@ -643,7 +680,204 @@ async fn submit_prove(
         status: JobStatus::Queued,
     };
 
-    // Spawn blocking proving task
+    // -------------------------------------------------------------------------
+    // multi-query: Submit to GPU scheduler with bounded concurrency
+    // -------------------------------------------------------------------------
+    #[cfg(feature = "multi-query")]
+    {
+        use stwo_ml::gpu_scheduler::{ProveJobResult as GpuJobResult, ScheduledJob};
+
+        // Look up weight cache for this model (if available)
+        let weight_cache = {
+            let caches = state.weight_caches.read().await;
+            caches.get(&req.model_id).cloned()
+        };
+
+        #[cfg(feature = "proof-stream")]
+        let ws_clone = state.ws_sink.clone();
+
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let scheduled = ScheduledJob {
+            job_id: job_id.clone(),
+            estimated_gpu_memory: 0, // advisory, future use
+            prove_fn: Box::new(move |_device_id| {
+                // Install proof-stream sink on the blocking thread
+                #[cfg(feature = "proof-stream")]
+                let _sink_guard = stwo_ml::gkr::prover::set_proof_sink(
+                    proof_stream::ProofSink::new(ws_clone),
+                );
+
+                let prove_start = Instant::now();
+                let proof_result = if let Some(ref cache) = weight_cache {
+                    stwo_ml::starknet::prove_for_starknet_onchain_cached(
+                        &*graph,
+                        &input_matrix,
+                        &*weights,
+                        cache,
+                    )
+                } else {
+                    prove_for_starknet_onchain(&*graph, &input_matrix, &*weights)
+                };
+
+                match proof_result {
+                    Ok(proof) => {
+                        let elapsed_ms = prove_start.elapsed().as_millis() as u64;
+                        // Serialize proof to bytes for transport through the scheduler
+                        let payload_json = serde_json::json!({
+                            "calldata": proof.combined_calldata.iter()
+                                .map(|f| format!("0x{:x}", f)).collect::<Vec<_>>(),
+                            "io_commitment": format!("0x{:x}", proof.io_commitment),
+                            "layer_chain_commitment": format!("0x{:x}", proof.layer_chain_commitment),
+                            "estimated_gas": proof.estimated_gas,
+                            "num_matmul_proofs": proof.num_matmul_proofs,
+                            "num_proven_layers": proof.num_proven_layers,
+                            "tee_attestation_hash": proof.tee_attestation_hash
+                                .map(|h| format!("0x{:x}", h)),
+                        });
+                        Ok(GpuJobResult {
+                            data: serde_json::to_vec(&payload_json).unwrap_or_default(),
+                            prove_time_ms: elapsed_ms,
+                            device_id: _device_id,
+                        })
+                    }
+                    Err(e) => Err(format!("{e}")),
+                }
+            }),
+            result_tx,
+            submitted_at: Instant::now(),
+        };
+
+        if let Err(e) = state.scheduler.submit(scheduled) {
+            // Queue full — return 429 Too Many Requests
+            let mut jobs_w = state.jobs.write().await;
+            if let Some(j) = jobs_w.get_mut(&job_id) {
+                j.status = JobStatus::Failed;
+                j.error = Some(format!("{e}"));
+                j.completed_at = Some(Instant::now());
+            }
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(ErrorResponse {
+                    error: format!("{e}"),
+                }),
+            ));
+        }
+
+        // Spawn async task to await result and update job status
+        let state_clone = state.clone();
+        let jid = job_id.clone();
+        let validator_url_clone = state_clone.validator_url.clone();
+        #[allow(unused_variables)]
+        let jid_for_validator = jid.clone();
+        tokio::task::spawn(async move {
+            // Mark as proving
+            {
+                let mut jobs = state_clone.jobs.write().await;
+                if let Some(j) = jobs.get_mut(&jid) {
+                    j.status = JobStatus::Proving;
+                    j.progress_bps = 100;
+                }
+            }
+
+            match result_rx.await {
+                Ok(Ok(gpu_result)) => {
+                    // Parse the serialized proof payload
+                    let payload_json: serde_json::Value =
+                        serde_json::from_slice(&gpu_result.data).unwrap_or_default();
+
+                    let calldata: Vec<String> = payload_json["calldata"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                        .unwrap_or_default();
+
+                    let payload = ProveResultPayload {
+                        calldata,
+                        io_commitment: payload_json["io_commitment"]
+                            .as_str()
+                            .unwrap_or("0x0")
+                            .to_string(),
+                        weight_commitment: model_weight_commitment.clone(),
+                        layer_chain_commitment: payload_json["layer_chain_commitment"]
+                            .as_str()
+                            .unwrap_or("0x0")
+                            .to_string(),
+                        estimated_gas: payload_json["estimated_gas"].as_u64().unwrap_or(0),
+                        num_matmul_proofs: payload_json["num_matmul_proofs"]
+                            .as_u64()
+                            .unwrap_or(0) as usize,
+                        num_layers: payload_json["num_proven_layers"]
+                            .as_u64()
+                            .unwrap_or(0) as usize,
+                        prove_time_ms: gpu_result.prove_time_ms,
+                        tee_attestation_hash: payload_json["tee_attestation_hash"]
+                            .as_str()
+                            .map(String::from),
+                    };
+
+                    let mut jobs = state_clone.jobs.write().await;
+                    if let Some(j) = jobs.get_mut(&jid) {
+                        j.status = JobStatus::Completed;
+                        j.progress_bps = 10000;
+                        j.completed_at = Some(Instant::now());
+                        j.result = Some(payload);
+                    }
+
+                    // Forward proof result to validator if configured
+                    #[cfg(any(feature = "audit-http", feature = "server-stream"))]
+                    if let Some(ref url) = validator_url_clone {
+                        let post_url =
+                            format!("{url}/api/v1/workers/job/{jid_for_validator}/result");
+                        let elapsed_ms = gpu_result.prove_time_ms;
+                        let jid_v = jid_for_validator.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let body = format!(
+                                r#"{{"job_id":"{}","success":true,"generation_time_ms":{}}}"#,
+                                jid_v, elapsed_ms
+                            );
+                            match ureq::post(&post_url)
+                                .header("Content-Type", "application/json")
+                                .send(body.as_bytes())
+                            {
+                                Ok(resp) if resp.status() == 200 || resp.status() == 201 => {}
+                                Ok(resp) => eprintln!(
+                                    "[prove-server] validator returned HTTP {} for job {}",
+                                    resp.status(),
+                                    jid_v
+                                ),
+                                Err(e) => eprintln!(
+                                    "[prove-server] validator bridge error for job {}: {}",
+                                    jid_v, e
+                                ),
+                            }
+                        })
+                        .await;
+                    }
+                }
+                Ok(Err(e)) => {
+                    let mut jobs = state_clone.jobs.write().await;
+                    if let Some(j) = jobs.get_mut(&jid) {
+                        j.status = JobStatus::Failed;
+                        j.error = Some(e);
+                        j.completed_at = Some(Instant::now());
+                    }
+                }
+                Err(_) => {
+                    let mut jobs = state_clone.jobs.write().await;
+                    if let Some(j) = jobs.get_mut(&jid) {
+                        j.status = JobStatus::Failed;
+                        j.error = Some("Scheduler channel closed".to_string());
+                        j.completed_at = Some(Instant::now());
+                    }
+                }
+            }
+        });
+    }
+
+    // -------------------------------------------------------------------------
+    // Legacy path: unbounded spawn_blocking (no scheduler)
+    // -------------------------------------------------------------------------
+    #[cfg(not(feature = "multi-query"))]
+    {
     let state_clone = state.clone();
     let jid = job_id.clone();
     tokio::task::spawn(async move {
@@ -789,6 +1023,7 @@ async fn submit_prove(
             }
         }
     });
+    }
 
     Ok((StatusCode::ACCEPTED, Json(resp)))
 }
@@ -1428,6 +1663,74 @@ async fn build_privacy_submit_calldata(
 // Dashboard + WebSocket
 // =============================================================================
 
+// =============================================================================
+// Queue stats endpoint (multi-query)
+// =============================================================================
+
+#[cfg(feature = "multi-query")]
+async fn get_queue_stats(
+    State(state): State<Arc<AppState>>,
+) -> Json<stwo_ml::gpu_scheduler::QueueStatsSnapshot> {
+    Json(state.scheduler.stats.snapshot())
+}
+
+// =============================================================================
+// Per-job WebSocket endpoint (multi-query + proof-stream)
+// =============================================================================
+
+#[cfg(all(feature = "multi-query", feature = "proof-stream"))]
+async fn ws_job_handler(
+    ws: WebSocketUpgrade,
+    Path(job_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let rx = state.ws_sink.subscribe();
+    ws.on_upgrade(move |socket| async move {
+        ws_job_client_loop(socket, rx, job_id).await;
+    })
+}
+
+#[cfg(all(feature = "multi-query", feature = "proof-stream"))]
+async fn ws_job_client_loop(
+    mut socket: WebSocket,
+    mut rx: tokio::sync::broadcast::Receiver<String>,
+    job_id: String,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+
+    // Wrap each event with the job_id for filtering
+    loop {
+        tokio::select! {
+            msg = rx.recv() => match msg {
+                Ok(json) => {
+                    // Wrap the raw event with job_id tagging
+                    let tagged = format!(r#"{{"job_id":"{}","event":{}}}"#, job_id, json);
+                    if socket.send(Message::Text(tagged.into())).await.is_err() {
+                        break;
+                    }
+                }
+                Err(RecvError::Lagged(n)) => {
+                    let warn = format!(
+                        r#"{{"job_id":"{}","event":{{"Log":{{"level":"Warn","message":"lagged {} events"}}}}}}"#,
+                        job_id, n
+                    );
+                    if socket.send(Message::Text(warn.into())).await.is_err() {
+                        break;
+                    }
+                }
+                Err(RecvError::Closed) => break,
+            },
+            msg = socket.recv() => match msg {
+                Some(Ok(Message::Ping(p))) => {
+                    let _ = socket.send(Message::Pong(p)).await;
+                }
+                None | Some(Ok(Message::Close(_))) => break,
+                _ => {}
+            }
+        }
+    }
+}
+
 async fn dashboard() -> impl IntoResponse {
     Html(include_str!("web_dashboard.html"))
 }
@@ -1506,6 +1809,33 @@ async fn main() {
     let ws_sink = proof_stream::WsBroadcastSink::new(1024);
     let validator_url = std::env::var("VALIDATOR_URL").ok();
 
+    // Initialize GPU scheduler (multi-query mode)
+    #[cfg(feature = "multi-query")]
+    let scheduler = {
+        let max_per_gpu: usize = std::env::var("MAX_CONCURRENT_PER_GPU")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        let max_queue: usize = std::env::var("MAX_QUEUE_DEPTH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64);
+        let device_ordinals: Vec<usize> = std::env::var("GPU_DEVICES")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|v| v.trim().parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        stwo_ml::gpu_scheduler::GpuScheduler::new(stwo_ml::gpu_scheduler::GpuSchedulerConfig {
+            max_concurrent_per_gpu: max_per_gpu,
+            max_queue_depth: max_queue,
+            device_ordinals,
+        })
+    };
+
     let state = Arc::new(AppState {
         jobs: RwLock::new(HashMap::new()),
         privacy_jobs: RwLock::new(HashMap::new()),
@@ -1514,6 +1844,10 @@ async fn main() {
         #[cfg(feature = "proof-stream")]
         ws_sink,
         validator_url,
+        #[cfg(feature = "multi-query")]
+        scheduler,
+        #[cfg(feature = "multi-query")]
+        weight_caches: RwLock::new(HashMap::new()),
     });
 
     let mut router: Router<Arc<AppState>> = Router::new()
@@ -1539,16 +1873,32 @@ async fn main() {
             post(build_privacy_submit_calldata),
         );
 
+    #[cfg(feature = "multi-query")]
+    {
+        router = router.route("/api/v1/queue", get(get_queue_stats));
+    }
+
     #[cfg(feature = "proof-stream")]
     {
         router = router.route("/ws", get(ws_handler));
     }
 
-    let app = router.layer(CorsLayer::permissive()).with_state(state);
+    #[cfg(all(feature = "multi-query", feature = "proof-stream"))]
+    {
+        router = router.route("/api/v1/prove/{job_id}/ws", get(ws_job_handler));
+    }
 
     let bind = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
     eprintln!("prove-server listening on {bind}");
     eprintln!("  GPU: {}", detect_tee_capability().device_name);
+    #[cfg(feature = "multi-query")]
+    eprintln!(
+        "  Scheduler: {} GPU(s), queue depth {}",
+        state.scheduler.gpu_count(),
+        std::env::var("MAX_QUEUE_DEPTH").unwrap_or_else(|_| "64".to_string()),
+    );
+
+    let app = router.layer(CorsLayer::permissive()).with_state(state);
     eprintln!("  Privacy: POST /api/v1/privacy/batch");
     eprintln!("  Privacy Submit: POST /api/v1/privacy/batch/{{job_id}}/submit-calldata");
     #[cfg(feature = "server-audit")]
