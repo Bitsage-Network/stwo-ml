@@ -1062,7 +1062,7 @@ fn prove_mle_opening_with_commitment_qm31_u32_gpu_tree(
         }
 
         // Build GPU tree for this round (dropped after extracting query auth paths)
-        let (tree, replay_qm31_words) = {
+        let (tree, _replay_qm31_words) = {
             let n_leaf_hashes = cur_n / 2;
             let mut qm31_words = vec![0u32; cur_n * 4];
             executor.device.dtoh_sync_copy_into(d_current, &mut qm31_words)
@@ -1078,16 +1078,6 @@ fn prove_mle_opening_with_commitment_qm31_u32_gpu_tree(
             ).map_err(|e| format!("GPU Merkle replay round {}: {e}", round))?;
             (t, qm31_words)
         };
-
-        // Diagnostic: verify Phase 2 tree root matches Phase 1 root
-        if round == 0 {
-            let replay_root_limbs = tree.root_u64().map_err(|e| format!("diag root: {e}"))?;
-            let replay_root = u64_limbs_to_felt252(&replay_root_limbs)
-                .ok_or_else(|| "diag: invalid replay root".to_string())?;
-            eprintln!("[DIAG] Phase2 tree root  = {:?}", replay_root);
-            eprintln!("[DIAG] Phase1 initial_root = {:?}", initial_root);
-            eprintln!("[DIAG] roots match = {}", replay_root == initial_root);
-        }
 
         for q in 0..n_queries {
             let left_idx = round_pair_indices[round][q];
@@ -1109,83 +1099,6 @@ fn prove_mle_opening_with_commitment_qm31_u32_gpu_tree(
                 .map_err(|e| format!("download right merkle sib (round {}, query {}): {}", round, q, e))?;
             let left_merkle_sib = u32s_to_secure_field(&left_sib_words);
             let right_merkle_sib = u32s_to_secure_field(&right_sib_words);
-
-            // Diagnostic: check session reads vs bulk download consistency
-            if round == 0 && q == 0 {
-                let left_xor = left_idx ^ 1;
-                let bulk_left = &replay_qm31_words[left_idx * 4..(left_idx + 1) * 4];
-                let bulk_sib = &replay_qm31_words[left_xor * 4..(left_xor + 1) * 4];
-                eprintln!("[DIAG] left_idx={left_idx}, left_idx^1={}", left_idx ^ 1);
-                eprintln!("[DIAG] session left_words = {:?}", left_words);
-                eprintln!("[DIAG] bulk    left_words = {:?}", bulk_left);
-                eprintln!("[DIAG] session sib_words  = {:?}", left_sib_words);
-                eprintln!("[DIAG] bulk    sib_words  = {:?}", bulk_sib);
-                eprintln!("[DIAG] words match = {}, sib match = {}", left_words == bulk_left, left_sib_words == bulk_sib);
-
-                // Check what verifier will compute
-                let leaf_felt = securefield_to_felt(left_value);
-                let sib_felt = securefield_to_felt(left_merkle_sib);
-                let hash_result = if left_idx & 1 == 0 {
-                    starknet_crypto::poseidon_hash(leaf_felt, sib_felt)
-                } else {
-                    starknet_crypto::poseidon_hash(sib_felt, leaf_felt)
-                };
-                // Compare with tree level-0 node at left_idx / 2
-                let tree_node_limbs = tree.node_u64(0, left_idx / 2);
-                eprintln!("[DIAG] leaf_felt = {:?}", leaf_felt);
-                eprintln!("[DIAG] sib_felt  = {:?}", sib_felt);
-                eprintln!("[DIAG] hash(leaf,sib) = {:?}", hash_result);
-                if let Ok(limbs) = &tree_node_limbs {
-                    let tree_node = u64_limbs_to_felt252(limbs);
-                    eprintln!("[DIAG] tree node(0, {}) = {:?}", left_idx / 2, tree_node);
-                    if let Some(tn) = tree_node {
-                        eprintln!("[DIAG] hash matches tree node = {}", hash_result == tn);
-                    }
-                }
-
-                // Build 2-leaf CPU Merkle tree from the SAME leaf pair
-                let even_idx = left_idx & !1; // round down to even
-                let odd_idx = even_idx + 1;
-                let even_arr: [u32; 4] = replay_qm31_words[even_idx * 4..(even_idx + 1) * 4]
-                    .try_into().unwrap();
-                let odd_arr: [u32; 4] = replay_qm31_words[odd_idx * 4..(odd_idx + 1) * 4]
-                    .try_into().unwrap();
-                let even_felt = securefield_to_felt(u32s_to_secure_field(&even_arr));
-                let odd_felt = securefield_to_felt(u32s_to_secure_field(&odd_arr));
-                let cpu_hash = starknet_crypto::poseidon_hash(even_felt, odd_felt);
-                eprintln!("[DIAG] CPU poseidon_hash(leaf[{}], leaf[{}]) = {:?}", even_idx, odd_idx, cpu_hash);
-                // Convert CPU hash to canonical bytes for raw comparison
-                let cpu_hash_bytes = cpu_hash.to_bytes_be();
-                eprintln!("[DIAG] CPU hash bytes = {:02x?}", &cpu_hash_bytes[..]);
-                if let Ok(ref gpu_node_limbs) = tree_node_limbs {
-                    // Convert GPU node limbs to bytes the same way
-                    let gpu_node_felt = u64_limbs_to_felt252(gpu_node_limbs);
-                    if let Some(gnf) = gpu_node_felt {
-                        let gpu_node_bytes = gnf.to_bytes_be();
-                        eprintln!("[DIAG] GPU node bytes = {:02x?}", &gpu_node_bytes[..]);
-                        eprintln!("[DIAG] bytes match = {}", cpu_hash_bytes == gpu_node_bytes);
-                    }
-                    // Also print raw GPU limbs
-                    eprintln!("[DIAG] GPU node raw limbs = {:?}", gpu_node_limbs);
-                }
-
-                // Also check the raw limbs fed to GPU
-                let even_limbs = qm31_u32_to_u64_limbs_direct(
-                    &replay_qm31_words[even_idx * 4..(even_idx + 1) * 4]
-                );
-                let odd_limbs = qm31_u32_to_u64_limbs_direct(
-                    &replay_qm31_words[odd_idx * 4..(odd_idx + 1) * 4]
-                );
-                eprintln!("[DIAG] GPU leaf limbs[{}] = {:?}", even_idx, even_limbs);
-                eprintln!("[DIAG] GPU leaf limbs[{}] = {:?}", odd_idx, odd_limbs);
-                let even_from_limbs = u64_limbs_to_felt252(&even_limbs);
-                let odd_from_limbs = u64_limbs_to_felt252(&odd_limbs);
-                eprintln!("[DIAG] limbs→felt even = {:?}", even_from_limbs);
-                eprintln!("[DIAG] limbs→felt odd  = {:?}", odd_from_limbs);
-                if let (Some(ef), Some(of)) = (even_from_limbs, odd_from_limbs) {
-                    eprintln!("[DIAG] felt roundtrip match = {} {}", ef == even_felt, of == odd_felt);
-                }
-            }
 
             let left_siblings = build_gpu_merkle_path_with_leaf_sibling(
                 &tree, left_idx, replay_layer_size, left_merkle_sib,
