@@ -1146,14 +1146,28 @@ fn prove_mle_opening_with_commitment_qm31_u32_gpu_tree(
                 // Build 2-leaf CPU Merkle tree from the SAME leaf pair
                 let even_idx = left_idx & !1; // round down to even
                 let odd_idx = even_idx + 1;
-                let even_felt = securefield_to_felt(u32s_to_secure_field(
-                    &replay_qm31_words[even_idx * 4..(even_idx + 1) * 4]
-                ));
-                let odd_felt = securefield_to_felt(u32s_to_secure_field(
-                    &replay_qm31_words[odd_idx * 4..(odd_idx + 1) * 4]
-                ));
+                let even_arr: [u32; 4] = replay_qm31_words[even_idx * 4..(even_idx + 1) * 4]
+                    .try_into().unwrap();
+                let odd_arr: [u32; 4] = replay_qm31_words[odd_idx * 4..(odd_idx + 1) * 4]
+                    .try_into().unwrap();
+                let even_felt = securefield_to_felt(u32s_to_secure_field(&even_arr));
+                let odd_felt = securefield_to_felt(u32s_to_secure_field(&odd_arr));
                 let cpu_hash = starknet_crypto::poseidon_hash(even_felt, odd_felt);
                 eprintln!("[DIAG] CPU poseidon_hash(leaf[{}], leaf[{}]) = {:?}", even_idx, odd_idx, cpu_hash);
+                // Convert CPU hash to canonical bytes for raw comparison
+                let cpu_hash_bytes = cpu_hash.to_bytes_be();
+                eprintln!("[DIAG] CPU hash bytes = {:02x?}", &cpu_hash_bytes[..]);
+                if let Ok(ref gpu_node_limbs) = tree_node_limbs {
+                    // Convert GPU node limbs to bytes the same way
+                    let gpu_node_felt = u64_limbs_to_felt252(gpu_node_limbs);
+                    if let Some(gnf) = gpu_node_felt {
+                        let gpu_node_bytes = gnf.to_bytes_be();
+                        eprintln!("[DIAG] GPU node bytes = {:02x?}", &gpu_node_bytes[..]);
+                        eprintln!("[DIAG] bytes match = {}", cpu_hash_bytes == gpu_node_bytes);
+                    }
+                    // Also print raw GPU limbs
+                    eprintln!("[DIAG] GPU node raw limbs = {:?}", gpu_node_limbs);
+                }
 
                 // Also check the raw limbs fed to GPU
                 let even_limbs = qm31_u32_to_u64_limbs_direct(
