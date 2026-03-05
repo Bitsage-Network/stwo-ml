@@ -1571,6 +1571,9 @@ pub fn matrix_to_mle_col_major_all_padded(
             .zip(limb_chunks)
             .enumerate()
             .for_each(|(j, ((sec_col, u32_col), limb_col))| {
+                // securefield_to_felt(zero) = (1<<124), encoded as hi-limb = 1<<60.
+                // Padding limbs must match this encoding, not FieldElement::ZERO.
+                let sentinel_hi: u64 = 1u64 << 60;
                 if j < src_cols {
                     for i in 0..src_rows {
                         let val = matrix.data[i * src_cols + j].0;
@@ -1582,10 +1585,24 @@ pub fn matrix_to_mle_col_major_all_padded(
                         limb_col[i * 4 + 1] = (packed >> 64) as u64;
                         // limb_col[i*4+2] and [i*4+3] stay 0 (pre-zeroed by caller)
                     }
+                    // Padding rows: sentinel encoding for zero SecureField
+                    for i in src_rows..padded_rows {
+                        limb_col[i * 4 + 1] = sentinel_hi;
+                    }
+                } else {
+                    // Entire padding column: sentinel for all rows
+                    for i in 0..padded_rows {
+                        limb_col[i * 4 + 1] = sentinel_hi;
+                    }
                 }
-                // Padding rows/cols stay zero in all three representations
             });
     } else {
+        // Pre-fill sentinel for all padding positions.
+        // securefield_to_felt(zero) = (1<<124) → hi-limb = 1<<60.
+        let sentinel_hi: u64 = 1u64 << 60;
+        for idx in 0..n {
+            limb_buf[idx * 4 + 1] = sentinel_hi;
+        }
         for i in 0..matrix.rows {
             for j in 0..matrix.cols {
                 let idx = j * padded_rows + i;
@@ -2211,5 +2228,53 @@ mod tests {
         let root_only = commit_mle_root_only(&evals);
 
         assert_eq!(root_full, root_only);
+    }
+
+    #[test]
+    #[cfg(feature = "cuda-runtime")]
+    fn test_all_padded_limbs_match_securefield_commitment() {
+        // Verify that matrix_to_mle_col_major_all_padded produces limbs whose
+        // Merkle root matches commit_mle_root_only (SecureField CPU path).
+        // This catches the padding sentinel bug: padding limbs must encode
+        // securefield_to_felt(zero) = (1<<124), not FieldElement::ZERO.
+        use crate::crypto::mle_opening::commit_mle_root_only;
+        use crate::crypto::poseidon_merkle::PoseidonMerkleTree;
+
+        // Non-power-of-2 dimensions to ensure padding exists
+        let (rows, cols) = (3, 5);
+        let mut matrix = M31Matrix::new(rows, cols);
+        for i in 0..rows {
+            for j in 0..cols {
+                matrix.set(i, j, M31::from((i * cols + j + 1) as u32));
+            }
+        }
+
+        let padded_rows = rows.next_power_of_two(); // 4
+        let padded_cols = cols.next_power_of_two(); // 8
+        let n = padded_rows * padded_cols; // 32
+
+        let mut limb_buf = vec![0u64; n * 4];
+        let (evals_sf, _evals_u32) =
+            matrix_to_mle_col_major_all_padded(&matrix, &mut limb_buf);
+
+        // Root from SecureField path (reference)
+        let root_sf = commit_mle_root_only(&evals_sf);
+
+        // Root from limb buffer via CPU Poseidon (same as GPU path uses)
+        let leaves: Vec<starknet_ff::FieldElement> = (0..n)
+            .map(|i| {
+                let lo = limb_buf[i * 4] as u128;
+                let hi = limb_buf[i * 4 + 1] as u128;
+                let packed = lo | (hi << 64);
+                starknet_ff::FieldElement::from(packed)
+            })
+            .collect();
+        let root_limb = PoseidonMerkleTree::root_only_parallel(leaves);
+
+        assert_eq!(
+            root_sf, root_limb,
+            "Limb-buffer Merkle root must match SecureField commitment \
+             (padding sentinel mismatch)"
+        );
     }
 }
