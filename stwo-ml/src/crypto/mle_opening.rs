@@ -1062,7 +1062,7 @@ fn prove_mle_opening_with_commitment_qm31_u32_gpu_tree(
         }
 
         // Build GPU tree for this round (dropped after extracting query auth paths)
-        let tree = {
+        let (tree, replay_qm31_words) = {
             let n_leaf_hashes = cur_n / 2;
             let mut qm31_words = vec![0u32; cur_n * 4];
             executor.device.dtoh_sync_copy_into(d_current, &mut qm31_words)
@@ -1073,10 +1073,21 @@ fn prove_mle_opening_with_commitment_qm31_u32_gpu_tree(
             let d_leaf = executor.device.htod_sync_copy(&leaf_limbs)
                 .map_err(|e| format!("H2D replay limbs round {}: {:?}", round, e))?;
             drop(leaf_limbs);
-            executor.execute_poseidon252_merkle_full_tree_gpu_layers(
+            let t = executor.execute_poseidon252_merkle_full_tree_gpu_layers(
                 &d_dummy_columns, 0, Some(&d_leaf), n_leaf_hashes, &d_rc,
-            ).map_err(|e| format!("GPU Merkle replay round {}: {e}", round))?
+            ).map_err(|e| format!("GPU Merkle replay round {}: {e}", round))?;
+            (t, qm31_words)
         };
+
+        // Diagnostic: verify Phase 2 tree root matches Phase 1 root
+        if round == 0 {
+            let replay_root_limbs = tree.root_u64().map_err(|e| format!("diag root: {e}"))?;
+            let replay_root = u64_limbs_to_felt252(&replay_root_limbs)
+                .ok_or_else(|| "diag: invalid replay root".to_string())?;
+            eprintln!("[DIAG] Phase2 tree root  = {:?}", replay_root);
+            eprintln!("[DIAG] Phase1 initial_root = {:?}", initial_root);
+            eprintln!("[DIAG] roots match = {}", replay_root == initial_root);
+        }
 
         for q in 0..n_queries {
             let left_idx = round_pair_indices[round][q];
@@ -1098,6 +1109,39 @@ fn prove_mle_opening_with_commitment_qm31_u32_gpu_tree(
                 .map_err(|e| format!("download right merkle sib (round {}, query {}): {}", round, q, e))?;
             let left_merkle_sib = u32s_to_secure_field(&left_sib_words);
             let right_merkle_sib = u32s_to_secure_field(&right_sib_words);
+
+            // Diagnostic: check session reads vs bulk download consistency
+            if round == 0 && q == 0 {
+                let bulk_left = &replay_qm31_words[left_idx * 4..(left_idx + 1) * 4];
+                let bulk_sib = &replay_qm31_words[(left_idx ^ 1) * 4..(left_idx ^ 1 + 1) * 4];
+                eprintln!("[DIAG] left_idx={left_idx}, left_idx^1={}", left_idx ^ 1);
+                eprintln!("[DIAG] session left_words = {:?}", left_words);
+                eprintln!("[DIAG] bulk    left_words = {:?}", bulk_left);
+                eprintln!("[DIAG] session sib_words  = {:?}", left_sib_words);
+                eprintln!("[DIAG] bulk    sib_words  = {:?}", bulk_sib);
+                eprintln!("[DIAG] words match = {}, sib match = {}", left_words == bulk_left, left_sib_words == bulk_sib);
+
+                // Check what verifier will compute
+                let leaf_felt = securefield_to_felt(left_value);
+                let sib_felt = securefield_to_felt(left_merkle_sib);
+                let hash_result = if left_idx & 1 == 0 {
+                    poseidon_hash(leaf_felt, sib_felt)
+                } else {
+                    poseidon_hash(sib_felt, leaf_felt)
+                };
+                // Compare with tree level-0 node at left_idx / 2
+                let tree_node_limbs = tree.node_u64(0, left_idx / 2);
+                eprintln!("[DIAG] leaf_felt = {:?}", leaf_felt);
+                eprintln!("[DIAG] sib_felt  = {:?}", sib_felt);
+                eprintln!("[DIAG] hash(leaf,sib) = {:?}", hash_result);
+                if let Ok(limbs) = &tree_node_limbs {
+                    let tree_node = u64_limbs_to_felt252(limbs);
+                    eprintln!("[DIAG] tree node(0, {}) = {:?}", left_idx / 2, tree_node);
+                    if let Some(tn) = tree_node {
+                        eprintln!("[DIAG] hash matches tree node = {}", hash_result == tn);
+                    }
+                }
+            }
 
             let left_siblings = build_gpu_merkle_path_with_leaf_sibling(
                 &tree, left_idx, replay_layer_size, left_merkle_sib,
