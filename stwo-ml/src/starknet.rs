@@ -1803,6 +1803,19 @@ pub fn build_streaming_gkr_calldata(
     let all_matmul_dims = extract_matmul_dims(circuit);
     let all_dequantize_bits = extract_dequantize_bits(circuit);
 
+    // Self-verify the serialized proof data against expected Fiat-Shamir transcript.
+    // This catches Rust↔Cairo serialization mismatches before on-chain submission.
+    replay_verify_serialized_proof(
+        &all_proof_felts,
+        raw_io_data,
+        &all_matmul_dims,
+        circuit.layers.len() as u32,
+        proof.layer_proofs.len() as u32,
+        true, // packed
+    ).map_err(|e| StarknetModelError::SoundnessGate(
+        format!("streaming self-verification failed: {e}")
+    ))?;
+
     // Build per-layer metadata for batch slicing and circuit hash registration.
     // Walk layers in GKR order (output → input, same as circuit reversed).
     let mut layer_is_matmul = Vec::new();
