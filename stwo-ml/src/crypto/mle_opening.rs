@@ -1125,9 +1125,9 @@ fn prove_mle_opening_with_commitment_qm31_u32_gpu_tree(
                 let leaf_felt = securefield_to_felt(left_value);
                 let sib_felt = securefield_to_felt(left_merkle_sib);
                 let hash_result = if left_idx & 1 == 0 {
-                    poseidon_hash(leaf_felt, sib_felt)
+                    starknet_crypto::poseidon_hash(leaf_felt, sib_felt)
                 } else {
-                    poseidon_hash(sib_felt, leaf_felt)
+                    starknet_crypto::poseidon_hash(sib_felt, leaf_felt)
                 };
                 // Compare with tree level-0 node at left_idx / 2
                 let tree_node_limbs = tree.node_u64(0, left_idx / 2);
