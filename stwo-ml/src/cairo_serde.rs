@@ -2963,6 +2963,77 @@ pub fn serialize_aggregated_binding_proof(
     serialize_mle_opening_proof(&proof.opening_proof, output);
 }
 
+/// Serialize an `MleOpeningProof` using packed QM31 (1 felt per QM31 instead of 4).
+///
+/// Saves ~6 felts per query-round (left_value + right_value: 8→2) plus 3 felts for final_value.
+/// Used by the streaming weight binding path where calldata is tight.
+pub fn serialize_mle_opening_proof_packed(proof: &MleOpeningProof, output: &mut Vec<FieldElement>) {
+    // intermediate_roots: Array<felt252>
+    serialize_u32(proof.intermediate_roots.len() as u32, output);
+    for root in &proof.intermediate_roots {
+        output.push(*root);
+    }
+    // queries: Array<MleQueryProof>
+    serialize_u32(proof.queries.len() as u32, output);
+    for query in &proof.queries {
+        serialize_u32(query.initial_pair_index, output);
+        serialize_u32(query.rounds.len() as u32, output);
+        for round in &query.rounds {
+            serialize_qm31_packed(round.left_value, output);
+            serialize_qm31_packed(round.right_value, output);
+            serialize_u32(round.left_siblings.len() as u32, output);
+            for s in &round.left_siblings {
+                output.push(*s);
+            }
+            serialize_u32(round.right_siblings.len() as u32, output);
+            for s in &round.right_siblings {
+                output.push(*s);
+            }
+        }
+    }
+    // final_value: QM31
+    serialize_qm31_packed(proof.final_value, output);
+}
+
+/// Serialize an aggregated weight binding proof using packed QM31 (1 felt per QM31).
+///
+/// Reduces binding proof size by ~975 felts for a typical 1-layer Qwen3-14B proof,
+/// bringing it under the 5000-felt Starknet calldata limit for streaming submission.
+pub fn serialize_aggregated_binding_proof_packed(
+    proof: &crate::crypto::aggregated_opening::AggregatedWeightBindingProof,
+    output: &mut Vec<FieldElement>,
+) {
+    // config (u32 values — no change)
+    serialize_usize(proof.config.selector_bits, output);
+    serialize_usize(proof.config.n_max, output);
+    serialize_usize(proof.config.m_padded, output);
+    serialize_usize(proof.config.n_global, output);
+    serialize_usize(proof.config.n_claims, output);
+
+    // sumcheck_round_polys: Vec<(QM31, QM31, QM31)> — packed (3 felts/round vs 12)
+    serialize_u32(proof.sumcheck_round_polys.len() as u32, output);
+    for (c0, c1, c2) in &proof.sumcheck_round_polys {
+        serialize_qm31_packed(*c0, output);
+        serialize_qm31_packed(*c1, output);
+        serialize_qm31_packed(*c2, output);
+    }
+
+    // oracle_eval_at_s: QM31 — packed (1 felt vs 4)
+    serialize_qm31_packed(proof.oracle_eval_at_s, output);
+
+    // super_root: felt252
+    output.push(proof.super_root.root);
+
+    // subtree_roots: Array<felt252>
+    serialize_u32(proof.super_root.subtree_roots.len() as u32, output);
+    for root in &proof.super_root.subtree_roots {
+        output.push(*root);
+    }
+
+    // opening_proof: MleOpeningProof — packed
+    serialize_mle_opening_proof_packed(&proof.opening_proof, output);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

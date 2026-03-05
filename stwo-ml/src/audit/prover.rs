@@ -408,16 +408,18 @@ impl<'a> AuditProver<'a> {
             });
         }
 
-        // Input MLE finalization chunks
+        // Weight binding (packed QM31, separate TX before input MLE)
+        steps.push(StreamingVerificationStep {
+            filename: "stream_weight_binding.txt".to_string(),
+            entrypoint: "verify_gkr_stream_weight_binding".to_string(),
+            calldata: streaming.weight_binding_calldata,
+        });
+
+        // Input MLE chunks (uniform — no binding data)
         for (i, chunk) in streaming.input_mle_chunks.iter().enumerate() {
-            let entrypoint = if i == streaming.input_mle_chunks.len() - 1 {
-                "verify_gkr_stream_finalize_input_mle".to_string()
-            } else {
-                "verify_gkr_stream_finalize_input_mle".to_string()
-            };
             steps.push(StreamingVerificationStep {
                 filename: format!("stream_finalize_input_mle_{}.txt", i),
-                entrypoint,
+                entrypoint: "verify_gkr_stream_finalize_input_mle".to_string(),
                 calldata: chunk.calldata.clone(),
             });
         }

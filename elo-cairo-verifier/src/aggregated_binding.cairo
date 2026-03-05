@@ -6,7 +6,7 @@
 use core::poseidon::poseidon_hash_span;
 use crate::field::{
     QM31, qm31_add, qm31_sub, qm31_mul, qm31_eq, qm31_zero, qm31_one,
-    poly_eval_degree2, eq_eval, pack_qm31_to_felt,
+    poly_eval_degree2, eq_eval, pack_qm31_to_felt, unpack_qm31_from_felt,
 };
 use crate::channel::{
     PoseidonChannel, channel_mix_felt, channel_mix_felts, channel_mix_poly_coeffs,
@@ -458,6 +458,137 @@ fn pow2(n: u32) -> u32 {
             i += 1;
         };
         result
+    }
+}
+
+use crate::types::{MleQueryRoundData, MleQueryProof};
+
+/// Deserialize an `MleOpeningProof` from packed QM31 format (1 felt per QM31).
+///
+/// Matches `serialize_mle_opening_proof_packed()` in Rust cairo_serde.rs.
+pub fn deserialize_mle_opening_proof_packed(ref data: Span<felt252>) -> MleOpeningProof {
+
+    // intermediate_roots: Array<felt252>
+    let num_roots: u32 = Serde::<u32>::deserialize(ref data).unwrap();
+    let mut intermediate_roots: Array<felt252> = array![];
+    let mut i: u32 = 0;
+    loop {
+        if i >= num_roots {
+            break;
+        }
+        intermediate_roots.append(*data.pop_front().unwrap());
+        i += 1;
+    };
+
+    // queries: Array<MleQueryProof>
+    let num_queries: u32 = Serde::<u32>::deserialize(ref data).unwrap();
+    let mut queries: Array<MleQueryProof> = array![];
+    let mut q: u32 = 0;
+    loop {
+        if q >= num_queries {
+            break;
+        }
+        let initial_pair_index: u32 = Serde::<u32>::deserialize(ref data).unwrap();
+        let num_rounds: u32 = Serde::<u32>::deserialize(ref data).unwrap();
+        let mut rounds: Array<MleQueryRoundData> = array![];
+        let mut r: u32 = 0;
+        loop {
+            if r >= num_rounds {
+                break;
+            }
+            let left_value = unpack_qm31_from_felt(*data.pop_front().unwrap());
+            let right_value = unpack_qm31_from_felt(*data.pop_front().unwrap());
+            // left_siblings
+            let num_left: u32 = Serde::<u32>::deserialize(ref data).unwrap();
+            let mut left_siblings: Array<felt252> = array![];
+            let mut ls: u32 = 0;
+            loop {
+                if ls >= num_left {
+                    break;
+                }
+                left_siblings.append(*data.pop_front().unwrap());
+                ls += 1;
+            };
+            // right_siblings
+            let num_right: u32 = Serde::<u32>::deserialize(ref data).unwrap();
+            let mut right_siblings: Array<felt252> = array![];
+            let mut rs: u32 = 0;
+            loop {
+                if rs >= num_right {
+                    break;
+                }
+                right_siblings.append(*data.pop_front().unwrap());
+                rs += 1;
+            };
+            rounds.append(MleQueryRoundData { left_value, right_value, left_siblings, right_siblings });
+            r += 1;
+        };
+        queries.append(MleQueryProof { initial_pair_index, rounds });
+        q += 1;
+    };
+
+    // final_value: QM31
+    let final_value = unpack_qm31_from_felt(*data.pop_front().unwrap());
+
+    MleOpeningProof { intermediate_roots, queries, final_value }
+}
+
+/// Deserialize an `AggregatedWeightBindingProof` from packed QM31 format.
+///
+/// Matches `serialize_aggregated_binding_proof_packed()` in Rust cairo_serde.rs.
+/// All QM31 values are packed as 1 felt instead of 4, reducing calldata by ~975 felts.
+pub fn deserialize_binding_proof_packed(ref data: Span<felt252>) -> AggregatedWeightBindingProof {
+    // Config (5 × u32)
+    let selector_bits: u32 = Serde::<u32>::deserialize(ref data).unwrap();
+    let n_max: u32 = Serde::<u32>::deserialize(ref data).unwrap();
+    let m_padded: u32 = Serde::<u32>::deserialize(ref data).unwrap();
+    let n_global: u32 = Serde::<u32>::deserialize(ref data).unwrap();
+    let n_claims: u32 = Serde::<u32>::deserialize(ref data).unwrap();
+    let config = AggregatedBindingConfig { selector_bits, n_max, m_padded, n_global, n_claims };
+
+    // Sumcheck round polys: packed QM31 triples
+    let num_rounds: u32 = Serde::<u32>::deserialize(ref data).unwrap();
+    let mut round_polys: Array<(QM31, QM31, QM31)> = array![];
+    let mut i: u32 = 0;
+    loop {
+        if i >= num_rounds {
+            break;
+        }
+        let c0 = unpack_qm31_from_felt(*data.pop_front().unwrap());
+        let c1 = unpack_qm31_from_felt(*data.pop_front().unwrap());
+        let c2 = unpack_qm31_from_felt(*data.pop_front().unwrap());
+        round_polys.append((c0, c1, c2));
+        i += 1;
+    };
+
+    // Oracle eval at s: packed QM31
+    let oracle_eval_at_s = unpack_qm31_from_felt(*data.pop_front().unwrap());
+
+    // Super root: felt252
+    let super_root: felt252 = *data.pop_front().unwrap();
+
+    // Subtree roots: Array<felt252>
+    let num_subtrees: u32 = Serde::<u32>::deserialize(ref data).unwrap();
+    let mut subtree_roots: Array<felt252> = array![];
+    let mut j: u32 = 0;
+    loop {
+        if j >= num_subtrees {
+            break;
+        }
+        subtree_roots.append(*data.pop_front().unwrap());
+        j += 1;
+    };
+
+    // Opening proof: packed MLE opening
+    let opening_proof = deserialize_mle_opening_proof_packed(ref data);
+
+    AggregatedWeightBindingProof {
+        config,
+        round_polys,
+        oracle_eval_at_s,
+        super_root,
+        subtree_roots,
+        opening_proof,
     }
 }
 

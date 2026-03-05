@@ -2104,6 +2104,7 @@ fn main() {
                                                     })
                                                 }).collect::<Vec<_>>(),
                                                 "stream_batches": batch_json,
+                                                "weight_binding_calldata": streaming.weight_binding_calldata,
                                                 "input_mle_chunks": streaming.input_mle_chunks.iter().map(|c| {
                                                     serde_json::json!({
                                                         "chunk_offset": c.chunk_offset,

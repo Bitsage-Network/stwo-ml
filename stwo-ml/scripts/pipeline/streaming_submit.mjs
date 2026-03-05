@@ -5,8 +5,9 @@
 //   1. stream_init    — opens session, returns session_id
 //   2. stream_layers  — N batches of layer proofs (parallelizable)
 //   3. stream_output_mle — M chunks of output MLE data
-//   4. stream_finalize_input_mle — weight binding + input MLE
-//   5. stream_finalize — final check + proof recording
+//   4. stream_weight_binding — packed aggregated binding verification
+//   5. stream_finalize_input_mle — input MLE chunks
+//   6. stream_finalize — final check + proof recording
 //
 // Usage:
 //   node streaming_submit.mjs \
@@ -159,6 +160,16 @@ function discoverSteps(dir) {
       name: f.replace(".txt", ""),
       file: f,
       entrypoint: "verify_gkr_stream_init_output_mle",
+    });
+  }
+
+  // Weight binding (packed QM31, separate TX before input MLE)
+  const weightBinding = files.find((f) => f.startsWith("stream_weight_binding"));
+  if (weightBinding) {
+    steps.push({
+      name: "stream_weight_binding",
+      file: weightBinding,
+      entrypoint: "verify_gkr_stream_weight_binding",
     });
   }
 

@@ -1635,9 +1635,12 @@ pub struct StreamingGkrCalldata {
     pub output_mle_chunks: Vec<OutputMleChunk>,
     /// Batches of layer proof data for verify_gkr_stream_layers.
     pub stream_batches: Vec<StreamBatch>,
+    /// Calldata for verify_gkr_stream_weight_binding (packed QM31 binding proof).
+    /// Separated from input MLE to stay under 5000-felt calldata limit.
+    pub weight_binding_calldata: Vec<String>,
     /// Chunked calldata for verify_gkr_stream_finalize_input_mle.
-    /// First chunk includes weight binding + IO commitment data.
-    /// Subsequent chunks are pure input MLE partial evaluation.
+    /// All chunks are uniform: session_id + packed_input_data + chunk metadata.
+    /// Weight binding is handled by a prior verify_gkr_stream_weight_binding TX.
     pub input_mle_chunks: Vec<InputMleChunk>,
     /// Calldata for verify_gkr_stream_finalize (just session_id).
     pub finalize_calldata: Vec<String>,
@@ -1982,12 +1985,12 @@ pub fn build_streaming_gkr_calldata(
                 .to_string(),
         ));
     }
-    let binding_data = starknet_weight_binding_data(proof)?;
-    let mut weight_binding_calldata: Vec<String> = Vec::new();
-    weight_binding_calldata.push(format!("{}", binding_mode));
-    weight_binding_calldata.push(format!("{}", binding_data.len()));
+    let binding_data = starknet_weight_binding_data_packed(proof)?;
+    let mut weight_binding_mode_and_data: Vec<String> = Vec::new();
+    weight_binding_mode_and_data.push(format!("{}", binding_mode));
+    weight_binding_mode_and_data.push(format!("{}", binding_data.len()));
     for bd in &binding_data {
-        weight_binding_calldata.push(bd.clone());
+        weight_binding_mode_and_data.push(bd.clone());
     }
 
     // deferred_proof_data
@@ -2035,18 +2038,25 @@ pub fn build_streaming_gkr_calldata(
         }
     }
 
-    // IO data for commitment re-verification (first input MLE chunk only)
-    let mut io_commitment_calldata: Vec<String> = Vec::new();
-    io_commitment_calldata.push(format!("{}", raw_io_data.len())); // original_io_len
-    io_commitment_calldata.push(format!("{}", packed_io.len()));   // packed_raw_io len
-    for f in &packed_io {
-        io_commitment_calldata.push(format!("0x{:x}", f));
-    }
+    // ── Build weight binding calldata (separate TX, packed QM31) ──
+    // This is a dedicated TX that verifies weight binding before input MLE chunks.
+    // Using packed QM31 keeps it under the 5000-felt Starknet calldata limit.
+    let mut wb_calldata: Vec<String> = Vec::new();
+    wb_calldata.push("__SESSION_ID__".to_string());
+    wb_calldata.extend(weight_expected_values);
+    wb_calldata.extend(weight_eval_points);
+    wb_calldata.extend(deferred_eval_points);
+    wb_calldata.extend(weight_binding_mode_and_data);
+    wb_calldata.extend(deferred_proof_calldata);
+    wb_calldata.extend(deferred_dims_calldata);
+    eprintln!(
+        "[streaming] weight_binding calldata: {} felts (limit: 5000)",
+        wb_calldata.len()
+    );
 
     // ── Build chunked input MLE calldata ──
-    // Split input data into chunks of INPUT_MLE_CHUNK_SIZE M31 values.
-    // First chunk carries weight binding + IO commitment data.
-    // Subsequent chunks are pure input MLE partial evaluation.
+    // All chunks are uniform: session_id + packed_input_data + chunk metadata.
+    // Weight binding is handled by a prior verify_gkr_stream_weight_binding TX.
     const INPUT_MLE_CHUNK_SIZE: u32 = 1024;
     let input_start = 3usize; // skip [in_rows, in_cols, in_len] header
     let input_end = input_start + io_in_len;
@@ -2077,28 +2087,6 @@ pub fn build_streaming_gkr_calldata(
         calldata.push(format!("{}", chunk_len));
         calldata.push(if is_last { "1".to_string() } else { "0".to_string() });
 
-        if chunk_idx == 0 {
-            // First chunk: include weight binding + eval points + deferred proofs + IO commitment
-            calldata.extend(weight_expected_values.clone());
-            calldata.extend(weight_eval_points.clone());
-            calldata.extend(deferred_eval_points.clone());
-            calldata.extend(weight_binding_calldata.clone());
-            calldata.extend(deferred_proof_calldata.clone());
-            calldata.extend(deferred_dims_calldata.clone());
-            calldata.extend(io_commitment_calldata.clone());
-        } else {
-            // Subsequent chunks: empty weight/deferred/IO arrays
-            calldata.push("0".to_string()); // weight_expected_values: empty array
-            calldata.push("0".to_string()); // weight_eval_points: empty array
-            calldata.push("0".to_string()); // deferred_eval_points: empty array
-            calldata.push("0".to_string()); // weight_binding_mode: 0 (ignored)
-            calldata.push("0".to_string()); // weight_binding_data: empty array
-            calldata.push("0".to_string()); // deferred_proof_data: empty array
-            calldata.push("0".to_string()); // deferred_matmul_dims: empty array
-            calldata.push("0".to_string()); // original_io_len: 0 (ignored)
-            calldata.push("0".to_string()); // packed_raw_io: empty array
-        }
-
         input_mle_chunks.push(InputMleChunk {
             chunk_offset,
             chunk_len,
@@ -2121,6 +2109,7 @@ pub fn build_streaming_gkr_calldata(
         init_calldata,
         output_mle_chunks,
         stream_batches,
+        weight_binding_calldata: wb_calldata,
         input_mle_chunks,
         finalize_calldata,
         session_metadata: StreamSessionMetadata {
@@ -2199,6 +2188,36 @@ fn starknet_weight_binding_data(
                     .to_string(),
             ))
         }
+    }
+}
+
+/// Packed variant of `starknet_weight_binding_data` — uses packed QM31 (1 felt per QM31)
+/// for the aggregated binding proof, reducing calldata by ~975 felts.
+fn starknet_weight_binding_data_packed(
+    proof: &crate::gkr::GKRProof,
+) -> Result<Vec<String>, StarknetModelError> {
+    use crate::gkr::types::WeightOpeningTranscriptMode;
+
+    match proof.weight_opening_transcript_mode {
+        WeightOpeningTranscriptMode::AggregatedOracleSumcheck => {
+            if let Some(binding) = proof.aggregated_binding.as_ref() {
+                let mut payload = Vec::new();
+                crate::cairo_serde::serialize_aggregated_binding_proof_packed(
+                    binding, &mut payload,
+                );
+                Ok(payload.into_iter().map(|f| format!("0x{:x}", f)).collect())
+            } else {
+                Err(StarknetModelError::SoundnessGate(
+                    "Streaming GKR requires full aggregated binding proof (packed). \
+                     RLC-only is not supported."
+                        .to_string(),
+                ))
+            }
+        }
+        _ => Err(StarknetModelError::SoundnessGate(
+            "Streaming GKR only supports AggregatedOracleSumcheck (mode 4) binding."
+                .to_string(),
+        )),
     }
 }
 
@@ -7689,17 +7708,22 @@ mod tests {
         let streaming = build_streaming_gkr_calldata(gkr, &circuit, model_id, &raw_io)
             .expect("streaming calldata should build with full binding");
 
-        // First input MLE chunk should contain weight binding data (not just 2-felt RLC marker)
+        // Weight binding calldata should contain packed binding proof data
+        assert!(
+            streaming.weight_binding_calldata.len() > 20,
+            "weight_binding_calldata should contain substantial packed binding proof, got {} felts",
+            streaming.weight_binding_calldata.len(),
+        );
+
+        // Input MLE chunks should be lightweight (no binding data)
         assert!(
             !streaming.input_mle_chunks.is_empty(),
             "should have at least one input MLE chunk"
         );
         let first_chunk = &streaming.input_mle_chunks[0];
-        // The binding data is embedded in the calldata; with a full proof it should be
-        // significantly larger than the 2-felt RLC marker
         assert!(
-            first_chunk.calldata.len() > 20,
-            "first chunk should contain substantial binding proof data, got {} felts",
+            first_chunk.calldata.len() < 20,
+            "first input MLE chunk should be small (no binding data), got {} felts",
             first_chunk.calldata.len(),
         );
     }
@@ -7806,12 +7830,11 @@ mod tests {
         let streaming = build_streaming_gkr_calldata(gkr, &circuit, model_id, &raw_io)
             .expect("streaming calldata should build");
 
-        // First chunk calldata should be larger than without eval points
-        let first_chunk = &streaming.input_mle_chunks[0];
+        // Weight binding calldata should contain eval points + binding proof
         assert!(
-            first_chunk.calldata.len() > 30,
-            "first chunk should contain eval points + binding proof, got {} felts",
-            first_chunk.calldata.len(),
+            streaming.weight_binding_calldata.len() > 30,
+            "weight_binding_calldata should contain eval points + binding proof, got {} felts",
+            streaming.weight_binding_calldata.len(),
         );
     }
 
