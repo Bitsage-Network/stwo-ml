@@ -1524,10 +1524,9 @@ fn main() {
                         memory_budget,
                     )
                     .map_err(|e| {
-                        stwo_ml::compiler::prove::ModelError::ProvingError {
-                            layer: 0,
-                            message: format!("Multi-GPU chunked proving: {e}"),
-                        }
+                        stwo_ml::aggregation::AggregationError::ProvingError(
+                            format!("Multi-GPU chunked proving: {e}"),
+                        )
                     })?;
 
                 eprintln!(
@@ -1552,10 +1551,9 @@ fn main() {
                     &input,
                     &model.weights,
                 )
-                .map_err(|e| stwo_ml::compiler::prove::ModelError::ProvingError {
-                    layer: 0,
-                    message: format!("Chunk composition: {e}"),
-                })
+                .map_err(|e| stwo_ml::aggregation::AggregationError::ProvingError(
+                    format!("Chunk composition: {e}"),
+                ))
             }
             #[cfg(not(feature = "multi-gpu"))]
             {
