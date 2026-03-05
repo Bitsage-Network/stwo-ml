@@ -909,9 +909,34 @@ fn eval_unified_oracle_3way_gpu(
                 results[k] = results[k] + sel_weights[k] * w_val;
             }
         } else {
-            // Branching variable is in the local region.
+            // Branching variable is in the local region (or padding).
+            let local_offset = config.n_max - n_vars;
+            let branch_in_local = branch_pos.saturating_sub(config.selector_bits);
+
+            if branch_in_local < local_offset {
+                // Branch is in the padding zone for this matrix — MLE eval is
+                // identical for all 3 t-values. Evaluate once, multiply by weights.
+                let w_val = if n_vars < GPU_MLE_THRESHOLD {
+                    let mle = source.get_mle(i);
+                    evaluate_mle_at(&mle, local_truncated_0)
+                } else {
+                    let mle_u32 = source.get_mle_u32(i);
+                    executor
+                        .evaluate_mle_at_gpu_u32(&mle_u32, local_truncated_0)
+                        .unwrap_or_else(|e| {
+                            eprintln!("[GPU] padding fallback for matrix {i}: {e:?}");
+                            let mle = source.get_mle(i);
+                            evaluate_mle_at(&mle, local_truncated_0)
+                        })
+                };
+                for k in 0..3 {
+                    results[k] = results[k] + sel_weights[k] * w_val;
+                }
+                continue;
+            }
+
             // Upload MLE once, fold shared prefix, clone+fork for the 3 branch values.
-            let local_branch_pos = branch_pos - config.selector_bits - (config.n_max - n_vars);
+            let local_branch_pos = branch_in_local - local_offset;
 
             if n_vars < GPU_MLE_THRESHOLD {
                 // CPU fallback for small MLEs
