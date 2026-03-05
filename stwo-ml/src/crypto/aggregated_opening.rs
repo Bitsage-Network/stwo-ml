@@ -1613,8 +1613,8 @@ fn build_virtual_mle_u32_streaming(
 
 /// Build the virtual MLE (SecureField) slot-by-slot from a streaming source.
 ///
-/// Used for CPU-only (non-CUDA) path. Each matrix MLE is loaded, copied, and dropped.
-#[cfg(not(feature = "cuda-runtime"))]
+/// Each matrix MLE is loaded, copied into the virtual MLE slot, and dropped.
+/// Used by both CPU and GPU paths for the single opening proof against the super-root.
 fn build_virtual_mle_streaming(
     source: &dyn WeightSource,
     config: &AggregatedBindingConfig,
