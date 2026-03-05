@@ -5,7 +5,7 @@ const RPC_URL = 'https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_
 const ACCOUNT_ADDRESS = '0x0759a4374389b0e3cfcc59d49310b6bc75bb12bbf8ce550eb5c2f026918bb344';
 const PRIVATE_KEY = '0x0154de503c7553e078b28044f15b60323899d9437bd44e99d9ab629acbada47a';
 const CONTRACT_ADDRESS = '0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005';
-const NEW_CLASS_HASH = '0x77ccc67d7ba2bc1102d7c5c5d1ddf1bc697c709721ac452529c1bb1002fd1f3';
+const NEW_CLASS_HASH = '0x4859cb47fd9a8fb94bb9c0b36a49c85e5f4aaeef7abfba7646916e882cc1d9a';
 
 const provider = new RpcProvider({ nodeUrl: RPC_URL });
 const signer = new Signer(PRIVATE_KEY);
