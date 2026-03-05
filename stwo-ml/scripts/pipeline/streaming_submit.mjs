@@ -37,7 +37,7 @@
 //   STARKNET_PRIVATE_KEY  — private key
 //   AVNU_API_KEY          — Avnu API key (sponsored mode only)
 
-import { Account, RpcProvider, PaymasterRpc } from "starknet";
+import { Account, RpcProvider } from "starknet";
 import { readFileSync, readdirSync } from "fs";
 
 // ── Config ───────────────────────────────────────────────────────────
@@ -275,6 +275,7 @@ async function main() {
   };
 
   if (opts.mode !== "direct") {
+    const { PaymasterRpc } = await import("starknet");
     const paymasterOpts = { nodeUrl: paymasterUrl };
     if (opts.mode === "sponsored" && opts.apiKey) {
       paymasterOpts.headers = { "x-paymaster-api-key": opts.apiKey };
