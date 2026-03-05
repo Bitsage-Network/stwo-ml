@@ -1678,63 +1678,37 @@ pub fn prove_aggregated_binding_streaming(
         }
     };
 
-    // 4. Per-matrix openings (each matrix fits on GPU individually)
-    //    Replaces the 16GB virtual MLE with per-matrix proofs (~2GB each).
-    let selector = &challenge_point[..config.selector_bits];
-    let local = &challenge_point[config.selector_bits..];
-    let t_opening = std::time::Instant::now();
-
-    let mut per_matrix_evals = Vec::with_capacity(source.len());
-    let mut per_matrix_openings = Vec::with_capacity(source.len());
-
-    for i in 0..source.len() {
-        let n_vars = claim_n_vars[i];
-        let local_truncated = &local[config.n_max - n_vars..];
-
-        let mle_u32 = source.get_mle_u32(i);
-        let (commitment, opening_proof) = prove_mle_opening_with_commitment_qm31_u32(
-            &mle_u32,
-            local_truncated,
-            channel,
-        );
-        assert_eq!(
-            commitment, claims[i].commitment,
-            "Per-matrix commitment mismatch for matrix {i}: prover_root={commitment:?}, claim_root={:?}",
-            claims[i].commitment
-        );
-
-        // Evaluate MLE at challenge point for oracle_eval reconstruction
-        let mle = source.get_mle(i);
-        let w_val = evaluate_mle_at(&mle, local_truncated);
-        per_matrix_evals.push(w_val);
-        per_matrix_openings.push(opening_proof);
-    }
-
-    // Reconstruct oracle_eval = Σ sel_weight(i) * w_val(i)
-    let mut oracle_eval = SecureField::zero();
-    for i in 0..source.len() {
-        let sel_weight = compute_selector_weight(i, selector, &config);
-        oracle_eval = oracle_eval + sel_weight * per_matrix_evals[i];
-    }
+    // 4. Oracle eval at challenge point (streaming — loads one matrix at a time)
+    let oracle_eval =
+        eval_unified_oracle_streaming(&challenge_point, source, &claim_n_vars, &config);
     channel.mix_felts(&[oracle_eval]);
 
+    // 5. Build virtual MLE and prove single opening against super-root.
+    //    This matches the Cairo verifier which expects a single MLE opening proof
+    //    against the super-root (not per-matrix openings).
+    //    Memory cost: ~2^n_global × 16 bytes (e.g. ~4GB for 4 matrices of Qwen3-14B 1-layer).
+    let t_opening = std::time::Instant::now();
+    let virtual_mle = build_virtual_mle_streaming(source, &config);
     eprintln!(
-        "[GPU] per-matrix openings: {} proofs in {:.1}s",
-        source.len(),
+        "[GPU] virtual MLE built: {} elements ({:.1} GB) in {:.1}s",
+        virtual_mle.len(),
+        (virtual_mle.len() * std::mem::size_of::<SecureField>()) as f64 / 1e9,
         t_opening.elapsed().as_secs_f64()
     );
-
-    // Dummy opening_proof for backward compat (unused when per_matrix_openings is set)
-    let dummy_opening = per_matrix_openings[0].clone();
+    let opening_proof = prove_mle_opening(&virtual_mle, &challenge_point, channel);
+    eprintln!(
+        "[GPU] single virtual MLE opening: {:.1}s total",
+        t_opening.elapsed().as_secs_f64()
+    );
 
     AggregatedWeightBindingProof {
         config,
         sumcheck_round_polys: round_polys,
         oracle_eval_at_s: oracle_eval,
-        opening_proof: dummy_opening,
+        opening_proof,
         super_root,
-        per_matrix_openings: Some(per_matrix_openings),
-        per_matrix_evals: Some(per_matrix_evals),
+        per_matrix_openings: None,
+        per_matrix_evals: None,
     }
 }
 
