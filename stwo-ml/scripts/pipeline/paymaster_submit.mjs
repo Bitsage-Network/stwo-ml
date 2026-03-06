@@ -21,7 +21,7 @@
 //   STARKNET_PRIVATE_KEY  — account private key (overridden by --private-key)
 //   AVNU_API_KEY          — Avnu API key (only needed for --mode sponsored)
 
-import { Account, RpcProvider, PaymasterRpc } from "starknet";
+import { Account, RpcProvider, PaymasterRpc, Signer } from "starknet";
 import { readFileSync } from "fs";
 
 // ─── Config ──────────────────────────────────────────────────────────
@@ -32,7 +32,7 @@ const PAYMASTER_URLS = {
 
 const RPC_URLS = {
   mainnet: "https://json-rpc.starknet-mainnet.public.lavanet.xyz",
-  sepolia: "https://rpc.starknet-testnet.lava.build",
+  sepolia: process.env.STARKNET_RPC || "https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_8/GUBwFqKhSgn4mwVbN6Sbn",
 };
 
 // STRK token address (same on mainnet and sepolia)
@@ -128,7 +128,7 @@ async function main() {
 
   if (opts.mode === "direct") {
     // ─── Direct execution (account pays gas in STRK) ──────────────
-    const account = new Account({ provider, address: opts.accountAddress, signer: opts.privateKey });
+    const account = new Account({ provider, address: opts.accountAddress, signer: new Signer(opts.privateKey) });
     console.error(`  Executing directly...`);
     const result = await account.execute(calls);
     txHash = result.transaction_hash;
@@ -151,7 +151,7 @@ async function main() {
     const account = new Account({
       provider,
       address: opts.accountAddress,
-      signer: opts.privateKey,
+      signer: new Signer(opts.privateKey),
       paymaster,
     });
 

@@ -2,12 +2,12 @@
 // Streaming multi-TX submission with exponential backoff retry.
 //
 // Orchestrates the multi-step GKR streaming verification flow:
-//   1. stream_init    — opens session, returns session_id
-//   2. stream_layers  — N batches of layer proofs (parallelizable)
-//   3. stream_output_mle — M chunks of output MLE data
+//   1. stream_init           — opens session, returns session_id
+//   2. stream_output_mle     — M chunks of output MLE data (MUST be before layers)
+//   3. stream_layers         — N batches of layer proofs
 //   4. stream_weight_binding — packed aggregated binding verification
 //   5. stream_finalize_input_mle — input MLE chunks
-//   6. stream_finalize — final check + proof recording
+//   6. stream_finalize       — final check + proof recording
 //
 // Usage:
 //   node streaming_submit.mjs \
@@ -37,7 +37,7 @@
 //   STARKNET_PRIVATE_KEY  — private key
 //   AVNU_API_KEY          — Avnu API key (sponsored mode only)
 
-import { Account, RpcProvider } from "starknet";
+import { Account, RpcProvider, Signer } from "starknet";
 import { readFileSync, readdirSync } from "fs";
 
 // ── Config ───────────────────────────────────────────────────────────
@@ -49,7 +49,7 @@ const PAYMASTER_URLS = {
 
 const RPC_URLS = {
   mainnet: "https://json-rpc.starknet-mainnet.public.lavanet.xyz",
-  sepolia: "https://rpc.starknet-testnet.lava.build",
+  sepolia: process.env.STARKNET_RPC || "https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_8/GUBwFqKhSgn4mwVbN6Sbn",
 };
 
 const STRK_TOKEN =
@@ -133,21 +133,11 @@ function discoverSteps(dir) {
   const files = readdirSync(dir).filter((f) => f.endsWith(".txt")).sort();
   const steps = [];
 
-  // Order: init, layers (sorted), output_mle (sorted), finalize_input_mle, finalize
+  // Order: init, output_mle (sorted), layers (sorted), weight_binding, finalize_input_mle, finalize
   const init = files.find((f) => f.startsWith("stream_init"));
   if (init) steps.push({ name: "stream_init", file: init, entrypoint: "verify_gkr_stream_init" });
 
-  const layers = files
-    .filter((f) => f.startsWith("stream_layers_"))
-    .sort((a, b) => {
-      const na = parseInt(a.match(/(\d+)/)?.[1] || "0", 10);
-      const nb = parseInt(b.match(/(\d+)/)?.[1] || "0", 10);
-      return na - nb;
-    });
-  for (const f of layers) {
-    steps.push({ name: f.replace(".txt", ""), file: f, entrypoint: "verify_gkr_stream_layers" });
-  }
-
+  // Output MLE must come BEFORE layers (channel state dependency)
   const outputMle = files
     .filter((f) => f.startsWith("stream_output_mle_"))
     .sort((a, b) => {
@@ -161,6 +151,17 @@ function discoverSteps(dir) {
       file: f,
       entrypoint: "verify_gkr_stream_init_output_mle",
     });
+  }
+
+  const layers = files
+    .filter((f) => f.startsWith("stream_layers_"))
+    .sort((a, b) => {
+      const na = parseInt(a.match(/(\d+)/)?.[1] || "0", 10);
+      const nb = parseInt(b.match(/(\d+)/)?.[1] || "0", 10);
+      return na - nb;
+    });
+  for (const f of layers) {
+    steps.push({ name: f.replace(".txt", ""), file: f, entrypoint: "verify_gkr_stream_layers" });
   }
 
   // Weight binding (packed QM31, separate TX before input MLE)
@@ -268,7 +269,8 @@ async function main() {
 
   const provider = new RpcProvider({ nodeUrl: rpcUrl });
 
-  const account = new Account(provider, opts.accountAddress, opts.privateKey);
+  const signer = new Signer(opts.privateKey);
+  const account = new Account({ provider, address: opts.accountAddress, signer });
 
   // Discover streaming steps from calldata directory
   const steps = discoverSteps(opts.calldataDir);
@@ -309,24 +311,28 @@ async function main() {
       step.name
     );
 
-    // Extract session_id from init step return value
+    // Extract session_id from init step event.
+    // session_id is #[key] in GkrSessionOpened event, so it's in keys[1]
+    // (keys[0] is the event selector hash).
     if (step.name === "stream_init" && !sessionId) {
-      // The session_id is typically the first return value.
-      // For now, read it from the transaction receipt events.
       try {
         const receipt = await provider.getTransactionReceipt(txHash);
         if (receipt.events && receipt.events.length > 0) {
-          // Session ID is usually in the first event's data
-          const firstEvent = receipt.events[0];
-          if (firstEvent.data && firstEvent.data.length > 0) {
-            sessionId = firstEvent.data[0];
+          const evt = receipt.events[0];
+          sessionId = evt.keys?.[1] || evt.data?.[0];
+          if (sessionId) {
             console.error(`  Session ID: ${sessionId}`);
           }
         }
+        if (!sessionId) {
+          console.error("  FATAL: Could not extract session_id from init receipt!");
+          process.exit(1);
+        }
       } catch (e) {
         console.error(
-          `  Warning: could not extract session_id from receipt: ${e.message}`
+          `  FATAL: could not extract session_id from receipt: ${e.message}`
         );
+        process.exit(1);
       }
     }
 

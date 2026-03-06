@@ -125,6 +125,55 @@ For direct model proving without the audit pipeline, use `--format ml_gkr`:
   --output proof.json
 ```
 
+### Submit on-chain (streaming multi-TX)
+
+For proofs that exceed single-TX calldata limits, use the streaming pipeline.
+This is the primary submission path for production proofs.
+
+```bash
+# 1. Generate the proof (on GPU)
+./target/release/prove-model \
+  --model-dir ~/.obelysk/models/qwen3-14b \
+  --layers 1 \
+  --gkr \
+  --format ml_gkr \
+  --output proof.json
+
+# 2. Register model + open session + upload + submit all verification steps
+node scripts/pipeline/register_and_submit.mjs proof.json
+```
+
+On subsequent runs with the same model, skip registration:
+
+```bash
+node scripts/pipeline/register_and_submit.mjs proof.json --skip-register
+```
+
+The script handles 18 transactions in sequence:
+
+| Phase | TXs | Description |
+|-------|-----|-------------|
+| Session management | 4 | open_gkr_session, upload 2 chunks, seal |
+| Verification | 14 | init, output_mle x5, layers x1, weight_binding, input_mle x5, finalize |
+
+**Step ordering is critical.** The protocol requires:
+`init` -> `output_mle` (all chunks) -> `layers` (all batches) -> `weight_binding` -> `input_mle` (all chunks) -> `finalize`
+
+Output MLE **must** come before layers due to channel state dependencies.
+
+**Environment variables:**
+
+| Variable | Description |
+|----------|-------------|
+| `STARKNET_ACCOUNT` | Account address (defaults to deployer) |
+| `STARKNET_PRIVATE_KEY` | Account private key |
+| `STARKNET_RPC` | RPC endpoint URL |
+| `CONTRACT_ADDRESS` | Verifier contract address |
+
+**Contract info (Sepolia):**
+- Contract: `0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005`
+- Current class (v31): `0x6a6b7a75d5ec1f63d715617d352bc0d353042b2a033d98fa28ffbaf6c5b5439`
+
 ### Pre-warm weight cache
 
 First-time proving computes Merkle roots for all weight matrices (~60s for Qwen3-14B).
@@ -200,7 +249,14 @@ Subsequent runs will load cached roots in <1ms.
 **GPU OOM during proving**: Lower `STWO_GPU_MERKLE_THRESHOLD` (e.g., `export STWO_GPU_MERKLE_THRESHOLD=2048`).
 
 **Streaming submission fails**: Ensure `STARKNET_ACCOUNT`, `STARKNET_PRIVATE_KEY` are set,
-and `node` (v18+) is available for the paymaster scripts.
+and `node` (v18+) is available for the paymaster scripts. Check that the account has
+sufficient STRK balance (~5-8 STRK for the 18 TXs). Install starknet.js: `npm install starknet`.
+
+**BINDING_SUPER_ROOT_FAILED**: The contract class is outdated. Upgrade to v31+
+(`0x6a6b7a75d5ec1f63d715617d352bc0d353042b2a033d98fa28ffbaf6c5b5439`).
+
+**Streaming steps fail mid-way**: You can resume by passing `--skip-register --skip-session`
+with the `SESSION_ID` env var set to the session ID from the open_gkr_session TX.
 
 ## Environment Variables
 

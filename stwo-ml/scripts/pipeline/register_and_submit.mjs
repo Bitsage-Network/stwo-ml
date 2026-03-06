@@ -22,7 +22,7 @@ import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-const RPC_URL = "https://rpc.starknet-testnet.lava.build";
+const RPC_URL = process.env.STARKNET_RPC || "https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_8/GUBwFqKhSgn4mwVbN6Sbn";
 const CONTRACT =
   process.env.CONTRACT_ADDRESS ||
   "0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005";
@@ -126,26 +126,38 @@ async function main() {
   // Step 2: Open session + upload + seal
   let sessionId;
   if (!skipSession) {
-    // Open session
+    // Open session (7 params: model_id, total_felts, circuit_depth, num_layers, weight_binding_mode, packed, io_packed)
     const totalFelts = vc.total_felts;
-    const numChunks = vc.num_chunks;
-    console.log(`\nOpening GKR session: ${totalFelts} felts, ${numChunks} chunks`);
+    const circuitDepth = vc.circuit_depth || 8;
+    const numLayers = (vc.layer_tags || []).length || circuitDepth;
+    const weightBindingMode = vc.weight_binding_mode || 4;
+    const packed = vc.packed ? 1 : 0;
+    const ioPacked = vc.io_packed ? 1 : 0;
+    console.log(`\nOpening GKR session: ${totalFelts} felts, depth=${circuitDepth}, layers=${numLayers}, binding_mode=${weightBindingMode}`);
     const openTx = await account.execute({
       contractAddress: CONTRACT,
       entrypoint: "open_gkr_session",
       calldata: CallData.compile({
         model_id: modelId,
         total_felts: totalFelts,
-        num_chunks: numChunks,
+        circuit_depth: circuitDepth,
+        num_layers: numLayers,
+        weight_binding_mode: weightBindingMode,
+        packed: packed,
+        io_packed: ioPacked,
       }),
     });
     console.log(`  open TX: ${openTx.transaction_hash}`);
     const receipt = await provider.waitForTransaction(openTx.transaction_hash);
 
     // Extract session_id from events
+    // session_id is #[key] in GkrSessionOpened, so it's in keys[1] (keys[0] is event selector)
     if (receipt.events && receipt.events.length > 0) {
-      sessionId = receipt.events[0].data[0];
+      const evt = receipt.events[0];
+      sessionId = evt.keys?.[1] || evt.data?.[0];
       console.log(`  Session ID: ${sessionId}`);
+      console.log(`  Event keys: ${JSON.stringify(evt.keys)}`);
+      console.log(`  Event data: ${JSON.stringify(evt.data)}`);
     } else {
       console.error("  Could not extract session ID from receipt!");
       process.exit(1);
@@ -158,8 +170,8 @@ async function main() {
       console.log(`  Uploading chunk ${i + 1}/${chunks.length} (${chunk.length} felts)`);
       const tx = await account.execute({
         contractAddress: CONTRACT,
-        entrypoint: "upload_proof_chunk",
-        calldata: [sessionId, `${chunk.length}`, ...chunk],
+        entrypoint: "upload_gkr_chunk",
+        calldata: [sessionId, `${i}`, `${chunk.length}`, ...chunk],
       });
       console.log(`    TX: ${tx.transaction_hash}`);
       await provider.waitForTransaction(tx.transaction_hash);
@@ -300,21 +312,7 @@ function discoverSteps(dir, files) {
       entrypoint: "verify_gkr_stream_init",
     });
 
-  const layers = files
-    .filter((f) => f.startsWith("stream_layers_"))
-    .sort((a, b) => {
-      const na = parseInt(a.match(/(\d+)/)?.[1] || "0", 10);
-      const nb = parseInt(b.match(/(\d+)/)?.[1] || "0", 10);
-      return na - nb;
-    });
-  for (const f of layers) {
-    steps.push({
-      name: f.replace(".txt", ""),
-      file: f,
-      entrypoint: "verify_gkr_stream_layers",
-    });
-  }
-
+  // Output MLE must come BEFORE layers (channel state dependency)
   const outputMle = files
     .filter((f) => f.startsWith("stream_output_mle_"))
     .sort((a, b) => {
@@ -327,6 +325,21 @@ function discoverSteps(dir, files) {
       name: f.replace(".txt", ""),
       file: f,
       entrypoint: "verify_gkr_stream_init_output_mle",
+    });
+  }
+
+  const layers = files
+    .filter((f) => f.startsWith("stream_layers_"))
+    .sort((a, b) => {
+      const na = parseInt(a.match(/(\d+)/)?.[1] || "0", 10);
+      const nb = parseInt(b.match(/(\d+)/)?.[1] || "0", 10);
+      return na - nb;
+    });
+  for (const f of layers) {
+    steps.push({
+      name: f.replace(".txt", ""),
+      file: f,
+      entrypoint: "verify_gkr_stream_layers",
     });
   }
 

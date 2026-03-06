@@ -46,11 +46,20 @@ All `STWO_*` environment variables that control proving, GPU, calldata, caching,
 | `STWO_CHANNEL_TRACE` | `0` | When `1`, print Fiat-Shamir channel operations for debugging transcript mismatches. |
 | `STWO_LOG_SUMCHECK` | `0` | When `1`, log sumcheck round details. |
 
+## MLE Opening
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `STWO_MLE_N_QUERIES` | `3` | Number of MLE opening queries. Cairo reads this from the proof, so both sides must agree. |
+
 ## External (non-STWO)
 
 | Variable | Description |
 |----------|-------------|
-| `STARKNET_ACCOUNT` | Starknet account address for on-chain submission. |
+| `STARKNET_ACCOUNT` | Starknet account address for on-chain submission. Used by pipeline scripts. |
 | `STARKNET_PRIVATE_KEY` | Private key for signing Starknet transactions. |
+| `STARKNET_RPC` | Starknet RPC endpoint URL. Defaults to Alchemy Sepolia. |
+| `CONTRACT_ADDRESS` | GKR verifier contract address. Defaults to `0x0121d1...`. |
+| `SESSION_ID` | Session ID for resuming streaming submission with `--skip-session`. |
 | `AVNU_API_KEY` | API key for AVNU paymaster (gasless transactions). |
 | `NEXT_PUBLIC_PROVER_WS_URL` | WebSocket URL for the marketplace to connect to the prove-server. |
