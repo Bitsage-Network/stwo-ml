@@ -881,60 +881,140 @@ Assumptions:
 \subsection{Theorem 2: MLE Opening Soundness}
 
 \begin{theorem}[MLE opening soundness]\label{thm:mle}
-  With $q$ spot-check queries per fold over $n$ folds:
+  Consider the MLE opening protocol with $n$ folds and $q$
+  spot-check queries per fold, where queries are sampled
+  uniformly without replacement from the folded table at each
+  round.
+  At fold~$i$, the table has $2^{n-i}$ entries and $q$ positions
+  are checked.
+  A cheating prover who substitutes an incorrect folded value at
+  any position must avoid all $q$ checks at that fold.
+  Under the assumption that the Fiat-Shamir transcript
+  (which determines query positions) behaves as a random oracle,
+  the probability of evading detection at a single fold is:
+  \[
+    \Pr[\text{evade fold } i] \le 1 - \frac{q}{2^{n-i}}.
+  \]
+  Since $2^{n-i} \ge 2$ for all folds ($i < n$), this gives
+  $\Pr[\text{evade}] \le 1 - q/2^{n-i} \le (1-1/2)^q = 2^{-q}$
+  as a conservative per-fold bound (worst case at the final fold
+  where the table has only 2 entries).
+
+  Over $n$ folds, assuming the adversary must cheat at every
+  fold to produce a consistent forgery (each fold's challenge
+  depends on the previous round's transcript via Fiat-Shamir),
+  the total evasion probability is bounded by:
   \begin{equation}\label{eq:mle-sound}
-    \varepsilon_{\text{mle}} \le (1-1/2)^{q\cdot n}
-    = 2^{-qn}.
+    \varepsilon_{\text{mle}} \le 2^{-qn}.
   \end{equation}
+
   For $n=13$ folds:
   \begin{itemize}[nosep,leftmargin=1.2em]
     \item $q=5$ (current default): $\varepsilon_{\text{mle}} = 2^{-65}$.
     \item $q=10$ (recommended): $\varepsilon_{\text{mle}} = 2^{-130}$.
   \end{itemize}
-  The query count is a runtime parameter read from the proof
-  structure; increasing $q$ requires no protocol changes, only
-  proportionally more calldata per MLE opening.
 \end{theorem}
 
 \begin{proof}
-  At each fold, the verifier checks $q$ randomly chosen positions.
-  A cheating prover who corrupts any folded value must avoid all $q$
-  checks at that fold.
-  Since each position is checked with probability $\ge 1/2$
-  (the table halves each round), the probability of evading $q$
-  checks is $(1/2)^q$.
-  Over $n$ folds, independence gives $(1/2)^{qn}$.
+  At fold~$i$, the verifier draws $q$ query indices uniformly from
+  $\{0,\ldots,2^{n-i}-1\}$ (without replacement), then checks that
+  each queried position is consistent with the committed Merkle path
+  and the folding equation $f_{i+1}[j] = f_i[j] + r_i(f_i[\text{mid}+j]-f_i[j])$.
+
+  If the prover corrupts any entry in the folded table, the
+  probability that none of the $q$ queries lands on a corrupted
+  position is at most $(1-1/2^{n-i})^q$.
+  At the last non-trivial fold ($i=n-1$, table size~2), this is
+  $(1/2)^q = 2^{-q}$, the worst case.
+
+  The Fiat-Shamir transcript binds each fold's challenges to
+  all prior rounds, so an adaptive adversary cannot
+  retroactively change earlier folds after seeing later
+  challenges.
+  The adversary must commit to the full folded-table Merkle tree
+  before learning the query positions for that fold.
+  By the random oracle assumption on Fiat-Shamir, the query
+  positions at each fold are independent of the adversary's
+  strategy for that fold, yielding the multiplicative bound
+  $\prod_{i=0}^{n-1} 2^{-q} = 2^{-qn}$.
+
+  \emph{Note:} This bound is conservative. At earlier folds
+  (larger tables), the per-fold evasion probability is strictly
+  less than $2^{-q}$, so the true soundness error is smaller
+  than $2^{-qn}$.
 \end{proof}
 
-\textbf{Recommendation:} We recommend $q=10$ for production
+\textbf{Recommendation.} We recommend $q=10$ for production
 deployments, providing 130-bit opening security.
 The calldata overhead is $2\times$ (10 vs.\ 5 Merkle paths per fold),
 adding $\sim$4{,}000 felts to the 86{,}723 total---a 4.6\% increase
 for 65 additional bits of security.
+The query count is a runtime parameter read from the proof
+structure; increasing $q$ requires no code changes.
 
 \subsection{Theorem 3: Aggregated Weight Binding Soundness}
 
 \begin{theorem}[Aggregated binding soundness]\label{thm:binding}
-  For $M$ weight matrices with claimed evaluations
-  $\{v_i\}_{i=1}^M$, if any $v_j \ne
-  W_{\text{global}}(\mathbf{g}_j, \mathbf{e}_j)$, the
-  aggregated binding mismatch sumcheck (\Cref{prot:binding})
-  accepts with probability at most:
+  Consider $M$ weight matrices with GKR-produced claimed evaluations
+  $\{v_i\}_{i=1}^M$ at points $\{\mathbf{e}_i\}$, and suppose
+  at least one claim is forged: $v_j \ne
+  W_{\text{global}}(\mathbf{g}_j, \mathbf{e}_j)$ for some~$j$.
+  The mismatch sumcheck (\Cref{prot:binding}) accepts with
+  probability at most:
   \begin{equation}\label{eq:binding-sound}
-    \varepsilon_{\text{bind}} \le \frac{M}{|\QM|}
-    \approx \frac{160}{2^{124}} \approx 2^{-117}.
+    \varepsilon_{\text{bind}} \le
+    \frac{M + k_{\text{sc}}
+    \cdot d_{\text{sc}}}{|\QM|}
   \end{equation}
+  where $k_{\text{sc}}$ is the number of sumcheck rounds in the
+  mismatch protocol and $d_{\text{sc}}=2$ is the per-round degree.
+  For $M=160$ and $k_{\text{sc}} = \lceil\log_2 N_{\text{global}}\rceil
+  \le 28$:
+  \[
+    \varepsilon_{\text{bind}} \le \frac{160 + 56}{2^{124}}
+    = \frac{216}{2^{124}} < 2^{-116}.
+  \]
 \end{theorem}
 
 \begin{proof}
-  The mismatch polynomial $\sum_i \rho^i \cdot \eq(\mathbf{g}_i,
-  \mathbf{s}) \cdot (W_{\text{global}}(\mathbf{s},\mathbf{e}_i)-v_i)$
-  is non-zero if any $v_j$ is forged.
-  By Schwartz-Zippel over the random batching coefficient $\rho$
-  and sumcheck challenges, the probability that this non-zero
-  polynomial evaluates to zero is bounded by the degree over
-  $|\QM|$.
-  The degree in $\rho$ is at most $M$, giving the bound.
+  Define the mismatch polynomial:
+  \[
+    P(\rho, \mathbf{s}) = \sum_{i=1}^{M} \rho^i
+    \cdot \eq(\mathbf{g}_i, \mathbf{s})
+    \cdot \bigl(W_{\text{global}}(\mathbf{s}, \mathbf{e}_i)
+    - v_i\bigr).
+  \]
+  If any $v_j$ is forged, the term $\rho^j \cdot
+  \eq(\mathbf{g}_j, \mathbf{s}) \cdot \delta_j$ is non-zero
+  (where $\delta_j = W_{\text{global}}(\mathbf{g}_j,
+  \mathbf{e}_j) - v_j \ne 0$).
+  Since $P$ has degree at most $M$ in $\rho$ and the terms
+  $\rho^j$ are linearly independent, $P$ is a non-zero
+  polynomial in $\rho$.
+
+  The protocol proceeds in two phases:
+  \begin{enumerate}[nosep,leftmargin=1.4em]
+    \item \textbf{Batching:} The verifier draws
+          $\rho \leftarrow \QM$ via Fiat-Shamir.
+          By Schwartz-Zippel, the probability that $P(\rho,
+          \mathbf{s})$ is identically zero in $\mathbf{s}$
+          (for this choice of $\rho$) is at most $M/|\QM|$.
+    \item \textbf{Sumcheck:} Conditioned on $P(\rho, \cdot)
+          \not\equiv 0$, the sumcheck over $\mathbf{s}$ has
+          $k_{\text{sc}}$ rounds of degree $d_{\text{sc}} = 2$.
+          By \Cref{thm:sumcheck}'s argument, cheating
+          probability is at most
+          $k_{\text{sc}} d_{\text{sc}} / |\QM|$.
+  \end{enumerate}
+  By union bound, the total probability is
+  $(M + k_{\text{sc}} d_{\text{sc}}) / |\QM|$.
+
+  The final Merkle commitment check (verifying the reduced
+  MLE evaluation against the Poseidon2-M31 super-root)
+  is deterministic and adds no soundness error beyond
+  the hash collision bound ($\sim 2^{-124}$ for
+  Poseidon2-M31), which is absorbed into the field-size
+  denominator.
 \end{proof}
 
 \subsection{Theorem 4: Deployed System Soundness}
@@ -962,13 +1042,28 @@ for 65 additional bits of security.
     + \underbrace{\varepsilon_{\text{bind}}}_{\text{binding}}.
   \end{equation}
   With $q=5$: $\varepsilon_{\text{total}} < 40\!\cdot\!2^{-119}
-  + 2^{-65} + 2^{-117} \approx 2^{-65}$,
+  + 2^{-65} + 2^{-116} \approx 2^{-65}$,
   dominated by MLE opening.
 
   With $q=10$: $\varepsilon_{\text{total}} <
-  40\!\cdot\!2^{-119} + 2^{-130} + 2^{-117}
-  \approx 2^{-112}$, dominated by binding.
+  40\!\cdot\!2^{-119} + 2^{-130} + 2^{-116}
+  \approx 2^{-111}$, dominated by binding.
 \end{theorem}
+
+\begin{remark}[Gap between field security and system soundness]
+  The 124-bit field $\QM$ provides a \emph{per-challenge}
+  security margin.
+  The deployed system's end-to-end bound ($2^{-111}$ at $q=10$)
+  is lower because soundness errors accumulate across $L$ layers
+  and $M$ weight matrices via union bound.
+  This gap is inherent to multi-instance interactive proof
+  composition and is consistent with the analysis in other
+  deployed systems~\cite{thaler2022proofs}.
+  Increasing $M$ (more layers) linearly degrades the binding
+  term; for a 100-layer model, the bound would be
+  $\approx 2^{-110}$, still well above the
+  80-bit conventional threshold.
+\end{remark}
 
 
 % =========================================================================
@@ -1065,45 +1160,94 @@ memory pressure, and serialization overhead.
 takes $\sim$500\,s; subsequent proofs hit the \texttt{.swcf} cache
 and reduce this to $<$1\,ms.
 
-\subsection{Comparison with Prior Work}
+\subsection{Ablations}
 
 \begin{table}[t]
-  \centering\scriptsize
-  \caption{Comparison with existing ZKML systems.
-           $\dagger$Linear trace only (activations unconstrained).
-           $\ddagger$Estimated from published data.}
-  \label{tab:comparison}
-  \setlength{\tabcolsep}{3pt}
-  \begin{tabular}{@{}lcccc@{}}
+  \centering\small
+  \caption{Ablation study: effect of key parameters on
+           calldata and soundness. All rows assume 40 layers,
+           160 matrices, $n=13$ folds.}
+  \label{tab:ablation}
+  \begin{tabular}{@{}lccc@{}}
     \toprule
-    \textbf{System} & \textbf{Params} & \textbf{Time}
-      & \textbf{On-Chain} & \textbf{Proof} \\
+    \textbf{Configuration} & \textbf{Felts} &
+      \textbf{$\varepsilon_{\text{mle}}$} &
+      \textbf{$\varepsilon_{\text{total}}$} \\
     \midrule
-    EZKL~\cite{ezkl2024}
-      & $\sim$1\,M & sec & Solidity & Halo2 \\
-    Giza~\cite{giza2024}
-      & $\sim$10\,M & min & Cairo & STARK \\
-    zkLLM~\cite{sun2024zkllm}
-      & 13\,B & 1--15\,m & None & Custom \\
-    Expander~\cite{polyhedra2024expander}
-      & ---$^\ddagger$ & ---$^\ddagger$ & None & GKR \\
-    DeepProve~\cite{lagrange2024}
-      & GPT-2$^\ddagger$ & ---$^\ddagger$ & None & GKR \\
+    Individual openings   & 2.4\,M & $2^{-65}$ & $2^{-65}$ \\
+    Aggregated, $q\!=\!5$ & 86{,}723 & $2^{-65}$ & $2^{-65}$ \\
+    Aggregated, $q\!=\!10$  & $\sim$91\,K & $2^{-130}$ & $2^{-111}$ \\
+    Cold cache, $q\!=\!5$   & 86{,}723 & $2^{-65}$ & $2^{-65}$ \\
     \midrule
-    \textbf{ObelyZK}
-      & 14\,B$^\dagger$ & 3\,s/lyr & Cairo & GKR \\
+    \multicolumn{4}{@{}l@{}}{\scriptsize\textbf{Timing impact}} \\
+    \midrule
+    Warm cache & \multicolumn{3}{l}{$<$1\,ms weight commit} \\
+    Cold cache & \multicolumn{3}{l}{$\sim$500\,s weight commit (first run)} \\
+    $q\!=\!5 \to q\!=\!10$ & \multicolumn{3}{l}{$+$4{,}000 felts (+4.6\%),
+      no proving time change} \\
     \bottomrule
   \end{tabular}
 \end{table}
 
+\Cref{tab:ablation} isolates the effect of the main design
+parameters.
+Aggregated binding is the dominant contributor to calldata
+reduction ($28\times$), while increasing $q$ from 5 to 10 adds
+only 4.6\% calldata but improves MLE opening soundness by 65~bits.
+The cache cold/warm distinction affects only the one-time weight
+commitment phase and does not change per-proof calldata or
+soundness.
+
+\subsection{Comparison with Prior Work}
+
+\begin{table*}[t]
+  \centering\scriptsize
+  \caption{Comparison with existing ZKML systems.
+           $\dagger$Linear trace only (activations unconstrained).
+           $\ddagger$Estimated from published data.
+           $\star$Measured single-layer, 40-layer extrapolated.}
+  \label{tab:comparison}
+  \setlength{\tabcolsep}{4pt}
+  \begin{tabular}{@{}lccccccl@{}}
+    \toprule
+    \textbf{System} & \textbf{Max Params} & \textbf{Prove Time}
+      & \textbf{Full Semantics} & \textbf{Deployed Verifier}
+      & \textbf{Proof Size} & \textbf{Measured}
+      & \textbf{Proof System} \\
+    \midrule
+    EZKL~\cite{ezkl2024}
+      & $\sim$1\,M & seconds & \ding{51} & Solidity
+      & $<$1\,KB & \ding{51} & Halo2/KZG \\
+    Giza~\cite{giza2024}
+      & $\sim$10\,M & minutes & \ding{51} & Cairo (Stone)
+      & KB--MB & \ding{51} & STARK \\
+    zkLLM~\cite{sun2024zkllm}
+      & 13\,B & 1--15\,min & \ding{51} & None
+      & $<$200\,KB & \ding{51} & Custom \\
+    Expander~\cite{polyhedra2024expander}
+      & ---$^\ddagger$ & ---$^\ddagger$ & ---$^\ddagger$ & None
+      & ---$^\ddagger$ & --- & GKR \\
+    DeepProve~\cite{lagrange2024}
+      & GPT-2$^\ddagger$ & ---$^\ddagger$ & ---$^\ddagger$ & None
+      & ---$^\ddagger$ & --- & GKR \\
+    \midrule
+    \textbf{ObelyZK}
+      & 14\,B$^\dagger$ & 3\,s/lyr$^\star$ & \ding{55}$^\dagger$
+      & Cairo v31 & 2.8\,MB & $\circ^\star$ & GKR+STARK \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
 \Cref{tab:comparison} positions ObelyZK relative to existing systems.
 Key differentiators:
 \begin{itemize}[nosep,leftmargin=1.2em]
-  \item \textbf{Scale + deployment}: the only system with both
-        14\,B-parameter proving and a deployed on-chain verifier.
+  \item \textbf{Scale + deployment}: to our knowledge, the first
+        publicly described system combining 14\,B-scale
+        linear-trace proving with a deployed on-chain Cairo
+        verifier on Starknet.
   \item \textbf{Aggregated binding}: enables practical calldata for
-        LLM-scale on-chain verification (no other system reports a
-        comparable mechanism).
+        LLM-scale on-chain verification; we are not aware of a
+        comparable batched-opening mechanism in other ZKML systems.
   \item \textbf{Honest scope}: ObelyZK constrains only linear
         operations; zkLLM constrains full inference including
         non-arithmetic ops via \emph{tlookup}.
@@ -1271,8 +1415,10 @@ Starknet Sepolia with a 14\,K-line Cairo verifier.
 The deployed verifier constrains the linear arithmetic trace (matmul,
 addition, scaling) but not nonlinear activations.
 This is an honest limitation that we are actively addressing.
-With activation LogUp enforcement and $q=10$ MLE queries, the system
-would provide full inference verification at 130-bit security.
+With activation LogUp enforcement (constraining nonlinear functions
+via lookup arguments) and $q=10$ MLE queries, the system would
+extend coverage to full inference verification at 130-bit
+MLE opening security.
 
 The mathematical foundation---GKR sumcheck over the M31 field tower,
 composed with Circle STARKs---is architecturally native to Starknet
