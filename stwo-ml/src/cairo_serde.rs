@@ -3034,6 +3034,156 @@ pub fn serialize_aggregated_binding_proof_packed(
     serialize_mle_opening_proof_packed(&proof.opening_proof, output);
 }
 
+/// Deserialize an `MleOpeningProof` from packed QM31 format.
+/// Inverse of `serialize_mle_opening_proof_packed`.
+pub fn deserialize_mle_opening_proof_packed(
+    data: &[FieldElement],
+    pos: &mut usize,
+) -> crate::crypto::mle_opening::MleOpeningProof {
+    use crate::crypto::mle_opening::{MleOpeningProof, MleQueryProof, MleQueryRoundData};
+    use crate::crypto::poseidon_channel::felt_to_securefield;
+
+    let n_roots = read_u32_at(data, pos) as usize;
+    let mut intermediate_roots = Vec::with_capacity(n_roots);
+    for _ in 0..n_roots {
+        intermediate_roots.push(data[*pos]);
+        *pos += 1;
+    }
+
+    let n_queries = read_u32_at(data, pos) as usize;
+    let mut queries = Vec::with_capacity(n_queries);
+    for _ in 0..n_queries {
+        let initial_pair_index = read_u32_at(data, pos);
+        let n_rounds = read_u32_at(data, pos) as usize;
+        let mut rounds = Vec::with_capacity(n_rounds);
+        for _ in 0..n_rounds {
+            let left_value = felt_to_securefield(data[*pos]);
+            *pos += 1;
+            let right_value = felt_to_securefield(data[*pos]);
+            *pos += 1;
+            let n_left = read_u32_at(data, pos) as usize;
+            let mut left_siblings = Vec::with_capacity(n_left);
+            for _ in 0..n_left {
+                left_siblings.push(data[*pos]);
+                *pos += 1;
+            }
+            let n_right = read_u32_at(data, pos) as usize;
+            let mut right_siblings = Vec::with_capacity(n_right);
+            for _ in 0..n_right {
+                right_siblings.push(data[*pos]);
+                *pos += 1;
+            }
+            rounds.push(MleQueryRoundData {
+                left_value,
+                right_value,
+                left_siblings,
+                right_siblings,
+            });
+        }
+        queries.push(MleQueryProof {
+            initial_pair_index,
+            rounds,
+        });
+    }
+
+    let final_value = felt_to_securefield(data[*pos]);
+    *pos += 1;
+
+    MleOpeningProof {
+        intermediate_roots,
+        queries,
+        final_value,
+    }
+}
+
+/// Deserialize an `AggregatedWeightBindingProof` from packed QM31 format.
+/// Inverse of `serialize_aggregated_binding_proof_packed`.
+pub fn deserialize_aggregated_binding_proof_packed(
+    data: &[FieldElement],
+    pos: &mut usize,
+) -> crate::crypto::aggregated_opening::AggregatedWeightBindingProof {
+    use crate::crypto::aggregated_opening::{
+        AggregatedBindingConfig, AggregatedWeightBindingProof, SuperRoot,
+    };
+    use crate::crypto::poseidon_channel::felt_to_securefield;
+
+    // config (5 u32 fields)
+    let selector_bits = read_u32_at(data, pos) as usize;
+    let n_max = read_u32_at(data, pos) as usize;
+    let m_padded = read_u32_at(data, pos) as usize;
+    let n_global = read_u32_at(data, pos) as usize;
+    let n_claims = read_u32_at(data, pos) as usize;
+
+    let config = AggregatedBindingConfig {
+        selector_bits,
+        n_max,
+        m_padded,
+        n_global,
+        n_claims,
+    };
+
+    // sumcheck_round_polys
+    let n_rounds = read_u32_at(data, pos) as usize;
+    let mut sumcheck_round_polys = Vec::with_capacity(n_rounds);
+    for _ in 0..n_rounds {
+        let c0 = felt_to_securefield(data[*pos]);
+        *pos += 1;
+        let c1 = felt_to_securefield(data[*pos]);
+        *pos += 1;
+        let c2 = felt_to_securefield(data[*pos]);
+        *pos += 1;
+        sumcheck_round_polys.push((c0, c1, c2));
+    }
+
+    // oracle_eval_at_s
+    let oracle_eval_at_s = felt_to_securefield(data[*pos]);
+    *pos += 1;
+
+    // super_root
+    let root = data[*pos];
+    *pos += 1;
+
+    let n_subtrees = read_u32_at(data, pos) as usize;
+    let mut subtree_roots = Vec::with_capacity(n_subtrees);
+    for _ in 0..n_subtrees {
+        subtree_roots.push(data[*pos]);
+        *pos += 1;
+    }
+
+    let super_root = SuperRoot {
+        root,
+        subtree_roots,
+        zero_tree_root: FieldElement::ZERO, // not serialized, reconstruction only
+        top_levels: selector_bits,
+    };
+
+    // opening_proof
+    let opening_proof = deserialize_mle_opening_proof_packed(data, pos);
+
+    AggregatedWeightBindingProof {
+        config,
+        sumcheck_round_polys,
+        oracle_eval_at_s,
+        opening_proof,
+        super_root,
+        per_matrix_openings: None,
+        per_matrix_evals: None,
+    }
+}
+
+/// Read a u32 from felt252 data at position, advancing pos.
+fn read_u32_at(data: &[FieldElement], pos: &mut usize) -> u32 {
+    let val = felt252_to_u64(&data[*pos]) as u32;
+    *pos += 1;
+    val
+}
+
+/// Convert a felt252 to u64 (for small values).
+fn felt252_to_u64(fe: &FieldElement) -> u64 {
+    let bytes = fe.to_bytes_be();
+    u64::from_be_bytes(bytes[24..32].try_into().unwrap())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

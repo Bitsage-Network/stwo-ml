@@ -1202,6 +1202,8 @@ fn apply_aggregated_oracle_sumcheck(
                 weights,
                 claim_node_ids,
             };
+            // Clone channel BEFORE proving so we can self-verify the binding proof.
+            let mut verify_channel = channel.clone();
             let proof =
                 prove_aggregated_binding_streaming(&agg_claims, &source, channel);
             eprintln!(
@@ -1209,6 +1211,19 @@ fn apply_aggregated_oracle_sumcheck(
                 agg_claims.len(),
                 proof.estimated_calldata_felts(),
             );
+            // Self-verify: the verifier replays the same channel ops as the prover.
+            if !crate::crypto::aggregated_opening::verify_aggregated_binding(
+                &proof,
+                &agg_claims,
+                &mut verify_channel,
+            ) {
+                panic!(
+                    "[{}] BINDING SELF-VERIFY FAILED: aggregated binding proof does not verify. \
+                     This is a prover bug.",
+                    log_tag,
+                );
+            }
+            eprintln!("  [{log_tag}] binding self-verify: PASSED");
             Some(proof)
         } else {
             // RLC binding: draw random weight, combine all expected values, mix into channel.

@@ -2060,6 +2060,36 @@ pub fn build_streaming_gkr_calldata(
         "[streaming] weight_binding calldata: {} felts (limit: 5000)",
         wb_calldata.len()
     );
+    // Diagnostic: print weight commitments for on-chain comparison
+    if let Some(binding) = proof.aggregated_binding.as_ref() {
+        eprintln!("[streaming] === BINDING DIAGNOSTICS ===");
+        eprintln!("[streaming]   super_root: 0x{:x}", binding.super_root.root);
+        for (i, sr) in binding.super_root.subtree_roots.iter().enumerate() {
+            eprintln!("[streaming]   subtree_root[{}]: 0x{:x}", i, sr);
+        }
+        for (i, wc) in proof.weight_commitments.iter().enumerate() {
+            eprintln!("[streaming]   registered_weight[{}]: 0x{:x}", i, wc);
+        }
+        for (i, wc) in proof.weight_claims.iter().enumerate() {
+            let eval_pt_hash = if wc.eval_point.is_empty() {
+                "empty".to_string()
+            } else {
+                format!("{} vars", wc.eval_point.len())
+            };
+            eprintln!(
+                "[streaming]   weight_claim[{}]: eval_pt={}, expected_value=0x{:x}",
+                i, eval_pt_hash,
+                crate::crypto::poseidon_channel::securefield_to_felt(wc.expected_value),
+            );
+        }
+        eprintln!("[streaming]   config: selector_bits={}, n_max={}, n_global={}, n_claims={}",
+            binding.config.selector_bits, binding.config.n_max,
+            binding.config.n_global, binding.config.n_claims);
+        eprintln!("[streaming]   sumcheck rounds: {}", binding.sumcheck_round_polys.len());
+        eprintln!("[streaming]   opening queries: {}", binding.opening_proof.queries.len());
+        eprintln!("[streaming]   opening intermediate roots: {}", binding.opening_proof.intermediate_roots.len());
+        eprintln!("[streaming] === END BINDING DIAGNOSTICS ===");
+    }
 
     // ── Build chunked input MLE calldata ──
     // All chunks are uniform: session_id + packed_input_data + chunk metadata.
@@ -2212,6 +2242,40 @@ fn starknet_weight_binding_data_packed(
                 crate::cairo_serde::serialize_aggregated_binding_proof_packed(
                     binding, &mut payload,
                 );
+                // Roundtrip check: deserialize and compare key fields
+                {
+                    let mut pos = 0usize;
+                    let rt = crate::cairo_serde::deserialize_aggregated_binding_proof_packed(
+                        &payload, &mut pos,
+                    );
+                    assert_eq!(
+                        pos, payload.len(),
+                        "binding proof roundtrip: consumed {} of {} felts",
+                        pos, payload.len()
+                    );
+                    assert_eq!(rt.config.selector_bits, binding.config.selector_bits, "selector_bits mismatch");
+                    assert_eq!(rt.config.n_max, binding.config.n_max, "n_max mismatch");
+                    assert_eq!(rt.config.n_global, binding.config.n_global, "n_global mismatch");
+                    assert_eq!(rt.config.n_claims, binding.config.n_claims, "n_claims mismatch");
+                    assert_eq!(rt.sumcheck_round_polys.len(), binding.sumcheck_round_polys.len(), "round polys len");
+                    for (i, ((a0, a1, a2), (b0, b1, b2))) in rt.sumcheck_round_polys.iter().zip(&binding.sumcheck_round_polys).enumerate() {
+                        assert_eq!(a0, b0, "round {i} c0 mismatch");
+                        assert_eq!(a1, b1, "round {i} c1 mismatch");
+                        assert_eq!(a2, b2, "round {i} c2 mismatch");
+                    }
+                    assert_eq!(rt.oracle_eval_at_s, binding.oracle_eval_at_s, "oracle_eval mismatch");
+                    assert_eq!(rt.super_root.root, binding.super_root.root, "super_root mismatch");
+                    assert_eq!(rt.super_root.subtree_roots, binding.super_root.subtree_roots, "subtree_roots mismatch");
+                    assert_eq!(rt.opening_proof.intermediate_roots, binding.opening_proof.intermediate_roots, "intermediate_roots mismatch");
+                    assert_eq!(rt.opening_proof.queries.len(), binding.opening_proof.queries.len(), "queries len mismatch");
+                    assert_eq!(rt.opening_proof.final_value, binding.opening_proof.final_value, "final_value mismatch");
+                    eprintln!(
+                        "[streaming] binding proof roundtrip: PASSED ({} felts, {} rounds, {} queries)",
+                        payload.len(),
+                        rt.sumcheck_round_polys.len(),
+                        rt.opening_proof.queries.len(),
+                    );
+                }
                 Ok(payload.into_iter().map(|f| format!("0x{:x}", f)).collect())
             } else {
                 Err(StarknetModelError::SoundnessGate(
