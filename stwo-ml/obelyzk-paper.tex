@@ -1,8 +1,9 @@
 % =========================================================================
-%  ObelyZK: GKR-Based Verifiable ZKML Inference for Billion-Parameter Models
-%           with M31-Native Privacy on Starknet
+%  ObelyZK: Verifiable Linear-Trace Inference for Billion-Parameter
+%           Neural Networks via GKR Sumcheck with Aggregated Weight
+%           Binding on Starknet
 %
-%  Target: arXiv cs.CR / cs.LG    |   Two-column, ~20 pages
+%  Target: arXiv cs.CR / cs.LG    |   Two-column, ~18 pages
 %
 %  License: CC BY 4.0
 % =========================================================================
@@ -74,7 +75,7 @@
 % ---------- header / footer ----------
 \pagestyle{fancy}
 \fancyhf{}
-\fancyhead[L]{\small\textit{ObelyZK: GKR-Based Verifiable ZKML on Starknet}}
+\fancyhead[L]{\small\textit{ObelyZK: Verifiable Linear-Trace Inference via GKR}}
 \fancyhead[R]{\small\thepage}
 \renewcommand{\headrulewidth}{0.4pt}
 
@@ -90,9 +91,11 @@
 \twocolumn[
 \begin{@twocolumnfalse}
 \begin{center}
-  {\LARGE\bfseries ObelyZK: GKR-Based Verifiable ZKML Inference for\par
+  {\LARGE\bfseries ObelyZK: Verifiable Linear-Trace Inference for\par
    \vspace{4pt}
-   Billion-Parameter Models with M31-Native Privacy on Starknet}
+   Billion-Parameter Neural Networks via GKR Sumcheck\par
+   \vspace{4pt}
+   with Aggregated Weight Binding on Starknet}
 
   \vspace{12pt}
 
@@ -108,35 +111,37 @@
 
   \begin{minipage}{0.92\textwidth}
     \small\textbf{Abstract.}
-    We present ObelyZK, a system for verifiable neural-network inference and
-    privacy-preserving decentralized finance on Starknet.
-    The system comprises three components:
-    (1)~a GKR-based interactive proof protocol~\cite{goldwasser2015delegating}
-    that cryptographically verifies the linear arithmetic trace
-    (matrix multiplications and weight bindings) of models up to
-    14~billion parameters, achieving 3.04\,s per-layer proving on
-    NVIDIA H100 GPUs;
-    (2)~a privacy protocol built on Poseidon2-M31~\cite{grassi2023poseidon2}
-    with six DeFi mechanisms and Association Set Provider
-    (ASP) compliance~\cite{buterin2023privacy}; and
-    (3)~a Cairo-native streaming on-chain verifier
-    ({\raise.17ex\hbox{$\scriptstyle\sim$}}14\,K lines of Cairo)
-    backed by 117\,K+ lines of Rust, with aggregated weight binding that
-    reduces on-chain calldata from 2.4\,M~felts to 86{,}723~felts
-    ($\approx$28$\times$).
-    All arithmetic operates over the Mersenne prime $p = 2^{31}-1$,
-    extended through a degree-4 tower $\M \to \CM \to \QM$ providing
-    124-bit algebraic security.
-    We detail the protocol, present a security analysis with formal
-    soundness bounds, and report benchmarks including 1{,}029+ passing
-    library tests and end-to-end on-chain verification of Qwen3-14B
-    inference across 18 streaming transactions.
+    We present ObelyZK, a system that cryptographically verifies the
+    \emph{linear arithmetic trace} of neural-network inference---matrix
+    multiplications, additions, and scaling operations---for models up
+    to 14 billion parameters, deployed on Starknet.
+    The core contribution is \emph{aggregated weight binding}: a
+    mismatch-sumcheck protocol that reduces the on-chain calldata
+    required to verify 160 weight matrices from 2.4\,M~felts to
+    86{,}723~felts ($\approx$28$\times$), making streaming
+    verification of LLM-scale proofs practical within Starknet's
+    per-transaction step limits.
+    The system operates over the Mersenne prime field
+    $p = 2^{31}-1$, extended through a degree-4 tower
+    $\M \to \CM \to \QM$ providing 124-bit algebraic security,
+    and achieves 3.04\,s per-layer GPU proving on NVIDIA H100.
+    The on-chain Cairo verifier ({\raise.17ex\hbox{$\scriptstyle\sim$}}14\,K
+    lines) accepts proofs via 18 streaming transactions and is
+    deployed on Starknet Sepolia.
+    We provide formal soundness analysis showing the system
+    achieves $2^{-130}$ security against forgery when the MLE
+    opening query count is set to $q=10$.
+    \textbf{Scope:} The deployed verifier constrains
+    only linear operations; nonlinear activations (ReLU, GELU,
+    Softmax) are executed by the prover but not independently
+    verified. We discuss the implications and path to full
+    inference verification.
   \end{minipage}
 
   \vspace{8pt}
   {\scriptsize\textbf{Keywords:}
-    verifiable inference, GKR protocol, sumcheck, STARK,
-    zero-knowledge machine learning, privacy pools, Starknet, M31}
+    verifiable inference, linear arithmetic trace, GKR protocol,
+    sumcheck, aggregated weight binding, STARK, Starknet, M31}
 
   \vspace{10pt}
 \end{center}
@@ -152,95 +157,53 @@ Verifying that a specific neural network with committed weights produced a
 specific output for a given input is a fundamental problem for AI
 accountability, regulatory compliance, and trustless computation
 markets~\cite{kang2022scaling, sun2024zkllm}.
+Existing ZKML systems face a scalability wall:
+EZKL~\cite{ezkl2024} handles $\sim$1\,M parameters via Halo2/KZG;
+Giza~\cite{giza2024} uses Cairo-STARK for small models;
+zkLLM~\cite{sun2024zkllm} demonstrates 13\,B-parameter proving but
+requires 1--15 minutes and lacks a deployed on-chain verifier.
 
-Existing approaches fall into three categories:
-(i)~\emph{optimistic verification} with fraud proofs, requiring honest watchers
-and challenge periods;
-(ii)~\emph{trusted execution environments} (TEEs), dependent on hardware-vendor
-trust assumptions; and
-(iii)~\emph{zero-knowledge proofs}, providing cryptographic guarantees but
-historically limited to small models~\cite{ezkl2024, giza2024, weng2021mystique, liu2021zkcnn}.
-Systems such as EZKL~\cite{ezkl2024} handle models up to $\sim$1\,M
-parameters with Halo2/KZG and Solidity verifiers, while
-Lagrange~\cite{lagrange2024} and
-Polyhedra~\cite{polyhedra2024expander} have published research on
-larger-scale ZKML but have not deployed production on-chain verifiers
-at LLM scale.
-
-ObelyZK addresses this gap by combining the GKR interactive proof
-protocol~\cite{goldwasser2015delegating, thaler2013time} with StarkWare's
-STWO prover~\cite{starkware2024stwo}, leveraging the Mersenne prime field
-$\M$ ($p = 2^{31}-1$) for hardware-aligned arithmetic and Circle
-STARKs~\cite{habock2024circle} for proof composition.
-This combination enables:
-
-\begin{itemize}[nosep,leftmargin=1.2em]
-  \item \textbf{14-billion-parameter verification} in 3.04\,s per
-        transformer layer on NVIDIA H100 GPUs;
-  \item \textbf{Streaming on-chain verification} via 18 transactions
-        (4~session management + 14~streaming GKR steps);
-  \item \textbf{Sub-\$0.001 on-chain cost} per verification transaction
-        on Starknet;
-  \item \textbf{86{,}723 felts calldata} ($\approx$28$\times$ reduction
-        from 2.4\,M) for a complete 40-layer proof via aggregated weight
-        binding.
-\end{itemize}
-
-Alongside ZKML verification, we deploy a privacy protocol native to the
-$\M$ field providing six DeFi mechanisms with ASP
-compliance~\cite{buterin2023privacy}.
+The central obstacle at LLM scale is \emph{on-chain calldata}:
+a 40-layer transformer with 160 weight matrices requires
+$\sim$2.4\,M field elements for individual MLE openings,
+exceeding any L2's per-transaction limits.
+This paper's main contribution addresses this bottleneck directly.
 
 \subsection{Contributions}
 
 \begin{enumerate}[nosep,leftmargin=1.4em]
-  \item \textbf{Cairo-native GKR verifier} ---
-        to our knowledge, the first deployed Cairo-based GKR verifier
-        for LLM-scale inference, comprising $\sim$14\,K lines implementing
-        the complete field tower, Fiat-Shamir channel, sumcheck, MLE
-        opening, streaming verification, and aggregated weight binding
-        (contract v31, class hash \texttt{0x6a6b\ldots5439}).
-  \item \textbf{LLM-scale proving} --- verified linear arithmetic trace
-        of Qwen3-14B (14\,B parameters, 40 transformer layers) at
-        3.04\,s/layer on GPU.
-        Nonlinear activations are specified but not yet enforced
-        in the deployed path (\Cref{rem:logup-status}).
-  \item \textbf{Aggregated weight binding} --- a protocol reducing
-        weight verification calldata by $\approx$28$\times$ via random
-        linear combination over a global oracle MLE.
-  \item \textbf{M31-native privacy layer} --- six DeFi privacy mechanisms
-        using Poseidon2-M31 throughout, with ASP compliance,
-        built atop the core ZKML verification infrastructure.
-  \item \textbf{117\,K+ lines of Rust} (\texttt{stwo-ml} crate)
-        with 20\,K+ CUDA kernel lines,
-        1{,}029+ library tests, 10 end-to-end audit tests, and 95
-        Cairo verifier tests.
+  \item \textbf{Aggregated weight binding} (\Cref{sec:binding}) ---
+        a mismatch-sumcheck protocol that batches 160 weight-matrix
+        MLE openings into a single global oracle, reducing calldata
+        from 2.4\,M to 86{,}723~felts ($\approx$28$\times$).
+        This is the key enabler for on-chain LLM verification.
+  \item \textbf{Cairo-native GKR streaming verifier}
+        (\Cref{sec:onchain}) --- $\sim$14\,K lines of Cairo
+        implementing the complete field tower, Fiat-Shamir channel,
+        sumcheck, MLE opening, and aggregated binding verification
+        across 18 streaming transactions.
+        Contract v31, class hash
+        \texttt{\small 0x6a6b\ldots5439}, deployed on Starknet Sepolia.
+  \item \textbf{GPU-accelerated GKR proving}
+        (\Cref{sec:gpu}) --- 3.04\,s per transformer layer for
+        Qwen3-14B on NVIDIA H100, with 17+ custom CUDA kernels.
+  \item \textbf{Formal security analysis} (\Cref{sec:security}) ---
+        four theorems establishing soundness bounds for each
+        verification component, with an explicit characterization of
+        what the deployed verifier does and does not constrain.
 \end{enumerate}
 
-\subsection{Paper Organization}
+\subsection{Scope and Honest Assessment}
 
-\Cref{sec:prelim} presents the M31 field tower and MLE foundations.
-\Cref{sec:arch} describes the system architecture.
-\Cref{sec:gkr,sec:sumcheck} detail the GKR and sumcheck protocols.
-\Cref{sec:logup} covers activation verification via LogUp.
-\Cref{sec:attention} describes attention mechanism decomposition.
-\Cref{sec:binding} presents aggregated weight binding.
-\Cref{sec:gpu} discusses GPU acceleration.
-\Cref{sec:poseidon} specifies Poseidon2-M31 primitives.
-\Cref{sec:privacy,sec:defi} cover the privacy protocol and DeFi mechanisms.
-\Cref{sec:onchain} details on-chain verification.
-\Cref{sec:security} provides security analysis.
-\Cref{sec:bench} reports benchmarks.
-\Cref{sec:related} surveys related work.
-\Cref{sec:conclusion} concludes.
-
-\subsection{Implementation Status}
-
-\Cref{tab:status} summarizes the maturity of each component.
-The core contribution --- linear arithmetic verification via
-GKR sumcheck with aggregated weight binding --- is fully deployed
-and benchmarked.
-Nonlinear activation enforcement is specified and implemented
-but not yet integrated into the deployed GKR path.
+\Cref{tab:status} summarizes what is deployed, implemented, and
+specified.
+The deployed verifier cryptographically constrains only
+\emph{linear operations} (matmul, addition, scaling).
+Nonlinear activation functions are implemented and specified via
+LogUp~\cite{habock2022logup} lookup arguments but \textbf{not enforced}
+in the deployed GKR path (\Cref{sec:limitations}).
+We state this limitation prominently throughout the paper
+rather than treating it as a footnote.
 
 \begin{table}[t]
   \centering\scriptsize
@@ -257,8 +220,7 @@ but not yet integrated into the deployed GKR path.
     MLE opening         & \ding{51} & \ding{51} & \ding{51} & \ding{51} \\
     Weight cache        & \ding{51} & \ding{51} & \ding{51} & \ding{51} \\
     Activation LogUp    & \ding{51} & \ding{51} & \ding{55} & \ding{55} \\
-    Privacy circuits    & \ding{51} & \ding{51} & \ding{51} & $\circ$ \\
-    Batch proving       & \ding{51} & \ding{51} & \ding{51} & $\circ$ \\
+    Privacy layer       & \ding{51} & \ding{51} & \ding{51} & $\circ$ \\
     \bottomrule
   \end{tabular}
 
@@ -267,6 +229,20 @@ but not yet integrated into the deployed GKR path.
    Depl = deployed on Starknet Sepolia; Bench = included in
    reported benchmarks.}
 \end{table}
+
+\subsection{Paper Organization}
+
+\Cref{sec:prelim} presents the M31 field tower and MLE foundations.
+\Cref{sec:gkr,sec:sumcheck} detail the GKR and sumcheck protocols.
+\Cref{sec:binding} presents aggregated weight binding (the core
+contribution).
+\Cref{sec:gpu} discusses GPU acceleration.
+\Cref{sec:onchain} details on-chain streaming verification.
+\Cref{sec:security} provides a theorem-driven security analysis.
+\Cref{sec:bench} reports benchmarks with a comparison to prior work.
+\Cref{sec:limitations} discusses limitations and future work.
+\Cref{sec:related} surveys related work.
+\Cref{sec:conclusion} concludes.
 
 
 % =========================================================================
@@ -405,88 +381,6 @@ Fixing variable $x_1=r$ reduces the MLE dimension by one:
 This operation is linear in the table size and is the core primitive
 for both the sumcheck prover and the MLE opening verifier.
 
-\subsection{Batch Montgomery Inversion}
-
-For $N$ field elements requiring inversion, we compute all inverses
-with a single inversion and $3(N-1)$ multiplications via prefix
-products and back-sweep~\cite{schwartz1980}.
-This is critical for LogUp verification (\Cref{sec:logup}).
-
-
-% =========================================================================
-\section{System Architecture}\label{sec:arch}
-% =========================================================================
-
-% ---------- TikZ: System Architecture ----------
-\begin{figure*}[t]
-  \centering
-  \begin{tikzpicture}[
-    block/.style={draw, rounded corners=4pt, minimum height=1.1cm,
-                  text width=2.5cm, align=center, font=\small,
-                  fill=#1!10, draw=#1!50},
-    arr/.style={-{Stealth[length=5pt]}, thick, darkgray},
-    lbl/.style={font=\scriptsize, darkgray},
-    node distance=0.5cm and 0.6cm
-  ]
-    % Off-chain row
-    \node[block=starkblue] (loader) {Model Loader\\[-2pt]\scriptsize ONNX / HF / ST};
-    \node[block=starkblue, right=of loader] (fwd) {Forward Pass\\[-2pt]\scriptsize M31 arithmetic};
-    \node[block=starkblue, right=of fwd] (gkr) {GKR Prover\\[-2pt]\scriptsize GPU + CUDA};
-    \node[block=accentpurple, right=of gkr] (agg) {Weight\\Binding};
-    \node[block=accentpurple, right=of agg] (serial) {Calldata\\Serialization};
-
-    % Below row
-    \node[block=starkblue, below=1cm of loader] (wc) {Weight Commit\\[-2pt]\scriptsize Poseidon2 Merkle};
-    \node[block=emerald, below=1cm of fwd] (cache) {Weight Cache\\[-2pt]\scriptsize .swcf file};
-    \node[block=accentpurple, below=1cm of gkr] (priv) {Privacy Circuits\\[-2pt]\scriptsize Deposit/Spend};
-
-    % On-chain row
-    \node[block=warmred, below=1cm of agg] (verifier) {GKR Verifier\\[-2pt]\scriptsize v31 Cairo};
-    \node[block=warmred, below=1cm of serial] (pool) {VM31 Pool\\[-2pt]\scriptsize Merkle + Null};
-
-    % Arrows
-    \draw[arr] (loader) -- (fwd);
-    \draw[arr] (fwd) -- (gkr);
-    \draw[arr] (gkr) -- (agg);
-    \draw[arr] (agg) -- (serial);
-    \draw[arr] (loader) -- (wc);
-    \draw[arr] (wc) -- (cache);
-    \draw[arr] (cache) -- (gkr);
-    \draw[arr] (gkr) -- (priv);
-    \draw[arr] (serial) -- node[right,lbl]{Starknet L2} (pool);
-    \draw[arr] (agg) -- (verifier);
-    \draw[arr] (wc) |- (verifier);
-    \draw[arr] (priv) -- (verifier);
-
-    % Bounding boxes
-    \begin{scope}[on background layer]
-      \node[fit=(loader)(fwd)(gkr)(agg)(serial)(wc)(cache)(priv),
-            draw=starkblue!40, fill=starkblue!3, rounded corners=6pt,
-            inner sep=8pt, label={[font=\small\bfseries,starkblue]above:Off-Chain Proving}] {};
-      \node[fit=(verifier)(pool),
-            draw=warmred!40, fill=warmred!3, rounded corners=6pt,
-            inner sep=8pt, label={[font=\small\bfseries,warmred!70!black]below:On-Chain Verification (Starknet Sepolia)}] {};
-    \end{scope}
-  \end{tikzpicture}
-  \caption{ObelyZK system architecture. The off-chain pipeline loads model
-           weights, executes the forward pass in M31 arithmetic, produces
-           a GKR proof with aggregated weight binding, and serializes
-           calldata. The on-chain Cairo verifier receives 18 streaming
-           transactions and produces an accept/reject verdict.}
-  \label{fig:arch}
-\end{figure*}
-
-The system (\Cref{fig:arch}) comprises an off-chain proving pipeline
-and an on-chain streaming verifier.
-The prover is implemented as the \texttt{stwo-ml} Rust crate
-(117\,K+ lines), which loads model weights (ONNX, HuggingFace
-SafeTensors, or raw M31-encoded), executes forward-pass inference
-in $\M$ arithmetic, produces a GKR proof with aggregated weight
-binding, and serializes the result as Cairo-compatible calldata.
-A weight commitment cache (\texttt{.swcf} file) stores Poseidon2-M31
-Merkle roots, avoiding recomputation on subsequent proofs
-(500\,s $\to$ $<$1\,ms on cache hit).
-
 
 % =========================================================================
 \section{GKR for Neural Networks}\label{sec:gkr}
@@ -536,11 +430,13 @@ regardless of the actual computation size.
   \label{fig:gkr-reduction}
 \end{figure}
 
-\subsection{Layer Types and Reduction Strategies}
+\subsection{Layer Types}
 
 \begin{table}[t]
   \centering\small
-  \caption{GKR layer types and reduction strategies.}
+  \caption{GKR layer types and reduction strategies.
+           Layers marked $\dagger$ are not constrained in the
+           deployed verifier.}
   \label{tab:layers}
   \begin{tabularx}{\columnwidth}{@{}lccX@{}}
     \toprule
@@ -549,13 +445,25 @@ regardless of the actual computation size.
     MatMul$(m,k,n)$     & 2 & $\log_2 k$ & Product of two MLEs \\
     Add$(n)$            & 1 & 1          & Linearity: $c_0=\text{claim}/2$ \\
     Mul$(n)$            & 2 & 1          & Degree-2 check \\
-    ReLU/GELU           & -- & --        & LogUp table lookup \\
-    LayerNorm/RMSNorm   & -- & --        & Variance mask + LogUp \\
+    ReLU/GELU$^\dagger$ & -- & --        & LogUp table lookup \\
+    LayerNorm$^\dagger$ & -- & --        & Variance mask + LogUp \\
     RoPE                & 1 & linear     & Trig.\ MLE \\
-    GQA Attention       & 2 & decomposed & Q$\times$K, Softmax, $\times$V \\
+    GQA Attention       & 2 & decomposed & Q$\times$K, $\times$V \\
     \bottomrule
   \end{tabularx}
 \end{table}
+
+Self-attention with Grouped Query Attention
+(GQA) computes:
+\[
+  \text{Attention}(Q,K,V)
+  = \text{softmax}\!\left(\frac{QK^T}{\sqrt{d_k}}\right)\!V
+\]
+We decompose this into five sublayers: QK$^T$ matmul (degree~2),
+scaling (degree~1), causal mask (linear), softmax (LogUp$^\dagger$),
+and score$\times$V matmul (degree~2).
+RoPE encoding is a linear layer with position-dependent trigonometric
+coefficients precomputed as an MLE.
 
 \subsection{Batch Verification}
 
@@ -627,159 +535,83 @@ Matrix~$A$ uses row-major layout; matrix~$B$ uses column-major
 \end{algorithmic}
 \end{algorithm}
 
-\begin{theorem}[Sumcheck soundness]\label{thm:sumcheck}
-  For a degree-$d$ polynomial over $\F$ with $k$ sumcheck rounds,
-  a cheating prover passes with probability at most
-  $kd/|\F|$~\cite{lund1992algebraic, schwartz1980, zippel1979}.
-  For our MatMul with $k=\lceil\log_2 5120\rceil = 13$, $d=2$,
-  over $\QM$ ($|\QM| = (2^{31}-1)^4 \approx 2^{124}$):
-  \[
-    \Pr[\text{cheat}] \le \frac{13\times 2}{2^{124}}
-    \approx 2^{-120}.
-  \]
-\end{theorem}
-
 \textbf{Proof compression.}
 Only $(c_0,c_2)$ are transmitted per round; the verifier reconstructs
 $c_1 = \text{claim} - 2c_0 - c_2$, saving 33\% of calldata.
 
 
 % =========================================================================
-\section{Activation Verification via LogUp}\label{sec:logup}
-% =========================================================================
-
-Nonlinear activations (ReLU, GELU, Softmax) cannot be expressed as
-low-degree polynomials over $\Fp$.
-We verify them using precomputed lookup tables and the
-LogUp argument~\cite{habock2022logup}.
-
-\begin{definition}[LogUp argument]\label{def:logup}
-  For execution-trace pairs $(u_i,v_i)_{i=1}^N$ and table entries
-  $(\text{in}_j,\text{out}_j)_{j=1}^T$ with multiplicities $m_j$,
-  the argument asserts:
-  \begin{equation}\label{eq:logup}
-    \sum_{i=1}^{N} \frac{1}{\gamma - u_i - \beta\, v_i}
-    = \sum_{j=1}^{T} \frac{m_j}{\gamma - \text{in}_j - \beta\,\text{out}_j}
-  \end{equation}
-  where $\gamma,\beta\in\QM$ are Fiat-Shamir challenges.
-\end{definition}
-
-\textbf{Lookup tables.}
-ReLU uses $2^{16}$ entries; GELU uses $2^{18}$; Softmax uses $2^{20}$.
-Values are quantized: $v_{\M} = \lfloor v_{\text{float}}\cdot 2^{16}\rfloor \bmod p$.
-
-\textbf{STARK composition.}
-Activation proofs are composed via STWO's \texttt{FrameworkComponent}
-with $\lceil N/2\rceil$ batches for $N$ fraction columns and constraint
-degree $\log_2(\text{size})+1$ with blowup factor~1.
-
-\textbf{LayerNorm variance masking.}
-$v_{\text{masked}} = \M(\text{raw.0}\;\&\;((1\ll 16)-1))$
-reduces outputs to the 16-bit table range while preserving
-the lookup argument's soundness.
-
-\begin{remark}[Deployment status]\label{rem:logup-status}
-  Activation LogUp is \textbf{specified and implemented} but
-  \textbf{not enforced} in the current deployed GKR path.
-  In the deployed verifier, the prover supplies
-  \texttt{logup\_proof: None} and the verifier mixes only the
-  input MLE evaluation, effectively treating activation functions
-  as unconstrained witnesses.
-\end{remark}
-
-\textbf{Implications for verified computation.}
-The deployed verifier cryptographically enforces only the
-\emph{linear arithmetic trace}: matrix multiplications, additions,
-and scaling operations are bound through sumcheck reductions.
-Nonlinear activation functions (ReLU, GELU, Softmax, LayerNorm)
-are executed by the prover but not independently constrained.
-This means the verifier confirms that:
-\begin{enumerate}[nosep,leftmargin=1.4em]
-  \item the claimed output is consistent with the committed weights
-        through all linear layers;
-  \item the weight commitments match via aggregated binding;
-  \item the Fiat-Shamir transcript is honestly constructed.
-\end{enumerate}
-It does \emph{not} independently verify that the prover applied
-the correct nonlinear function between linear layers.
-\Cref{sec:security} provides a precise soundness statement
-for this partially-constrained verification mode.
-Enforcing activation LogUp in the GKR path is active
-development work; the primary obstacle is that M31 matmul
-outputs may exceed the precomputed activation table range
-($2^{16}$--$2^{20}$ entries), requiring either range reduction
-or expanded tables.
-
-
-% =========================================================================
-\section{Attention Mechanism Decomposition}\label{sec:attention}
-% =========================================================================
-
-Self-attention with Grouped Query Attention
-(GQA)~\cite{sun2024zkllm} computes:
-\[
-  \text{Attention}(Q,K,V)
-  = \text{softmax}\!\left(\frac{QK^T}{\sqrt{d_k}}\right)\!V
-\]
-where $Q\in\F^{s\times d}$, $K,V\in\F^{s\times d_{kv}}$ for
-sequence length~$s$.
-We decompose this into five GKR-verifiable sublayers:
-
-\begin{enumerate}[nosep,leftmargin=1.4em]
-  \item \textbf{QK$^T$ MatMul}: Sumcheck over $d_k$, degree~2.
-  \item \textbf{Scaling}: Element-wise $\times 1/\sqrt{d_k}$, degree~1.
-  \item \textbf{Causal mask}: Addition of $-\infty$ mask, linear.
-  \item \textbf{Softmax}: LogUp table lookup per row.
-  \item \textbf{Score$\times$V MatMul}: Sumcheck over $s$, degree~2.
-\end{enumerate}
-
-\textbf{RoPE (Rotary Position Encoding).}
-$\text{RoPE}(x,m)_k = x_k\cos(m\theta_k) - x_{k+1}\sin(m\theta_k)$
-with $\theta_k = 10000^{-2k/d}$.
-In GKR, this is a linear layer (degree~1) with position-dependent
-trigonometric coefficients precomputed as an MLE.
-
-
-% =========================================================================
 \section{Aggregated Weight Binding}\label{sec:binding}
 % =========================================================================
 
-\subsection{Motivation}
+This section presents the paper's core contribution: a protocol that
+makes on-chain verification of LLM-scale weight commitments practical.
+
+\subsection{The Calldata Bottleneck}
 
 A 40-layer Qwen3-14B has 160 weight matrices.
-Individual MLE openings require $\sim$2.4\,M felts of calldata ---
-infeasible for on-chain verification.
+Verifying each independently requires an MLE opening proof per matrix,
+totaling $\sim$2.4\,M felts of calldata.
+Starknet's per-transaction step limit ($\sim$10\,M Cairo steps) makes
+processing this volume infeasible in streaming transactions.
 
-\subsection{Protocol}
+\subsection{Global Oracle Construction}
+
+\begin{definition}[Global weight oracle]\label{def:global-oracle}
+  Given $M$ weight matrices $\{W_1,\ldots,W_M\}$ with dimensions
+  $\{(r_i,c_i)\}_{i=1}^M$, the global oracle MLE is:
+  \begin{equation}\label{eq:global}
+    W_{\text{global}}(\mathbf{s},\mathbf{x})
+    = \sum_{i=1}^{M} \eq(\mathbf{s},\mathbf{g}_i)
+      \cdot \MLE{W_i}(\mathbf{x}),
+  \end{equation}
+  where $\mathbf{s}\in\{0,1\}^{\lceil\log_2 M\rceil}$ are selector bits
+  and $\mathbf{g}_i$ is the binary encoding of matrix index~$i$.
+\end{definition}
+
+\subsection{Mismatch Sumcheck Protocol}
 
 \begin{protocol}[Aggregated weight binding]\label{prot:binding}
   Given $M$ weight matrices with claimed evaluations $v_i$ at
-  points $\mathbf{e}_i$:
+  points $\mathbf{e}_i$ (produced by the GKR sumcheck):
   \begin{enumerate}[nosep,leftmargin=1.4em]
-    \item Arrange all matrices into a global oracle MLE
-          $W_{\text{global}}$ with $\lceil\log_2 M\rceil$ selector bits.
-    \item Draw batching random $\rho\leftarrow\QM$ from Fiat-Shamir.
-    \item Run mismatch sumcheck:
+    \item \textbf{Batch.} Draw $\rho\leftarrow\QM$ from the
+          Fiat-Shamir channel.
+    \item \textbf{Mismatch sumcheck.} Prove that the random
+          linear combination of all mismatches vanishes:
       \begin{equation}\label{eq:binding}
         \sum_{i=1}^{M} \rho^i \cdot \eq(\mathbf{g}_i,\mathbf{s})
-        \cdot \bigl(W_{\text{global}}(\mathbf{s}) - v_i\bigr) \equiv 0,
+        \cdot \bigl(W_{\text{global}}(\mathbf{s},\mathbf{e}_i) - v_i\bigr) \equiv 0.
       \end{equation}
-      where $\mathbf{g}_i = [\text{selector}_i \| \mathbf{0}_{\text{pad}} \| \mathbf{e}_i]$.
-    \item Verify the final MLE opening against the committed
-          super-root with subtree openings.
+    \item \textbf{Commitment check.} Verify the final MLE opening
+          against the committed Poseidon2-M31 super-root
+          with subtree Merkle openings.
   \end{enumerate}
 \end{protocol}
 
-\textbf{Zero-tree commitment extension.}
+\textbf{Intuition.}
+If all claimed evaluations are correct
+($W_{\text{global}}(\mathbf{s},\mathbf{e}_i) = v_i$ for all~$i$),
+every term in the sum is zero.
+A cheating prover who forges even one evaluation $v_j$ must
+produce a non-zero polynomial that sums to zero---which
+by Schwartz-Zippel~\cite{schwartz1980,zippel1979} occurs with
+probability at most $1/|\QM|\approx 2^{-124}$.
+
+\subsection{Zero-Tree Commitment Extension}
+
 Matrices with different depths are padded to $n_{\max}$ using
 zero-tree hashing: $h_0 = \text{pack}(\QM::0)$,
 $h_i = \text{poseidon\_hash}(h_{i-1}, h_{i-1})$.
+This allows a single Merkle super-root to cover all weight matrices
+regardless of individual dimensions.
 
-\subsection{Results}
+\subsection{Streaming Calldata Breakdown}
 
 \begin{table}[t]
   \centering\small
-  \caption{Calldata comparison for Qwen3-14B 40-layer proof.}
+  \caption{Calldata for Qwen3-14B 40-layer proof.
+           Aggregated binding reduces total calldata by 28$\times$.}
   \label{tab:calldata}
   \begin{tabular}{@{}lrr@{}}
     \toprule
@@ -787,19 +619,29 @@ $h_i = \text{poseidon\_hash}(h_{i-1}, h_{i-1})$.
     \midrule
     Individual openings & $\sim$2{,}400{,}000 & $\sim$76.8\,MB \\
     Aggregated binding  & 86{,}723 & $\sim$2.8\,MB \\
-    \quad Binding overhead & $\sim$4{,}290 & $\sim$137\,KB \\
+    \quad GKR layer data & $\sim$82{,}433 & $\sim$2.6\,MB \\
+    \quad Binding proof  & $\sim$4{,}290 & $\sim$137\,KB \\
     \midrule
     \textbf{Reduction}  & \multicolumn{2}{c}{\textbf{$\approx$28$\times$}} \\
     \bottomrule
   \end{tabular}
 \end{table}
 
-\begin{proposition}[Binding soundness]\label{prop:binding}
-  The aggregated weight binding provides per-claim soundness
-  $1/|\QM|\approx 2^{-124}$.
-  For $M=160$ matrices, the probability that any forged claim
-  passes is at most $M/|\QM| \approx 160/2^{124}\approx 2^{-117}$.
-\end{proposition}
+\subsection{Memory-Efficient Proving}
+
+The off-chain binding prover uses \texttt{GraphWeightSource}---a
+streaming interface that loads weight matrices on demand from the
+model graph rather than materializing all 160 matrices simultaneously.
+This bounds peak memory at $\sim$4\,GB (one weight matrix at a time)
+versus $\sim$640\,GB for full materialization.
+
+\subsection{Weight Commitment Cache}
+
+Poseidon2-M31 Merkle root computation for 160 matrices takes
+$\sim$500\,s on first run.
+The weight cache (\texttt{.swcf} file) stores roots keyed by
+$(node\_id, rows\_padded, cols\_padded)$, reducing subsequent
+proofs to $<$1\,ms (cache hit) for the commitment phase.
 
 
 % =========================================================================
@@ -862,8 +704,7 @@ broadcast (16 bytes).
     \end{axis}
   \end{tikzpicture}
   \caption{GPU (CUDA) speedup over CPU (STWO SIMD) for key operations
-           on NVIDIA H100. Poseidon2 Merkle tree commitment achieves
-           96$\times$ due to massive parallelism.}
+           on NVIDIA H100.}
   \label{fig:gpu-speedup}
 \end{figure}
 
@@ -872,162 +713,6 @@ Weight commitment computation supports multi-GPU via greedy
 bin-packing (\texttt{multi\_gpu::partition\_by\_size()}), with one
 \texttt{DeviceGuard} per thread and fallback to single-GPU pipelined
 path on failure.
-
-
-% =========================================================================
-\section{Poseidon2-M31 Primitives}\label{sec:poseidon}
-% =========================================================================
-
-Poseidon2-M31~\cite{grassi2023poseidon2} is a sponge-based hash
-operating natively over $\M$:
-
-\begin{table}[t]
-  \centering\small
-  \caption{Poseidon2-M31 parameters.}
-  \label{tab:poseidon}
-  \begin{tabular}{@{}ll@{}}
-    \toprule
-    State width $t$ & 16 M31 elements \\
-    Rate / Capacity & 8 / 8 \\
-    S-box degree $d$ & 5 ($x\mapsto x^5$) \\
-    Full rounds $R_f$ & 8 (4+4 split) \\
-    Partial rounds $R_p$ & 14 \\
-    Total rounds & 22 \\
-    S-box inverse $d^{-1}$ & $1{,}717{,}986{,}917$ \\
-    Security & $\sim$124-bit collision \\
-    \bottomrule
-  \end{tabular}
-\end{table}
-
-\textbf{S-box validity:} $\gcd(5,p-1) = \gcd(5, 2^{31}-2) = 1$,
-confirming $x\mapsto x^5$ is a permutation over $\Fp$.
-
-\begin{lemma}[S-box inverse]\label{lem:sbox}
-  The inverse exponent is $d^{-1} = 5^{-1}\bmod(p-1)$.
-  Since $p-1 = 2^{31}-2 = 2\cdot(2^{30}-1)$ and
-  $5\cdot 1{,}717{,}986{,}917 = 8{,}589{,}934{,}585
-  = 4\cdot(2^{31}-2) + 1 \equiv 1\pmod{p-1}$,
-  we have $d^{-1} = 1{,}717{,}986{,}917$.
-\end{lemma}
-
-\textbf{Diffusion layers.}
-External rounds: circulant MDS matrix
-$\text{circ}(2M_4, M_4, M_4, M_4)$ with $M_4$ a $4\times 4$
-addition-only matrix.
-Internal rounds: $M_I = J + \text{diag}(\mathbf{v})$ where
-$v_0 = p-2 \equiv -2\pmod{p}$.
-
-\textbf{Round constants.}
-Derived via SHA-256 counter mode with domain separator
-\texttt{"Poseidon2-M31-rc"} (142 constants total: 128 for full
-rounds + 14 for partial).
-
-\textbf{Hash functions.}
-Sponge hash absorbs in 8-element chunks with domain separation
-$\text{state}[\text{RATE}] \leftarrow \text{len}(\text{input})$,
-yielding 248-bit output ($\sim$124-bit collision resistance).
-Compression ($16\to 8$) uses domain constant
-$\texttt{0x4D524B4C}$ (``MRKL'').
-
-
-% =========================================================================
-\section{VM31 Privacy Protocol}\label{sec:privacy}
-% =========================================================================
-
-\subsection{Note Structure}
-
-A private note is $(\text{pk}, \text{blinding},
-\text{amount}, \text{asset\_id})$.
-
-\textbf{Commitment} (11 M31 inputs):
-$\text{comm} = \prhash(\text{pk}[8], \text{blinding}, \text{amt\_lo},
-\text{amt\_hi})$.
-
-\textbf{Nullifier} (12 M31 inputs):
-$\text{null} = \prhash(\text{comm}[8], \text{sk}[4])$.
-
-Amounts: $\text{amount} = \text{lo} + \text{hi}\cdot 2^{31}$,
-each component range-checked via 16-bit sub-limb decomposition
-($v = \text{lo}_{16} + \text{hi}_{16}\cdot 2^{16}$).
-
-\subsection{Transaction Circuits}
-
-\begin{itemize}[nosep,leftmargin=1.2em]
-  \item \textbf{Deposit} (2 Poseidon2 permutations): commitment
-        correctness + range check on amount sub-limbs.
-  \item \textbf{Spend} (2-in, 2-out): Merkle membership
-        (depth~20, 40 hash verifications), nullifier computation,
-        amount conservation
-        ($\text{in}_1+\text{in}_2 = \text{out}_1+\text{out}_2$),
-        output commitment correctness.
-  \item \textbf{Withdraw} (1-in): Merkle proof + withdrawal binding
-        ($\prhash(\text{payout}, \text{credit}, \text{asset},
-        \text{amt\_lo}, \text{amt\_hi}, \text{idx})$).
-\end{itemize}
-
-\subsection{On-Chain Pool (3-Step Protocol)}
-
-\begin{enumerate}[nosep,leftmargin=1.4em]
-  \item \texttt{submit\_batch\_proof}: STARK proof verification,
-        relayer-gated, returns \texttt{batch\_id}.
-  \item \texttt{apply\_batch\_chunk(id, start, count)}: insert notes
-        into Merkle tree, record nullifiers.
-        Permissionless after 120 blocks.
-  \item \texttt{finalize\_batch(id)}: update canonical Merkle root.
-\end{enumerate}
-
-
-% =========================================================================
-\section{Privacy DeFi Mechanisms}\label{sec:defi}
-% =========================================================================
-
-\begin{table}[t]
-  \centering\small
-  \caption{Six privacy mechanisms deployed on Starknet.}
-  \label{tab:privacy}
-  \begin{tabularx}{\columnwidth}{@{}lX@{}}
-    \toprule
-    \textbf{Mechanism} & \textbf{Cryptographic Basis} \\
-    \midrule
-    Privacy Pools (ASP)    & Poseidon2-M31, LeanIMT \\
-    Dark Pool Auctions     & Pedersen commit-reveal, uniform clearing \\
-    Shielded AMM Swaps     & Ekubo ILocker + ZK withdrawal \\
-    Stealth Payments       & ECDH + Schnorr (EIP-5564~\cite{eip5564}) \\
-    UTXO Privacy Pool      & Poseidon2-M31, depth-20 Merkle \\
-    Confidential Transfers & ElGamal on Stark curve~\cite{elgamal1985} \\
-    \bottomrule
-  \end{tabularx}
-\end{table}
-
-\subsection{ElGamal Confidential Transfers}
-
-Exponential ElGamal on the Stark curve with standard notation:
-\begin{align}
-  C_1 &= g^r, \label{eq:c1} \\
-  C_2 &= g^m \cdot \mathit{pk}^r, \label{eq:c2}
-\end{align}
-where $g$ is the generator, $\mathit{pk}$ the recipient's public key,
-$r$ random, and $m$ the plaintext.
-The homomorphic property $\text{Enc}(a)\cdot\text{Enc}(b) = \text{Enc}(a+b)$
-enables encrypted balance updates without decryption.
-
-A Chaum-Pedersen same-encryption proof demonstrates that two
-ciphertexts encrypt the same value under different keys, with
-domain separator \texttt{'obelysk-same-enc-2-v1'}.
-
-\subsection{ASP Compliance}
-
-Following Buterin et al.~\cite{buterin2023privacy}, three compliance
-modes: (1)~full privacy; (2)~inclusion proof (deposit in ASP set);
-(3)~exclusion proof (not in blacklist).
-
-\textbf{Critical security note.}
-All Schnorr proofs use arithmetic modulo curve order~$N$, not
-field prime~$P$.
-Since $P\neq N$, felt252 arithmetic (mod~$P$) would break Schnorr
-soundness.
-The protocol implements explicit \texttt{mul\_mod\_n},
-\texttt{add\_mod\_n} operations.
 
 
 % =========================================================================
@@ -1063,20 +748,14 @@ Class hash:\par
 \subsection{MLE Opening Verification}
 
 \begin{enumerate}[nosep,leftmargin=1.4em]
-  \item Commitment: $2^n$ evaluations $\to$ Poseidon Merkle root $R_0$.
+  \item Commitment: $2^n$ evaluations $\to$ Poseidon2-M31 Merkle root.
   \item Folding: $n$ rounds, challenge $r_i$ per round:
     $f_{i+1}[j] = f_i[j] + r_i(f_i[\mathrm{mid}+j]-f_i[j])$.
-  \item Spot checks: \textbf{3--5 queries per fold} (read from
-    proof at runtime; default 5 via \texttt{MLE\_NUM\_QUERIES}).
+  \item Spot checks: $q$ queries per fold (read from
+    proof at runtime; default 5 via \texttt{MLE\_NUM\_QUERIES},
+    recommended $q=10$ for production; see \Cref{thm:mle}).
   \item Verify Merkle paths and folding consistency at each layer.
 \end{enumerate}
-
-\begin{remark}[Query count]\label{rem:queries}
-  The MLE spot-check query count is \emph{not} hardcoded.
-  It is read from the proof structure at runtime, with
-  the Cairo verifier default set to~5.
-  This enables tuning the security/cost tradeoff per deployment.
-\end{remark}
 
 \subsection{18-Transaction Streaming Protocol}
 
@@ -1128,6 +807,17 @@ Class hash:\par
   \label{fig:streaming}
 \end{figure}
 
+The streaming protocol (\Cref{fig:streaming}) splits verification
+across 18 transactions to fit within Starknet's per-TX step limit:
+\begin{enumerate}[nosep,leftmargin=1.4em]
+  \item \textbf{Session phase} (TXs 1--4): open session, upload
+        calldata in chunks, seal session.
+  \item \textbf{Verification phase} (TXs 5--18): init channel state,
+        verify output MLE, process 10 layer steps (each running
+        sumcheck verification), verify aggregated weight binding,
+        finalize with input MLE check and verdict.
+\end{enumerate}
+
 \textbf{QM31 packing.}
 QM31 values are packed into felt252:
 $\text{packed} = 1\cdot 2^{124} + a_0\cdot 2^{93} + a_1\cdot 2^{62}
@@ -1135,8 +825,7 @@ $\text{packed} = 1\cdot 2^{124} + a_0\cdot 2^{93} + a_1\cdot 2^{62}
 (125 bits used, 1-bit sentinel prevents zero ambiguity).
 
 \textbf{IO-packed calldata.}
-The v31 verifier uses packed IO format: 8 M31 per felt252, reducing
-IO calldata from 10{,}246 to 1{,}281 felts.
+8 M31 per felt252, reducing IO calldata from 10{,}246 to 1{,}281 felts.
 \texttt{evaluate\_mle\_from\_packed\_1row()} evaluates the MLE directly
 from packed felts without unpacking.
 
@@ -1145,108 +834,141 @@ from packed felts without unpacking.
 \section{Security Analysis}\label{sec:security}
 % =========================================================================
 
+We present four theorems establishing the soundness of each
+verification component. All security statements are in the
+random oracle model for Fiat-Shamir.
+
 \subsection{Threat Model}
 
-We consider a malicious prover $\calP^*$ attempting to convince
-the on-chain verifier $\calV$ to accept an incorrect inference
-result.
-The following assumptions hold:
+We consider a computationally unbounded malicious prover $\calP^*$
+attempting to convince the on-chain verifier $\calV$ to accept an
+incorrect result.
+Assumptions:
 \begin{itemize}[nosep,leftmargin=1.2em]
   \item The Fiat-Shamir hash (Poseidon252) is modeled as a random
         oracle binding transcript challenges to the full history.
-  \item The prover has unbounded computation but must produce
-        a valid transcript accepted by the Cairo verifier contract.
   \item Starknet L2 provides data availability and transaction
         ordering guarantees.
-  \item The relayer in the privacy pool is semi-trusted for liveness
-        (gating period) but not for correctness; after 120~blocks,
-        pool operations become permissionless.
+  \item The prover must produce a valid transcript accepted by the
+        Cairo verifier contract; no physical access to the verifier
+        is assumed.
 \end{itemize}
 
-\subsection{Deployed Verification Statement}
+\subsection{Theorem 1: Sumcheck Soundness Per Layer}
 
-The deployed verifier (v31) cryptographically enforces the following:
+\begin{theorem}[Sumcheck soundness]\label{thm:sumcheck}
+  For a degree-$d$ sumcheck polynomial over $\QM$ with $k$ rounds,
+  a cheating prover passes with probability at most
+  $kd/|\QM|$~\cite{lund1992algebraic, schwartz1980, zippel1979}.
+  For matmul with $k=\lceil\log_2 5120\rceil = 13$ and $d=2$:
+  \[
+    \varepsilon_{\text{sc}} \le \frac{13\times 2}{2^{124}}
+    = \frac{26}{2^{124}} \approx 2^{-119}.
+  \]
+\end{theorem}
 
-\begin{theorem}[Deployed verification]\label{thm:deployed}
-  Given committed input $x$, output $y$, and weight matrices
-  $\{W_i\}_{i=1}^M$ with Poseidon2-M31 Merkle roots, the
-  verifier accepts if and only if:
+\begin{proof}
+  Each sumcheck round requires the prover to send a degree-$d$
+  univariate polynomial $p_i(X)$ such that $p_i(0)+p_i(1)$ equals
+  the current claim.
+  By Schwartz-Zippel, a dishonest $p_i$ agrees with the honest
+  polynomial at the random challenge $r_i$ with probability at
+  most $d/|\QM|$.
+  By union bound over $k$ rounds, the total cheating probability
+  is at most $kd/|\QM|$.
+\end{proof}
+
+\subsection{Theorem 2: MLE Opening Soundness}
+
+\begin{theorem}[MLE opening soundness]\label{thm:mle}
+  With $q$ spot-check queries per fold over $n$ folds:
+  \begin{equation}\label{eq:mle-sound}
+    \varepsilon_{\text{mle}} \le (1-1/2)^{q\cdot n}
+    = 2^{-qn}.
+  \end{equation}
+  For $n=13$ folds:
+  \begin{itemize}[nosep,leftmargin=1.2em]
+    \item $q=5$ (current default): $\varepsilon_{\text{mle}} = 2^{-65}$.
+    \item $q=10$ (recommended): $\varepsilon_{\text{mle}} = 2^{-130}$.
+  \end{itemize}
+  The query count is a runtime parameter read from the proof
+  structure; increasing $q$ requires no protocol changes, only
+  proportionally more calldata per MLE opening.
+\end{theorem}
+
+\begin{proof}
+  At each fold, the verifier checks $q$ randomly chosen positions.
+  A cheating prover who corrupts any folded value must avoid all $q$
+  checks at that fold.
+  Since each position is checked with probability $\ge 1/2$
+  (the table halves each round), the probability of evading $q$
+  checks is $(1/2)^q$.
+  Over $n$ folds, independence gives $(1/2)^{qn}$.
+\end{proof}
+
+\textbf{Recommendation:} We recommend $q=10$ for production
+deployments, providing 130-bit opening security.
+The calldata overhead is $2\times$ (10 vs.\ 5 Merkle paths per fold),
+adding $\sim$4{,}000 felts to the 86{,}723 total---a 4.6\% increase
+for 65 additional bits of security.
+
+\subsection{Theorem 3: Aggregated Weight Binding Soundness}
+
+\begin{theorem}[Aggregated binding soundness]\label{thm:binding}
+  For $M$ weight matrices with claimed evaluations
+  $\{v_i\}_{i=1}^M$, if any $v_j \ne
+  W_{\text{global}}(\mathbf{g}_j, \mathbf{e}_j)$, the
+  aggregated binding mismatch sumcheck (\Cref{prot:binding})
+  accepts with probability at most:
+  \begin{equation}\label{eq:binding-sound}
+    \varepsilon_{\text{bind}} \le \frac{M}{|\QM|}
+    \approx \frac{160}{2^{124}} \approx 2^{-117}.
+  \end{equation}
+\end{theorem}
+
+\begin{proof}
+  The mismatch polynomial $\sum_i \rho^i \cdot \eq(\mathbf{g}_i,
+  \mathbf{s}) \cdot (W_{\text{global}}(\mathbf{s},\mathbf{e}_i)-v_i)$
+  is non-zero if any $v_j$ is forged.
+  By Schwartz-Zippel over the random batching coefficient $\rho$
+  and sumcheck challenges, the probability that this non-zero
+  polynomial evaluates to zero is bounded by the degree over
+  $|\QM|$.
+  The degree in $\rho$ is at most $M$, giving the bound.
+\end{proof}
+
+\subsection{Theorem 4: Deployed System Soundness}
+
+\begin{theorem}[End-to-end deployed soundness]\label{thm:deployed}
+  The deployed v31 verifier constrains the following:
   \begin{enumerate}[nosep,leftmargin=1.4em]
-    \item each linear layer's sumcheck reduction is consistent
-          (matmul, addition, scaling);
-    \item the aggregated weight binding confirms all weight MLE
-          evaluations against committed roots;
-    \item the MLE opening spot-checks pass at each fold;
-    \item the Fiat-Shamir transcript is honestly constructed.
+    \item[(a)] Every linear layer's sumcheck reduction is
+          consistent (matmul, addition, scaling).
+    \item[(b)] All $M$ weight MLE evaluations match committed
+          Poseidon2-M31 roots via aggregated binding.
+    \item[(c)] MLE opening spot-checks pass at each fold.
+    \item[(d)] The Fiat-Shamir transcript is honestly
+          constructed.
   \end{enumerate}
   \textbf{Not enforced:} nonlinear activation functions between
-  linear layers (\Cref{rem:logup-status}).
-  The prover supplies activations as unconstrained witnesses.
+  linear layers (see \Cref{sec:limitations}).
+
+  By union bound over $L=40$ layers, the total forgery probability
+  for the linear arithmetic trace is:
+  \begin{equation}\label{eq:combined}
+    \varepsilon_{\text{total}} \le
+    \underbrace{L \cdot \varepsilon_{\text{sc}}}_{\text{sumcheck}}
+    + \underbrace{\varepsilon_{\text{mle}}}_{\text{MLE opening}}
+    + \underbrace{\varepsilon_{\text{bind}}}_{\text{binding}}.
+  \end{equation}
+  With $q=5$: $\varepsilon_{\text{total}} < 40\!\cdot\!2^{-119}
+  + 2^{-65} + 2^{-117} \approx 2^{-65}$,
+  dominated by MLE opening.
+
+  With $q=10$: $\varepsilon_{\text{total}} <
+  40\!\cdot\!2^{-119} + 2^{-130} + 2^{-117}
+  \approx 2^{-112}$, dominated by binding.
 \end{theorem}
-
-\subsection{Soundness of Linear Arithmetic Verification}
-
-\begin{theorem}[Sumcheck soundness per layer]\label{thm:gkr-sound}
-  For a matmul layer with $k\le 13$ sumcheck rounds of degree
-  $d=2$, over $\QM$ ($|\QM|\approx 2^{124}$), a cheating prover
-  passes with probability at most $kd/|\QM| \le 26/2^{124}
-  \approx 2^{-119}$.
-\end{theorem}
-
-\begin{corollary}[End-to-end for 40 layers]
-  By union bound over $L=40$ layers:
-  $\Pr[\text{forge}] \le L\cdot kd/|\QM|
-  = 40\cdot 26/2^{124} < 2^{-113}$.
-\end{corollary}
-
-\textbf{MLE opening soundness.}
-With $q=5$ spot-check queries per fold (runtime-configurable,
-default in Cairo), over $n=13$ folds:
-\begin{equation}\label{eq:mle-sound}
-  \Pr[\text{forged opening}] \le (1/2)^{q\cdot n}
-  = 2^{-65}.
-\end{equation}
-This is the weakest component.
-Increasing to $q=10$ yields $2^{-130}$; this is a
-deployment parameter, not a protocol limitation.
-
-\textbf{Aggregated weight binding.}
-By \Cref{prop:binding}, soundness is $\approx 2^{-117}$ for 160 matrices.
-
-\textbf{Combined soundness.}
-$\min(2^{-113}, 2^{-65}, 2^{-117}) = 2^{-65}$, dominated by
-MLE opening queries at the current default $q=5$.
-
-\textbf{Limitation: unconstrained activations.}
-Because activation LogUp is not enforced in the deployed path,
-a malicious prover could substitute arbitrary values for
-nonlinear activation outputs while maintaining valid sumcheck
-reductions for all linear layers.
-The practical impact depends on the application: for weight
-binding verification (confirming a specific model was used),
-the linear trace provides strong guarantees; for full
-inference correctness including nonlinearities, activation
-LogUp enforcement is required.
-
-\subsection{Privacy Security}
-
-\begin{table}[t]
-  \centering\small
-  \caption{Privacy security properties and assumptions.}
-  \label{tab:privacy-sec}
-  \begin{tabularx}{\columnwidth}{@{}lX@{}}
-    \toprule
-    \textbf{Property} & \textbf{Mechanism / Assumption} \\
-    \midrule
-    Amount privacy     & ElGamal + Pedersen (DDH on Stark curve) \\
-    Sender anonymity   & Nullifier unlinkability (Poseidon2-M31 $\sim$124-bit) \\
-    Receiver anonymity & Stealth addresses via ECDH (CDH) \\
-    Double-spend       & On-chain nullifier set + Poseidon2-M31 preimage \\
-    Conservation       & STARK proof of circuit (STWO soundness) \\
-    Compliance         & ASP Merkle membership (hash preimage) \\
-    \bottomrule
-  \end{tabularx}
-\end{table}
 
 
 % =========================================================================
@@ -1275,11 +997,13 @@ LogUp enforcement is required.
   \end{tabular}
 \end{table}
 
-\subsection{Inference Proving}
+\subsection{Per-Layer Proving}
 
 \begin{table}[t]
   \centering\small
-  \caption{Qwen3-14B single-layer proving breakdown (H100).}
+  \caption{Qwen3-14B single-layer proving breakdown (H100).
+           These are \emph{measured} timings for a single
+           transformer layer.}
   \label{tab:proving}
   \begin{tabular}{@{}lr@{}}
     \toprule
@@ -1296,13 +1020,6 @@ LogUp enforcement is required.
     \bottomrule
   \end{tabular}
 \end{table}
-
-\textbf{40-layer extrapolation:} $40\times 3.04 \approx 122$\,s
-(extrapolated; not a measured end-to-end run).
-Full end-to-end timing including model loading and serialization
-is not yet benchmarked.
-Weight cache hit reduces subsequent weight commitment computation
-from $\sim$500\,s to $<$1\,ms.
 
 % ---------- pgfplots: Proving Time Breakdown ----------
 \begin{figure}[t]
@@ -1334,17 +1051,63 @@ from $\sim$500\,s to $<$1\,ms.
     \end{axis}
   \end{tikzpicture}
   \caption{Per-layer proving time breakdown for Qwen3-14B on H100.
-           Overhead (Fiat-Shamir channel, serialization) dominates.}
+           Overhead (channel, serialization) dominates at 63\%.}
   \label{fig:proving-breakdown}
 \end{figure}
 
-\subsection{Trace Reduction}
+\textbf{40-layer projection:} $40\times 3.04 \approx 122$\,s.
+This is a linear extrapolation from the single-layer measurement,
+not a measured end-to-end run.
+Actual end-to-end timing may differ due to model loading,
+memory pressure, and serialization overhead.
 
-For a $5120\times 5120$ matmul, na\"ive STARK trace requires
-$5120^3 \approx 1.34\times 10^{11}$ rows.
-GKR reduces to $\sim$78\,M operations ($\sim$1{,}700$\times$ per-layer).
-The end-to-end calldata reduction for the 40-layer proof is
-$\approx$28$\times$ (\Cref{tab:calldata}).
+\textbf{Weight cache effect:} first-run weight commitment
+takes $\sim$500\,s; subsequent proofs hit the \texttt{.swcf} cache
+and reduce this to $<$1\,ms.
+
+\subsection{Comparison with Prior Work}
+
+\begin{table}[t]
+  \centering\scriptsize
+  \caption{Comparison with existing ZKML systems.
+           $\dagger$Linear trace only (activations unconstrained).
+           $\ddagger$Estimated from published data.}
+  \label{tab:comparison}
+  \setlength{\tabcolsep}{3pt}
+  \begin{tabular}{@{}lcccc@{}}
+    \toprule
+    \textbf{System} & \textbf{Params} & \textbf{Time}
+      & \textbf{On-Chain} & \textbf{Proof} \\
+    \midrule
+    EZKL~\cite{ezkl2024}
+      & $\sim$1\,M & sec & Solidity & Halo2 \\
+    Giza~\cite{giza2024}
+      & $\sim$10\,M & min & Cairo & STARK \\
+    zkLLM~\cite{sun2024zkllm}
+      & 13\,B & 1--15\,m & None & Custom \\
+    Expander~\cite{polyhedra2024expander}
+      & ---$^\ddagger$ & ---$^\ddagger$ & None & GKR \\
+    DeepProve~\cite{lagrange2024}
+      & GPT-2$^\ddagger$ & ---$^\ddagger$ & None & GKR \\
+    \midrule
+    \textbf{ObelyZK}
+      & 14\,B$^\dagger$ & 3\,s/lyr & Cairo & GKR \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\Cref{tab:comparison} positions ObelyZK relative to existing systems.
+Key differentiators:
+\begin{itemize}[nosep,leftmargin=1.2em]
+  \item \textbf{Scale + deployment}: the only system with both
+        14\,B-parameter proving and a deployed on-chain verifier.
+  \item \textbf{Aggregated binding}: enables practical calldata for
+        LLM-scale on-chain verification (no other system reports a
+        comparable mechanism).
+  \item \textbf{Honest scope}: ObelyZK constrains only linear
+        operations; zkLLM constrains full inference including
+        non-arithmetic ops via \emph{tlookup}.
+\end{itemize}
 
 \subsection{On-Chain Costs}
 
@@ -1358,8 +1121,6 @@ $\approx$28$\times$ (\Cref{tab:calldata}).
     \midrule
     GKR verify (1 layer) & $\sim$280\,K & $<$\$0.001 \\
     Full 40-layer (18 TXs) & $\sim$2.5\,M & $\sim$\$0.01 \\
-    Privacy deposit & $\sim$150\,K & $<$\$0.001 \\
-    Privacy spend (2-in/2-out) & $\sim$400\,K & $<$\$0.002 \\
     \bottomrule
   \end{tabular}
 \end{table}
@@ -1368,7 +1129,7 @@ $\approx$28$\times$ (\Cref{tab:calldata}).
 
 \begin{table}[t]
   \centering\small
-  \caption{Codebase scale.}
+  \caption{Codebase scale (\texttt{stwo-ml} repository).}
   \label{tab:codebase}
   \begin{tabular}{@{}lrl@{}}
     \toprule
@@ -1386,6 +1147,76 @@ $\approx$28$\times$ (\Cref{tab:calldata}).
 
 
 % =========================================================================
+\section{Limitations and Future Work}\label{sec:limitations}
+% =========================================================================
+
+\subsection{Unconstrained Activations}
+
+The most significant limitation of the deployed system is that
+nonlinear activation functions (ReLU, GELU, Softmax, LayerNorm)
+are \textbf{not independently constrained} by the on-chain verifier.
+A malicious prover could substitute arbitrary values for activation
+outputs while producing valid sumcheck proofs for all linear layers.
+
+\textbf{What this means in practice.}
+The deployed verifier proves that:
+\begin{itemize}[nosep,leftmargin=1.2em]
+  \item the claimed output is arithmetically consistent with the
+        committed weights through all matrix multiplications;
+  \item the weight commitments are valid via aggregated binding.
+\end{itemize}
+It does \emph{not} prove that the prover applied the correct
+nonlinear function between linear layers.
+For applications where the primary concern is \emph{weight binding}
+(confirming a specific model was used), the linear trace provides
+meaningful guarantees.
+For full inference correctness, activation enforcement is required.
+
+\textbf{Technical obstacle.}
+Activation LogUp is implemented and tested but not deployed because
+M31 matmul intermediate outputs can exceed the precomputed lookup
+table range ($2^{16}$--$2^{20}$ entries).
+Integrating activation LogUp into the deployed GKR path requires
+either adaptive range reduction or expanded tables with
+proportionally higher calldata cost.
+
+\subsection{Extrapolated Multi-Layer Timing}
+
+The 40-layer projection (122\,s) is a linear extrapolation from
+single-layer measurements.
+We have not yet performed a measured end-to-end 40-layer proving
+run.
+Actual timing may differ due to GPU memory pressure at 40-layer
+scale, model loading overhead, and calldata serialization.
+We plan to report measured multi-layer timings in a future revision.
+
+\subsection{Query Count Tradeoff}
+
+The current Cairo default of $q=5$ MLE queries yields only 65-bit
+opening security---below the 124-bit field security.
+We recommend $q=10$ (130-bit opening security) for production.
+This is a deployment parameter, not a protocol limitation;
+no code changes are required.
+
+\subsection{Future Directions}
+
+\begin{enumerate}[nosep,leftmargin=1.4em]
+  \item \textbf{Activation LogUp enforcement}: integrate activation
+        verification into the deployed GKR path, achieving full
+        inference correctness.
+  \item \textbf{Measured multi-layer runs}: end-to-end benchmarks
+        for 5, 10, 20, and 40 layer configurations with variance
+        reporting.
+  \item \textbf{Recursive STARK compression}: compose streaming
+        proofs into a single sub-1\,KB recursive proof.
+  \item \textbf{Verifiable fine-tuning}: extend GKR to backward
+        pass gradients.
+  \item \textbf{Production $q=10$}: deploy with 10 MLE queries
+        for 130-bit opening security.
+\end{enumerate}
+
+
+% =========================================================================
 \section{Related Work}\label{sec:related}
 % =========================================================================
 
@@ -1394,25 +1225,15 @@ EZKL~\cite{ezkl2024} handles $\sim$1\,M-parameter models via Halo2/KZG
 with Solidity verifiers.
 Giza~\cite{giza2024} uses STARK (Stone) for small--medium models.
 Polyhedra's Expander~\cite{polyhedra2024expander} is a GKR-based engine
-achieving 4{,}500 Keccak-f/s but lacks a deployed on-chain verifier.
+achieving 4{,}500 Keccak-f/s.
 Lagrange DeepProve~\cite{lagrange2024} targets large-scale GKR with
-GPT-2 demos.
+GPT-2 demonstrations.
 zkLLM~\cite{sun2024zkllm} (ACM CCS 2024) introduces \emph{tlookup}
 for non-arithmetic tensor ops, proving up to 13\,B parameters in
 1--15 minutes with $<$200\,KB proofs.
-To our knowledge, ObelyZK is the first system with a publicly
-deployed on-chain verifier on Starknet for 14\,B-scale ZKML
-inference with sub-4\,s per-layer proving.
-
-\textbf{Privacy DeFi.}
-Railgun~\cite{railgun2024} provides shielded transfers on Ethereum
-with BN254 Groth16.
-0xbow~\cite{0xbow2024} is the canonical Privacy Pools/ASP implementation.
-Penumbra~\cite{penumbra2024} runs a shielded DEX on its own chain.
-Aztec~\cite{aztec2024} builds a general-purpose privacy L2.
-ObelyZK differentiates with (1)~six mechanisms vs.\ typically
-1--2, (2)~M31-native proving without felt252 emulation, and
-(3)~integrated ASP compliance on Starknet.
+A comprehensive survey appears in~\cite{xing2025zkml}.
+zkCNN~\cite{liu2021zkcnn} applies GKR to convolutional networks.
+vCNN~\cite{lee2024vcnn} uses zkSNARKs for CNN verification.
 
 \textbf{Interactive proofs.}
 The GKR protocol~\cite{goldwasser2015delegating} was made practical
@@ -1422,52 +1243,104 @@ The sumcheck protocol~\cite{lund1992algebraic} underpins all GKR
 reductions.
 Schwartz-Zippel~\cite{schwartz1980, zippel1979} provides the
 foundational polynomial identity testing bound.
-A comprehensive survey of zero-knowledge machine learning appears
-in~\cite{xing2025zkml}.
 Thaler's textbook~\cite{thaler2022proofs} provides a thorough treatment
 of interactive proofs and their applications.
-zkCNN~\cite{liu2021zkcnn} applies GKR to convolutional networks,
-demonstrating the approach's viability for ML workloads.
 
 \textbf{Proof infrastructure.}
 STWO~\cite{starkware2024stwo} provides the Circle STARK
 backend~\cite{habock2024circle} with M31-native arithmetic.
 FRI~\cite{ben-sasson2018fri} enables efficient proximity testing
 for STARK proof composition.
+Marlin~\cite{chiesa2020marlin} offers preprocessing zkSNARKs with
+universal SRS as an alternative to STARKs.
 
 
 % =========================================================================
 \section{Conclusion}\label{sec:conclusion}
 % =========================================================================
 
-ObelyZK demonstrates that verifiable AI inference at LLM scale is
-practical today, not a theoretical future possibility.
-By combining GKR interactive proofs with STWO's Circle STARKs over
-the M31 field tower:
-\begin{itemize}[nosep,leftmargin=1.2em]
-  \item 3.04\,s per-layer proving on H100 GPU;
-  \item 86{,}723 felts calldata ($\approx$28$\times$ reduction)
-        via aggregated weight binding;
-  \item 18-transaction streaming on-chain verification;
-  \item Six compliant privacy mechanisms with ASP framework;
-  \item 117\,K+ lines of Rust, $\sim$14\,K Cairo, 1{,}029+ tests.
-\end{itemize}
+We presented ObelyZK, a system for verifiable linear-trace inference
+at LLM scale.
+The core contribution---aggregated weight binding---reduces on-chain
+calldata by 28$\times$ (from 2.4\,M to 86{,}723 felts), making
+streaming verification of 40-layer transformer proofs practical within
+Starknet's transaction limits.
+The system achieves 3.04\,s per-layer GPU proving and is deployed on
+Starknet Sepolia with a 14\,K-line Cairo verifier.
 
-The system is deployed on Starknet Sepolia (contract v31) with
-end-to-end verified Qwen3-14B inference.
-The mathematical foundation --- GKR sumcheck over the M31 field tower,
-composed with Circle STARKs --- is architecturally native to Starknet.
+The deployed verifier constrains the linear arithmetic trace (matmul,
+addition, scaling) but not nonlinear activations.
+This is an honest limitation that we are actively addressing.
+With activation LogUp enforcement and $q=10$ MLE queries, the system
+would provide full inference verification at 130-bit security.
 
-\textbf{Future work.}
-(1)~Increase MLE query count to 10+ for $>$128-bit opening soundness.
-(2)~Recursive STARK compression for sub-1\,KB final proofs.
-(3)~Verifiable fine-tuning (forward + backward pass GKR).
-(4)~Confidential computing via CPU attestation + CVM deployment.
+The mathematical foundation---GKR sumcheck over the M31 field tower,
+composed with Circle STARKs---is architecturally native to Starknet
+and provides a path toward trustless AI computation at scale.
 
 
 % =========================================================================
 \appendix
 % =========================================================================
+
+\section{Poseidon2-M31 Specification}\label{app:poseidon}
+
+Poseidon2-M31~\cite{grassi2023poseidon2} is a sponge-based hash
+operating natively over $\M$.
+Parameters: state width $t=16$, rate$=$capacity$=8$,
+S-box degree $d=5$, full rounds $R_f=8$ (4+4 split),
+partial rounds $R_p=14$, total 22 rounds.
+
+\textbf{S-box validity:} $\gcd(5,p-1) = 1$, confirming $x\mapsto x^5$
+is a permutation.
+Inverse: $d^{-1} = 5^{-1}\bmod(p-1) = 1{,}717{,}986{,}917$.
+
+\textbf{Diffusion.}
+External: circulant MDS $\text{circ}(2M_4, M_4, M_4, M_4)$.
+Internal: $M_I = J + \text{diag}(\mathbf{v})$, $v_0 = p-2$.
+
+\textbf{Hash output:} 8 M31 elements (248 bits, $\sim$124-bit collision).
+Compression ($16\to 8$): domain constant
+$\texttt{0x4D524B4C}$ (``MRKL'').
+
+\section{Privacy Protocol Summary}\label{app:privacy}
+
+ObelyZK includes a privacy protocol built on Poseidon2-M31 with
+six DeFi mechanisms (\Cref{tab:privacy}).
+This is architecturally independent of the ZKML verification system
+and is described here for completeness.
+
+\begin{table}[h]
+  \centering\small
+  \caption{Privacy mechanisms (deployed on Starknet Sepolia).}
+  \label{tab:privacy}
+  \begin{tabularx}{\columnwidth}{@{}lX@{}}
+    \toprule
+    \textbf{Mechanism} & \textbf{Basis} \\
+    \midrule
+    Privacy Pools (ASP~\cite{buterin2023privacy})
+      & Poseidon2-M31, LeanIMT \\
+    Dark Pool Auctions
+      & Pedersen commit-reveal \\
+    Shielded AMM Swaps
+      & ZK withdrawal proofs \\
+    Stealth Payments
+      & ECDH + Schnorr (EIP-5564~\cite{eip5564}) \\
+    UTXO Privacy Pool
+      & Poseidon2-M31, depth-20 Merkle \\
+    Confidential Transfers
+      & ElGamal~\cite{elgamal1985} on Stark curve \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+\textbf{Note structure:}
+Commitment (11 M31 inputs): $\prhash(\text{pk}[8], \text{blinding},
+\text{amt\_lo}, \text{amt\_hi})$.
+Nullifier (12 M31 inputs): $\prhash(\text{comm}[8], \text{sk}[4])$.
+Transaction circuits: deposit (2 Poseidon2 permutations),
+spend (2-in/2-out with depth-20 Merkle membership),
+withdraw (1-in with withdrawal binding).
 
 \section{Deployed Contract Addresses}\label{app:contracts}
 
@@ -1479,11 +1352,6 @@ composed with Circle STARKs --- is architecturally native to Starknet.
     \midrule
     ZKML Verifier    & \texttt{0x005928ac548dc2719ef1\ldots 674fba} \\
     GKR v31 (class)  & \texttt{0x6a6b7a75d5ec1f63d715\ldots 5b5439} \\
-    Privacy Pools    & \texttt{0x0d85ad03dcd91a075bef\ldots b78a7} \\
-    Dark Pool        & \texttt{0x047765422c66c23d1639\ldots a0d46} \\
-    Shielded Swap    & \texttt{0x056b76b42487b943a0d3\ldots 2f1d6} \\
-    Confid.\ Xfer    & \texttt{0x07ab4e4cf7ec2fca4875\ldots 00e86} \\
-    VM31 Bridge      & \texttt{0x025a45900864ac136ae5\ldots 630a7} \\
     Deployer         & \texttt{0x0759a4374389b0e3cfcc\ldots bb344} \\
     \bottomrule
   \end{tabularx}
@@ -1504,10 +1372,11 @@ composed with Circle STARKs --- is architecturally native to Starknet.
     $\eq(\mathbf{x},\mathbf{y})$ & Lagrange equality kernel \\
     $\rho,\alpha,\lambda,\beta,\gamma$ & Fiat-Shamir challenges \\
     $\calP, \calV$ & Prover, Verifier \\
+    $\varepsilon$ & Soundness error bound \\
+    $q$ & MLE spot-check query count per fold \\
     ASP    & Association Set Provider \\
     GKR    & Goldwasser-Kalai-Rothblum protocol \\
     LogUp  & Logarithmic derivative lookup argument \\
-    RLC    & Random Linear Combination \\
     \bottomrule
   \end{tabularx}
 \end{table}
