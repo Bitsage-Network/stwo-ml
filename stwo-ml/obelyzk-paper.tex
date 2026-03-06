@@ -600,6 +600,60 @@ produce a non-zero polynomial that sums to zero---which
 by Schwartz-Zippel~\cite{schwartz1980,zippel1979} occurs with
 probability at most $1/|\QM|\approx 2^{-124}$.
 
+% ---------- TikZ: Aggregated Binding Concept ----------
+\begin{figure}[t]
+  \centering
+  \begin{tikzpicture}[
+    mat/.style={draw, rounded corners=2pt, minimum width=0.55cm,
+                minimum height=0.55cm, font=\tiny, fill=#1!15, draw=#1!50},
+    bigbox/.style={draw, rounded corners=4pt, minimum height=1.4cm,
+                   text width=2.2cm, align=center, font=\scriptsize,
+                   fill=#1!10, draw=#1!50},
+    arr/.style={-{Stealth[length=4pt]}, thick, darkgray},
+    lbl/.style={font=\tiny, darkgray},
+    node distance=0.15cm
+  ]
+    % --- Left: Naive ---
+    \node[font=\scriptsize\bfseries] at (-1.8,2) {Na\"ive};
+
+    \foreach \i in {0,...,4} {
+      \node[mat=starkblue] (w\i) at (-2.2+\i*0.65, 1.2) {$W_{\the\numexpr\i+1}$};
+      \node[mat=accentpurple] (p\i) at (-2.2+\i*0.65, 0.3) {\tiny proof};
+      \draw[arr, thin] (w\i) -- (p\i);
+    }
+    \node[font=\tiny, darkgray] at (-0.15,1.2) {$\cdots$};
+    \node[font=\tiny, darkgray] at (-0.15,0.3) {$\cdots$};
+    \node[mat=starkblue] (wn) at (0.45, 1.2) {$W_M$};
+    \node[mat=accentpurple] (pn) at (0.45, 0.3) {\tiny proof};
+    \draw[arr, thin] (wn) -- (pn);
+
+    \node[font=\tiny\bfseries, warmred] at (-0.9, -0.25) {2.4\,M felts};
+
+    % --- Right: Aggregated ---
+    \node[font=\scriptsize\bfseries] at (3.7,2) {Aggregated};
+
+    \node[bigbox=starkblue] (global) at (3.2, 1.15) {Global Oracle\\$W_{\text{global}}$\\{\tiny $M$ matrices}};
+    \node[bigbox=emerald] (sc) at (3.2, -0.25) {Mismatch\\Sumcheck\\{\tiny 1 proof}};
+    \draw[arr] (global) -- (sc);
+
+    \node[mat=accentpurple, minimum width=1.2cm] (root) at (5.1, 1.15) {\tiny super-root};
+    \draw[arr, thin] (global) -- (root);
+    \draw[arr, thin, dashed] (root) |- (sc);
+
+    \node[font=\tiny\bfseries, emerald!70!black] at (3.7, -1.0) {86{,}723 felts};
+
+    % --- Arrow between ---
+    \draw[-{Stealth[length=6pt]}, ultra thick, warmred!70!black]
+      (1.1, 0.5) -- node[above, font=\scriptsize\bfseries]{28$\times$} (2.1, 0.5);
+  \end{tikzpicture}
+  \caption{Aggregated weight binding eliminates per-matrix opening
+           proofs. Left: na\"ive approach requires one MLE opening per
+           weight matrix ($\sim$2.4\,M felts). Right: a single global
+           oracle with mismatch sumcheck verifies all 160 matrices
+           (86{,}723 felts), a 28$\times$ reduction.}
+  \label{fig:binding-concept}
+\end{figure}
+
 \subsection{Zero-Tree Commitment Extension}
 
 Matrices with different depths are padded to $n_{\max}$ using
@@ -761,53 +815,93 @@ Class hash:\par
 
 \subsection{18-Transaction Streaming Protocol}
 
-% ---------- TikZ: Streaming Protocol ----------
-\begin{figure}[t]
+% ---------- TikZ: End-to-End Proof Flow ----------
+\begin{figure*}[t]
   \centering
   \begin{tikzpicture}[
-    step/.style={draw, rounded corners=2pt, minimum width=3cm,
-                 minimum height=0.42cm, font=\scriptsize,
-                 fill=#1!10, draw=#1!40},
-    arr/.style={-{Stealth[length=3pt]}, thin, gray},
-    node distance=0.22cm
+    phase/.style={draw, rounded corners=3pt, minimum height=0.7cm,
+                  text width=1.7cm, align=center, font=\tiny\bfseries,
+                  fill=#1!12, draw=#1!50},
+    step/.style={draw, rounded corners=2pt, minimum height=0.4cm,
+                 minimum width=1.5cm, font=\tiny,
+                 fill=#1!8, draw=#1!35},
+    arr/.style={-{Stealth[length=4pt]}, thick, darkgray},
+    sarr/.style={-{Stealth[length=3pt]}, thin, gray!70},
+    lbl/.style={font=\tiny, darkgray},
+    node distance=0.3cm and 0.35cm
   ]
-    % Session (4 TX)
-    \node[step=starkblue]                (s1) {1. open\_session};
-    \node[step=starkblue, below=of s1]   (s2) {2. upload\_calldata};
-    \node[step=starkblue, below=of s2]   (s3) {3. upload\_calldata};
-    \node[step=starkblue, below=of s3]   (s4) {4. seal\_session};
+    % === Off-chain ===
+    \node[phase=starkblue] (load) {Model\\Load};
+    \node[phase=starkblue, right=of load] (fwd) {Forward\\Pass};
+    \node[phase=starkblue, right=of fwd] (gkr) {GKR\\Prove};
+    \node[phase=accentpurple, right=of gkr] (bind) {Aggregated\\Binding};
+    \node[phase=starkblue, right=of bind] (serial) {Serialize\\Calldata};
 
-    % Streaming (14 TX)
-    \node[step=accentpurple, below=0.35cm of s4] (v1)  {5. init};
-    \node[step=accentpurple, below=of v1]  (v2)  {6. output\_mle};
-    \node[step=warmred, below=of v2]       (v3)  {7--16. layer steps ($\times$10)};
-    \node[step=accentpurple, below=of v3]  (v4)  {17. weight\_binding};
-    \node[step=emerald, below=of v4]       (v5)  {18. finalize};
+    \draw[arr] (load) -- (fwd);
+    \draw[arr] (fwd) -- (gkr);
+    \draw[arr] (gkr) -- (bind);
+    \draw[arr] (bind) -- (serial);
 
-    \foreach \a/\b in {s1/s2, s2/s3, s3/s4, s4/v1, v1/v2, v2/v3, v3/v4, v4/v5}
-      \draw[arr] (\a) -- (\b);
+    \node[font=\scriptsize\bfseries, starkblue, above=0.25cm of gkr]
+      {Off-Chain (GPU, 3.04\,s/layer)};
 
-    % Labels
-    \node[font=\scriptsize\bfseries, starkblue, left=0.3cm of s2]
-      {Session};
-    \node[font=\scriptsize\bfseries, warmred!70!black, left=0.3cm of v3]
-      {Streaming};
+    % === Boundary ===
+    \draw[dashed, thick, darkgray!40]
+      ([xshift=0.4cm]serial.east) ++(0,0.8) -- ++(0,-3.0);
+    \node[font=\tiny\itshape, darkgray, rotate=90]
+      at ([xshift=0.7cm]serial.east) {Starknet L2};
 
-    % Brace
-    \draw[decorate, decoration={brace,amplitude=4pt,mirror},
+    % === On-chain: Session ===
+    \node[step=starkblue, right=1.2cm of serial, yshift=0.4cm]
+      (tx1) {open\_session};
+    \node[step=starkblue, right=0.2cm of tx1]
+      (tx2) {upload $\times$2};
+    \node[step=starkblue, right=0.2cm of tx2]
+      (tx3) {seal};
+
+    \draw[sarr] (tx1) -- (tx2);
+    \draw[sarr] (tx2) -- (tx3);
+    \draw[arr] (serial.east) -- ++(0.4,0) |- (tx1.west);
+
+    % === On-chain: Verification ===
+    \node[step=accentpurple, below=0.45cm of tx1]
+      (v1) {init + output};
+    \node[step=warmred, right=0.2cm of v1, text width=1.8cm]
+      (v2) {layer steps $\times$10};
+    \node[step=accentpurple, right=0.2cm of v2]
+      (v3) {binding};
+    \node[step=emerald, right=0.2cm of v3]
+      (v4) {finalize};
+
+    \draw[sarr] (tx3.south) -- ++(0,-0.15) -| (v1.north);
+    \draw[sarr] (v1) -- (v2);
+    \draw[sarr] (v2) -- (v3);
+    \draw[sarr] (v3) -- (v4);
+
+    % Verdict
+    \node[draw, rounded corners=3pt, fill=emerald!20, draw=emerald!60,
+          font=\tiny\bfseries, right=0.25cm of v4, minimum height=0.5cm,
+          text width=0.9cm, align=center]
+      (verdict) {Accept /\\ Reject};
+    \draw[arr, emerald!70!black] (v4) -- (verdict);
+
+    % Braces
+    \draw[decorate, decoration={brace,amplitude=3pt},
           thick, starkblue!60]
-      ([xshift=-0.15cm]s1.north west) -- ([xshift=-0.15cm]s4.south west)
-      node[midway, left=6pt, font=\tiny\bfseries, starkblue]{4 TX};
-    \draw[decorate, decoration={brace,amplitude=4pt,mirror},
+      ([yshift=2pt]tx1.north west) -- ([yshift=2pt]tx3.north east)
+      node[midway, above=3pt, font=\tiny\bfseries, starkblue]{4 TX};
+    \draw[decorate, decoration={brace,amplitude=3pt,mirror},
           thick, warmred!60]
-      ([xshift=-0.15cm]v1.north west) -- ([xshift=-0.15cm]v5.south west)
-      node[midway, left=6pt, font=\tiny\bfseries, warmred]{14 TX};
+      ([yshift=-2pt]v1.south west) -- ([yshift=-2pt]v4.south east)
+      node[midway, below=3pt, font=\tiny\bfseries, warmred]{14 TX};
   \end{tikzpicture}
-  \caption{18-transaction streaming verification: 4~session management
-           + 14~streaming GKR steps.
-           Each step is an independent Starknet transaction.}
+  \caption{End-to-end proof flow. Off-chain: model loading, M31 forward
+           pass, GKR proving, aggregated binding, and calldata serialization.
+           On-chain: 18 Starknet transactions split into 4 session management
+           and 14 streaming verification steps, ending with an accept/reject
+           verdict.}
   \label{fig:streaming}
-\end{figure}
+\end{figure*}
 
 The streaming protocol (\Cref{fig:streaming}) splits verification
 across 18 transactions to fit within Starknet's per-TX step limit:
@@ -1213,8 +1307,52 @@ and reduce this to $<$1\,ms.
   \end{tabular}
 \end{table}
 
-\Cref{tab:ablation} isolates the effect of the main design
-parameters.
+% ---------- pgfplots: Calldata Ablation Bar Chart ----------
+\begin{figure}[t]
+  \centering
+  \begin{tikzpicture}
+    \begin{axis}[
+      ybar,
+      bar width=16pt,
+      width=\columnwidth,
+      height=5cm,
+      symbolic x coords={Individual, Agg.\ $q\!=\!5$, Agg.\ $q\!=\!10$},
+      xtick=data,
+      xticklabel style={font=\scriptsize},
+      ylabel={Calldata (felts)},
+      ylabel style={font=\small},
+      ymin=0, ymax=2600000,
+      ytick={0,500000,1000000,1500000,2000000,2500000},
+      yticklabel style={font=\tiny},
+      yticklabels={0, 500K, 1M, 1.5M, 2M, 2.5M},
+      nodes near coords={\pgfmathprintnumber[precision=0]{\pgfplotspointmeta}},
+      every node near coord/.append style={font=\tiny\bfseries, above=1pt},
+      enlarge x limits=0.3,
+    ]
+    \addplot[fill=warmred!60, draw=warmred] coordinates {
+      (Individual, 2400000)
+    };
+    \addplot[fill=emerald!60, draw=emerald] coordinates {
+      (Agg.\ $q\!=\!5$, 86723)
+    };
+    \addplot[fill=starkblue!60, draw=starkblue] coordinates {
+      (Agg.\ $q\!=\!10$, 91000)
+    };
+    \end{axis}
+
+    % Annotation arrow
+    \draw[-{Stealth[length=4pt]}, thick, darkgray]
+      (1.3, 2.8) -- node[above, font=\tiny\bfseries]{28$\times$} (2.5, 0.7);
+  \end{tikzpicture}
+  \caption{Calldata comparison for 40-layer Qwen3-14B.
+           Aggregated binding is the dominant reduction ($28\times$);
+           increasing $q$ from 5 to 10 adds only 4.6\% more felts
+           while improving MLE opening soundness by 65 bits.}
+  \label{fig:calldata-ablation}
+\end{figure}
+
+\Cref{tab:ablation} and \Cref{fig:calldata-ablation} isolate the
+effect of the main design parameters.
 Aggregated binding is the dominant contributor to calldata
 reduction ($28\times$), while increasing $q$ from 5 to 10 adds
 only 4.6\% calldata but improves MLE opening soundness by 65~bits.
