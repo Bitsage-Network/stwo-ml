@@ -41,10 +41,10 @@ use stwo::prover::backend::gpu::cuda_executor::{
 
 /// Number of queries for MLE opening proofs.
 ///
-/// Configurable via `STWO_MLE_N_QUERIES` env var (2..=20, default 5).
+/// Configurable via `STWO_MLE_N_QUERIES` env var (2..=20, default 10).
 /// Each query on an n-variable MLE provides ~n bits of soundness, so
-/// 5 queries × 27 vars = 135 bits — above 128-bit security target.
-pub const MLE_N_QUERIES: usize = 5;
+/// 10 queries × 13 vars = 130 bits — at the 130-bit security target.
+pub const MLE_N_QUERIES: usize = 10;
 
 /// Runtime-configurable query count (cached on first call).
 pub fn mle_n_queries() -> usize {

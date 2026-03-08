@@ -1052,17 +1052,15 @@ Assumptions:
 \end{proof}
 
 \textbf{Operational default.}
-The intended production configuration is $q=10$, providing
+The production default is $q=10$, providing
 130-bit MLE opening security that matches the field's 124-bit
 algebraic security margin.
-The current Cairo default of $q=5$ is a development
-convenience; all soundness bounds in this paper are stated
-parametrically in~$q$ so that either setting can be evaluated.
 The calldata overhead of $q=10$ vs.\ $q=5$ is $2\times$ Merkle
 paths per fold, adding $\sim$4{,}000 felts to the 86{,}723
 total---a 4.6\% increase for 65 additional bits of security.
-The query count is a runtime parameter read from the proof
-structure; changing $q$ requires no code modifications.
+The query count is a runtime parameter
+(\texttt{STWO\_MLE\_N\_QUERIES}); all soundness bounds in this
+paper are stated parametrically in~$q$.
 
 \subsection{Theorem 3: Aggregated Weight Binding Soundness}
 
@@ -1166,11 +1164,7 @@ structure; changing $q$ requires no code modifications.
     + \underbrace{\varepsilon_{\text{mle}}}_{\text{MLE opening}}
     + \underbrace{\varepsilon_{\text{bind}}}_{\text{binding}}.
   \end{equation}
-  With $q=5$: $\varepsilon_{\text{total}} < 40\!\cdot\!2^{-119}
-  + 2^{-65} + 2^{-116} \approx 2^{-65}$,
-  dominated by MLE opening.
-
-  With $q=10$: $\varepsilon_{\text{total}} <
+  With the production default $q=10$: $\varepsilon_{\text{total}} <
   40\!\cdot\!2^{-119} + 2^{-130} + 2^{-116}
   \approx 2^{-111}$, dominated by binding.
 \end{theorem}
