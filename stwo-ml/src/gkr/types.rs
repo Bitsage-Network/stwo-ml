@@ -354,6 +354,8 @@ pub enum LayerProof {
         input_eval: SecureField,
         output_eval: SecureField,
         table_commitment: starknet_ff::FieldElement,
+        /// Quantization bit-width (mixed into Fiat-Shamir channel for domain separation).
+        bits: u32,
     },
 
     /// LogUp proof for quantization (input → quantized output lookup).
@@ -366,6 +368,14 @@ pub enum LayerProof {
         output_eval: SecureField,
         table_inputs: Vec<M31>,
         table_outputs: Vec<M31>,
+        /// Quantization bit-width (mixed into channel).
+        bits: u32,
+        /// |zero_point| (mixed into channel).
+        zero_point_abs: u32,
+        /// scale × 2³² truncated to u64, serialized as two u32s (mixed into channel).
+        scale_fixed: u64,
+        /// Strategy tag: 0=Direct, 1=Sym8, 2=Asym8, 3=Sym4, 4=Asym4 (mixed into channel).
+        strategy_tag: u32,
     },
 
     /// LogUp proof for embedding lookup (token_id, col_idx, value).
@@ -378,6 +388,10 @@ pub enum LayerProof {
         output_eval: SecureField,
         /// Number of variables in the projected embedding-input claim.
         input_num_vars: usize,
+        /// Vocabulary size (mixed into channel for replay).
+        vocab_size: u32,
+        /// Embedding dimension (mixed into channel for replay).
+        embed_dim: u32,
     },
 
     /// Block-extended 3-factor sumcheck for SIMD matmul where both operands vary.
@@ -410,6 +424,14 @@ pub enum LayerProof {
         sub_proofs: Vec<LayerProof>,
         /// Output MLE evaluations for each sub-matmul's fresh claim.
         sub_claim_values: Vec<SecureField>,
+        /// Number of attention heads (mixed into channel for replay).
+        num_heads: u32,
+        /// Sequence length (mixed into channel for replay).
+        seq_len: u32,
+        /// Model dimension (mixed into channel for replay).
+        d_model: u32,
+        /// Whether causal masking is applied (mixed into channel for replay).
+        causal: bool,
     },
 }
 

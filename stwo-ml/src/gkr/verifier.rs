@@ -297,6 +297,7 @@ fn verify_gkr_inner(
                     input_eval,
                     output_eval,
                     table_commitment,
+                    ..
                 },
             ) => verify_dequantize_reduction(
                 &current_claim,
@@ -318,6 +319,7 @@ fn verify_gkr_inner(
                     output_eval,
                     table_inputs,
                     table_outputs,
+                    ..
                 },
             ) => verify_quantize_reduction(
                 &current_claim,
@@ -341,6 +343,7 @@ fn verify_gkr_inner(
                     input_eval,
                     output_eval,
                     input_num_vars,
+                    ..
                 },
             ) => verify_embedding_reduction(
                 &current_claim,
@@ -401,6 +404,7 @@ fn verify_gkr_inner(
                 LayerProof::Attention {
                     sub_proofs,
                     sub_claim_values,
+                    ..
                 },
             ) => {
                 verify_attention_reduction(
@@ -536,6 +540,7 @@ fn verify_gkr_inner(
                 input_eval,
                 output_eval,
                 table_commitment,
+                ..
             } => {
                 // Verify Dequantize deferred proof via full LogUp verification.
                 // Look up QuantParams from the circuit's skip layer.
@@ -589,6 +594,7 @@ fn verify_gkr_inner(
                 output_eval,
                 table_inputs,
                 table_outputs,
+                ..
             } => {
                 // Verify Quantize deferred proof via full LogUp verification.
                 let skip_layer_idx =
@@ -1453,6 +1459,7 @@ fn verify_gkr_simd_inner(
                 LayerProof::Attention {
                     sub_proofs,
                     sub_claim_values,
+                    ..
                 },
             ) => verify_attention_reduction(
                 &current_claim,
@@ -1472,6 +1479,7 @@ fn verify_gkr_simd_inner(
                     input_eval,
                     output_eval,
                     table_commitment,
+                    ..
                 },
             ) => verify_dequantize_reduction(
                 &current_claim,
@@ -1493,6 +1501,7 @@ fn verify_gkr_simd_inner(
                     output_eval,
                     table_inputs,
                     table_outputs,
+                    ..
                 },
             ) => verify_quantize_reduction(
                 &current_claim,
@@ -1516,6 +1525,7 @@ fn verify_gkr_simd_inner(
                     input_eval,
                     output_eval,
                     input_num_vars,
+                    ..
                 },
             ) => verify_embedding_reduction(
                 &current_claim,
@@ -1690,6 +1700,7 @@ fn verify_gkr_simd_inner(
                 input_eval,
                 output_eval,
                 table_commitment,
+                ..
             } => {
                 let skip_layer_idx =
                     deferred_skip_layer_indices.get(i).copied().ok_or_else(|| {
@@ -1744,6 +1755,7 @@ fn verify_gkr_simd_inner(
                 output_eval,
                 table_inputs,
                 table_outputs,
+                ..
             } => {
                 let skip_layer_idx =
                     deferred_skip_layer_indices.get(i).copied().ok_or_else(|| {
@@ -7860,6 +7872,7 @@ mod tests {
                 input_eval,
                 output_eval,
                 table_commitment,
+                ..
             } => {
                 let result = verify_dequantize_reduction(
                     &output_claim,
@@ -7951,6 +7964,7 @@ mod tests {
                 input_eval,
                 output_eval,
                 table_commitment,
+                ..
             } => {
                 if !logup.multiplicities.is_empty() {
                     logup.multiplicities[0] = logup.multiplicities[0].wrapping_add(1);
@@ -8032,6 +8046,7 @@ mod tests {
                 output_eval,
                 table_inputs,
                 table_outputs,
+                ..
             } => {
                 let result = verify_quantize_reduction(
                     &output_claim,
@@ -8117,6 +8132,7 @@ mod tests {
                 input_eval,
                 output_eval,
                 input_num_vars,
+                ..
             } => {
                 let result = verify_embedding_reduction(
                     &output_claim,

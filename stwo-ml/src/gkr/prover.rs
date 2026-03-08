@@ -5852,6 +5852,7 @@ fn reduce_dequantize_layer(
             input_eval,
             output_eval,
             table_commitment,
+            bits: params.bits as u32,
         },
         claim,
     ))
@@ -6102,6 +6103,10 @@ fn reduce_quantize_layer(
             output_eval,
             table_inputs: table.inputs.clone(),
             table_outputs: table.outputs.clone(),
+            bits: params.bits as u32,
+            zero_point_abs: params.zero_point.unsigned_abs(),
+            scale_fixed: (params.scale * (1u64 << 32) as f64) as u64,
+            strategy_tag: quantize_strategy_tag(params.strategy) as u32,
         },
         claim,
     ))
@@ -6336,6 +6341,8 @@ fn reduce_embedding_layer(
             input_eval,
             output_eval,
             input_num_vars,
+            vocab_size: embedding_table.rows as u32,
+            embed_dim: embedding_table.cols as u32,
         },
         claim,
     ))
@@ -8170,6 +8177,10 @@ fn reduce_attention_layer_simd_gpu(
         LayerProof::Attention {
             sub_proofs,
             sub_claim_values,
+            num_heads: config.num_heads as u32,
+            seq_len: config.seq_len as u32,
+            d_model: config.d_model as u32,
+            causal: config.causal,
         },
         final_input_claim,
     ))
@@ -8370,6 +8381,10 @@ fn reduce_attention_layer(
         LayerProof::Attention {
             sub_proofs,
             sub_claim_values,
+            num_heads: config.num_heads as u32,
+            seq_len: config.seq_len as u32,
+            d_model: config.d_model as u32,
+            causal: config.causal,
         },
         final_input_claim,
     ))
@@ -8796,6 +8811,7 @@ mod tests {
             LayerProof::Attention {
                 sub_proofs,
                 sub_claim_values,
+                ..
             } => {
                 let expected = 4 + 2 * 1; // 6 sub-proofs for 1 head
                 assert_eq!(
@@ -8875,6 +8891,7 @@ mod tests {
             LayerProof::Attention {
                 sub_proofs,
                 sub_claim_values,
+                ..
             } => {
                 let expected = 4 + 2 * 2; // 8 sub-proofs for 2 heads
                 assert_eq!(sub_proofs.len(), expected);
@@ -8940,6 +8957,7 @@ mod tests {
             LayerProof::Attention {
                 mut sub_proofs,
                 sub_claim_values,
+                ..
             } => {
                 // Tamper with the first sub-proof (output projection)
                 if let LayerProof::MatMul {
@@ -9007,6 +9025,7 @@ mod tests {
             LayerProof::Attention {
                 sub_proofs,
                 sub_claim_values,
+                ..
             } => {
                 let mut verifier_channel = PoseidonChannel::new();
                 verifier_channel.mix_u64(0xA774);

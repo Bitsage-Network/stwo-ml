@@ -1471,8 +1471,16 @@ pub fn serialize_gkr_model_proof(proof: &crate::gkr::GKRProof, output: &mut Vec<
             LayerProof::Attention {
                 sub_proofs,
                 sub_claim_values,
+                num_heads,
+                seq_len,
+                d_model,
+                causal,
             } => {
                 serialize_u32(5, output); // tag: Attention
+                serialize_u32(*num_heads, output);
+                serialize_u32(*seq_len, output);
+                serialize_u32(*d_model, output);
+                serialize_u32(if *causal { 1 } else { 0 }, output);
                 serialize_u32(sub_proofs.len() as u32, output);
                 // Serialize sub_claim_values
                 for val in sub_claim_values {
@@ -1504,8 +1512,11 @@ pub fn serialize_gkr_model_proof(proof: &crate::gkr::GKRProof, output: &mut Vec<
                 input_eval,
                 output_eval,
                 table_commitment,
+                bits,
+                ..
             } => {
                 serialize_u32(6, output); // tag: Dequantize
+                serialize_u32(*bits, output);
                 serialize_qm31(*input_eval, output);
                 serialize_qm31(*output_eval, output);
                 output.push(*table_commitment);
@@ -1525,8 +1536,18 @@ pub fn serialize_gkr_model_proof(proof: &crate::gkr::GKRProof, output: &mut Vec<
                 output_eval,
                 table_inputs,
                 table_outputs,
+                bits,
+                zero_point_abs,
+                scale_fixed,
+                strategy_tag,
+                ..
             } => {
                 serialize_u32(9, output); // tag: Quantize
+                serialize_u32(*bits, output);
+                serialize_u32(*zero_point_abs, output);
+                serialize_u32((*scale_fixed >> 32) as u32, output);
+                serialize_u32(*scale_fixed as u32, output);
+                serialize_u32(*strategy_tag, output);
                 serialize_qm31(*input_eval, output);
                 serialize_qm31(*output_eval, output);
                 match logup_proof {
@@ -1547,8 +1568,12 @@ pub fn serialize_gkr_model_proof(proof: &crate::gkr::GKRProof, output: &mut Vec<
                 input_eval,
                 output_eval,
                 input_num_vars,
+                vocab_size,
+                embed_dim,
             } => {
                 serialize_u32(10, output); // tag: Embedding
+                serialize_u32(*vocab_size, output);
+                serialize_u32(*embed_dim, output);
                 serialize_qm31(*input_eval, output);
                 serialize_qm31(*output_eval, output);
                 serialize_u32(*input_num_vars as u32, output);
@@ -1876,8 +1901,16 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
             LayerProof::Attention {
                 sub_proofs,
                 sub_claim_values,
+                num_heads,
+                seq_len,
+                d_model,
+                causal,
             } => {
                 serialize_u32(5, output);
+                serialize_u32(*num_heads, output);
+                serialize_u32(*seq_len, output);
+                serialize_u32(*d_model, output);
+                serialize_u32(if *causal { 1 } else { 0 }, output);
                 serialize_u32(sub_proofs.len() as u32, output);
                 for val in sub_claim_values {
                     serialize_qm31(*val, output);
@@ -1907,8 +1940,11 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
                 input_eval,
                 output_eval,
                 table_commitment,
+                bits,
+                ..
             } => {
                 serialize_u32(6, output);
+                serialize_u32(*bits, output);
                 serialize_qm31(*input_eval, output);
                 serialize_qm31(*output_eval, output);
                 output.push(*table_commitment);
@@ -1927,8 +1963,18 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
                 output_eval,
                 table_inputs,
                 table_outputs,
+                bits,
+                zero_point_abs,
+                scale_fixed,
+                strategy_tag,
+                ..
             } => {
                 serialize_u32(9, output);
+                serialize_u32(*bits, output);
+                serialize_u32(*zero_point_abs, output);
+                serialize_u32((*scale_fixed >> 32) as u32, output);
+                serialize_u32(*scale_fixed as u32, output);
+                serialize_u32(*strategy_tag, output);
                 serialize_qm31(*input_eval, output);
                 serialize_qm31(*output_eval, output);
                 match logup_proof {
@@ -1949,8 +1995,12 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
                 input_eval,
                 output_eval,
                 input_num_vars,
+                vocab_size,
+                embed_dim,
             } => {
                 serialize_u32(10, output);
+                serialize_u32(*vocab_size, output);
+                serialize_u32(*embed_dim, output);
                 serialize_qm31(*input_eval, output);
                 serialize_qm31(*output_eval, output);
                 serialize_u32(*input_num_vars as u32, output);
@@ -2082,29 +2132,39 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
     for deferred in &proof.deferred_proofs {
         // Claim value (the skip_eval from the Add reduction)
         serialize_qm31(deferred.claim.value, output);
-        // MatMul dimensions
-        let (m, k, n) = deferred.dims().unwrap();
-        serialize_u32(m as u32, output);
-        serialize_u32(k as u32, output);
-        serialize_u32(n as u32, output);
-        // MatMul sumcheck proof (same format as Tag 0 but without the tag)
-        if let LayerProof::MatMul {
-            round_polys,
-            final_a_eval,
-            final_b_eval,
-        } = &deferred.layer_proof
-        {
-            serialize_u32(round_polys.len() as u32, output);
-            for rp in round_polys {
-                // Compressed: omit c1 (verifier reconstructs from current_sum)
-                serialize_qm31(rp.c0, output);
-                serialize_qm31(rp.c2, output);
+        if deferred.has_weights() {
+            serialize_u32(0, output); // kind: MatMul
+            // MatMul dimensions
+            let (m, k, n) = deferred.dims().unwrap();
+            serialize_u32(m as u32, output);
+            serialize_u32(k as u32, output);
+            serialize_u32(n as u32, output);
+            // MatMul sumcheck proof (same format as Tag 0 but without the tag)
+            if let LayerProof::MatMul {
+                round_polys,
+                final_a_eval,
+                final_b_eval,
+            } = &deferred.layer_proof
+            {
+                serialize_u32(round_polys.len() as u32, output);
+                for rp in round_polys {
+                    // Compressed: omit c1 (verifier reconstructs from current_sum)
+                    serialize_qm31(rp.c0, output);
+                    serialize_qm31(rp.c2, output);
+                }
+                serialize_qm31(*final_a_eval, output);
+                serialize_qm31(*final_b_eval, output);
             }
-            serialize_qm31(*final_a_eval, output);
-            serialize_qm31(*final_b_eval, output);
+            // Weight commitment
+            output.push(deferred.weight_commitment().unwrap());
+        } else {
+            serialize_u32(1, output); // kind: Weightless (Quantize/Dequantize)
+            // Serialize layer proof data with length prefix (replay skips this blob)
+            let mut sub = Vec::new();
+            serialize_layer_proof_packed_inner(&deferred.layer_proof, &mut sub, None);
+            serialize_u32(sub.len() as u32, output);
+            output.extend_from_slice(&sub);
         }
-        // Weight commitment
-        output.push(deferred.weight_commitment().unwrap());
     }
 }
 
@@ -2275,8 +2335,16 @@ fn serialize_layer_proof_packed_inner(
         LayerProof::Attention {
             sub_proofs,
             sub_claim_values,
+            num_heads,
+            seq_len,
+            d_model,
+            causal,
         } => {
             serialize_u32(5, output);
+            serialize_u32(*num_heads, output);
+            serialize_u32(*seq_len, output);
+            serialize_u32(*d_model, output);
+            serialize_u32(if *causal { 1 } else { 0 }, output);
             serialize_u32(sub_proofs.len() as u32, output);
             for val in sub_claim_values {
                 serialize_qm31_packed(*val, output);
@@ -2308,8 +2376,11 @@ fn serialize_layer_proof_packed_inner(
             input_eval,
             output_eval,
             table_commitment,
+            bits,
+            ..
         } => {
             serialize_u32(6, output);
+            serialize_u32(*bits, output);
             serialize_qm31_packed(*input_eval, output);
             serialize_qm31_packed(*output_eval, output);
             output.push(*table_commitment);
@@ -2421,8 +2492,18 @@ fn serialize_layer_proof_packed_inner(
             output_eval,
             table_inputs,
             table_outputs,
+            bits,
+            zero_point_abs,
+            scale_fixed,
+            strategy_tag,
+            ..
         } => {
             serialize_u32(9, output);
+            serialize_u32(*bits, output);
+            serialize_u32(*zero_point_abs, output);
+            serialize_u32((*scale_fixed >> 32) as u32, output);
+            serialize_u32(*scale_fixed as u32, output);
+            serialize_u32(*strategy_tag, output);
             serialize_qm31_packed(*input_eval, output);
             serialize_qm31_packed(*output_eval, output);
             match logup_proof {
@@ -2443,8 +2524,12 @@ fn serialize_layer_proof_packed_inner(
             input_eval,
             output_eval,
             input_num_vars,
+            vocab_size,
+            embed_dim,
         } => {
             serialize_u32(10, output);
+            serialize_u32(*vocab_size, output);
+            serialize_u32(*embed_dim, output);
             serialize_qm31_packed(*input_eval, output);
             serialize_qm31_packed(*output_eval, output);
             serialize_u32(*input_num_vars as u32, output);
@@ -2490,26 +2575,35 @@ pub fn serialize_gkr_proof_data_only_packed(proof: &crate::gkr::GKRProof, output
     serialize_u32(proof.deferred_proofs.len() as u32, output);
     for deferred in &proof.deferred_proofs {
         serialize_qm31_packed(deferred.claim.value, output);
-        let (m, k, n) = deferred.dims().unwrap();
-        serialize_u32(m as u32, output);
-        serialize_u32(k as u32, output);
-        serialize_u32(n as u32, output);
-        if let crate::gkr::types::LayerProof::MatMul {
-            round_polys,
-            final_a_eval,
-            final_b_eval,
-        } = &deferred.layer_proof
-        {
-            serialize_u32(round_polys.len() as u32, output);
-            for rp in round_polys {
-                // Compressed: omit c1 (verifier reconstructs from current_sum)
-                serialize_qm31_packed(rp.c0, output);
-                serialize_qm31_packed(rp.c2, output);
+        if deferred.has_weights() {
+            serialize_u32(0, output); // kind: MatMul
+            let (m, k, n) = deferred.dims().unwrap();
+            serialize_u32(m as u32, output);
+            serialize_u32(k as u32, output);
+            serialize_u32(n as u32, output);
+            if let crate::gkr::types::LayerProof::MatMul {
+                round_polys,
+                final_a_eval,
+                final_b_eval,
+            } = &deferred.layer_proof
+            {
+                serialize_u32(round_polys.len() as u32, output);
+                for rp in round_polys {
+                    // Compressed: omit c1 (verifier reconstructs from current_sum)
+                    serialize_qm31_packed(rp.c0, output);
+                    serialize_qm31_packed(rp.c2, output);
+                }
+                serialize_qm31_packed(*final_a_eval, output);
+                serialize_qm31_packed(*final_b_eval, output);
             }
-            serialize_qm31_packed(*final_a_eval, output);
-            serialize_qm31_packed(*final_b_eval, output);
+            output.push(deferred.weight_commitment().unwrap());
+        } else {
+            serialize_u32(1, output); // kind: Weightless (Quantize/Dequantize)
+            let mut sub = Vec::new();
+            serialize_layer_proof_packed_inner(&deferred.layer_proof, &mut sub, None);
+            serialize_u32(sub.len() as u32, output);
+            output.extend_from_slice(&sub);
         }
-        output.push(deferred.weight_commitment().unwrap());
     }
 }
 
@@ -2525,25 +2619,34 @@ pub fn serialize_gkr_proof_data_only_double_packed(proof: &crate::gkr::GKRProof,
     serialize_u32(proof.deferred_proofs.len() as u32, output);
     for deferred in &proof.deferred_proofs {
         serialize_qm31_packed(deferred.claim.value, output);
-        let (m, k, n) = deferred.dims().unwrap();
-        serialize_u32(m as u32, output);
-        serialize_u32(k as u32, output);
-        serialize_u32(n as u32, output);
-        if let crate::gkr::types::LayerProof::MatMul {
-            round_polys,
-            final_a_eval,
-            final_b_eval,
-        } = &deferred.layer_proof
-        {
-            serialize_u32(round_polys.len() as u32, output);
-            for rp in round_polys {
-                // Double-packed: c0+c2 in one felt
-                serialize_qm31_pair_packed(rp.c0, rp.c2, output);
+        if deferred.has_weights() {
+            serialize_u32(0, output); // kind: MatMul
+            let (m, k, n) = deferred.dims().unwrap();
+            serialize_u32(m as u32, output);
+            serialize_u32(k as u32, output);
+            serialize_u32(n as u32, output);
+            if let crate::gkr::types::LayerProof::MatMul {
+                round_polys,
+                final_a_eval,
+                final_b_eval,
+            } = &deferred.layer_proof
+            {
+                serialize_u32(round_polys.len() as u32, output);
+                for rp in round_polys {
+                    // Double-packed: c0+c2 in one felt
+                    serialize_qm31_pair_packed(rp.c0, rp.c2, output);
+                }
+                serialize_qm31_packed(*final_a_eval, output);
+                serialize_qm31_packed(*final_b_eval, output);
             }
-            serialize_qm31_packed(*final_a_eval, output);
-            serialize_qm31_packed(*final_b_eval, output);
+            output.push(deferred.weight_commitment().unwrap());
+        } else {
+            serialize_u32(1, output); // kind: Weightless (Quantize/Dequantize)
+            let mut sub = Vec::new();
+            serialize_layer_proof_packed_inner(&deferred.layer_proof, &mut sub, None);
+            serialize_u32(sub.len() as u32, output);
+            output.extend_from_slice(&sub);
         }
-        output.push(deferred.weight_commitment().unwrap());
     }
 }
 
@@ -2706,9 +2809,17 @@ fn serialize_layer_proof_double_packed_inner(
         LayerProof::Attention {
             sub_proofs,
             sub_claim_values,
+            num_heads,
+            seq_len,
+            d_model,
+            causal,
         } => {
             // Attention not commonly used with double-packed; fall back to packed
             serialize_u32(5, output);
+            serialize_u32(*num_heads, output);
+            serialize_u32(*seq_len, output);
+            serialize_u32(*d_model, output);
+            serialize_u32(if *causal { 1 } else { 0 }, output);
             serialize_u32(sub_proofs.len() as u32, output);
             for val in sub_claim_values {
                 serialize_qm31_packed(*val, output);
@@ -2740,8 +2851,11 @@ fn serialize_layer_proof_double_packed_inner(
             input_eval,
             output_eval,
             table_commitment,
+            bits,
+            ..
         } => {
             serialize_u32(6, output);
+            serialize_u32(*bits, output);
             serialize_qm31_packed(*input_eval, output);
             serialize_qm31_packed(*output_eval, output);
             output.push(*table_commitment);
@@ -2852,8 +2966,18 @@ fn serialize_layer_proof_double_packed_inner(
             output_eval,
             table_inputs,
             table_outputs,
+            bits,
+            zero_point_abs,
+            scale_fixed,
+            strategy_tag,
+            ..
         } => {
             serialize_u32(9, output);
+            serialize_u32(*bits, output);
+            serialize_u32(*zero_point_abs, output);
+            serialize_u32((*scale_fixed >> 32) as u32, output);
+            serialize_u32(*scale_fixed as u32, output);
+            serialize_u32(*strategy_tag, output);
             serialize_qm31_packed(*input_eval, output);
             serialize_qm31_packed(*output_eval, output);
             match logup_proof {
@@ -2874,8 +2998,12 @@ fn serialize_layer_proof_double_packed_inner(
             input_eval,
             output_eval,
             input_num_vars,
+            vocab_size,
+            embed_dim,
         } => {
             serialize_u32(10, output);
+            serialize_u32(*vocab_size, output);
+            serialize_u32(*embed_dim, output);
             serialize_qm31_packed(*input_eval, output);
             serialize_qm31_packed(*output_eval, output);
             serialize_u32(*input_num_vars as u32, output);
