@@ -164,6 +164,8 @@ pub trait IVM31Pool<TContractState> {
 
     // ── Admin ──
 
+    fn transfer_ownership(ref self: TContractState, new_owner: ContractAddress);
+    fn owner(self: @TContractState) -> ContractAddress;
     fn set_relayer(ref self: TContractState, relayer: ContractAddress);
     fn cancel_batch(ref self: TContractState, batch_id: felt252);
     fn set_batch_timeout_blocks(ref self: TContractState, timeout_blocks: u64);
@@ -1159,6 +1161,17 @@ pub mod VM31PoolContract {
         }
 
         // ── Admin ──
+
+        fn transfer_ownership(ref self: ContractState, new_owner: ContractAddress) {
+            assert!(get_caller_address() == self.owner.read(), "VM31: owner only");
+            let zero_addr: ContractAddress = 0_felt252.try_into().unwrap();
+            assert!(new_owner != zero_addr, "VM31: new owner cannot be zero");
+            self.owner.write(new_owner);
+        }
+
+        fn owner(self: @ContractState) -> ContractAddress {
+            self.owner.read()
+        }
 
         fn cancel_batch(ref self: ContractState, batch_id: felt252) {
             assert!(get_caller_address() == self.owner.read(), "VM31: owner only");
