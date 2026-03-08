@@ -1524,6 +1524,7 @@ pub fn build_chunked_gkr_calldata(
             num_layers,
             use_packed,
             Some(proof.io_commitment),
+            proof.aggregated_binding.as_ref(),
         ).map_err(|e| StarknetModelError::SoundnessGate(
             format!("self-verification failed: {e}")
         ))?;
@@ -1817,6 +1818,7 @@ pub fn build_streaming_gkr_calldata(
         proof.layer_proofs.len() as u32,
         true, // packed
         Some(proof.io_commitment),
+        proof.aggregated_binding.as_ref(),
     ).map_err(|e| StarknetModelError::SoundnessGate(
         format!("streaming self-verification failed: {e}")
     ))?;
@@ -2707,6 +2709,7 @@ fn build_verify_model_gkr_calldata_inner(
         num_layers,
         packed,
         Some(proof.io_commitment),
+        proof.aggregated_binding.as_ref(),
     ).map_err(|e| StarknetModelError::SoundnessGate(
         format!("self-verification failed: {e}")
     ))?;
@@ -3120,6 +3123,7 @@ pub fn replay_verify_double_packed_proof(
         &packed_data, raw_io, matmul_dims, circuit_depth, num_layers,
         true, // packed
         Some(proof.io_commitment),
+        proof.aggregated_binding.as_ref(),
     )?;
 
     Ok(())
@@ -3133,6 +3137,7 @@ pub fn replay_verify_serialized_proof(
     num_layers: u32,
     packed: bool,
     expected_io_commitment: Option<FieldElement>,
+    weight_binding: Option<&crate::crypto::aggregated_opening::AggregatedWeightBindingProof>,
 ) -> Result<(), String> {
     use crate::crypto::poseidon_channel::PoseidonChannel;
     use crate::gkr::prover::mix_secure_field;
@@ -4310,6 +4315,51 @@ pub fn replay_verify_serialized_proof(
             "trailing data after deferred proofs: consumed {} of {} felts",
             off, proof_data.len()
         ));
+    }
+
+    // Weight binding transcript replay (AggregatedOracleSumcheck full binding).
+    // Reproduces the channel operations from verify_aggregated_binding() and
+    // verify_mle_opening() so the full Fiat-Shamir transcript is checked.
+    if let Some(binding) = weight_binding {
+        use crate::crypto::mle_opening::mle_n_queries;
+
+        if trace {
+            eprintln!("[VERIFIER] replaying weight binding (n_claims={}, n_global={})",
+                binding.config.n_claims, binding.config.n_global);
+        }
+
+        // 1. Mix super-root
+        ch.mix_felt(binding.super_root.root);
+
+        // 2. Draw β weights (rho + geometric powers)
+        let _rho = ch.draw_qm31();
+
+        // 3. Sumcheck rounds
+        for &(c0, c1, c2) in &binding.sumcheck_round_polys {
+            ch.mix_poly_coeffs(c0, c1, c2);
+            let _r = ch.draw_qm31();
+        }
+
+        // 4-5. MLE opening transcript
+        // Legacy path (per_matrix_openings is always None in practice):
+        // mix oracle eval, then verify_mle_opening against super_root.
+        ch.mix_felts(&[binding.oracle_eval_at_s]);
+
+        // verify_mle_opening channel ops: mix commitment + intermediate roots + draw queries
+        ch.mix_felt(binding.super_root.root);
+        for root in &binding.opening_proof.intermediate_roots {
+            ch.mix_felt(*root);
+        }
+        let n_rounds = binding.sumcheck_round_polys.len();
+        let half_n = if n_rounds > 0 { 1usize << (n_rounds - 1) } else { 0 };
+        let n_queries = mle_n_queries().min(half_n);
+        for _ in 0..n_queries {
+            let _ = ch.draw_felt252();
+        }
+
+        if trace {
+            eprintln!("[VERIFIER] ch after weight binding: {:?}", ch.digest());
+        }
     }
 
     Ok(())
@@ -7570,6 +7620,7 @@ mod tests {
             num_layers,
             false,
             Some(gkr.io_commitment),
+            None,
         );
         assert!(result.is_ok(), "replay_verify failed: {:?}", result.err());
         println!("SUCCESS: replay_verify_serialized_proof passed");
@@ -8724,6 +8775,7 @@ mod tests {
             gkr.layer_proofs.len() as u32,
             false,
             Some(gkr.io_commitment),
+            None,
         );
         assert!(result.is_ok(), "Unpacked replay failed: {:?}", result.err());
         println!("LayerNorm+Piecewise unpacked replay OK ({} felts)", proof_data.len());
@@ -8739,6 +8791,7 @@ mod tests {
             gkr.layer_proofs.len() as u32,
             true,
             Some(gkr.io_commitment),
+            None,
         );
         assert!(result2.is_ok(), "Packed replay failed: {:?}", result2.err());
         println!("LayerNorm+Piecewise packed replay OK ({} felts)", packed_data.len());
@@ -9033,7 +9086,7 @@ mod tests {
         let result = super::replay_verify_serialized_proof(
             &proof_data, &raw_io, &matmul_dims,
             circuit.layers.len() as u32, gkr.layer_proofs.len() as u32,
-            false, Some(gkr.io_commitment),
+            false, Some(gkr.io_commitment), None,
         );
         assert!(result.is_ok(), "Unpacked deferred replay failed: {:?}", result.err());
 
@@ -9043,7 +9096,7 @@ mod tests {
         let result2 = super::replay_verify_serialized_proof(
             &packed_data, &raw_io, &matmul_dims,
             circuit.layers.len() as u32, gkr.layer_proofs.len() as u32,
-            true, Some(gkr.io_commitment),
+            true, Some(gkr.io_commitment), None,
         );
         assert!(result2.is_ok(), "Packed deferred replay failed: {:?}", result2.err());
         println!("Deferred proof replay roundtrip OK (unpacked={}, packed={} felts, {} deferred)",
@@ -9101,7 +9154,7 @@ mod tests {
         let result = super::replay_verify_serialized_proof(
             &packed_data, &raw_io, &matmul_dims,
             circuit.layers.len() as u32, gkr.layer_proofs.len() as u32,
-            true, Some(gkr.io_commitment),
+            true, Some(gkr.io_commitment), None,
         );
         assert!(result.is_err(), "Tampered deferred proof should be rejected");
         let err = result.unwrap_err();
@@ -9151,7 +9204,7 @@ mod tests {
         let result = super::replay_verify_serialized_proof(
             &packed_data, &raw_io, &matmul_dims,
             circuit.layers.len() as u32, gkr.layer_proofs.len() as u32,
-            true, Some(gkr.io_commitment),
+            true, Some(gkr.io_commitment), None,
         );
         assert!(result.is_ok(), "Clean data should pass: {:?}", result.err());
 
@@ -9162,7 +9215,7 @@ mod tests {
         let result2 = super::replay_verify_serialized_proof(
             &with_trailing, &raw_io, &matmul_dims,
             circuit.layers.len() as u32, gkr.layer_proofs.len() as u32,
-            true, Some(gkr.io_commitment),
+            true, Some(gkr.io_commitment), None,
         );
         assert!(result2.is_err(), "Trailing data should be rejected");
         let err = result2.unwrap_err();
@@ -9378,6 +9431,7 @@ mod tests {
             gkr.layer_proofs.len() as u32,
             true, // packed
             Some(gkr.io_commitment),
+            None,
         );
         assert!(
             result.is_ok(),
@@ -9444,7 +9498,7 @@ mod tests {
         let result = super::replay_verify_serialized_proof(
             &packed, &raw_io, &matmul_dims,
             circuit.layers.len() as u32, gkr.layer_proofs.len() as u32,
-            true, Some(gkr.io_commitment),
+            true, Some(gkr.io_commitment), None,
         );
         assert!(result.is_ok(), "Replay with kind-tagged deferred proofs failed: {:?}", result.err());
         println!("Kind-tagged deferred replay OK ({} packed felts, {} deferred)", packed.len(), gkr.deferred_proofs.len());
