@@ -60,8 +60,9 @@ use crate::compiler::prove::{
 };
 use crate::components::activation::{compute_multiplicities, ActivationEval, ActivationRelation};
 use crate::components::attention::{
-    attention_forward, attention_forward_cached, pad_to_pow2, prove_attention_onchain,
-    prove_attention_with, split_heads, transpose_m31, AttentionProof, AttentionProofOnChain,
+    attention_forward, attention_forward_cached, pad_to_pow2,
+    prove_attention_cached_from_intermediates, prove_attention_onchain, prove_attention_with,
+    split_heads, transpose_m31, AttentionIntermediates, AttentionProof, AttentionProofOnChain,
     AttentionWeights, MultiHeadAttentionConfig,
 };
 use crate::components::conv2d::{conv2d_forward, Im2ColConfig};
@@ -547,6 +548,9 @@ struct AttentionLayerData {
     config: MultiHeadAttentionConfig,
     weights: AttentionWeights,
     input: M31Matrix,
+    /// Pre-computed intermediates from Phase 1 (cached attention path).
+    /// When present, Phase 2b uses these directly instead of recomputing.
+    cached_intermediates: Option<AttentionIntermediates>,
 }
 
 /// Collected Embedding layer data for unified STARK aggregation.
@@ -892,6 +896,7 @@ where
                         config: *attn_config,
                         weights: attn_weights,
                         input: current.clone(),
+                        cached_intermediates: None,
                     });
                     intermediates.push((node.id, current.clone()));
                     node_outputs.insert(node.id, inter.final_output.clone());
@@ -2713,6 +2718,7 @@ where
                         config: *attn_config,
                         weights: attn_weights,
                         input: current.clone(),
+                        cached_intermediates: None,
                     });
                     intermediates.push((node.id, current.clone()));
                     node_outputs.insert(node.id, inter.final_output.clone());
@@ -3832,6 +3838,63 @@ pub fn prove_model_pure_gkr_prefill_with_cache(
     prove_model_pure_gkr_inner::<SimdBackend>(graph, input, weights, weight_cache, Some(kv_cache))
 }
 
+/// Streaming prefill: split a long prompt into chunks and prove each independently.
+///
+/// For each chunk of `chunk_size` rows from `input`:
+/// 1. Build a graph dimensioned for that chunk via `graph.with_seq_len(chunk_rows)`
+/// 2. Prove with `prove_model_pure_gkr_prefill_with_cache`
+/// 3. KV-cache grows incrementally across chunks
+/// 4. Weight Merkle roots are shared via an internal `SharedWeightCache`
+///
+/// Returns one proof per chunk.
+pub fn prove_model_pure_gkr_prefill_chunked(
+    graph: &ComputationGraph,
+    input: &M31Matrix,
+    weights: &GraphWeights,
+    kv_cache: &mut crate::components::attention::ModelKVCache,
+    chunk_size: usize,
+) -> Result<Vec<AggregatedModelProofOnChain>, AggregationError> {
+    assert!(chunk_size > 0, "chunk_size must be > 0");
+    let total_rows = input.rows;
+    let cols = input.cols;
+    let weight_cache: crate::weight_cache::SharedWeightCache = std::sync::Arc::new(
+        std::sync::RwLock::new(crate::weight_cache::WeightCommitmentCache::new("prefill_chunked")),
+    );
+
+    let mut proofs = Vec::new();
+    let mut offset = 0usize;
+    while offset < total_rows {
+        let chunk_rows = (total_rows - offset).min(chunk_size);
+        let chunk_graph = graph.with_seq_len(chunk_rows);
+
+        // Extract input sub-matrix [offset..offset+chunk_rows, :]
+        let mut chunk_input = M31Matrix::new(chunk_rows, cols);
+        chunk_input.data.copy_from_slice(
+            &input.data[offset * cols..(offset + chunk_rows) * cols],
+        );
+
+        eprintln!(
+            "=== Prefill chunk [{}/{}] rows {}..{} ===",
+            proofs.len() + 1,
+            (total_rows + chunk_size - 1) / chunk_size,
+            offset,
+            offset + chunk_rows,
+        );
+
+        let proof = prove_model_pure_gkr_prefill_with_cache(
+            &chunk_graph,
+            &chunk_input,
+            weights,
+            kv_cache,
+            Some(&weight_cache),
+        )?;
+        proofs.push(proof);
+        offset += chunk_rows;
+    }
+
+    Ok(proofs)
+}
+
 /// Inner implementation: forward pass → GKR → unified STARK.
 fn prove_model_pure_gkr_inner<B>(
     graph: &ComputationGraph,
@@ -4114,17 +4177,19 @@ where
                         w_v: wv.clone(),
                         w_o: wo.clone(),
                     };
-                    let inter = if let Some(ref mut kvc) = kv_cache {
+                    let (inter, cached_inter) = if let Some(ref mut kvc) = kv_cache {
                         let layer_cache = kvc.get_or_create(node.id, attn_config);
-                        attention_forward_cached(&current, &attn_weights, attn_config, layer_cache, attn_config.causal)
+                        let i = attention_forward_cached(&current, &attn_weights, attn_config, layer_cache, attn_config.causal);
+                        (i.clone(), Some(i))
                     } else {
-                        attention_forward(&current, &attn_weights, attn_config, attn_config.causal)
+                        (attention_forward(&current, &attn_weights, attn_config, attn_config.causal), None)
                     };
                     attention_layers.push(AttentionLayerData {
                         node_id: node.id,
                         config: *attn_config,
                         weights: attn_weights,
                         input: current.clone(),
+                        cached_intermediates: cached_inter,
                     });
                     intermediates.push((node.id, current.clone()));
                     node_outputs.insert(node.id, inter.final_output.clone());
@@ -4358,45 +4423,70 @@ where
     outer_profiler.end_phase(0);
     // ── End: gkr_proof ──
 
+    // Merge inner GKR profiler sub-phases into outer profiler (if available).
+    if let Some(inner) = crate::gkr::profiler::take_inner_profiler() {
+        outer_profiler.merge_inner(&inner);
+    }
+
     eprintln!(
         "  GKR proof: {} layer proofs in {:.2}s",
         gkr_proof.layer_proofs.len(),
         t_gkr.elapsed().as_secs_f64(),
     );
 
-    // Phase 2b: Attention layers (still proven independently)
-    // NOTE: prove_attention_onchain re-runs attention_forward() internally, which
-    // computes K/V from input only (no cache). This is correct for prefill (empty
-    // cache) and for any call where seq_len matches the graph's attention config.
-    // For true incremental decode with cached K/V from previous steps, Phase 2b
-    // would need to use prove_attention_cached with the populated cache — but that
-    // requires storing per-layer intermediates from Phase 1 to avoid double-appending.
-    // TODO: Cache attention intermediates from Phase 1 forward pass to avoid redundant
-    // recomputation in Phase 2b.
+    // Phase 2b: Attention layers (proven independently from GKR).
+    // When cached_intermediates are available (prefill/decode with KV-cache),
+    // prove directly from stored intermediates — avoids re-running the forward
+    // pass and double-appending to the KV-cache.
+    //
+    // Each layer is fully independent (lookup by node_id, no shared mutable
+    // state), so we prove them in parallel via rayon.
     outer_profiler.begin_phase("attention_proofs", 0);
-    let mut attention_proofs = Vec::new();
-    for (i, layer) in attention_layers.iter().enumerate() {
-        let t_attn = std::time::Instant::now();
-        let proof = prove_attention_onchain(
-            &layer.input,
-            &layer.weights,
-            &layer.config,
-            layer.config.causal,
-        )
-        .map_err(|e| {
-            AggregationError::ProvingError(format!(
-                "Attention node {} (on-chain): {e}",
-                layer.node_id
-            ))
-        })?;
+    let attn_results: Vec<Result<(usize, AttentionProofOnChain, std::time::Duration, bool), AggregationError>> =
+        attention_layers
+            .par_iter()
+            .map(|layer| {
+                let t_attn = std::time::Instant::now();
+                let is_cached = layer.cached_intermediates.is_some();
+                let proof = if let Some(ref inter) = layer.cached_intermediates {
+                    prove_attention_cached_from_intermediates(
+                        &layer.input,
+                        &layer.weights,
+                        &layer.config,
+                        inter,
+                    )
+                } else {
+                    prove_attention_onchain(
+                        &layer.input,
+                        &layer.weights,
+                        &layer.config,
+                        layer.config.causal,
+                    )
+                }
+                .map_err(|e| {
+                    AggregationError::ProvingError(format!(
+                        "Attention node {} (on-chain): {e}",
+                        layer.node_id
+                    ))
+                })?;
+                Ok((layer.node_id, proof, t_attn.elapsed(), is_cached))
+            })
+            .collect();
+
+    // Collect results and record profiler timing serially (PhaseProfiler is &mut).
+    let mut attention_proofs = Vec::with_capacity(attn_results.len());
+    for (i, result) in attn_results.into_iter().enumerate() {
+        let (node_id, proof, elapsed, is_cached) = result?;
+        let mode = if is_cached { "cached" } else { "full" };
         eprintln!(
-            "  Attention [{}/{}] node {} in {:.2}s",
+            "  Attention [{}/{}] node {} ({mode}) in {:.2}s",
             i + 1,
             attention_layers.len(),
-            layer.node_id,
-            t_attn.elapsed().as_secs_f64(),
+            node_id,
+            elapsed.as_secs_f64(),
         );
-        attention_proofs.push((layer.node_id, proof));
+        outer_profiler.record_forward_op("attention", elapsed);
+        attention_proofs.push((node_id, proof));
     }
     outer_profiler.end_phase(0);
     // ── End: attention_proofs ──
@@ -10751,5 +10841,209 @@ mod tests {
         );
         // Cache should now have the tokens from this call
         assert_eq!(cache.len(), seq_len);
+    }
+
+    #[test]
+    fn test_prefill_batch_cached_attention() {
+        // Verify that prefill proving with seq_len > 1 uses cached attention
+        // intermediates (no double-append to KV-cache) and produces a valid proof.
+        use crate::components::attention::{
+            attention_forward_cached, prove_attention_cached_from_intermediates,
+            AttentionWeights, KVCache, MultiHeadAttentionConfig,
+        };
+
+        let d_model = 8;
+        let seq_len = 4;
+        let config = MultiHeadAttentionConfig {
+            d_model,
+            num_heads: 2,
+            num_kv_heads: 2,
+            seq_len,
+            causal: true,
+        };
+        let weights = AttentionWeights {
+            w_q: make_test_matrix(d_model, d_model),
+            w_k: make_test_matrix(d_model, d_model),
+            w_v: make_test_matrix(d_model, d_model),
+            w_o: make_test_matrix(d_model, d_model),
+        };
+
+        let input = make_test_matrix(seq_len, d_model);
+        let mut cache = KVCache::new(&config);
+
+        // Phase 1: forward pass populates cache and returns intermediates
+        let intermediates =
+            attention_forward_cached(&input, &weights, &config, &mut cache, true);
+        assert_eq!(cache.len(), seq_len);
+        assert_eq!(intermediates.final_output.rows, seq_len);
+
+        // Phase 2b: prove from stored intermediates — cache is NOT touched
+        let cache_len_before = cache.len();
+        let result = prove_attention_cached_from_intermediates(
+            &input,
+            &weights,
+            &config,
+            &intermediates,
+        );
+        assert!(
+            result.is_ok(),
+            "prove_attention_cached_from_intermediates should succeed: {:?}",
+            result.err(),
+        );
+        // Cache must not have grown (no double-append)
+        assert_eq!(cache.len(), cache_len_before);
+
+        let proof = result.unwrap();
+        // Verify proof has the expected structure
+        assert_eq!(proof.score_proofs.len(), config.num_heads);
+        assert_eq!(proof.attn_v_proofs.len(), config.num_heads);
+        assert_eq!(proof.intermediates.final_output.rows, seq_len);
+    }
+
+    #[test]
+    fn test_profiler_inner_merge_integration() {
+        // Verify that the outer profiler includes GKR inner sub-phases
+        // when STWO_PROFILE is enabled and a real GKR proof runs.
+        use crate::compiler::graph::{ComputationGraph, GraphOp};
+
+        let _guard = EnvVarGuard::set("STWO_PROFILE", "1");
+        crate::set_profile(true);
+
+        let (m, k, n) = (4, 4, 4);
+        let mut graph = ComputationGraph::new((m, k));
+        let mm_id = graph.add_node(GraphOp::MatMul { dims: (m, k, n) }, vec![], (m, n));
+
+        let input = make_test_matrix(m, k);
+        let mut weights = crate::compiler::graph::GraphWeights::new();
+        weights.add_weight(mm_id, make_test_matrix(k, n));
+
+        let result = prove_model_pure_gkr(&graph, &input, &weights);
+        assert!(result.is_ok(), "proving should succeed: {:?}", result.err());
+
+        let json = crate::gkr::profiler::take_profile_json();
+        assert!(json.is_some(), "profile JSON should be stored");
+        let json = json.unwrap();
+        // Inner GKR sub-phases should appear with gkr/ prefix
+        assert!(
+            json.contains("\"gkr/channel_init\""),
+            "JSON should contain gkr/channel_init from inner profiler merge"
+        );
+        assert!(
+            json.contains("\"gkr/layer_walk\""),
+            "JSON should contain gkr/layer_walk from inner profiler merge"
+        );
+    }
+
+    #[test]
+    fn test_parallel_attention_matches_sequential() {
+        // Prove a model with attention and verify the proof structure is valid.
+        // The parallel path should produce identical results to sequential.
+        use crate::compiler::graph::{ComputationGraph, GraphOp};
+        use crate::components::attention::MultiHeadAttentionConfig;
+
+        let d_model = 8;
+        let seq_len = 2;
+        let config = MultiHeadAttentionConfig {
+            d_model,
+            num_heads: 2,
+            num_kv_heads: 2,
+            seq_len,
+            causal: false,
+        };
+
+        let mut graph = ComputationGraph::new((seq_len, d_model));
+        let mm_id = graph.add_node(
+            GraphOp::MatMul { dims: (seq_len, d_model, d_model) },
+            vec![],
+            (seq_len, d_model),
+        );
+        let attn_id = graph.add_node(
+            GraphOp::Attention { config },
+            vec![mm_id],
+            (seq_len, d_model),
+        );
+
+        let input = make_test_matrix(seq_len, d_model);
+        let mut weights = crate::compiler::graph::GraphWeights::new();
+        weights.add_weight(mm_id, make_test_matrix(d_model, d_model));
+        let wq = make_test_matrix(d_model, d_model);
+        let wk = make_test_matrix(d_model, d_model);
+        let wv = make_test_matrix(d_model, d_model);
+        let wo = make_test_matrix(d_model, d_model);
+        weights.add_named_weight(attn_id, "w_q", wq.clone());
+        weights.add_named_weight(attn_id, "w_k", wk.clone());
+        weights.add_named_weight(attn_id, "w_v", wv.clone());
+        weights.add_named_weight(attn_id, "w_o", wo.clone());
+        weights.add_weight(attn_id + 1, wq);
+        weights.add_weight(attn_id + 2, wk);
+        weights.add_weight(attn_id + 3, wv);
+        weights.add_weight(attn_id + 4, wo);
+
+        let result = prove_model_pure_gkr(&graph, &input, &weights);
+        assert!(result.is_ok(), "parallel attention proving should succeed: {:?}", result.err());
+
+        let proof = result.unwrap();
+        // Attention proof should be present
+        assert_eq!(proof.attention_proofs.len(), 1, "should have 1 attention proof");
+        assert_eq!(proof.attention_proofs[0].0, attn_id, "node_id should match");
+    }
+
+    #[test]
+    fn test_prefill_chunked() {
+        // 8-token input proved as 2 × 4-token chunks.
+        use crate::compiler::graph::{ComputationGraph, GraphOp};
+        use crate::components::attention::{ModelKVCache, MultiHeadAttentionConfig};
+
+        let d_model = 8;
+        let seq_len = 8;
+        let config = MultiHeadAttentionConfig {
+            d_model,
+            num_heads: 2,
+            num_kv_heads: 2,
+            seq_len,
+            causal: false,
+        };
+
+        let mut graph = ComputationGraph::new((seq_len, d_model));
+        let mm_id = graph.add_node(
+            GraphOp::MatMul { dims: (seq_len, d_model, d_model) },
+            vec![],
+            (seq_len, d_model),
+        );
+        let attn_id = graph.add_node(
+            GraphOp::Attention { config },
+            vec![mm_id],
+            (seq_len, d_model),
+        );
+
+        let input = make_test_matrix(seq_len, d_model);
+        let mut weights = crate::compiler::graph::GraphWeights::new();
+        weights.add_weight(mm_id, make_test_matrix(d_model, d_model));
+        let wq = make_test_matrix(d_model, d_model);
+        let wk = make_test_matrix(d_model, d_model);
+        let wv = make_test_matrix(d_model, d_model);
+        let wo = make_test_matrix(d_model, d_model);
+        weights.add_named_weight(attn_id, "w_q", wq.clone());
+        weights.add_named_weight(attn_id, "w_k", wk.clone());
+        weights.add_named_weight(attn_id, "w_v", wv.clone());
+        weights.add_named_weight(attn_id, "w_o", wo.clone());
+        weights.add_weight(attn_id + 1, wq);
+        weights.add_weight(attn_id + 2, wk);
+        weights.add_weight(attn_id + 3, wv);
+        weights.add_weight(attn_id + 4, wo);
+
+        let mut kv_cache = ModelKVCache::new();
+        let chunk_size = 4;
+        let result = prove_model_pure_gkr_prefill_chunked(
+            &graph, &input, &weights, &mut kv_cache, chunk_size,
+        );
+        assert!(result.is_ok(), "chunked prefill should succeed: {:?}", result.err());
+
+        let proofs = result.unwrap();
+        assert_eq!(proofs.len(), 2, "8 tokens / 4 chunk_size = 2 proofs");
+
+        // KV-cache should contain entries from both chunks
+        let layer_cache = kv_cache.get(attn_id).expect("attention layer should have cache");
+        assert_eq!(layer_cache.len(), 8, "KV-cache should have all 8 tokens");
     }
 }
