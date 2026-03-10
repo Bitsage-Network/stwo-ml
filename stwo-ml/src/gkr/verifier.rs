@@ -4901,6 +4901,18 @@ pub(crate) fn verify_attention_reduction(
 
     let mut proof_idx = 0;
 
+    // Validate sub_claim_values[0] matches the output claim (soundness: prevents
+    // an attacker from fabricating the output projection sub-claim independently).
+    if sub_claim_values[0] != output_claim.value {
+        return Err(GKRError::VerificationError {
+            layer_idx,
+            reason: format!(
+                "attention sub_claim_values[0] mismatch: expected {:?}, got {:?}",
+                output_claim.value, sub_claim_values[0],
+            ),
+        });
+    }
+
     // --- Sub-proof 0: Output projection matmul ---
     // Uses the actual output_claim (not a fresh one)
     let _output_proj_claim = match &sub_proofs[proof_idx] {
@@ -5126,6 +5138,18 @@ pub(crate) fn verify_attention_reduction_decode(
     };
 
     let mut proof_idx = 0;
+
+    // Validate sub_claim_values[0] matches the output claim (soundness: prevents
+    // an attacker from fabricating the output projection sub-claim independently).
+    if sub_claim_values[0] != output_claim.value {
+        return Err(GKRError::VerificationError {
+            layer_idx,
+            reason: format!(
+                "attention_decode sub_claim_values[0] mismatch: expected {:?}, got {:?}",
+                output_claim.value, sub_claim_values[0],
+            ),
+        });
+    }
 
     // Sub-proof 0: Output projection (new_tokens × d_model × d_model)
     let _output_proj_claim = match &sub_proofs[proof_idx] {

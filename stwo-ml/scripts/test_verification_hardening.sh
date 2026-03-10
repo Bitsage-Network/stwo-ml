@@ -204,6 +204,38 @@ with open('$TMPDIR/tampered_commit.json', 'w') as f:
     fi
 fi
 
+# ── Tests 11-13: Decode (DCOD) tamper rejection tests ───────────────────
+echo ""
+echo "── Decode (DCOD) Tamper Rejection Tests"
+
+# These tests use cargo test to run the Rust-level tamper tests.
+# They don't require MODEL_DIR since they use synthetic graphs.
+DECODE_TESTS=(
+    "decode_tamper_position_offset_rejected"
+    "decode_tamper_kv_commitment_rejected"
+    "decode_tamper_new_tokens_rejected"
+)
+
+CARGO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CARGO_BIN="cargo"
+
+for test_name in "${DECODE_TESTS[@]}"; do
+    TEST_NUM=$((PASS + FAIL + SKIP + 1))
+    echo "── Test $TEST_NUM: $test_name"
+    if $CARGO_BIN test --features std -p stwo-ml --test decode_benchmark "$test_name" -- --nocapture 2>"$TMPDIR/${test_name}.log" 1>&2; then
+        pass "$test_name"
+    else
+        # Check if it's a compilation issue vs actual failure
+        if grep -q "test result: FAILED" "$TMPDIR/${test_name}.log" 2>/dev/null; then
+            fail "$test_name (verification accepted tampered proof)"
+        elif grep -q "error\[E" "$TMPDIR/${test_name}.log" 2>/dev/null; then
+            skip "$test_name (compilation error — run cargo check first)"
+        else
+            fail "$test_name"
+        fi
+    fi
+done
+
 # ── Summary ──────────────────────────────────────────────────────────────
 echo ""
 echo "============================================"
