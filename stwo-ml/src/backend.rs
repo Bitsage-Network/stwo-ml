@@ -33,7 +33,7 @@ where
         // SAFETY: Col<Src, F> and Col<Dst, F> are the same concrete type.
         // CircleEvaluation<B, F, O> differs only in zero-sized PhantomData<B>.
         // Both structs have identical layout: (CircleDomain, Col<_, F>).
-        debug_assert_eq!(
+        assert_eq!(
             std::mem::size_of::<CircleEvaluation<Src, F, BitReversedOrder>>(),
             std::mem::size_of::<CircleEvaluation<Dst, F, BitReversedOrder>>(),
             "CircleEvaluation size mismatch between backends"

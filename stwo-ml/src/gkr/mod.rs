@@ -39,6 +39,7 @@
 //! checks each layer proof against the circuit structure.
 
 pub mod circuit;
+pub mod profiler;
 pub mod prover;
 pub mod types;
 pub mod verifier;
@@ -60,4 +61,5 @@ pub use types::{
     DeferredProof, EmbeddingLogUpProof, GKRClaim, GKRError, GKRProof, LayerProof, LogUpProof,
     ReductionOutput, RoundPolyDeg3, WeightOpeningTranscriptMode,
 };
+pub use profiler::PhaseProfiler;
 pub use verifier::verify_gkr_with_weights;

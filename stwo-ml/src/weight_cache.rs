@@ -1,12 +1,54 @@
-//! Weight commitment cache for model-static matrices.
+//! # Weight Commitment Cache
 //!
-//! Weight matrices are fixed per model — their restricted MLEs and Poseidon
-//! commitments are deterministic given the same padded dimensions. This module
-//! caches those results so they're computed once and reused across inferences.
+//! Caches Poseidon Merkle roots and restricted-MLE results for model weight matrices.
+//! Weight matrices are immutable per model — their commitments are deterministic
+//! given the same padded dimensions.
 //!
-//! For Qwen3-14B (160 matmuls): skips 160 × `restrict_cols` GPU dispatches +
+//! ## Performance Impact
+//!
+//! - **First inference**: full computation (~500s for Qwen3-14B, 160 matmuls)
+//! - **Subsequent inferences**: cache hit (<1ms) — skips GPU restrict + Merkle
+//! - **Estimated speedup**: 30-50% of total proving time
+//!
+//! For Qwen3-14B: skips 160 × `restrict_cols` GPU dispatches +
 //! 160 × `commit_mle_root_only` Merkle root computations per inference.
-//! Estimated 30-50% per-inference speedup.
+//!
+//! ## Binary Format (v4)
+//!
+//! ```text
+//! [SWCF magic 4B][version u32][model_id len + UTF-8][fingerprint 32B]
+//! [entry_count u32]
+//! [CacheKey: node_id, m_pad, k_pad, n_pad]
+//! [CachedWeight: f_b, b_commitment, r_j, root, tree_path]
+//! ```
+//!
+//! File extension: `.stwo_weight_cache.swcf`
+//!
+//! ## Content Fingerprinting
+//!
+//! 8 M31 samples per matrix, Poseidon-hashed. Detects fine-tuning / weight swaps.
+//! On load, the fingerprint is verified against the current weights — mismatches
+//! invalidate the entire cache.
+//!
+//! ## Integration
+//!
+//! ```rust,no_run
+//! # use stwo_ml::weight_cache::{shared_cache_for_model, save_shared_cache};
+//! let cache = shared_cache_for_model("/path/to/model");
+//! // ... pass cache to prove_model_pure_gkr_auto_with_cache ...
+//! save_shared_cache(&cache, "/path/to/model");
+//! ```
+//!
+//! ## Pre-warming
+//!
+//! `prewarm_weight_roots()` runs in a background thread during forward pass.
+//! GPU variant (`prewarm_weight_roots_gpu_exclusive`) uses pipelined double-buffering.
+//!
+//! ## Multi-GPU
+//!
+//! With `multi-gpu` feature, `apply_aggregated_oracle_sumcheck()` partitions
+//! weight commitments across GPUs via greedy bin-packing. Each GPU computes
+//! its partition's Merkle roots independently, and results are merged.
 
 use std::collections::HashMap;
 use std::io::{self, Read as IoRead, Write as IoWrite};
@@ -18,12 +60,35 @@ use stwo::core::fields::cm31::CM31;
 use stwo::core::fields::m31::M31;
 use stwo::core::fields::qm31::{SecureField, QM31};
 
+/// Reject symlinks to prevent symlink-based attacks on cache file I/O.
+///
+/// Returns `Ok(())` if the path does not exist or is not a symlink.
+/// Returns `Err` if the path is a symlink.
+fn reject_symlink(path: &Path) -> io::Result<()> {
+    if path.exists() {
+        let meta = std::fs::symlink_metadata(path)?;
+        if meta.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("Refusing to follow symlink: {}", path.display()),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Binary format version. Bump on layout changes.
 /// v1: f_b + b_commitment + r_j
 /// v2: v1 + initial_mle_root (Optional<FieldElement>)
 /// v3: v2 + merkle_tree_cache_path (Optional<String>)
 /// v4: v3 + weight_fingerprint header (32 bytes, validates weight content)
 const CACHE_VERSION: u32 = 4;
+
+/// Sanity caps for values read from cache files to prevent OOM from crafted data.
+const MAX_MODEL_ID_LEN: usize = 1024;
+const MAX_ENTRIES: usize = 100_000;
+const MAX_SECUREFIELD_VEC_LEN: usize = 1_000_000;
+const MAX_PATH_LEN: usize = 4096;
 
 /// Number of M31 elements sampled per weight matrix for fingerprinting.
 /// With 8 samples × 160 matrices = 1280 elements hashed → ~5µs total.
@@ -251,6 +316,7 @@ impl WeightCommitmentCache {
     /// Format: MAGIC(4) | version(4) | model_id_len(4) | model_id | fingerprint(32) | num_entries(4) | entries...
     /// Each entry: node_id(8) | m(8) | k(8) | n(8) | f_b_len(4) | f_b(16*len) | b_commitment(32) | r_j_len(4) | r_j(16*len)
     pub fn save(&mut self, path: &Path) -> io::Result<()> {
+        reject_symlink(path)?;
         let file = std::fs::File::create(path)?;
         let mut w = io::BufWriter::with_capacity(1 << 20, file); // 1 MB buffer
 
@@ -308,6 +374,7 @@ impl WeightCommitmentCache {
 
     /// Load cache from a binary file.
     pub fn load(path: &Path) -> io::Result<Self> {
+        reject_symlink(path)?;
         let file = std::fs::File::open(path)?;
         let mut r = io::BufReader::with_capacity(1 << 20, file);
 
@@ -332,6 +399,12 @@ impl WeightCommitmentCache {
 
         // Model ID
         let id_len = read_u32(&mut r)? as usize;
+        if id_len > MAX_MODEL_ID_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("model_id length {id_len} exceeds maximum {MAX_MODEL_ID_LEN}"),
+            ));
+        }
         let mut id_bytes = vec![0u8; id_len];
         r.read_exact(&mut id_bytes)?;
         let model_id = String::from_utf8(id_bytes)
@@ -348,6 +421,12 @@ impl WeightCommitmentCache {
 
         // Entries
         let num_entries = read_u32(&mut r)? as usize;
+        if num_entries > MAX_ENTRIES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("entry count {num_entries} exceeds maximum {MAX_ENTRIES}"),
+            ));
+        }
         let mut entries = HashMap::with_capacity(num_entries);
 
         for _ in 0..num_entries {
@@ -379,6 +458,12 @@ impl WeightCommitmentCache {
                 r.read_exact(&mut flag)?;
                 if flag[0] != 0 {
                     let path_len = read_u32(&mut r)? as usize;
+                    if path_len > MAX_PATH_LEN {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("merkle_tree_cache_path length {path_len} exceeds maximum {MAX_PATH_LEN}"),
+                        ));
+                    }
                     let mut path_bytes = vec![0u8; path_len];
                     r.read_exact(&mut path_bytes)?;
                     let path_str = String::from_utf8(path_bytes)
@@ -524,7 +609,7 @@ pub fn save_shared_cache(
 
 /// Compute a 32-byte fingerprint of weight matrices by sampling elements.
 ///
-/// Samples [`FINGERPRINT_SAMPLES_PER_MATRIX`] elements from each weight matrix
+/// Samples `FINGERPRINT_SAMPLES_PER_MATRIX` (8) elements from each weight matrix
 /// at deterministic positions (spread evenly across the data). The sampled
 /// values are mixed into a running hash using FNV-1a-like mixing.
 ///
@@ -597,6 +682,12 @@ fn write_securefield_vec(w: &mut impl IoWrite, v: &[SecureField]) -> io::Result<
 
 fn read_securefield_vec(r: &mut impl IoRead) -> io::Result<Vec<SecureField>> {
     let len = read_u32(r)? as usize;
+    if len > MAX_SECUREFIELD_VEC_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("securefield vec length {len} exceeds maximum {MAX_SECUREFIELD_VEC_LEN}"),
+        ));
+    }
     let mut v = Vec::with_capacity(len);
     for _ in 0..len {
         let a = read_u32(r)?;
@@ -889,6 +980,7 @@ impl MmapWeightCache {
     /// Open a cache file via memory-mapping. Falls back to regular file I/O
     /// if mmap fails (e.g., empty file, permissions).
     pub fn open(path: &Path) -> io::Result<Self> {
+        reject_symlink(path)?;
         let file = std::fs::File::open(path)?;
         let metadata = file.metadata()?;
         if metadata.len() == 0 {
@@ -929,6 +1021,12 @@ impl MmapWeightCache {
         }
 
         let id_len = read_u32(r)? as usize;
+        if id_len > MAX_MODEL_ID_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("model_id length {id_len} exceeds maximum {MAX_MODEL_ID_LEN}"),
+            ));
+        }
         let mut id_buf = vec![0u8; id_len];
         r.read_exact(&mut id_buf)?;
         let model_id = String::from_utf8(id_buf)
@@ -941,6 +1039,12 @@ impl MmapWeightCache {
         }
 
         let num_entries = read_u32(r)? as usize;
+        if num_entries > MAX_ENTRIES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("entry count {num_entries} exceeds maximum {MAX_ENTRIES}"),
+            ));
+        }
         let mut entries = HashMap::with_capacity(num_entries);
 
         for _ in 0..num_entries {
@@ -970,6 +1074,12 @@ impl MmapWeightCache {
                 r.read_exact(&mut flag)?;
                 if flag[0] == 1 {
                     let path_len = read_u32(r)? as usize;
+                    if path_len > MAX_PATH_LEN {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("merkle_tree_cache_path length {path_len} exceeds maximum {MAX_PATH_LEN}"),
+                        ));
+                    }
                     let mut path_buf = vec![0u8; path_len];
                     r.read_exact(&mut path_buf)?;
                     Some(PathBuf::from(String::from_utf8_lossy(&path_buf).to_string()))

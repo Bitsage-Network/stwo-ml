@@ -47,6 +47,8 @@ pub enum TxBuilderError {
     WithdrawAmountMismatch { requested: u64, note_amount: u64 },
     #[error("asset id {requested} does not match note asset {note_asset}")]
     AssetMismatch { requested: u32, note_asset: u32 },
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
 }
 
 /// A pending transaction to include in the batch.
@@ -272,6 +274,11 @@ impl TxBuilder {
                     ..
                 } => {
                     let commitment_hex = commitment_to_hex(&note.commitment());
+                    if !spent_commitments.iter().all(|c| c != &commitment_hex) {
+                        return Err(TxBuilderError::InvalidInput(format!(
+                            "duplicate note spend in batch: {commitment_hex}"
+                        )));
+                    }
                     spent_commitments.push(commitment_hex);
                     withdrawals.push(WithdrawWitness {
                         note: note.clone(),
@@ -302,9 +309,15 @@ impl TxBuilder {
                         new_commitments.push((out_note.commitment(), out_note.clone()));
                     }
 
-                    // Mark input notes as spent
+                    // Mark input notes as spent (reject duplicates)
                     for (note, _, _) in input_notes {
-                        spent_commitments.push(commitment_to_hex(&note.commitment()));
+                        let commitment_hex = commitment_to_hex(&note.commitment());
+                        if spent_commitments.contains(&commitment_hex) {
+                            return Err(TxBuilderError::InvalidInput(format!(
+                                "duplicate note spend in batch: {commitment_hex}"
+                            )));
+                        }
+                        spent_commitments.push(commitment_hex);
                     }
 
                     // Encrypt memos for output notes

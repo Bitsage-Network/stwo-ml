@@ -391,9 +391,14 @@ impl StreamingWeightPipeline {
         let dtype = tensor.dtype();
         let shape = tensor.shape().to_vec();
 
-        // SAFETY: the mmap outlives `self`, and `tensor.data()` is a slice
-        // of the mmap. We extend the lifetime to match `&self` which is safe
-        // because the mmap is owned by `self.shards`.
+        // SAFETY: safetensors 0.4.x stores tensor data as direct byte-range
+        // views into the backing buffer (the mmap). This means data_ptr points
+        // into self.shards[shard_idx].mmap, which is owned by self and outlives
+        // &self. The local `tensors` struct contains only header metadata/offsets,
+        // not a copy of the data bytes.
+        //
+        // IMPORTANT: if upgrading safetensors, verify that tensor.data() still
+        // returns a slice of the original backing bytes (no decompression/copy).
         let data_ptr = tensor.data().as_ptr();
         let data_len = tensor.data().len();
         let data = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };

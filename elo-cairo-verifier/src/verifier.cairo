@@ -249,6 +249,9 @@ pub trait ISumcheckVerifier<TContractState> {
         num_layers: u32,
         in_cols: u32,
         out_cols: u32,
+        has_kv_cache: bool,
+        kv_cache_commitment: felt252,
+        prev_kv_cache_commitment: felt252,
     );
 
     /// Evaluate output MLE in chunked TXs (splits expensive computation across
@@ -344,7 +347,7 @@ mod SumcheckVerifierContract {
     };
     use crate::channel::{
         PoseidonChannel,
-        channel_default, channel_mix_u64,
+        channel_default, channel_mix_u64, channel_mix_felt,
         channel_draw_qm31s, channel_mix_secure_field,
     };
     use crate::model_verifier::{
@@ -503,6 +506,12 @@ mod SumcheckVerifierContract {
         stream_deferred_point_len: Map<(u64, u32), u32>,
         /// (session_id, deferred_idx, coord_idx) → packed QM31 coordinate.
         stream_deferred_point: Map<(u64, u32, u32), felt252>,
+        /// session_id → whether this session has KV-cache commitment data.
+        stream_has_kv_cache: Map<u64, bool>,
+        /// session_id → KV-cache super-commitment (Poseidon over all K/V heads).
+        stream_kv_cache_commitment: Map<u64, felt252>,
+        /// session_id → previous step's KV-cache commitment (ZERO for prefill).
+        stream_prev_kv_cache_commitment: Map<u64, felt252>,
     }
 
     #[event]
@@ -547,6 +556,7 @@ mod SumcheckVerifierContract {
         proof_hash: felt252,
         io_commitment: felt252,
         num_layers: u32,
+        kv_cache_commitment: felt252,
     }
 
     #[derive(Drop, starknet::Event)]
@@ -1042,6 +1052,9 @@ mod SumcheckVerifierContract {
             num_layers: u32,
             in_cols: u32,
             out_cols: u32,
+            has_kv_cache: bool,
+            kv_cache_commitment: felt252,
+            prev_kv_cache_commitment: felt252,
         ) {
             // Auth: must be session owner, session must be sealed
             assert!(self.session_sealed.entry(session_id).read(), "SESSION_NOT_SEALED");
@@ -1079,6 +1092,13 @@ mod SumcheckVerifierContract {
             // Seed Fiat-Shamir channel (deterministic, no MLE eval here)
             let _padded_out_cols = next_power_of_two(out_cols);
             let mut ch = channel_default();
+
+            // Mix KV-cache commitment BEFORE circuit metadata (matches prover order
+            // in aggregation.rs: mix_felt(kv) → prove_gkr → mix_u64(depth, rows, cols))
+            if has_kv_cache {
+                channel_mix_felt(ref ch, kv_cache_commitment);
+            }
+
             channel_mix_u64(ref ch, circuit_depth.into());
             channel_mix_u64(ref ch, in_rows_v.into());
             channel_mix_u64(ref ch, in_cols.into());
@@ -1107,6 +1127,11 @@ mod SumcheckVerifierContract {
             self.stream_initialized.entry(session_id).write(true);
             self.stream_output_mle_done.entry(session_id).write(false);
             self.stream_finalized.entry(session_id).write(false);
+
+            // Store KV-cache commitment for finalize proof_hash computation
+            self.stream_has_kv_cache.entry(session_id).write(has_kv_cache);
+            self.stream_kv_cache_commitment.entry(session_id).write(kv_cache_commitment);
+            self.stream_prev_kv_cache_commitment.entry(session_id).write(prev_kv_cache_commitment);
 
             let model_id = self.session_model_id.entry(session_id).read();
             self.emit(GkrStreamStarted { session_id, model_id, num_layers });
@@ -1748,24 +1773,39 @@ mod SumcheckVerifierContract {
                 "STREAM_INPUT_CLAIM_MISMATCH",
             );
 
-            // Compute proof hash using channel state after weight binding
+            // Compute proof hash using channel state after weight binding.
+            // Backward-compatible: only include KV commitment when present.
             let ch_digest = self.stream_channel_digest.entry(session_id).read();
             let stored_io_commitment = self.stream_io_commitment.entry(session_id).read();
             let num_layers = self.stream_total_layers.entry(session_id).read();
-            let proof_hash = core::poseidon::poseidon_hash_span(
-                array![ch_digest, stored_io_commitment, model_id, num_layers.into()].span(),
-            );
+            let proof_hash = if self.stream_has_kv_cache.entry(session_id).read() {
+                let stored_kv = self.stream_kv_cache_commitment.entry(session_id).read();
+                core::poseidon::poseidon_hash_span(
+                    array![ch_digest, stored_io_commitment, stored_kv, model_id, num_layers.into()]
+                        .span(),
+                )
+            } else {
+                core::poseidon::poseidon_hash_span(
+                    array![ch_digest, stored_io_commitment, model_id, num_layers.into()].span(),
+                )
+            };
 
             // Record proof on-chain
             assert!(!self.verified_proofs.entry(proof_hash).read(), "PROOF_ALREADY_VERIFIED");
             self.verified_proofs.entry(proof_hash).write(true);
             let count = self.verification_counts.entry(model_id).read();
             self.verification_counts.entry(model_id).write(count + 1);
+            let kv_commit_for_event = if self.stream_has_kv_cache.entry(session_id).read() {
+                self.stream_kv_cache_commitment.entry(session_id).read()
+            } else {
+                0
+            };
             self.emit(ModelGkrVerified {
                 model_id,
                 proof_hash,
                 io_commitment: stored_io_commitment,
                 num_layers,
+                kv_cache_commitment: kv_commit_for_event,
             });
 
             self.stream_finalized.entry(session_id).write(true);

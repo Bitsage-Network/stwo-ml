@@ -346,6 +346,42 @@ impl ComputationGraph {
         sub
     }
 
+    /// Clone this graph with a different sequence length (input row count).
+    ///
+    /// Updates:
+    /// - `input_shape.0` → `new_seq_len`
+    /// - `MatMul { dims: (m, k, n) }` where `m == old_seq_len` → `m = new_seq_len`
+    /// - `Attention { config }` where `config.seq_len == old_seq_len` → `config.seq_len = new_seq_len`
+    /// - Node `output_shape.0` where it matched the old seq_len → updated
+    ///
+    /// Useful for chunked prefill: slice a long prompt into chunks and re-prove
+    /// each with a graph dimensioned for the chunk size.
+    pub fn with_seq_len(&self, new_seq_len: usize) -> ComputationGraph {
+        let old_seq_len = self.input_shape.0;
+        let mut g = self.clone();
+        g.input_shape.0 = new_seq_len;
+
+        for node in &mut g.nodes {
+            match &mut node.op {
+                GraphOp::MatMul { dims: (m, _k, _n) } if *m == old_seq_len => {
+                    *m = new_seq_len;
+                }
+                GraphOp::Attention { config } if config.seq_len == old_seq_len => {
+                    config.seq_len = new_seq_len;
+                }
+                _ => {}
+            }
+            if node.output_shape.0 == old_seq_len {
+                node.output_shape.0 = new_seq_len;
+            }
+        }
+
+        if g.output_shape.0 == old_seq_len {
+            g.output_shape.0 = new_seq_len;
+        }
+        g
+    }
+
     /// Detect transformer block boundaries.
     ///
     /// A transformer block is a repeating pattern of LayerNorm → MatMul (attention) →
@@ -1142,5 +1178,54 @@ mod tests {
         // 1 identity + 8 ops per block × 3 = 25 (identity only on first block)
         assert_eq!(graph.num_layers(), 25);
         assert_eq!(graph.output_shape, (4, 16));
+    }
+
+    #[test]
+    fn test_graph_with_seq_len() {
+        use crate::components::attention::MultiHeadAttentionConfig;
+
+        let seq_len = 8;
+        let d_model = 16;
+        let config = MultiHeadAttentionConfig::new(2, d_model, seq_len);
+
+        let mut graph = ComputationGraph::new((seq_len, d_model));
+        graph.add_node(
+            GraphOp::MatMul { dims: (seq_len, d_model, d_model) },
+            vec![],
+            (seq_len, d_model),
+        );
+        graph.add_node(
+            GraphOp::Attention { config },
+            vec![0],
+            (seq_len, d_model),
+        );
+
+        let new_graph = graph.with_seq_len(4);
+
+        // Input/output shapes updated
+        assert_eq!(new_graph.input_shape, (4, d_model));
+        assert_eq!(new_graph.output_shape, (4, d_model));
+
+        // MatMul m dimension updated
+        match &new_graph.nodes[0].op {
+            GraphOp::MatMul { dims: (m, k, n) } => {
+                assert_eq!(*m, 4);
+                assert_eq!(*k, d_model);
+                assert_eq!(*n, d_model);
+            }
+            _ => panic!("expected MatMul"),
+        }
+
+        // Attention config seq_len updated
+        match &new_graph.nodes[1].op {
+            GraphOp::Attention { config } => {
+                assert_eq!(config.seq_len, 4);
+            }
+            _ => panic!("expected Attention"),
+        }
+
+        // Node output shapes updated
+        assert_eq!(new_graph.nodes[0].output_shape, (4, d_model));
+        assert_eq!(new_graph.nodes[1].output_shape, (4, d_model));
     }
 }

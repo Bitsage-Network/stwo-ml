@@ -28,6 +28,7 @@ import {
   RpcProvider,
   CallData,
   ETransactionVersion,
+  Signer,
   ec,
   hash,
   num,
@@ -186,7 +187,7 @@ function getAccount(provider, privateKey, address, network = "sepolia") {
   return new Account({
     provider,
     address,
-    signer: privateKey,
+    signer: new Signer(privateKey),
     transactionVersion: ETransactionVersion.V3,
     paymaster: new PaymasterRpc(paymasterOpts),
   });
@@ -529,7 +530,7 @@ async function deployAccountDirect(provider, account, deploymentData, network) {
     const funder = new Account({
       provider,
       address: funderAddress,
-      signer: funderKey,
+      signer: new Signer(funderKey),
       transactionVersion: ETransactionVersion.V3,
     });
     info(`Funding ephemeral account from ${funderAddress}...`);

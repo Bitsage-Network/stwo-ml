@@ -96,15 +96,16 @@ impl std::fmt::Debug for DepositExecution {
 
 impl Drop for DepositExecution {
     fn drop(&mut self) {
-        // Zeroize permutation I/O to prevent secret residue in memory.
+        // Volatile write prevents compiler from eliding zeroization of secrets.
+        let zero = M31::from_u32_unchecked(0);
         for perm in &mut self.all_permutation_inputs {
             for v in perm.iter_mut() {
-                *v = M31::from_u32_unchecked(0);
+                unsafe { std::ptr::write_volatile(v, zero); }
             }
         }
         for perm in &mut self.all_permutation_outputs {
             for v in perm.iter_mut() {
-                *v = M31::from_u32_unchecked(0);
+                unsafe { std::ptr::write_volatile(v, zero); }
             }
         }
     }

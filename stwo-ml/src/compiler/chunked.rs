@@ -795,6 +795,8 @@ where
             tiled_matmul_proofs: Vec::new(),
             gkr_proof: None,
             gkr_batch_data: None,
+            kv_cache_commitment: None,
+            prev_kv_cache_commitment: None,
         });
     }
 
@@ -834,6 +836,8 @@ where
         tiled_matmul_proofs: Vec::new(),
         gkr_proof: None,
         gkr_batch_data: None,
+        kv_cache_commitment: None,
+        prev_kv_cache_commitment: None,
     })
 }
 

@@ -578,6 +578,17 @@ fn validate_withdrawal_bindings(
                     "legacy v1 binding requires payout==credit at index {i}"
                 )));
             }
+            // Reject V1 bindings unless explicitly opted in (deprecated).
+            if std::env::var("STWO_ALLOW_V1_BINDINGS").unwrap_or_default() != "1" {
+                return Err(RelayerError::InvalidInput(format!(
+                    "deprecated v1 withdrawal binding at index {i} \
+                     (upgrade client to v2 bindings)"
+                )));
+            }
+            eprintln!(
+                "  WARNING: withdrawal at index {i} uses deprecated V1 binding. \
+                 Upgrade to V2 (includes credit_recipient in hash)."
+            );
         }
     }
     Ok(())

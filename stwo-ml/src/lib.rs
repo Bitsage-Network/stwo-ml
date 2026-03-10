@@ -33,6 +33,22 @@ pub fn is_quiet() -> bool {
     QUIET.load(Ordering::Relaxed)
 }
 
+/// Global profiling flag: when true, enables per-phase timing in GKR provers.
+/// Set via `set_profile(true)` or `STWO_PROFILE=1` env var.
+static PROFILE: AtomicBool = AtomicBool::new(false);
+
+/// Enable or disable phase profiling globally.
+pub fn set_profile(enabled: bool) {
+    PROFILE.store(enabled, Ordering::Relaxed);
+}
+
+/// Returns true if phase profiling is enabled.
+#[inline]
+pub fn is_profile() -> bool {
+    PROFILE.load(Ordering::Relaxed)
+        || std::env::var("STWO_PROFILE").map_or(false, |v| v == "1" || v == "true")
+}
+
 pub mod aggregation;
 pub mod backend;
 pub mod cairo_serde;

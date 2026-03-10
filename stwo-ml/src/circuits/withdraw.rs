@@ -121,14 +121,16 @@ impl std::fmt::Debug for WithdrawExecution {
 
 impl Drop for WithdrawExecution {
     fn drop(&mut self) {
+        let zero = M31::from_u32_unchecked(0);
         for perm in &mut self.all_permutation_inputs {
             for v in perm.iter_mut() {
-                *v = M31::from_u32_unchecked(0);
+                // SAFETY: volatile write prevents compiler from eliding zeroization.
+                unsafe { std::ptr::write_volatile(v, zero); }
             }
         }
         for perm in &mut self.all_permutation_outputs {
             for v in perm.iter_mut() {
-                *v = M31::from_u32_unchecked(0);
+                unsafe { std::ptr::write_volatile(v, zero); }
             }
         }
     }

@@ -51,6 +51,10 @@ pub struct RoPEConfig {
     pub base: f64,
     /// Maximum sequence length for table precomputation.
     pub max_seq_len: usize,
+    /// Position offset for decode-step RoPE (default: 0).
+    /// During autoregressive generation, tokens at local positions 0..seq_len
+    /// receive RoPE angles for absolute positions offset..offset+seq_len.
+    pub position_offset: usize,
 }
 
 impl RoPEConfig {
@@ -61,6 +65,7 @@ impl RoPEConfig {
             head_dim,
             base: 10000.0,
             max_seq_len: seq_len,
+            position_offset: 0,
         }
     }
 
@@ -71,6 +76,15 @@ impl RoPEConfig {
 
     pub fn with_max_seq_len(mut self, max_seq_len: usize) -> Self {
         self.max_seq_len = max_seq_len;
+        self
+    }
+
+    /// Set a position offset for decode-step RoPE.
+    ///
+    /// During autoregressive decode, new tokens at local position 0..seq_len
+    /// must receive RoPE angles for absolute positions offset..offset+seq_len.
+    pub fn with_offset(mut self, offset: usize) -> Self {
+        self.position_offset = offset;
         self
     }
 
@@ -167,17 +181,26 @@ pub fn build_rope_lookup_table(config: &RoPEConfig) -> PrecomputedTable {
 /// Each row corresponds to a position m.
 /// Adjacent pairs (col 2j, col 2j+1) are rotated by angle θ_j × m.
 ///
+/// `position_offset`: absolute position of the first row. During prefill this
+/// is 0; during autoregressive decode it equals the number of tokens already
+/// in the KV-cache, so that new tokens get correct rotary angles.
+///
 /// The rotation in M31 fixed-point arithmetic:
 ///   x' = x·cos - y·sin  (mod P, with re-centering)
 ///   y' = x·sin + y·cos  (mod P, with re-centering)
-pub fn apply_rope(matrix: &M31Matrix, table: &RoPETable) -> (M31Matrix, Vec<M31>, Vec<M31>) {
+pub fn apply_rope(
+    matrix: &M31Matrix,
+    table: &RoPETable,
+    position_offset: usize,
+) -> (M31Matrix, Vec<M31>, Vec<M31>) {
     let seq_len = matrix.rows;
     let head_dim = matrix.cols;
     let n_pairs = head_dim / 2;
 
     assert!(
-        seq_len <= table.config.max_seq_len,
-        "seq_len {} exceeds table max_seq_len {}",
+        position_offset + seq_len <= table.config.max_seq_len,
+        "position_offset ({}) + seq_len ({}) exceeds table max_seq_len ({})",
+        position_offset,
         seq_len,
         table.config.max_seq_len
     );
@@ -192,11 +215,12 @@ pub fn apply_rope(matrix: &M31Matrix, table: &RoPETable) -> (M31Matrix, Vec<M31>
     let mut sin_used = Vec::with_capacity(seq_len * n_pairs);
 
     for pos in 0..seq_len {
+        let abs_pos = position_offset + pos;
         for j in 0..n_pairs {
             let x = matrix.data[pos * head_dim + 2 * j];
             let y = matrix.data[pos * head_dim + 2 * j + 1];
 
-            let table_idx = pos * n_pairs + j;
+            let table_idx = abs_pos * n_pairs + j;
             let cos_m31 = table.cos_vals[table_idx];
             let sin_m31 = table.sin_vals[table_idx];
 
@@ -447,7 +471,7 @@ mod tests {
             ],
         };
 
-        let (rotated, cos_used, sin_used) = apply_rope(&input, &table);
+        let (rotated, cos_used, sin_used) = apply_rope(&input, &table, 0);
         assert_eq!(rotated.rows, 2);
         assert_eq!(rotated.cols, 4);
         assert_eq!(cos_used.len(), 4); // 2 positions × 2 pairs
@@ -497,6 +521,77 @@ mod tests {
                     norm
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_apply_rope_offset_zero_unchanged() {
+        // Passing offset=0 must produce identical results to the previous behavior.
+        let config = RoPEConfig::new(4, 4);
+        let table = build_rope_table(&config);
+        let input = M31Matrix {
+            rows: 4,
+            cols: 4,
+            data: (0..16)
+                .map(|i| float_to_m31_signed((i as f64) / 16.0))
+                .collect(),
+        };
+
+        let (out_0, cos_0, sin_0) = apply_rope(&input, &table, 0);
+        // Re-run with explicit 0 — must be bitwise identical
+        let (out_0b, cos_0b, sin_0b) = apply_rope(&input, &table, 0);
+        assert_eq!(out_0.data, out_0b.data);
+        assert_eq!(cos_0, cos_0b);
+        assert_eq!(sin_0, sin_0b);
+    }
+
+    #[test]
+    fn test_apply_rope_with_offset() {
+        // Position 0 with offset=5 must use the same rotation angles as
+        // position 5 with offset=0 in a longer table.
+        let head_dim = 4;
+        let max_len = 16;
+        let config_long = RoPEConfig::new(max_len, head_dim).with_max_seq_len(max_len);
+        let table_long = build_rope_table(&config_long);
+
+        let row = M31Matrix {
+            rows: 1,
+            cols: head_dim,
+            data: vec![
+                float_to_m31_signed(0.6),
+                float_to_m31_signed(-0.3),
+                float_to_m31_signed(0.1),
+                float_to_m31_signed(0.9),
+            ],
+        };
+
+        // Method A: single row at local pos 0 with offset=5
+        let (rot_offset, cos_a, sin_a) = apply_rope(&row, &table_long, 5);
+
+        // Method B: embed the row at position 5 in a 6-row matrix, offset=0
+        let mut padded = M31Matrix {
+            rows: 6,
+            cols: head_dim,
+            data: vec![M31::from(0); 6 * head_dim],
+        };
+        for j in 0..head_dim {
+            padded.data[5 * head_dim + j] = row.data[j];
+        }
+        let (rot_full, cos_b, sin_b) = apply_rope(&padded, &table_long, 0);
+
+        // The rotated values for the row at absolute position 5 must match.
+        for j in 0..head_dim {
+            assert_eq!(
+                rot_offset.data[j], rot_full.data[5 * head_dim + j],
+                "col {}: offset-rotated vs full-rotated mismatch",
+                j
+            );
+        }
+        // cos/sin used for position 5 must be identical
+        let n_pairs = head_dim / 2;
+        for j in 0..n_pairs {
+            assert_eq!(cos_a[j], cos_b[5 * n_pairs + j], "cos mismatch pair {}", j);
+            assert_eq!(sin_a[j], sin_b[5 * n_pairs + j], "sin mismatch pair {}", j);
         }
     }
 }

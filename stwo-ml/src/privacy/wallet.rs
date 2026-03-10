@@ -495,7 +495,7 @@ fn hex_to_m31_vec(hex: &str) -> Result<Vec<M31>, WalletError> {
         let chunk = &hex[i * 8..(i + 1) * 8];
         let val = u32::from_str_radix(chunk, 16)
             .map_err(|e| WalletError::HexParse(format!("invalid hex '{chunk}': {e}")))?;
-        result.push(M31::from_u32_unchecked(val));
+        result.push(super::reduce_u32_to_m31(val));
     }
     Ok(result)
 }

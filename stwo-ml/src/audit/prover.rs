@@ -377,7 +377,7 @@ impl<'a> AuditProver<'a> {
         let raw_io = crate::cairo_serde::serialize_raw_io(input, output);
 
         let streaming = crate::starknet::build_streaming_gkr_calldata(
-            gkr_proof, &circuit, model_id, &raw_io,
+            gkr_proof, &circuit, model_id, &raw_io, None, None,
         )
         .map_err(|e| AuditError::ProvingFailed(format!("Streaming calldata build failed: {}", e)))?;
 

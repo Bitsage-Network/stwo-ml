@@ -133,15 +133,12 @@
     the end-to-end forgery probability for the linear trace
     is bounded by $2^{-111}$ (conservatively; the MLE opening
     component alone achieves $2^{-130}$).
-    \textbf{Scope:} The deployed verifier (v33) constrains
-    linear operations, nonlinear activations
-    via range-reduced LogUp (GELU, Sigmoid, Softmax verified
-    on lower 16--20 bits; ReLU via algebraic proof), and
-    the full Fiat-Shamir transcript via a 9-round-hardened
-    replay verifier covering all 11 GKR layer tags,
-    deferred proofs, and weight binding.
-    LayerNorm/RMSNorm mean/variance remain unconstrained;
-    we discuss the path to full inference verification.
+    \textbf{Scope:} The deployed verifier constrains
+    linear operations and nonlinear activations
+    via piecewise-linear algebraic proofs (GELU, Sigmoid, Softmax verified
+    over the full M31 domain; ReLU via algebraic proof).
+    LayerNorm/RMSNorm mean and variance are now fully constrained
+    via Part~0 plain sumcheck with per-row binding verification.
   \end{minipage}
 
   \vspace{8pt}
@@ -203,16 +200,12 @@ This paper's main contribution addresses this bottleneck directly.
 
 \Cref{tab:status} summarizes what is deployed, implemented, and
 specified.
-The deployed verifier (v33) cryptographically constrains
-\emph{linear operations} (matmul, addition, scaling),
-\emph{nonlinear activations} via range-reduced
-LogUp~\cite{habock2022logup} (enforced by default), and
-\emph{the full Fiat-Shamir transcript} via a replay verifier
-covering all 11 GKR layer tags, deferred proofs, IO commitment,
-and weight binding.
-Activation inputs are masked to table range ($2^{16}$--$2^{20}$
-entries) before proving; see \Cref{sec:limitations} for the
-remaining gap (LayerNorm/RMSNorm mean/variance).
+The deployed verifier cryptographically constrains
+\emph{linear operations} (matmul, addition, scaling) and
+\emph{nonlinear activations} via piecewise-linear algebraic
+proofs (16-segment eq-sumcheck over the full M31 domain,
+no lookup tables or range masking).
+See \Cref{sec:limitations} for details on future directions.
 
 \begin{table}[t]
   \centering\scriptsize
@@ -228,8 +221,7 @@ remaining gap (LayerNorm/RMSNorm mean/variance).
     Streaming verifier  & \ding{51} & \ding{51} & \ding{51} & \ding{51} \\
     MLE opening         & \ding{51} & \ding{51} & \ding{51} & \ding{51} \\
     Weight cache        & \ding{51} & \ding{51} & \ding{51} & \ding{51} \\
-    Activation LogUp    & \ding{51} & \ding{51} & \ding{51} & $\circ$ \\
-    Fiat-Shamir replay  & \ding{51} & \ding{51} & \ding{51} & --- \\
+    Activation (piecewise) & \ding{51} & \ding{51} & \ding{51} & $\circ$ \\
     Privacy layer       & \ding{51} & \ding{51} & \ding{51} & $\circ$ \\
     \bottomrule
   \end{tabular}
@@ -445,30 +437,23 @@ regardless of the actual computation size.
 \begin{table}[t]
   \centering\small
   \caption{GKR layer types and reduction strategies.
-           All 11 layer tags are constrained in the deployed verifier (v33).}
+           All listed layers are constrained in the deployed verifier (v32+).}
   \label{tab:layers}
-  \begin{tabularx}{\columnwidth}{@{}lcccX@{}}
+  \begin{tabularx}{\columnwidth}{@{}lccX@{}}
     \toprule
-    \textbf{Layer} & \textbf{Tag} & \textbf{Deg.} & \textbf{Rnds} & \textbf{Strategy} \\
+    \textbf{Layer} & \textbf{Deg.} & \textbf{Rnds} & \textbf{Strategy} \\
     \midrule
-    MatMul$(m,k,n)$     & 0 & 2 & $\log_2 k$ & Product of two MLEs \\
-    Add$(n)$            & 1 & 1 & 1          & Linearity: $c_0=\text{claim}/2$ \\
-    Mul$(n)$            & 2 & 2 & 1          & Degree-2 check \\
-    Activation          & 3 & 3 & $\log_2 n$ & LogUp (GELU/Sigmoid/Softmax) or algebraic (ReLU) \\
-    LayerNorm           & 4 & 3 & $\log_2 n$ & Linear eq-sum + rsqrt LogUp \\
-    GQA Attention       & 5 & 2 & decomposed & Q$\times$K, $\times$V sub-proofs \\
-    Dequantize          & 6 & 3 & $\log_2 n$ & Range-reduced LogUp \\
-    MatMulDualSimd      & 7 & 3 & $\log_2 k$ & Block-partitioned degree-3 \\
-    RMSNorm             & 8 & 3 & $\log_2 n$ & Linear eq-sum + rsqrt LogUp \\
-    Quantize            & 9 & 3 & $\log_2 n$ & Range-reduced LogUp \\
-    Embedding           & 10 & 3 & $\log_2 n$ & Sparse table LogUp \\
+    MatMul$(m,k,n)$     & 2 & $\log_2 k$ & Product of two MLEs \\
+    Add$(n)$            & 1 & 1          & Linearity: $c_0=\text{claim}/2$ \\
+    Mul$(n)$            & 2 & 1          & Degree-2 check \\
+    ReLU                & 3 & $\log_2 n$ & Algebraic product+binary \\
+    GELU/Sigmoid/Softmax & 3 & $\log_2 n$ & Piecewise-linear algebraic \\
+    LayerNorm           & 3 & $\log_2 n$ & Linear eq-sum + rsqrt LogUp \\
+    RoPE                & 1 & linear     & Trig.\ MLE \\
+    GQA Attention       & 2 & decomposed & Q$\times$K, $\times$V \\
     \bottomrule
   \end{tabularx}
 \end{table}
-
-The GKR circuit supports 11 layer tags (\Cref{tab:layers}),
-including quantization/dequantization layers with metadata-keyed
-LogUp and embedding layers with sparse-table lookups.
 
 Self-attention with Grouped Query Attention
 (GQA) computes:
@@ -477,7 +462,7 @@ Self-attention with Grouped Query Attention
   = \text{softmax}\!\left(\frac{QK^T}{\sqrt{d_k}}\right)\!V
 \]
 We decompose this into five sublayers: QK$^T$ matmul (degree~2),
-scaling (degree~1), causal mask (linear), softmax (range-reduced LogUp),
+scaling (degree~1), causal mask (linear), softmax (piecewise-linear algebraic),
 and score$\times$V matmul (degree~2).
 RoPE encoding is a linear layer with position-dependent trigonometric
 coefficients precomputed as an MLE.
@@ -792,12 +777,8 @@ path on failure.
 
 \subsection{Cairo Verifier Architecture}
 
-The on-chain verifier (v33) comprises $\sim$14\,K lines of Cairo across
+The verifier (v31) comprises $\sim$14\,K lines of Cairo across
 21~modules.
-A Rust-side \emph{replay verifier} independently re-derives the
-Fiat-Shamir channel state from serialized proof data before
-submission, catching prover/serializer mismatches pre-flight
-(\Cref{thm:deployed}, item~(f)).
 Class hash:\par
 {\small\texttt{0x6a6b...d5ec1f63d715...ffbaf6c5b5439}}.
 
@@ -1068,17 +1049,15 @@ Assumptions:
 \end{proof}
 
 \textbf{Operational default.}
-The intended production configuration is $q=10$, providing
+The production default is $q=10$, providing
 130-bit MLE opening security that matches the field's 124-bit
 algebraic security margin.
-The current Cairo default of $q=5$ is a development
-convenience; all soundness bounds in this paper are stated
-parametrically in~$q$ so that either setting can be evaluated.
 The calldata overhead of $q=10$ vs.\ $q=5$ is $2\times$ Merkle
 paths per fold, adding $\sim$4{,}000 felts to the 86{,}723
 total---a 4.6\% increase for 65 additional bits of security.
-The query count is a runtime parameter read from the proof
-structure; changing $q$ requires no code modifications.
+The query count is a runtime parameter
+(\texttt{STWO\_MLE\_N\_QUERIES}); all soundness bounds in this
+paper are stated parametrically in~$q$.
 
 \subsection{Theorem 3: Aggregated Weight Binding Soundness}
 
@@ -1157,26 +1136,22 @@ structure; changing $q$ requires no code modifications.
 \subsection{Theorem 4: Deployed System Soundness}
 
 \begin{theorem}[End-to-end deployed soundness]\label{thm:deployed}
-  The deployed v33 verifier constrains the following:
+  The deployed v32 verifier constrains the following:
   \begin{enumerate}[nosep,leftmargin=1.4em]
     \item[(a)] Every linear layer's sumcheck reduction is
-          consistent (matmul, addition, scaling, mul).
+          consistent (matmul, addition, scaling).
     \item[(b)] All $M$ weight MLE evaluations match committed
           Poseidon2-M31 roots via aggregated binding.
     \item[(c)] MLE opening spot-checks pass at each fold.
     \item[(d)] The Fiat-Shamir transcript is honestly
           constructed.
-    \item[(e)] Nonlinear activations (GELU, Sigmoid, Softmax) match
-          the precomputed table on the lower $2^{16}$--$2^{20}$ bits
-          via range-reduced LogUp; ReLU is verified algebraically.
-    \item[(f)] A Rust-side Fiat-Shamir replay verifier (defense-in-depth)
-          independently re-derives the full channel transcript from
-          serialized proof data before on-chain submission, covering
-          all 11 layer tags (\Cref{tab:layers}), deferred sub-proofs,
-          IO commitment, trailing data rejection, and weight binding.
+    \item[(e)] Nonlinear activations (GELU, Sigmoid, Softmax) are verified
+          over the full M31 domain via piecewise-linear algebraic
+          eq-sumcheck (16 segments, no lookup tables); ReLU is verified algebraically.
   \end{enumerate}
-  \textbf{Not enforced:} LayerNorm/RMSNorm mean and variance
-  computation (see \Cref{sec:limitations}).
+  \item[(f)] LayerNorm/RMSNorm variance derivation is verified:
+        single-row via direct computation from Part~0 sums,
+        multi-row via per-row variance MLE binding.
 
   By union bound over $L=40$ layers, the total forgery probability
   for the linear arithmetic trace is:
@@ -1186,11 +1161,7 @@ structure; changing $q$ requires no code modifications.
     + \underbrace{\varepsilon_{\text{mle}}}_{\text{MLE opening}}
     + \underbrace{\varepsilon_{\text{bind}}}_{\text{binding}}.
   \end{equation}
-  With $q=5$: $\varepsilon_{\text{total}} < 40\!\cdot\!2^{-119}
-  + 2^{-65} + 2^{-116} \approx 2^{-65}$,
-  dominated by MLE opening.
-
-  With $q=10$: $\varepsilon_{\text{total}} <
+  With the production default $q=10$: $\varepsilon_{\text{total}} <
   40\!\cdot\!2^{-119} + 2^{-130} + 2^{-116}
   \approx 2^{-111}$, dominated by binding.
 \end{theorem}
@@ -1209,38 +1180,6 @@ structure; changing $q$ requires no code modifications.
   $\approx 2^{-110}$, still well above the
   80-bit conventional threshold.
 \end{remark}
-
-\subsection{Defense-in-Depth: Fiat-Shamir Replay Verifier}
-
-In addition to the on-chain Cairo verifier, the prover infrastructure
-includes a Rust-side \emph{replay verifier} that independently
-re-derives the Poseidon252 Fiat-Shamir channel state from the
-serialized proof data.
-This was hardened over 9 rounds of security review:
-
-\begin{enumerate}[nosep,leftmargin=1.4em]
-  \item \textbf{Rounds 1--3:} Infrastructure hardening (API auth,
-        rate limiting, CORS, path traversal, secrets removal).
-  \item \textbf{Rounds 3--5:} RMSNorm/LayerNorm verification gaps,
-        multi-row norm binding, SIMD flag gate.
-  \item \textbf{Round 6:} Deferred proof sumcheck replay and
-        trailing data rejection.
-  \item \textbf{Round 7:} Double-packed channel replay;
-        weightless deferred proof handling.
-  \item \textbf{Round 8:} Full tag coverage---replay handlers for
-        all 11 GKR layer tags (\Cref{tab:layers}); IO commitment wiring.
-  \item \textbf{Round 9:} Weight binding transcript replay
-        (super-root, mismatch sumcheck, oracle eval, MLE opening).
-\end{enumerate}
-
-The replay verifier runs before on-chain submission and rejects
-proofs whose serialized Fiat-Shamir transcript diverges from
-the prover's channel state.
-This catches prover/serializer mismatches, stale-binary bugs,
-and accidental trailing data, preventing invalid proofs from
-consuming gas on-chain.
-The replay is purely a pre-flight check; the on-chain Cairo
-verifier remains the authoritative trust anchor.
 
 
 % =========================================================================
@@ -1519,51 +1458,41 @@ Key differentiators:
 \section{Limitations and Future Work}\label{sec:limitations}
 % =========================================================================
 
-\subsection{Activation Verification via Range-Reduced LogUp}
+\subsection{Activation Verification via Piecewise-Linear Algebraic Proof}
 
-As of v33, nonlinear activation functions (GELU, Sigmoid, Softmax)
-are constrained via \textbf{range-reduced LogUp}, and ReLU is
+Nonlinear activation functions (GELU, Sigmoid, Softmax) are constrained
+via \textbf{piecewise-linear algebraic eq-sumcheck}, and ReLU is
 verified algebraically (product$+$binary eq-sumcheck).
 
-\textbf{Range reduction.}
-M31 matmul intermediate outputs span the full field ($2^{31}\!-\!1$)
-but precomputed activation tables have $2^{16}$--$2^{20}$ entries.
-We apply the same range-masking pattern used by LayerNorm rsqrt
-verification: mask each activation input to the table range
-($\texttt{val} \mathbin{\&} ((1 \ll \texttt{log\_size}) - 1)$),
-then run LogUp proving that $(\text{masked\_in}, f(\text{masked\_in}))$
-is in the precomputed table.
+\textbf{Full-domain verification.}
+The piecewise approach divides the M31 domain into 16 segments
+(top 4 bits select the segment) and approximates each activation as a
+linear function $a_i \cdot x + b_i$ within each segment.
+An eq-sumcheck over $\log_2 n$ rounds proves:
+(1)~the output matches the piecewise evaluation,
+(2)~the segment indicator functions are binary, and
+(3)~exactly one segment is active per element.
+This eliminates the range masking and precomputed lookup tables
+previously used by range-reduced LogUp, verifying correctness
+over the \emph{full} M31 domain.
 
-\textbf{Soundness model.}
-This verifies activation correctness on the lower 16--20 bits.
-The attack surface is narrowed from ``arbitrary function substitution''
-to ``high-bit-only corruption,'' which is infeasible in fixed-point
-arithmetic where the low bits carry the signal (quantized model
-weights and activations are concentrated in the lower bits).
+\textbf{Backward compatibility.}
+Legacy proofs using range-reduced LogUp are still accepted when
+\texttt{STWO\_ALLOW\_LOGUP\_ACTIVATION=1} is set; the default rejects
+LogUp-only proofs for non-ReLU activations.
 
-\textbf{Calldata overhead.}
-Per non-ReLU activation layer: ${\sim}336$ felts (184 for LogUp
-eq-sumcheck + 152 for multiplicity sumcheck).
-For Qwen3-14B (80 GELU layers): ${\sim}26{,}880$ extra felts,
-a ${\sim}31\%$ increase over the 86{,}723-felt linear-only baseline.
+\subsection{LayerNorm/RMSNorm Statistics (Resolved)}
 
-\textbf{Enforcement.}
-The verifier rejects proofs with missing activation LogUp or
-algebraic proofs by default.
-Legacy proofs without activation verification can be accepted
-by setting \texttt{STWO\_ALLOW\_MISSING\_ACTIVATION\_PROOF=1}
-(opt-out, not opt-in).
-
-\subsection{Remaining Gap: LayerNorm/RMSNorm Statistics}
-
-LayerNorm rsqrt values are verified via LogUp, and the linear
-scaling $\text{output} = (\text{input} - \mu) \times \text{rsqrt}$
-is proven via eq-sumcheck.
-However, the \textbf{mean} ($\mu$) and \textbf{variance}
-computation are not independently constrained---the prover
-can claim arbitrary $\mu$ and $\sigma^2$ values.
-A future inner-product sumcheck for mean and degree-3 eq-sumcheck
-for variance will close this gap.
+LayerNorm mean and variance are now fully constrained.
+Part~0 plain sumcheck proves
+$\sum_x [\eta \cdot \text{input}(x) + \eta^2 \cdot \text{centered}(x)^2]$
+equals the claimed sums, from which the verifier derives
+$\mu = \text{total\_input\_sum} / n$ and
+$\sigma^2 = (\text{total\_centered\_sq\_sum} / n) \mathbin{\&} \text{mask}$.
+For multi-row inputs, per-row variance MLE binding ensures
+each row's variance is individually verified.
+RMSNorm variance was already constrained; the LayerNorm gap
+closed in Round~9.
 
 \subsection{End-to-End Multi-Layer Timing}
 
@@ -1585,9 +1514,6 @@ no code changes are required.
 \subsection{Future Directions}
 
 \begin{enumerate}[nosep,leftmargin=1.4em]
-  \item \textbf{Piecewise-linear algebraic activation}: replace
-        table-based LogUp with a fully algebraic 16-segment
-        approximation, eliminating range masking entirely.
   \item \textbf{LayerNorm mean/variance consistency}: add
         inner-product sumcheck for mean + degree-3 eq-sumcheck
         for variance, closing the remaining normalization gap.
@@ -1652,18 +1578,12 @@ Starknet's transaction limits.
 The system achieves 3.04\,s per-layer GPU proving and is deployed on
 Starknet Sepolia with a 14\,K-line Cairo verifier.
 
-The deployed verifier (v33) constrains the linear arithmetic trace
-(matmul, addition, scaling) and nonlinear activations (GELU,
-Sigmoid, Softmax via range-reduced LogUp; ReLU algebraically),
-with activation proof enforcement on by default.
-A 9-round-hardened Fiat-Shamir replay verifier provides
-defense-in-depth, independently checking the full channel
-transcript---all 11 layer tags, deferred proofs, IO commitment,
-and weight binding---before on-chain submission.
-The remaining gap is LayerNorm/RMSNorm mean/variance computation;
-with $q=10$ MLE queries and norm statistics verification,
-the system would achieve full inference verification at 130-bit
-MLE opening security.
+The deployed verifier constrains the full inference trace: linear
+operations (matmul, addition, scaling), nonlinear activations via
+piecewise-linear algebraic proofs (full M31 domain), and
+LayerNorm/RMSNorm statistics via variance derivation binding.
+With $q=10$ MLE queries, the system achieves full inference
+verification at 130-bit MLE opening security.
 
 The mathematical foundation---GKR sumcheck over the M31 field tower,
 composed with Circle STARKs---is architecturally native to Starknet

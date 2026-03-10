@@ -92,8 +92,11 @@ pub fn tensor_to_f32(data: &[u8], dtype: safetensors::Dtype) -> Vec<f32> {
             .collect(),
         safetensors::Dtype::I8 => data.iter().map(|&b| b as i8 as f32).collect(),
         safetensors::Dtype::U8 => data.iter().map(|&b| b as f32).collect(),
-        _ => {
-            // Fallback: treat as f32
+        other => {
+            eprintln!(
+                "  WARNING: unsupported dtype {:?}, treating as f32 (may corrupt weights)",
+                other
+            );
             data.chunks_exact(4)
                 .map(|c| {
                     if c.len() == 4 {
@@ -154,7 +157,10 @@ pub fn dtype_byte_size(dtype: safetensors::Dtype) -> usize {
         safetensors::Dtype::I16 | safetensors::Dtype::U16 => 2,
         safetensors::Dtype::I32 | safetensors::Dtype::U32 => 4,
         safetensors::Dtype::F64 | safetensors::Dtype::I64 | safetensors::Dtype::U64 => 8,
-        _ => 4, // fallback
+        other => {
+            eprintln!("  WARNING: unknown dtype {:?}, assuming 4-byte elements", other);
+            4
+        }
     }
 }
 

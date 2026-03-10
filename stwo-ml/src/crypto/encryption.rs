@@ -78,15 +78,21 @@ impl KeyUsageTracker {
 /// Available when `audit`, `cli`, or `server` features are enabled.
 #[cfg(any(feature = "audit", feature = "cli", feature = "server"))]
 pub fn generate_secure_nonce() -> Result<[M31; 4], EncryptError> {
-    let mut buf = [0u8; 16];
-    getrandom::getrandom(&mut buf).map_err(|_| EncryptError::RngFailed)?;
-    let p: u32 = 0x7FFFFFFF; // M31 prime = 2^31 - 1
-    Ok([
-        M31::from_u32_unchecked(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) % p),
-        M31::from_u32_unchecked(u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) % p),
-        M31::from_u32_unchecked(u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]) % p),
-        M31::from_u32_unchecked(u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]) % p),
-    ])
+    const P: u32 = 0x7FFFFFFF; // M31 prime = 2^31 - 1
+    let mut result = [M31::from_u32_unchecked(0); 4];
+    for elem in result.iter_mut() {
+        loop {
+            let mut buf = [0u8; 4];
+            getrandom::getrandom(&mut buf).map_err(|_| EncryptError::RngFailed)?;
+            let v = u32::from_le_bytes(buf) >> 1; // 31 bits, uniform in [0, 2^31)
+            if v < P {
+                *elem = M31::from_u32_unchecked(v);
+                break;
+            }
+            // v == P: reject and retry (probability ~4.7e-10)
+        }
+    }
+    Ok(result)
 }
 
 /// Derive a synthetic nonce from key + plaintext (SIV construction).

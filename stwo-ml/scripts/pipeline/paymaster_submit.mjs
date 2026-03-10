@@ -31,8 +31,8 @@ const PAYMASTER_URLS = {
 };
 
 const RPC_URLS = {
-  mainnet: "https://json-rpc.starknet-mainnet.public.lavanet.xyz",
-  sepolia: process.env.STARKNET_RPC || "https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_8/GUBwFqKhSgn4mwVbN6Sbn",
+  mainnet: process.env.STARKNET_RPC || "https://json-rpc.starknet-mainnet.public.lavanet.xyz",
+  sepolia: process.env.STARKNET_RPC || "https://api.cartridge.gg/x/starknet/sepolia",
 };
 
 // STRK token address (same on mainnet and sepolia)

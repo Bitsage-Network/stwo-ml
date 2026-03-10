@@ -44,7 +44,10 @@ pub struct AggregatedWeightBindingProof {
 
 /// Compute the Poseidon hash of (a, b) using 2-to-1 hashing.
 fn poseidon_hash_2(a: felt252, b: felt252) -> felt252 {
-    poseidon_hash_span(array![a, b].span())
+    // Must match Rust's starknet_crypto::poseidon_hash(a, b) = hades_permutation(a, b, 2).s0
+    // Do NOT use poseidon_hash_span — that's the sponge construction which gives different results.
+    let (s0, _, _) = core::poseidon::hades_permutation(a, b, 2);
+    s0
 }
 
 /// Build Merkle root from a power-of-2 array of leaves.
@@ -273,24 +276,17 @@ pub fn verify_aggregated_binding(
     let config = proof.config;
 
     // 1. Verify super-root from subtree roots
-    if !verify_super_root(*proof.super_root, proof.subtree_roots.span()) {
-        return false;
-    }
+    assert!(verify_super_root(*proof.super_root, proof.subtree_roots.span()), "BINDING_SUPER_ROOT_FAILED");
 
     // 1b. Verify subtree roots match registered weight commitments
-    //     (with zero-tree extension for smaller matrices).
-    //     This is the critical binding: ensures the prover's claimed subtree
-    //     roots correspond to the actual registered weight MLE commitments.
-    if !verify_subtree_commitments(
+    assert!(verify_subtree_commitments(
         proof.subtree_roots.span(),
         weight_commitments,
         weight_claims,
         *config.n_claims,
         *config.n_max,
         *config.m_padded,
-    ) {
-        return false;
-    }
+    ), "BINDING_SUBTREE_COMMITMENTS_FAILED");
 
     // 2. Mix super-root into channel
     channel_mix_felt(ref ch, *proof.super_root);
@@ -302,9 +298,7 @@ pub fn verify_aggregated_binding(
 
     // 4. Verify sumcheck rounds
     let round_polys = proof.round_polys.span();
-    if round_polys.len() != n_global {
-        return false;
-    }
+    assert!(round_polys.len() == n_global, "BINDING_ROUND_POLY_COUNT_MISMATCH");
 
     let mut current_sum = qm31_zero(); // Expected sum = 0 (mismatch is zero)
     let mut challenge_point: Array<QM31> = array![];
@@ -324,9 +318,7 @@ pub fn verify_aggregated_binding(
 
         // Check: p(0) + p(1) == current_sum
         let round_sum = qm31_add(p0, p1);
-        if !qm31_eq(round_sum, current_sum) {
-            return false;
-        }
+        assert!(qm31_eq(round_sum, current_sum), "BINDING_SUMCHECK_ROUND_FAILED");
 
         // Mix round polynomial into channel
         channel_mix_poly_coeffs(ref ch, c0, c1, c2);
@@ -409,21 +401,21 @@ pub fn verify_aggregated_binding(
         claim_i += 1;
     };
 
-    if !qm31_eq(current_sum, verifier_sum) {
-        return false;
-    }
+    assert!(qm31_eq(current_sum, verifier_sum), "BINDING_FINAL_SUM_MISMATCH");
 
     // 6. Mix oracle eval into channel
     let oracle_arr: Array<QM31> = array![oracle_eval];
     channel_mix_felts(ref ch, oracle_arr.span());
 
     // 7. Verify single MLE opening against super-root
-    verify_mle_opening(
+    let mle_ok = verify_mle_opening(
         *proof.super_root,
         proof.opening_proof,
         challenge_span,
         ref ch,
-    )
+    );
+    assert!(mle_ok, "BINDING_MLE_OPENING_FAILED");
+    true
 }
 
 /// Power of 2 helper: 2^n for small n (up to 31).

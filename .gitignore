@@ -19,6 +19,10 @@ findingscore.md
 # Decrypted secrets (NEVER commit)
 scripts/pipeline/configs/.secrets.env
 secrets.env
+.env
+.env.*
+*.pem
+*.key
 
 # Deployment keystores (NEVER commit)
 deployment/

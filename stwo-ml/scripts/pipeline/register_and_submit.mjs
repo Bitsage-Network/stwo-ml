@@ -22,16 +22,15 @@ import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-const RPC_URL = process.env.STARKNET_RPC || "https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_8/GUBwFqKhSgn4mwVbN6Sbn";
+const RPC_URL = process.env.STARKNET_RPC;
+if (!RPC_URL) { console.error("FATAL: STARKNET_RPC env var required"); process.exit(1); }
 const CONTRACT =
   process.env.CONTRACT_ADDRESS ||
   "0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005";
-const ACCOUNT_ADDRESS =
-  process.env.STARKNET_ACCOUNT ||
-  "0x0759a4374389b0e3cfcc59d49310b6bc75bb12bbf8ce550eb5c2f026918bb344";
-const PRIVATE_KEY =
-  process.env.STARKNET_PRIVATE_KEY ||
-  "0x0154de503c7553e078b28044f15b60323899d9437bd44e99d9ab629acbada47a";
+const ACCOUNT_ADDRESS = process.env.STARKNET_ACCOUNT;
+if (!ACCOUNT_ADDRESS) { console.error("FATAL: STARKNET_ACCOUNT env var required"); process.exit(1); }
+const PRIVATE_KEY = process.env.STARKNET_PRIVATE_KEY;
+if (!PRIVATE_KEY) { console.error("FATAL: STARKNET_PRIVATE_KEY env var required"); process.exit(1); }
 
 const args = process.argv.slice(2);
 const proofPath = args.find((a) => !a.startsWith("--"));

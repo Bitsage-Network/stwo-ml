@@ -175,6 +175,33 @@ pub struct ActivationProductProof {
     pub bit_evals: Option<Vec<SecureField>>,
 }
 
+/// Piecewise-linear algebraic activation proof.
+///
+/// Proves activation correctness via 16-segment linear approximation over the
+/// full M31 domain. Uses a combined degree-3 eq-sumcheck with 18 constraints:
+///   - η^0: output matches piecewise evaluation
+///   - η^1: partition of unity (indicators sum to 1)
+///   - η^{2..17}: binary indicator enforcement (I_i ∈ {0,1})
+///
+/// Total degree: 3 (eq × indicator × (1 - indicator)).
+/// Eliminates lookup tables — ~82% calldata reduction vs LogUp.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct PiecewiseAlgebraicProof {
+    /// Degree-3 round polynomials from the combined eq-sumcheck (one per variable).
+    pub round_polys: Vec<RoundPolyDeg3>,
+    /// V_input(s) — input MLE evaluated at the final sumcheck challenge point.
+    pub input_eval: SecureField,
+    /// V_output(s) — output MLE evaluated at the final sumcheck challenge point.
+    pub output_eval: SecureField,
+    /// V_{I_i}(s) — indicator MLE evaluations at the final sumcheck challenge point.
+    pub indicator_evals: [SecureField; 16],
+    /// Segment bit MLE evaluations at the final sumcheck challenge point.
+    /// 4 bits encoding the segment index (top 4 bits of input).
+    /// None for legacy proofs without segment-input binding.
+    pub seg_bit_evals: Option<[SecureField; 4]>,
+}
+
 /// Per-layer proof in the GKR protocol.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -220,9 +247,16 @@ pub enum LayerProof {
         /// Present for ReLU: proves `output = input * indicator` with `indicator ∈ {0,1}`.
         /// `None` for non-ReLU activations and legacy proofs.
         activation_proof: Option<ActivationProductProof>,
+        /// Piecewise-linear algebraic proof (GELU/Sigmoid/Softmax).
+        /// Default for non-ReLU activations. Opt-out: `STWO_PIECEWISE_ACTIVATION=0`.
+        piecewise_proof: Option<PiecewiseAlgebraicProof>,
         input_eval: SecureField,
         output_eval: SecureField,
         table_commitment: starknet_ff::FieldElement,
+        /// True when this activation was proved via SIMD block-combination.
+        /// SIMD combined activations operate on combined SecureField MLEs and
+        /// cannot produce individual LogUp/algebraic/piecewise proofs.
+        simd_combined: bool,
     },
 
     /// Layer normalization reduction.
@@ -251,6 +285,28 @@ pub enum LayerProof {
         /// SIMD path skips LogUp since combined variance/rsqrt are QM31
         /// sums that don't map to individual table entries.
         simd_combined: bool,
+        /// Part 0: Batched mean + variance plain sumcheck round polynomials.
+        /// Proves: Σ_x [η·input(x) + η²·centered(x)²] = η·total_input_sum + η²·total_centered_sq_sum
+        mean_var_round_polys: Option<Vec<RoundPolyDeg3>>,
+        /// Final evaluations at the mean/variance sumcheck challenge point: (input(s₀), mean(s₀)).
+        mean_var_final_evals: Option<(SecureField, SecureField)>,
+        /// Ṽ_variance(r) — variance MLE evaluated at the claim point.
+        var_eval: Option<SecureField>,
+        /// Centered-consistency binding evals at Part 1 challenge: (input(s₁), mean(s₁)).
+        centered_binding_evals: Option<(SecureField, SecureField)>,
+        /// Claimed sums for plain sumcheck: (total_input_sum, total_centered_sq_sum).
+        mv_claimed_sums: Option<(SecureField, SecureField)>,
+        /// Number of active columns (for Part 0 channel mixing: mix_u64(n_active)).
+        /// Serialized into Part 0 so the verifier can replay `mix_u64(n_active)`.
+        n_active: Option<usize>,
+        /// Per-row mean values for multi-row binding verification.
+        /// When rows > 1, the verifier uses these to reconstruct mean(s₀)
+        /// from the Part 0 sumcheck challenge, preventing fake per-row means.
+        row_means: Option<Vec<M31>>,
+        /// Per-row variance values for multi-row variance binding verification.
+        /// When rows > 1, the verifier uses these to reconstruct var_eval
+        /// from the Part 0 sumcheck challenge, preventing fake per-row variances.
+        row_variances: Option<Vec<M31>>,
     },
 
     /// RMS normalization reduction.
@@ -276,6 +332,21 @@ pub enum LayerProof {
         rsqrt_table_commitment: starknet_ff::FieldElement,
         /// True if this was produced by the SIMD combined-product path.
         simd_combined: bool,
+        /// Part 0: RMS² verification plain sumcheck round polynomials.
+        /// Proves: Σ_x input(x)² = total_sq_sum (no eq weighting).
+        rms_sq_round_polys: Option<Vec<RoundPolyDeg3>>,
+        /// Final input(s₀) evaluation at the RMS² sumcheck challenge point.
+        rms_sq_input_final: Option<SecureField>,
+        /// Claimed total sum of input squares: Σ input(x)².
+        /// Verifier uses this to derive rms_sq and check against rms_sq_eval.
+        rms_sq_claimed_sq_sum: Option<SecureField>,
+        /// Number of active (un-padded) columns for the RMS² sumcheck.
+        /// Serialized into Part 0 so the verifier can replay `mix_u64(n_active)`.
+        rms_sq_n_active: Option<usize>,
+        /// Per-row rms² values for multi-row binding verification.
+        /// When rows > 1, the verifier uses these to reconstruct rms_sq(s₀)
+        /// from the Part 0 sumcheck challenge, preventing fake per-row rms².
+        row_rms_sq: Option<Vec<M31>>,
     },
 
     /// LogUp proof for dequantization (quantized → dequantized lookup).
@@ -287,6 +358,8 @@ pub enum LayerProof {
         input_eval: SecureField,
         output_eval: SecureField,
         table_commitment: starknet_ff::FieldElement,
+        /// Quantization bit-width (mixed into Fiat-Shamir channel for domain separation).
+        bits: u32,
     },
 
     /// LogUp proof for quantization (input → quantized output lookup).
@@ -299,6 +372,14 @@ pub enum LayerProof {
         output_eval: SecureField,
         table_inputs: Vec<M31>,
         table_outputs: Vec<M31>,
+        /// Quantization bit-width (mixed into channel).
+        bits: u32,
+        /// |zero_point| (mixed into channel).
+        zero_point_abs: u32,
+        /// scale × 2³² truncated to u64, serialized as two u32s (mixed into channel).
+        scale_fixed: u64,
+        /// Strategy tag: 0=Direct, 1=Sym8, 2=Asym8, 3=Sym4, 4=Asym4 (mixed into channel).
+        strategy_tag: u32,
     },
 
     /// LogUp proof for embedding lookup (token_id, col_idx, value).
@@ -311,6 +392,10 @@ pub enum LayerProof {
         output_eval: SecureField,
         /// Number of variables in the projected embedding-input claim.
         input_num_vars: usize,
+        /// Vocabulary size (mixed into channel for replay).
+        vocab_size: u32,
+        /// Embedding dimension (mixed into channel for replay).
+        embed_dim: u32,
     },
 
     /// Block-extended 3-factor sumcheck for SIMD matmul where both operands vary.
@@ -343,6 +428,14 @@ pub enum LayerProof {
         sub_proofs: Vec<LayerProof>,
         /// Output MLE evaluations for each sub-matmul's fresh claim.
         sub_claim_values: Vec<SecureField>,
+        /// Number of attention heads (mixed into channel for replay).
+        num_heads: u32,
+        /// Sequence length (mixed into channel for replay).
+        seq_len: u32,
+        /// Model dimension (mixed into channel for replay).
+        d_model: u32,
+        /// Whether causal masking is applied (mixed into channel for replay).
+        causal: bool,
     },
 }
 

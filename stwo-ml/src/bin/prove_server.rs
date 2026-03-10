@@ -10,21 +10,26 @@
 #![feature(portable_simd)]
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
 #[cfg(feature = "proof-stream")]
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+#[cfg(feature = "proof-stream")]
+use axum::extract::Query;
 use axum::{
-    extract::{Path, State},
-    http::StatusCode,
+    extract::{ConnectInfo, Path, State},
+    http::{header::{AUTHORIZATION, CONTENT_TYPE}, Method, StatusCode},
+    middleware,
     response::{Html, IntoResponse},
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
+use tower_http::limit::RequestBodyLimitLayer;
 use uuid::Uuid;
 
 use stwo::core::fields::m31::M31;
@@ -159,6 +164,10 @@ struct AppState {
     privacy_jobs: RwLock<HashMap<String, PrivacyJob>>,
     models: RwLock<HashMap<String, LoadedModel>>,
     started_at: Instant,
+    /// API key for bearer token authentication. None = open access (dev mode).
+    api_key: Option<String>,
+    /// Per-IP rate limiter state.
+    rate_limiter: RateLimiter,
     #[cfg(feature = "proof-stream")]
     ws_sink: proof_stream::WsBroadcastSink,
     validator_url: Option<String>,
@@ -377,6 +386,149 @@ struct ErrorResponse {
 }
 
 // =============================================================================
+// Security middleware
+// =============================================================================
+
+/// In-memory token-bucket rate limiter (per IP).
+struct RateLimiter {
+    /// requests per minute per IP
+    rpm: u32,
+    /// burst capacity
+    burst: u32,
+    buckets: Mutex<HashMap<IpAddr, (Instant, u32)>>,
+}
+
+impl RateLimiter {
+    fn new(rpm: u32, burst: u32) -> Self {
+        Self {
+            rpm,
+            burst,
+            buckets: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn check(&self, ip: IpAddr) -> bool {
+        let mut buckets = self.buckets.lock().await;
+        let now = Instant::now();
+        let entry = buckets.entry(ip).or_insert((now, 0));
+
+        // Reset bucket if more than 60s elapsed
+        if now.duration_since(entry.0).as_secs() >= 60 {
+            *entry = (now, 0);
+        }
+
+        if entry.1 < self.rpm + self.burst {
+            entry.1 += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Evict stale entries older than 2 minutes to prevent unbounded memory growth.
+    async fn evict_stale(&self) {
+        let mut buckets = self.buckets.lock().await;
+        let now = Instant::now();
+        buckets.retain(|_, (t, _)| now.duration_since(*t).as_secs() < 120);
+    }
+}
+
+/// Constant-time token comparison via SHA-256.
+///
+/// Hashing both sides ensures equal-length comparison and prevents
+/// timing side-channel attacks on the API key.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    use sha2::{Sha256, Digest};
+    let ha = Sha256::digest(a.as_bytes());
+    let hb = Sha256::digest(b.as_bytes());
+    // Fixed-length (32 byte) comparison — constant time for equal-length slices
+    ha.as_slice()
+        .iter()
+        .zip(hb.as_slice().iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
+/// Bearer token authentication middleware.
+///
+/// When `PROVE_SERVER_API_KEY` is set, all requests through this layer must
+/// include `Authorization: Bearer <key>`. When unset, all requests pass through.
+async fn auth_middleware(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: middleware::Next,
+) -> Result<axum::response::Response, StatusCode> {
+    if let Some(ref expected) = state.api_key {
+        let auth_ok = req
+            .headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+            .map(|token| constant_time_eq(token, expected))
+            .unwrap_or(false);
+        if !auth_ok {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+    Ok(next.run(req).await)
+}
+
+/// Rate limiting middleware for expensive endpoints.
+async fn rate_limit_middleware(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    req: axum::extract::Request,
+    next: middleware::Next,
+) -> Result<axum::response::Response, StatusCode> {
+    if !state.rate_limiter.check(addr.ip()).await {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    Ok(next.run(req).await)
+}
+
+/// Validate a model path: canonicalize and check against allowlist.
+fn validate_model_path(
+    p: &std::path::Path,
+) -> Result<std::path::PathBuf, (StatusCode, Json<ErrorResponse>)> {
+    // First reject obvious traversal in the raw string (before canonicalize, which needs the file to exist)
+    let s = p.to_string_lossy();
+    if s.contains("..") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Path traversal not allowed".to_string(),
+            }),
+        ));
+    }
+
+    // Canonicalize to resolve symlinks and normalize
+    let canonical = std::fs::canonicalize(p).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Invalid path: does not exist or cannot be resolved".to_string(),
+            }),
+        )
+    })?;
+
+    // Check against allowlist if configured
+    if let Ok(allowed) = std::env::var("PROVE_SERVER_MODEL_DIR") {
+        let allowed_canonical = std::fs::canonicalize(&allowed)
+            .unwrap_or_else(|_| std::path::PathBuf::from(&allowed));
+        if !canonical.starts_with(&allowed_canonical) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse {
+                    error: "Path outside allowed model directory".to_string(),
+                }),
+            ));
+        }
+    }
+
+    Ok(canonical)
+}
+
+// =============================================================================
 // Audit types (server-audit)
 // =============================================================================
 
@@ -492,43 +644,34 @@ async fn load_model(
     State(state): State<Arc<AppState>>,
     Json(req): Json<LoadModelRequest>,
 ) -> Result<(StatusCode, Json<LoadModelResponse>), (StatusCode, Json<ErrorResponse>)> {
-    // Validate model paths — reject traversal attempts
-    let reject_traversal = |p: &std::path::Path| -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-        let s = p.to_string_lossy();
-        if s.contains("..") {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: "Path traversal not allowed".to_string(),
-                }),
-            ));
-        }
-        Ok(())
-    };
-
-    // Support either ONNX file or HF directory
-    let onnx = if let Some(ref model_dir) = req.model_dir {
-        let path = std::path::PathBuf::from(model_dir);
-        reject_traversal(&path)?;
-        load_hf_model(&path, None).map_err(|e| {
+    // Support either ONNX file or HF directory — with canonicalized path validation
+    let (onnx, canonical_path) = if let Some(ref model_dir) = req.model_dir {
+        let path = validate_model_path(&std::path::PathBuf::from(model_dir))?;
+        let model = load_hf_model(&path, None).map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
                     error: format!("Failed to load HF model: {e}"),
                 }),
             )
-        })?
+        })?;
+        (model, path)
     } else {
-        let path = std::path::PathBuf::from(&req.model_path);
-        reject_traversal(&path)?;
-        load_onnx(&path).map_err(|e| {
+        let path = validate_model_path(&std::path::PathBuf::from(&req.model_path))?;
+        let model = load_onnx(&path).map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
                     error: format!("Failed to load model: {e}"),
                 }),
             )
-        })?
+        })?;
+        // For ONNX files, use the parent directory for cache
+        let dir = path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf();
+        (model, dir)
     };
 
     let desc = req.description.as_deref().unwrap_or("api-loaded-model");
@@ -556,25 +699,21 @@ async fn load_model(
 
     state.models.write().await.insert(model_id.clone(), loaded);
 
+    // Use the canonicalized path for weight cache (not raw user input)
     #[cfg(feature = "multi-query")]
     {
-        let model_dir = req
-            .model_dir
-            .as_deref()
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                std::path::PathBuf::from(&req.model_path)
-                    .parent()
-                    .unwrap_or(std::path::Path::new("."))
-                    .to_path_buf()
-            });
-        let cache = stwo_ml::weight_cache::shared_cache_for_model(&model_dir, &model_id);
+        let cache =
+            stwo_ml::weight_cache::shared_cache_for_model(&canonical_path, &model_id);
         state
             .weight_caches
             .write()
             .await
             .insert(model_id, cache);
     }
+
+    // Suppress unused variable warning when multi-query is disabled
+    #[cfg(not(feature = "multi-query"))]
+    let _ = canonical_path;
 
     Ok((StatusCode::CREATED, Json(resp)))
 }
@@ -583,7 +722,7 @@ async fn load_hf_model_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<LoadHfModelRequest>,
 ) -> Result<(StatusCode, Json<LoadModelResponse>), (StatusCode, Json<ErrorResponse>)> {
-    let path = std::path::PathBuf::from(&req.model_dir);
+    let path = validate_model_path(&std::path::PathBuf::from(&req.model_dir))?;
     let hf = load_hf_model(&path, req.layers).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -618,10 +757,10 @@ async fn load_hf_model_handler(
 
     state.models.write().await.insert(model_id.clone(), loaded);
 
+    // Use the canonicalized path for weight cache (not raw user input)
     #[cfg(feature = "multi-query")]
     {
-        let model_dir = std::path::PathBuf::from(&req.model_dir);
-        let cache = stwo_ml::weight_cache::shared_cache_for_model(&model_dir, &model_id);
+        let cache = stwo_ml::weight_cache::shared_cache_for_model(&path, &model_id);
         state
             .weight_caches
             .write()
@@ -1050,7 +1189,7 @@ async fn submit_prove(
                                     output_m31,
                                     timestamp_ns: std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap()
+                                        .unwrap_or_default()
                                         .as_nanos()
                                         as u64,
                                     latency_ms: prove_elapsed.as_millis() as u64,
@@ -1225,21 +1364,24 @@ async fn submit_privacy_batch(
                     ]
                 };
 
-                // Helper: generate random blinding (fallible)
+                // Helper: generate random blinding (fallible, rejection-sampled).
                 let random_blinding = || -> Result<[BaseField; 4], String> {
-                    let mut buf = [0u8; 16];
-                    getrandom::getrandom(&mut buf)
-                        .map_err(|e| format!("entropy source unavailable: {e}"))?;
-                    Ok([
-                        m31(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])
-                            % ((1u32 << 31) - 1)),
-                        m31(u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]])
-                            % ((1u32 << 31) - 1)),
-                        m31(u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]])
-                            % ((1u32 << 31) - 1)),
-                        m31(u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]])
-                            % ((1u32 << 31) - 1)),
-                    ])
+                    const P: u32 = (1u32 << 31) - 1; // M31 prime
+                    let mut result = [m31(0); 4];
+                    for elem in result.iter_mut() {
+                        loop {
+                            let mut buf = [0u8; 4];
+                            getrandom::getrandom(&mut buf)
+                                .map_err(|e| format!("entropy source unavailable: {e}"))?;
+                            let v = u32::from_le_bytes(buf) >> 1; // 31 bits, uniform in [0, 2^31)
+                            if v < P {
+                                *elem = m31(v);
+                                break;
+                            }
+                            // v == P (2^31 - 1): reject and retry (~0% probability)
+                        }
+                    }
+                    Ok(result)
                 };
 
                 // Max amount that fits in two M31 limbs
@@ -1773,7 +1915,17 @@ async fn submit_audit(
             }),
         )
     })?;
-    let log_dir = std::path::PathBuf::from(&audit_dir).join(&req.model_id);
+    // Sanitize model_id: only allow alphanumeric, underscore, hyphen, dot
+    let sanitized_model_id: String = req.model_id.chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-' || *c == '.')
+        .collect();
+    if sanitized_model_id.is_empty() || sanitized_model_id.contains("..") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error: "invalid model_id".to_string() }),
+        ));
+    }
+    let log_dir = std::path::PathBuf::from(&audit_dir).join(&sanitized_model_id);
 
     drop(models);
 
@@ -1931,11 +2083,18 @@ async fn ws_job_handler(
     ws: WebSocketUpgrade,
     Path(job_id): Path<String>,
     State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<axum::response::Response, StatusCode> {
+    if let Some(ref expected) = state.api_key {
+        match params.get("token") {
+            Some(t) if constant_time_eq(t, expected) => {}
+            _ => return Err(StatusCode::UNAUTHORIZED),
+        }
+    }
     let rx = state.ws_sink.subscribe();
-    ws.on_upgrade(move |socket| async move {
+    Ok(ws.on_upgrade(move |socket| async move {
         ws_job_client_loop(socket, rx, job_id).await;
-    })
+    }).into_response())
 }
 
 #[cfg(all(feature = "multi-query", feature = "proof-stream"))]
@@ -1984,11 +2143,22 @@ async fn dashboard() -> impl IntoResponse {
 }
 
 #[cfg(feature = "proof-stream")]
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<axum::response::Response, StatusCode> {
+    // Authenticate WebSocket via ?token= query param when API key is configured
+    if let Some(ref expected) = state.api_key {
+        match params.get("token") {
+            Some(t) if constant_time_eq(t, expected) => {}
+            _ => return Err(StatusCode::UNAUTHORIZED),
+        }
+    }
     let rx = state.ws_sink.subscribe();
-    ws.on_upgrade(move |socket| async move {
+    Ok(ws.on_upgrade(move |socket| async move {
         ws_client_loop(socket, rx).await;
-    })
+    }).into_response())
 }
 
 #[cfg(feature = "proof-stream")]
@@ -2084,11 +2254,24 @@ async fn main() {
         })
     };
 
+    // Security configuration
+    let api_key = std::env::var("PROVE_SERVER_API_KEY").ok();
+    let rate_limit_rpm: u32 = std::env::var("PROVE_SERVER_RATE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+    let rate_limit_burst: u32 = std::env::var("PROVE_SERVER_BURST")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+
     let state = Arc::new(AppState {
         jobs: RwLock::new(HashMap::new()),
         privacy_jobs: RwLock::new(HashMap::new()),
         models: RwLock::new(HashMap::new()),
         started_at: Instant::now(),
+        api_key: api_key.clone(),
+        rate_limiter: RateLimiter::new(rate_limit_rpm, rate_limit_burst),
         #[cfg(feature = "proof-stream")]
         ws_sink,
         validator_url,
@@ -2100,9 +2283,8 @@ async fn main() {
         audit_jobs: RwLock::new(HashMap::new()),
     });
 
-    let mut router: Router<Arc<AppState>> = Router::new()
-        .route("/", get(dashboard))
-        .route("/health", get(health))
+    // Authenticated + rate-limited API routes
+    let api_routes = Router::new()
         .route("/api/v1/models", post(load_model))
         .route("/api/v1/models/hf", post(load_hf_model_handler))
         .route("/api/v1/models/{model_id}", get(get_model))
@@ -2123,26 +2305,94 @@ async fn main() {
             post(build_privacy_submit_calldata),
         );
 
+    #[allow(unused_mut)]
+    let mut api_routes = api_routes;
+
     #[cfg(feature = "multi-query")]
     {
-        router = router.route("/api/v1/queue", get(get_queue_stats));
+        api_routes = api_routes.route("/api/v1/queue", get(get_queue_stats));
     }
 
     #[cfg(feature = "server-audit")]
     {
-        router = router
+        api_routes = api_routes
             .route("/api/v1/audit", post(submit_audit))
             .route("/api/v1/audit/{job_id}", get(get_audit_status));
     }
 
-    #[cfg(feature = "proof-stream")]
-    {
-        router = router.route("/ws", get(ws_handler));
-    }
-
     #[cfg(all(feature = "multi-query", feature = "proof-stream"))]
     {
-        router = router.route("/api/v1/prove/{job_id}/ws", get(ws_job_handler));
+        api_routes = api_routes.route("/api/v1/prove/{job_id}/ws", get(ws_job_handler));
+    }
+
+    // Apply auth + rate-limit middleware to API routes
+    let api_routes = api_routes
+        .layer(middleware::from_fn_with_state(state.clone(), rate_limit_middleware))
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+
+    // Public routes (no auth required): dashboard, health, WebSocket
+    let public_routes = Router::new()
+        .route("/", get(dashboard))
+        .route("/health", get(health));
+
+    #[allow(unused_mut)]
+    let mut public_routes = public_routes;
+
+    #[cfg(feature = "proof-stream")]
+    {
+        public_routes = public_routes.route("/ws", get(ws_handler));
+    }
+
+    // Merge authenticated API routes into the main router
+    let router = public_routes.merge(api_routes);
+
+    // Spawn periodic cleanup: rate limiter + completed jobs (prevent unbounded growth)
+    {
+        let state_cleanup = state.clone();
+        tokio::spawn(async move {
+            /// Completed jobs older than this are evicted.
+            const JOB_TTL_SECS: u64 = 3600; // 1 hour
+            /// Maximum jobs retained per map (hard cap).
+            const MAX_JOBS: usize = 10_000;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                state_cleanup.rate_limiter.evict_stale().await;
+
+                // Evict completed jobs older than TTL
+                let now = Instant::now();
+                let evict = |completed_at: &Option<Instant>| -> bool {
+                    match completed_at {
+                        Some(t) => now.duration_since(*t).as_secs() < JOB_TTL_SECS,
+                        None => true, // keep in-progress jobs
+                    }
+                };
+
+                {
+                    let mut jobs = state_cleanup.jobs.write().await;
+                    jobs.retain(|_, j| evict(&j.completed_at));
+                    // Hard cap: if still over limit, drop oldest completed first
+                    if jobs.len() > MAX_JOBS {
+                        let mut to_remove: Vec<_> = jobs.iter()
+                            .filter(|(_, j)| j.completed_at.is_some())
+                            .map(|(k, j)| (k.clone(), j.started_at))
+                            .collect();
+                        to_remove.sort_by_key(|(_, t)| *t);
+                        for (k, _) in to_remove.iter().take(jobs.len() - MAX_JOBS) {
+                            jobs.remove(k);
+                        }
+                    }
+                }
+                {
+                    let mut pj = state_cleanup.privacy_jobs.write().await;
+                    pj.retain(|_, j| evict(&j.completed_at));
+                }
+                #[cfg(feature = "server-audit")]
+                {
+                    let mut aj = state_cleanup.audit_jobs.write().await;
+                    aj.retain(|_, j| evict(&j.completed_at));
+                }
+            }
+        });
     }
 
     let bind = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
@@ -2155,7 +2405,41 @@ async fn main() {
         std::env::var("MAX_QUEUE_DEPTH").unwrap_or_else(|_| "64".to_string()),
     );
 
-    let app = router.layer(CorsLayer::permissive()).with_state(state);
+    // CORS: configurable via PROVE_SERVER_CORS_ORIGINS, permissive in dev mode
+    let cors = if let Ok(origins) = std::env::var("PROVE_SERVER_CORS_ORIGINS") {
+        let origins: Vec<axum::http::HeaderValue> = origins
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        CorsLayer::new()
+            .allow_origin(origins)
+            .allow_methods([Method::GET, Method::POST])
+            .allow_headers([CONTENT_TYPE, AUTHORIZATION])
+    } else {
+        eprintln!("  WARNING: CORS permissive (set PROVE_SERVER_CORS_ORIGINS for production)");
+        CorsLayer::permissive()
+    };
+
+    if api_key.is_some() {
+        eprintln!("  Auth: API key required (PROVE_SERVER_API_KEY)");
+    } else {
+        eprintln!("  WARNING: No API key configured (set PROVE_SERVER_API_KEY for production)");
+    }
+    eprintln!("  Rate limit: {rate_limit_rpm} req/min, burst {rate_limit_burst}");
+    if let Ok(dir) = std::env::var("PROVE_SERVER_MODEL_DIR") {
+        eprintln!("  Model dir allowlist: {dir}");
+    }
+
+    // Body size limit: 50 MB default, configurable via PROVE_SERVER_MAX_BODY_MB.
+    let max_body_mb: usize = std::env::var("PROVE_SERVER_MAX_BODY_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
+    let app = router
+        .layer(RequestBodyLimitLayer::new(max_body_mb * 1024 * 1024))
+        .layer(cors)
+        .with_state(state);
+    eprintln!("  Body limit: {max_body_mb} MB");
     eprintln!("  Privacy: POST /api/v1/privacy/batch");
     eprintln!("  Privacy Submit: POST /api/v1/privacy/batch/{{job_id}}/submit-calldata");
     #[cfg(feature = "server-audit")]
@@ -2189,10 +2473,13 @@ async fn main() {
         }
     };
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await
-        .expect("Server error");
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
+    .expect("Server error");
 
     eprintln!("prove-server shut down.");
 }

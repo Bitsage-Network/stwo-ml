@@ -122,14 +122,29 @@ impl NoteData {
         }
     }
 
-    pub fn to_note(&self) -> Note {
-        Note::new(
-            self.owner_pubkey.map(M31::from_u32_unchecked),
-            M31::from_u32_unchecked(self.asset_id),
-            M31::from_u32_unchecked(self.amount_lo),
-            M31::from_u32_unchecked(self.amount_hi),
-            self.blinding.map(M31::from_u32_unchecked),
-        )
+    pub fn to_note(&self) -> Result<Note, String> {
+        const P: u32 = (1u32 << 31) - 1;
+        let validate = |v: u32, name: &str| -> Result<M31, String> {
+            if v >= P {
+                return Err(format!("{name} value {v} >= M31 prime {P}"));
+            }
+            Ok(M31::from_u32_unchecked(v))
+        };
+        let mut pk = [M31::from_u32_unchecked(0); 4];
+        for (i, &v) in self.owner_pubkey.iter().enumerate() {
+            pk[i] = validate(v, &format!("owner_pubkey[{i}]"))?;
+        }
+        let mut bl = [M31::from_u32_unchecked(0); 4];
+        for (i, &v) in self.blinding.iter().enumerate() {
+            bl[i] = validate(v, &format!("blinding[{i}]"))?;
+        }
+        Ok(Note::new(
+            pk,
+            validate(self.asset_id, "asset_id")?,
+            validate(self.amount_lo, "amount_lo")?,
+            validate(self.amount_hi, "amount_hi")?,
+            bl,
+        ))
     }
 
     pub fn amount(&self) -> u64 {
@@ -337,7 +352,10 @@ impl NoteStore {
     {
         for note in &mut self.notes {
             if note.merkle_index == 0 && note.status != NoteStatus::Spent {
-                let reconstructed = note.note.to_note();
+                let reconstructed = match note.note.to_note() {
+                    Ok(n) => n,
+                    Err(_) => continue, // skip corrupt note data
+                };
                 let commitment = reconstructed.commitment();
                 if let Some(idx) = find_commitment(&commitment) {
                     note.merkle_index = idx;
@@ -537,7 +555,7 @@ fn hex_to_m31_vec(hex: &str) -> Result<Vec<M31>, NoteStoreError> {
         let chunk = &hex[i * 8..(i + 1) * 8];
         let val = u32::from_str_radix(chunk, 16)
             .map_err(|e| NoteStoreError::Json(format!("invalid hex '{chunk}': {e}")))?;
-        result.push(M31::from_u32_unchecked(val));
+        result.push(super::reduce_u32_to_m31(val));
     }
     Ok(result)
 }
@@ -592,7 +610,7 @@ mod tests {
         let sk = test_sk();
         let note = test_note(&sk);
         let data = NoteData::from_note(&note);
-        let recovered = data.to_note();
+        let recovered = data.to_note().expect("valid note data");
         assert_eq!(note.commitment(), recovered.commitment());
     }
 

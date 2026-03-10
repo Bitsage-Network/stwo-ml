@@ -20,12 +20,14 @@ _OBELYSK_CONTRACTS_LOADED=1
 # StweMlStarkVerifier (recursive STARK verification)
 STARK_VERIFIER_SEPOLIA="0x005928ac548dc2719ef1b34869db2b61c2a55a4b148012fad742262a8d674fba"
 
-# Obelysk/Elo Cairo Verifier (GKR verification + audit) — v26
-# Class hash: 0x4859cb47fd9a8fb94bb9c0b36a49c85e5f4aaeef7abfba7646916e882cc1d9a
-# Previous class hash (v24): 0x77ccc67d7ba2bc1102d7c5c5d1ddf1bc697c709721ac452529c1bb1002fd1f3
-# v26 fix: streaming GKR requires full aggregated weight binding verification (eval points in calldata)
-# Entrypoints: verify_model_gkr_v4_packed_io, open_gkr_session, upload_gkr_chunk, seal_gkr_session,
-#   verify_gkr_from_session, verify_gkr_feed_chunk, verify_gkr_execute
+# Obelysk/Elo Cairo Verifier (GKR verification + audit) — v31
+# Class hash: 0x6a6b7a75d5ec1f63d715617d352bc0d353042b2a033d98fa28ffbaf6c5b5439
+# Previous: v30=0x38e9f407.., v29=0x316aa715.., v26=0x4859cb47..
+# v31 fix: poseidon_hash_2 uses hades_permutation(a,b,2) matching Rust (was sponge construction)
+# Streaming entrypoints: verify_gkr_stream_init, verify_gkr_stream_init_output_mle,
+#   verify_gkr_stream_layers, verify_gkr_stream_weight_binding,
+#   verify_gkr_stream_finalize_input_mle, verify_gkr_stream_finalize
+# Session entrypoints: open_gkr_session, upload_gkr_chunk, seal_gkr_session
 ELO_VERIFIER_SEPOLIA="0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005"
 
 # VM31 Privacy Pool

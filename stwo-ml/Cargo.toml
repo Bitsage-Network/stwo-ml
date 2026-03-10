@@ -46,7 +46,7 @@ memmap2 = "0.9"
 clap = { version = "4", features = ["derive", "env"], optional = true }
 serde_json = { version = "1", optional = true }
 axum = { version = "0.7", features = ["macros", "ws"], optional = true }
-tower-http = { version = "0.5", features = ["cors"], optional = true }
+tower-http = { version = "0.5", features = ["cors", "limit"], optional = true }
 uuid = { version = "1.6", features = ["v4", "serde"], optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
 crossbeam = { version = "0.8", optional = true }
@@ -97,4 +97,8 @@ harness = false
 
 [[bench]]
 name = "e2e_models"
+harness = false
+
+[[bench]]
+name = "decode"
 harness = false

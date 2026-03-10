@@ -50,6 +50,146 @@ use crate::components::matmul::{
 use crate::gadgets::lookup_table::activations::softmax_exp;
 use crate::gadgets::lookup_table::PrecomputedTable;
 
+/// Returns a cached reference to the global softmax exp lookup table.
+///
+/// The table (1M entries at `production_log_size() = 20`) is built once on
+/// first call and reused across all attention proofs.
+pub fn softmax_table() -> &'static PrecomputedTable {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<PrecomputedTable> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        PrecomputedTable::build_parallel(
+            softmax_exp,
+            ActivationType::Softmax.production_log_size(),
+        )
+    })
+}
+
+// ---------------------------------------------------------------------------
+// KV-cache commitment chain
+// ---------------------------------------------------------------------------
+// Domain tags for Poseidon hash domain separation.
+const DOMAIN_KV_K: u64 = 0x4b56_4b; // "KVK"
+const DOMAIN_KV_V: u64 = 0x4b56_56; // "KVV"
+const DOMAIN_KV_LAYER: u64 = 0x4b56_4c59; // "KVLY"
+const DOMAIN_KV_MODEL: u64 = 0x4b56_4d44; // "KVMD"
+
+/// Per-layer KV-cache commitment: individual K/V head roots + combined root.
+#[derive(Debug, Clone)]
+pub struct KVLayerCommitment {
+    /// Poseidon root for each K head matrix.
+    pub k_roots: Vec<starknet_ff::FieldElement>,
+    /// Poseidon root for each V head matrix.
+    pub v_roots: Vec<starknet_ff::FieldElement>,
+    /// Combined layer commitment: Poseidon(DOMAIN_LAYER, layer_id, cached_len, num_kv_heads, d_k, k_roots..., v_roots...).
+    pub combined: starknet_ff::FieldElement,
+    /// Cached sequence length at the time of commitment.
+    pub cached_len: usize,
+}
+
+/// Model-level KV-cache commitment chaining across decode steps.
+#[derive(Debug, Clone)]
+pub struct ModelKVCacheCommitment {
+    /// Per-layer commitments.
+    pub layer_commitments: Vec<(usize, KVLayerCommitment)>,
+    /// Super-commitment chaining prev_commitment → current state.
+    pub super_commitment: starknet_ff::FieldElement,
+    /// Decode step index (0 for prefill).
+    pub step_index: usize,
+    /// Previous step's super-commitment (ZERO for step 0).
+    pub prev_commitment: starknet_ff::FieldElement,
+}
+
+/// Compute Poseidon commitment for a single K or V head matrix.
+///
+/// `domain_tag` should be `DOMAIN_KV_K` or `DOMAIN_KV_V` for domain separation.
+pub fn compute_kv_head_commitment(
+    matrix: &M31Matrix,
+    domain_tag: u64,
+) -> starknet_ff::FieldElement {
+    use starknet_ff::FieldElement;
+
+    let mut parts = Vec::with_capacity(3 + matrix.data.len());
+    parts.push(FieldElement::from(domain_tag));
+    parts.push(FieldElement::from(matrix.rows as u64));
+    parts.push(FieldElement::from(matrix.cols as u64));
+    for &v in &matrix.data {
+        parts.push(FieldElement::from(v.0 as u64));
+    }
+    starknet_crypto::poseidon_hash_many(&parts)
+}
+
+/// Compute per-layer KV-cache commitment combining all K/V head roots.
+pub fn compute_kv_layer_commitment(
+    cache: &KVCache,
+    layer_id: usize,
+) -> KVLayerCommitment {
+    use starknet_ff::FieldElement;
+
+    let k_roots: Vec<FieldElement> = (0..cache.num_kv_heads)
+        .map(|h| compute_kv_head_commitment(cache.get_k(h), DOMAIN_KV_K))
+        .collect();
+    let v_roots: Vec<FieldElement> = (0..cache.num_kv_heads)
+        .map(|h| compute_kv_head_commitment(cache.get_v(h), DOMAIN_KV_V))
+        .collect();
+
+    let mut parts = Vec::with_capacity(5 + k_roots.len() + v_roots.len());
+    parts.push(FieldElement::from(DOMAIN_KV_LAYER));
+    parts.push(FieldElement::from(layer_id as u64));
+    parts.push(FieldElement::from(cache.cached_len as u64));
+    parts.push(FieldElement::from(cache.num_kv_heads as u64));
+    parts.push(FieldElement::from(cache.d_k as u64));
+    parts.extend_from_slice(&k_roots);
+    parts.extend_from_slice(&v_roots);
+    let combined = starknet_crypto::poseidon_hash_many(&parts);
+
+    KVLayerCommitment {
+        k_roots,
+        v_roots,
+        combined,
+        cached_len: cache.cached_len,
+    }
+}
+
+/// Compute model-level KV-cache super-commitment, chaining from the previous step.
+///
+/// `prev_commitment` is `FieldElement::ZERO` for the initial prefill step.
+pub fn compute_model_kv_cache_commitment(
+    kv_cache: &ModelKVCache,
+    prev_commitment: starknet_ff::FieldElement,
+    step_index: usize,
+) -> ModelKVCacheCommitment {
+    use starknet_ff::FieldElement;
+
+    // Collect layer commitments in sorted order for determinism.
+    let mut layer_ids: Vec<usize> = kv_cache.layers.keys().copied().collect();
+    layer_ids.sort();
+
+    let layer_commitments: Vec<(usize, KVLayerCommitment)> = layer_ids
+        .iter()
+        .map(|&lid| {
+            let cache = kv_cache.layers.get(&lid).unwrap();
+            (lid, compute_kv_layer_commitment(cache, lid))
+        })
+        .collect();
+
+    let mut parts = Vec::with_capacity(3 + layer_commitments.len());
+    parts.push(FieldElement::from(DOMAIN_KV_MODEL));
+    parts.push(prev_commitment);
+    parts.push(FieldElement::from(step_index as u64));
+    for (_, lc) in &layer_commitments {
+        parts.push(lc.combined);
+    }
+    let super_commitment = starknet_crypto::poseidon_hash_many(&parts);
+
+    ModelKVCacheCommitment {
+        layer_commitments,
+        super_commitment,
+        step_index,
+        prev_commitment,
+    }
+}
+
 /// Configuration for a single attention head.
 #[derive(Debug, Clone, Copy)]
 pub struct AttentionHeadConfig {
@@ -246,6 +386,26 @@ pub struct AttentionIntermediates {
 }
 
 // ===== KV-Cache for Incremental Decoding =====
+//
+// Architecture overview:
+//
+// The KV-cache enables two proving modes:
+// 1. **Prefill** (seq_len > 1): Process a batch of tokens, populate the cache.
+// 2. **Decode** (seq_len = 1): Generate one token, append to the cache.
+//
+// During forward pass:
+// - Q is projected from new tokens only: (new_tokens, d_model) × W_q
+// - K_new/V_new are projected from new tokens and appended to the cache
+// - Scores use Q_new × K_full^T where K_full is the entire cached K
+// - Context uses softmax × V_full where V_full is the entire cached V
+//
+// For proving, `prove_attention_cached()` verifies only the new projections.
+// The GKR prover uses `prove_model_pure_gkr_prefill()` which wires the cache
+// through the forward pass loop in `prove_model_pure_gkr_inner()`.
+//
+// Multi-layer: `ModelKVCache` wraps a HashMap<layer_id, KVCache>, one per
+// attention layer. `get_or_create()` lazily initializes caches as layers
+// are encountered during the forward pass.
 
 /// Per-layer KV cache storing accumulated key/value projections.
 ///
@@ -348,13 +508,40 @@ fn vstack(top: &M31Matrix, bottom: &M31Matrix) -> M31Matrix {
 pub struct ModelKVCache {
     /// Per-layer caches, indexed by layer/node ID.
     pub layers: std::collections::HashMap<usize, KVCache>,
+    /// Commitment computed after the latest cache mutation.
+    pub commitment: Option<ModelKVCacheCommitment>,
 }
 
 impl ModelKVCache {
     pub fn new() -> Self {
         Self {
             layers: std::collections::HashMap::new(),
+            commitment: None,
         }
+    }
+
+    /// Compute and store a commitment for the current cache state.
+    ///
+    /// Uses the previous super-commitment (or ZERO) as the chain link.
+    /// The step index auto-increments based on the previous commitment.
+    pub fn commit(&mut self) -> &ModelKVCacheCommitment {
+        let prev = self.super_commitment();
+        let step = self
+            .commitment
+            .as_ref()
+            .map(|c| c.step_index + 1)
+            .unwrap_or(0);
+        let new_commitment = compute_model_kv_cache_commitment(self, prev, step);
+        self.commitment = Some(new_commitment);
+        self.commitment.as_ref().unwrap()
+    }
+
+    /// Return the current super-commitment, or ZERO if not yet committed.
+    pub fn super_commitment(&self) -> starknet_ff::FieldElement {
+        self.commitment
+            .as_ref()
+            .map(|c| c.super_commitment)
+            .unwrap_or(starknet_ff::FieldElement::ZERO)
     }
 
     /// Get or create a cache for a given layer.
@@ -525,6 +712,10 @@ pub struct AttentionProofOnChain {
     /// Log2 of trace size for softmax STARK.
     pub softmax_log_size: u32,
     pub intermediates: AttentionIntermediates,
+    /// KV-cache commitment at the time this attention proof was generated.
+    /// Present when proving with a KV-cache; verifiers check this matches the
+    /// outer proof's `kv_cache_commitment`.
+    pub kv_cache_commitment: Option<starknet_ff::FieldElement>,
 }
 
 /// Error type for attention proving.
@@ -920,15 +1111,12 @@ where
     })?;
 
     // Batched softmax exp STARK proof (all heads in one proof)
-    let table = PrecomputedTable::build_parallel(
-        softmax_exp,
-        ActivationType::Softmax.production_log_size(),
-    );
+    let table = softmax_table();
     let pcs_config = PcsConfig::default();
     let (component, softmax_exp_proof) = prove_activation_layer::<B, MC>(
         &all_softmax_inputs,
         &all_softmax_outputs,
-        &table,
+        table,
         pcs_config,
     )
     .map_err(|e| AttentionError::Activation(format!("softmax exp STARK: {e}")))?;
@@ -1042,16 +1230,13 @@ pub fn prove_attention_onchain(
         })?;
 
     // Batched softmax exp STARK proof (all heads in one proof, Blake2s channel)
-    let table = PrecomputedTable::build_parallel(
-        softmax_exp,
-        ActivationType::Softmax.production_log_size(),
-    );
+    let table = softmax_table();
     let pcs_config = PcsConfig::default();
     let (component, softmax_exp_proof) =
         prove_activation_layer::<SimdBackend, Blake2sMerkleChannel>(
             &all_softmax_inputs,
             &all_softmax_outputs,
-            &table,
+            table,
             pcs_config,
         )
         .map_err(|e| AttentionError::Activation(format!("softmax exp STARK: {e}")))?;
@@ -1068,6 +1253,285 @@ pub fn prove_attention_onchain(
         softmax_claimed_sum: component.claimed_sum(),
         softmax_log_size,
         intermediates,
+        kv_cache_commitment: None,
+    })
+}
+
+/// Prove multi-head attention with KV-cache support for prefill batch proving.
+///
+/// Uses `attention_forward_cached()` to run the forward pass with KV-cache,
+/// then proves each matmul and the softmax STARK exactly like `prove_attention_onchain()`.
+///
+/// Key differences from `prove_attention_onchain()`:
+/// - Takes `&mut KVCache` — cache is updated with new K/V projections.
+/// - Q/K/V projections prove only new token rows (not full cached sequence).
+/// - Score matmul: Q_new × K_full^T → (new_tokens, total_len) using full cached K.
+/// - Context: softmax × V_full → (new_tokens, d_k) using full cached V.
+///
+/// This enables prefill batch proving (seq_len > 1) and incremental decode proving.
+pub fn prove_attention_cached(
+    input: &M31Matrix,
+    weights: &AttentionWeights,
+    config: &MultiHeadAttentionConfig,
+    cache: &mut KVCache,
+    causal: bool,
+) -> Result<AttentionProofOnChain, AttentionError> {
+    let intermediates = attention_forward_cached(input, weights, config, cache, causal);
+
+    // Q/K/V projection proofs verify only the NEW token projections:
+    //   input (new_tokens × d_model) × W_k = k_new (new_tokens × d_k_total)
+    // intermediates.k/v contain the FULL cached K/V (total_len rows), which we
+    // use for score/context matmuls but NOT for projection proofs.
+    let k_new = matmul_m31_auto(&pad_to_pow2(input), &pad_to_pow2(&weights.w_k));
+    let v_new = matmul_m31_auto(&pad_to_pow2(input), &pad_to_pow2(&weights.w_v));
+
+    let input_p = pad_to_pow2(input);
+    let wq_p = pad_to_pow2(&weights.w_q);
+    let wk_p = pad_to_pow2(&weights.w_k);
+    let wv_p = pad_to_pow2(&weights.w_v);
+    let wo_p = pad_to_pow2(&weights.w_o);
+    let q_p = pad_to_pow2(&intermediates.q);
+
+    let q_proof = prove_matmul_sumcheck_onchain_auto(&input_p, &wq_p, &q_p).map_err(|e| {
+        AttentionError::MatMul {
+            stage: "Q_projection".into(),
+            source: e,
+        }
+    })?;
+    let k_proof = prove_matmul_sumcheck_onchain_auto(&input_p, &wk_p, &k_new).map_err(|e| {
+        AttentionError::MatMul {
+            stage: "K_projection".into(),
+            source: e,
+        }
+    })?;
+    let v_proof = prove_matmul_sumcheck_onchain_auto(&input_p, &wv_p, &v_new).map_err(|e| {
+        AttentionError::MatMul {
+            stage: "V_projection".into(),
+            source: e,
+        }
+    })?;
+
+    let q_heads = split_heads(&intermediates.q, config.num_heads);
+    let kv_heads_k = split_heads(&intermediates.k, config.num_kv_heads);
+    let kv_heads_v = split_heads(&intermediates.v, config.num_kv_heads);
+    let group_size = config.group_size();
+
+    let mut score_proofs = Vec::with_capacity(config.num_heads);
+    let mut attn_v_proofs = Vec::with_capacity(config.num_heads);
+    let mut all_softmax_inputs = Vec::new();
+    let mut all_softmax_outputs = Vec::new();
+
+    for h in 0..config.num_heads {
+        let kv_idx = h / group_size;
+        let k_t = transpose_m31(&kv_heads_k[kv_idx]);
+        let q_h_p = pad_to_pow2(&q_heads[h]);
+        let k_t_p = pad_to_pow2(&k_t);
+        let scores_p = matmul_m31_auto(&q_h_p, &k_t_p);
+        let sp = prove_matmul_sumcheck_onchain_auto(&q_h_p, &k_t_p, &scores_p).map_err(|e| {
+            AttentionError::MatMul {
+                stage: format!("score_head_{h}"),
+                source: e,
+            }
+        })?;
+        score_proofs.push(sp);
+
+        let score_mat = &intermediates.score_matrices[h];
+        for val in &score_mat.data {
+            all_softmax_inputs.push(*val);
+            all_softmax_outputs.push(softmax_exp(*val));
+        }
+
+        let soft_p = pad_to_pow2(&intermediates.softmax_outputs[h]);
+        let v_h_p = pad_to_pow2(&kv_heads_v[kv_idx]);
+        let context_p = matmul_m31_auto(&soft_p, &v_h_p);
+        let avp = prove_matmul_sumcheck_onchain_auto(&soft_p, &v_h_p, &context_p).map_err(|e| {
+            AttentionError::MatMul {
+                stage: format!("attn_v_head_{h}"),
+                source: e,
+            }
+        })?;
+        attn_v_proofs.push(avp);
+    }
+
+    let concat_p = pad_to_pow2(&intermediates.concat);
+    let out_p = pad_to_pow2(&intermediates.final_output);
+    let output_proof =
+        prove_matmul_sumcheck_onchain_auto(&concat_p, &wo_p, &out_p).map_err(|e| {
+            AttentionError::MatMul {
+                stage: "output_projection".into(),
+                source: e,
+            }
+        })?;
+
+    let table = softmax_table();
+    let pcs_config = PcsConfig::default();
+    let (component, softmax_exp_proof) =
+        prove_activation_layer::<SimdBackend, Blake2sMerkleChannel>(
+            &all_softmax_inputs,
+            &all_softmax_outputs,
+            table,
+            pcs_config,
+        )
+        .map_err(|e| AttentionError::Activation(format!("softmax exp STARK: {e}")))?;
+    let softmax_log_size = table.log_size.max(4);
+
+    Ok(AttentionProofOnChain {
+        q_proof,
+        k_proof,
+        v_proof,
+        score_proofs,
+        attn_v_proofs,
+        output_proof,
+        softmax_exp_proof,
+        softmax_claimed_sum: component.claimed_sum(),
+        softmax_log_size,
+        intermediates,
+        kv_cache_commitment: None,
+    })
+}
+
+/// Prove attention from pre-computed intermediates (no forward pass re-run).
+///
+/// This avoids the double-append problem: Phase 1 already ran
+/// `attention_forward_cached()` which mutated the KV-cache. Phase 2b calls
+/// this function with the stored intermediates so the cache is not touched
+/// again and the proofs are consistent with the cached K/V state.
+///
+/// K/V projection proofs verify only the new-token projections (input × W_k,
+/// input × W_v), while score/context matmuls use the full cached K/V from
+/// `intermediates.k` / `intermediates.v`.
+pub fn prove_attention_cached_from_intermediates(
+    input: &M31Matrix,
+    weights: &AttentionWeights,
+    config: &MultiHeadAttentionConfig,
+    intermediates: &AttentionIntermediates,
+) -> Result<AttentionProofOnChain, AttentionError> {
+    prove_attention_cached_from_intermediates_with_kv_commitment(
+        input,
+        weights,
+        config,
+        intermediates,
+        None,
+    )
+}
+
+/// Like [`prove_attention_cached_from_intermediates`] but binds a KV-cache
+/// commitment into the returned proof for verifier cross-checking.
+pub fn prove_attention_cached_from_intermediates_with_kv_commitment(
+    input: &M31Matrix,
+    weights: &AttentionWeights,
+    config: &MultiHeadAttentionConfig,
+    intermediates: &AttentionIntermediates,
+    kv_cache_commitment: Option<starknet_ff::FieldElement>,
+) -> Result<AttentionProofOnChain, AttentionError> {
+    // K/V projection proofs verify only the NEW token projections:
+    //   input (new_tokens × d_model) × W_k = k_new (new_tokens × d_k_total)
+    // intermediates.k/v contain the FULL cached K/V (total_len rows).
+    let k_new = matmul_m31_auto(&pad_to_pow2(input), &pad_to_pow2(&weights.w_k));
+    let v_new = matmul_m31_auto(&pad_to_pow2(input), &pad_to_pow2(&weights.w_v));
+
+    let input_p = pad_to_pow2(input);
+    let wq_p = pad_to_pow2(&weights.w_q);
+    let wk_p = pad_to_pow2(&weights.w_k);
+    let wv_p = pad_to_pow2(&weights.w_v);
+    let wo_p = pad_to_pow2(&weights.w_o);
+    let q_p = pad_to_pow2(&intermediates.q);
+
+    let q_proof = prove_matmul_sumcheck_onchain_auto(&input_p, &wq_p, &q_p).map_err(|e| {
+        AttentionError::MatMul {
+            stage: "Q_projection".into(),
+            source: e,
+        }
+    })?;
+    let k_proof = prove_matmul_sumcheck_onchain_auto(&input_p, &wk_p, &k_new).map_err(|e| {
+        AttentionError::MatMul {
+            stage: "K_projection".into(),
+            source: e,
+        }
+    })?;
+    let v_proof = prove_matmul_sumcheck_onchain_auto(&input_p, &wv_p, &v_new).map_err(|e| {
+        AttentionError::MatMul {
+            stage: "V_projection".into(),
+            source: e,
+        }
+    })?;
+
+    let q_heads = split_heads(&intermediates.q, config.num_heads);
+    let kv_heads_k = split_heads(&intermediates.k, config.num_kv_heads);
+    let kv_heads_v = split_heads(&intermediates.v, config.num_kv_heads);
+    let group_size = config.group_size();
+
+    let mut score_proofs = Vec::with_capacity(config.num_heads);
+    let mut attn_v_proofs = Vec::with_capacity(config.num_heads);
+    let mut all_softmax_inputs = Vec::new();
+    let mut all_softmax_outputs = Vec::new();
+
+    for h in 0..config.num_heads {
+        let kv_idx = h / group_size;
+        let k_t = transpose_m31(&kv_heads_k[kv_idx]);
+        let q_h_p = pad_to_pow2(&q_heads[h]);
+        let k_t_p = pad_to_pow2(&k_t);
+        let scores_p = matmul_m31_auto(&q_h_p, &k_t_p);
+        let sp = prove_matmul_sumcheck_onchain_auto(&q_h_p, &k_t_p, &scores_p).map_err(|e| {
+            AttentionError::MatMul {
+                stage: format!("score_head_{h}"),
+                source: e,
+            }
+        })?;
+        score_proofs.push(sp);
+
+        let score_mat = &intermediates.score_matrices[h];
+        for val in &score_mat.data {
+            all_softmax_inputs.push(*val);
+            all_softmax_outputs.push(softmax_exp(*val));
+        }
+
+        let soft_p = pad_to_pow2(&intermediates.softmax_outputs[h]);
+        let v_h_p = pad_to_pow2(&kv_heads_v[kv_idx]);
+        let context_p = matmul_m31_auto(&soft_p, &v_h_p);
+        let avp = prove_matmul_sumcheck_onchain_auto(&soft_p, &v_h_p, &context_p).map_err(|e| {
+            AttentionError::MatMul {
+                stage: format!("attn_v_head_{h}"),
+                source: e,
+            }
+        })?;
+        attn_v_proofs.push(avp);
+    }
+
+    let concat_p = pad_to_pow2(&intermediates.concat);
+    let out_p = pad_to_pow2(&intermediates.final_output);
+    let output_proof =
+        prove_matmul_sumcheck_onchain_auto(&concat_p, &wo_p, &out_p).map_err(|e| {
+            AttentionError::MatMul {
+                stage: "output_projection".into(),
+                source: e,
+            }
+        })?;
+
+    let table = softmax_table();
+    let pcs_config = PcsConfig::default();
+    let (component, softmax_exp_proof) =
+        prove_activation_layer::<SimdBackend, Blake2sMerkleChannel>(
+            &all_softmax_inputs,
+            &all_softmax_outputs,
+            table,
+            pcs_config,
+        )
+        .map_err(|e| AttentionError::Activation(format!("softmax exp STARK: {e}")))?;
+    let softmax_log_size = table.log_size.max(4);
+
+    Ok(AttentionProofOnChain {
+        q_proof,
+        k_proof,
+        v_proof,
+        score_proofs,
+        attn_v_proofs,
+        output_proof,
+        softmax_exp_proof,
+        softmax_claimed_sum: component.claimed_sum(),
+        softmax_log_size,
+        intermediates: intermediates.clone(),
+        kv_cache_commitment,
     })
 }
 
@@ -2074,5 +2538,88 @@ mod tests {
         assert_eq!(cache.len(), 5);
         assert_eq!(inter2.score_matrices[0].rows, 1);
         assert_eq!(inter2.score_matrices[0].cols, 5);
+    }
+
+    #[test]
+    fn test_softmax_table_cached() {
+        let t1 = softmax_table();
+        let t2 = softmax_table();
+        // Same pointer ⇒ OnceLock reuse, no rebuild.
+        assert!(std::ptr::eq(t1, t2), "softmax_table() should return the same static reference");
+        assert_eq!(t1.log_size, ActivationType::Softmax.production_log_size());
+    }
+
+    // ── KV-cache commitment tests ──
+
+    #[test]
+    fn test_kv_head_commitment_deterministic() {
+        let m = make_test_input(4, 8);
+        let c1 = compute_kv_head_commitment(&m, DOMAIN_KV_K);
+        let c2 = compute_kv_head_commitment(&m, DOMAIN_KV_K);
+        assert_eq!(c1, c2, "Same data + same domain → same commitment");
+    }
+
+    #[test]
+    fn test_kv_head_commitment_domain_separation() {
+        let m = make_test_input(4, 8);
+        let ck = compute_kv_head_commitment(&m, DOMAIN_KV_K);
+        let cv = compute_kv_head_commitment(&m, DOMAIN_KV_V);
+        assert_ne!(ck, cv, "K vs V domain tags must produce different commitments");
+    }
+
+    #[test]
+    fn test_kv_layer_commitment_grows() {
+        let config = MultiHeadAttentionConfig::new(1, 4, 8);
+        let mut cache = KVCache::new(&config);
+
+        // Prefill 2 tokens
+        let k1 = make_test_input(2, 4);
+        let v1 = make_test_input(2, 4);
+        cache.append(&k1, &v1);
+        let c1 = compute_kv_layer_commitment(&cache, 0);
+
+        // Append 1 more token
+        let k2 = make_test_input(1, 4);
+        let v2 = make_test_input(1, 4);
+        cache.append(&k2, &v2);
+        let c2 = compute_kv_layer_commitment(&cache, 0);
+
+        assert_ne!(
+            c1.combined, c2.combined,
+            "Commitment must change after appending tokens"
+        );
+        assert_eq!(c1.cached_len, 2);
+        assert_eq!(c2.cached_len, 3);
+    }
+
+    #[test]
+    fn test_model_kv_cache_commit_chain() {
+        use starknet_ff::FieldElement;
+
+        let config = MultiHeadAttentionConfig::new(1, 4, 8);
+        let mut model_cache = ModelKVCache::new();
+
+        // Step 0: prefill
+        {
+            let layer_cache = model_cache.get_or_create(0, &config);
+            let k = make_test_input(3, 4);
+            let v = make_test_input(3, 4);
+            layer_cache.append(&k, &v);
+        }
+        let c0 = model_cache.commit().clone();
+        assert_eq!(c0.step_index, 0);
+        assert_eq!(c0.prev_commitment, FieldElement::ZERO);
+
+        // Step 1: decode 1 token — chains from step 0
+        {
+            let layer_cache = model_cache.get_or_create(0, &config);
+            let k = make_test_input(1, 4);
+            let v = make_test_input(1, 4);
+            layer_cache.append(&k, &v);
+        }
+        let c1 = model_cache.commit().clone();
+        assert_eq!(c1.step_index, 1);
+        assert_eq!(c1.prev_commitment, c0.super_commitment);
+        assert_ne!(c0.super_commitment, c1.super_commitment);
     }
 }

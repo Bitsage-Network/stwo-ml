@@ -83,6 +83,7 @@ pub fn felt_to_securefield(fe: FieldElement) -> SecureField {
 pub struct PoseidonChannel {
     digest: FieldElement,
     n_draws: u32,
+    hash_count: u64,
 }
 
 impl PoseidonChannel {
@@ -91,7 +92,14 @@ impl PoseidonChannel {
         Self {
             digest: FieldElement::ZERO,
             n_draws: 0,
+            hash_count: 0,
         }
+    }
+
+    /// Returns the cumulative number of Poseidon hashes (permutations) performed.
+    #[inline]
+    pub fn hash_count(&self) -> u64 {
+        self.hash_count
     }
 
     /// Mix a u64 value into the channel.
@@ -107,6 +115,7 @@ impl PoseidonChannel {
         hades_permutation(&mut state);
         self.digest = state[0];
         self.n_draws = 0;
+        self.hash_count += 1;
     }
 
     /// Draw a raw felt252 from the channel.
@@ -120,6 +129,7 @@ impl PoseidonChannel {
         ];
         hades_permutation(&mut state);
         self.n_draws += 1;
+        self.hash_count += 1;
         state[0]
     }
 
@@ -180,6 +190,7 @@ impl PoseidonChannel {
         let hash = starknet_crypto::poseidon_hash_many(&[self.digest, felt1, felt2]);
         self.digest = hash;
         self.n_draws = 0;
+        self.hash_count += 1;
     }
 
     /// Mix a degree-3 round polynomial (4 QM31 coefficients = 16 M31s) into the channel.
@@ -206,6 +217,7 @@ impl PoseidonChannel {
         let hash = starknet_crypto::poseidon_hash_many(&[self.digest, felt1, felt2]);
         self.digest = hash;
         self.n_draws = 0;
+        self.hash_count += 1;
     }
 
     /// Mix a variable-length array of QM31 values into the channel.
@@ -249,6 +261,7 @@ impl PoseidonChannel {
 
         self.digest = starknet_crypto::poseidon_hash_many(&hash_inputs);
         self.n_draws = 0;
+        self.hash_count += 1;
     }
 
     /// Get the current digest (for debugging/testing).
