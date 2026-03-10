@@ -935,6 +935,11 @@ pub fn apply_layernorm_pub(input: &M31Matrix, dim: usize) -> M31Matrix {
     apply_layernorm(input, dim)
 }
 
+/// Apply RMSNorm (public for decode prefill).
+pub fn apply_rmsnorm_pub(input: &M31Matrix, dim: usize) -> M31Matrix {
+    apply_rmsnorm_detailed(input, dim).output_matrix
+}
+
 /// Apply an activation function element-wise to a matrix.
 /// Parallelized with rayon for arrays >= 4096 elements.
 fn apply_activation(input: &M31Matrix, f: &(dyn Fn(M31) -> M31 + Sync)) -> M31Matrix {

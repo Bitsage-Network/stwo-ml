@@ -47,6 +47,7 @@ use stwo_ml::cairo_serde::{
     deserialize_raw_io, serialize_ml_proof_for_recursive, serialize_ml_proof_to_file,
     DirectProofMetadata, MLClaimMetadata,
 };
+use stwo_ml::compiler::hf_loader::load_hf_model_decode;
 use stwo_ml::compiler::inspect::summarize_model;
 use stwo_ml::compiler::onnx::{load_onnx, OnnxModel};
 use stwo_ml::components::matmul::M31Matrix;
@@ -234,6 +235,22 @@ struct Cli {
     /// Outputs `<output>.decode_bench.json` with per-step timing breakdown.
     #[arg(long)]
     decode_bench: Option<usize>,
+
+    /// Enable decode-step proving mode (requires --format ml_gkr and --model-dir).
+    #[arg(long)]
+    decode: bool,
+
+    /// Path to load/save KV-cache state for incremental decode proving.
+    #[arg(long)]
+    kv_cache: Option<PathBuf>,
+
+    /// Number of synthetic tokens for initial KV-cache prefill (default: 8).
+    #[arg(long, default_value = "8")]
+    prefill_len: usize,
+
+    /// Number of decode tokens to prove (default: 1).
+    #[arg(long, default_value = "1")]
+    decode_steps: usize,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1401,6 +1418,15 @@ fn main() {
         eprintln!("  Remove --skip-commitment to compute real commitments.");
         process::exit(1);
     }
+    if cli.decode && cli.format != OutputFormat::MlGkr {
+        eprintln!("Error: --decode requires --format ml_gkr");
+        eprintln!("  Add: --format ml_gkr");
+        process::exit(1);
+    }
+    if cli.decode && cli.model_dir.is_none() {
+        eprintln!("Error: --decode requires --model-dir");
+        process::exit(1);
+    }
 
     let model = load_model(&cli);
     let model_load_elapsed = t_e2e.elapsed();
@@ -1547,6 +1573,18 @@ fn main() {
                 d.sm_count,
             );
         }
+    }
+
+    // ── Decode mode: branch off before normal proving pipeline ──
+    if cli.decode {
+        let weight_cache = cli.model_dir.as_ref().map(|dir| {
+            let model_id_str = if cli.model_id.is_empty() { "unknown".to_string() } else { cli.model_id.clone() };
+            stwo_ml::weight_cache::shared_cache_for_model_mmap(
+                dir, &model_id_str, &model.weights,
+            )
+        });
+        run_decode_mode(&cli, &model, weight_cache.as_ref());
+        return;
     }
 
     let t0 = Instant::now();
@@ -6774,4 +6812,232 @@ fn compute_scaling_analysis(steps: &[serde_json::Value]) -> (f64, f64) {
     };
 
     (slope, sum_elapsed / n)
+}
+// ─────────────────────────────────────────────────────────────────────────────
+// Decode-step proving mode
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Run decode-step proving: load decode-compatible model, manage KV cache,
+/// and produce proofs for each decode step.
+#[cfg(any(feature = "cli", feature = "model-loading"))]
+fn run_decode_mode(
+    cli: &Cli,
+    _prefill_model: &OnnxModel,
+    weight_cache: Option<&stwo_ml::weight_cache::SharedWeightCache>,
+) {
+    use stwo_ml::aggregation::prove_model_pure_gkr_decode_step;
+    use stwo_ml::kv_state::KVCacheState;
+
+    let model_dir = cli.model_dir.as_ref().expect("--decode requires --model-dir");
+    let t_start = Instant::now();
+
+    // 1. Load decode-compatible model (with Attention nodes + named weights)
+    eprintln!("Loading decode-compatible model...");
+    let decode_model = load_hf_model_decode(model_dir, cli.layers)
+        .unwrap_or_else(|e| {
+            eprintln!("Error loading decode model: {e}");
+            process::exit(1);
+        });
+
+    // 2. Load or initialize KV cache
+    let (mut kv_cache, mut kv_commitment) = if let Some(ref kv_path) = cli.kv_cache {
+        if kv_path.exists() {
+            eprintln!("Loading KV cache from {}", kv_path.display());
+            let state = KVCacheState::load(kv_path).unwrap_or_else(|e| {
+                eprintln!("Error loading KV cache: {e}");
+                process::exit(1);
+            });
+            state.to_live()
+        } else {
+            eprintln!("Seeding KV cache from prefill (len={})", cli.prefill_len);
+            run_prefill(&decode_model, cli.prefill_len)
+        }
+    } else {
+        eprintln!("No --kv-cache path: running prefill (len={})", cli.prefill_len);
+        run_prefill(&decode_model, cli.prefill_len)
+    };
+
+    eprintln!(
+        "KV cache ready: {} layers, cached_len={}, kv_commit=0x{:x}",
+        kv_cache.layers.len(),
+        kv_cache.cached_len(),
+        kv_commitment.commitment(),
+    );
+
+    // 3. Run decode steps
+    for step in 0..cli.decode_steps {
+        let token_input = generate_random_input(1, decode_model.input_shape.1);
+        let t_step = Instant::now();
+
+        let (proof, new_kv_commit) = prove_model_pure_gkr_decode_step(
+            &decode_model.graph,
+            &token_input,
+            &decode_model.weights,
+            &mut kv_cache,
+            &mut kv_commitment,
+            weight_cache,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("Decode step {} failed: {e}", step);
+            process::exit(1);
+        });
+
+        eprintln!(
+            "  Step {}/{}: {:.1}ms, kv_commit=0x{:x}",
+            step + 1,
+            cli.decode_steps,
+            t_step.elapsed().as_secs_f64() * 1000.0,
+            new_kv_commit,
+        );
+
+        // Write proof for each step
+        let output_path = if cli.decode_steps > 1 {
+            let stem = cli.output.file_stem().unwrap().to_str().unwrap();
+            let ext = cli.output.extension().map(|e| e.to_str().unwrap()).unwrap_or("json");
+            cli.output.with_file_name(format!("{stem}_{step}.{ext}"))
+        } else {
+            cli.output.clone()
+        };
+
+        // Serialize decode proof as minimal JSON
+        let json_obj = serde_json::json!({
+            "format": "ml_gkr_decode",
+            "decode_step": step,
+            "kv_cache_commitment": format!("0x{:x}", new_kv_commit),
+            "num_layers": decode_model.graph.num_layers(),
+            "num_matmul_proofs": proof.matmul_proofs.len(),
+            "num_batched_matmul_proofs": proof.batched_matmul_proofs.len(),
+            "num_activation_claims": proof.activation_claims.len(),
+            "has_gkr_proof": proof.gkr_proof.is_some(),
+        });
+
+        let output_str = serde_json::to_string_pretty(&json_obj).unwrap();
+        std::fs::write(&output_path, &output_str).unwrap_or_else(|e| {
+            eprintln!("Error writing decode proof to '{}': {e}", output_path.display());
+            process::exit(1);
+        });
+        eprintln!("    Proof written to {}", output_path.display());
+    }
+
+    // 4. Save KV cache state if --kv-cache specified
+    if let Some(ref kv_path) = cli.kv_cache {
+        let state = KVCacheState::from_live(&kv_cache, &kv_commitment);
+        state.save(kv_path).unwrap_or_else(|e| {
+            eprintln!("Error saving KV cache: {e}");
+            process::exit(1);
+        });
+        eprintln!("KV cache saved to {}", kv_path.display());
+    }
+
+    let total = t_start.elapsed();
+    eprintln!(
+        "=== Decode Summary ===\n  Steps: {}\n  Total: {:.1}s\n  Final KV commit: 0x{:x}\n=====================",
+        cli.decode_steps,
+        total.as_secs_f64(),
+        kv_commitment.commitment(),
+    );
+}
+
+/// Run a synthetic prefill to populate the KV cache before decode steps.
+///
+/// Runs a forward pass through the decode graph with `(prefill_len, d_model)` input
+/// to populate each layer's KV cache. No proof is generated.
+#[cfg(any(feature = "cli", feature = "model-loading"))]
+fn run_prefill(
+    model: &OnnxModel,
+    prefill_len: usize,
+) -> (
+    stwo_ml::components::attention::ModelKVCache,
+    stwo_ml::aggregation::IncrementalKVCommitment,
+) {
+    use stwo_ml::aggregation::IncrementalKVCommitment;
+    use stwo_ml::compiler::graph::GraphOp;
+    use stwo_ml::compiler::prove::{apply_layernorm_pub, apply_rmsnorm_pub};
+    use stwo_ml::components::attention::{
+        attention_forward_cached, AttentionWeights, ModelKVCache,
+    };
+    use stwo_ml::components::matmul::M31Matrix;
+
+    let d_model = model.input_shape.1;
+    let mut kv_cache = ModelKVCache::new();
+    let mut current = generate_random_input(prefill_len, d_model);
+
+    // Run forward pass through graph, processing Attention nodes to fill KV cache
+    let mut node_outputs: std::collections::HashMap<usize, M31Matrix> =
+        std::collections::HashMap::new();
+
+    for (idx, node) in model.graph.nodes.iter().enumerate() {
+        match &node.op {
+            GraphOp::MatMul { dims: (_m, _k, _n) } => {
+                if let Some(w) = model.weights.get_weight(idx) {
+                    current = stwo_ml::components::matmul::matmul_m31(&current, w);
+                }
+            }
+            GraphOp::Activation { activation_type, .. } => {
+                let f = activation_type.as_fn();
+                let output_data: Vec<M31> = current.data.iter().map(|&x| (*f)(x)).collect();
+                current = M31Matrix {
+                    rows: current.rows,
+                    cols: current.cols,
+                    data: output_data,
+                };
+            }
+            GraphOp::LayerNorm { dim } => {
+                current = apply_layernorm_pub(&current, *dim);
+            }
+            GraphOp::RMSNorm { dim } => {
+                current = apply_rmsnorm_pub(&current, *dim);
+            }
+            GraphOp::Attention { config } => {
+                let cache = kv_cache.get_or_create(idx, config);
+                let w_q = model.weights.get_named_weight(idx, "w_q");
+                let w_k = model.weights.get_named_weight(idx, "w_k");
+                let w_v = model.weights.get_named_weight(idx, "w_v");
+                let w_o = model.weights.get_named_weight(idx, "w_o");
+
+                if let (Some(wq), Some(wk), Some(wv), Some(wo)) = (w_q, w_k, w_v, w_o) {
+                    let attn_weights = AttentionWeights {
+                        w_q: wq.clone(),
+                        w_k: wk.clone(),
+                        w_v: wv.clone(),
+                        w_o: wo.clone(),
+                    };
+                    let intermediates = attention_forward_cached(
+                        &current, &attn_weights, config, cache, config.causal,
+                    );
+                    current = intermediates.final_output;
+                } else {
+                    eprintln!("  WARN: Attention node {} missing weights, passing through", idx);
+                }
+            }
+            GraphOp::Add { .. } => {
+                // Residual add: get the fork source from inputs
+                if node.inputs.len() >= 2 {
+                    if let Some(residual) = node_outputs.get(&node.inputs[0]) {
+                        let mut out = M31Matrix::new(current.rows, current.cols);
+                        for i in 0..current.data.len() {
+                            out.data[i] = current.data[i] + residual.data[i];
+                        }
+                        current = out;
+                    }
+                }
+            }
+            GraphOp::Identity { .. } => {
+                // Fork point: save current output for residual connections
+            }
+            _ => {}
+        }
+        node_outputs.insert(idx, current.clone());
+    }
+
+    let initial_capacity = (prefill_len * 2).next_power_of_two().max(16);
+    let commitment = IncrementalKVCommitment::from_kv_cache(&kv_cache, initial_capacity);
+    eprintln!(
+        "Prefill complete: {} tokens, {} layers, kv_commit=0x{:x}",
+        prefill_len,
+        kv_cache.layers.len(),
+        commitment.commitment(),
+    );
+
+    (kv_cache, commitment)
 }

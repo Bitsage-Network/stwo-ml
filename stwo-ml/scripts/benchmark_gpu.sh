@@ -22,6 +22,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 FORMAT="${FORMAT:-ml_gkr}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
+DECODE="${DECODE:-0}"
+PREFILL_LEN="${PREFILL_LEN:-8}"
+DECODE_STEPS="${DECODE_STEPS:-5}"
 
 # Auto-detect model directory
 if [[ -n "${2:-}" ]]; then
@@ -55,6 +58,7 @@ echo "  Format    : ${FORMAT}"
 echo "  GPU       : ${GPU_NAME} (${GPU_MEM})"
 echo "  Features  : ${FEATURES}"
 echo "  Binding   : ${STWO_WEIGHT_BINDING:-default (batched openings)}"
+[[ "${DECODE}" == "1" ]] && echo "  Decode    : ON (prefill=${PREFILL_LEN}, steps=${DECODE_STEPS})"
 echo ""
 
 if [[ "${SKIP_BUILD}" != "1" ]]; then
@@ -66,6 +70,12 @@ fi
 
 OUTPUT="/tmp/benchmark_qwen3_${LAYERS}L_$(date +%s).json"
 
+DECODE_FLAGS=""
+if [[ "${DECODE}" == "1" ]]; then
+    DECODE_FLAGS="--decode --prefill-len ${PREFILL_LEN} --decode-steps ${DECODE_STEPS}"
+    FORMAT="ml_gkr"  # decode requires ml_gkr
+fi
+
 echo "Starting prove (${LAYERS} layers, format=${FORMAT})..."
 echo "Output: ${OUTPUT}"
 echo ""
@@ -76,6 +86,7 @@ time target/release/prove-model \
     --layers "${LAYERS}" \
     --gpu \
     --format "${FORMAT}" \
+    ${DECODE_FLAGS} \
     --output "${OUTPUT}" \
     2>&1 | tee /tmp/benchmark_latest.log
 
@@ -89,6 +100,11 @@ if [[ -f /tmp/benchmark_latest.log ]]; then
     grep -E '(Forward pass complete|layer reductions complete|weight commitments:.*done|weight openings:.*elapsed|GKR proof:.*layer proofs|Unified STARK|Proving completed|Phase [0-9]+ complete)' /tmp/benchmark_latest.log | sed 's/^/  /'
     echo ""
     grep -E '(GPU|CPU|backend|MLE.*backend|OOM|fallback)' /tmp/benchmark_latest.log | sort -u | sed 's/^/  /'
+    if [[ "${DECODE}" == "1" ]]; then
+        echo ""
+        echo "Decode timings:"
+        grep -E '(Decode|decode|KV commit|KV cache|Step [0-9]|Prefill)' /tmp/benchmark_latest.log | sed 's/^/  /'
+    fi
 fi
 
 echo ""

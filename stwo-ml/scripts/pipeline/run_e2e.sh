@@ -27,6 +27,9 @@ DRY_RUN=""
 SUBMIT=""
 VERIFY_GKR=""
 WEIGHT_BINDING=""
+DECODE_FLAG=""
+PREFILL_LEN="8"
+DECODE_STEPS_ARG="1"
 COUNT=3
 OUTPUT_DIR="$HOME/.obelysk/audits"
 
@@ -42,6 +45,9 @@ usage() {
   echo "  --submit            Submit proof on-chain via Avnu paymaster (gasless)"
   echo "  --verify-gkr        Submit GKR proofs for on-chain verification (with --submit)"
   echo "  --dry-run           Prove + report, skip on-chain submission"
+  echo "  --decode            Enable decode-step proving mode"
+  echo "  --prefill-len N     Prefill length for decode (default: 8)"
+  echo "  --decode-steps N    Decode tokens to prove (default: 1)"
   echo "  --weight-binding M  Weight binding mode: aggregated (default), sequential"
   echo "  --output-dir PATH   Where to save reports (default: ~/.obelysk/audits)"
   echo "  -h, --help          Show this help"
@@ -64,6 +70,9 @@ while [[ $# -gt 0 ]]; do
     --submit)     SUBMIT="--submit"; shift ;;
     --verify-gkr) VERIFY_GKR="--verify-gkr"; shift ;;
     --dry-run)    DRY_RUN="--dry-run"; shift ;;
+    --decode)       DECODE_FLAG="--decode"; shift ;;
+    --prefill-len)  PREFILL_LEN="$2"; shift 2 ;;
+    --decode-steps) DECODE_STEPS_ARG="$2"; shift 2 ;;
     --weight-binding) WEIGHT_BINDING="$2"; shift 2 ;;
     --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
     -h|--help)    usage ;;
@@ -161,6 +170,7 @@ echo "  Inferences: $COUNT"
 echo "  GPU:        ${GPU_FLAG:-off}"
 echo "  Submit:     ${SUBMIT:-off}"
 echo "  Verify GKR: ${VERIFY_GKR:-off}"
+echo "  Decode:     ${DECODE_FLAG:-off}"
 echo "  Output:     $REPORT"
 echo ""
 
@@ -192,6 +202,7 @@ if [[ -n "$VERIFY_GKR" ]]; then
   AUDIT_ARGS+=(--mode gkr --verify-gkr)
 fi
 [[ -n "$WEIGHT_BINDING" ]] && AUDIT_ARGS+=(--weight-binding "$WEIGHT_BINDING")
+[[ -n "$DECODE_FLAG" ]] && AUDIT_ARGS+=($DECODE_FLAG --prefill-len "$PREFILL_LEN" --decode-steps "$DECODE_STEPS_ARG")
 
 "$BINARY" audit "${AUDIT_ARGS[@]}"
 

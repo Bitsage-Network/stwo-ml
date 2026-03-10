@@ -1020,6 +1020,301 @@ fn load_weights_from_shards(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Decode Graph (Attention-aware) — for decode-step proving
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build a decode-compatible computation graph using `transformer_block()`.
+///
+/// Unlike `build_hf_transformer_graph()` which uses flat `linear()` calls,
+/// this produces `GraphOp::Attention` nodes + residual `Add` connections,
+/// matching what `prove_model_pure_gkr_decode_step` expects.
+fn build_hf_decode_graph(
+    config: &TransformerConfig,
+    hf_config: &HfConfig,
+    num_layers: usize,
+) -> ComputationGraph {
+    use crate::compiler::onnx::NormType;
+    let d = config.d_model;
+
+    let mut builder = GraphBuilder::new((1, d));
+    for _ in 0..num_layers {
+        builder.transformer_block(
+            hf_config.num_attention_heads,
+            hf_config.num_key_value_heads,
+            1, // seq_len=1 for decode
+            config.d_ff,
+        );
+    }
+    // Final norm (matching prefill graph)
+    match config.norm_type {
+        NormType::LayerNorm => { builder.layer_norm(); }
+        NormType::RMSNorm => { builder.rms_norm(); }
+    }
+    builder.build()
+}
+
+/// Build a weight name mapping for decode graphs (which contain Attention nodes).
+///
+/// Returns two maps:
+/// - `matmul_map`: node_id → tensor_name for positional MatMul weights (FFN up/down)
+/// - `attention_map`: Vec of (node_id, key_name, tensor_name) for named attention weights
+fn build_decode_weight_name_map(
+    graph: &ComputationGraph,
+    num_layers: usize,
+    available_tensors: &[(String, usize)],
+) -> (HashMap<usize, String>, Vec<(usize, String, String)>) {
+    let tensor_set: std::collections::HashSet<&str> = available_tensors
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+
+    let mut matmul_map = HashMap::new();
+    let mut attention_map: Vec<(usize, String, String)> = Vec::new();
+
+    // Walk graph nodes per layer. transformer_block() produces per block:
+    //   Identity(fork) → RMSNorm → Attention → Add → Identity(fork) → RMSNorm
+    //   → MatMul(up) → Activation → MatMul(down) → Add
+    // That's ~10 nodes/block.
+    let mut layer_idx = 0usize;
+    let mut matmul_in_layer = 0usize;
+
+    for (idx, node) in graph.nodes.iter().enumerate() {
+        match &node.op {
+            GraphOp::Attention { .. } => {
+                // Map Q/K/V/O projection weights as named weights
+                let candidates = |suffix: &str| -> Vec<String> {
+                    vec![
+                        format!("model.layers.{layer_idx}.self_attn.{suffix}.weight"),
+                        format!("model.layers.{layer_idx}.attention.{}.weight",
+                            match suffix {
+                                "q_proj" => "wq",
+                                "k_proj" => "wk",
+                                "v_proj" => "wv",
+                                "o_proj" => "wo",
+                                _ => suffix,
+                            }),
+                        format!("transformer.h.{layer_idx}.attn.{suffix}.weight"),
+                    ]
+                };
+
+                for (key, suffix) in [
+                    ("w_q", "q_proj"),
+                    ("w_k", "k_proj"),
+                    ("w_v", "v_proj"),
+                    ("w_o", "o_proj"),
+                ] {
+                    for name in candidates(suffix) {
+                        if tensor_set.contains(name.as_str()) {
+                            attention_map.push((idx, key.to_string(), name));
+                            break;
+                        }
+                    }
+                }
+                matmul_in_layer = 0;
+            }
+            GraphOp::MatMul { .. } => {
+                // FFN MatMul nodes: up_proj (first) and down_proj (second) within each block
+                let tensor_name = if matmul_in_layer == 0 {
+                    // FFN up projection
+                    let up_candidates = [
+                        format!("model.layers.{layer_idx}.mlp.up_proj.weight"),
+                        format!("model.layers.{layer_idx}.mlp.gate_proj.weight"),
+                        format!("model.layers.{layer_idx}.feed_forward.w1.weight"),
+                        format!("transformer.h.{layer_idx}.mlp.up_proj.weight"),
+                    ];
+                    up_candidates.iter().find(|n| tensor_set.contains(n.as_str())).cloned()
+                } else {
+                    // FFN down projection
+                    let down_candidates = [
+                        format!("model.layers.{layer_idx}.mlp.down_proj.weight"),
+                        format!("model.layers.{layer_idx}.feed_forward.w2.weight"),
+                        format!("transformer.h.{layer_idx}.mlp.down_proj.weight"),
+                    ];
+                    down_candidates.iter().find(|n| tensor_set.contains(n.as_str())).cloned()
+                };
+                if let Some(name) = tensor_name {
+                    matmul_map.insert(idx, name);
+                }
+                matmul_in_layer += 1;
+            }
+            GraphOp::Add { .. } => {
+                // Second Add in a block marks end of transformer block
+                // Count Adds to detect layer boundaries: 2 Adds per block
+                // (post-attention residual + post-FFN residual)
+                // We advance layer_idx after the second Add
+                // But we need to track: after Attention's Add, we're in FFN part
+                // After FFN's Add, layer is complete
+                if matmul_in_layer >= 2 {
+                    layer_idx += 1;
+                    matmul_in_layer = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    (matmul_map, attention_map)
+}
+
+/// Load a model from a HuggingFace directory in decode-compatible format.
+///
+/// Unlike `load_hf_model()`, this builds a graph with `Attention` nodes and
+/// residual connections (via `transformer_block()`), suitable for decode-step
+/// proving with `prove_model_pure_gkr_decode_step`.
+///
+/// Attention weights (Q/K/V/O projections) are loaded as named weights.
+pub fn load_hf_model_decode(
+    model_dir: &Path,
+    num_layers: Option<usize>,
+) -> Result<OnnxModel, OnnxError> {
+    // ── Step 1: Run validation ──
+    let report = validate_model_directory(model_dir, num_layers);
+    eprintln!();
+    eprintln!("  ── Model Validation (decode) ──");
+    eprintln!("{}", report.format_report());
+    eprintln!();
+
+    if !report.passed() {
+        return Err(OnnxError::WeightError(format!(
+            "Model validation failed: {}/{} checks passed.",
+            report.num_passed(),
+            report.checks.len(),
+        )));
+    }
+
+    // ── Step 2: Parse config ──
+    let config_path = model_dir.join("config.json");
+    let hf_config = HfConfig::from_file(&config_path)?;
+    let transformer_config = hf_config.to_transformer_config();
+
+    let layers = num_layers.unwrap_or(hf_config.num_hidden_layers);
+    let layers = if layers == 0 { hf_config.num_hidden_layers } else { layers };
+
+    eprintln!("Model (decode): {} ({})", hf_config.model_type, model_dir.display());
+    eprintln!(
+        "  hidden_size={}, heads={}/{} (q/kv), ff={}, layers={}/{}",
+        hf_config.hidden_size,
+        hf_config.num_attention_heads,
+        hf_config.num_key_value_heads,
+        hf_config.intermediate_size,
+        layers,
+        hf_config.num_hidden_layers,
+    );
+
+    // ── Step 3: Build decode graph ──
+    let graph = build_hf_decode_graph(&transformer_config, &hf_config, layers);
+
+    // ── Step 4: Discover shards + build name maps ──
+    let shard_paths = discover_shards(model_dir, "model")
+        .map_err(|e| OnnxError::WeightError(format!("Cannot discover shards: {e}")))?;
+
+    if shard_paths.is_empty() {
+        return Err(OnnxError::WeightError(format!(
+            "No SafeTensors weight files found in {}",
+            model_dir.display(),
+        )));
+    }
+
+    eprintln!("  Loading weights from {} shards...", shard_paths.len());
+
+    let all_tensor_names: Vec<(String, usize)> = list_tensors_sharded(&shard_paths)
+        .map_err(|e| OnnxError::WeightError(format!("Cannot list tensors: {e}")))?;
+
+    let (matmul_map, attention_map) =
+        build_decode_weight_name_map(&graph, layers, &all_tensor_names);
+    eprintln!(
+        "  Weight mapping: {} MatMul + {} Attention entries",
+        matmul_map.len(),
+        attention_map.len(),
+    );
+
+    // ── Step 4a: Load FFN MatMul weights ──
+    let mut weights =
+        load_weights_from_shards(&shard_paths, &graph, &matmul_map, QuantStrategy::Symmetric8)
+            .map_err(|e| OnnxError::WeightError(format!("Cannot load weights: {e}")))?;
+
+    // ── Step 4b: Load Attention named weights ──
+    // Memory-map shards once for attention weights
+    let mut tensor_to_shard: HashMap<String, usize> = HashMap::new();
+    let mut shard_mmaps: Vec<memmap2::Mmap> = Vec::with_capacity(shard_paths.len());
+    for path in &shard_paths {
+        let file = std::fs::File::open(path)
+            .map_err(|e| OnnxError::WeightError(format!("Cannot open shard: {e}")))?;
+        let mmap = unsafe { memmap2::Mmap::map(&file) }
+            .map_err(|e| OnnxError::WeightError(format!("Cannot mmap shard: {e}")))?;
+        let st = safetensors::SafeTensors::deserialize(&mmap)
+            .map_err(|e| OnnxError::WeightError(format!("Cannot parse shard: {e}")))?;
+        for name in st.names() {
+            tensor_to_shard.insert(name.to_string(), shard_mmaps.len());
+        }
+        shard_mmaps.push(mmap);
+    }
+
+    let mut attn_loaded = 0usize;
+    for (node_id, key_name, tensor_name) in &attention_map {
+        let Some(&shard_idx) = tensor_to_shard.get(tensor_name) else {
+            eprintln!(
+                "    WARN: attention tensor '{}' not found in any shard for node {}",
+                tensor_name, node_id,
+            );
+            continue;
+        };
+        let tensors = safetensors::SafeTensors::deserialize(&shard_mmaps[shard_idx])
+            .map_err(|e| OnnxError::WeightError(format!("{tensor_name}: {e}")))?;
+        let tensor = tensors
+            .tensor(tensor_name)
+            .map_err(|e| OnnxError::WeightError(format!("{tensor_name}: {e}")))?;
+        let data = tensor_to_f32(tensor.data(), tensor.dtype());
+        let shape = tensor.shape();
+
+        // Attention weight shape: [out_features, in_features]
+        // Quantize and store as named weight
+        let (rows, cols) = if shape.len() == 2 { (shape[0], shape[1]) } else { (1, data.len()) };
+        let (matrix, _) = quantize_weight_matrix(&data, cols, rows, QuantStrategy::Symmetric8);
+        weights.add_named_weight(*node_id, key_name, matrix);
+        attn_loaded += 1;
+    }
+    eprintln!("  Loaded {} attention weight matrices", attn_loaded);
+
+    // ── Step 5: Verify all Attention nodes have named weights ──
+    let attention_nodes: Vec<usize> = graph
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| matches!(n.op, GraphOp::Attention { .. }))
+        .map(|(idx, _)| idx)
+        .collect();
+
+    for &idx in &attention_nodes {
+        for key in &["w_q", "w_k", "w_v", "w_o"] {
+            if weights.get_named_weight(idx, key).is_none() {
+                eprintln!(
+                    "  WARN: Attention node {} missing named weight '{}'",
+                    idx, key,
+                );
+            }
+        }
+    }
+
+    let num_parameters = crate::compiler::onnx::count_matmul_params(&graph);
+
+    let metadata = ModelMetadata {
+        name: format!("{}_{}L_decode", hf_config.model_type, layers),
+        num_parameters,
+        input_shape: graph.input_shape,
+        output_shape: graph.output_shape,
+        num_layers: graph.num_layers(),
+    };
+
+    Ok(OnnxModel {
+        input_shape: graph.input_shape,
+        graph,
+        weights,
+        metadata,
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Embedding Row Extraction
 // ─────────────────────────────────────────────────────────────────────────────
 

@@ -5259,7 +5259,7 @@ pub fn prove_model_pure_gkr_decode_step(
     gkr_channel.mix_felt(new_kv_commitment);
     gkr_channel.mix_felt(prev_kv_commitment);
 
-    let mut gkr_proof = crate::gkr::prove_gkr_decode(
+    let mut gkr_proof = crate::gkr::prove_gkr_decode_auto_with_cache(
         &circuit,
         &gkr_execution,
         weights,

@@ -50,6 +50,11 @@ pub use prover::prove_gkr_auto;
 pub use prover::prove_gkr_auto_with_cache;
 pub use prover::prove_gkr_with_cache;
 pub use prover::prove_gkr_decode;
+pub use prover::prove_gkr_decode_auto_with_cache;
+#[cfg(feature = "cuda-runtime")]
+pub use prover::prove_gkr_decode_gpu;
+#[cfg(feature = "cuda-runtime")]
+pub use prover::prove_gkr_decode_gpu_with_cache;
 #[cfg(feature = "cuda-runtime")]
 pub use prover::prove_gkr_gpu;
 #[cfg(feature = "cuda-runtime")]

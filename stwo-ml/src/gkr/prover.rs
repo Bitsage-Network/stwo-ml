@@ -3570,6 +3570,681 @@ pub fn prove_gkr_gpu_with_cache(
     Ok(proof)
 }
 
+/// GPU-accelerated decode-step GKR prover — thin wrapper that delegates to
+/// `prove_gkr_decode_gpu_with_cache` without a weight cache.
+#[cfg(feature = "cuda-runtime")]
+pub fn prove_gkr_decode_gpu(
+    circuit: &LayeredCircuit,
+    execution: &GraphExecution,
+    weights: &GraphWeights,
+    channel: &mut PoseidonChannel,
+    decode_attention_data: &std::collections::HashMap<
+        usize,
+        (AttentionIntermediates, usize),
+    >,
+) -> Result<GKRProof, GKRError> {
+    prove_gkr_decode_gpu_with_cache(circuit, execution, weights, channel, None, decode_attention_data)
+}
+
+/// GPU-accelerated decode-step GKR prover with optional weight commitment cache.
+///
+/// Combines GPU layer dispatch (MatMul, Add, Mul, Activation) from
+/// `prove_gkr_gpu_with_cache` with decode-specific attention dispatch and
+/// the extended VecDeque-based deferred proof queue from `prove_gkr_decode`.
+#[cfg(feature = "cuda-runtime")]
+pub fn prove_gkr_decode_gpu_with_cache(
+    circuit: &LayeredCircuit,
+    execution: &GraphExecution,
+    weights: &GraphWeights,
+    channel: &mut PoseidonChannel,
+    weight_cache: Option<&crate::weight_cache::SharedWeightCache>,
+    decode_attention_data: &std::collections::HashMap<
+        usize,
+        (AttentionIntermediates, usize),
+    >,
+) -> Result<GKRProof, GKRError> {
+    use crate::gpu_sumcheck::GpuSumcheckExecutor;
+
+    let gpu = GpuSumcheckExecutor::cached().map_err(|e| GKRError::ReductionError {
+        layer_idx: 0,
+        reason: format!("GPU init: {e}"),
+    })?;
+
+    let d = circuit.layers.len();
+    let mut layer_proofs = Vec::with_capacity(d);
+    let mut weight_commitments = Vec::with_capacity(d / 2);
+    let mut weight_data: Vec<(usize, Vec<SecureField>, SecureField)> = Vec::with_capacity(d / 2);
+    let mut deferred_info: Vec<(GKRClaim, usize)> = Vec::new();
+
+    // Seed channel with circuit metadata (same as all provers)
+    channel.mix_u64(d as u64);
+    channel.mix_u64(circuit.input_shape.0 as u64);
+    channel.mix_u64(circuit.input_shape.1 as u64);
+
+    // Start with claim on output layer
+    let output = &execution.output;
+    let output_padded = pad_matrix_pow2(output);
+    let output_mle = matrix_to_mle(&output_padded);
+
+    let log_out_rows = output_padded.rows.ilog2() as usize;
+    let log_out_cols = output_padded.cols.ilog2() as usize;
+
+    let r_out = channel.draw_qm31s(log_out_rows + log_out_cols);
+    let output_value = evaluate_mle(&output_mle, &r_out);
+    mix_secure_field(channel, output_value);
+
+    let output_claim = GKRClaim {
+        point: r_out,
+        value: output_value,
+    };
+    let mut current_claim = output_claim.clone();
+
+    emit_proof_event!(|| proof_stream::ProofEvent::ProofStart {
+        model_name: None,
+        backend: "gpu-gkr-decode".to_string(),
+        num_layers: circuit.layers.len(),
+        input_shape: circuit.input_shape,
+        output_shape: circuit.output_shape,
+    });
+
+    // Cache GPU device names once for proof-stream events.
+    #[cfg(feature = "proof-stream")]
+    let gkr_gpu_info: Vec<(u32, String, u64)> = crate::multi_gpu::discover_devices()
+        .iter()
+        .map(|d| (d.ordinal, d.name.clone(), d.total_memory))
+        .collect();
+
+    let total_work_layers = circuit
+        .layers
+        .iter()
+        .filter(|l| !matches!(l.layer_type, LayerType::Identity | LayerType::Input))
+        .count();
+    let total_matmul_layers = circuit
+        .layers
+        .iter()
+        .filter(|l| matches!(l.layer_type, LayerType::MatMul { .. }))
+        .count();
+    let t_gkr_walk = std::time::Instant::now();
+    let mut done_work_layers: usize = 0;
+    let mut done_matmul_layers: usize = 0;
+    let mut last_progress = std::time::Instant::now();
+
+    // Walk layers from output → input (GPU dispatch + decode attention)
+    for layer_idx in (0..d).rev() {
+        let layer = &circuit.layers[layer_idx];
+
+        #[cfg(feature = "proof-stream")]
+        let _ps_t = std::time::Instant::now();
+        emit_proof_event!(|| proof_stream::ProofEvent::LayerStart {
+            layer_idx,
+            kind: layer_kind_from_type(&layer.layer_type),
+            input_shape: layer.input_shape,
+            output_shape: layer.output_shape,
+            trace_cost: estimate_trace_cost(&layer.layer_type),
+            claim_value_approx: sf_to_f32(current_claim.value),
+            gpu_device: Some(0),
+        });
+
+        let (proof, next_claim) = match &layer.layer_type {
+            LayerType::MatMul {
+                m, k, n, weight_node_id,
+            } => {
+                let a_matrix = get_intermediate(execution, layer.node_id)?;
+                let b_matrix = weights
+                    .get_weight(*weight_node_id)
+                    .ok_or(GKRError::MissingWeight { node_id: *weight_node_id })?;
+
+                let (proof, claim) = reduce_matmul_layer_gpu(
+                    &gpu, &current_claim, a_matrix, b_matrix, *m, *k, *n, channel,
+                )?;
+
+                let final_b_eval = match &proof {
+                    LayerProof::MatMul { final_b_eval, .. } => *final_b_eval,
+                    _ => unreachable!("reduce_matmul_layer_gpu returns MatMul"),
+                };
+                push_matmul_weight_data(
+                    *weight_node_id, *m, *n,
+                    &current_claim.point, &claim.point,
+                    final_b_eval, &mut weight_data,
+                );
+
+                #[cfg(feature = "proof-stream")]
+                if let LayerProof::MatMul { ref round_polys, .. } = proof {
+                    let n_rounds = round_polys.len();
+                    let init = sf_to_f32(current_claim.value);
+                    for (round, rp) in round_polys.iter().enumerate() {
+                        let c0 = proof_stream::SecureFieldMirror {
+                            a: rp.c0.0 .0 .0, b: rp.c0.0 .1 .0,
+                            c: rp.c0.1 .0 .0, d: rp.c0.1 .1 .0,
+                        };
+                        let c1 = proof_stream::SecureFieldMirror {
+                            a: rp.c1.0 .0 .0, b: rp.c1.0 .1 .0,
+                            c: rp.c1.1 .0 .0, d: rp.c1.1 .1 .0,
+                        };
+                        let c2 = proof_stream::SecureFieldMirror {
+                            a: rp.c2.0 .0 .0, b: rp.c2.0 .1 .0,
+                            c: rp.c2.1 .0 .0, d: rp.c2.1 .1 .0,
+                        };
+                        let claim_approx = init / (1u32 << round.min(30)) as f32;
+                        emit_proof_event!(|| proof_stream::ProofEvent::SumcheckRound {
+                            layer_idx,
+                            round,
+                            total_rounds: n_rounds,
+                            poly_deg2: Some(proof_stream::RoundPolyViz { c0, c1, c2 }),
+                            poly_deg3: None,
+                            claim_value_approx: claim_approx,
+                        });
+                    }
+                }
+
+                (proof, claim)
+            }
+
+            LayerType::Add { .. } => {
+                let (lhs_vals, rhs_vals) = get_binary_op_intermediates(execution, layer, circuit)?;
+                let (proof, _claim) =
+                    reduce_add_layer_gpu(&gpu, &current_claim, &lhs_vals, &rhs_vals, channel)?;
+                process_add_deferred(
+                    proof, &current_claim, &layer.input_layers, &mut deferred_info,
+                )
+            }
+
+            LayerType::Mul { .. } => {
+                let (lhs_vals, rhs_vals) = get_binary_op_intermediates(execution, layer, circuit)?;
+                reduce_mul_layer_gpu(&gpu, &current_claim, &lhs_vals, &rhs_vals, channel)?
+            }
+
+            LayerType::Activation { activation_type, .. } => {
+                let input_matrix = get_intermediate(execution, layer.node_id)?;
+                if *activation_type == crate::components::activation::ActivationType::ReLU {
+                    reduce_activation_layer_algebraic(
+                        &current_claim, input_matrix, *activation_type, channel,
+                    )?
+                } else {
+                    reduce_activation_layer_gpu(
+                        &gpu, &current_claim, input_matrix, *activation_type, channel,
+                    )?
+                }
+            }
+
+            LayerType::LayerNorm { dim, .. } => {
+                let input_matrix = get_intermediate(execution, layer.node_id)?;
+                reduce_layernorm_layer(&current_claim, input_matrix, *dim, channel)?
+            }
+
+            LayerType::RMSNorm { dim, .. } => {
+                let input_matrix = get_intermediate(execution, layer.node_id)?;
+                reduce_rmsnorm_layer(&current_claim, input_matrix, *dim, channel)?
+            }
+
+            LayerType::Quantize { params, .. } => {
+                let input_matrix = get_intermediate(execution, layer.node_id)?;
+                reduce_quantize_layer(&current_claim, input_matrix, params, channel)?
+            }
+
+            LayerType::Embedding { .. } => {
+                let input_matrix = get_intermediate(execution, layer.node_id)?;
+                let output_matrix = get_node_output(execution, layer.node_id)?;
+                let embed_table = weights
+                    .get_weight(layer.node_id)
+                    .ok_or(GKRError::MissingWeight { node_id: layer.node_id })?;
+                reduce_embedding_layer(
+                    &current_claim, input_matrix, output_matrix, embed_table, channel,
+                )?
+            }
+
+            LayerType::Dequantize { params, .. } => {
+                let input_matrix = get_intermediate(execution, layer.node_id)?;
+                reduce_dequantize_layer(&current_claim, input_matrix, params, channel)?
+            }
+
+            LayerType::Identity => continue,
+
+            LayerType::Attention { config } => {
+                // Decode path: use pre-computed intermediates when available
+                let input_matrix = get_intermediate(execution, layer.node_id)?;
+                let attn_weights = get_attention_weights(weights, layer)?;
+
+                if let Some((inter, full_seq_len)) = decode_attention_data.get(&layer.node_id) {
+                    reduce_attention_layer_decode(
+                        &current_claim, input_matrix, &attn_weights, inter, config,
+                        *full_seq_len, channel,
+                    )?
+                } else {
+                    reduce_attention_layer(
+                        &current_claim, input_matrix, &attn_weights, config, channel,
+                    )?
+                }
+            }
+
+            LayerType::Input => break,
+        };
+
+        layer_proofs.push(proof);
+        current_claim = next_claim;
+
+        #[cfg(feature = "proof-stream")]
+        emit_proof_event!(|| proof_stream::ProofEvent::LayerEnd {
+            layer_idx,
+            kind: proof_stream::LayerProofKind::Sumcheck,
+            final_claim_value_approx: sf_to_f32(current_claim.value),
+            duration_ms: _ps_t.elapsed().as_millis() as u64,
+            rounds_completed: 0,
+        });
+        #[cfg(feature = "proof-stream")]
+        {
+            let layers_total = circuit.layers.len();
+            emit_proof_event!(|| {
+                let devices: Vec<proof_stream::GpuSnapshot> = gkr_gpu_info
+                    .iter()
+                    .map(|(id, name, mem)| proof_stream::GpuSnapshot {
+                        device_id: *id,
+                        device_name: name.clone(),
+                        utilization: (layer_idx + 1) as f32 / layers_total as f32,
+                        free_memory_bytes: Some(*mem),
+                    })
+                    .collect();
+                proof_stream::ProofEvent::GpuStatus {
+                    devices,
+                    matmul_done: layer_proofs.len(),
+                    matmul_total: layers_total,
+                    layers_done: layer_idx + 1,
+                    layers_total,
+                }
+            });
+        }
+
+        done_work_layers += 1;
+        let is_matmul = matches!(&layer.layer_type, LayerType::MatMul { .. });
+        if is_matmul {
+            done_matmul_layers += 1;
+        }
+        let should_log = is_matmul
+            || done_work_layers == total_work_layers
+            || last_progress.elapsed().as_secs() >= 10;
+        if should_log {
+            let elapsed = t_gkr_walk.elapsed().as_secs_f64();
+            let eta = if done_work_layers > 0 {
+                let per_layer = elapsed / done_work_layers as f64;
+                per_layer * (total_work_layers.saturating_sub(done_work_layers)) as f64
+            } else {
+                0.0
+            };
+            eprintln!(
+                "  [GKR-decode-GPU] progress: {}/{} layers (matmul {}/{}) elapsed {:.1}s, eta ~{:.0}s",
+                done_work_layers, total_work_layers,
+                done_matmul_layers, total_matmul_layers,
+                elapsed, eta,
+            );
+            last_progress = std::time::Instant::now();
+        }
+    }
+
+    eprintln!(
+        "  [GKR-decode-GPU] layer reductions complete in {:.1}s; entering opening phase (deferred={}, weight_openings={})",
+        t_gkr_walk.elapsed().as_secs_f64(),
+        deferred_info.len(),
+        weight_data.len(),
+    );
+
+    // Free GPU memory accumulated during layer reductions before weight opening phase.
+    #[cfg(feature = "cuda-runtime")]
+    {
+        if let Ok(gpu) = crate::gpu_sumcheck::GpuSumcheckExecutor::cached() {
+            if let Err(e) = gpu.device.synchronize() {
+                eprintln!("  [GKR-decode-GPU] GPU sync warning (non-fatal): {:?}", e);
+            }
+        }
+    }
+
+    let flags = compute_weight_mode_flags();
+    let aggregate_weight_binding = flags.aggregate_weight_binding;
+    let mut deferred_weight_claims_data: Vec<(usize, Vec<SecureField>, SecureField)> =
+        Vec::with_capacity(deferred_info.len());
+
+    // Deferred proofs — VecDeque-based iteration to handle all transformer-block
+    // layer types (same as prove_gkr_decode), but with GPU MatMul reductions.
+    let mut deferred_proofs = Vec::with_capacity(deferred_info.len());
+    let mut deferred_queue: std::collections::VecDeque<(GKRClaim, usize)> =
+        deferred_info.into_iter().collect();
+    let t_deferred = std::time::Instant::now();
+    let deferred_total = deferred_queue.len();
+    let mut deferred_done: usize = 0;
+
+    while let Some((deferred_claim, rhs_layer_idx)) = deferred_queue.pop_front() {
+        let rhs_layer = &circuit.layers[rhs_layer_idx];
+        match &rhs_layer.layer_type {
+            LayerType::MatMul { m, k, n, weight_node_id } => {
+                let a_matrix = get_intermediate(execution, rhs_layer.node_id)?;
+                let b_matrix = weights
+                    .get_weight(*weight_node_id)
+                    .ok_or(GKRError::MissingWeight { node_id: *weight_node_id })?;
+
+                mix_secure_field(channel, deferred_claim.value);
+
+                // GPU backend for deferred matmul reductions
+                let (reduction, input_claim) =
+                    reduce_matmul_layer_with_backend::<stwo::prover::backend::gpu::GpuBackend>(
+                        &deferred_claim, a_matrix, b_matrix, *m, *k, *n, channel,
+                    )?;
+
+                let pm = m.next_power_of_two();
+                let log_m = pm.ilog2() as usize;
+                let pn = n.next_power_of_two();
+                let log_n = pn.ilog2() as usize;
+                let r_j = deferred_claim.point[log_m..log_m + log_n].to_vec();
+                let sumcheck_challenges = &input_claim.point[log_m..];
+                let mut weight_eval_point = r_j;
+                weight_eval_point.extend_from_slice(sumcheck_challenges);
+
+                let deferred_weight_claim = super::types::WeightClaim {
+                    weight_node_id: *weight_node_id,
+                    eval_point: weight_eval_point.clone(),
+                    expected_value: reduction.final_b_eval,
+                };
+                let (deferred_weight_commitment, deferred_opening) = if aggregate_weight_binding {
+                    deferred_weight_claims_data.push((
+                        *weight_node_id, weight_eval_point, reduction.final_b_eval,
+                    ));
+                    (
+                        starknet_ff::FieldElement::ZERO,
+                        crate::crypto::mle_opening::MleOpeningProof {
+                            intermediate_roots: Vec::new(),
+                            queries: Vec::new(),
+                            final_value: SecureField::zero(),
+                        },
+                    )
+                } else {
+                    let b_mle_u32 = matrix_to_mle_col_major_u32_padded(b_matrix);
+                    crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32(
+                        &b_mle_u32, &deferred_weight_claim.eval_point, channel,
+                    )
+                };
+
+                deferred_proofs.push(super::types::DeferredProof {
+                    claim: deferred_claim.clone(),
+                    layer_proof: LayerProof::MatMul {
+                        round_polys: reduction.round_polys,
+                        final_a_eval: reduction.final_a_eval,
+                        final_b_eval: reduction.final_b_eval,
+                    },
+                    input_claim,
+                    kind: super::types::DeferredProofKind::MatMul {
+                        dims: (*m, *k, *n),
+                        weight_commitment: deferred_weight_commitment,
+                        weight_opening: deferred_opening,
+                        weight_claim: deferred_weight_claim,
+                    },
+                });
+            }
+            LayerType::Quantize { params, .. } => {
+                let input_matrix = get_intermediate(execution, rhs_layer.node_id)?;
+                mix_secure_field(channel, deferred_claim.value);
+                let (layer_proof, input_claim) =
+                    reduce_quantize_layer(&deferred_claim, input_matrix, params, channel)?;
+                deferred_proofs.push(super::types::DeferredProof {
+                    claim: deferred_claim.clone(),
+                    layer_proof,
+                    input_claim,
+                    kind: super::types::DeferredProofKind::Weightless,
+                });
+            }
+            LayerType::Dequantize { params, .. } => {
+                let input_matrix = get_intermediate(execution, rhs_layer.node_id)?;
+                mix_secure_field(channel, deferred_claim.value);
+                let (layer_proof, input_claim) =
+                    reduce_dequantize_layer(&deferred_claim, input_matrix, params, channel)?;
+                deferred_proofs.push(super::types::DeferredProof {
+                    claim: deferred_claim.clone(),
+                    layer_proof,
+                    input_claim,
+                    kind: super::types::DeferredProofKind::Weightless,
+                });
+            }
+            LayerType::RMSNorm { dim, .. } => {
+                let input_matrix = get_intermediate(execution, rhs_layer.node_id)?;
+                mix_secure_field(channel, deferred_claim.value);
+                let (layer_proof, input_claim) =
+                    reduce_rmsnorm_layer(&deferred_claim, input_matrix, *dim, channel)?;
+                deferred_proofs.push(super::types::DeferredProof {
+                    claim: deferred_claim.clone(),
+                    layer_proof,
+                    input_claim,
+                    kind: super::types::DeferredProofKind::Weightless,
+                });
+            }
+            LayerType::LayerNorm { dim, .. } => {
+                let input_matrix = get_intermediate(execution, rhs_layer.node_id)?;
+                mix_secure_field(channel, deferred_claim.value);
+                let (layer_proof, input_claim) =
+                    reduce_layernorm_layer(&deferred_claim, input_matrix, *dim, channel)?;
+                deferred_proofs.push(super::types::DeferredProof {
+                    claim: deferred_claim.clone(),
+                    layer_proof,
+                    input_claim,
+                    kind: super::types::DeferredProofKind::Weightless,
+                });
+            }
+            LayerType::Activation { activation_type, .. } => {
+                let input_matrix = get_intermediate(execution, rhs_layer.node_id)?;
+                mix_secure_field(channel, deferred_claim.value);
+                let (layer_proof, input_claim) = if *activation_type
+                    == crate::components::activation::ActivationType::ReLU
+                {
+                    reduce_activation_layer_algebraic(
+                        &deferred_claim, input_matrix, *activation_type, channel,
+                    )?
+                } else {
+                    reduce_activation_layer(
+                        &deferred_claim, input_matrix, *activation_type, channel,
+                    )?
+                };
+                deferred_proofs.push(super::types::DeferredProof {
+                    claim: deferred_claim.clone(),
+                    layer_proof,
+                    input_claim,
+                    kind: super::types::DeferredProofKind::Weightless,
+                });
+            }
+            LayerType::Add { .. } => {
+                let (lhs_vals, rhs_vals) =
+                    get_binary_op_intermediates(execution, rhs_layer, circuit)?;
+                mix_secure_field(channel, deferred_claim.value);
+                let (add_proof, _claim) =
+                    reduce_add_layer(&deferred_claim, &lhs_vals, &rhs_vals, channel)?;
+                let (final_proof, trunk_claim) = process_add_deferred(
+                    add_proof, &deferred_claim, &rhs_layer.input_layers,
+                    &mut Vec::new(),
+                );
+                deferred_proofs.push(super::types::DeferredProof {
+                    claim: deferred_claim.clone(),
+                    layer_proof: final_proof,
+                    input_claim: trunk_claim,
+                    kind: super::types::DeferredProofKind::Weightless,
+                });
+            }
+            LayerType::Identity | LayerType::Input => {
+                mix_secure_field(channel, deferred_claim.value);
+                let lhs_eval = deferred_claim.value;
+                let rhs_eval = SecureField::zero();
+                mix_secure_field(channel, lhs_eval);
+                mix_secure_field(channel, rhs_eval);
+                let _alpha = channel.draw_qm31();
+                deferred_proofs.push(super::types::DeferredProof {
+                    claim: deferred_claim.clone(),
+                    layer_proof: LayerProof::Add {
+                        lhs_eval, rhs_eval, trunk_idx: 0,
+                    },
+                    input_claim: deferred_claim.clone(),
+                    kind: super::types::DeferredProofKind::Weightless,
+                });
+            }
+            LayerType::Attention { config } => {
+                let input_matrix = get_intermediate(execution, rhs_layer.node_id)?;
+                let attn_weights = get_attention_weights(weights, rhs_layer)?;
+                mix_secure_field(channel, deferred_claim.value);
+                let (layer_proof, input_claim) =
+                    if let Some((inter, full_seq_len)) = decode_attention_data.get(&rhs_layer.node_id) {
+                        reduce_attention_layer_decode(
+                            &deferred_claim, input_matrix, &attn_weights, inter, config,
+                            *full_seq_len, channel,
+                        )?
+                    } else {
+                        reduce_attention_layer(
+                            &deferred_claim, input_matrix, &attn_weights, config, channel,
+                        )?
+                    };
+                deferred_proofs.push(super::types::DeferredProof {
+                    claim: deferred_claim.clone(),
+                    layer_proof,
+                    input_claim,
+                    kind: super::types::DeferredProofKind::Weightless,
+                });
+            }
+            LayerType::Embedding { .. } | LayerType::Mul { .. } => {
+                mix_secure_field(channel, deferred_claim.value);
+                deferred_proofs.push(super::types::DeferredProof {
+                    claim: deferred_claim.clone(),
+                    layer_proof: LayerProof::Add {
+                        lhs_eval: deferred_claim.value,
+                        rhs_eval: SecureField::zero(),
+                        trunk_idx: 0,
+                    },
+                    input_claim: deferred_claim.clone(),
+                    kind: super::types::DeferredProofKind::Weightless,
+                });
+            }
+        }
+
+        deferred_done += 1;
+        if deferred_total > 0 && (deferred_done % 4 == 0 || deferred_done == deferred_total) {
+            let elapsed = t_deferred.elapsed().as_secs_f64();
+            let eta = if deferred_done > 0 {
+                let per = elapsed / deferred_done as f64;
+                per * (deferred_total.saturating_sub(deferred_done)) as f64
+            } else {
+                0.0
+            };
+            eprintln!(
+                "  [GKR-decode-GPU] deferred proofs: {}/{} elapsed {:.1}s, eta ~{:.0}s",
+                deferred_done, deferred_total, elapsed, eta,
+            );
+        }
+    }
+
+    // Weight opening phase — same as prove_gkr_gpu_with_cache
+    let mut weight_openings = Vec::with_capacity(weight_data.len());
+    let mut weight_claims = Vec::with_capacity(weight_data.len());
+    let mut weight_opening_transcript_mode = WeightOpeningTranscriptMode::Sequential;
+    let mut aggregated_binding_proof = None;
+
+    let use_aggregated_oracle_sumcheck = gkr_aggregated_oracle_sumcheck_enabled()
+        && (!weight_data.is_empty() || !deferred_weight_claims_data.is_empty());
+
+    let aggregate_weight_binding = aggregate_weight_binding
+        && (!weight_data.is_empty() || !deferred_weight_claims_data.is_empty())
+        && !use_aggregated_oracle_sumcheck;
+
+    let (weight_commitments_new);
+    if use_aggregated_oracle_sumcheck {
+        weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
+        let (wc, claims, proof) = apply_aggregated_oracle_sumcheck(
+            &weight_data, &deferred_weight_claims_data, &mut deferred_proofs,
+            weights, channel, "GKR-decode-GPU", weight_cache,
+        )?;
+        weight_commitments_new = wc;
+        weight_claims = claims;
+        aggregated_binding_proof = proof;
+    } else if aggregate_weight_binding {
+        weight_opening_transcript_mode = WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1;
+        weight_claims =
+            apply_aggregated_rlc_binding(&weight_data, &deferred_weight_claims_data, channel);
+        weight_commitments_new = Vec::new();
+    } else {
+        weight_commitments_new = Vec::new();
+        weight_claims = weight_data
+            .iter()
+            .map(|(wid, ep, ev)| super::types::WeightClaim {
+                weight_node_id: *wid,
+                eval_point: ep.clone(),
+                expected_value: *ev,
+            })
+            .collect();
+        // Sequential weight openings
+        for (opening_idx, (weight_node_id, _eval_point, _expected_value)) in
+            weight_data.into_iter().enumerate()
+        {
+            let b_matrix = weights.get_weight(weight_node_id).ok_or(
+                GKRError::MissingWeight { node_id: weight_node_id },
+            )?;
+            let claim = &weight_claims[opening_idx];
+            let b_mle_u32 = matrix_to_mle_col_major_u32_padded(b_matrix);
+            let (commitment, opening) =
+                crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32(
+                    &b_mle_u32, &claim.eval_point, channel,
+                );
+            weight_commitments.push(commitment);
+            weight_openings.push(opening);
+        }
+    }
+    weight_commitments.extend(weight_commitments_new);
+
+    if let Some(mode) = finalize_weight_transcript_mode(&flags, aggregate_weight_binding) {
+        weight_opening_transcript_mode = mode;
+    }
+
+    let model_input = execution.intermediates.get(&0).unwrap_or(&execution.output);
+    let io_commitment = crate::aggregation::compute_io_commitment(model_input, &execution.output);
+
+    emit_proof_event!(|| proof_stream::ProofEvent::ProofComplete {
+        duration_ms: t_gkr_walk.elapsed().as_millis() as u64,
+        num_layer_proofs: layer_proofs.len(),
+        num_weight_openings: weight_openings.len(),
+        weight_binding_mode: "gpu-decode-sequential".to_string(),
+    });
+
+    Ok(GKRProof {
+        layer_proofs,
+        output_claim,
+        input_claim: current_claim,
+        weight_commitments,
+        weight_openings,
+        weight_claims,
+        weight_opening_transcript_mode,
+        io_commitment,
+        deferred_proofs,
+        aggregated_binding: aggregated_binding_proof,
+        kv_cache_commitment: None,
+        prev_kv_cache_commitment: None,
+    })
+}
+
+/// Prove a decode step with the best available backend.
+///
+/// Uses `prove_gkr_decode_gpu_with_cache` when CUDA runtime is enabled and GPU
+/// is available, otherwise falls back to `prove_gkr_decode`.
+pub fn prove_gkr_decode_auto_with_cache(
+    circuit: &LayeredCircuit,
+    execution: &GraphExecution,
+    weights: &GraphWeights,
+    channel: &mut PoseidonChannel,
+    weight_cache: Option<&crate::weight_cache::SharedWeightCache>,
+    decode_attention_data: &std::collections::HashMap<
+        usize,
+        (AttentionIntermediates, usize),
+    >,
+) -> Result<GKRProof, GKRError> {
+    #[cfg(feature = "cuda-runtime")]
+    {
+        if crate::backend::force_gpu() || crate::backend::gpu_is_available() {
+            return prove_gkr_decode_gpu_with_cache(
+                circuit, execution, weights, channel, weight_cache, decode_attention_data,
+            );
+        }
+    }
+    prove_gkr_decode(circuit, execution, weights, channel, weight_cache, decode_attention_data)
+}
+
 /// GPU matmul reduction: dispatches to `GpuSumcheckExecutor::reduce_matmul_layer_gpu`.
 #[cfg(feature = "cuda-runtime")]
 fn reduce_matmul_layer_gpu(
