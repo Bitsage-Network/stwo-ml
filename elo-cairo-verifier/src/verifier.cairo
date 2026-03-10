@@ -510,7 +510,7 @@ mod SumcheckVerifierContract {
         stream_has_kv_cache: Map<u64, bool>,
         /// session_id → KV-cache super-commitment (Poseidon over all K/V heads).
         stream_kv_cache_commitment: Map<u64, felt252>,
-        /// session_id → previous step's KV-cache commitment (ZERO for prefill).
+        /// session_id → previous step's KV-cache commitment (for chaining).
         stream_prev_kv_cache_commitment: Map<u64, felt252>,
     }
 
@@ -557,6 +557,7 @@ mod SumcheckVerifierContract {
         io_commitment: felt252,
         num_layers: u32,
         kv_cache_commitment: felt252,
+        prev_kv_cache_commitment: felt252,
     }
 
     #[derive(Drop, starknet::Event)]
@@ -1092,13 +1093,12 @@ mod SumcheckVerifierContract {
             // Seed Fiat-Shamir channel (deterministic, no MLE eval here)
             let _padded_out_cols = next_power_of_two(out_cols);
             let mut ch = channel_default();
-
-            // Mix KV-cache commitment BEFORE circuit metadata (matches prover order
-            // in aggregation.rs: mix_felt(kv) → prove_gkr → mix_u64(depth, rows, cols))
+            // KV-cache commitments mixed BEFORE circuit_depth (matches Rust prover order).
+            // Both current and previous KV are bound for sequential inference chaining.
             if has_kv_cache {
                 channel_mix_felt(ref ch, kv_cache_commitment);
+                channel_mix_felt(ref ch, prev_kv_cache_commitment);
             }
-
             channel_mix_u64(ref ch, circuit_depth.into());
             channel_mix_u64(ref ch, in_rows_v.into());
             channel_mix_u64(ref ch, in_cols.into());
@@ -1123,6 +1123,11 @@ mod SumcheckVerifierContract {
             self.stream_out_cols.entry(session_id).write(out_cols);
             self.stream_in_cols.entry(session_id).write(in_cols);
             self.stream_out_data_m31_start.entry(session_id).write(3 + in_len + 3);
+
+            // Store KV-cache fields
+            self.stream_has_kv_cache.entry(session_id).write(has_kv_cache == 1);
+            self.stream_kv_cache_commitment.entry(session_id).write(kv_cache_commitment);
+            self.stream_prev_kv_cache_commitment.entry(session_id).write(prev_kv_cache_commitment);
 
             self.stream_initialized.entry(session_id).write(true);
             self.stream_output_mle_done.entry(session_id).write(false);
@@ -1778,11 +1783,12 @@ mod SumcheckVerifierContract {
             let ch_digest = self.stream_channel_digest.entry(session_id).read();
             let stored_io_commitment = self.stream_io_commitment.entry(session_id).read();
             let num_layers = self.stream_total_layers.entry(session_id).read();
-            let proof_hash = if self.stream_has_kv_cache.entry(session_id).read() {
-                let stored_kv = self.stream_kv_cache_commitment.entry(session_id).read();
+            let has_kv = self.stream_has_kv_cache.entry(session_id).read();
+            let stored_kv = self.stream_kv_cache_commitment.entry(session_id).read();
+            let stored_prev_kv = self.stream_prev_kv_cache_commitment.entry(session_id).read();
+            let proof_hash = if has_kv {
                 core::poseidon::poseidon_hash_span(
-                    array![ch_digest, stored_io_commitment, stored_kv, model_id, num_layers.into()]
-                        .span(),
+                    array![ch_digest, stored_io_commitment, model_id, num_layers.into(), stored_kv, stored_prev_kv].span(),
                 )
             } else {
                 core::poseidon::poseidon_hash_span(
@@ -1795,17 +1801,13 @@ mod SumcheckVerifierContract {
             self.verified_proofs.entry(proof_hash).write(true);
             let count = self.verification_counts.entry(model_id).read();
             self.verification_counts.entry(model_id).write(count + 1);
-            let kv_commit_for_event = if self.stream_has_kv_cache.entry(session_id).read() {
-                self.stream_kv_cache_commitment.entry(session_id).read()
-            } else {
-                0
-            };
             self.emit(ModelGkrVerified {
                 model_id,
                 proof_hash,
                 io_commitment: stored_io_commitment,
                 num_layers,
-                kv_cache_commitment: kv_commit_for_event,
+                kv_cache_commitment: stored_kv,
+                prev_kv_cache_commitment: stored_prev_kv,
             });
 
             self.stream_finalized.entry(session_id).write(true);

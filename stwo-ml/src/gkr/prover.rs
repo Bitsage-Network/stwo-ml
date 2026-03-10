@@ -2025,6 +2025,8 @@ pub fn prove_gkr_with_cache(
         io_commitment,
         deferred_proofs,
         aggregated_binding: aggregated_binding_proof,
+        kv_cache_commitment: None,
+        prev_kv_cache_commitment: None,
     };
 
     profiler.end_phase(channel.hash_count());
@@ -3047,6 +3049,8 @@ pub fn prove_gkr_gpu_with_cache(
         io_commitment,
         deferred_proofs,
         aggregated_binding: aggregated_binding_proof,
+        kv_cache_commitment: None,
+        prev_kv_cache_commitment: None,
     };
 
     profiler.end_phase(channel.hash_count());
@@ -3936,6 +3940,8 @@ pub fn prove_gkr_simd_gpu_with_cache(
         io_commitment,
         deferred_proofs,
         aggregated_binding: aggregated_binding_proof,
+        kv_cache_commitment: None,
+        prev_kv_cache_commitment: None,
     })
 }
 

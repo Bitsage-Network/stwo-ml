@@ -542,6 +542,14 @@ pub struct GKRProof {
     /// When present, `weight_openings` is empty — all claims are proven
     /// in one shot via a mismatch sumcheck + single MLE opening.
     pub aggregated_binding: Option<AggregatedWeightBindingProof>,
+
+    /// KV-cache commitment (Poseidon hash of current KV state after this inference).
+    /// Present when the proof covers a model with KV-cache (autoregressive decoding).
+    pub kv_cache_commitment: Option<starknet_ff::FieldElement>,
+
+    /// Previous KV-cache commitment (for chaining sequential inferences).
+    /// Present when `kv_cache_commitment` is set.
+    pub prev_kv_cache_commitment: Option<starknet_ff::FieldElement>,
 }
 
 /// Discriminant for deferred proof kind: weight-bearing (MatMul) vs weightless

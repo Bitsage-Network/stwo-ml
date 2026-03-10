@@ -3832,6 +3832,8 @@ where
 
     // Step 4: Generate GKR proof
     let mut gkr_channel = crate::crypto::poseidon_channel::PoseidonChannel::new();
+    // KV-cache commitment mixed before circuit metadata (when present)
+    // Currently None — will be populated by KV-cache proving pipeline
     let gkr_proof = crate::gkr::prove_gkr(&circuit, &gkr_execution, weights, &mut gkr_channel)
         .map_err(|e| AggregationError::ProvingError(format!("GKR proving: {e}")))?;
 
@@ -7267,6 +7269,14 @@ pub fn verify_aggregated_model_proof_onchain(
         })?;
 
         let mut gkr_channel = crate::crypto::poseidon_channel::PoseidonChannel::new();
+        // KV-cache commitments mixed before circuit metadata (matches Cairo verifier order).
+        // Both current and previous KV bound for sequential inference chaining.
+        if let Some(kv) = gkr_proof.kv_cache_commitment {
+            gkr_channel.mix_felt(kv);
+            if let Some(prev_kv) = gkr_proof.prev_kv_cache_commitment {
+                gkr_channel.mix_felt(prev_kv);
+            }
+        }
         crate::gkr::verify_gkr_with_weights(
             &circuit,
             gkr_proof,

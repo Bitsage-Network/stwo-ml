@@ -2301,6 +2301,7 @@ fn main() {
                                                 }).collect::<Vec<_>>(),
                                                 "finalize_calldata": streaming.finalize_calldata,
                                                 "layer_tags": streaming.session_metadata.layer_tags,
+                                                "has_kv_cache": streaming.session_metadata.has_kv_cache,
                                             })
                                         }
                                         Err(e) => {

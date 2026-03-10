@@ -1547,6 +1547,7 @@ pub fn build_chunked_gkr_calldata(
             Some(proof.io_commitment),
             proof.aggregated_binding.as_ref(),
             kv_cache_commitment,
+            proof.prev_kv_cache_commitment,
         ).map_err(|e| StarknetModelError::SoundnessGate(
             format!("self-verification failed: {e}")
         ))?;
@@ -1722,6 +1723,8 @@ pub struct StreamSessionMetadata {
     pub weight_binding_mode: u32,
     /// Layer tags in GKR walk order (output → input) for circuit hash registration.
     pub layer_tags: Vec<u32>,
+    /// Whether this proof includes KV-cache commitments.
+    pub has_kv_cache: bool,
 }
 
 /// Build streaming GKR calldata for calldata-only verification (v25).
@@ -1782,13 +1785,15 @@ pub fn build_streaming_gkr_calldata(
     init_calldata.push(format!("{}", io_in_cols));  // in_cols
     init_calldata.push(format!("{}", io_out_cols));  // out_cols
 
-    // KV-cache commitment (optional — for autoregressive models)
+    // KV-cache commitment fields (always 3 felts for positional Cairo params)
     if let (Some(kv), Some(prev_kv)) = (kv_cache_commitment, prev_kv_cache_commitment) {
-        init_calldata.push("1".to_string()); // has_kv = true
+        init_calldata.push("1".to_string());
         init_calldata.push(format!("0x{:x}", kv));
         init_calldata.push(format!("0x{:x}", prev_kv));
     } else {
-        init_calldata.push("0".to_string()); // has_kv = false
+        init_calldata.push("0".to_string());
+        init_calldata.push("0x0".to_string());
+        init_calldata.push("0x0".to_string());
     }
 
     // ── Build chunked output_mle calldata ──
@@ -1853,6 +1858,7 @@ pub fn build_streaming_gkr_calldata(
         Some(proof.io_commitment),
         proof.aggregated_binding.as_ref(),
         kv_cache_commitment,
+        prev_kv_cache_commitment,
     ).map_err(|e| StarknetModelError::SoundnessGate(
         format!("streaming self-verification failed: {e}")
     ))?;
@@ -2194,6 +2200,7 @@ pub fn build_streaming_gkr_calldata(
             num_layers,
             weight_binding_mode: binding_mode,
             layer_tags: layer_tags_vec,
+            has_kv_cache: proof.kv_cache_commitment.is_some(),
         },
         upload_chunks: chunked.chunks,
     })
@@ -2745,6 +2752,7 @@ fn build_verify_model_gkr_calldata_inner(
         Some(proof.io_commitment),
         proof.aggregated_binding.as_ref(),
         None, // KV-cache commitment: not used in V1/V4 direct calldata path
+        None, // prev_kv_cache_commitment
     ).map_err(|e| StarknetModelError::SoundnessGate(
         format!("self-verification failed: {e}")
     ))?;
@@ -3175,6 +3183,7 @@ pub fn replay_verify_serialized_proof(
     expected_io_commitment: Option<FieldElement>,
     weight_binding: Option<&crate::crypto::aggregated_opening::AggregatedWeightBindingProof>,
     kv_cache_commitment: Option<FieldElement>,
+    prev_kv_cache_commitment: Option<FieldElement>,
 ) -> Result<(), String> {
     use crate::crypto::poseidon_channel::PoseidonChannel;
     use crate::gkr::prover::mix_secure_field;
@@ -3260,13 +3269,14 @@ pub fn replay_verify_serialized_proof(
     }
 
     let mut ch = PoseidonChannel::new();
-
-    // Mix KV-cache commitment BEFORE circuit metadata (must match prover order
-    // in aggregation.rs: mix_felt(kv) → prove_gkr → mix_u64(depth, rows, cols))
-    if let Some(kvc) = kv_cache_commitment {
-        ch.mix_felt(kvc);
+    // KV-cache commitments mixed BEFORE circuit_depth (matches Cairo verifier order).
+    // Both current and previous KV are bound for sequential inference chaining.
+    if let Some(kv) = kv_cache_commitment {
+        ch.mix_felt(kv);
+        if let Some(prev_kv) = prev_kv_cache_commitment {
+            ch.mix_felt(prev_kv);
+        }
     }
-
     ch.mix_u64(circuit_depth as u64);
     ch.mix_u64(input_rows);
     ch.mix_u64(input_cols);
@@ -7674,7 +7684,8 @@ mod tests {
             false,
             Some(gkr.io_commitment),
             None,
-            None,
+            None, // no KV cache
+            None, // no prev KV
         );
         assert!(result.is_ok(), "replay_verify failed: {:?}", result.err());
         println!("SUCCESS: replay_verify_serialized_proof passed");
@@ -9031,6 +9042,7 @@ mod tests {
         // We test the None path (full builder) and verify format by comparing
         // against a KV-enabled build that skips replay verification.
         use crate::aggregation::prove_model_pure_gkr;
+        let _guard = EnvVarGuard::unset("STWO_AGGREGATED_RLC_ONLY");
 
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(2);
@@ -9065,31 +9077,24 @@ mod tests {
         .expect("streaming calldata should build without KV");
         let init_no_kv = &streaming_no_kv.init_calldata;
 
-        // Last element without KV should be "0" (has_kv = false)
-        assert_eq!(
-            init_no_kv.last().unwrap(), "0",
-            "has_kv should be 0 when None"
-        );
+        // 3-felt KV format: last 3 entries should be [has_kv=0, kv=0x0, prev_kv=0x0]
+        let no_kv_len = init_no_kv.len();
+        assert!(no_kv_len >= 6, "init_calldata too short: {no_kv_len}");
+        assert_eq!(&init_no_kv[no_kv_len - 3], "0", "has_kv should be 0 when None");
+        assert_eq!(&init_no_kv[no_kv_len - 2], "0x0", "kv_commitment should be 0x0");
+        assert_eq!(&init_no_kv[no_kv_len - 1], "0x0", "prev_kv_commitment should be 0x0");
 
-        // Verify KV serialization format by manually constructing what init_calldata
-        // would look like with KV appended (the serialization happens before replay).
+        // Verify KV serialization format with actual KV commitments.
         let kvc = FieldElement::from(0xCAFEu64);
         let prev_kvc = FieldElement::from(0xDEADu64);
 
-        // The None path ends with: ..., in_cols, out_cols, "0" (has_kv)
+        // The None path ends with: ..., in_cols, out_cols, "0", "0x0", "0x0"
         // The Some path should end with: ..., in_cols, out_cols, "1", kvc_hex, prev_kvc_hex
-        // Verify by checking the no-KV suffix and computing expected KV suffix.
-        let no_kv_len = init_no_kv.len();
-        assert!(no_kv_len >= 3, "init_calldata too short: {no_kv_len}");
-
-        // The in_cols and out_cols should be at positions [-3] and [-2] in no-KV mode
-        let in_cols_str = &init_no_kv[no_kv_len - 3];
-        let out_cols_str = &init_no_kv[no_kv_len - 2];
+        let out_cols_str = &init_no_kv[no_kv_len - 4];
+        let in_cols_str = &init_no_kv[no_kv_len - 5];
 
         // With KV, the expected format is:
         // [..., in_cols, out_cols, "1", "0xcafe", "0xdead"]
-        // The prefix (everything before in_cols) should be identical.
-        let expected_kv_init_len = no_kv_len - 1 + 3; // remove "0", add "1", kvc, prev_kvc
         let expected_kv_suffix = vec![
             in_cols_str.clone(),
             out_cols_str.clone(),
@@ -9097,9 +9102,9 @@ mod tests {
             format!("0x{:x}", kvc),
             format!("0x{:x}", prev_kvc),
         ];
-        // Verify the prefix matches
-        let prefix_len = no_kv_len - 3;
-        let _ = (expected_kv_init_len, expected_kv_suffix, prefix_len);
+        // Verify the prefix would match
+        let prefix_len = no_kv_len - 5;
+        let _ = (expected_kv_suffix, prefix_len);
         // The format is validated: has_kv=0 for None, has_kv=1+kvc+prev for Some
     }
 
@@ -9129,6 +9134,8 @@ mod tests {
         let proof = prove_model_pure_gkr(&graph, &input, &weights)
             .expect("GKR proving should succeed");
         let gkr = proof.gkr_proof.as_ref().expect("GKR proof expected");
+        // No KV cache → last 3 init felts should be [0, 0x0, 0x0]
+        assert!(gkr.kv_cache_commitment.is_none());
 
         let circuit = crate::gkr::LayeredCircuit::from_graph(&graph).expect("circuit compile");
         let raw_io = crate::cairo_serde::serialize_raw_io(&input, &proof.execution.output);
@@ -9139,16 +9146,18 @@ mod tests {
         )
         .expect("streaming calldata should build without KV commitment");
 
-        // Init calldata should end with: ..., in_cols, out_cols, has_kv(0)
         let init = &streaming.init_calldata;
         let len = init.len();
-        assert_eq!(init[len - 1], "0", "has_kv should be 0 when None");
+        // Last 3 entries: has_kv=0, kv=0x0, prev_kv=0x0
+        assert_eq!(&init[len - 3], "0", "has_kv should be 0 for non-KV proof");
+        assert_eq!(&init[len - 2], "0x0", "kv_commitment should be 0x0");
+        assert_eq!(&init[len - 1], "0x0", "prev_kv_commitment should be 0x0");
 
-        // Verify the element before has_kv is out_cols (a numeric value)
-        let out_cols_str = &init[len - 2];
+        // out_cols is at len-4 (before the 3 KV felts)
+        let out_cols_str = &init[len - 4];
         assert!(
             out_cols_str.parse::<u32>().is_ok(),
-            "element before has_kv should be out_cols (numeric), got: {out_cols_str}"
+            "element before KV felts should be out_cols (numeric), got: {out_cols_str}"
         );
     }
 

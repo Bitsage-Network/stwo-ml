@@ -1512,6 +1512,8 @@ pub fn serialize_gkr_model_proof(proof: &crate::gkr::GKRProof, output: &mut Vec<
                         io_commitment: proof.io_commitment,
                         deferred_proofs: vec![],
                         aggregated_binding: None,
+                        kv_cache_commitment: None,
+                        prev_kv_cache_commitment: None,
                     };
                     let mut sub_buf = Vec::new();
                     serialize_gkr_model_proof(&tmp, &mut sub_buf);
@@ -1951,6 +1953,8 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
                         io_commitment: proof.io_commitment,
                         deferred_proofs: vec![],
                         aggregated_binding: None,
+                        kv_cache_commitment: None,
+                        prev_kv_cache_commitment: None,
                     };
                     let mut sub_buf = Vec::new();
                     serialize_gkr_model_proof(&tmp, &mut sub_buf);
@@ -2396,6 +2400,8 @@ fn serialize_layer_proof_packed_inner(
                         io_commitment: proof.io_commitment,
                         deferred_proofs: vec![],
                         aggregated_binding: None,
+                        kv_cache_commitment: None,
+                        prev_kv_cache_commitment: None,
                     };
                     let mut sub_buf = Vec::new();
                     serialize_gkr_model_proof(&tmp, &mut sub_buf);
@@ -2881,6 +2887,8 @@ fn serialize_layer_proof_double_packed_inner(
                         io_commitment: proof.io_commitment,
                         deferred_proofs: vec![],
                         aggregated_binding: None,
+                        kv_cache_commitment: None,
+                        prev_kv_cache_commitment: None,
                     };
                     let mut sub_buf = Vec::new();
                     serialize_gkr_model_proof(&tmp, &mut sub_buf);
@@ -5858,6 +5866,8 @@ mod tests {
             io_commitment: FieldElement::ZERO,
             deferred_proofs: vec![],
             aggregated_binding: None,
+            kv_cache_commitment: None,
+            prev_kv_cache_commitment: None,
         };
 
         // Serialize both ways
