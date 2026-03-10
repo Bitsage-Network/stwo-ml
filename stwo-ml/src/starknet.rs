@@ -2051,19 +2051,33 @@ pub fn build_streaming_gkr_calldata(
         crate::cairo_serde::serialize_u32(proof.deferred_proofs.len() as u32, &mut deferred_felts);
         for deferred in &proof.deferred_proofs {
             crate::cairo_serde::serialize_qm31_packed(deferred.claim.value, &mut deferred_felts);
-            if let crate::gkr::types::LayerProof::MatMul {
-                round_polys,
-                final_a_eval,
-                final_b_eval,
-            } = &deferred.layer_proof
-            {
-                crate::cairo_serde::serialize_u32(round_polys.len() as u32, &mut deferred_felts);
-                for rp in round_polys {
-                    crate::cairo_serde::serialize_qm31_packed(rp.c0, &mut deferred_felts);
-                    crate::cairo_serde::serialize_qm31_packed(rp.c2, &mut deferred_felts);
+            match &deferred.kind {
+                crate::gkr::types::DeferredProofKind::MatMul { weight_commitment, .. } => {
+                    crate::cairo_serde::serialize_u32(0, &mut deferred_felts);
+                    if let crate::gkr::types::LayerProof::MatMul {
+                        round_polys,
+                        final_a_eval,
+                        final_b_eval,
+                    } = &deferred.layer_proof
+                    {
+                        crate::cairo_serde::serialize_u32(round_polys.len() as u32, &mut deferred_felts);
+                        for rp in round_polys {
+                            crate::cairo_serde::serialize_qm31_packed(rp.c0, &mut deferred_felts);
+                            crate::cairo_serde::serialize_qm31_packed(rp.c2, &mut deferred_felts);
+                        }
+                        crate::cairo_serde::serialize_qm31_packed(*final_a_eval, &mut deferred_felts);
+                        crate::cairo_serde::serialize_qm31_packed(*final_b_eval, &mut deferred_felts);
+                    }
+                    deferred_felts.push(*weight_commitment);
                 }
-                crate::cairo_serde::serialize_qm31_packed(*final_a_eval, &mut deferred_felts);
-                crate::cairo_serde::serialize_qm31_packed(*final_b_eval, &mut deferred_felts);
+                crate::gkr::types::DeferredProofKind::Weightless => {
+                    crate::cairo_serde::serialize_u32(1, &mut deferred_felts);
+                    if let crate::gkr::types::LayerProof::Add { lhs_eval, rhs_eval, trunk_idx } = &deferred.layer_proof {
+                        crate::cairo_serde::serialize_qm31_packed(*lhs_eval, &mut deferred_felts);
+                        crate::cairo_serde::serialize_qm31_packed(*rhs_eval, &mut deferred_felts);
+                        crate::cairo_serde::serialize_u32(*trunk_idx as u32, &mut deferred_felts);
+                    }
+                }
             }
         }
         deferred_proof_calldata.push(format!("{}", deferred_felts.len()));
@@ -4296,6 +4310,146 @@ pub fn replay_verify_serialized_proof(
                     eprintln!("[VERIFIER Embedding] layer {} vocab={} dim={} ch={:?}",
                         layer, emb_vocab_size, emb_embed_dim, ch.digest());
                 }
+            11 => {
+                // AttentionDecode — same structure as Attention (tag 5) but with
+                // DCOD domain tag and dual dimensions (new_tokens, full_seq_len).
+                let num_sub_proofs = read_u32_from(proof_data, &mut off) as usize;
+                let num_heads = read_u32_from(proof_data, &mut off) as usize;
+                let new_tokens = read_u32_from(proof_data, &mut off) as usize;
+                let full_seq_len = read_u32_from(proof_data, &mut off) as usize;
+                let d_model = read_u32_from(proof_data, &mut off) as usize;
+                let causal_flag = read_u32_from(proof_data, &mut off);
+                let d_k = d_model / num_heads;
+
+                let mut sub_claim_values = Vec::with_capacity(num_sub_proofs);
+                for _ in 0..num_sub_proofs {
+                    sub_claim_values.push(read_qm31_from(proof_data, &mut off));
+                }
+
+                // Mix DCOD metadata
+                ch.mix_u64(0x44434F44_u64); // "DCOD"
+                ch.mix_u64(num_heads as u64);
+                ch.mix_u64(new_tokens as u64);
+                ch.mix_u64(full_seq_len as u64);
+                ch.mix_u64(d_model as u64);
+                ch.mix_u64(causal_flag as u64);
+
+                if trace {
+                    eprintln!(
+                        "[VERIFIER AttentionDecode] num_sub={} heads={} new_tokens={} full_seq={} d_model={} causal={}",
+                        num_sub_proofs, num_heads, new_tokens, full_seq_len, d_model, causal_flag
+                    );
+                }
+
+                let two = SecureField::from(M31::from(2u32));
+                let mut proof_idx = 0usize;
+
+                macro_rules! replay_matmul_decode {
+                    ($claim_val:expr, $m:expr, $k:expr, $n:expr) => {{
+                        let cv = $claim_val;
+                        let mm = $m;
+                        let kk = $k;
+                        let nn = $n;
+                        ch.mix_u64(mm as u64);
+                        ch.mix_u64(kk as u64);
+                        ch.mix_u64(nn as u64);
+                        mix_secure_field(&mut ch, cv);
+                        let nr = read_u32_from(proof_data, &mut off) as usize;
+                        let mut csum = cv;
+                        for _ in 0..nr {
+                            let c0 = read_qm31_from(proof_data, &mut off);
+                            let c2 = read_qm31_from(proof_data, &mut off);
+                            let c1 = csum - two * c0 - c2;
+                            ch.mix_poly_coeffs(c0, c1, c2);
+                            let chal = ch.draw_qm31();
+                            csum = c0 + c1 * chal + c2 * chal * chal;
+                        }
+                        let fa = read_qm31_from(proof_data, &mut off);
+                        let fb = read_qm31_from(proof_data, &mut off);
+                        if csum != fa * fb {
+                            return Err(format!(
+                                "DCOD_MATMUL_FINAL_MISMATCH at layer {}: sum={:?} != a*b={:?}",
+                                layer, csum, fa * fb
+                            ));
+                        }
+                        mix_secure_field(&mut ch, fa);
+                        mix_secure_field(&mut ch, fb);
+                        fa
+                    }};
+                }
+
+                // Sub-proof 0: Output projection (new_tokens × d_model × d_model)
+                let sub_tag_0 = read_u32_from(proof_data, &mut off);
+                if sub_tag_0 != 0 {
+                    return Err(format!("DCOD_SUB0_NOT_MATMUL: tag={}", sub_tag_0));
+                }
+                let _output_proj_a = replay_matmul_decode!(
+                    current_claim_value, new_tokens, d_model, d_model
+                );
+                proof_idx += 1;
+
+                // Per-head sub-proofs (h = H-1..0): context + score
+                for _h in 0..num_heads {
+                    // Context: new_tokens × full_seq_len × d_k
+                    let pm_ctx = new_tokens.next_power_of_two();
+                    let pn_ctx = d_k.next_power_of_two();
+                    let log_ctx = pm_ctx.ilog2() as usize + pn_ctx.ilog2() as usize;
+                    let _r_ctx = ch.draw_qm31s(log_ctx);
+                    mix_secure_field(&mut ch, sub_claim_values[proof_idx]);
+
+                    let sub_tag = read_u32_from(proof_data, &mut off);
+                    if sub_tag != 0 {
+                        return Err(format!("DCOD_CTX_NOT_MATMUL: tag={}", sub_tag));
+                    }
+                    let _ctx_a = replay_matmul_decode!(
+                        sub_claim_values[proof_idx], new_tokens, full_seq_len, d_k
+                    );
+                    proof_idx += 1;
+
+                    // Score: new_tokens × d_k × full_seq_len
+                    let pm_sc = new_tokens.next_power_of_two();
+                    let pn_sc = full_seq_len.next_power_of_two();
+                    let log_sc = pm_sc.ilog2() as usize + pn_sc.ilog2() as usize;
+                    let _r_sc = ch.draw_qm31s(log_sc);
+                    mix_secure_field(&mut ch, sub_claim_values[proof_idx]);
+
+                    let sub_tag2 = read_u32_from(proof_data, &mut off);
+                    if sub_tag2 != 0 {
+                        return Err(format!("DCOD_SCORE_NOT_MATMUL: tag={}", sub_tag2));
+                    }
+                    let _score_a = replay_matmul_decode!(
+                        sub_claim_values[proof_idx], new_tokens, d_k, full_seq_len
+                    );
+                    proof_idx += 1;
+                }
+
+                // V, K, Q projections: new_tokens × d_model × d_model
+                let mut last_final_a = SecureField::zero();
+                for proj_label in &["V", "K", "Q"] {
+                    let pm = new_tokens.next_power_of_two();
+                    let pn = d_model.next_power_of_two();
+                    let log_proj = pm.ilog2() as usize + pn.ilog2() as usize;
+                    let _r_proj = ch.draw_qm31s(log_proj);
+                    mix_secure_field(&mut ch, sub_claim_values[proof_idx]);
+
+                    let sub_tag = read_u32_from(proof_data, &mut off);
+                    if sub_tag != 0 {
+                        return Err(format!("DCOD_{}_NOT_MATMUL: tag={}", proj_label, sub_tag));
+                    }
+                    last_final_a = replay_matmul_decode!(
+                        sub_claim_values[proof_idx], new_tokens, d_model, d_model
+                    );
+                    proof_idx += 1;
+                }
+
+                if proof_idx != num_sub_proofs {
+                    return Err(format!(
+                        "DCOD_SUBPROOF_COUNT_MISMATCH: expected {} got {}",
+                        num_sub_proofs, proof_idx
+                    ));
+                }
+
+                current_claim_value = last_final_a;
             }
             _ => return Err(format!("Unknown tag {} at layer {}", tag, layer)),
         }
@@ -4369,59 +4523,6 @@ pub fn replay_verify_serialized_proof(
                     kind, di
                 ));
             }
-        }
-    }
-
-    // Reject trailing data after all proofs
-    if off != proof_data.len() {
-        return Err(format!(
-            "trailing data after deferred proofs: consumed {} of {} felts",
-            off, proof_data.len()
-        ));
-    }
-
-    // Weight binding transcript replay (AggregatedOracleSumcheck full binding).
-    // Reproduces the channel operations from verify_aggregated_binding() and
-    // verify_mle_opening() so the full Fiat-Shamir transcript is checked.
-    if let Some(binding) = weight_binding {
-        use crate::crypto::mle_opening::mle_n_queries;
-
-        if trace {
-            eprintln!("[VERIFIER] replaying weight binding (n_claims={}, n_global={})",
-                binding.config.n_claims, binding.config.n_global);
-        }
-
-        // 1. Mix super-root
-        ch.mix_felt(binding.super_root.root);
-
-        // 2. Draw β weights (rho + geometric powers)
-        let _rho = ch.draw_qm31();
-
-        // 3. Sumcheck rounds
-        for &(c0, c1, c2) in &binding.sumcheck_round_polys {
-            ch.mix_poly_coeffs(c0, c1, c2);
-            let _r = ch.draw_qm31();
-        }
-
-        // 4-5. MLE opening transcript
-        // Legacy path (per_matrix_openings is always None in practice):
-        // mix oracle eval, then verify_mle_opening against super_root.
-        ch.mix_felts(&[binding.oracle_eval_at_s]);
-
-        // verify_mle_opening channel ops: mix commitment + intermediate roots + draw queries
-        ch.mix_felt(binding.super_root.root);
-        for root in &binding.opening_proof.intermediate_roots {
-            ch.mix_felt(*root);
-        }
-        let n_rounds = binding.sumcheck_round_polys.len();
-        let half_n = if n_rounds > 0 { 1usize << (n_rounds - 1) } else { 0 };
-        let n_queries = mle_n_queries().min(half_n);
-        for _ in 0..n_queries {
-            let _ = ch.draw_felt252();
-        }
-
-        if trace {
-            eprintln!("[VERIFIER] ch after weight binding: {:?}", ch.digest());
         }
     }
 

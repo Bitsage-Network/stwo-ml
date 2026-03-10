@@ -49,6 +49,7 @@ pub use prover::prove_gkr;
 pub use prover::prove_gkr_auto;
 pub use prover::prove_gkr_auto_with_cache;
 pub use prover::prove_gkr_with_cache;
+pub use prover::prove_gkr_decode;
 #[cfg(feature = "cuda-runtime")]
 pub use prover::prove_gkr_gpu;
 #[cfg(feature = "cuda-runtime")]

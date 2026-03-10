@@ -468,6 +468,7 @@ fn test_gkr_roundtrip_with_activation() {
             stwo_ml::gkr::types::LayerProof::Dequantize { .. } => "Dequantize",
             stwo_ml::gkr::types::LayerProof::MatMulDualSimd { .. } => "MatMulDualSimd",
             stwo_ml::gkr::types::LayerProof::Attention { .. } => "Attention",
+            stwo_ml::gkr::types::LayerProof::AttentionDecode { .. } => "AttentionDecode",
             stwo_ml::gkr::types::LayerProof::Quantize { .. } => "Quantize",
             stwo_ml::gkr::types::LayerProof::Embedding { .. } => "Embedding",
         })
@@ -909,6 +910,7 @@ fn test_gkr_roundtrip_with_layernorm() {
             stwo_ml::gkr::types::LayerProof::Dequantize { .. } => "Dequantize",
             stwo_ml::gkr::types::LayerProof::MatMulDualSimd { .. } => "MatMulDualSimd",
             stwo_ml::gkr::types::LayerProof::Attention { .. } => "Attention",
+            stwo_ml::gkr::types::LayerProof::AttentionDecode { .. } => "AttentionDecode",
             stwo_ml::gkr::types::LayerProof::Quantize { .. } => "Quantize",
             stwo_ml::gkr::types::LayerProof::Embedding { .. } => "Embedding",
         })
@@ -1652,4 +1654,134 @@ fn test_d11_export_residual_onchain_calldata() {
     eprintln!("D11 Residual artifacts exported:");
     eprintln!("  Register: {} parts", register_calldata.len());
     eprintln!("  Total:    {} felts", gkr_sn.total_calldata_size);
+}
+
+// ============================================================================
+// E2E Decode Step: prove → serialize → self-verify (tag 11 + Weightless deferred)
+// ============================================================================
+
+#[test]
+fn test_e2e_decode_cairo_verify() {
+    use stwo_ml::aggregation::{IncrementalKVCommitment, prove_model_pure_gkr_decode_step};
+    use stwo_ml::components::attention::{
+        attention_forward_cached, AttentionWeights, ModelKVCache,
+    };
+    use stwo_ml::compiler::graph::GraphBuilder;
+    use stwo_ml::compiler::onnx::generate_weights_for_graph;
+    use stwo_ml::starknet::{extract_matmul_dims, replay_verify_serialized_proof};
+
+    let d_model = 64;
+    let num_heads = 2;
+    let d_ff = 256;
+    let prefill_len = 4;
+
+    // Build decode graph (1-layer transformer block)
+    let mut builder = GraphBuilder::new((1, d_model));
+    builder.transformer_block(num_heads, num_heads, 1, d_ff);
+    let graph = builder.build();
+
+    let mut weights = generate_weights_for_graph(&graph, 42);
+
+    // Helper: deterministic random matrix
+    let random_m31 = |rows: usize, cols: usize, seed: u64| -> M31Matrix {
+        let mut data = Vec::with_capacity(rows * cols);
+        let mut state = seed;
+        for _ in 0..(rows * cols) {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            data.push(M31::from((state >> 33) as u32 % 100));
+        }
+        M31Matrix { rows, cols, data }
+    };
+
+    // Add attention named weights
+    let topo = graph.topological_order();
+    for &node_id in &topo {
+        let node = &graph.nodes[node_id];
+        if let stwo_ml::compiler::graph::GraphOp::Attention { config: _ } = &node.op {
+            weights.add_named_weight(node.id, "w_q", random_m31(d_model, d_model, 200 + node.id as u64));
+            weights.add_named_weight(node.id, "w_k", random_m31(d_model, d_model, 300 + node.id as u64));
+            weights.add_named_weight(node.id, "w_v", random_m31(d_model, d_model, 400 + node.id as u64));
+            weights.add_named_weight(node.id, "w_o", random_m31(d_model, d_model, 500 + node.id as u64));
+        }
+    }
+
+    // Seed KV cache with prefill
+    let mut kv_cache = ModelKVCache::new();
+    let prefill_input = random_m31(prefill_len, d_model, 123);
+    for &node_id in &topo {
+        let node = &graph.nodes[node_id];
+        if let stwo_ml::compiler::graph::GraphOp::Attention { config } = &node.op {
+            let attn_weights = AttentionWeights {
+                w_q: weights.get_named_weight(node.id, "w_q").unwrap().clone(),
+                w_k: weights.get_named_weight(node.id, "w_k").unwrap().clone(),
+                w_v: weights.get_named_weight(node.id, "w_v").unwrap().clone(),
+                w_o: weights.get_named_weight(node.id, "w_o").unwrap().clone(),
+            };
+            let cache = kv_cache.get_or_create(node.id, config);
+            let _ = attention_forward_cached(&prefill_input, &attn_weights, config, cache, config.causal);
+        }
+    }
+
+    // Prove a decode step
+    let token_input = random_m31(1, d_model, 999);
+    let mut kv_commitment = IncrementalKVCommitment::from_kv_cache(&kv_cache, 16);
+    let (proof, kv_commit) = prove_model_pure_gkr_decode_step(
+        &graph, &token_input, &weights, &mut kv_cache, &mut kv_commitment, None,
+    ).expect("decode proving should succeed");
+
+    let gkr = proof.gkr_proof.as_ref().expect("should have GKR proof");
+    assert!(!gkr.layer_proofs.is_empty(), "should have layer proofs");
+    assert!(gkr.kv_cache_commitment.is_some(), "should have KV commitment");
+    assert_eq!(gkr.kv_cache_commitment.unwrap(), kv_commit, "KV commitment mismatch");
+
+    // Serialize proof data (unpacked for simplicity)
+    let mut proof_data = Vec::new();
+    stwo_ml::cairo_serde::serialize_gkr_proof_data_only(gkr, &mut proof_data);
+    assert!(!proof_data.is_empty(), "serialized proof should be non-empty");
+
+    // Build matmul dims from circuit
+    let circuit = stwo_ml::gkr::LayeredCircuit::from_graph(&graph).unwrap();
+    let matmul_dims = extract_matmul_dims(&circuit);
+    let circuit_depth = circuit.layers.len() as u32;
+    let num_layers = gkr.layer_proofs.len() as u32;
+
+    // Build raw_io for replay verification
+    let mut raw_io = Vec::new();
+    raw_io.push(FieldElement::from(token_input.rows as u64));
+    raw_io.push(FieldElement::from(token_input.cols as u64));
+    raw_io.push(FieldElement::from(token_input.data.len() as u64));
+    for v in &token_input.data {
+        raw_io.push(FieldElement::from(v.0 as u64));
+    }
+    raw_io.push(FieldElement::from(proof.execution.output.rows as u64));
+    raw_io.push(FieldElement::from(proof.execution.output.cols as u64));
+    raw_io.push(FieldElement::from(proof.execution.output.data.len() as u64));
+    for v in &proof.execution.output.data {
+        raw_io.push(FieldElement::from(v.0 as u64));
+    }
+
+    // Self-verify: replay Fiat-Shamir channel against serialized proof
+    let result = replay_verify_serialized_proof(
+        &proof_data,
+        &raw_io,
+        &matmul_dims,
+        circuit_depth,
+        num_layers,
+        false, // unpacked
+        gkr.kv_cache_commitment,
+        gkr.prev_kv_cache_commitment,
+    );
+    assert!(
+        result.is_ok(),
+        "decode calldata replay verification failed: {:?}",
+        result.err()
+    );
+
+    // Verify deferred proofs are present (decode generates Weightless deferred proofs)
+    eprintln!(
+        "E2E decode Cairo verify: PASSED ({} layers, {} deferred proofs, {} proof_data felts)",
+        gkr.layer_proofs.len(),
+        gkr.deferred_proofs.len(),
+        proof_data.len(),
+    );
 }

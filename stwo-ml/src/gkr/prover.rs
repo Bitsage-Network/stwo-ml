@@ -14,7 +14,8 @@ use stwo::core::fields::m31::M31;
 
 use crate::compiler::graph::{GraphExecution, GraphWeights};
 use crate::components::attention::{
-    attention_forward, split_heads, transpose_m31, AttentionWeights, MultiHeadAttentionConfig,
+    attention_forward, split_heads, transpose_m31, AttentionIntermediates, AttentionWeights,
+    MultiHeadAttentionConfig,
 };
 #[cfg(feature = "cuda-runtime")]
 use crate::components::matmul::matmul_m31;
@@ -2039,6 +2040,510 @@ pub fn prove_gkr_with_cache(
     }
 
     Ok(proof)
+}
+
+/// Decode-step GKR prover.
+///
+/// Like [`prove_gkr_with_cache`] but handles decode-mode attention layers.
+/// Each entry in `decode_attention_data` maps a node_id to pre-computed
+/// `(AttentionIntermediates, full_seq_len)` from `attention_forward_cached()`.
+///
+/// At `LayerType::Attention`, dispatches to `reduce_attention_layer_decode`
+/// instead of `reduce_attention_layer`. Also handles deferred proofs for
+/// RMSNorm, Activation, Identity, and recursive Add layers that arise from
+/// transformer-block residual connections.
+pub fn prove_gkr_decode(
+    circuit: &LayeredCircuit,
+    execution: &GraphExecution,
+    weights: &GraphWeights,
+    channel: &mut PoseidonChannel,
+    weight_cache: Option<&crate::weight_cache::SharedWeightCache>,
+    decode_attention_data: &std::collections::HashMap<
+        usize,
+        (AttentionIntermediates, usize),
+    >,
+) -> Result<GKRProof, GKRError> {
+    let d = circuit.layers.len();
+    let mut layer_proofs = Vec::with_capacity(d);
+    let mut weight_commitments = Vec::with_capacity(d / 2);
+    let mut weight_data: Vec<(usize, Vec<SecureField>, SecureField)> = Vec::with_capacity(d / 2);
+
+    // Seed channel with circuit metadata
+    channel.mix_u64(d as u64);
+    channel.mix_u64(circuit.input_shape.0 as u64);
+    channel.mix_u64(circuit.input_shape.1 as u64);
+
+    // Start with claim on output layer
+    let output = &execution.output;
+    let output_padded = pad_matrix_pow2(output);
+    let output_mle = matrix_to_mle(&output_padded);
+    let log_out_rows = output_padded.rows.ilog2() as usize;
+    let log_out_cols = output_padded.cols.ilog2() as usize;
+    let r_out = channel.draw_qm31s(log_out_rows + log_out_cols);
+    let output_value = evaluate_mle(&output_mle, &r_out);
+    mix_secure_field(channel, output_value);
+
+    let output_claim = GKRClaim {
+        point: r_out,
+        value: output_value,
+    };
+    let mut current_claim = output_claim.clone();
+
+    // Deferred claims from DAG Add layers
+    let mut deferred_info: Vec<(GKRClaim, usize)> = Vec::new();
+
+    // Walk layers from output → input
+    for layer_idx in (0..d).rev() {
+        let layer = &circuit.layers[layer_idx];
+
+        let (proof, next_claim) = match &layer.layer_type {
+            LayerType::MatMul {
+                m, k, n, weight_node_id,
+            } => {
+                let a_matrix = get_intermediate(execution, layer.node_id)?;
+                let b_matrix = weights.get_weight(*weight_node_id).ok_or(
+                    GKRError::MissingWeight { node_id: *weight_node_id },
+                )?;
+                let (reduction, claim) =
+                    reduce_matmul_layer(&current_claim, a_matrix, b_matrix, *m, *k, *n, channel)?;
+                push_matmul_weight_data(
+                    *weight_node_id, *m, *n,
+                    &current_claim.point, &claim.point,
+                    reduction.final_b_eval, &mut weight_data,
+                );
+                (
+                    LayerProof::MatMul {
+                        round_polys: reduction.round_polys,
+                        final_a_eval: reduction.final_a_eval,
+                        final_b_eval: reduction.final_b_eval,
+                    },
+                    claim,
+                )
+            }
+
+            LayerType::Add { .. } => {
+                let (lhs_vals, rhs_vals) =
+                    get_binary_op_intermediates(execution, layer, circuit)?;
+                let (proof, _claim) =
+                    reduce_add_layer(&current_claim, &lhs_vals, &rhs_vals, channel)?;
+                process_add_deferred(
+                    proof, &current_claim, &layer.input_layers, &mut deferred_info,
+                )
+            }
+
+            LayerType::Mul { .. } => {
+                let (lhs_vals, rhs_vals) =
+                    get_binary_op_intermediates(execution, layer, circuit)?;
+                reduce_mul_layer(&current_claim, &lhs_vals, &rhs_vals, channel)?
+            }
+
+            LayerType::Activation { activation_type, .. } => {
+                let input_matrix = get_intermediate(execution, layer.node_id)?;
+                if *activation_type == crate::components::activation::ActivationType::ReLU {
+                    reduce_activation_layer_algebraic(
+                        &current_claim, input_matrix, *activation_type, channel,
+                    )?
+                } else {
+                    reduce_activation_layer(
+                        &current_claim, input_matrix, *activation_type, channel,
+                    )?
+                }
+            }
+
+            LayerType::LayerNorm { dim, .. } => {
+                let input_matrix = get_intermediate(execution, layer.node_id)?;
+                reduce_layernorm_layer(&current_claim, input_matrix, *dim, channel)?
+            }
+
+            LayerType::RMSNorm { dim, .. } => {
+                let input_matrix = get_intermediate(execution, layer.node_id)?;
+                reduce_rmsnorm_layer(&current_claim, input_matrix, *dim, channel)?
+            }
+
+            LayerType::Quantize { params, .. } => {
+                let input_matrix = get_intermediate(execution, layer.node_id)?;
+                reduce_quantize_layer(&current_claim, input_matrix, params, channel)?
+            }
+
+            LayerType::Embedding { .. } => {
+                let input_matrix = get_intermediate(execution, layer.node_id)?;
+                let output_matrix = get_node_output(execution, layer.node_id)?;
+                let embed_table = weights.get_weight(layer.node_id).ok_or(
+                    GKRError::MissingWeight { node_id: layer.node_id },
+                )?;
+                reduce_embedding_layer(
+                    &current_claim, input_matrix, output_matrix, embed_table, channel,
+                )?
+            }
+
+            LayerType::Identity => {
+                continue;
+            }
+
+            LayerType::Attention { config } => {
+                let input_matrix = get_intermediate(execution, layer.node_id)?;
+                let attn_weights = get_attention_weights(weights, layer)?;
+
+                // Decode path: use pre-computed intermediates
+                if let Some((inter, full_seq_len)) = decode_attention_data.get(&layer.node_id) {
+                    reduce_attention_layer_decode(
+                        &current_claim,
+                        input_matrix,
+                        &attn_weights,
+                        inter,
+                        config,
+                        *full_seq_len,
+                        channel,
+                    )?
+                } else {
+                    // Fall back to prefill path
+                    reduce_attention_layer(
+                        &current_claim,
+                        input_matrix,
+                        &attn_weights,
+                        config,
+                        channel,
+                    )?
+                }
+            }
+
+            LayerType::Dequantize { params, .. } => {
+                let input_matrix = get_intermediate(execution, layer.node_id)?;
+                reduce_dequantize_layer(&current_claim, input_matrix, params, channel)?
+            }
+
+            LayerType::Input => {
+                break;
+            }
+        };
+
+        layer_proofs.push(proof);
+        current_claim = next_claim;
+    }
+
+    let flags = compute_weight_mode_flags();
+    let aggregate_weight_binding = flags.aggregate_weight_binding;
+    let mut deferred_weight_claims_data: Vec<(usize, Vec<SecureField>, SecureField)> =
+        Vec::with_capacity(deferred_info.len());
+
+    // Generate deferred proofs — extended to handle all transformer-block layer types.
+    let mut deferred_proofs = Vec::with_capacity(deferred_info.len());
+    // Process deferred info iteratively (Add layers may spawn sub-deferred entries).
+    let mut deferred_queue: std::collections::VecDeque<(GKRClaim, usize)> =
+        deferred_info.into_iter().collect();
+
+    while let Some((deferred_claim, rhs_layer_idx)) = deferred_queue.pop_front() {
+        let rhs_layer = &circuit.layers[rhs_layer_idx];
+        match &rhs_layer.layer_type {
+            LayerType::MatMul { m, k, n, weight_node_id } => {
+                let a_matrix = get_intermediate(execution, rhs_layer.node_id)?;
+                let b_matrix = weights.get_weight(*weight_node_id).ok_or(
+                    GKRError::MissingWeight { node_id: *weight_node_id },
+                )?;
+                mix_secure_field(channel, deferred_claim.value);
+                let (reduction, input_claim) =
+                    reduce_matmul_layer(&deferred_claim, a_matrix, b_matrix, *m, *k, *n, channel)?;
+
+                let pm = m.next_power_of_two();
+                let log_m = pm.ilog2() as usize;
+                let pn = n.next_power_of_two();
+                let log_n = pn.ilog2() as usize;
+                let r_j = deferred_claim.point[log_m..log_m + log_n].to_vec();
+                let sumcheck_challenges = &input_claim.point[log_m..];
+                let mut weight_eval_point = r_j;
+                weight_eval_point.extend_from_slice(sumcheck_challenges);
+
+                let deferred_weight_claim = super::types::WeightClaim {
+                    weight_node_id: *weight_node_id,
+                    eval_point: weight_eval_point.clone(),
+                    expected_value: reduction.final_b_eval,
+                };
+                let (deferred_weight_commitment, deferred_weight_opening) =
+                    if aggregate_weight_binding {
+                        deferred_weight_claims_data.push((
+                            *weight_node_id, weight_eval_point, reduction.final_b_eval,
+                        ));
+                        (
+                            starknet_ff::FieldElement::ZERO,
+                            crate::crypto::mle_opening::MleOpeningProof {
+                                intermediate_roots: Vec::new(),
+                                queries: Vec::new(),
+                                final_value: SecureField::zero(),
+                            },
+                        )
+                    } else {
+                        #[cfg(feature = "cuda-runtime")]
+                        {
+                            let b_mle_u32 = matrix_to_mle_col_major_u32_padded(b_matrix);
+                            crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32(
+                                &b_mle_u32, &deferred_weight_claim.eval_point, channel,
+                            )
+                        }
+                        #[cfg(not(feature = "cuda-runtime"))]
+                        {
+                            let b_mle = matrix_to_mle_col_major_padded(b_matrix);
+                            crate::crypto::mle_opening::prove_mle_opening_with_commitment(
+                                &b_mle, &deferred_weight_claim.eval_point, channel,
+                            )
+                        }
+                    };
+                deferred_proofs.push(super::types::DeferredProof {
+                    claim: deferred_claim.clone(),
+                    layer_proof: LayerProof::MatMul {
+                        round_polys: reduction.round_polys,
+                        final_a_eval: reduction.final_a_eval,
+                        final_b_eval: reduction.final_b_eval,
+                    },
+                    input_claim,
+                    kind: super::types::DeferredProofKind::MatMul {
+                        dims: (*m, *k, *n),
+                        weight_commitment: deferred_weight_commitment,
+                        weight_opening: deferred_weight_opening,
+                        weight_claim: deferred_weight_claim,
+                    },
+                });
+            }
+            LayerType::Quantize { params, .. } => {
+                let input_matrix = get_intermediate(execution, rhs_layer.node_id)?;
+                mix_secure_field(channel, deferred_claim.value);
+                let (layer_proof, input_claim) =
+                    reduce_quantize_layer(&deferred_claim, input_matrix, params, channel)?;
+                deferred_proofs.push(super::types::DeferredProof {
+                    claim: deferred_claim.clone(),
+                    layer_proof,
+                    input_claim,
+                    kind: super::types::DeferredProofKind::Weightless,
+                });
+            }
+            LayerType::Dequantize { params, .. } => {
+                let input_matrix = get_intermediate(execution, rhs_layer.node_id)?;
+                mix_secure_field(channel, deferred_claim.value);
+                let (layer_proof, input_claim) =
+                    reduce_dequantize_layer(&deferred_claim, input_matrix, params, channel)?;
+                deferred_proofs.push(super::types::DeferredProof {
+                    claim: deferred_claim.clone(),
+                    layer_proof,
+                    input_claim,
+                    kind: super::types::DeferredProofKind::Weightless,
+                });
+            }
+            // --- Decode extensions: handle all layer types from transformer blocks ---
+            LayerType::RMSNorm { dim, .. } => {
+                let input_matrix = get_intermediate(execution, rhs_layer.node_id)?;
+                mix_secure_field(channel, deferred_claim.value);
+                let (layer_proof, input_claim) =
+                    reduce_rmsnorm_layer(&deferred_claim, input_matrix, *dim, channel)?;
+                deferred_proofs.push(super::types::DeferredProof {
+                    claim: deferred_claim.clone(),
+                    layer_proof,
+                    input_claim,
+                    kind: super::types::DeferredProofKind::Weightless,
+                });
+            }
+            LayerType::LayerNorm { dim, .. } => {
+                let input_matrix = get_intermediate(execution, rhs_layer.node_id)?;
+                mix_secure_field(channel, deferred_claim.value);
+                let (layer_proof, input_claim) =
+                    reduce_layernorm_layer(&deferred_claim, input_matrix, *dim, channel)?;
+                deferred_proofs.push(super::types::DeferredProof {
+                    claim: deferred_claim.clone(),
+                    layer_proof,
+                    input_claim,
+                    kind: super::types::DeferredProofKind::Weightless,
+                });
+            }
+            LayerType::Activation { activation_type, .. } => {
+                let input_matrix = get_intermediate(execution, rhs_layer.node_id)?;
+                mix_secure_field(channel, deferred_claim.value);
+                let (layer_proof, input_claim) = if *activation_type
+                    == crate::components::activation::ActivationType::ReLU
+                {
+                    reduce_activation_layer_algebraic(
+                        &deferred_claim, input_matrix, *activation_type, channel,
+                    )?
+                } else {
+                    reduce_activation_layer(
+                        &deferred_claim, input_matrix, *activation_type, channel,
+                    )?
+                };
+                deferred_proofs.push(super::types::DeferredProof {
+                    claim: deferred_claim.clone(),
+                    layer_proof,
+                    input_claim,
+                    kind: super::types::DeferredProofKind::Weightless,
+                });
+            }
+            LayerType::Add { .. } => {
+                // Deferred Add: reduce the Add layer and follow the trunk.
+                // The skip branch value is bound by the Add reduction itself
+                // (lhs_eval + rhs_eval = claim_value) — no separate deferred proof needed.
+                let (lhs_vals, rhs_vals) =
+                    get_binary_op_intermediates(execution, rhs_layer, circuit)?;
+                mix_secure_field(channel, deferred_claim.value);
+                let (add_proof, _claim) =
+                    reduce_add_layer(&deferred_claim, &lhs_vals, &rhs_vals, channel)?;
+                let (final_proof, trunk_claim) = process_add_deferred(
+                    add_proof,
+                    &deferred_claim,
+                    &rhs_layer.input_layers,
+                    &mut Vec::new(), // sub-deferred not queued — skip bound by Add reduction
+                );
+
+                deferred_proofs.push(super::types::DeferredProof {
+                    claim: deferred_claim.clone(),
+                    layer_proof: final_proof,
+                    input_claim: trunk_claim,
+                    kind: super::types::DeferredProofKind::Weightless,
+                });
+            }
+            LayerType::Identity | LayerType::Input => {
+                // Identity/Input: the claim propagates unchanged — trivial deferred proof.
+                // Replay Add reduction channel ops for transcript consistency:
+                // mix claim.value (before match), mix lhs_eval, mix rhs_eval, draw alpha.
+                mix_secure_field(channel, deferred_claim.value);
+                let lhs_eval = deferred_claim.value;
+                let rhs_eval = SecureField::zero();
+                mix_secure_field(channel, lhs_eval);
+                mix_secure_field(channel, rhs_eval);
+                let _alpha = channel.draw_qm31();
+                deferred_proofs.push(super::types::DeferredProof {
+                    claim: deferred_claim.clone(),
+                    layer_proof: LayerProof::Add {
+                        lhs_eval,
+                        rhs_eval,
+                        trunk_idx: 0,
+                    },
+                    input_claim: deferred_claim.clone(),
+                    kind: super::types::DeferredProofKind::Weightless,
+                });
+            }
+            LayerType::Attention { config } => {
+                let input_matrix = get_intermediate(execution, rhs_layer.node_id)?;
+                let attn_weights = get_attention_weights(weights, rhs_layer)?;
+                mix_secure_field(channel, deferred_claim.value);
+                let (layer_proof, input_claim) =
+                    if let Some((inter, full_seq_len)) = decode_attention_data.get(&rhs_layer.node_id) {
+                        reduce_attention_layer_decode(
+                            &deferred_claim, input_matrix, &attn_weights, inter, config,
+                            *full_seq_len, channel,
+                        )?
+                    } else {
+                        reduce_attention_layer(
+                            &deferred_claim, input_matrix, &attn_weights, config, channel,
+                        )?
+                    };
+                deferred_proofs.push(super::types::DeferredProof {
+                    claim: deferred_claim.clone(),
+                    layer_proof,
+                    input_claim,
+                    kind: super::types::DeferredProofKind::Weightless,
+                });
+            }
+            LayerType::Embedding { .. } | LayerType::Mul { .. } => {
+                // These shouldn't appear as deferred branches in typical transformer blocks,
+                // but handle them for completeness.
+                mix_secure_field(channel, deferred_claim.value);
+                deferred_proofs.push(super::types::DeferredProof {
+                    claim: deferred_claim.clone(),
+                    layer_proof: LayerProof::Add {
+                        lhs_eval: deferred_claim.value,
+                        rhs_eval: SecureField::zero(),
+                        trunk_idx: 0,
+                    },
+                    input_claim: deferred_claim.clone(),
+                    kind: super::types::DeferredProofKind::Weightless,
+                });
+            }
+        }
+    }
+
+    // Weight opening strategy — same as prove_gkr_with_cache
+    let mut weight_openings = Vec::with_capacity(weight_data.len());
+    let mut weight_opening_transcript_mode = WeightOpeningTranscriptMode::Sequential;
+    let mut aggregated_binding_proof = None;
+
+    let use_aggregated_oracle_sumcheck = gkr_aggregated_oracle_sumcheck_enabled()
+        && (!weight_data.is_empty() || !deferred_weight_claims_data.is_empty());
+
+    let aggregate_weight_binding = aggregate_weight_binding
+        && (!weight_data.is_empty() || !deferred_weight_claims_data.is_empty())
+        && !use_aggregated_oracle_sumcheck;
+
+    let (weight_claims, weight_commitments_new);
+
+    if use_aggregated_oracle_sumcheck {
+        weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
+        let (wc, claims, proof) = apply_aggregated_oracle_sumcheck(
+            &weight_data, &deferred_weight_claims_data, &mut deferred_proofs,
+            weights, channel, "GKR-decode", weight_cache,
+        )?;
+        weight_commitments_new = wc;
+        weight_claims = claims;
+        aggregated_binding_proof = proof;
+    } else if aggregate_weight_binding {
+        weight_opening_transcript_mode = WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1;
+        weight_claims =
+            apply_aggregated_rlc_binding(&weight_data, &deferred_weight_claims_data, channel);
+        weight_commitments_new = Vec::new();
+    } else {
+        weight_commitments_new = Vec::new();
+        weight_claims = weight_data
+            .iter()
+            .map(|(wid, ep, ev)| super::types::WeightClaim {
+                weight_node_id: *wid,
+                eval_point: ep.clone(),
+                expected_value: *ev,
+            })
+            .collect();
+        // Sequential weight openings
+        for (opening_idx, (weight_node_id, _eval_point, _expected_value)) in
+            weight_data.into_iter().enumerate()
+        {
+            let b_matrix = weights.get_weight(weight_node_id).ok_or(
+                GKRError::MissingWeight { node_id: weight_node_id },
+            )?;
+            let claim = &weight_claims[opening_idx];
+            #[cfg(feature = "cuda-runtime")]
+            let (commitment, opening) = {
+                let b_mle_u32 = matrix_to_mle_col_major_u32_padded(b_matrix);
+                crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32(
+                    &b_mle_u32, &claim.eval_point, channel,
+                )
+            };
+            #[cfg(not(feature = "cuda-runtime"))]
+            let (commitment, opening) = {
+                let b_mle = matrix_to_mle_col_major_padded(b_matrix);
+                crate::crypto::mle_opening::prove_mle_opening_with_commitment(
+                    &b_mle, &claim.eval_point, channel,
+                )
+            };
+            weight_commitments.push(commitment);
+            weight_openings.push(opening);
+        }
+    }
+    weight_commitments.extend(weight_commitments_new);
+
+    if let Some(mode) = finalize_weight_transcript_mode(&flags, aggregate_weight_binding) {
+        weight_opening_transcript_mode = mode;
+    }
+
+    let model_input = execution.intermediates.get(&0).unwrap_or(&execution.output);
+    let io_commitment = crate::aggregation::compute_io_commitment(model_input, &execution.output);
+
+    Ok(GKRProof {
+        layer_proofs,
+        output_claim,
+        input_claim: current_claim,
+        weight_commitments,
+        weight_openings,
+        weight_claims,
+        weight_opening_transcript_mode,
+        io_commitment,
+        deferred_proofs,
+        aggregated_binding: aggregated_binding_proof,
+        kv_cache_commitment: None,
+        prev_kv_cache_commitment: None,
+    })
 }
 
 /// Prove a full model forward pass using the best available backend.
@@ -7851,8 +8356,24 @@ fn get_attention_weights(
     weights: &GraphWeights,
     layer: &super::circuit::CircuitLayer,
 ) -> Result<AttentionWeights, GKRError> {
-    // Try to get 4 weight matrices starting at node_id + 1
     let base = layer.node_id;
+
+    // Try named weights first (used by transformer_block / aggregation forward pass)
+    if let (Some(wq), Some(wk), Some(wv), Some(wo)) = (
+        weights.get_named_weight(base, "w_q"),
+        weights.get_named_weight(base, "w_k"),
+        weights.get_named_weight(base, "w_v"),
+        weights.get_named_weight(base, "w_o"),
+    ) {
+        return Ok(AttentionWeights {
+            w_q: wq.clone(),
+            w_k: wk.clone(),
+            w_v: wv.clone(),
+            w_o: wo.clone(),
+        });
+    }
+
+    // Fall back to positional weights at node_id + 1..4 (legacy convention)
     let w_q = weights
         .get_weight(base + 1)
         .ok_or(GKRError::MissingWeight { node_id: base + 1 })?
@@ -8388,6 +8909,185 @@ fn reduce_attention_layer(
             num_heads: config.num_heads as u32,
             seq_len: config.seq_len as u32,
             d_model: config.d_model as u32,
+            causal: config.causal,
+        },
+        final_input_claim,
+    ))
+}
+
+/// Decode-step attention reduction: uses pre-computed intermediates (no cache mutation).
+///
+/// Sub-proof ordering is identical to `reduce_attention_layer`:
+///   0: output projection, 1..2H: per-head context+score, 2H+1..2H+3: V/K/Q projections.
+/// Dimensions differ: rows = new_tokens, score/context cols = full_seq_len.
+/// Domain tag: 0x44434F44 ("DCOD").
+pub(crate) fn reduce_attention_layer_decode(
+    output_claim: &GKRClaim,
+    input_matrix: &M31Matrix,
+    attn_weights: &AttentionWeights,
+    intermediates: &AttentionIntermediates,
+    config: &MultiHeadAttentionConfig,
+    full_seq_len: usize,
+    channel: &mut PoseidonChannel,
+) -> Result<(LayerProof, GKRClaim), GKRError> {
+    let num_heads = config.num_heads;
+    let new_tokens = input_matrix.rows;
+    let d_model = config.d_model;
+    let d_k = config.d_k();
+
+    // Mix decode metadata into channel for domain separation
+    channel.mix_u64(0x44434F44_u64); // "DCOD" tag
+    channel.mix_u64(num_heads as u64);
+    channel.mix_u64(new_tokens as u64);
+    channel.mix_u64(full_seq_len as u64);
+    channel.mix_u64(d_model as u64);
+    channel.mix_u64(if config.causal { 1 } else { 0 });
+
+    let expected_count = 4 + 2 * num_heads;
+    let mut sub_proofs = Vec::with_capacity(expected_count);
+    let mut sub_claim_values = Vec::with_capacity(expected_count);
+
+    // Reuse the prove_sub_matmul closure from reduce_attention_layer
+    let prove_sub_matmul = |a: &M31Matrix,
+                            b: &M31Matrix,
+                            m: usize,
+                            k: usize,
+                            n: usize,
+                            channel: &mut PoseidonChannel|
+     -> Result<(LayerProof, GKRClaim, SecureField), GKRError> {
+        use crate::components::matmul::matmul_m31;
+        let c = matmul_m31(a, b);
+        let c_padded = pad_matrix_pow2(&c);
+        let c_mle = matrix_to_mle(&c_padded);
+        let log_rows = c_padded.rows.ilog2() as usize;
+        let log_cols = c_padded.cols.ilog2() as usize;
+        let r = channel.draw_qm31s(log_rows + log_cols);
+        let claimed_value = evaluate_mle(&c_mle, &r);
+        mix_secure_field(channel, claimed_value);
+        let fresh_claim = GKRClaim {
+            point: r,
+            value: claimed_value,
+        };
+        let (proof, input_claim) = reduce_matmul_layer(&fresh_claim, a, b, m, k, n, channel)?;
+        let layer_proof = LayerProof::MatMul {
+            round_polys: proof.round_polys,
+            final_a_eval: proof.final_a_eval,
+            final_b_eval: proof.final_b_eval,
+        };
+        Ok((layer_proof, input_claim, claimed_value))
+    };
+
+    // --- Sub-proof 0: Output projection (new_tokens×d_model = new_tokens×d_model × d_model×d_model) ---
+    let (output_proj_proof, _concat_claim) = reduce_matmul_layer(
+        output_claim,
+        &intermediates.concat,
+        &attn_weights.w_o,
+        new_tokens,
+        d_model,
+        d_model,
+        channel,
+    )?;
+    sub_proofs.push(LayerProof::MatMul {
+        round_polys: output_proj_proof.round_polys,
+        final_a_eval: output_proj_proof.final_a_eval,
+        final_b_eval: output_proj_proof.final_b_eval,
+    });
+    sub_claim_values.push(output_claim.value);
+
+    // Split intermediates per head — K/V are full_seq_len rows, Q is new_tokens rows
+    let k_heads = split_heads(&intermediates.k, num_heads);
+    let v_heads = split_heads(&intermediates.v, num_heads);
+    let q_heads = split_heads(&intermediates.q, num_heads);
+
+    // --- Per-head sub-proofs (h = H-1..0) ---
+    for h in (0..num_heads).rev() {
+        // Context: softmax × V_full → (new_tokens, d_k)
+        // dims: new_tokens × full_seq_len × d_k
+        let (ctx_proof, _ctx_input, ctx_value) = prove_sub_matmul(
+            &intermediates.softmax_outputs[h],
+            &v_heads[h],
+            new_tokens,
+            full_seq_len,
+            d_k,
+            channel,
+        )?;
+        sub_proofs.push(ctx_proof);
+        sub_claim_values.push(ctx_value);
+
+        // Score: Q_h × K_full^T → (new_tokens, full_seq_len)
+        // dims: new_tokens × d_k × full_seq_len
+        let k_h_t = transpose_m31(&k_heads[h]);
+        let (score_proof, _score_input, score_value) =
+            prove_sub_matmul(&q_heads[h], &k_h_t, new_tokens, d_k, full_seq_len, channel)?;
+        sub_proofs.push(score_proof);
+        sub_claim_values.push(score_value);
+    }
+
+    // --- Projection matmuls: V, K, Q = input × W ---
+    // V projection (new_tokens × d_model × d_model)
+    let (v_proof, _v_input, v_value) = prove_sub_matmul(
+        input_matrix,
+        &attn_weights.w_v,
+        new_tokens,
+        d_model,
+        d_model,
+        channel,
+    )?;
+    sub_proofs.push(v_proof);
+    sub_claim_values.push(v_value);
+
+    // K projection
+    let (k_proof, _k_input, k_value) = prove_sub_matmul(
+        input_matrix,
+        &attn_weights.w_k,
+        new_tokens,
+        d_model,
+        d_model,
+        channel,
+    )?;
+    sub_proofs.push(k_proof);
+    sub_claim_values.push(k_value);
+
+    // Q projection — determines the final input claim
+    let q = crate::components::matmul::matmul_m31(input_matrix, &attn_weights.w_q);
+    let q_padded = pad_matrix_pow2(&q);
+    let q_mle = matrix_to_mle(&q_padded);
+    let log_rows = q_padded.rows.ilog2() as usize;
+    let log_cols = q_padded.cols.ilog2() as usize;
+    let r_q = channel.draw_qm31s(log_rows + log_cols);
+    let q_value = evaluate_mle(&q_mle, &r_q);
+    mix_secure_field(channel, q_value);
+    let q_claim = GKRClaim {
+        point: r_q,
+        value: q_value,
+    };
+    let (q_reduction, final_input_claim) = reduce_matmul_layer(
+        &q_claim,
+        input_matrix,
+        &attn_weights.w_q,
+        new_tokens,
+        d_model,
+        d_model,
+        channel,
+    )?;
+    sub_proofs.push(LayerProof::MatMul {
+        round_polys: q_reduction.round_polys,
+        final_a_eval: q_reduction.final_a_eval,
+        final_b_eval: q_reduction.final_b_eval,
+    });
+    sub_claim_values.push(q_value);
+
+    assert_eq!(sub_proofs.len(), expected_count);
+    assert_eq!(sub_claim_values.len(), expected_count);
+
+    Ok((
+        LayerProof::AttentionDecode {
+            sub_proofs,
+            sub_claim_values,
+            num_heads: config.num_heads,
+            new_tokens,
+            full_seq_len,
+            d_model: config.d_model,
             causal: config.causal,
         },
         final_input_claim,

@@ -795,6 +795,106 @@ fn try_build_gpu_from_qm31_u32(words: &[u32]) -> Result<Option<Vec<MerkleLayer>>
     Ok(Some(layers))
 }
 
+/// Incremental binary Merkle tree using Poseidon hash.
+///
+/// Stored as a flat 1-indexed array (heap layout). Leaves occupy
+/// `[capacity..2*capacity)`, internal nodes `[1..capacity)`, root at index 1.
+/// Supports O(log N) appends by only recomputing the path from the new leaf to root.
+#[derive(Debug, Clone)]
+pub struct IncrementalPoseidonMerkle {
+    nodes: Vec<FieldElement>,
+    capacity: usize,
+    len: usize,
+}
+
+impl IncrementalPoseidonMerkle {
+    /// Create a new incremental Merkle tree with the given capacity (rounded up to power of 2).
+    ///
+    /// Internal nodes are initialized from zero leaves so that `root()` matches
+    /// `PoseidonMerkleTree::build` with the same (zero-padded) leaves at all times.
+    pub fn new(capacity: usize) -> Self {
+        let capacity = capacity.next_power_of_two().max(2);
+        let mut nodes = vec![FieldElement::ZERO; 2 * capacity];
+        // Build internal nodes bottom-up from zero leaves
+        let mut idx = capacity - 1;
+        while idx >= 1 {
+            nodes[idx] = poseidon_hash(nodes[2 * idx], nodes[2 * idx + 1]);
+            idx -= 1;
+        }
+        Self {
+            nodes,
+            capacity,
+            len: 0,
+        }
+    }
+
+    /// Push a leaf and recompute the path to root.
+    ///
+    /// Automatically grows the tree (doubling capacity) if full.
+    pub fn push(&mut self, leaf: FieldElement) {
+        if self.len == self.capacity {
+            self.grow();
+        }
+        let leaf_idx = self.capacity + self.len;
+        self.nodes[leaf_idx] = leaf;
+        self.len += 1;
+        self.recompute_path(leaf_idx);
+    }
+
+    /// Root commitment. Returns the hash of the zero-initialized tree if empty.
+    pub fn root(&self) -> FieldElement {
+        self.nodes[1]
+    }
+
+    /// Number of leaves currently inserted.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Maximum number of leaves before a grow is required.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Double the tree capacity, preserving all existing leaves and roots.
+    ///
+    /// The old tree of capacity C becomes the left subtree of a new tree of
+    /// capacity 2C. Old root moves to `nodes[2]`, new right subtree is
+    /// initialized from zero leaves.
+    fn grow(&mut self) {
+        let new_cap = self.capacity * 2;
+        let mut new_nodes = vec![FieldElement::ZERO; 2 * new_cap];
+
+        // Copy existing leaves into the left half of the new leaf range
+        for i in 0..self.capacity {
+            new_nodes[new_cap + i] = self.nodes[self.capacity + i];
+        }
+
+        // Build internal nodes bottom-up for the entire new tree
+        let mut idx = new_cap - 1;
+        while idx >= 1 {
+            new_nodes[idx] = poseidon_hash(new_nodes[2 * idx], new_nodes[2 * idx + 1]);
+            idx -= 1;
+        }
+
+        self.nodes = new_nodes;
+        self.capacity = new_cap;
+    }
+
+    /// Recompute internal nodes from `leaf_idx` up to root.
+    fn recompute_path(&mut self, leaf_idx: usize) {
+        let mut idx = leaf_idx >> 1;
+        while idx >= 1 {
+            self.nodes[idx] = poseidon_hash(self.nodes[2 * idx], self.nodes[2 * idx + 1]);
+            idx >>= 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

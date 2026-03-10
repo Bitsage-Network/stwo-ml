@@ -13,7 +13,7 @@
 //   5=Attention, 6=Dequantize, 7=MatMulDualSimd, 8=RMSNorm
 
 use crate::field::{QM31, CM31, qm31_zero, qm31_sub, qm31_add, poly_eval_degree3, log2_ceil, next_power_of_two, unpack_qm31_from_felt, unpack_qm31_pair_from_felt, pack_qm31_to_felt};
-use crate::channel::{PoseidonChannel, channel_mix_secure_field, channel_mix_u64, channel_draw_qm31, channel_mix_poly_coeffs_deg3};
+use crate::channel::{PoseidonChannel, channel_mix_secure_field, channel_mix_u64, channel_draw_qm31, channel_draw_qm31s, channel_mix_poly_coeffs_deg3};
 use crate::types::{GKRClaim, CompressedRoundPoly, CompressedGkrRoundPoly};
 use crate::layer_verifiers::{
     verify_add_layer, verify_mul_layer, verify_matmul_layer,
@@ -237,6 +237,205 @@ pub fn dispatch_matmul(
         current_claim, round_polys.span(), final_a, final_b, m, k, n, ref ch,
     );
     (claim, final_b)
+}
+
+/// Draw a fresh claim and dispatch a sub-matmul inside an attention block.
+fn dispatch_fresh_sub_matmul(
+    sub_claim_value: QM31,
+    m: u32, k: u32, n: u32,
+    ref reader: ProofReader,
+    ref ch: PoseidonChannel,
+) -> GKRClaim {
+    let padded_m = next_power_of_two(m);
+    let padded_n = next_power_of_two(n);
+    let log_rows = log2_ceil(padded_m);
+    let log_cols = log2_ceil(padded_n);
+    let fresh_point = channel_draw_qm31s(ref ch, log_rows + log_cols);
+    channel_mix_secure_field(ref ch, sub_claim_value);
+
+    let fresh_claim = GKRClaim { point: fresh_point, value: sub_claim_value };
+
+    let sub_tag = read_u32(ref reader);
+    assert!(sub_tag == 0, "ATTN_FRESH_SUB_NOT_MATMUL");
+    let (new_claim, _final_b) = dispatch_matmul(
+        @fresh_claim, m, k, n, ref reader, ref ch,
+    );
+    new_claim
+}
+
+/// Parse and verify a Tag 5 (Attention) layer proof.
+///
+/// Attention decomposes into 4 + 2*num_heads MatMul sub-proofs:
+///   0: output projection, then per-head (context + score), then V, K, Q projections.
+pub fn dispatch_attention(
+    current_claim: @GKRClaim,
+    ref reader: ProofReader,
+    ref ch: PoseidonChannel,
+) -> GKRClaim {
+    let num_sub_proofs = read_u32(ref reader);
+    let num_heads = read_u32(ref reader);
+    let seq_len = read_u32(ref reader);
+    let d_model = read_u32(ref reader);
+    let causal = read_u32(ref reader);
+    let d_k = d_model / num_heads;
+
+    // Read sub_claim_values
+    let mut sub_claim_values: Array<QM31> = array![];
+    let mut i: u32 = 0;
+    loop {
+        if i >= num_sub_proofs { break; }
+        sub_claim_values.append(read_qm31(ref reader));
+        i += 1;
+    };
+
+    // Mix ATTN metadata
+    channel_mix_u64(ref ch, 0x4154544E); // "ATTN"
+    channel_mix_u64(ref ch, num_heads.into());
+    channel_mix_u64(ref ch, seq_len.into());
+    channel_mix_u64(ref ch, d_model.into());
+    channel_mix_u64(ref ch, causal.into());
+
+    let mut proof_idx: u32 = 0;
+
+    // Sub-proof 0: Output projection (uses parent claim, NO fresh claim)
+    let sub_tag_0 = read_u32(ref reader);
+    assert!(sub_tag_0 == 0, "ATTN_SUB0_NOT_MATMUL");
+    let (_output_proj_claim, _) = dispatch_matmul(
+        current_claim, seq_len, d_model, d_model, ref reader, ref ch,
+    );
+    proof_idx += 1;
+
+    // Per-head sub-proofs (h = num_heads-1..0): context + score
+    let mut h: u32 = 0;
+    loop {
+        if h >= num_heads { break; }
+
+        // Context matmul (fresh claim): dims seq_len × seq_len × d_k
+        let _ctx_claim = dispatch_fresh_sub_matmul(
+            *sub_claim_values.at(proof_idx), seq_len, seq_len, d_k,
+            ref reader, ref ch,
+        );
+        proof_idx += 1;
+
+        // Score matmul (fresh claim): dims seq_len × d_k × seq_len
+        let _score_claim = dispatch_fresh_sub_matmul(
+            *sub_claim_values.at(proof_idx), seq_len, d_k, seq_len,
+            ref reader, ref ch,
+        );
+        proof_idx += 1;
+        h += 1;
+    };
+
+    // V, K, Q projections (fresh claims): dims seq_len × d_model × d_model
+    let _v_claim = dispatch_fresh_sub_matmul(
+        *sub_claim_values.at(proof_idx), seq_len, d_model, d_model,
+        ref reader, ref ch,
+    );
+    proof_idx += 1;
+    let _k_claim = dispatch_fresh_sub_matmul(
+        *sub_claim_values.at(proof_idx), seq_len, d_model, d_model,
+        ref reader, ref ch,
+    );
+    proof_idx += 1;
+    let q_claim = dispatch_fresh_sub_matmul(
+        *sub_claim_values.at(proof_idx), seq_len, d_model, d_model,
+        ref reader, ref ch,
+    );
+    proof_idx += 1;
+
+    assert!(proof_idx == num_sub_proofs, "ATTN_SUBPROOF_COUNT_MISMATCH");
+
+    q_claim // Q projection determines the final input claim
+}
+
+/// Parse and verify a Tag 11 (AttentionDecode) layer proof.
+///
+/// Like dispatch_attention but with decode-specific dimensions:
+/// - Score: (new_tokens, d_k, full_seq_len)
+/// - Context: (new_tokens, full_seq_len, d_k)
+/// - Projections: (new_tokens, d_model, d_model)
+pub fn dispatch_attention_decode(
+    current_claim: @GKRClaim,
+    ref reader: ProofReader,
+    ref ch: PoseidonChannel,
+) -> GKRClaim {
+    let num_sub_proofs = read_u32(ref reader);
+    let num_heads = read_u32(ref reader);
+    let new_tokens = read_u32(ref reader);
+    let full_seq_len = read_u32(ref reader);
+    let d_model = read_u32(ref reader);
+    let causal = read_u32(ref reader);
+    let d_k = d_model / num_heads;
+
+    // Read sub_claim_values
+    let mut sub_claim_values: Array<QM31> = array![];
+    let mut i: u32 = 0;
+    loop {
+        if i >= num_sub_proofs { break; }
+        sub_claim_values.append(read_qm31(ref reader));
+        i += 1;
+    };
+
+    // Mix DCOD metadata
+    channel_mix_u64(ref ch, 0x44434F44); // "DCOD"
+    channel_mix_u64(ref ch, num_heads.into());
+    channel_mix_u64(ref ch, new_tokens.into());
+    channel_mix_u64(ref ch, full_seq_len.into());
+    channel_mix_u64(ref ch, d_model.into());
+    channel_mix_u64(ref ch, causal.into());
+
+    let mut proof_idx: u32 = 0;
+
+    // Sub-proof 0: Output projection (uses parent claim, NO fresh claim)
+    // Dims: new_tokens × d_model × d_model
+    let sub_tag_0 = read_u32(ref reader);
+    assert!(sub_tag_0 == 0, "DCOD_SUB0_NOT_MATMUL");
+    let (_output_proj_claim, _) = dispatch_matmul(
+        current_claim, new_tokens, d_model, d_model, ref reader, ref ch,
+    );
+    proof_idx += 1;
+
+    // Per-head sub-proofs (h = num_heads-1..0): context + score
+    let mut h: u32 = 0;
+    loop {
+        if h >= num_heads { break; }
+
+        // Context matmul (fresh claim): dims new_tokens × full_seq_len × d_k
+        let _ctx_claim = dispatch_fresh_sub_matmul(
+            *sub_claim_values.at(proof_idx), new_tokens, full_seq_len, d_k,
+            ref reader, ref ch,
+        );
+        proof_idx += 1;
+
+        // Score matmul (fresh claim): dims new_tokens × d_k × full_seq_len
+        let _score_claim = dispatch_fresh_sub_matmul(
+            *sub_claim_values.at(proof_idx), new_tokens, d_k, full_seq_len,
+            ref reader, ref ch,
+        );
+        proof_idx += 1;
+        h += 1;
+    };
+
+    // V, K, Q projections (fresh claims): dims new_tokens × d_model × d_model
+    let _v_claim = dispatch_fresh_sub_matmul(
+        *sub_claim_values.at(proof_idx), new_tokens, d_model, d_model,
+        ref reader, ref ch,
+    );
+    proof_idx += 1;
+    let _k_claim = dispatch_fresh_sub_matmul(
+        *sub_claim_values.at(proof_idx), new_tokens, d_model, d_model,
+        ref reader, ref ch,
+    );
+    proof_idx += 1;
+    let q_claim = dispatch_fresh_sub_matmul(
+        *sub_claim_values.at(proof_idx), new_tokens, d_model, d_model,
+        ref reader, ref ch,
+    );
+    proof_idx += 1;
+
+    assert!(proof_idx == num_sub_proofs, "DCOD_SUBPROOF_COUNT_MISMATCH");
+
+    q_claim // Q projection determines the final input claim
 }
 
 /// Parse and verify a Tag 1 (Add) layer proof.
@@ -646,6 +845,9 @@ pub fn verify_gkr_model_with_trace_dp(
         } else if tag == 4 {
             // LayerNorm
             current_claim = dispatch_layernorm(@current_claim, ref reader, ref ch);
+        } else if tag == 5 {
+            // Attention — decomposed into sub-matmul proofs
+            current_claim = dispatch_attention(@current_claim, ref reader, ref ch);
         } else if tag == 6 {
             // Dequantize
             assert!(dequantize_idx < dequantize_bits.len(), "DEQUANTIZE_BITS_UNDERRUN");
@@ -655,6 +857,9 @@ pub fn verify_gkr_model_with_trace_dp(
         } else if tag == 8 {
             // RMSNorm
             current_claim = dispatch_rmsnorm(@current_claim, ref reader, ref ch);
+        } else if tag == 11 {
+            // AttentionDecode — decode step with cached KV
+            current_claim = dispatch_attention_decode(@current_claim, ref reader, ref ch);
         } else {
             assert!(false, "UNKNOWN_LAYER_TAG");
         }
@@ -694,47 +899,63 @@ pub fn verify_gkr_model_with_trace_dp(
         // Mix claim value into Fiat-Shamir channel (matches Rust prover)
         channel_mix_secure_field(ref ch, claim_value);
 
-        // Read MatMul dimensions for the skip branch
-        let m = read_u32(ref reader);
-        let k = read_u32(ref reader);
-        let n = read_u32(ref reader);
+        // Read deferred proof kind tag: 0 = MatMul, 1 = Weightless (Add)
+        let kind = read_u32(ref reader);
 
-        let log_m = log2_ceil(next_power_of_two(m));
-        let log_n = log2_ceil(next_power_of_two(n));
+        if kind == 0 {
+            // MatMul deferred proof: read dims, sumcheck, weight commitment
+            let m = read_u32(ref reader);
+            let k = read_u32(ref reader);
+            let n = read_u32(ref reader);
 
-        // Construct and verify deferred matmul sumcheck
-        let deferred_claim = GKRClaim { point: deferred_point, value: claim_value };
-        let (new_claim, final_b_eval) = dispatch_matmul(
-            @deferred_claim, m, k, n, ref reader, ref ch,
-        );
+            let log_m = log2_ceil(next_power_of_two(m));
+            let log_n = log2_ceil(next_power_of_two(n));
 
-        // Build weight evaluation point: [r_j || sumcheck_challenges]
-        let mut eval_point: Array<QM31> = array![];
-        let mut j: u32 = 0;
-        loop {
-            if j >= log_n {
-                break;
-            }
-            eval_point.append(*deferred_claim.point.at(log_m + j));
-            j += 1;
-        };
-        j = log_m;
-        loop {
-            if j >= new_claim.point.len() {
-                break;
-            }
-            eval_point.append(*new_claim.point.at(j));
-            j += 1;
-        };
+            // Construct and verify deferred matmul sumcheck
+            let deferred_claim = GKRClaim { point: deferred_point, value: claim_value };
+            let (new_claim, final_b_eval) = dispatch_matmul(
+                @deferred_claim, m, k, n, ref reader, ref ch,
+            );
 
-        weight_claims.append(WeightClaimData {
-            eval_point,
-            expected_value: final_b_eval,
-        });
+            // Build weight evaluation point: [r_j || sumcheck_challenges]
+            let mut eval_point: Array<QM31> = array![];
+            let mut j: u32 = 0;
+            loop {
+                if j >= log_n {
+                    break;
+                }
+                eval_point.append(*deferred_claim.point.at(log_m + j));
+                j += 1;
+            };
+            j = log_m;
+            loop {
+                if j >= new_claim.point.len() {
+                    break;
+                }
+                eval_point.append(*new_claim.point.at(j));
+                j += 1;
+            };
 
-        // Read deferred weight commitment (bound by caller against registration)
-        let deferred_weight_commitment = read_felt(ref reader);
-        deferred_weight_commitments.append(deferred_weight_commitment);
+            weight_claims.append(WeightClaimData {
+                eval_point,
+                expected_value: final_b_eval,
+            });
+
+            // Read deferred weight commitment (bound by caller against registration)
+            let deferred_weight_commitment = read_felt(ref reader);
+            deferred_weight_commitments.append(deferred_weight_commitment);
+        } else {
+            // kind == 1: Weightless deferred proof (Add layer)
+            // Read lhs_eval, rhs_eval, trunk_idx and replay Add channel ops
+            let lhs_eval = read_qm31(ref reader);
+            let rhs_eval = read_qm31(ref reader);
+            let _trunk_idx = read_u32(ref reader);
+
+            // Replay Add channel mixing (matches Rust prover transcript)
+            channel_mix_secure_field(ref ch, lhs_eval);
+            channel_mix_secure_field(ref ch, rhs_eval);
+            let _alpha = channel_draw_qm31(ref ch);
+        }
 
         def_idx += 1;
     };
@@ -865,6 +1086,9 @@ pub fn verify_gkr_layers_batch(
         } else if tag == 4 {
             // LayerNorm
             current_claim = dispatch_layernorm(@current_claim, ref reader, ref ch);
+        } else if tag == 5 {
+            // Attention — decomposed into sub-matmul proofs
+            current_claim = dispatch_attention(@current_claim, ref reader, ref ch);
         } else if tag == 6 {
             // Dequantize
             assert!(dequantize_idx < dequantize_bits_batch.len(), "BATCH_DEQUANTIZE_BITS_UNDERRUN");
@@ -874,6 +1098,9 @@ pub fn verify_gkr_layers_batch(
         } else if tag == 8 {
             // RMSNorm
             current_claim = dispatch_rmsnorm(@current_claim, ref reader, ref ch);
+        } else if tag == 11 {
+            // AttentionDecode — decode step with cached KV
+            current_claim = dispatch_attention_decode(@current_claim, ref reader, ref ch);
         } else {
             assert!(false, "UNKNOWN_LAYER_TAG");
         }

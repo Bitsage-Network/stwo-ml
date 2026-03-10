@@ -267,6 +267,146 @@ pub fn compute_io_commitment_packed(input: &M31Matrix, output: &M31Matrix) -> Fi
     starknet_crypto::poseidon_hash_many(&hash_inputs)
 }
 
+/// Compute a Poseidon commitment over the current KV-cache state.
+///
+/// Domain separator 0x4B56 ("KV"). Per-layer: layer_id, cached_len, num_kv_heads, d_k,
+/// then all K/V data flattened. Used to chain sequential decode-step proofs.
+pub fn compute_kv_cache_commitment(
+    kv_cache: &crate::components::attention::ModelKVCache,
+) -> FieldElement {
+    let mut hash_inputs = Vec::new();
+    hash_inputs.push(FieldElement::from(0x4B56_u64)); // "KV" domain separator
+    hash_inputs.push(FieldElement::from(kv_cache.layers.len() as u64));
+    // Sort by layer_id for deterministic ordering
+    let mut layer_ids: Vec<usize> = kv_cache.layers.keys().copied().collect();
+    layer_ids.sort();
+    for &layer_id in &layer_ids {
+        let cache = &kv_cache.layers[&layer_id];
+        hash_inputs.push(FieldElement::from(layer_id as u64));
+        hash_inputs.push(FieldElement::from(cache.cached_len as u64));
+        hash_inputs.push(FieldElement::from(cache.num_kv_heads as u64));
+        hash_inputs.push(FieldElement::from(cache.d_k as u64));
+        for h in 0..cache.num_kv_heads {
+            for &v in &cache.k_cache[h].data {
+                hash_inputs.push(FieldElement::from(v.0 as u64));
+            }
+            for &v in &cache.v_cache[h].data {
+                hash_inputs.push(FieldElement::from(v.0 as u64));
+            }
+        }
+    }
+    starknet_crypto::poseidon_hash_many(&hash_inputs)
+}
+
+/// Per-layer incremental Merkle tree for KV-cache commitment.
+///
+/// Each leaf at position `t` hashes all heads' K/V data for that position:
+/// `poseidon_hash_many([0x4B56, t, h0_K[t,0..d_k], h0_V[t,0..d_k], ...])`
+pub struct IncrementalLayerKVCommitment {
+    tree: crate::crypto::poseidon_merkle::IncrementalPoseidonMerkle,
+}
+
+/// Model-level incremental KV-cache commitment.
+///
+/// Wraps per-layer incremental Merkle trees and produces a model-level
+/// commitment by hashing sorted layer roots. Reduces per-step cost from
+/// O(cache_size) to O(new_tokens × log(capacity)).
+pub struct IncrementalKVCommitment {
+    layers: std::collections::BTreeMap<usize, IncrementalLayerKVCommitment>,
+}
+
+impl IncrementalKVCommitment {
+    /// Build from an existing KV cache state (one-time O(N) cost after prefill).
+    pub fn from_kv_cache(
+        kv_cache: &crate::components::attention::ModelKVCache,
+        initial_capacity: usize,
+    ) -> Self {
+        let mut layers = std::collections::BTreeMap::new();
+        for (&layer_id, cache) in &kv_cache.layers {
+            let mut tree = crate::crypto::poseidon_merkle::IncrementalPoseidonMerkle::new(
+                initial_capacity.max(cache.cached_len),
+            );
+            for pos in 0..cache.cached_len {
+                let leaf = Self::hash_kv_position_from_cache(cache, pos);
+                tree.push(leaf);
+            }
+            layers.insert(
+                layer_id,
+                IncrementalLayerKVCommitment { tree },
+            );
+        }
+        Self { layers }
+    }
+
+    /// Incrementally append new positions to each layer's Merkle tree.
+    ///
+    /// Call this **after** the forward pass has appended new K/V to the cache.
+    /// Only hashes the last `new_tokens` positions per layer — O(new_tokens × log(capacity)).
+    pub fn append_step(
+        &mut self,
+        kv_cache: &crate::components::attention::ModelKVCache,
+        new_tokens: usize,
+    ) {
+        for (&layer_id, cache) in &kv_cache.layers {
+            let layer = self.layers.entry(layer_id).or_insert_with(|| {
+                // Layer created during decode (first time seeing this attention node).
+                // Bootstrap its tree from scratch with current cache contents.
+                let mut tree = crate::crypto::poseidon_merkle::IncrementalPoseidonMerkle::new(
+                    cache.cached_len,
+                );
+                for pos in 0..(cache.cached_len - new_tokens) {
+                    tree.push(Self::hash_kv_position_from_cache(cache, pos));
+                }
+                IncrementalLayerKVCommitment { tree }
+            });
+            let start = cache.cached_len - new_tokens;
+            for pos in start..cache.cached_len {
+                let leaf = Self::hash_kv_position_from_cache(cache, pos);
+                layer.tree.push(leaf);
+            }
+        }
+    }
+
+    /// Model-level commitment: hash of sorted layer roots.
+    ///
+    /// `poseidon_hash_many([0x4B56, num_layers, layer_0_id, layer_0_root, ...])`
+    pub fn commitment(&self) -> FieldElement {
+        let mut hash_inputs = Vec::with_capacity(2 + self.layers.len() * 2);
+        hash_inputs.push(FieldElement::from(0x4B56_u64));
+        hash_inputs.push(FieldElement::from(self.layers.len() as u64));
+        for (&layer_id, layer) in &self.layers {
+            hash_inputs.push(FieldElement::from(layer_id as u64));
+            hash_inputs.push(layer.tree.root());
+        }
+        starknet_crypto::poseidon_hash_many(&hash_inputs)
+    }
+
+    /// Hash one position's K/V data across all heads into a single leaf.
+    fn hash_kv_position_from_cache(
+        cache: &crate::components::attention::KVCache,
+        pos: usize,
+    ) -> FieldElement {
+        let mut leaf_inputs = Vec::with_capacity(
+            2 + cache.num_kv_heads * cache.d_k * 2,
+        );
+        leaf_inputs.push(FieldElement::from(0x4B56_u64));
+        leaf_inputs.push(FieldElement::from(pos as u64));
+        for h in 0..cache.num_kv_heads {
+            for col in 0..cache.d_k {
+                leaf_inputs.push(FieldElement::from(
+                    cache.k_cache[h].get(pos, col).0 as u64,
+                ));
+            }
+            for col in 0..cache.d_k {
+                leaf_inputs.push(FieldElement::from(
+                    cache.v_cache[h].get(pos, col).0 as u64,
+                ));
+            }
+        }
+        starknet_crypto::poseidon_hash_many(&leaf_inputs)
+    }
+}
+
 /// Compute a Poseidon commitment over LayerNorm mean and variance values.
 ///
 /// Binds the prover to specific mean/variance choices, preventing a malicious prover
@@ -4947,6 +5087,235 @@ where
         kv_cache_commitment,
         prev_kv_cache_commitment,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Decode-step GKR pipeline: cached KV attention + GKR proving
+// ---------------------------------------------------------------------------
+
+/// Prove a single decode step (1 new token) using cached KV attention.
+///
+/// Returns `(proof, new_kv_commitment)`. The proof includes both
+/// `kv_cache_commitment` (after) and `prev_kv_cache_commitment` (before)
+/// for sequential chaining.
+pub fn prove_model_pure_gkr_decode_step(
+    graph: &ComputationGraph,
+    input: &M31Matrix,
+    weights: &GraphWeights,
+    kv_cache: &mut crate::components::attention::ModelKVCache,
+    kv_commitment: &mut IncrementalKVCommitment,
+    weight_cache: Option<&crate::weight_cache::SharedWeightCache>,
+) -> Result<(AggregatedModelProofOnChain, FieldElement), AggregationError> {
+    use crate::components::attention::{attention_forward_cached, AttentionIntermediates};
+    use std::collections::HashMap;
+
+    let t_start = std::time::Instant::now();
+    eprintln!("=== Decode-Step GKR Pipeline ===");
+
+    // Snapshot KV commitment BEFORE forward pass (O(L) hash of layer roots)
+    let prev_kv_commitment = kv_commitment.commitment();
+
+    // Phase 1: Forward pass with cached KV attention.
+    // Pure GKR — only collect intermediates and node_outputs for the GKR prover.
+    let mut intermediates: Vec<(usize, M31Matrix)> = Vec::new();
+    let mut node_outputs: HashMap<usize, M31Matrix> = HashMap::new();
+    let mut current = input.clone();
+
+    // Store pre-computed AttentionIntermediates for decode GKR walk
+    let mut decode_attention_data: HashMap<usize, (AttentionIntermediates, usize)> =
+        HashMap::new();
+
+    let topo = graph.topological_order();
+    eprintln!("Phase 1/2: Forward pass ({} nodes, decode)...", topo.len());
+
+    for &node_id in &topo {
+        let node = &graph.nodes[node_id];
+        if let Some(&first_input) = node.inputs.first() {
+            if let Some(inp) = node_outputs.get(&first_input) {
+                current = inp.clone();
+            }
+        }
+
+        match &node.op {
+            GraphOp::Attention {
+                config: attn_config,
+            } => {
+                let w_q = weights.get_named_weight(node.id, "w_q");
+                let w_k = weights.get_named_weight(node.id, "w_k");
+                let w_v = weights.get_named_weight(node.id, "w_v");
+                let w_o = weights.get_named_weight(node.id, "w_o");
+
+                if let (Some(wq), Some(wk), Some(wv), Some(wo)) = (w_q, w_k, w_v, w_o) {
+                    let attn_weights = AttentionWeights {
+                        w_q: wq.clone(),
+                        w_k: wk.clone(),
+                        w_v: wv.clone(),
+                        w_o: wo.clone(),
+                    };
+                    let cache = kv_cache.get_or_create(node.id, attn_config);
+                    let full_seq_len_before = cache.len();
+                    let inter = attention_forward_cached(
+                        &current,
+                        &attn_weights,
+                        attn_config,
+                        cache,
+                        attn_config.causal,
+                    );
+                    let full_seq_len = full_seq_len_before + current.rows;
+                    intermediates.push((node.id, current.clone()));
+                    node_outputs.insert(node.id, inter.final_output.clone());
+                    current = inter.final_output.clone();
+                    // Store for decode GKR walk
+                    decode_attention_data.insert(node.id, (inter, full_seq_len));
+                } else {
+                    intermediates.push((node.id, current.clone()));
+                    node_outputs.insert(node.id, current.clone());
+                }
+            }
+            GraphOp::MatMul { .. } => {
+                let w = weights.get_weight(node.id);
+                if let Some(w) = w {
+                    let out = crate::components::matmul::matmul_m31_auto(&current, w);
+                    intermediates.push((node.id, current.clone()));
+                    node_outputs.insert(node.id, out.clone());
+                    current = out;
+                } else {
+                    intermediates.push((node.id, current.clone()));
+                    node_outputs.insert(node.id, current.clone());
+                }
+            }
+            GraphOp::Activation { activation_type, .. } => {
+                let f = activation_type.as_fn();
+                let output_data: Vec<M31> = current.data.iter().map(|&x| (*f)(x)).collect();
+                let out = M31Matrix {
+                    rows: current.rows,
+                    cols: current.cols,
+                    data: output_data,
+                };
+                intermediates.push((node.id, current.clone()));
+                node_outputs.insert(node.id, out.clone());
+                current = out;
+            }
+            GraphOp::Add { .. } => {
+                let second_input = node.inputs.get(1).copied();
+                if let Some(second_id) = second_input {
+                    if let Some(rhs) = node_outputs.get(&second_id) {
+                        let out = elementwise_add(&current, rhs);
+                        intermediates.push((node.id, current.clone()));
+                        node_outputs.insert(node.id, out.clone());
+                        current = out;
+                    }
+                }
+            }
+            GraphOp::RMSNorm { dim } => {
+                let rn = apply_rmsnorm_detailed(&current, *dim);
+                intermediates.push((node.id, current.clone()));
+                node_outputs.insert(node.id, rn.output_matrix.clone());
+                current = rn.output_matrix;
+            }
+            GraphOp::Mul { .. } => {
+                let second_input = node.inputs.get(1).copied();
+                if let Some(second_id) = second_input {
+                    if let Some(rhs) = node_outputs.get(&second_id) {
+                        let out = elementwise_mul(&current, rhs);
+                        intermediates.push((node.id, current.clone()));
+                        node_outputs.insert(node.id, out.clone());
+                        current = out;
+                    }
+                }
+            }
+            _ => {
+                intermediates.push((node.id, current.clone()));
+                node_outputs.insert(node.id, current.clone());
+            }
+        }
+    }
+
+    eprintln!(
+        "  Forward pass complete in {:.2}s",
+        t_start.elapsed().as_secs_f64()
+    );
+
+    // Incrementally update KV commitment AFTER forward pass — O(new_tokens × log(cap))
+    kv_commitment.append_step(kv_cache, input.rows);
+    let new_kv_commitment = kv_commitment.commitment();
+
+    // Phase 2: GKR proof
+    let t_gkr = std::time::Instant::now();
+    eprintln!("Phase 2/2: GKR proof (decode step)...");
+
+    let circuit = crate::gkr::LayeredCircuit::from_graph(graph)
+        .map_err(|e| AggregationError::ProvingError(format!("GKR circuit compilation: {e}")))?;
+
+    let gkr_execution = crate::compiler::graph::GraphExecution {
+        intermediates: intermediates.iter().cloned().collect(),
+        node_outputs: node_outputs.clone(),
+        output: current.clone(),
+    };
+
+    let mut gkr_channel = crate::crypto::poseidon_channel::PoseidonChannel::new();
+
+    // Mix KV commitments into channel (matches verifier gate)
+    gkr_channel.mix_felt(new_kv_commitment);
+    gkr_channel.mix_felt(prev_kv_commitment);
+
+    let mut gkr_proof = crate::gkr::prove_gkr_decode(
+        &circuit,
+        &gkr_execution,
+        weights,
+        &mut gkr_channel,
+        weight_cache,
+        &decode_attention_data,
+    )
+    .map_err(|e| AggregationError::ProvingError(format!("GKR decode proving: {e}")))?;
+
+    gkr_proof.kv_cache_commitment = Some(new_kv_commitment);
+    gkr_proof.prev_kv_cache_commitment = Some(prev_kv_commitment);
+
+    eprintln!(
+        "  GKR decode proof: {} layer proofs in {:.2}s",
+        gkr_proof.layer_proofs.len(),
+        t_gkr.elapsed().as_secs_f64(),
+    );
+
+    // Commitments
+    let layer_chain_commitment = compute_layer_chain_commitment(input, &intermediates, &current);
+    let io_commitment = compute_io_commitment(input, &current);
+
+    let execution = GraphExecution {
+        intermediates,
+        output: current,
+    };
+
+    let proof = AggregatedModelProofOnChain {
+        unified_stark: None,
+        matmul_proofs: Vec::new(),
+        batched_matmul_proofs: Vec::new(),
+        add_claims: Vec::new(),
+        mul_claims: Vec::new(),
+        layernorm_claims: Vec::new(),
+        rmsnorm_claims: Vec::new(),
+        execution,
+        activation_claims: Vec::new(),
+        attention_proofs: Vec::new(),
+        embedding_claims: Vec::new(),
+        quantize_claims: Vec::new(),
+        dequantize_claims: Vec::new(),
+        layer_chain_commitment,
+        io_commitment,
+        layernorm_mean_var_commitments: Vec::new(),
+        quantize_params_commitment: FieldElement::ZERO,
+        tiled_matmul_proofs: Vec::new(),
+        gkr_proof: Some(gkr_proof),
+        gkr_batch_data: None,
+    };
+
+    eprintln!(
+        "=== Decode step complete in {:.2}s ===",
+        t_start.elapsed().as_secs_f64(),
+    );
+
+    Ok((proof, new_kv_commitment))
 }
 
 // ---------------------------------------------------------------------------

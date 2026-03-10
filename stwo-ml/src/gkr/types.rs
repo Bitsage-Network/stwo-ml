@@ -437,6 +437,22 @@ pub enum LayerProof {
         /// Whether causal masking is applied (mixed into channel for replay).
         causal: bool,
     },
+
+    /// Attention decode step (cached KV, sub-matmuls have asymmetric dims).
+    ///
+    /// Like `Attention`, but sub-matmul dimensions differ from prefill:
+    /// - Score: (new_tokens, d_k, full_seq_len)
+    /// - Context: (new_tokens, full_seq_len, d_k)
+    /// - Projections: (new_tokens, d_model, d_model)
+    AttentionDecode {
+        sub_proofs: Vec<LayerProof>,
+        sub_claim_values: Vec<SecureField>,
+        num_heads: usize,
+        new_tokens: usize,
+        full_seq_len: usize,
+        d_model: usize,
+        causal: bool,
+    },
 }
 
 /// Weight claim from a MatMul layer: the evaluation point and expected value

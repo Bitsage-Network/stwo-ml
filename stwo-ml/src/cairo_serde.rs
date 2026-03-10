@@ -1302,7 +1302,8 @@ fn serialize_piecewise_proof(
 ///
 /// Layout: `num_layers, [layer_proof]×num_layers, input_claim, weight_commitments, io_commitment`
 ///
-/// Layer proof tags: 0=MatMul, 1=Add, 2=Mul, 3=Activation, 4=LayerNorm, 5=Attention.
+/// Layer proof tags: 0=MatMul, 1=Add, 2=Mul, 3=Activation, 4=LayerNorm, 5=Attention,
+/// 6=Dequantize, 7=MatMulDualSimd, 8=RMSNorm, 9=Quantize, 10=Embedding, 11=AttentionDecode.
 pub fn serialize_gkr_model_proof(proof: &crate::gkr::GKRProof, output: &mut Vec<FieldElement>) {
     use crate::gkr::types::LayerProof;
 
@@ -1495,31 +1496,35 @@ pub fn serialize_gkr_model_proof(proof: &crate::gkr::GKRProof, output: &mut Vec<
                 serialize_u32(*d_model, output);
                 serialize_u32(if *causal { 1 } else { 0 }, output);
                 serialize_u32(sub_proofs.len() as u32, output);
-                // Serialize sub_claim_values
+                serialize_u32(*num_heads as u32, output);
+                serialize_u32(*seq_len as u32, output);
+                serialize_u32(*d_model as u32, output);
+                serialize_u32(if *causal { 1 } else { 0 }, output);
                 for val in sub_claim_values {
                     serialize_qm31(*val, output);
                 }
-                for sub in sub_proofs {
-                    let tmp = crate::gkr::GKRProof {
-                        layer_proofs: vec![sub.clone()],
-                        output_claim: proof.output_claim.clone(),
-                        input_claim: proof.input_claim.clone(),
-                        weight_commitments: vec![],
-                        weight_openings: vec![],
-                        weight_claims: vec![],
-                        weight_opening_transcript_mode:
-                            crate::gkr::types::WeightOpeningTranscriptMode::Sequential,
-                        io_commitment: proof.io_commitment,
-                        deferred_proofs: vec![],
-                        aggregated_binding: None,
-                        kv_cache_commitment: None,
-                        prev_kv_cache_commitment: None,
-                    };
-                    let mut sub_buf = Vec::new();
-                    serialize_gkr_model_proof(&tmp, &mut sub_buf);
-                    // Skip the num_layers=1 prefix felt
-                    output.extend_from_slice(&sub_buf[1..]);
+                serialize_attention_sub_proofs(sub_proofs, output, false);
+            }
+            LayerProof::AttentionDecode {
+                sub_proofs,
+                sub_claim_values,
+                num_heads,
+                new_tokens,
+                full_seq_len,
+                d_model,
+                causal,
+            } => {
+                serialize_u32(11, output); // tag: AttentionDecode
+                serialize_u32(sub_proofs.len() as u32, output);
+                serialize_u32(*num_heads as u32, output);
+                serialize_u32(*new_tokens as u32, output);
+                serialize_u32(*full_seq_len as u32, output);
+                serialize_u32(*d_model as u32, output);
+                serialize_u32(if *causal { 1 } else { 0 }, output);
+                for val in sub_claim_values {
+                    serialize_qm31(*val, output);
                 }
+                serialize_attention_sub_proofs(sub_proofs, output, false);
             }
             LayerProof::Dequantize {
                 logup_proof,
@@ -1750,6 +1755,42 @@ pub fn serialize_gkr_model_proof(proof: &crate::gkr::GKRProof, output: &mut Vec<
     output.push(proof.io_commitment);
 }
 
+/// Serialize attention sub-proofs (MatMul layer proofs) directly without GKRProof wrapper.
+///
+/// Each sub-proof is a MatMul and is serialized as: tag(0) + num_rounds + round_polys + finals.
+/// When `packed` is true, QM31 values use packed format.
+fn serialize_attention_sub_proofs(
+    sub_proofs: &[crate::gkr::types::LayerProof],
+    output: &mut Vec<FieldElement>,
+    packed: bool,
+) {
+    use crate::gkr::types::LayerProof;
+    for sub in sub_proofs {
+        if let LayerProof::MatMul { round_polys, final_a_eval, final_b_eval } = sub {
+            serialize_u32(0, output); // MatMul tag
+            serialize_u32(round_polys.len() as u32, output);
+            for rp in round_polys {
+                if packed {
+                    serialize_qm31_packed(rp.c0, output);
+                    serialize_qm31_packed(rp.c2, output);
+                } else {
+                    serialize_qm31(rp.c0, output);
+                    serialize_qm31(rp.c2, output);
+                }
+            }
+            if packed {
+                serialize_qm31_packed(*final_a_eval, output);
+                serialize_qm31_packed(*final_b_eval, output);
+            } else {
+                serialize_qm31(*final_a_eval, output);
+                serialize_qm31(*final_b_eval, output);
+            }
+        } else {
+            panic!("attention sub-proof must be MatMul, got: {:?}", std::mem::discriminant(sub));
+        }
+    }
+}
+
 /// Serialize ONLY the per-layer GKR proof data (tags + layer-specific fields).
 ///
 /// This omits the header (num_layers) and footer (input_claim, weight_commitments,
@@ -1937,29 +1978,35 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
                 serialize_u32(*d_model, output);
                 serialize_u32(if *causal { 1 } else { 0 }, output);
                 serialize_u32(sub_proofs.len() as u32, output);
+                serialize_u32(*num_heads as u32, output);
+                serialize_u32(*seq_len as u32, output);
+                serialize_u32(*d_model as u32, output);
+                serialize_u32(if *causal { 1 } else { 0 }, output);
                 for val in sub_claim_values {
                     serialize_qm31(*val, output);
                 }
-                for sub in sub_proofs {
-                    let tmp = crate::gkr::GKRProof {
-                        layer_proofs: vec![sub.clone()],
-                        output_claim: proof.output_claim.clone(),
-                        input_claim: proof.input_claim.clone(),
-                        weight_commitments: vec![],
-                        weight_openings: vec![],
-                        weight_claims: vec![],
-                        weight_opening_transcript_mode:
-                            crate::gkr::types::WeightOpeningTranscriptMode::Sequential,
-                        io_commitment: proof.io_commitment,
-                        deferred_proofs: vec![],
-                        aggregated_binding: None,
-                        kv_cache_commitment: None,
-                        prev_kv_cache_commitment: None,
-                    };
-                    let mut sub_buf = Vec::new();
-                    serialize_gkr_model_proof(&tmp, &mut sub_buf);
-                    output.extend_from_slice(&sub_buf[1..]);
+                serialize_attention_sub_proofs(sub_proofs, output, false);
+            }
+            LayerProof::AttentionDecode {
+                sub_proofs,
+                sub_claim_values,
+                num_heads,
+                new_tokens,
+                full_seq_len,
+                d_model,
+                causal,
+            } => {
+                serialize_u32(11, output);
+                serialize_u32(sub_proofs.len() as u32, output);
+                serialize_u32(*num_heads as u32, output);
+                serialize_u32(*new_tokens as u32, output);
+                serialize_u32(*full_seq_len as u32, output);
+                serialize_u32(*d_model as u32, output);
+                serialize_u32(if *causal { 1 } else { 0 }, output);
+                for val in sub_claim_values {
+                    serialize_qm31(*val, output);
                 }
+                serialize_attention_sub_proofs(sub_proofs, output, false);
             }
             LayerProof::Dequantize {
                 logup_proof,
@@ -2383,30 +2430,38 @@ fn serialize_layer_proof_packed_inner(
             serialize_u32(*d_model, output);
             serialize_u32(if *causal { 1 } else { 0 }, output);
             serialize_u32(sub_proofs.len() as u32, output);
+            serialize_u32(*num_heads as u32, output);
+            serialize_u32(*seq_len as u32, output);
+            serialize_u32(*d_model as u32, output);
+            serialize_u32(if *causal { 1 } else { 0 }, output);
             for val in sub_claim_values {
                 serialize_qm31_packed(*val, output);
             }
-            if let Some(proof) = proof_for_attention {
-                for sub in sub_proofs {
-                    let tmp = crate::gkr::GKRProof {
-                        layer_proofs: vec![sub.clone()],
-                        output_claim: proof.output_claim.clone(),
-                        input_claim: proof.input_claim.clone(),
-                        weight_commitments: vec![],
-                        weight_openings: vec![],
-                        weight_claims: vec![],
-                        weight_opening_transcript_mode:
-                            crate::gkr::types::WeightOpeningTranscriptMode::Sequential,
-                        io_commitment: proof.io_commitment,
-                        deferred_proofs: vec![],
-                        aggregated_binding: None,
-                        kv_cache_commitment: None,
-                        prev_kv_cache_commitment: None,
-                    };
-                    let mut sub_buf = Vec::new();
-                    serialize_gkr_model_proof(&tmp, &mut sub_buf);
-                    output.extend_from_slice(&sub_buf[1..]);
-                }
+            if proof_for_attention.is_some() {
+                serialize_attention_sub_proofs(sub_proofs, output, true);
+            }
+        }
+        LayerProof::AttentionDecode {
+            sub_proofs,
+            sub_claim_values,
+            num_heads,
+            new_tokens,
+            full_seq_len,
+            d_model,
+            causal,
+        } => {
+            serialize_u32(11, output);
+            serialize_u32(sub_proofs.len() as u32, output);
+            serialize_u32(*num_heads as u32, output);
+            serialize_u32(*new_tokens as u32, output);
+            serialize_u32(*full_seq_len as u32, output);
+            serialize_u32(*d_model as u32, output);
+            serialize_u32(if *causal { 1 } else { 0 }, output);
+            for val in sub_claim_values {
+                serialize_qm31_packed(*val, output);
+            }
+            if proof_for_attention.is_some() {
+                serialize_attention_sub_proofs(sub_proofs, output, true);
             }
         }
         LayerProof::Dequantize {
@@ -2863,37 +2918,44 @@ fn serialize_layer_proof_double_packed_inner(
             d_model,
             causal,
         } => {
-            // Attention not commonly used with double-packed; fall back to packed
             serialize_u32(5, output);
             serialize_u32(*num_heads, output);
             serialize_u32(*seq_len, output);
             serialize_u32(*d_model, output);
             serialize_u32(if *causal { 1 } else { 0 }, output);
             serialize_u32(sub_proofs.len() as u32, output);
+            serialize_u32(*num_heads as u32, output);
+            serialize_u32(*seq_len as u32, output);
+            serialize_u32(*d_model as u32, output);
+            serialize_u32(if *causal { 1 } else { 0 }, output);
             for val in sub_claim_values {
                 serialize_qm31_packed(*val, output);
             }
-            if let Some(proof) = proof_for_attention {
-                for sub in sub_proofs {
-                    let tmp = crate::gkr::GKRProof {
-                        layer_proofs: vec![sub.clone()],
-                        output_claim: proof.output_claim.clone(),
-                        input_claim: proof.input_claim.clone(),
-                        weight_commitments: vec![],
-                        weight_openings: vec![],
-                        weight_claims: vec![],
-                        weight_opening_transcript_mode:
-                            crate::gkr::types::WeightOpeningTranscriptMode::Sequential,
-                        io_commitment: proof.io_commitment,
-                        deferred_proofs: vec![],
-                        aggregated_binding: None,
-                        kv_cache_commitment: None,
-                        prev_kv_cache_commitment: None,
-                    };
-                    let mut sub_buf = Vec::new();
-                    serialize_gkr_model_proof(&tmp, &mut sub_buf);
-                    output.extend_from_slice(&sub_buf[1..]);
-                }
+            if proof_for_attention.is_some() {
+                serialize_attention_sub_proofs(sub_proofs, output, true);
+            }
+        }
+        LayerProof::AttentionDecode {
+            sub_proofs,
+            sub_claim_values,
+            num_heads,
+            new_tokens,
+            full_seq_len,
+            d_model,
+            causal,
+        } => {
+            serialize_u32(11, output);
+            serialize_u32(sub_proofs.len() as u32, output);
+            serialize_u32(*num_heads as u32, output);
+            serialize_u32(*new_tokens as u32, output);
+            serialize_u32(*full_seq_len as u32, output);
+            serialize_u32(*d_model as u32, output);
+            serialize_u32(if *causal { 1 } else { 0 }, output);
+            for val in sub_claim_values {
+                serialize_qm31_packed(*val, output);
+            }
+            if proof_for_attention.is_some() {
+                serialize_attention_sub_proofs(sub_proofs, output, true);
             }
         }
         LayerProof::Dequantize {

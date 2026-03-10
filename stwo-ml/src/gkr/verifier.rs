@@ -420,6 +420,32 @@ fn verify_gkr_inner(
                 )?
             }
 
+            (
+                LayerType::Attention { config: _ },
+                LayerProof::AttentionDecode {
+                    sub_proofs,
+                    sub_claim_values,
+                    num_heads,
+                    new_tokens,
+                    full_seq_len,
+                    d_model,
+                    causal,
+                },
+            ) => {
+                verify_attention_reduction_decode(
+                    &current_claim,
+                    sub_proofs,
+                    sub_claim_values,
+                    *num_heads,
+                    *new_tokens,
+                    *full_seq_len,
+                    *d_model,
+                    *causal,
+                    layer_idx,
+                    channel,
+                )?
+            }
+
             (layer_type, layer_proof) => {
                 return Err(GKRError::VerificationError {
                     layer_idx,
@@ -640,6 +666,114 @@ fn verify_gkr_inner(
                     return Err(GKRError::VerificationError {
                         layer_idx: 0,
                         reason: format!("deferred proof {} (quantize) input claim mismatch", i),
+                    });
+                }
+            }
+            LayerProof::Add {
+                lhs_eval,
+                rhs_eval,
+                ..
+            } => {
+                // Deferred Add proof: verify Add reduction (lhs + rhs == claim).
+                // Used when a transformer-block residual Add is on a deferred skip branch.
+                let skip_layer_idx = deferred_skip_layer_indices.get(i).copied().unwrap_or(0);
+                let input_layers = &circuit.layers[skip_layer_idx].input_layers;
+                let deferred_input_claim = verify_add_reduction(
+                    &deferred.claim,
+                    *lhs_eval,
+                    *rhs_eval,
+                    input_layers,
+                    0,
+                    channel,
+                )?;
+                if deferred_input_claim.point != deferred.input_claim.point
+                    || deferred_input_claim.value != deferred.input_claim.value
+                {
+                    return Err(GKRError::VerificationError {
+                        layer_idx: 0,
+                        reason: format!("deferred proof {} (add) input claim mismatch", i),
+                    });
+                }
+            }
+            LayerProof::RMSNorm {
+                logup_proof,
+                multiplicity_sumcheck,
+                linear_round_polys,
+                linear_final_evals,
+                input_eval,
+                output_eval,
+                rms_sq_eval,
+                rsqrt_eval,
+                rsqrt_table_commitment,
+                simd_combined,
+            } => {
+                // Deferred RMSNorm proof
+                let skip_layer_idx = deferred_skip_layer_indices.get(i).copied().unwrap_or(0);
+                let dim = match &circuit.layers[skip_layer_idx].layer_type {
+                    LayerType::RMSNorm { dim, .. } => *dim,
+                    _ => {
+                        return Err(GKRError::VerificationError {
+                            layer_idx: 0,
+                            reason: format!(
+                                "deferred proof {} skip layer is not RMSNorm",
+                                i
+                            ),
+                        })
+                    }
+                };
+                let deferred_input_claim = verify_rmsnorm_reduction(
+                    &deferred.claim,
+                    logup_proof.as_ref(),
+                    multiplicity_sumcheck.as_ref(),
+                    linear_round_polys,
+                    *linear_final_evals,
+                    *input_eval,
+                    *output_eval,
+                    *rms_sq_eval,
+                    *rsqrt_eval,
+                    *rsqrt_table_commitment,
+                    *simd_combined,
+                    dim,
+                    0,
+                    channel,
+                )?;
+                if deferred_input_claim.point != deferred.input_claim.point
+                    || deferred_input_claim.value != deferred.input_claim.value
+                {
+                    return Err(GKRError::VerificationError {
+                        layer_idx: 0,
+                        reason: format!("deferred proof {} (rmsnorm) input claim mismatch", i),
+                    });
+                }
+            }
+            LayerProof::Activation {
+                activation_type,
+                logup_proof,
+                multiplicity_sumcheck,
+                activation_proof,
+                input_eval,
+                output_eval,
+                table_commitment,
+            } => {
+                // Deferred Activation proof
+                let deferred_input_claim = verify_activation_reduction(
+                    &deferred.claim,
+                    *activation_type,
+                    logup_proof.as_ref(),
+                    multiplicity_sumcheck.as_ref(),
+                    activation_proof.as_ref(),
+                    *input_eval,
+                    *output_eval,
+                    *table_commitment,
+                    0,
+                    channel,
+                )?;
+                if deferred_input_claim.point != deferred.input_claim.point
+                    || deferred_input_claim.value != deferred.input_claim.value
+                {
+                    return Err(GKRError::VerificationError {
+                        layer_idx: 0,
+                        reason: format!("deferred proof {} (activation) input claim mismatch", i),
                     });
                 }
             }
@@ -1471,6 +1605,30 @@ fn verify_gkr_simd_inner(
                 sub_proofs,
                 sub_claim_values,
                 Some(&r_simd),
+                layer_idx,
+                channel,
+            )?,
+
+            (
+                LayerType::Attention { .. },
+                LayerProof::AttentionDecode {
+                    sub_proofs,
+                    sub_claim_values,
+                    num_heads,
+                    new_tokens,
+                    full_seq_len,
+                    d_model,
+                    causal,
+                },
+            ) => verify_attention_reduction_decode(
+                &current_claim,
+                sub_proofs,
+                sub_claim_values,
+                *num_heads,
+                *new_tokens,
+                *full_seq_len,
+                *d_model,
+                *causal,
                 layer_idx,
                 channel,
             )?,
@@ -4853,6 +5011,214 @@ pub(crate) fn verify_attention_reduction(
                 layer_idx,
                 reason: format!(
                     "attention Q projection: expected MatMul, got {:?}",
+                    std::mem::discriminant(other),
+                ),
+            });
+        }
+    };
+
+    Ok(final_claim)
+}
+
+/// Verify a decode-step attention reduction (DCOD domain tag, asymmetric dims).
+pub(crate) fn verify_attention_reduction_decode(
+    output_claim: &GKRClaim,
+    sub_proofs: &[LayerProof],
+    sub_claim_values: &[SecureField],
+    num_heads: usize,
+    new_tokens: usize,
+    full_seq_len: usize,
+    d_model: usize,
+    causal: bool,
+    layer_idx: usize,
+    channel: &mut PoseidonChannel,
+) -> Result<GKRClaim, GKRError> {
+    let d_k = d_model / num_heads;
+
+    let expected_count = 4 + 2 * num_heads;
+    if sub_proofs.len() != expected_count {
+        return Err(GKRError::VerificationError {
+            layer_idx,
+            reason: format!(
+                "attention_decode: expected {} sub-proofs, got {}",
+                expected_count,
+                sub_proofs.len(),
+            ),
+        });
+    }
+    if sub_claim_values.len() != expected_count {
+        return Err(GKRError::VerificationError {
+            layer_idx,
+            reason: format!(
+                "attention_decode: expected {} sub-claim values, got {}",
+                expected_count,
+                sub_claim_values.len(),
+            ),
+        });
+    }
+
+    // Replay DCOD metadata (must match prover)
+    channel.mix_u64(0x44434F44_u64); // "DCOD"
+    channel.mix_u64(num_heads as u64);
+    channel.mix_u64(new_tokens as u64);
+    channel.mix_u64(full_seq_len as u64);
+    channel.mix_u64(d_model as u64);
+    channel.mix_u64(if causal { 1 } else { 0 });
+
+    let verify_fresh_sub_matmul = |proof: &LayerProof,
+                                   claimed_value: SecureField,
+                                   m: usize,
+                                   k: usize,
+                                   n: usize,
+                                   channel: &mut PoseidonChannel|
+     -> Result<GKRClaim, GKRError> {
+        let pm = m.next_power_of_two();
+        let pn = n.next_power_of_two();
+        let log_rows = pm.ilog2() as usize;
+        let log_cols = pn.ilog2() as usize;
+        let r = channel.draw_qm31s(log_rows + log_cols);
+        mix_secure_field(channel, claimed_value);
+        let fresh_claim = GKRClaim {
+            point: r,
+            value: claimed_value,
+        };
+        match proof {
+            LayerProof::MatMul {
+                round_polys,
+                final_a_eval,
+                final_b_eval,
+            } => verify_matmul_reduction(
+                &fresh_claim,
+                round_polys,
+                *final_a_eval,
+                *final_b_eval,
+                m,
+                k,
+                n,
+                layer_idx,
+                channel,
+            ),
+            other => Err(GKRError::VerificationError {
+                layer_idx,
+                reason: format!(
+                    "attention_decode sub-proof: expected MatMul, got {:?}",
+                    std::mem::discriminant(other),
+                ),
+            }),
+        }
+    };
+
+    let mut proof_idx = 0;
+
+    // Sub-proof 0: Output projection (new_tokens × d_model × d_model)
+    let _output_proj_claim = match &sub_proofs[proof_idx] {
+        LayerProof::MatMul {
+            round_polys,
+            final_a_eval,
+            final_b_eval,
+        } => verify_matmul_reduction(
+            output_claim,
+            round_polys,
+            *final_a_eval,
+            *final_b_eval,
+            new_tokens,
+            d_model,
+            d_model,
+            layer_idx,
+            channel,
+        )?,
+        other => {
+            return Err(GKRError::VerificationError {
+                layer_idx,
+                reason: format!(
+                    "attention_decode output proj: expected MatMul, got {:?}",
+                    std::mem::discriminant(other),
+                ),
+            });
+        }
+    };
+    proof_idx += 1;
+
+    // Per-head sub-proofs (h = H-1..0)
+    for _h in (0..num_heads).rev() {
+        // Context: new_tokens × full_seq_len × d_k
+        let _ctx_claim = verify_fresh_sub_matmul(
+            &sub_proofs[proof_idx],
+            sub_claim_values[proof_idx],
+            new_tokens,
+            full_seq_len,
+            d_k,
+            channel,
+        )?;
+        proof_idx += 1;
+
+        // Score: new_tokens × d_k × full_seq_len
+        let _score_claim = verify_fresh_sub_matmul(
+            &sub_proofs[proof_idx],
+            sub_claim_values[proof_idx],
+            new_tokens,
+            d_k,
+            full_seq_len,
+            channel,
+        )?;
+        proof_idx += 1;
+    }
+
+    // V, K projections: new_tokens × d_model × d_model
+    let _v_claim = verify_fresh_sub_matmul(
+        &sub_proofs[proof_idx],
+        sub_claim_values[proof_idx],
+        new_tokens,
+        d_model,
+        d_model,
+        channel,
+    )?;
+    proof_idx += 1;
+
+    let _k_claim = verify_fresh_sub_matmul(
+        &sub_proofs[proof_idx],
+        sub_claim_values[proof_idx],
+        new_tokens,
+        d_model,
+        d_model,
+        channel,
+    )?;
+    proof_idx += 1;
+
+    // Q projection — determines the final input claim
+    let q_padded_rows = new_tokens.next_power_of_two();
+    let q_padded_cols = d_model.next_power_of_two();
+    let log_rows = q_padded_rows.ilog2() as usize;
+    let log_cols = q_padded_cols.ilog2() as usize;
+    let r_q = channel.draw_qm31s(log_rows + log_cols);
+    let q_value = sub_claim_values[proof_idx];
+    mix_secure_field(channel, q_value);
+    let q_claim = GKRClaim {
+        point: r_q,
+        value: q_value,
+    };
+
+    let final_claim = match &sub_proofs[proof_idx] {
+        LayerProof::MatMul {
+            round_polys,
+            final_a_eval,
+            final_b_eval,
+        } => verify_matmul_reduction(
+            &q_claim,
+            round_polys,
+            *final_a_eval,
+            *final_b_eval,
+            new_tokens,
+            d_model,
+            d_model,
+            layer_idx,
+            channel,
+        )?,
+        other => {
+            return Err(GKRError::VerificationError {
+                layer_idx,
+                reason: format!(
+                    "attention_decode Q projection: expected MatMul, got {:?}",
                     std::mem::discriminant(other),
                 ),
             });
