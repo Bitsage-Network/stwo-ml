@@ -9222,8 +9222,8 @@ mod tests {
         let no_kv_len = init_no_kv.len();
         assert!(no_kv_len >= 6, "init_calldata too short: {no_kv_len}");
         assert_eq!(&init_no_kv[no_kv_len - 3], "0", "has_kv should be 0 when None");
-        assert_eq!(&init_no_kv[no_kv_len - 2], "0x0", "kv_commitment should be 0x0");
-        assert_eq!(&init_no_kv[no_kv_len - 1], "0x0", "prev_kv_commitment should be 0x0");
+        assert_eq!(&init_no_kv[no_kv_len - 2], "0", "kv_commitment should be 0");
+        assert_eq!(&init_no_kv[no_kv_len - 1], "0", "prev_kv_commitment should be 0");
 
         // Verify KV serialization format with actual KV commitments.
         let kvc = FieldElement::from(0xCAFEu64);
@@ -9291,8 +9291,8 @@ mod tests {
         let len = init.len();
         // Last 3 entries: has_kv=0, kv=0x0, prev_kv=0x0
         assert_eq!(&init[len - 3], "0", "has_kv should be 0 for non-KV proof");
-        assert_eq!(&init[len - 2], "0x0", "kv_commitment should be 0x0");
-        assert_eq!(&init[len - 1], "0x0", "prev_kv_commitment should be 0x0");
+        assert_eq!(&init[len - 2], "0", "kv_commitment should be 0");
+        assert_eq!(&init[len - 1], "0", "prev_kv_commitment should be 0");
 
         // out_cols is at len-4 (before the 3 KV felts)
         let out_cols_str = &init[len - 4];

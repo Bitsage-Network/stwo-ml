@@ -1723,7 +1723,6 @@ pub fn prove_gkr_with_cache(
 
     // ── Phase: deferred_proofs ──
     profiler.begin_phase("deferred_proofs", channel.hash_count());
-
     let flags = compute_weight_mode_flags();
     let aggregate_weight_binding = flags.aggregate_weight_binding;
     // In aggregated mode, include deferred MatMul weight claims in the same
@@ -1770,8 +1769,15 @@ pub fn prove_gkr_with_cache(
                     eval_point: weight_eval_point.clone(),
                     expected_value: reduction.final_b_eval,
                 };
+                // Include deferred weight claims in aggregated binding when either
+                // the old batch RLC mode or the new AggregatedOracleSumcheck mode
+                // is active. Without this, the verifier reconstructs more claims
+                // than the prover used in the binding proof, causing verification
+                // failure on DAG graphs with residual connections.
+                let use_aggregated_binding =
+                    aggregate_weight_binding || gkr_aggregated_oracle_sumcheck_enabled();
                 let (deferred_weight_commitment, deferred_weight_opening) =
-                    if aggregate_weight_binding {
+                    if use_aggregated_binding {
                         deferred_weight_claims_data.push((
                             *weight_node_id,
                             weight_eval_point,
@@ -2258,8 +2264,10 @@ pub fn prove_gkr_decode(
                     eval_point: weight_eval_point.clone(),
                     expected_value: reduction.final_b_eval,
                 };
+                let use_aggregated_binding =
+                    aggregate_weight_binding || gkr_aggregated_oracle_sumcheck_enabled();
                 let (deferred_weight_commitment, deferred_weight_opening) =
-                    if aggregate_weight_binding {
+                    if use_aggregated_binding {
                         deferred_weight_claims_data.push((
                             *weight_node_id, weight_eval_point, reduction.final_b_eval,
                         ));
@@ -3061,7 +3069,9 @@ pub fn prove_gkr_gpu_with_cache(
                     eval_point: weight_eval_point.clone(),
                     expected_value: reduction.final_b_eval,
                 };
-                let (deferred_weight_commitment, deferred_opening) = if aggregate_weight_binding {
+                let use_aggregated_binding =
+                    aggregate_weight_binding || gkr_aggregated_oracle_sumcheck_enabled();
+                let (deferred_weight_commitment, deferred_opening) = if use_aggregated_binding {
                     deferred_weight_claims_data.push((
                         *weight_node_id,
                         weight_eval_point,
@@ -3694,12 +3704,12 @@ pub fn prove_gkr_decode_gpu_with_cache(
                     .get_weight(*weight_node_id)
                     .ok_or(GKRError::MissingWeight { node_id: *weight_node_id })?;
 
-                let (proof, claim) = reduce_matmul_layer_gpu(
+                let (proof, claim, _mm_timings) = reduce_matmul_layer_gpu(
                     &gpu, &current_claim, a_matrix, b_matrix, *m, *k, *n, channel,
                 )?;
 
                 let final_b_eval = match &proof {
-                    LayerProof::MatMul { final_b_eval, .. } => *final_b_eval,
+                    LayerProof::MatMul { final_b_eval, .. } => final_b_eval,
                     _ => unreachable!("reduce_matmul_layer_gpu returns MatMul"),
                 };
                 push_matmul_weight_data(
@@ -3923,7 +3933,7 @@ pub fn prove_gkr_decode_gpu_with_cache(
                 mix_secure_field(channel, deferred_claim.value);
 
                 // GPU backend for deferred matmul reductions
-                let (reduction, input_claim) =
+                let (reduction, input_claim, _mm_timings) =
                     reduce_matmul_layer_with_backend::<stwo::prover::backend::gpu::GpuBackend>(
                         &deferred_claim, a_matrix, b_matrix, *m, *k, *n, channel,
                     )?;
@@ -3942,7 +3952,9 @@ pub fn prove_gkr_decode_gpu_with_cache(
                     eval_point: weight_eval_point.clone(),
                     expected_value: reduction.final_b_eval,
                 };
-                let (deferred_weight_commitment, deferred_opening) = if aggregate_weight_binding {
+                let use_aggregated_binding =
+                    aggregate_weight_binding || gkr_aggregated_oracle_sumcheck_enabled();
+                let (deferred_weight_commitment, deferred_opening) = if use_aggregated_binding {
                     deferred_weight_claims_data.push((
                         *weight_node_id, weight_eval_point, reduction.final_b_eval,
                     ));
@@ -4928,8 +4940,10 @@ pub fn prove_gkr_simd_gpu_with_cache(
                 };
 
                 // In aggregated mode, defer weight opening; otherwise prove inline
+                let use_aggregated_binding =
+                    aggregate_weight_binding || gkr_aggregated_oracle_sumcheck_enabled();
                 let (deferred_weight_commitment, deferred_weight_opening) =
-                    if aggregate_weight_binding {
+                    if use_aggregated_binding {
                         deferred_weight_claims_data.push((
                             *weight_node_id,
                             weight_eval_point,

@@ -52,6 +52,14 @@ if (!vc || vc.mode !== "streaming") {
   process.exit(1);
 }
 
+// Validate required streaming fields
+if (!vc.init_calldata || !vc.finalize_calldata || !vc.model_id || !vc.total_felts) {
+  console.error(
+    "Proof missing required streaming fields: init_calldata, finalize_calldata, model_id, total_felts"
+  );
+  process.exit(1);
+}
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -155,8 +163,6 @@ async function main() {
       const evt = receipt.events[0];
       sessionId = evt.keys?.[1] || evt.data?.[0];
       console.log(`  Session ID: ${sessionId}`);
-      console.log(`  Event keys: ${JSON.stringify(evt.keys)}`);
-      console.log(`  Event data: ${JSON.stringify(evt.data)}`);
     } else {
       console.error("  Could not extract session ID from receipt!");
       process.exit(1);
@@ -288,15 +294,19 @@ async function main() {
   console.log("All steps completed successfully!");
 
   // Verify
-  try {
-    const result = await provider.callContract({
-      contractAddress: CONTRACT,
-      entrypoint: "is_proof_verified",
-      calldata: [proof.proof_hash || "0x0"],
-    });
-    console.log(`is_proof_verified: ${result[0]}`);
-  } catch {
-    console.log("(could not check is_proof_verified)");
+  if (proof.proof_hash) {
+    try {
+      const result = await provider.callContract({
+        contractAddress: CONTRACT,
+        entrypoint: "is_proof_verified",
+        calldata: [proof.proof_hash],
+      });
+      console.log(`is_proof_verified: ${result[0]}`);
+    } catch {
+      console.log("(could not check is_proof_verified)");
+    }
+  } else {
+    console.log("Warning: proof_hash not present in proof file — skipping on-chain verification check");
   }
 }
 

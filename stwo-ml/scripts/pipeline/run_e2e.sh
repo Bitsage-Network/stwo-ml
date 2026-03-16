@@ -121,7 +121,7 @@ if [[ ! -f "$BINARY" ]]; then
   if command -v nvidia-smi &>/dev/null; then
     FEATURES="$FEATURES,cuda-runtime"
   fi
-  (cd "$REPO_DIR" && cargo build --release --features "$FEATURES")
+  (cd "$REPO_DIR" && cargo build --release --bin prove-model --features "$FEATURES")
 fi
 
 # ─── Check paymaster deps (only if --submit) ────────────────────────
@@ -149,7 +149,10 @@ if [[ -n "$SUBMIT" ]]; then
   PAYMASTER_DIR="$REPO_DIR/scripts/pipeline"
   if [[ ! -d "$PAYMASTER_DIR/node_modules/starknet" ]]; then
     echo "Installing starknet.js..."
-    (cd "$PAYMASTER_DIR" && npm init -y --silent 2>/dev/null && npm install starknet --silent)
+    (cd "$PAYMASTER_DIR" && npm init -y --silent 2>/dev/null && npm install starknet --silent) || {
+      echo "Error: npm install starknet failed. Check network connectivity and Node.js version."
+      exit 1
+    }
   fi
 fi
 

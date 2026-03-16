@@ -471,8 +471,13 @@ fn verify_gkr_inner(
         });
     }
 
+    // In batched/aggregated modes, deferred weight bindings are verified in the
+    // aggregated pass — not per-deferred Merkle openings. This covers both the old
+    // BatchedRlcDirectEvalV1 mode and the new AggregatedOracleSumcheck mode.
     let batched_rlc_mode =
-        proof.weight_opening_transcript_mode == WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1;
+        proof.weight_opening_transcript_mode == WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1
+            || proof.weight_opening_transcript_mode
+                == WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
 
     // Verify deferred proofs for skip branches of DAG Add layers.
     // Fiat-Shamir order: walk → deferred proofs → weight openings.
@@ -808,9 +813,15 @@ fn verify_gkr_inner(
             let weight_claim = deferred.weight_claim().unwrap();
 
             if batched_rlc_mode {
-                // In batched RLC mode, deferred weight binding is checked in the
-                // aggregated verifier pass (no per-deferred Merkle opening).
-                if weight_commitment != starknet_ff::FieldElement::ZERO {
+                // In batched/aggregated modes, deferred weight binding is checked
+                // in the aggregated verifier pass (no per-deferred Merkle opening).
+                //
+                // BatchedRlcDirectEvalV1: weight_commitment = ZERO, opening = empty.
+                // AggregatedOracleSumcheck: weight_commitment = real Merkle root
+                //   (needed for super-root reconstruction), opening = empty.
+                let is_agg_oracle = proof.weight_opening_transcript_mode
+                    == WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
+                if !is_agg_oracle && weight_commitment != starknet_ff::FieldElement::ZERO {
                     return Err(GKRError::VerificationError {
                         layer_idx: 0,
                         reason: format!(
@@ -1785,7 +1796,9 @@ fn verify_gkr_simd_inner(
     }
 
     let batched_rlc_mode =
-        proof.weight_opening_transcript_mode == WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1;
+        proof.weight_opening_transcript_mode == WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1
+            || proof.weight_opening_transcript_mode
+                == WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
 
     // Verify deferred proofs for skip branches of DAG Add layers.
     // Fiat-Shamir order: walk → deferred proofs → weight openings.
@@ -1999,7 +2012,9 @@ fn verify_gkr_simd_inner(
             let weight_claim = deferred.weight_claim().unwrap();
 
             if batched_rlc_mode {
-                if weight_commitment != starknet_ff::FieldElement::ZERO {
+                let is_agg_oracle = proof.weight_opening_transcript_mode
+                    == WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
+                if !is_agg_oracle && weight_commitment != starknet_ff::FieldElement::ZERO {
                     return Err(GKRError::VerificationError {
                         layer_idx: 0,
                         reason: format!(
