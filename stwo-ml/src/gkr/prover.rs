@@ -3709,7 +3709,7 @@ pub fn prove_gkr_decode_gpu_with_cache(
                 )?;
 
                 let final_b_eval = match &proof {
-                    LayerProof::MatMul { final_b_eval, .. } => final_b_eval,
+                    LayerProof::MatMul { final_b_eval, .. } => *final_b_eval,
                     _ => unreachable!("reduce_matmul_layer_gpu returns MatMul"),
                 };
                 push_matmul_weight_data(
