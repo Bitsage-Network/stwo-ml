@@ -1683,19 +1683,21 @@ pub fn prove_aggregated_binding_streaming(
         eval_unified_oracle_streaming(&challenge_point, source, &claim_n_vars, &config);
     channel.mix_felts(&[oracle_eval]);
 
-    // 5. Build virtual MLE and prove single opening against super-root.
-    //    This matches the Cairo verifier which expects a single MLE opening proof
-    //    against the super-root (not per-matrix openings).
+    // 5. Build virtual MLE in u32 format and prove opening via GPU.
+    //    Uses the GPU-resident MLE opening path (Poseidon Merkle + fold on device),
+    //    which is ~20-50× faster than the CPU SecureField path for large MLEs.
     //    Memory cost: ~2^n_global × 16 bytes (e.g. ~4GB for 4 matrices of Qwen3-14B 1-layer).
     let t_opening = std::time::Instant::now();
-    let virtual_mle = build_virtual_mle_streaming(source, &config);
+    let virtual_mle_u32 = build_virtual_mle_u32_streaming(source, &config);
+    let n_elements = virtual_mle_u32.len() / 4;
     eprintln!(
         "[GPU] virtual MLE built: {} elements ({:.1} GB) in {:.1}s",
-        virtual_mle.len(),
-        (virtual_mle.len() * std::mem::size_of::<SecureField>()) as f64 / 1e9,
+        n_elements,
+        (virtual_mle_u32.len() * std::mem::size_of::<u32>()) as f64 / 1e9,
         t_opening.elapsed().as_secs_f64()
     );
-    let opening_proof = prove_mle_opening(&virtual_mle, &challenge_point, channel);
+    let (_commitment, opening_proof) =
+        prove_mle_opening_with_commitment_qm31_u32(&virtual_mle_u32, &challenge_point, channel);
     eprintln!(
         "[GPU] single virtual MLE opening: {:.1}s total",
         t_opening.elapsed().as_secs_f64()
