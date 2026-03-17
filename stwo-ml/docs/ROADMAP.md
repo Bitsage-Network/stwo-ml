@@ -1,6 +1,6 @@
 # ObelyZK Protocol Roadmap
 
-**Version**: 1.0 | **Date**: March 16, 2026 | **Author**: Bitsage Network
+**Version**: 2.0 | **Date**: March 17, 2026 | **Author**: Bitsage Network
 
 > Strategy: Deep research per phase, implement, test end-to-end on H100 GPU, verify all security properties, then advance to next phase.
 
@@ -222,128 +222,172 @@ Tamper tests confirm: `test_layernorm_multi_row_tampered_mean_rejected`, `test_r
 
 ---
 
-## Phase 2: Performance — Sub-30s Proving
+## Phase 2: Performance Optimization
 
-**Goal**: Full 40-layer Qwen3-14B proof in under 30 seconds on H100 NVL.
+**Goal**: Reduce proving overhead where possible. 103s baseline is already strong.
 
-### 2A. Lower GPU Dispatch Threshold
+**Analysis (March 17, 2026)**: Deep research revealed the GPU dispatch threshold (2A)
+was a red herring — all matmuls already use GPU via `gpu_matmul_m31_full` and
+`reduce_matmul_layer_gpu`. The 103s breakdown is:
 
-**Current**: GPU sumcheck only activates for matrices with k >= 16384 elements.
-**Issue**: Qwen3-14B Q/K/V projections are 5120x5120 (k=5120 < 16384), so they fall to CPU.
-**Fix**: Change threshold to 4096 (or even 2048).
-**Expected savings**: ~25s (forward pass 38s->15s, GKR walk 47s->30s).
+| Phase | Time | Backend | Optimization Potential |
+|-------|------|---------|----------------------|
+| Weight loading | 35s | CPU I/O (mmap + transpose) | Parallel shard extraction |
+| Forward pass | 38s | GPU (`gpu_matmul_m31_full`) | Fused activation kernels |
+| GKR walk | 47s | GPU (`reduce_matmul_layer_gpu`) | Already optimized |
+| Unified STARK | 5s | CPU (SimdBackend) | Blocked by STWO GpuBackend bug |
+| Serialization | 2s | CPU | Binary format |
 
-**Files**: `src/gpu_sumcheck.rs` line 14 (MLE_THRESHOLD constant)
+### 2A. GPU Dispatch Threshold — RESOLVED (Not a Bottleneck)
 
-**Test plan**: Benchmark 1-layer and 40-layer before/after on H100.
+**Status**: CLOSED. Investigation confirmed all matmuls already dispatch to GPU.
+The 16384 comment in gpu_sumcheck.rs is outdated documentation, not an active threshold.
 
----
+### 2B. GPU Unified STARK — BLOCKED (STWO Library Bug)
 
-### 2B. GPU-Accelerated Unified STARK
+**Status**: DEFERRED. The GpuBackend hits `ConstraintsNotSatisfied` due to a bug in
+STWO's preprocessed column allocator that deduplicates columns by name. Multi-instance
+components (e.g., 40 RMSNorm layers) read wrong column data. Instance ID workaround
+fixes SimdBackend but not GpuBackend. Fix requires STWO library changes.
+**Impact**: 5s → 2s (low priority, already fast).
 
-**Current**: Unified STARK uses SimdBackend (CPU) because GpuBackend hits `ConstraintsNotSatisfied` with preprocessed columns.
-**Fix**: Debug and fix GpuBackend preprocessed column handling.
-**Expected savings**: ~3s (5s -> 2s).
+### 2C. Fused GPU Kernels
 
-**Files**: `src/aggregation.rs` (STARK backend dispatch)
+**Status**: OPEN. Forward pass does CPU↔GPU transfers between matmul and activation.
+Fusing activation into the GPU kernel would eliminate round-trips.
+**Impact**: ~5s savings on forward pass.
 
----
+### 2D. Binary Serialization
 
-### 2C. Fused Forward + Activation GPU Kernels
-
-**Current**: Forward pass downloads matmul output to CPU, applies activation, uploads back.
-**Fix**: CUDA kernel that applies activation in-place on GPU after matmul.
-**Expected savings**: ~5s (eliminate CPU<->GPU round-trips).
-
-**Files**: `src/gpu_sumcheck.rs` (new activation kernel), `src/aggregation.rs` (dispatch)
-
----
-
-### 2D. GPU Memory Pooling
-
-**Current**: Each matmul allocates fresh GPU buffers (`device.alloc_zeros()`).
-**Fix**: Pre-allocate buffer pool, reuse across layers.
-**Expected savings**: ~2s (eliminate allocation overhead for 160 matmuls).
-
----
-
-### 2E. Binary Calldata Serialization
-
-**Current**: JSON hex encoding (`format!("0x{:x}", f)` per element).
-**Fix**: Compact binary format for storage/transmission. JSON kept for debug.
-**Expected savings**: ~1.5s, 7MB -> 3.6MB proof size.
-
----
-
-### Phase 2 Target
-
-| Metric | Before | After |
-|--------|--------|-------|
-| Forward pass | 38s | ~12s |
-| GKR walk | 47s | ~25s |
-| Unified STARK | 5s | ~2s |
-| Serialization | 2s | ~0.5s |
-| **Total** | **103s** | **~30s** |
+**Status**: OPEN. JSON hex encoding is 2x larger than necessary.
+**Impact**: 2s → 0.5s, 7MB → 3.6MB.
 
 ---
 
 ## Phase 3: Multi-Model Support & Benchmarking
 
-**Goal**: Prove the protocol works across diverse architectures, not just Qwen3-14B.
+**Goal**: Prove the protocol works across diverse architectures — dense, MoE, and vision.
 
-### 3A. Model Support Matrix
+### 3A. Model Support Matrix (Updated March 17, 2026)
 
-| Model | Params | Architecture | New Components Needed | Priority |
-|-------|--------|-------------|----------------------|----------|
-| **Qwen3-14B** | 14B | Dense transformer, GQA, RMSNorm | None (baseline) | DONE |
-| **MiniMax-01** | 456B | MoE (32 experts, top-2 routing) | Router verification, expert selection proof | HIGH |
-| **Kimi (Moonshot)** | ~200B | Dense, 200K context | Long-context KV proving, chunked attention | HIGH |
-| **YOLOv8** | 3-68M | CNN + detection head | Conv2D, BatchNorm, anchor box | MEDIUM |
-| **Llama-3-8B** | 8B | Dense transformer, GQA, RMSNorm | None (same arch as Qwen) | HIGH |
-| **Llama-3-70B** | 70B | Dense, GQA | Multi-GPU proving, memory optimization | HIGH |
-| **Mistral-7B** | 7B | Sliding window attention | Window mask constraint | MEDIUM |
-| **Mixtral-8x7B** | 47B | MoE (8 experts, top-2) | Router verification | HIGH |
-| **Phi-3 Mini** | 3.8B | Dense, long context | Already partially supported | LOW |
-| **GPT-2** | 124M-1.5B | Dense, LayerNorm (not RMSNorm) | LayerNorm gamma/beta | LOW |
-| **DeepSeek-V3** | 671B | MoE (256 experts) | Large-scale MoE routing | FUTURE |
+**Tier 1: Ready NOW (zero code changes after SiLU fix)**
 
-### 3B. MoE (Mixture-of-Experts) Verification
+| Model | Params | Norm | Activation | Attention | Status |
+|-------|--------|------|-----------|-----------|--------|
+| **Qwen3-14B** | 14B | RMSNorm | SiLU | GQA (40h/8kv) | **PROVEN** (103s, 40L) |
+| **Llama-3-8B** | 8B | RMSNorm | SiLU | GQA (32h/8kv) | **READY** (download + run) |
+| **Llama-3-70B** | 70B | RMSNorm | SiLU | GQA (64h/8kv) | **READY** (multi-GPU memory) |
+| **Mistral-7B** | 7B | RMSNorm | SiLU | GQA (32h/8kv) | **READY** |
+| **Phi-3 Mini** | 3.8B | RMSNorm | GELU | GQA | **READY** |
+| **GPT-2** | 124M-1.5B | LayerNorm | GELU | MHA (12h) | **READY** |
+| **GLM-4-9B** | 9B | RMSNorm | SiLU | GQA | **READY** (standard transformer) |
 
-MoE models (MiniMax, Mixtral, DeepSeek) require two new verified components:
+**Tier 2: Needs MoE routing (single feature unlocks all)**
 
-1. **Router verification**: Prove the gating network's top-k selection is correct
-   - Router is a small MatMul (hidden_dim -> num_experts) — already verifiable
-   - Top-k selection: prove the k largest values were correctly identified
-   - New component: `TopKEval` STARK with sorting network constraint
+| Model | Total Params | Active | Experts | Router | Source |
+|-------|-------------|--------|---------|--------|--------|
+| **Mixtral-8x7B** | 47B | 13B | 8, top-2 | MatMul | Open-weight (Mistral AI) |
+| **Kimi K2** | 1T | 32B | MoE | MatMul | Open-weight (Moonshot AI) |
+| **GLM-5** | 744B | 40B | MoE | MatMul | Open-weight (Zhipu AI, MIT) |
+| **DeepSeek-V3** | 671B | ~37B | 256, top-8 | MatMul | Open-weight |
+| **Kimi K2.5** | 1T+ | 32B | MoE + Vision | MatMul | Open-weight (Moonshot AI) |
 
-2. **Expert selection proof**: Prove only the selected experts were activated
-   - Conditional execution: if expert_i selected, prove MatMul; if not, prove zero contribution
-   - Challenge: variable computation graph per token (experts differ)
-   - Solution: commit to routing decisions, prove each selected expert independently
+**Tier 3: Needs specialized components**
 
-### 3C. CNN Support (YOLOv8)
+| Model | Params | Blocker | New Component | Effort |
+|-------|--------|---------|---------------|--------|
+| **MiniMax-01** | 456B | Lightning (linear) attention | `GraphOp::LinearAttention` | HIGH (2-4 weeks) |
+| **MiniMax-M1** | 456B | Same + reasoning | Same | HIGH |
+| **YOLOv8** | 3-68M | Vision pipeline | Image preprocessing, Conv2D wiring | MEDIUM (2 weeks) |
+| **ViT** | 86-632M | Patch embedding | Conv2D + reshape | MEDIUM |
 
-Conv2D can be decomposed into MatMul via im2col:
+### 3B. MoE Routing Protocol (KEY UNLOCK — Tier 2)
+
+**Impact**: Single implementation unlocks Mixtral, Kimi K2/K2.5, GLM-5, DeepSeek-V3.
+
+**How MoE works**:
+```
+For each token:
+  1. router_logits = input × W_router          (MatMul: hidden_dim → num_experts)
+  2. gate_weights = softmax(top-k(router_logits))  (top-k selection + normalize)
+  3. For each selected expert i:
+       expert_out_i = FFN_i(input)             (MatMul: hidden → ff → hidden)
+  4. output = Σ gate_weight_i × expert_out_i   (weighted sum)
+```
+
+**What needs proving**:
+
+| Step | Operation | Already Supported? | New Component Needed |
+|------|-----------|-------------------|---------------------|
+| Router MatMul | `input × W_router` | **Yes** (standard MatMul) | None |
+| Top-k selection | Find k largest logits | **No** | `TopKProof` |
+| Gate softmax | softmax over selected logits | **Yes** (Phase 1B softmax sum) | Wire to MoE |
+| Expert FFN | Per-expert MatMul chain | **Yes** (standard MatMul) | None |
+| Weighted sum | `Σ gate_i × expert_i` | **Yes** (Mul + Add) | None |
+
+**The only new primitive**: `TopKProof` — prove that the k selected indices are the k largest values.
+
+**TopK verification protocol** (comparison-based):
+1. Prover provides: selected indices `[i_1, ..., i_k]` and values `[v_1, ..., v_k]`
+2. Prover provides: rejected indices `[j_1, ..., j_{n-k}]` and values `[u_1, ..., u_{n-k}]`
+3. Constraint 1: all values at selected indices match router_logits (LogUp lookup)
+4. Constraint 2: all values at rejected indices match router_logits (LogUp lookup)
+5. Constraint 3: `min(selected) >= max(rejected)` (comparison proof)
+6. Constraint 4: union of selected + rejected = all indices (permutation argument)
+
+**Estimated complexity**: ~1 week for TopK constraint + 1 week for MoE graph wiring.
+
+**Files to modify**:
+- `src/compiler/graph.rs`: Add `GraphOp::MoE { num_experts, top_k, expert_dims }`
+- `src/gkr/circuit.rs`: Add `LayerType::MoE { ... }`
+- `src/gkr/prover.rs`: Add `reduce_moe_layer()` that decomposes into router + TopK + experts
+- `src/components/topk.rs`: New file — TopK STARK constraint + trace generation
+- `src/compiler/hf_loader.rs`: Detect MoE architecture from config.json, build expert graph
+
+### 3C. Lightning Attention Protocol (MiniMax-specific)
+
+**Blocker for**: MiniMax-01, MiniMax-M1 only. Not needed for other MoE models.
+
+Lightning Attention replaces `softmax(QK^T/√d)V` with linear attention:
+`output = φ(Q) × (φ(K)^T × V)` where φ is a kernel function.
+
+This changes the attention from O(n²) to O(n) but requires a completely different
+arithmetization — no softmax, no score matrix, different matmul decomposition.
+
+**Protocol**: Would need `GraphOp::LinearAttention` with:
+1. Kernel function application: `φ(Q)`, `φ(K)` — element-wise (like activation, LogUp provable)
+2. Accumulated KV: `S = Σ φ(K_i)^T × V_i` — running sum (MatMul + Add)
+3. Output: `out_i = φ(Q_i) × S` — MatMul
+
+**Effort**: 2-4 weeks. Deferred until MoE routing is complete.
+
+### 3D. CNN Support (YOLOv8, Vision Transformers)
+
+`GraphOp::Conv2D` already exists in the graph IR. Implementation via im2col:
 - `Conv2D(input, kernel) = MatMul(im2col(input), reshape(kernel))`
-- im2col is a deterministic reorganization (index mapping) — provable via permutation argument
-- BatchNorm: same structure as LayerNorm (mean + variance + affine transform)
-- Detection head: argmax/NMS are post-processing, not part of the arithmetic trace
+- im2col is deterministic index mapping — provable via permutation argument
+- BatchNorm: same as LayerNorm (mean + variance + affine, already proven)
+- Detection head (NMS, anchor boxes): post-processing, not part of arithmetic trace
 
-### 3D. Competitive Benchmarking
+**Effort**: 2 weeks. Conv2D IR exists, need inference pipeline + im2col proof.
 
-| Competitor | Claimed | Architecture | Our Advantage |
-|-----------|---------|-------------|---------------|
-| **EZKL** | ~1M params, seconds | Halo2/KZG | We handle 14B+ params, on-chain verifier |
-| **zkLLM** | 13B params, 1-15 min | Custom commitment | We're faster (103s), deployed on-chain |
-| **Giza** | ~10M params, minutes | Cairo-STARK | We're 1000x larger model scale |
-| **Expander** | GKR framework | GKR (no deployment) | We have deployed Cairo verifier |
-| **DeepProve** | GPT-2 scale | GKR | We handle 100x larger models |
+### 3E. Competitive Benchmarking
+
+| Competitor | Max Params | Prove Time | On-Chain | Proof System |
+|-----------|-----------|-----------|----------|-------------|
+| **EZKL** | ~1M | seconds | Solidity (Ethereum) | Halo2/KZG |
+| **zkLLM** | 13B | 1-15 min | None | Custom |
+| **Giza** | ~10M | minutes | Cairo (Stone) | STARK |
+| **Expander** | ? | ? | None | GKR |
+| **DeepProve** | GPT-2 | ? | None | GKR |
+| **ObelyZK** | **14B (dense), 1T+ (MoE target)** | **103s** | **Cairo (Starknet)** | **GKR + STARK** |
 
 **Benchmark protocol**:
-1. Standardize on common models (GPT-2, Llama-3-8B) for apples-to-apples comparison
-2. Measure: prove time, verify time, proof size, calldata size, security level
-3. Publish reproducible benchmarks with exact hardware specs
-4. Open-source benchmark suite for community verification
+1. Standardize: GPT-2-124M, Llama-3-8B, Mixtral-8x7B (when MoE ready)
+2. Measure: prove time, verify time, proof size, calldata, security level
+3. Hardware: H100 NVL (single GPU), document exact specs
+4. Reproducible: publish scripts + model weights + expected outputs
+5. Open-source benchmark suite for community verification
 
 ---
 
@@ -415,21 +459,24 @@ Conv2D can be decomposed into MatMul via im2col:
 
 ---
 
-## Execution Timeline
+## Execution Timeline (Updated March 17, 2026)
 
-| Phase | Duration | Deliverable | Test Gate |
-|-------|----------|-------------|-----------|
-| **1A** LayerNorm mean/variance | 1-2 weeks | Inner-product sumcheck for mean + variance | Full 40L proof on H100, tamper tests pass |
-| **1B** Softmax sum | 1 week | Sum accumulator constraint | Attention proof on H100, tamper tests pass |
-| **1C** RoPE arithmetization | 2-3 weeks | LogUp table + rotation constraint | Full 40L with position encoding verified |
-| **1D** Causal mask | 1 week | Mask constraint in STARK | Attention with correct/incorrect masks tested |
-| **1E** f64 elimination | 2 weeks | Integer-only tables | Cross-platform determinism test |
-| **2A** GPU threshold | 1 day | Constant change + benchmark | 40L in <80s on H100 |
-| **2B** GPU unified STARK | 1-2 weeks | Fix GpuBackend | 40L in <75s on H100 |
-| **2C** Fused kernels | 2 weeks | New CUDA kernels | 40L in <50s on H100 |
-| **2D-2E** Memory + serialization | 1 week | Pool + binary format | 40L in <35s on H100 |
-| **3A-3D** Multi-model + benchmarks | 4-6 weeks | 5+ models verified, benchmark suite | Published comparison table |
-| **4A** Recursive composition | 4-6 weeks | Constant-size on-chain proof | Single TX verification on Starknet |
+| Phase | Status | Deliverable | Test Gate |
+|-------|--------|-------------|-----------|
+| **1A** LayerNorm mean/variance | **CLOSED** (was already done) | Plain sumcheck + LogUp | Tamper tests pass |
+| **1B** Softmax sum | **CLOSED** (March 17) | Plain sumcheck + row-sum binding | 5 tamper tests pass |
+| **1C** RoPE arithmetization | **CLOSED** (March 17) | Full STARK (rotation + LogUp) | 8 RoPE tests + circuit test |
+| **1D** Causal mask | **CLOSED** (March 17) | Fiat-Shamir binding | Causal mismatch test |
+| **1E** f64 elimination | OPEN | Integer-only tables | Cross-platform determinism test |
+| **2A** GPU threshold | **CLOSED** (not a bottleneck) | Already on GPU | Confirmed via profiling |
+| **2B** GPU unified STARK | DEFERRED (STWO bug) | Needs STWO library fix | — |
+| **2C-2D** Fused kernels + serialization | OPEN | CUDA + binary | ~7s savings |
+| **3A** SiLU activation | **CLOSED** (March 17) | Native SiLU LogUp | 4 unit tests |
+| **3B** MoE routing (TopK) | **NEXT** | TopK proof + MoE graph | Mixtral/Kimi/GLM-5 proven |
+| **3C** Lightning Attention | FUTURE | Linear attention protocol | MiniMax-01 proven |
+| **3D** CNN (YOLOv8) | FUTURE | im2col proof | YOLOv8 proven |
+| **3E** Benchmarks | NEXT (after 3B) | 5+ models, comparison table | Published |
+| **4A** Recursive composition | FUTURE | Constant-size on-chain proof | Single TX on Starknet |
 
 ---
 
