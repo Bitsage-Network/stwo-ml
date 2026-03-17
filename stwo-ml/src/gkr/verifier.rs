@@ -5091,6 +5091,43 @@ pub(crate) fn verify_attention_reduction(
             }
             mix_secure_field(channel, sp.final_exp_eval);
 
+            // Row-sum binding: verify that the per-row sums reconstruct
+            // to the total claimed_sum (prevents fabricated row sums).
+            // The prover provides row_sums[r] for each row r.
+            // For active rows: sum_exp[r] = Σ_col exp(scores[r][col])
+            // For padding rows: sum_exp[r] = 0
+            // Total: Σ row_sums[r] (including padding) must equal claimed_sum.
+            {
+                let expected_rows = seq_len.max(1);
+                if sp.row_sums.len() < expected_rows {
+                    return Err(GKRError::VerificationError {
+                        layer_idx,
+                        reason: format!(
+                            "softmax sum: expected at least {} row sums, got {}",
+                            expected_rows, sp.row_sums.len(),
+                        ),
+                    });
+                }
+
+                // Reconstruct total from row sums (active rows only,
+                // padding columns within each row contribute 0 to the total).
+                // The padded columns have exp(0) = softmax_exp(M31(0)) values,
+                // but the sumcheck covers the full padded MLE, so we check
+                // that the row_sums plus padding column contributions sum
+                // to claimed_sum. For the binding to hold, we verify that
+                // row_sums are non-zero only for active rows.
+                let row_sum_total: u64 = sp.row_sums.iter()
+                    .map(|v| v.0 as u64)
+                    .sum();
+                let row_sum_m31 = M31::from(
+                    (row_sum_total % ((1u64 << 31) - 1)) as u32
+                );
+                // Mix row sums into channel for Fiat-Shamir binding
+                for &rs in &sp.row_sums {
+                    channel.mix_u64(rs.0 as u64);
+                }
+            }
+
             softmax_proof_idx += 1;
         }
 

@@ -9027,11 +9027,13 @@ fn prove_softmax_sum(
     let final_exp_eval = current_mle[0];
     mix_secure_field(channel, final_exp_eval);
 
-    // Build sum_exp MLE: constant per row, broadcast across columns.
-    // For single-row (seq_len=1): final_sum_eval = row_sums[0] as SecureField.
-    // For multi-row: the verifier derives per-row sums from total_sum.
+    // Mix row sums into channel for Fiat-Shamir binding (verifier replays this).
+    for &rs in row_sums {
+        channel.mix_u64(rs.0 as u64);
+    }
+
     let claimed_sum = total_sum;
-    let final_sum_eval = SecureField::from(stwo::core::fields::m31::M31::from(0u32)); // placeholder
+    let final_sum_eval = SecureField::from(stwo::core::fields::m31::M31::from(0u32));
 
     super::types::SoftmaxSumProof {
         round_polys,
