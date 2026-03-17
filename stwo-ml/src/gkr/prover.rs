@@ -10611,6 +10611,150 @@ mod tests {
     }
 
     #[test]
+    fn test_attention_tampered_softmax_sum_fails() {
+        // Tamper with the softmax sum proof and verify rejection.
+        // This validates that the verifier catches a fabricated sum_exp.
+        use crate::components::attention::{attention_forward, MultiHeadAttentionConfig};
+        use crate::gkr::verifier::verify_attention_reduction_for_test;
+
+        let config = MultiHeadAttentionConfig::new(1, 4, 4);
+        let weights = make_attn_test_weights(4, 42);
+        let input = make_attn_test_input(4, 4);
+
+        let intermediates = attention_forward(&input, &weights, &config, false);
+        let output = &intermediates.final_output;
+        let output_padded = pad_matrix_pow2(output);
+        let output_mle = matrix_to_mle(&output_padded);
+        let log_rows = output_padded.rows.ilog2() as usize;
+        let log_cols = output_padded.cols.ilog2() as usize;
+
+        let mut prover_channel = PoseidonChannel::new();
+        prover_channel.mix_u64(0xA774);
+        let r_out = prover_channel.draw_qm31s(log_rows + log_cols);
+        let output_value = evaluate_mle(&output_mle, &r_out);
+        let output_claim = GKRClaim {
+            point: r_out,
+            value: output_value,
+        };
+
+        let (proof, _input_claim) = reduce_attention_layer(
+            &output_claim,
+            &input,
+            &weights,
+            &config,
+            &mut prover_channel,
+        )
+        .unwrap();
+
+        match proof {
+            LayerProof::Attention {
+                sub_proofs,
+                sub_claim_values,
+                mut softmax_sum_proofs,
+                ..
+            } => {
+                // Tamper: corrupt the claimed_sum in the softmax sum proof
+                assert!(
+                    !softmax_sum_proofs.is_empty(),
+                    "attention proof should have softmax sum proofs"
+                );
+                softmax_sum_proofs[0].claimed_sum =
+                    softmax_sum_proofs[0].claimed_sum + SecureField::one();
+
+                let mut verifier_channel = PoseidonChannel::new();
+                verifier_channel.mix_u64(0xA774);
+                let _ = verifier_channel.draw_qm31s(log_rows + log_cols);
+
+                let result = verify_attention_reduction_for_test(
+                    &output_claim,
+                    &config,
+                    &sub_proofs,
+                    &sub_claim_values,
+                    &softmax_sum_proofs,
+                    0,
+                    &mut verifier_channel,
+                );
+                assert!(
+                    result.is_err(),
+                    "tampered softmax sum should fail verification"
+                );
+            }
+            _ => panic!("expected Attention proof"),
+        }
+    }
+
+    #[test]
+    fn test_attention_tampered_softmax_round_poly_fails() {
+        // Tamper with a round polynomial in the softmax sum proof.
+        use crate::components::attention::{attention_forward, MultiHeadAttentionConfig};
+        use crate::gkr::verifier::verify_attention_reduction_for_test;
+
+        let config = MultiHeadAttentionConfig::new(1, 4, 4);
+        let weights = make_attn_test_weights(4, 77);
+        let input = make_attn_test_input(4, 4);
+
+        let intermediates = attention_forward(&input, &weights, &config, false);
+        let output = &intermediates.final_output;
+        let output_padded = pad_matrix_pow2(output);
+        let output_mle = matrix_to_mle(&output_padded);
+        let log_rows = output_padded.rows.ilog2() as usize;
+        let log_cols = output_padded.cols.ilog2() as usize;
+
+        let mut prover_channel = PoseidonChannel::new();
+        prover_channel.mix_u64(0xA775);
+        let r_out = prover_channel.draw_qm31s(log_rows + log_cols);
+        let output_value = evaluate_mle(&output_mle, &r_out);
+        let output_claim = GKRClaim {
+            point: r_out,
+            value: output_value,
+        };
+
+        let (proof, _) = reduce_attention_layer(
+            &output_claim,
+            &input,
+            &weights,
+            &config,
+            &mut prover_channel,
+        )
+        .unwrap();
+
+        match proof {
+            LayerProof::Attention {
+                sub_proofs,
+                sub_claim_values,
+                mut softmax_sum_proofs,
+                ..
+            } => {
+                assert!(!softmax_sum_proofs.is_empty());
+                // Tamper: corrupt the first round polynomial
+                if !softmax_sum_proofs[0].round_polys.is_empty() {
+                    softmax_sum_proofs[0].round_polys[0].c0 =
+                        softmax_sum_proofs[0].round_polys[0].c0 + SecureField::one();
+                }
+
+                let mut verifier_channel = PoseidonChannel::new();
+                verifier_channel.mix_u64(0xA775);
+                let _ = verifier_channel.draw_qm31s(log_rows + log_cols);
+
+                let result = verify_attention_reduction_for_test(
+                    &output_claim,
+                    &config,
+                    &sub_proofs,
+                    &sub_claim_values,
+                    &softmax_sum_proofs,
+                    0,
+                    &mut verifier_channel,
+                );
+                assert!(
+                    result.is_err(),
+                    "tampered softmax round poly should fail verification"
+                );
+            }
+            _ => panic!("expected Attention proof"),
+        }
+    }
+
+    #[test]
     fn test_attention_causal_prove_verify() {
         // Causal masking variant
         use crate::components::attention::{attention_forward, MultiHeadAttentionConfig};
