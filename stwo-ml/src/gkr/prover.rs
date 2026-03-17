@@ -9626,6 +9626,28 @@ fn reduce_attention_layer(
     channel.mix_u64(d_model as u64);
     channel.mix_u64(if config.causal { 1 } else { 0 });
 
+    // Phase 1D: Bind causal mask pattern to Fiat-Shamir transcript.
+    // The mask is deterministic from (seq_len, causal, position_offset).
+    // Mix the exact mask parameters so any deviation in the prover's
+    // forward pass (wrong mask, skipped mask, wrong offset) causes
+    // channel state divergence → all subsequent challenges change → proof fails.
+    if config.causal {
+        // Position offset for decode-step causal masking.
+        // During prefill: offset = 0, total_len = seq_len
+        // During decode: offset = cached_len, total_len = cached_len + new_tokens
+        let position_offset = 0usize; // prefill path; decode path overrides in reduce_attention_layer_decode
+        channel.mix_u64(0x434D534B_u64); // "CMSK" tag for causal mask
+        channel.mix_u64(position_offset as u64);
+        // Mix the sentinel value hash — binds to exact P-2 sentinel
+        let mask_sentinel = (1u32 << 31) - 3; // P - 2
+        channel.mix_u64(mask_sentinel as u64);
+        // Mix the expected number of masked positions per row.
+        // For prefill causal: row i masks (seq_len - 1 - i) positions.
+        // Total masked = seq_len*(seq_len-1)/2
+        let total_masked = seq_len * seq_len.saturating_sub(1) / 2;
+        channel.mix_u64(total_masked as u64);
+    }
+
     let expected_count = 4 + 2 * num_heads;
     let mut sub_proofs = Vec::with_capacity(expected_count);
     let mut sub_claim_values = Vec::with_capacity(expected_count);

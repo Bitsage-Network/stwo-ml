@@ -4907,6 +4907,17 @@ pub(crate) fn verify_attention_reduction(
     channel.mix_u64(d_model as u64);
     channel.mix_u64(if config.causal { 1 } else { 0 });
 
+    // Phase 1D: Replay causal mask commitment (must match prover exactly).
+    if config.causal {
+        let position_offset = 0usize; // prefill path
+        channel.mix_u64(0x434D534B_u64); // "CMSK" tag
+        channel.mix_u64(position_offset as u64);
+        let mask_sentinel = (1u32 << 31) - 3;
+        channel.mix_u64(mask_sentinel as u64);
+        let total_masked = seq_len * seq_len.saturating_sub(1) / 2;
+        channel.mix_u64(total_masked as u64);
+    }
+
     // Helper: verify a sub-matmul that used a fresh claim.
     // Handles both MatMul (shared-weight, degree-2) and MatMulDualSimd (dual-operand, degree-3).
     let verify_fresh_sub_matmul = |proof: &LayerProof,
