@@ -29,6 +29,9 @@ pub enum ActivationType {
     /// Element-wise exp(x) component of softmax. Normalization (dividing by
     /// sum of exponents) is handled separately in the attention pipeline.
     Softmax,
+    /// SiLU (Sigmoid Linear Unit): x * sigmoid(x) = x / (1 + exp(-x)).
+    /// Used by Llama, Mistral, and most modern LLMs in the FFN gate.
+    SiLU,
 }
 
 impl ActivationType {
@@ -39,6 +42,7 @@ impl ActivationType {
             ActivationType::GELU => 16,
             ActivationType::Sigmoid => 16,
             ActivationType::Softmax => 20,
+            ActivationType::SiLU => 16,
         }
     }
 
@@ -49,11 +53,12 @@ impl ActivationType {
             ActivationType::GELU => 18,
             ActivationType::Sigmoid => 16,
             ActivationType::Softmax => 20,
+            ActivationType::SiLU => 18,
         }
     }
 
     /// Unique type tag for LogUp domain separation (M1 fix).
-    /// Ensures ReLU, GELU, Sigmoid, and Softmax use distinct relation entries
+    /// Ensures each activation type uses distinct relation entries
     /// even when they share the same ActivationRelation random challenges.
     pub fn type_tag(&self) -> u32 {
         match self {
@@ -61,6 +66,7 @@ impl ActivationType {
             ActivationType::GELU => 2,
             ActivationType::Sigmoid => 3,
             ActivationType::Softmax => 4,
+            ActivationType::SiLU => 5,
         }
     }
 
@@ -77,6 +83,7 @@ impl ActivationType {
             ActivationType::GELU => Box::new(activations::gelu_approx),
             ActivationType::Sigmoid => Box::new(activations::sigmoid_approx),
             ActivationType::Softmax => Box::new(activations::softmax_exp),
+            ActivationType::SiLU => Box::new(activations::silu_approx),
         }
     }
 }
@@ -320,6 +327,7 @@ fn apply_activation_f64(act_type: ActivationType, val: u32) -> u32 {
         }
         ActivationType::Sigmoid => 1.0 / (1.0 + (-x).exp()),
         ActivationType::Softmax => x.exp(), // element-wise exp component
+        ActivationType::SiLU => x / (1.0 + (-x).exp()), // x * sigmoid(x)
     };
 
     // Scale back and map to M31

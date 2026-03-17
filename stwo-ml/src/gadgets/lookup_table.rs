@@ -255,6 +255,46 @@ pub mod activations {
         }
     }
 
+    /// SiLU (Sigmoid Linear Unit): x * sigmoid(x) = x / (1 + exp(-x)).
+    ///
+    /// Used by Llama, Mistral, and most modern LLMs in the FFN gate projection.
+    /// Uses the same fixed-point convention as GELU (scale = 2^16).
+    /// Interprets M31 values using standard sign convention:
+    ///   val <= P/2  → positive: x_real = val / scale
+    ///   val >  P/2  → negative: x_real = -(P - val) / scale
+    pub fn silu_approx(x: M31) -> M31 {
+        let val = x.0;
+        let p = (1u64 << 31) - 1;
+        let half_p = (1u32 << 30) - 1;
+        let scale = GELU_FIXED_POINT_SCALE as f64;
+
+        if val == 0 {
+            return M31::from(0);
+        }
+
+        // Convert M31 to signed real number
+        let x_real = if val <= half_p {
+            val as f64 / scale
+        } else {
+            -((p - val as u64) as f64) / scale
+        };
+
+        // SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
+        let silu = x_real / (1.0 + (-x_real).exp());
+
+        // Convert back to M31 fixed-point
+        if silu >= 0.0 {
+            let result = (silu * scale).round();
+            let clamped = (result as u64).min(p - 1) as u32;
+            M31::from(clamped)
+        } else {
+            // Negative result wraps around in M31
+            let neg = (-silu * scale).round() as u64;
+            let wrapped = (p - neg.min(p - 1)) as u32;
+            M31::from(wrapped)
+        }
+    }
+
     /// Approximate sigmoid: 1/(1+e^(-x)).
     ///
     /// Maps M31 values to a fixed-point sigmoid approximation (scale = 2^16).
@@ -565,5 +605,51 @@ mod tests {
                 i, actual.0, expected_val, x_real,
             );
         }
+    }
+
+    #[test]
+    fn test_silu_zero() {
+        // SiLU(0) = 0 * sigmoid(0) = 0 * 0.5 = 0
+        let result = activations::silu_approx(M31::from(0));
+        assert_eq!(result.0, 0, "SiLU(0) should be 0");
+    }
+
+    #[test]
+    fn test_silu_positive() {
+        // SiLU(x) ≈ x for large positive x (sigmoid → 1)
+        // x = 65536 (= 1.0 in fixed-point with scale=2^16)
+        let x = M31::from(65536);
+        let result = activations::silu_approx(x);
+        // SiLU(1.0) = 1.0 * sigmoid(1.0) = 1.0 * 0.7311 ≈ 0.7311
+        // In fixed-point: ~47908
+        let silu_1 = 1.0_f64 / (1.0 + (-1.0_f64).exp()); // 0.7311
+        let expected = (silu_1 * 65536.0).round() as u32;
+        let diff = (result.0 as i64 - expected as i64).unsigned_abs();
+        assert!(
+            diff <= 1,
+            "SiLU(1.0): got {}, expected {} (diff {})",
+            result.0, expected, diff,
+        );
+    }
+
+    #[test]
+    fn test_silu_table_builds() {
+        // Verify we can build a LogUp table with SiLU
+        let table = PrecomputedTable::build(activations::silu_approx, 16);
+        assert_eq!(table.size(), 1 << 16);
+        // SiLU(0) = 0
+        assert_eq!(table.lookup(M31::from(0)), Some(M31::from(0)));
+    }
+
+    #[test]
+    fn test_silu_vs_gelu_different() {
+        // SiLU and GELU should produce different values for the same input
+        let x = M31::from(32768); // 0.5 in fixed-point
+        let silu = activations::silu_approx(x);
+        let gelu = activations::gelu_approx(x);
+        assert_ne!(
+            silu, gelu,
+            "SiLU and GELU should produce different outputs for x=0.5"
+        );
     }
 }

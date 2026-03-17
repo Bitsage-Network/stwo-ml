@@ -462,7 +462,8 @@ impl HfConfig {
         let activation = match self.hidden_act.as_str() {
             "gelu" | "gelu_new" | "gelu_fast" => ActivationType::GELU,
             "relu" => ActivationType::ReLU,
-            "silu" | "swiglu" => ActivationType::GELU, // Map SiLU to GELU for now
+            "silu" | "swiglu" => ActivationType::SiLU,
+            "sigmoid" => ActivationType::Sigmoid,
             _ => ActivationType::GELU,
         };
 

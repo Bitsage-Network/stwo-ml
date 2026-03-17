@@ -146,6 +146,13 @@ pub fn sigmoid_f32(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
+/// SiLU (Sigmoid Linear Unit): x * sigmoid(x).
+///
+/// Used by Llama, Mistral, and most modern LLMs in FFN gate projection.
+pub fn silu_f32(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
 /// Numerically stable softmax over a row.
 ///
 /// Subtracts max for stability, then exp + normalize.
@@ -168,6 +175,7 @@ pub fn apply_activation_f32(matrix: &F32Matrix, act_type: ActivationType) -> F32
         ActivationType::ReLU => relu_f32,
         ActivationType::GELU => gelu_f32,
         ActivationType::Sigmoid => sigmoid_f32,
+        ActivationType::SiLU => silu_f32,
         ActivationType::Softmax => {
             // For softmax, apply row-wise
             let mut result = F32Matrix::new(matrix.rows, matrix.cols);
