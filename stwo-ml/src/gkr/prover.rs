@@ -9579,7 +9579,7 @@ fn reduce_attention_layer_simd_gpu(
             seq_len: config.seq_len as u32,
             d_model: config.d_model as u32,
             causal: config.causal,
-            softmax_sum_proofs: Vec::new(), // TODO(Phase 1B): softmax sum verification
+            softmax_sum_proofs: Vec::new(), // SIMD/dual-block path: softmax sum proofs not yet wired (uses separate block MLEs)
         },
         final_input_claim,
     ))
@@ -10751,6 +10751,149 @@ mod tests {
                     result.is_err(),
                     "tampered softmax round poly should fail verification"
                 );
+            }
+            _ => panic!("expected Attention proof"),
+        }
+    }
+
+    #[test]
+    fn test_attention_tampered_row_sum_fails() {
+        // Tamper with a per-row sum_exp value — the row-sum binding
+        // should detect the inconsistency with the proven total.
+        use crate::components::attention::{attention_forward, MultiHeadAttentionConfig};
+        use crate::gkr::verifier::verify_attention_reduction_for_test;
+
+        let config = MultiHeadAttentionConfig::new(1, 4, 4);
+        let weights = make_attn_test_weights(4, 55);
+        let input = make_attn_test_input(4, 4);
+
+        let intermediates = attention_forward(&input, &weights, &config, false);
+        let output = &intermediates.final_output;
+        let output_padded = pad_matrix_pow2(output);
+        let output_mle = matrix_to_mle(&output_padded);
+        let log_rows = output_padded.rows.ilog2() as usize;
+        let log_cols = output_padded.cols.ilog2() as usize;
+
+        let mut prover_channel = PoseidonChannel::new();
+        prover_channel.mix_u64(0xA776);
+        let r_out = prover_channel.draw_qm31s(log_rows + log_cols);
+        let output_value = evaluate_mle(&output_mle, &r_out);
+        let output_claim = GKRClaim {
+            point: r_out,
+            value: output_value,
+        };
+
+        let (proof, _) = reduce_attention_layer(
+            &output_claim,
+            &input,
+            &weights,
+            &config,
+            &mut prover_channel,
+        )
+        .unwrap();
+
+        match proof {
+            LayerProof::Attention {
+                sub_proofs,
+                sub_claim_values,
+                mut softmax_sum_proofs,
+                ..
+            } => {
+                assert!(!softmax_sum_proofs.is_empty());
+                assert!(!softmax_sum_proofs[0].row_sums.is_empty());
+
+                // Tamper: corrupt a row sum (add 1 to first row's sum)
+                softmax_sum_proofs[0].row_sums[0] = stwo::core::fields::m31::M31::from(
+                    softmax_sum_proofs[0].row_sums[0].0.wrapping_add(1),
+                );
+
+                let mut verifier_channel = PoseidonChannel::new();
+                verifier_channel.mix_u64(0xA776);
+                let _ = verifier_channel.draw_qm31s(log_rows + log_cols);
+
+                let result = verify_attention_reduction_for_test(
+                    &output_claim,
+                    &config,
+                    &sub_proofs,
+                    &sub_claim_values,
+                    &softmax_sum_proofs,
+                    0,
+                    &mut verifier_channel,
+                );
+                assert!(
+                    result.is_err(),
+                    "tampered row sum should fail row-sum binding check"
+                );
+            }
+            _ => panic!("expected Attention proof"),
+        }
+    }
+
+    #[test]
+    fn test_attention_softmax_proofs_present() {
+        // Verify that reduce_attention_layer actually produces
+        // non-empty softmax_sum_proofs (one per head).
+        use crate::components::attention::{attention_forward, MultiHeadAttentionConfig};
+
+        // 2-head attention to verify one proof per head
+        let config = MultiHeadAttentionConfig::new(2, 4, 4);
+        let weights = make_attn_test_weights(4, 33);
+        let input = make_attn_test_input(4, 4);
+
+        let intermediates = attention_forward(&input, &weights, &config, false);
+        let output = &intermediates.final_output;
+        let output_padded = pad_matrix_pow2(output);
+        let output_mle = matrix_to_mle(&output_padded);
+        let log_rows = output_padded.rows.ilog2() as usize;
+        let log_cols = output_padded.cols.ilog2() as usize;
+
+        let mut ch = PoseidonChannel::new();
+        ch.mix_u64(0xA777);
+        let r_out = ch.draw_qm31s(log_rows + log_cols);
+        let output_value = evaluate_mle(&output_mle, &r_out);
+        let output_claim = GKRClaim {
+            point: r_out,
+            value: output_value,
+        };
+
+        let (proof, _) = reduce_attention_layer(
+            &output_claim,
+            &input,
+            &weights,
+            &config,
+            &mut ch,
+        )
+        .unwrap();
+
+        match &proof {
+            LayerProof::Attention {
+                softmax_sum_proofs, num_heads, ..
+            } => {
+                assert_eq!(
+                    softmax_sum_proofs.len(),
+                    *num_heads as usize,
+                    "should have one softmax sum proof per head"
+                );
+                for (h, sp) in softmax_sum_proofs.iter().enumerate() {
+                    assert!(
+                        !sp.round_polys.is_empty(),
+                        "head {} should have round polys",
+                        h
+                    );
+                    assert!(
+                        !sp.row_sums.is_empty(),
+                        "head {} should have row sums",
+                        h
+                    );
+                    // Row sums should be non-zero for active rows
+                    for (r, &rs) in sp.row_sums.iter().enumerate() {
+                        assert!(
+                            rs.0 > 0,
+                            "head {} row {} has zero sum_exp (should be > 0 for active rows)",
+                            h, r,
+                        );
+                    }
+                }
             }
             _ => panic!("expected Attention proof"),
         }

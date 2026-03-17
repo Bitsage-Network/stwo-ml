@@ -5099,29 +5099,50 @@ pub(crate) fn verify_attention_reduction(
             // Total: Σ row_sums[r] (including padding) must equal claimed_sum.
             {
                 let expected_rows = seq_len.max(1);
-                if sp.row_sums.len() < expected_rows {
+                if sp.row_sums.len() != expected_rows {
                     return Err(GKRError::VerificationError {
                         layer_idx,
                         reason: format!(
-                            "softmax sum: expected at least {} row sums, got {}",
+                            "softmax sum: expected {} row sums, got {}",
                             expected_rows, sp.row_sums.len(),
                         ),
                     });
                 }
 
-                // Reconstruct total from row sums (active rows only,
-                // padding columns within each row contribute 0 to the total).
-                // The padded columns have exp(0) = softmax_exp(M31(0)) values,
-                // but the sumcheck covers the full padded MLE, so we check
-                // that the row_sums plus padding column contributions sum
-                // to claimed_sum. For the binding to hold, we verify that
-                // row_sums are non-zero only for active rows.
-                let row_sum_total: u64 = sp.row_sums.iter()
-                    .map(|v| v.0 as u64)
-                    .sum();
-                let row_sum_m31 = M31::from(
-                    (row_sum_total % ((1u64 << 31) - 1)) as u32
-                );
+                // Reconstruct expected total from row sums + padding.
+                // softmax_exp(M31(0)) = 65536 (2^16 scale factor).
+                // Padding columns within active rows and all padding rows
+                // contribute this value to the sumcheck total.
+                let exp_zero = 65536u64; // softmax_exp(M31(0)).0
+                let pad_cols = padded_cols - seq_len;
+                let pad_rows = padded_rows - seq_len;
+
+                // Active rows: row_sums[r] covers active cols; padding cols add exp_zero each
+                let mut expected_total: u64 = 0;
+                for &rs in &sp.row_sums {
+                    expected_total += rs.0 as u64;
+                    expected_total += pad_cols as u64 * exp_zero;
+                }
+                // Padding rows: all padded_cols positions have exp(0)
+                expected_total += pad_rows as u64 * padded_cols as u64 * exp_zero;
+
+                // Reduce to M31 and compare against claimed_sum
+                let p = (1u64 << 31) - 1;
+                let expected_m31 = M31::from((expected_total % p) as u32);
+                let claimed_m31 = M31::from(sp.claimed_sum.0 .0 .0);
+
+                if expected_m31 != claimed_m31 {
+                    return Err(GKRError::VerificationError {
+                        layer_idx,
+                        reason: format!(
+                            "softmax sum: row-sum binding failed. \
+                             expected total {} (from {} row sums + {} pad_cols + {} pad_rows), \
+                             got claimed_sum M31 component {}",
+                            expected_m31.0, sp.row_sums.len(), pad_cols, pad_rows, claimed_m31.0,
+                        ),
+                    });
+                }
+
                 // Mix row sums into channel for Fiat-Shamir binding
                 for &rs in &sp.row_sums {
                     channel.mix_u64(rs.0 as u64);
