@@ -79,6 +79,13 @@ pub enum LayerType {
     /// Reduction: LogUp lookup argument on (token_id, col_idx, value).
     Embedding { vocab_size: usize, embed_dim: usize },
 
+    /// Rotary Position Embedding: element-wise rotation of (x,y) pairs.
+    /// Reduction: collected for unified STARK (rotation constraints + LogUp table).
+    /// In the GKR walk, claim propagates unchanged (same shape in/out).
+    RoPE {
+        config: crate::components::rope::RoPEConfig,
+    },
+
     /// Identity / passthrough (zero-cost in GKR, claim propagates unchanged).
     Identity,
 }
@@ -268,7 +275,7 @@ impl LayeredCircuit {
                 params: params.clone(),
             }),
             GraphOp::RMSNorm { dim } => Ok(LayerType::RMSNorm { dim: *dim }),
-            GraphOp::RoPE { .. } => Ok(LayerType::Identity),
+            GraphOp::RoPE { config } => Ok(LayerType::RoPE { config: *config }),
         }
     }
 
@@ -343,6 +350,7 @@ impl LayeredCircuit {
                 LayerType::Quantize { .. } => counts.quantize += 1,
                 LayerType::Embedding { .. } => counts.embedding += 1,
                 LayerType::Input => counts.input += 1,
+                LayerType::RoPE { .. } => counts.identity += 1, // RoPE counted with identity for now
                 LayerType::Identity => counts.identity += 1,
             }
         }

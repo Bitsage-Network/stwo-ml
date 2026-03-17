@@ -106,7 +106,7 @@ fn layer_kind_from_type(layer_type: &LayerType) -> proof_stream::LayerKind {
         LayerType::Embedding { .. } => proof_stream::LayerKind::Embedding,
         // Quantize/Dequantize mapped to Add (no dedicated color needed)
         LayerType::Dequantize { .. } | LayerType::Quantize { .. } => proof_stream::LayerKind::Add,
-        LayerType::Input | LayerType::Identity => proof_stream::LayerKind::Add,
+        LayerType::Input | LayerType::Identity | LayerType::RoPE { .. } => proof_stream::LayerKind::Add,
     }
 }
 
@@ -124,7 +124,7 @@ fn estimate_trace_cost(layer_type: &LayerType) -> usize {
             vocab_size,
             embed_dim,
         } => vocab_size * embed_dim,
-        LayerType::Input | LayerType::Identity => 0,
+        LayerType::Input | LayerType::Identity | LayerType::RoPE { .. } => 0,
     }
 }
 
@@ -1724,8 +1724,8 @@ pub fn prove_gkr_with_cache(
                 )?
             }
 
-            LayerType::Identity => {
-                // Claim propagates unchanged
+            LayerType::Identity | LayerType::RoPE { .. } => {
+                // Claim propagates unchanged (RoPE verified in unified STARK)
                 continue;
             }
 
@@ -2263,7 +2263,7 @@ pub fn prove_gkr_decode(
                 )?
             }
 
-            LayerType::Identity => {
+            LayerType::Identity | LayerType::RoPE { .. } => {
                 continue;
             }
 
@@ -2485,8 +2485,8 @@ pub fn prove_gkr_decode(
                     kind: super::types::DeferredProofKind::Weightless,
                 });
             }
-            LayerType::Identity | LayerType::Input => {
-                // Identity/Input: the claim propagates unchanged — trivial deferred proof.
+            LayerType::Identity | LayerType::RoPE { .. } | LayerType::Input => {
+                // Identity/Input/RoPE: the claim propagates unchanged — trivial deferred proof.
                 // Replay Add reduction channel ops for transcript consistency:
                 // mix claim.value (before match), mix lhs_eval, mix rhs_eval, draw alpha.
                 mix_secure_field(channel, deferred_claim.value);
@@ -2769,7 +2769,7 @@ pub fn prove_gkr_gpu_with_cache(
     let total_work_layers = circuit
         .layers
         .iter()
-        .filter(|l| !matches!(l.layer_type, LayerType::Identity | LayerType::Input))
+        .filter(|l| !matches!(l.layer_type, LayerType::Identity | LayerType::RoPE { .. } | LayerType::Input))
         .count();
     let total_matmul_layers = circuit
         .layers
@@ -2987,7 +2987,7 @@ pub fn prove_gkr_gpu_with_cache(
                 reduce_dequantize_layer(&current_claim, input_matrix, params, channel)?
             }
 
-            LayerType::Identity => continue,
+            LayerType::Identity | LayerType::RoPE { .. } => continue,
 
             LayerType::Attention { config } => {
                 profiler.record_layer_type("attention");
@@ -3754,7 +3754,7 @@ pub fn prove_gkr_decode_gpu_with_cache(
     let total_work_layers = circuit
         .layers
         .iter()
-        .filter(|l| !matches!(l.layer_type, LayerType::Identity | LayerType::Input))
+        .filter(|l| !matches!(l.layer_type, LayerType::Identity | LayerType::RoPE { .. } | LayerType::Input))
         .count();
     let total_matmul_layers = circuit
         .layers
@@ -3895,7 +3895,7 @@ pub fn prove_gkr_decode_gpu_with_cache(
                 reduce_dequantize_layer(&current_claim, input_matrix, params, channel)?
             }
 
-            LayerType::Identity => continue,
+            LayerType::Identity | LayerType::RoPE { .. } => continue,
 
             LayerType::Attention { config } => {
                 // Decode path: use pre-computed intermediates when available
@@ -4921,7 +4921,7 @@ pub fn prove_gkr_simd_gpu_with_cache(
                 reduce_dequantize_layer(&current_claim, input_matrix, params, channel)?
             }
 
-            LayerType::Identity => continue,
+            LayerType::Identity | LayerType::RoPE { .. } => continue,
             LayerType::Input => break,
 
             LayerType::Attention { config } => {
