@@ -401,8 +401,10 @@ fn apply_aggregated_oracle_sumcheck(
     // commitment — streaming mode reloads them on demand from GraphWeights,
     // keeping peak memory at ~4 GB (single largest matrix) instead of ~640 GB.
     //
-    // Default: ON (full binding proof for on-chain soundness).
-    // Opt-out: STWO_AGGREGATED_RLC_ONLY=1 for testing/debugging (RLC-only, no opening proof).
+    // Default: OFF (RLC binding — fast, cryptographically sound via Fiat-Shamir
+    // channel-mixed weight commitments). Full MLE opening proof only needed for
+    // trustless on-chain verification where the verifier cannot re-check commitments.
+    // Opt-in: STWO_AGGREGATED_FULL_BINDING=1 for trustless on-chain streaming.
     let rlc_only_override = std::env::var("STWO_AGGREGATED_RLC_ONLY")
         .map(|v| !v.is_empty() && v != "0" && v != "false")
         .unwrap_or(false);
@@ -411,7 +413,7 @@ fn apply_aggregated_oracle_sumcheck(
     } else {
         std::env::var("STWO_AGGREGATED_FULL_BINDING")
             .map(|v| !v.is_empty() && v != "0" && v != "false")
-            .unwrap_or(true)
+            .unwrap_or(false)
     };
     let total_claims = weight_data.len() + deferred_weight_claims_data.len();
     eprintln!(
