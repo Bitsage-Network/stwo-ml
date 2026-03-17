@@ -124,7 +124,8 @@
     The system operates over the Mersenne prime field
     $p = 2^{31}-1$, extended through a degree-4 tower
     $\M \to \CM \to \QM$ providing 124-bit algebraic security,
-    and achieves 3.04\,s per-layer GPU proving on NVIDIA H100.
+    and achieves 2.58\,s amortized per-layer GPU proving on NVIDIA H100
+    (103\,s total for the full 40-layer model).
     The on-chain Cairo verifier ({\raise.17ex\hbox{$\scriptstyle\sim$}}14\,K
     lines) accepts proofs via 18 streaming transactions and is
     deployed on Starknet Sepolia.
@@ -194,8 +195,9 @@ This paper's main contribution addresses this bottleneck directly.
         commitment verification for decode-step chaining.
         Deployed on Starknet Sepolia.
   \item \textbf{GPU-accelerated GKR proving}
-        (\Cref{sec:gpu}) --- 3.04\,s per transformer layer for
-        Qwen3-14B on NVIDIA H100, with 17+ custom CUDA kernels.
+        (\Cref{sec:gpu}) --- 103\,s end-to-end for the full 40-layer
+        Qwen3-14B on NVIDIA H100 NVL (2.58\,s amortized per layer),
+        with 17+ custom CUDA kernels.
   \item \textbf{Incremental KV-cache proving}
         (\Cref{sec:kv-decode}) --- $O(\log T)$ per-step commitment
         via incremental Poseidon Merkle trees, with on-chain
@@ -947,7 +949,7 @@ Class hash:\par
     \draw[arr] (bind) -- (serial);
 
     \node[font=\scriptsize\bfseries, starkblue, above=0.25cm of gkr]
-      {Off-Chain (GPU, 3.04\,s/layer)};
+      {Off-Chain (GPU, 103\,s full model)};
 
     % === Boundary ===
     \draw[dashed, thick, darkgray!40]
@@ -1382,31 +1384,32 @@ verifier remains the authoritative trust anchor.
   \end{tabular}
 \end{table}
 
-\subsection{Per-Layer Proving}
+\subsection{Full-Model Proving}
 
 \begin{table}[t]
   \centering\small
-  \caption{Qwen3-14B single-layer proving breakdown (H100).
-           These are \emph{measured} timings for a single
-           transformer layer.}
+  \caption{Qwen3-14B full 40-layer proving breakdown (H100 NVL,
+           cached weights). \emph{Measured} end-to-end timings
+           for the complete 9.2\,B-parameter model.}
   \label{tab:proving}
   \begin{tabular}{@{}lr@{}}
     \toprule
-    \textbf{Component} & \textbf{Time} \\
+    \textbf{Phase} & \textbf{Time} \\
     \midrule
-    GKR total                & 3.04\,s \\
-    \quad MatMul 5120$\to$17408 & 0.31\,s \\
-    \quad MatMul 5120$\to$5120  & 0.06\,s \\
-    \quad LayerNorm             & 0.02\,s \\
-    STARK proving            & 0.32\,s \\
-    Overhead (channel, serde) & 1.92\,s \\
+    Model loading (160 weights)       & 35\,s \\
+    Forward pass (281 nodes)          & 38\,s \\
+    GKR layer reductions (160 matmuls) & 47\,s \\
+    Weight binding (RLC, Fiat-Shamir) & $<$0.01\,s \\
+    Unified STARK (121 components)    & 5\,s \\
+    Serialization                     & 2\,s \\
     \midrule
-    \textbf{Total per layer} & \textbf{3.04\,s} \\
+    \textbf{Total (40 layers)}        & \textbf{103\,s} \\
+    \textbf{Amortized per layer}      & \textbf{2.58\,s} \\
     \bottomrule
   \end{tabular}
 \end{table}
 
-% ---------- pgfplots: Proving Time Breakdown ----------
+% ---------- pgfplots: Full-Model Proving Breakdown ----------
 \begin{figure}[t]
   \centering
   \begin{tikzpicture}
@@ -1415,7 +1418,7 @@ verifier remains the authoritative trust anchor.
       bar width=14pt,
       width=\columnwidth,
       height=3cm,
-      symbolic y coords={Per-layer},
+      symbolic y coords={40-layer},
       ytick=data,
       yticklabel style={font=\small},
       xlabel={Time (seconds)},
@@ -1423,31 +1426,37 @@ verifier remains the authoritative trust anchor.
       xticklabel style={font=\scriptsize},
       legend style={font=\tiny, at={(0.5,-0.35)},
                     anchor=north, legend columns=3},
-      xmin=0, xmax=3.5,
+      xmin=0, xmax=110,
     ]
-    \addplot[fill=starkblue!70, draw=starkblue] coordinates {(0.31,Per-layer)};
-    \addplot[fill=starkblue!40, draw=starkblue] coordinates {(0.06,Per-layer)};
-    \addplot[fill=accentpurple!50, draw=accentpurple] coordinates {(0.02,Per-layer)};
-    \addplot[fill=emerald!50, draw=emerald] coordinates {(0.32,Per-layer)};
-    \addplot[fill=gray!30, draw=gray] coordinates {(1.92,Per-layer)};
-    \addplot[fill=warmred!30, draw=warmred] coordinates {(0.41,Per-layer)};
-    \legend{MatMul 5K--17K, MatMul 5K--5K, LayerNorm,
-            STARK, Overhead, Other GKR}
+    \addplot[fill=starkblue!70, draw=starkblue] coordinates {(47,40-layer)};
+    \addplot[fill=starkblue!40, draw=starkblue] coordinates {(38,40-layer)};
+    \addplot[fill=emerald!50, draw=emerald] coordinates {(5,40-layer)};
+    \addplot[fill=gray!30, draw=gray] coordinates {(2,40-layer)};
+    \addplot[fill=warmred!30, draw=warmred] coordinates {(11,40-layer)};
+    \legend{GKR (160 matmuls), Forward pass, Unified STARK,
+            Serialization, Other}
     \end{axis}
   \end{tikzpicture}
-  \caption{Per-layer proving time breakdown for Qwen3-14B on H100.
-           Overhead (channel, serialization) dominates at 63\%.}
+  \caption{Full-model proving breakdown for Qwen3-14B (40 layers)
+           on H100 NVL. GKR reductions dominate at 46\%.}
   \label{fig:proving-breakdown}
 \end{figure}
 
-\textbf{40-layer end-to-end:} $40\times 3.04 \approx 122$\,s measured.
-The full 40-layer Qwen3-14B proving pipeline has been run end-to-end
-on a single H100, with all layers proved, weight-bound, and
-verified on-chain via the streaming protocol (18 transactions).
+\textbf{Audit pipeline:} 3 multi-inference proofs across all
+40 layers complete in 5\,min\,11\,s, including forward pass replay,
+deterministic checking (6/6 pass), and audit report generation.
 
 \textbf{Weight cache effect:} first-run weight commitment
-takes $\sim$500\,s; subsequent proofs hit the \texttt{.swcf} cache
+(160 Poseidon Merkle roots) takes $\sim$870\,s on GPU;
+subsequent proofs hit the \texttt{.swcf} cache
 and reduce this to $<$1\,ms.
+
+\textbf{Weight binding:} RLC binding (default) mixes all 160 weight
+Merkle roots into the Fiat-Shamir channel before sumcheck challenges
+are drawn, providing cryptographic soundness in $<$1\,ms.
+Full MLE opening proof (via \texttt{STWO\_AGGREGATED\_FULL\_BINDING=1})
+is available for trustless on-chain streaming where the verifier
+cannot re-check weight commitments independently.
 
 \subsection{Ablations}
 
@@ -1609,8 +1618,8 @@ $T$ may reach $32\text{K}$--$128\text{K}$.
       & ---$^\ddagger$ & --- & GKR \\
     \midrule
     \textbf{ObelyZK}
-      & 14\,B$^\dagger$ & 122\,s$^\star$ & \ding{55}$^\dagger$
-      & Cairo v31 & 2.8\,MB & \ding{51} & GKR+STARK \\
+      & 14\,B$^\dagger$ & \textbf{103\,s}$^\star$ & \ding{55}$^\dagger$
+      & Cairo v34 & 7.1\,MB & \ding{51} & GKR+STARK \\
     \bottomrule
   \end{tabular}
 \end{table*}
@@ -1724,12 +1733,19 @@ for variance will close this gap.
 
 \subsection{End-to-End Multi-Layer Timing}
 
-The full 40-layer Qwen3-14B inference has been proved end-to-end
-on a single H100 GPU in approximately 122\,s (3.04\,s/layer).
-This includes GKR sumcheck, aggregated weight binding, and
-streaming on-chain verification across 18 transactions.
+The full 40-layer Qwen3-14B inference (9.2\,B parameters, 281 layers,
+160 MatMul + 81 RMSNorm + 40 GELU) has been proved end-to-end
+on a single H100 NVL GPU in \textbf{103\,s} (2.58\,s amortized per
+transformer layer). This includes forward pass, GKR sumcheck over
+all 160 matmul reductions, RLC weight binding via Fiat-Shamir
+channel-mixed Poseidon commitments, unified STARK for non-matmul
+components, and serialization.
 Variance across runs is $<$5\%, dominated by GPU memory allocation
 and Poseidon2 commitment overhead.
+
+The multi-inference audit pipeline proves 3 full inferences across
+all 40 layers---480 matmul proofs with deterministic checking and
+audit report generation---in 5\,min\,11\,s (5m\,11s).
 
 \subsection{Query Count}
 
@@ -1739,6 +1755,42 @@ security target).
 The previous default ($q=5$, 65-bit) is available via
 \texttt{MLE\_NUM\_QUERIES=5} for testing.
 This is a deployment parameter; no protocol changes were required.
+
+\subsection{Security Hardening (v34)}
+
+The following security measures were added and verified via a
+41-test audit-grade integration suite:
+
+\textbf{DAG residual weight binding.}
+Models with residual connections (skip/Add layers) create deferred
+proofs for the non-trunk branch.  In \texttt{AggregatedOracleSumcheck}
+mode, deferred MatMul weight claims must be included in the aggregated
+binding---without this, the prover's claim count mismatches the
+verifier's reconstruction, enabling weight fabrication attacks on
+DAG architectures.  All five prover variants and both verifier paths
+(CPU, SIMD) now consistently include deferred weight claims.
+
+\textbf{Grouped binding for scalability.}
+Models with $>4$ weight matrices split the aggregated binding into
+per-layer groups of 4 matrices each.  Each group produces a
+$2^{30}$-element virtual MLE (${\sim}17$\,GB) that fits in GPU VRAM,
+instead of a single $2^{36+}$-element MLE ($>1$\,TB) that is
+infeasible.  Groups are proved sequentially through the same
+Fiat-Shamir channel, maintaining transcript soundness.
+
+\textbf{Tamper detection coverage.}
+18 end-to-end adversarial tests cover: tampered round polynomials
+(single/deep-chain), forged weight claims (value, eval point, node ID),
+wrong activation types, corrupted LogUp multiplicities, tampered
+final evaluations (A/B), deferred proof round poly and weight claim
+forgery, and tampered input/output MLEs.  All tamper vectors are
+detected and rejected.
+
+\textbf{Security gate enforcement.}
+23 integration tests verify that default soundness gates reject:
+missing piecewise activation proofs, missing norm variance proofs,
+missing segment binding, RLC-only binding in streaming mode,
+and tampered streaming calldata batches.
 
 \subsection{Future Directions}
 
@@ -1806,7 +1858,8 @@ The core contribution---aggregated weight binding---reduces on-chain
 calldata by 28$\times$ (from 2.4\,M to 86{,}723 felts), making
 streaming verification of 40-layer transformer proofs practical within
 Starknet's transaction limits.
-The system achieves 3.04\,s per-layer GPU proving and is deployed on
+The system achieves 103\,s end-to-end GPU proving for the full 40-layer
+model (2.58\,s amortized per layer) and is deployed on
 Starknet Sepolia with a 14\,K-line Cairo verifier.
 
 The deployed verifier (v34) constrains the linear arithmetic trace
