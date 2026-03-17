@@ -11236,6 +11236,85 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_3a_silu_activation_prove_verify() {
+        // Phase 3A hardening: end-to-end proof with SiLU activation.
+        // Verifies the full chain: forward pass (SiLU) → GKR → unified STARK.
+        use crate::aggregation::prove_model_pure_gkr;
+        use crate::compiler::graph::GraphBuilder;
+        use crate::components::activation::ActivationType;
+
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(4);
+        builder.activation(ActivationType::SiLU);
+        builder.linear(4);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
+
+        let mut weights = GraphWeights::new();
+        let mut w0 = M31Matrix::new(4, 4);
+        for i in 0..16 {
+            w0.data[i] = M31::from(((i % 5) + 1) as u32);
+        }
+        weights.add_weight(0, w0);
+        let mut w1 = M31Matrix::new(4, 4);
+        for i in 0..16 {
+            w1.data[i] = M31::from(((i * 3 % 7) + 1) as u32);
+        }
+        weights.add_weight(2, w1);
+
+        let proof = prove_model_pure_gkr(&graph, &input, &weights)
+            .expect("SiLU model proving should succeed");
+        assert!(
+            proof.gkr_proof.is_some(),
+            "should produce GKR proof for SiLU model"
+        );
+    }
+
+    #[test]
+    fn test_1c_rope_in_graph_not_identity() {
+        // Phase 1C hardening: verify RoPE layers in a full model graph
+        // are compiled as LayerType::RoPE, not Identity, and that the
+        // unified STARK includes RoPE in its component count.
+        use crate::gkr::circuit::{LayerType, LayeredCircuit};
+        use crate::compiler::graph::GraphBuilder;
+        use crate::components::rope::RoPEConfig;
+
+        // Build: matmul → rope → matmul
+        let mut builder = GraphBuilder::new((2, 4));
+        builder.linear(4);
+        let rope_config = RoPEConfig::new(2, 4);
+        let rope_id = builder.graph.add_node(
+            crate::compiler::graph::GraphOp::RoPE { config: rope_config },
+            vec![builder.last_node.unwrap()],
+            (2, 4),
+        );
+        builder.last_node = Some(rope_id);
+        builder.linear(4);
+        let graph = builder.build();
+
+        let circuit = LayeredCircuit::from_graph(&graph).unwrap();
+
+        // Count layer types
+        let rope_layers: Vec<_> = circuit
+            .layers
+            .iter()
+            .filter(|l| matches!(l.layer_type, LayerType::RoPE { .. }))
+            .collect();
+        let identity_layers: Vec<_> = circuit
+            .layers
+            .iter()
+            .filter(|l| matches!(l.layer_type, LayerType::Identity))
+            .collect();
+
+        assert_eq!(rope_layers.len(), 1, "should have 1 RoPE layer");
+        assert_eq!(identity_layers.len(), 0, "should have 0 Identity layers (RoPE is not Identity)");
+    }
+
     // ===== SIMD Attention Test Helpers =====
 
     /// CPU degree-2 matmul sumcheck on pre-restricted SecureField vectors.

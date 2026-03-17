@@ -9019,10 +9019,11 @@ mod tests {
 
     #[test]
     fn test_streaming_calldata_includes_aggregated_binding() {
-        // Default mode (full binding ON) should produce streaming calldata with
+        // Explicit full binding mode should produce streaming calldata with
         // a serialized AggregatedWeightBindingProof, not an RLC marker.
+        // Note: default is RLC (fast); full binding requires opt-in.
         use crate::aggregation::prove_model_pure_gkr;
-        let _guard = EnvVarGuard::unset("STWO_AGGREGATED_RLC_ONLY");
+        let _guard = EnvVarGuard::set("STWO_AGGREGATED_FULL_BINDING", "1");
 
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(2);
