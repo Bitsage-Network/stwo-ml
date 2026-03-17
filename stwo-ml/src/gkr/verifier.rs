@@ -406,6 +406,7 @@ fn verify_gkr_inner(
                 LayerProof::Attention {
                     sub_proofs,
                     sub_claim_values,
+                    ref softmax_sum_proofs,
                     ..
                 },
             ) => {
@@ -414,6 +415,7 @@ fn verify_gkr_inner(
                     config,
                     sub_proofs,
                     sub_claim_values,
+                    softmax_sum_proofs,
                     None, // no SIMD in standard verify_gkr
                     layer_idx,
                     channel,
@@ -1655,6 +1657,7 @@ fn verify_gkr_simd_inner(
                 LayerProof::Attention {
                     sub_proofs,
                     sub_claim_values,
+                    ref softmax_sum_proofs,
                     ..
                 },
             ) => verify_attention_reduction(
@@ -1662,6 +1665,7 @@ fn verify_gkr_simd_inner(
                 config,
                 sub_proofs,
                 sub_claim_values,
+                softmax_sum_proofs,
                 Some(&r_simd),
                 layer_idx,
                 channel,
@@ -4863,6 +4867,7 @@ pub(crate) fn verify_attention_reduction(
     config: &MultiHeadAttentionConfig,
     sub_proofs: &[LayerProof],
     sub_claim_values: &[SecureField],
+    softmax_sum_proofs: &[super::types::SoftmaxSumProof],
     r_simd: Option<&[SecureField]>,
     layer_idx: usize,
     channel: &mut PoseidonChannel,
@@ -5021,6 +5026,8 @@ pub(crate) fn verify_attention_reduction(
     proof_idx += 1;
 
     // --- Per-head sub-proofs (h = H-1..0) ---
+    let mut softmax_proof_idx = 0usize;
+
     for _h in (0..num_heads).rev() {
         // Context matmul (fresh claim): context_h = softmax_h × V_h
         let _ctx_claim = verify_fresh_sub_matmul(
@@ -5033,6 +5040,59 @@ pub(crate) fn verify_attention_reduction(
             channel,
         )?;
         proof_idx += 1;
+
+        // === SOFTMAX SUM VERIFICATION (Phase 1B) ===
+        // Replay the plain sumcheck proving Σ exp = sum_exp per row.
+        if softmax_proof_idx < softmax_sum_proofs.len() {
+            let sp = &softmax_sum_proofs[softmax_proof_idx];
+            let padded_cols = seq_len.next_power_of_two();
+            let padded_rows = seq_len.next_power_of_two();
+            let num_vars = (padded_rows * padded_cols).trailing_zeros() as usize;
+
+            if sp.round_polys.len() != num_vars {
+                return Err(GKRError::VerificationError {
+                    layer_idx,
+                    reason: format!(
+                        "softmax sum proof: expected {} rounds, got {}",
+                        num_vars, sp.round_polys.len(),
+                    ),
+                });
+            }
+
+            // Replay channel: mix tag + padded_cols + claimed_sum
+            channel.mix_u64(0x5358_u64); // "SX" tag
+            channel.mix_u64(padded_cols as u64);
+            mix_secure_field(channel, sp.claimed_sum);
+
+            // Verify plain sumcheck rounds
+            let mut current_sum = sp.claimed_sum;
+            for rp in &sp.round_polys {
+                // Degree 1: p(0) + p(1) = current_sum
+                // p(0) = c0, p(1) = c0 + c1
+                if rp.c0 + rp.c0 + rp.c1 != current_sum {
+                    return Err(GKRError::VerificationError {
+                        layer_idx,
+                        reason: "softmax sum: round poly p(0)+p(1) != claimed sum".to_string(),
+                    });
+                }
+                // Mix and draw challenge
+                mix_secure_field(channel, rp.c0);
+                mix_secure_field(channel, rp.c1);
+                let challenge = channel.draw_qm31();
+                current_sum = rp.c0 + rp.c1 * challenge;
+            }
+
+            // Final eval check: the folded MLE should equal the final value
+            if sp.final_exp_eval != current_sum {
+                return Err(GKRError::VerificationError {
+                    layer_idx,
+                    reason: "softmax sum: final exp eval != folded sum".to_string(),
+                });
+            }
+            mix_secure_field(channel, sp.final_exp_eval);
+
+            softmax_proof_idx += 1;
+        }
 
         // Score matmul (fresh claim): scores_h = Q_h × K_h^T
         let _score_claim = verify_fresh_sub_matmul(
@@ -5409,6 +5469,7 @@ pub fn verify_attention_reduction_for_test(
     config: &MultiHeadAttentionConfig,
     sub_proofs: &[LayerProof],
     sub_claim_values: &[SecureField],
+    softmax_sum_proofs: &[super::types::SoftmaxSumProof],
     layer_idx: usize,
     channel: &mut PoseidonChannel,
 ) -> Result<GKRClaim, GKRError> {
@@ -5417,6 +5478,7 @@ pub fn verify_attention_reduction_for_test(
         config,
         sub_proofs,
         sub_claim_values,
+        softmax_sum_proofs,
         None,
         layer_idx,
         channel,

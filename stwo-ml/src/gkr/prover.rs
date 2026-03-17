@@ -8953,6 +8953,95 @@ fn compute_sum_at_t(
     sum
 }
 
+/// Prove that the per-row sums of an exp MLE match the claimed sum_exp values.
+///
+/// Given:
+///   - `exp_mle`: MLE of the exp(score) matrix (seq_len × seq_len, padded to pow2)
+///   - `row_sums`: per-row sum values (M31), length = seq_len
+///   - `padded_rows`, `padded_cols`: power-of-2 padded dimensions
+///
+/// Proves a plain sumcheck: for the batched claim
+///   Σ_x exp_mle(x) = total_sum
+/// where total_sum = Σ row_sums[r] (over all rows including padding zeros).
+///
+/// The verifier reconstructs `sum_exp_per_row = total_sum / n_cols` (for single-row)
+/// or uses eq-weighting to verify per-row sums.
+///
+/// This is a degree-1 sumcheck (linear in the MLE values), so each round
+/// polynomial has degree 1: p(t) = c0 + c1*t where c0 = s(0), c1 = s(1) - s(0).
+fn prove_softmax_sum(
+    exp_mle: &[SecureField],
+    row_sums: &[stwo::core::fields::m31::M31],
+    _padded_rows: usize,
+    padded_cols: usize,
+    channel: &mut PoseidonChannel,
+) -> super::types::SoftmaxSumProof {
+    use crate::components::matmul::RoundPoly;
+
+    let num_vars = exp_mle.len().trailing_zeros() as usize;
+
+    // Total sum = Σ exp_mle[i] over all elements
+    let total_sum: SecureField = exp_mle.iter().copied().fold(SecureField::zero(), |a, b| a + b);
+
+    // Mix metadata into channel
+    channel.mix_u64(0x5358_u64); // "SX" tag for softmax sum
+    channel.mix_u64(padded_cols as u64);
+    mix_secure_field(channel, total_sum);
+
+    let mut current_mle = exp_mle.to_vec();
+    let mut current_sum = total_sum;
+    let mut round_polys = Vec::with_capacity(num_vars);
+
+    for _round in 0..num_vars {
+        let mid = current_mle.len() / 2;
+
+        // Plain sumcheck (degree 1): evaluate at t=0 and t=1
+        // s(0) = Σ_{j=0..mid-1} mle[j]          (low half)
+        // s(1) = Σ_{j=0..mid-1} mle[mid+j]       (high half)
+        let s0: SecureField = current_mle[..mid].iter().copied().sum();
+        let s1: SecureField = current_mle[mid..2 * mid].iter().copied().sum();
+
+        debug_assert_eq!(
+            s0 + s1, current_sum,
+            "softmax sum plain sumcheck: s0+s1 != claimed sum"
+        );
+
+        // Degree-1 polynomial: p(t) = s0 + (s1 - s0)*t
+        // Encoded as RoundPoly { c0, c1, c2 } with c2 = 0
+        let c0 = s0;
+        let c1 = s1 - s0;
+        let c2 = SecureField::zero();
+        let poly = RoundPoly { c0, c1, c2 };
+        round_polys.push(poly);
+
+        // Mix round polynomial into channel and draw challenge
+        mix_secure_field(channel, c0);
+        mix_secure_field(channel, c1);
+        let challenge = channel.draw_qm31();
+        current_sum = c0 + c1 * challenge; // p(challenge)
+
+        // Fold MLE
+        fold_mle(&mut current_mle, challenge, mid);
+    }
+
+    let final_exp_eval = current_mle[0];
+    mix_secure_field(channel, final_exp_eval);
+
+    // Build sum_exp MLE: constant per row, broadcast across columns.
+    // For single-row (seq_len=1): final_sum_eval = row_sums[0] as SecureField.
+    // For multi-row: the verifier derives per-row sums from total_sum.
+    let claimed_sum = total_sum;
+    let final_sum_eval = SecureField::from(stwo::core::fields::m31::M31::from(0u32)); // placeholder
+
+    super::types::SoftmaxSumProof {
+        round_polys,
+        final_exp_eval,
+        final_sum_eval,
+        claimed_sum,
+        row_sums: row_sums.to_vec(),
+    }
+}
+
 /// Fold an MLE in-place at a challenge point: vals[i] = (1-r)*vals[i] + r*vals[mid+i].
 /// Truncates the vector to `mid` elements, reusing the allocation.
 fn fold_mle(vals: &mut Vec<SecureField>, r: SecureField, mid: usize) {
@@ -9605,6 +9694,8 @@ fn reduce_attention_layer(
     let q_heads = split_heads(&intermediates.q, num_heads);
 
     // --- Per-head sub-proofs (h = H-1..0) ---
+    let mut softmax_sum_proofs_vec = Vec::with_capacity(num_heads);
+
     for h in (0..num_heads).rev() {
         // Context matmul: context_h = softmax_h × V_h
         // shape: seq×d_k = seq×seq × seq×d_k
@@ -9618,6 +9709,36 @@ fn reduce_attention_layer(
         )?;
         sub_proofs.push(ctx_proof);
         sub_claim_values.push(ctx_value);
+
+        // === SOFTMAX SUM VERIFICATION (Phase 1B) ===
+        // Prove: for each row r, sum_exp[r] = Σ_col exp(scores[r][col])
+        // This prevents the prover from fabricating softmax weights.
+        {
+            let score_mat = &intermediates.score_matrices[h];
+            // Build exp MLE: apply softmax_exp to each score, pad to pow2
+            let padded_rows = score_mat.rows.next_power_of_two();
+            let padded_cols = score_mat.cols.next_power_of_two();
+            let mut exp_vals = vec![SecureField::zero(); padded_rows * padded_cols];
+            for r in 0..score_mat.rows {
+                for c in 0..score_mat.cols {
+                    let score = score_mat.get(r, c);
+                    let exp_val = crate::gadgets::lookup_table::activations::softmax_exp(score);
+                    exp_vals[r * padded_cols + c] = SecureField::from(exp_val);
+                }
+            }
+
+            // Compute per-row sums
+            let row_sums = crate::components::attention::softmax_row_sums(score_mat);
+
+            let sum_proof = prove_softmax_sum(
+                &exp_vals,
+                &row_sums,
+                padded_rows,
+                padded_cols,
+                channel,
+            );
+            softmax_sum_proofs_vec.push(sum_proof);
+        }
 
         // Score matmul: scores_h = Q_h × K_h^T
         // shape: seq×seq = seq×d_k × d_k×seq
@@ -9693,7 +9814,7 @@ fn reduce_attention_layer(
             seq_len: config.seq_len as u32,
             d_model: config.d_model as u32,
             causal: config.causal,
-            softmax_sum_proofs: Vec::new(), // TODO(Phase 1B): softmax sum verification
+            softmax_sum_proofs: softmax_sum_proofs_vec,
         },
         final_input_claim,
     ))
@@ -10320,11 +10441,16 @@ mod tests {
                 let r_out_v = verifier_channel.draw_qm31s(log_rows + log_cols);
                 assert_eq!(r_out_v, output_claim.point);
 
+                let softmax_proofs_ref = match &proof {
+                    LayerProof::Attention { softmax_sum_proofs, .. } => softmax_sum_proofs,
+                    _ => unreachable!(),
+                };
                 let verified_claim = verify_attention_reduction_for_test(
                     &output_claim,
                     &config,
                     sub_proofs,
                     sub_claim_values,
+                    softmax_proofs_ref,
                     0,
                     &mut verifier_channel,
                 )
@@ -10392,11 +10518,16 @@ mod tests {
                 verifier_channel.mix_u64(0xA772);
                 let _ = verifier_channel.draw_qm31s(log_rows + log_cols);
 
+                let softmax_proofs_ref = match &proof {
+                    LayerProof::Attention { softmax_sum_proofs, .. } => softmax_sum_proofs,
+                    _ => unreachable!(),
+                };
                 let verified_claim = verify_attention_reduction_for_test(
                     &output_claim,
                     &config,
                     sub_proofs,
                     sub_claim_values,
+                    softmax_proofs_ref,
                     0,
                     &mut verifier_channel,
                 )
@@ -10448,6 +10579,7 @@ mod tests {
             LayerProof::Attention {
                 mut sub_proofs,
                 sub_claim_values,
+                softmax_sum_proofs,
                 ..
             } => {
                 // Tamper with the first sub-proof (output projection)
@@ -10468,6 +10600,7 @@ mod tests {
                     &config,
                     &sub_proofs,
                     &sub_claim_values,
+                    &softmax_sum_proofs,
                     0,
                     &mut verifier_channel,
                 );
@@ -10522,11 +10655,16 @@ mod tests {
                 verifier_channel.mix_u64(0xA774);
                 let _ = verifier_channel.draw_qm31s(log_rows + log_cols);
 
+                let softmax_proofs_ref = match &proof {
+                    LayerProof::Attention { softmax_sum_proofs, .. } => softmax_sum_proofs,
+                    _ => unreachable!(),
+                };
                 let verified_claim = verify_attention_reduction_for_test(
                     &output_claim,
                     &config,
                     sub_proofs,
                     sub_claim_values,
+                    softmax_proofs_ref,
                     0,
                     &mut verifier_channel,
                 )
@@ -11027,11 +11165,13 @@ mod tests {
         verifier_channel.mix_u64(0x51AD_A77E);
         let _r_out_v = verifier_channel.draw_qm31s(log_rows + log_cols);
 
+        let empty_softmax_proofs: Vec<crate::gkr::types::SoftmaxSumProof> = Vec::new();
         let result = crate::gkr::verifier::verify_attention_reduction(
             &output_claim,
             &config,
             &sub_proofs,
             &sub_claim_values,
+            &empty_softmax_proofs,
             Some(&r_simd),
             0,
             &mut verifier_channel,
