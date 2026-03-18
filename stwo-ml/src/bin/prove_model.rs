@@ -251,6 +251,14 @@ struct Cli {
     /// Number of decode tokens to prove (default: 1).
     #[arg(long, default_value = "1")]
     decode_steps: usize,
+
+    /// Produce a recursive STARK proof that compresses the GKR calldata.
+    ///
+    /// After GKR proving, runs the recursive prover to produce a constant-size
+    /// STARK proof (~500 felts) that attests "the GKR verifier accepted."
+    /// This replaces the 18-TX streaming pipeline with a single TX.
+    #[arg(long)]
+    recursive: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -2030,6 +2038,42 @@ fn main() {
     };
 
     eprintln!("Proving completed in {:.2}s", prove_elapsed.as_secs_f64());
+
+    // ── Recursive STARK composition (optional) ───────────────────────
+    if cli.recursive {
+        if let Some(ref gkr) = proof.gkr_proof {
+            eprintln!("Phase 4/4: Recursive STARK composition...");
+            let circuit = stwo_ml::gkr::LayeredCircuit::from_graph(&model.graph)
+                .expect("circuit compile for recursive");
+
+            let zero_qm31 = stwo::core::fields::qm31::QM31::default();
+            match stwo_ml::recursive::prove_recursive(
+                &circuit,
+                gkr,
+                &proof.execution.output,
+                &model.weights,
+                zero_qm31, // weight_super_root — TODO: wire from compute_weight_commitment
+                zero_qm31, // io_commitment — TODO: wire from compute_io_commitment
+                prove_elapsed.as_secs_f64(),
+            ) {
+                Ok(recursive_proof) => {
+                    eprintln!(
+                        "  Recursive STARK: {:.2}s, {} Poseidon perms, log_size={}",
+                        recursive_proof.metadata.recursive_prove_time_secs,
+                        recursive_proof.metadata.n_poseidon_perms,
+                        recursive_proof.metadata.trace_log_size,
+                    );
+                    // TODO: serialize recursive proof alongside GKR proof
+                }
+                Err(e) => {
+                    eprintln!("  Recursive STARK failed: {e}");
+                    eprintln!("  (Continuing with standard GKR proof output)");
+                }
+            }
+        } else {
+            eprintln!("  --recursive requires --gkr --format ml_gkr");
+        }
+    }
 
     // Build metadata
     let io_commitment = compute_io_commitment(&input, &proof.execution.output);
