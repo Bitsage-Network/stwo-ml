@@ -64,6 +64,7 @@ pub mod json_serde;
 pub mod kv_state;
 pub mod receipt;
 pub mod starknet;
+pub mod recursive;
 pub mod tee;
 pub mod weight_cache;
 
