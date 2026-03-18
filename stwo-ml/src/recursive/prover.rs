@@ -181,10 +181,8 @@ pub fn prove_recursive(
     eprintln!("  [Recursive] Step 4/4: Proving (STARK)...");
 
     // Compute initial/final digest limbs from the production verifier's channel state.
-    // Initial = zero (fresh channel), final = digest after all verifier operations.
     let zero_limbs = super::air::felt252_to_limbs(&starknet_ff::FieldElement::ZERO);
-    // TODO: capture actual final digest from production verifier channel
-    let final_limbs = zero_limbs;
+    let final_limbs = super::air::felt252_to_limbs(&witness.final_digest);
 
     let eval = RecursiveVerifierEval {
         log_n_rows: log_size,

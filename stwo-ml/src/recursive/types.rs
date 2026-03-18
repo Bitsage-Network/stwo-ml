@@ -98,6 +98,10 @@ pub struct GkrVerifierWitness {
     /// Total QM31 arithmetic operations.
     pub n_qm31_ops: usize,
 
+    /// Final channel digest after production verification (felt252).
+    /// Used as boundary constraint in the recursive STARK.
+    pub final_digest: FieldElement,
+
     /// Total equality checks.
     pub n_equality_checks: usize,
 }

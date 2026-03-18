@@ -298,7 +298,8 @@ pub fn generate_witness(
     use crate::gkr::circuit::LayerType;
 
     // ── Pass 1: production verification ──────────────────────────────
-    // Run the real verifier to (a) confirm validity and (b) measure hash_count.
+    // Run the real verifier to (a) confirm validity, (b) measure hash_count,
+    // and (c) capture the final channel digest.
     let mut prod_channel = crate::crypto::poseidon_channel::PoseidonChannel::new();
     let _claim = if let Some(w) = weights {
         crate::gkr::verifier::verify_gkr_with_weights(circuit, proof, output, w, &mut prod_channel)?
@@ -306,6 +307,7 @@ pub fn generate_witness(
         crate::gkr::verifier::verify_gkr(circuit, proof, output, &mut prod_channel)?
     };
     let total_poseidon_calls = prod_channel.hash_count() as usize;
+    let final_digest = prod_channel.digest();
 
     // ── Pass 2: instrumented replay ──────────────────────────────────
     // Replay with InstrumentedChannel for detailed witness.
@@ -474,6 +476,7 @@ pub fn generate_witness(
         n_poseidon_perms: total_poseidon_calls,
         n_sumcheck_rounds,
         n_qm31_ops,
+        final_digest,
         n_equality_checks,
     };
 
