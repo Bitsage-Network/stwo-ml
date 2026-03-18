@@ -4576,6 +4576,14 @@ pub fn replay_verify_serialized_proof(
         }
     }
 
+    // Reject trailing data — all proof felts must be consumed
+    if off < proof_data.len() {
+        return Err(format!(
+            "trailing data: consumed {} of {} felts ({} unconsumed)",
+            off, proof_data.len(), proof_data.len() - off,
+        ));
+    }
+
     Ok(())
 }
 
@@ -9269,7 +9277,9 @@ mod tests {
     #[test]
     fn test_streaming_init_calldata_no_kv_commitment() {
         // When KV commitments are None, init_calldata should have has_kv=0.
+        // Full binding is required for streaming calldata soundness gate.
         use crate::aggregation::prove_model_pure_gkr;
+        let _guard = EnvVarGuard::set("STWO_AGGREGATED_FULL_BINDING", "1");
 
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(2);
