@@ -235,12 +235,11 @@ pub fn prove_recursive(
         estimate_proof_size(&stark_proof),
     );
 
-    // Serialize the STARK proof
-    let stark_proof_bytes = serialize_stark_proof(&stark_proof);
-
     Ok(RecursiveProof {
-        stark_proof_bytes,
+        stark_proof: stark_proof,
         public_inputs: witness.public_inputs,
+        final_digest: final_digest_felt,
+        log_size,
         metadata: RecursiveProofMetadata {
             recursive_prove_time_secs: recursive_prove_time,
             gkr_prove_time_secs,

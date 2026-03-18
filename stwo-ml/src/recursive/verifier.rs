@@ -30,6 +30,7 @@ pub fn verify_recursive(
     stark_proof: &stwo::core::proof::StarkProof<Poseidon252MerkleHasher>,
     public_inputs: &RecursivePublicInputs,
     log_size: u32,
+    final_digest: starknet_ff::FieldElement,
 ) -> Result<(), RecursiveError> {
     let pcs_config = PcsConfig::default();
 
@@ -38,7 +39,7 @@ pub fn verify_recursive(
     let eval = RecursiveVerifierEval {
         log_n_rows: log_size,
         initial_digest_limbs: zero_limbs,
-        final_digest_limbs: zero_limbs, // TODO: wire actual final digest
+        final_digest_limbs: super::air::felt252_to_limbs(&final_digest),
     };
 
     // Build dummy component to get trace_log_degree_bounds
@@ -128,8 +129,17 @@ mod tests {
         let recursive_proof = recursive_result.expect("recursive proving should succeed");
         eprintln!(
             "Recursive proof produced (log_size={}, {} poseidon perms, {:.3}s)",
-            log_size, witness.n_poseidon_perms,
+            recursive_proof.log_size, witness.n_poseidon_perms,
             recursive_proof.metadata.recursive_prove_time_secs,
         );
+
+        // Full roundtrip: verify the recursive STARK proof
+        let verify_result = verify_recursive(
+            &recursive_proof.stark_proof,
+            &recursive_proof.public_inputs,
+            recursive_proof.log_size,
+            recursive_proof.final_digest,
+        );
+        assert!(verify_result.is_ok(), "recursive verification should succeed: {:?}", verify_result.err());
     }
 }

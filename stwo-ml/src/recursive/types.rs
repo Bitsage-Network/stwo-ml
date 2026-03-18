@@ -146,14 +146,21 @@ pub struct RecursivePublicInputs {
 /// Contains a standard STWO STARK proof plus the public inputs.
 /// On-chain verification uses stwo-cairo-verifier's generic `verify()`.
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RecursiveProof {
-    /// The STARK proof bytes (serialized StarkProof<Blake2sMerkleHasher>).
-    /// On-chain, this is passed directly to stwo-cairo-verifier.
-    pub stark_proof_bytes: Vec<u8>,
+    /// The actual STARK proof (Poseidon252MerkleHasher).
+    /// Used for Rust-side verification via `verify_recursive()`.
+    pub stark_proof: stwo::core::proof::StarkProof<
+        stwo::core::vcs_lifted::poseidon252_merkle::Poseidon252MerkleHasher,
+    >,
 
     /// Public inputs committed in the circuit.
     pub public_inputs: RecursivePublicInputs,
+
+    /// Final channel digest from the GKR verifier (for boundary constraint).
+    pub final_digest: FieldElement,
+
+    /// Trace log_size (needed for verifier to reconstruct the AIR).
+    pub log_size: u32,
 
     /// Proof metadata for debugging/display.
     pub metadata: RecursiveProofMetadata,
