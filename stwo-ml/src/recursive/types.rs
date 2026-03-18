@@ -25,6 +25,14 @@ pub enum WitnessOp {
         output: [FieldElement; 3],
     },
 
+    /// A channel operation that transforms digest_before → digest_after.
+    /// This is the unit of chaining — one per mix/draw/mix_poly_coeffs call.
+    /// May internally involve multiple Hades permutations (e.g., poseidon_hash_many).
+    ChannelOp {
+        digest_before: FieldElement,
+        digest_after: FieldElement,
+    },
+
     /// Sumcheck round verification (degree-2, MatMul layers).
     /// Verifies: `c0 + (c0 + c1 + c2) == claim`, then `next = c0 + c1*r + c2*r^2`.
     SumcheckRoundDeg2 {

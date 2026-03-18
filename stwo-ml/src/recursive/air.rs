@@ -50,8 +50,12 @@ pub const COLS_PER_STATE: usize = 3 * LIMBS_PER_FELT; // 27
 /// Columns for the shifted next-row input digest (for chain constraints).
 pub const COLS_SHIFTED_DIGEST: usize = LIMBS_PER_FELT; // 9
 
-/// Total columns per row: input state + output state + op_type + shifted_next_digest.
-pub const COLS_PER_ROW: usize = 2 * COLS_PER_STATE + 1 + COLS_SHIFTED_DIGEST; // 64
+/// Columns for one digest: 9 M31 limbs.
+pub const COLS_PER_DIGEST: usize = LIMBS_PER_FELT; // 9
+
+/// Total columns per row: digest_before + digest_after + shifted_next_before + op_type.
+/// Chain-based layout: each row = one channel operation.
+pub const COLS_PER_ROW: usize = COLS_PER_DIGEST + COLS_PER_DIGEST + COLS_PER_DIGEST + 1; // 28
 
 // ═══════════════════════════════════════════════════════════════════════
 // Felt252 ↔ M31 limb decomposition
@@ -149,72 +153,44 @@ impl FrameworkEval for RecursiveVerifierEval {
         });
 
         // ── Read execution trace columns ─────────────────────────────
-        // Input state: [digest(9), value(9), capacity(9)] = 27 columns
-        let input_digest: [E::F; LIMBS_PER_FELT] =
-            std::array::from_fn(|_| eval.next_trace_mask());
-        let input_value: [E::F; LIMBS_PER_FELT] =
-            std::array::from_fn(|_| eval.next_trace_mask());
-        let input_cap: [E::F; LIMBS_PER_FELT] =
+        // digest_before: 9 M31 limbs (the channel digest at the start of this op)
+        let digest_before: [E::F; LIMBS_PER_FELT] =
             std::array::from_fn(|_| eval.next_trace_mask());
 
-        // Output state: [digest(9), value(9), capacity(9)] = 27 columns
-        let output_digest: [E::F; LIMBS_PER_FELT] =
-            std::array::from_fn(|_| eval.next_trace_mask());
-        let _output_value: [E::F; LIMBS_PER_FELT] =
-            std::array::from_fn(|_| eval.next_trace_mask());
-        let _output_cap: [E::F; LIMBS_PER_FELT] =
+        // digest_after: 9 M31 limbs (the channel digest after this op completes)
+        let digest_after: [E::F; LIMBS_PER_FELT] =
             std::array::from_fn(|_| eval.next_trace_mask());
 
-        // Op type: 0 = mix, 1 = draw
+        // shifted_next_before: 9 M31 limbs (digest_before of the NEXT row)
+        let shifted_next_before: [E::F; LIMBS_PER_FELT] =
+            std::array::from_fn(|_| eval.next_trace_mask());
+
+        // op_type: 0 = mix, 1 = draw, 2 = mix_poly_coeffs
         let _op_type = eval.next_trace_mask();
 
-        // Shifted next-row input digest (9 columns).
-        // On row i, this holds input_digest[row i+1].
-        // On the last row, this is zero (no next row).
-        let shifted_next_digest: [E::F; LIMBS_PER_FELT] =
-            std::array::from_fn(|_| eval.next_trace_mask());
-
-        // ── Boundary constraint: first row's input digest = initial ──
+        // ── Boundary: first row's digest_before = initial (zero) ─────
         for j in 0..LIMBS_PER_FELT {
             eval.add_constraint(
                 is_first.clone()
-                    * (input_digest[j].clone() - E::F::from(self.initial_digest_limbs[j])),
+                    * (digest_before[j].clone() - E::F::from(self.initial_digest_limbs[j])),
             );
         }
 
-        // ── Boundary constraint: last row's output digest = final ────
-        // NOTE: This constraint is only active when final_digest_limbs is non-zero,
-        // meaning the witness recorded the complete Hades chain. When the witness
-        // only partially records the chain (Pass 2 covers core layers), the
-        // final digest is set to zero and this constraint becomes trivial.
+        // ── Boundary: last row's digest_after = final ────────────────
         for j in 0..LIMBS_PER_FELT {
             eval.add_constraint(
                 is_last.clone()
-                    * (output_digest[j].clone() - E::F::from(self.final_digest_limbs[j])),
+                    * (digest_after[j].clone() - E::F::from(self.final_digest_limbs[j])),
             );
         }
 
-        // ── Chain constraint: output_digest[row] == input_digest[row+1]
-        //
-        // We use a shifted column approach: `shifted_next_digest[row_i]`
-        // holds `input_digest[row_{i+1}]`. The prover populates this from
-        // the trace. The constraint checks equality on all chain rows:
-        //
-        //   is_chain * (output_digest[j] - shifted_next_digest[j]) == 0
-        //
-        // This enforces the Fiat-Shamir transcript chain — each Hades call's
-        // output digest feeds the next call's input digest.
-        // Chain constraint temporarily gated behind env var for debugging.
-        // When enabled, this enforces transcript continuity at every row.
-        if std::env::var("STWO_RECURSIVE_CHAIN_CONSTRAINT").is_ok() {
-            for j in 0..LIMBS_PER_FELT {
-                eval.add_constraint(
-                    is_chain.clone()
-                        * (output_digest[j].clone() - shifted_next_digest[j].clone()),
-                );
-            }
+        // ── Chain: digest_after[row] == digest_before[row+1] ─────────
+        for j in 0..LIMBS_PER_FELT {
+            eval.add_constraint(
+                is_chain.clone()
+                    * (digest_after[j].clone() - shifted_next_before[j].clone()),
+            );
         }
-        let _ = (&is_chain, &shifted_next_digest);
 
         eval
     }
@@ -239,22 +215,20 @@ pub fn build_recursive_trace(
 ) -> RecursiveTraceData {
     use super::types::WitnessOp;
 
-    // Collect all HadesPerm ops from the witness
-    let hades_ops: Vec<([FieldElement; 3], [FieldElement; 3])> = witness
+    // Collect all ChannelOp entries — these are the chain units.
+    // Each ChannelOp records (digest_before, digest_after) for one channel operation.
+    let channel_ops: Vec<(FieldElement, FieldElement)> = witness
         .ops
         .iter()
         .filter_map(|op| match op {
-            WitnessOp::HadesPerm { input, output } => Some((*input, *output)),
+            WitnessOp::ChannelOp { digest_before, digest_after } => Some((*digest_before, *digest_after)),
             _ => None,
         })
         .collect();
 
-    let n_hades = hades_ops.len();
-    // Real rows = recorded Hades ops only. The production verifier's total
-    // Poseidon count is used for sizing (log_size) to ensure enough capacity,
-    // but is_last and is_chain are based on actual recorded data.
-    let n_real_rows = n_hades;
-    let n_for_sizing = witness.n_poseidon_perms.max(n_hades);
+    let n_ops = channel_ops.len();
+    let n_real_rows = n_ops;
+    let n_for_sizing = witness.n_poseidon_perms.max(n_ops);
 
     let log_size = if n_for_sizing <= 1 {
         1
@@ -269,56 +243,40 @@ pub fn build_recursive_trace(
         execution_trace.push(vec![M31::from_u32_unchecked(0); n_padded_rows]);
     }
 
-    // Compute a zero-state Hades permutation for padding
-    let zero_felt = FieldElement::ZERO;
-    let zero_state = [zero_felt; 3];
-    let mut padded_output = zero_state;
-    crate::crypto::hades::hades_permutation(&mut padded_output);
-    let zero_input_limbs = hades_state_to_limbs(&zero_state);
-    let zero_output_limbs = hades_state_to_limbs(&padded_output);
+    // Zero limbs for padding
+    let zero_limbs = felt252_to_limbs(&FieldElement::ZERO);
 
+    // Populate trace from ChannelOp data
     for row in 0..n_padded_rows {
-        let (input_limbs, output_limbs, op_type) = if row < n_hades {
-            // Real data from the witness
-            let (ref input, ref output) = hades_ops[row];
-            let il = hades_state_to_limbs(input);
-            let ol = hades_state_to_limbs(output);
-            // Determine op type from capacity: 2 = mix, 3 = draw
-            let cap_bytes = input[2].to_bytes_be();
-            let cap_val = cap_bytes[31];
-            let op = if cap_val == 3 { 1u32 } else { 0u32 };
-            (il, ol, op)
+        let (before_limbs, after_limbs, op_type) = if row < n_ops {
+            let (before, after) = channel_ops[row];
+            (felt252_to_limbs(&before), felt252_to_limbs(&after), 0u32)
         } else {
-            // Padding: valid zero-input Hades permutation
-            (zero_input_limbs, zero_output_limbs, 0u32)
+            // Padding rows: digest stays zero
+            (zero_limbs, zero_limbs, 0u32)
         };
 
-        // Write input state limbs (27 columns)
-        for j in 0..COLS_PER_STATE {
-            execution_trace[j][row] = input_limbs[j];
+        // Write digest_before (9 columns)
+        for j in 0..LIMBS_PER_FELT {
+            execution_trace[j][row] = before_limbs[j];
         }
-        // Write output state limbs (27 columns)
-        for j in 0..COLS_PER_STATE {
-            execution_trace[COLS_PER_STATE + j][row] = output_limbs[j];
+        // Write digest_after (9 columns)
+        for j in 0..LIMBS_PER_FELT {
+            execution_trace[LIMBS_PER_FELT + j][row] = after_limbs[j];
         }
-        // Write op_type (1 column)
-        execution_trace[2 * COLS_PER_STATE][row] = M31::from_u32_unchecked(op_type);
-
-        // Shifted next-row digest (9 columns) — populated in second pass below
+        // shifted_next_before populated in second pass
+        // Write op_type
+        execution_trace[3 * LIMBS_PER_FELT][row] = M31::from_u32_unchecked(op_type);
     }
 
-    // Second pass: populate shifted_next_digest columns.
-    // shifted_next_digest[row_i] = input_digest[row_{i+1}]
-    let shifted_col_start = 2 * COLS_PER_STATE + 1;
+    // Second pass: shifted_next_before[row_i] = digest_before[row_{i+1}]
+    let shifted_start = 2 * LIMBS_PER_FELT;
     for row in 0..n_padded_rows {
-        let next_row = row + 1;
-        if next_row < n_padded_rows {
-            // Copy input_digest of next row
+        if row + 1 < n_padded_rows {
             for j in 0..LIMBS_PER_FELT {
-                execution_trace[shifted_col_start + j][row] = execution_trace[j][next_row];
+                execution_trace[shifted_start + j][row] = execution_trace[j][row + 1];
             }
         }
-        // Last row: shifted_next_digest = 0 (already zeroed)
     }
 
     // Preprocessed columns
@@ -342,7 +300,7 @@ pub fn build_recursive_trace(
         preprocessed_is_chain: is_chain,
         log_size,
         n_real_rows,
-        n_hades_recorded: n_hades,
+        n_channel_ops: n_ops,
     }
 }
 
@@ -366,9 +324,8 @@ pub struct RecursiveTraceData {
     /// Number of real (non-padding) rows.
     pub n_real_rows: usize,
 
-    /// Number of Hades permutations recorded in the witness (may be < n_real_rows
-    /// because some operations like mix_poly_coeffs use poseidon_hash_many internally).
-    pub n_hades_recorded: usize,
+    /// Number of channel operations (ChannelOp entries) in the trace.
+    pub n_channel_ops: usize,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -383,10 +340,9 @@ mod tests {
     #[test]
     fn test_cols_per_row() {
         assert_eq!(LIMBS_PER_FELT, 9);
-        assert_eq!(COLS_PER_STATE, 27);
-        assert_eq!(COLS_SHIFTED_DIGEST, 9);
-        // 27 (input) + 27 (output) + 1 (op_type) + 9 (shifted_next_digest) = 64
-        assert_eq!(COLS_PER_ROW, 64);
+        assert_eq!(COLS_PER_DIGEST, 9);
+        // 9 (digest_before) + 9 (digest_after) + 9 (shifted_next_before) + 1 (op_type) = 28
+        assert_eq!(COLS_PER_ROW, 28);
     }
 
     #[test]
@@ -435,17 +391,17 @@ mod tests {
     }
 
     #[test]
-    fn test_trace_with_real_hades() {
-        // Build a witness with real Hades ops and verify trace population.
+    fn test_trace_with_channel_op() {
+        // Build a witness with ChannelOp and verify trace population.
         use crate::recursive::types::WitnessOp;
 
-        let mut state = [FieldElement::ZERO, FieldElement::from(42u64), FieldElement::TWO];
-        let input = state;
+        let digest_before = FieldElement::ZERO;
+        let mut state = [digest_before, FieldElement::from(42u64), FieldElement::TWO];
         crate::crypto::hades::hades_permutation(&mut state);
-        let output = state;
+        let digest_after = state[0];
 
         let witness = GkrVerifierWitness {
-            ops: vec![WitnessOp::HadesPerm { input, output }],
+            ops: vec![WitnessOp::ChannelOp { digest_before, digest_after }],
             public_inputs: crate::recursive::types::RecursivePublicInputs {
                 circuit_hash: stwo::core::fields::qm31::QM31::default(),
                 io_commitment: stwo::core::fields::qm31::QM31::default(),
@@ -456,62 +412,51 @@ mod tests {
             n_poseidon_perms: 1,
             n_sumcheck_rounds: 0,
             n_qm31_ops: 0,
-            final_digest: FieldElement::ZERO,
+            final_digest: digest_after,
             n_equality_checks: 0,
         };
 
         let trace = build_recursive_trace(&witness);
 
-        assert_eq!(trace.log_size, 1); // 1 real row → padded to 2
+        assert_eq!(trace.log_size, 1);
         assert_eq!(trace.n_real_rows, 1);
-        assert_eq!(trace.n_hades_recorded, 1);
+        assert_eq!(trace.n_channel_ops, 1);
         assert_eq!(trace.execution_trace.len(), COLS_PER_ROW);
-        assert_eq!(trace.execution_trace[0].len(), 2); // 2^1
 
-        // Verify row 0 has the real input digest limbs
-        let expected_input_limbs = hades_state_to_limbs(&input);
-        for j in 0..COLS_PER_STATE {
-            assert_eq!(
-                trace.execution_trace[j][0], expected_input_limbs[j],
-                "input limb {j} mismatch"
-            );
+        // Verify digest_before limbs (first 9 columns)
+        let before_limbs = felt252_to_limbs(&digest_before);
+        for j in 0..LIMBS_PER_FELT {
+            assert_eq!(trace.execution_trace[j][0], before_limbs[j]);
         }
 
-        // Verify row 0 has the real output digest limbs
-        let expected_output_limbs = hades_state_to_limbs(&output);
-        for j in 0..COLS_PER_STATE {
-            assert_eq!(
-                trace.execution_trace[COLS_PER_STATE + j][0], expected_output_limbs[j],
-                "output limb {j} mismatch"
-            );
+        // Verify digest_after limbs (columns 9-17)
+        let after_limbs = felt252_to_limbs(&digest_after);
+        for j in 0..LIMBS_PER_FELT {
+            assert_eq!(trace.execution_trace[LIMBS_PER_FELT + j][0], after_limbs[j]);
         }
 
-        // Verify is_first/is_last
         assert_eq!(trace.preprocessed_is_first[0], M31::from_u32_unchecked(1));
         assert_eq!(trace.preprocessed_is_last[0], M31::from_u32_unchecked(1));
     }
 
     #[test]
     fn test_trace_chain_correctness() {
-        // Two Hades calls: verify the chain (output digest of row 0 == input digest of row 1).
+        // Two channel ops: verify digest_after[0] == digest_before[1].
         use crate::recursive::types::WitnessOp;
 
-        // Call 1: mix(42)
-        let mut state1 = [FieldElement::ZERO, FieldElement::from(42u64), FieldElement::TWO];
-        let input1 = state1;
-        crate::crypto::hades::hades_permutation(&mut state1);
-        let output1 = state1;
+        let d0 = FieldElement::ZERO;
+        let mut s1 = [d0, FieldElement::from(42u64), FieldElement::TWO];
+        crate::crypto::hades::hades_permutation(&mut s1);
+        let d1 = s1[0];
 
-        // Call 2: mix(100) — input digest should be output1's digest
-        let mut state2 = [output1[0], FieldElement::from(100u64), FieldElement::TWO];
-        let input2 = state2;
-        crate::crypto::hades::hades_permutation(&mut state2);
-        let output2 = state2;
+        let mut s2 = [d1, FieldElement::from(100u64), FieldElement::TWO];
+        crate::crypto::hades::hades_permutation(&mut s2);
+        let d2 = s2[0];
 
         let witness = GkrVerifierWitness {
             ops: vec![
-                WitnessOp::HadesPerm { input: input1, output: output1 },
-                WitnessOp::HadesPerm { input: input2, output: output2 },
+                WitnessOp::ChannelOp { digest_before: d0, digest_after: d1 },
+                WitnessOp::ChannelOp { digest_before: d1, digest_after: d2 },
             ],
             public_inputs: crate::recursive::types::RecursivePublicInputs {
                 circuit_hash: stwo::core::fields::qm31::QM31::default(),
@@ -523,24 +468,20 @@ mod tests {
             n_poseidon_perms: 2,
             n_sumcheck_rounds: 0,
             n_qm31_ops: 0,
-            final_digest: FieldElement::ZERO,
+            final_digest: d2,
             n_equality_checks: 0,
         };
 
         let trace = build_recursive_trace(&witness);
 
-        assert_eq!(trace.n_hades_recorded, 2);
-        assert_eq!(trace.log_size, 1); // 2 rows → padded to 2
+        assert_eq!(trace.n_channel_ops, 2);
 
-        // Verify chain: output_digest[row0] == input_digest[row1]
-        let output_digest_start = COLS_PER_STATE; // output state starts at column 27
+        // Verify chain: digest_after[row0] == digest_before[row1]
         for j in 0..LIMBS_PER_FELT {
-            let out_digest_limb_row0 = trace.execution_trace[output_digest_start + j][0];
-            let in_digest_limb_row1 = trace.execution_trace[j][1];
-            assert_eq!(
-                out_digest_limb_row0, in_digest_limb_row1,
-                "chain broken at limb {j}: output_digest[0] != input_digest[1]"
-            );
+            let after_row0 = trace.execution_trace[LIMBS_PER_FELT + j][0];
+            let before_row1 = trace.execution_trace[j][1];
+            assert_eq!(after_row0, before_row1,
+                "chain broken at limb {j}: digest_after[0] != digest_before[1]");
         }
     }
 

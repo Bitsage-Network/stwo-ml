@@ -192,16 +192,16 @@ pub fn prove_recursive(
     // witness only partially records the chain (Pass 2 covers core layers).
     let zero_limbs = super::air::felt252_to_limbs(&starknet_ff::FieldElement::ZERO);
 
-    // Find the last recorded HadesPerm's output digest
-    let last_hades_output = witness.ops.iter().rev().find_map(|op| {
-        if let super::types::WitnessOp::HadesPerm { output, .. } = op {
-            Some(output[0]) // digest = first element of output state
+    // Find the last ChannelOp's digest_after
+    let last_channel_op = witness.ops.iter().rev().find_map(|op| {
+        if let super::types::WitnessOp::ChannelOp { digest_after, .. } = op {
+            Some(*digest_after)
         } else {
             None
         }
     });
 
-    let final_digest_felt = last_hades_output.unwrap_or(starknet_ff::FieldElement::ZERO);
+    let final_digest_felt = last_channel_op.unwrap_or(starknet_ff::FieldElement::ZERO);
     let final_limbs = super::air::felt252_to_limbs(&final_digest_felt);
 
     eprintln!(

@@ -161,11 +161,14 @@ mod unit_tests {
             WitnessOp::EqualityCheck { lhs: one, rhs: one },
             WitnessOp::ChannelMix { value: one },
             WitnessOp::ChannelDraw { result: one },
+            WitnessOp::ChannelOp {
+                digest_before: starknet_ff::FieldElement::ZERO,
+                digest_after: starknet_ff::FieldElement::ONE,
+            },
         ];
 
-        assert_eq!(ops.len(), 8, "should have all 8 WitnessOp variants");
+        assert_eq!(ops.len(), 9, "should have all 9 WitnessOp variants");
 
-        // Verify each can be matched
         for op in &ops {
             match op {
                 WitnessOp::HadesPerm { .. } => {}
@@ -176,6 +179,7 @@ mod unit_tests {
                 WitnessOp::EqualityCheck { .. } => {}
                 WitnessOp::ChannelMix { .. } => {}
                 WitnessOp::ChannelDraw { .. } => {}
+                WitnessOp::ChannelOp { .. } => {}
             }
         }
     }
@@ -334,5 +338,62 @@ mod integration_tests {
         let hash1 = super::super::witness::compute_circuit_hash(&circuit1);
         let hash2 = super::super::witness::compute_circuit_hash(&circuit2);
         assert_ne!(hash1, hash2, "different circuits should have different hashes");
+    }
+}
+
+#[cfg(test)]
+mod chain_debug {
+    use crate::recursive::air::{build_recursive_trace, LIMBS_PER_FELT};
+    use crate::recursive::witness::generate_witness;
+    use crate::compiler::graph::{GraphBuilder, GraphWeights};
+    use crate::components::matmul::M31Matrix;
+    use stwo::core::fields::m31::M31;
+    use stwo::core::fields::qm31::QM31;
+    use stwo::core::fields::cm31::CM31;
+
+    #[test]
+    fn test_real_witness_chain_integrity() {
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(2);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+
+        let mut weights = GraphWeights::new();
+        let mut w = M31Matrix::new(4, 2);
+        for i in 0..4 { for j in 0..2 { w.set(i, j, M31::from((i * 2 + j + 1) as u32)); } }
+        weights.add_weight(0, w);
+
+        let proof = crate::aggregation::prove_model_pure_gkr(&graph, &input, &weights)
+            .expect("GKR proving");
+        let gkr = proof.gkr_proof.as_ref().expect("GKR proof");
+        let circuit = crate::gkr::LayeredCircuit::from_graph(&graph).expect("circuit");
+        let zero = QM31(CM31(M31::from(0), M31::from(0)), CM31(M31::from(0), M31::from(0)));
+
+        let witness = generate_witness(&circuit, gkr, &proof.execution.output, Some(&weights), zero, zero)
+            .expect("witness");
+
+        let trace = build_recursive_trace(&witness);
+        
+        // Check chain integrity: digest_after[row] == digest_before[row+1]
+        let mut chain_breaks = 0;
+        for row in 0..trace.n_real_rows.saturating_sub(1) {
+            for j in 0..LIMBS_PER_FELT {
+                let digest_after = trace.execution_trace[LIMBS_PER_FELT + j][row];
+                let next_in_digest = trace.execution_trace[j][row + 1];
+                let shifted = trace.execution_trace[2 * LIMBS_PER_FELT + j][row];
+                
+                if digest_after != next_in_digest {
+                    if chain_breaks < 3 {
+                        eprintln!("Chain break at row {row} limb {j}: digest_after={:?}, next_digest_before={:?}", digest_after, next_in_digest);
+                    }
+                    chain_breaks += 1;
+                }
+                assert_eq!(shifted, next_in_digest, "shifted column mismatch at row {row} limb {j}");
+            }
+        }
+        eprintln!("Chain breaks: {chain_breaks} out of {} checks", (trace.n_real_rows - 1) * LIMBS_PER_FELT);
+        assert_eq!(chain_breaks, 0, "Chain has {chain_breaks} breaks — transcript not continuous");
     }
 }
