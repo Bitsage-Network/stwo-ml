@@ -223,6 +223,7 @@ mod integration_tests {
             &circuit,
             gkr,
             &proof.execution.output,
+            Some(&weights),
             zero, // weight_super_root placeholder
             zero, // io_commitment placeholder
         )
@@ -285,7 +286,7 @@ mod integration_tests {
         let zero = QM31(CM31(M31::from(0), M31::from(0)), CM31(M31::from(0), M31::from(0)));
 
         let witness = generate_witness(
-            &circuit, gkr, &proof.execution.output, zero, zero,
+            &circuit, gkr, &proof.execution.output, Some(&weights), zero, zero,
         )
         .expect("witness generation should succeed");
 
