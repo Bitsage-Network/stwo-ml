@@ -125,12 +125,13 @@ prove_conversation() {
     echo -e "${WHITE}Proving $n_turns conversation turns...${RESET}"
     echo ""
 
-    # Step 1: Capture — run each turn through FULL M31 forward pass (all 24 layers)
-    echo -e "${YELLOW}Step 1/4: Capturing M31 forward passes (all 24 layers)${RESET}"
+    # Step 1: Capture — run each turn through FULL transformer (all layers + attention)
+    echo -e "${YELLOW}Step 1/4: Capturing M31 forward passes (full attention, all layers)${RESET}"
     "$PROVE_BIN" capture \
         --model-dir "$MODEL_DIR" \
         --log-dir "$LOG_DIR/logs" \
         --conversation "$CONV_FILE" \
+        --full-attention \
         --model-name "qwen2-0.5b" \
         2>&1 | grep -v "^\s*$"
 

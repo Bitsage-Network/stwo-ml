@@ -1040,19 +1040,41 @@ fn build_hf_decode_graph(
 
 /// Build a full transformer graph with attention and configurable batch/seq_len.
 ///
-/// This is the most complete graph: includes Q/K/V/O projections, attention
-/// mechanism (softmax + score matmul), residual connections, and FFN.
+/// This is the most complete graph: includes embedding lookup, Q/K/V/O projections,
+/// attention mechanism (softmax + score matmul), residual connections, and FFN.
 /// Used for both decode (seq_len=1) and batched (seq_len=N) proving.
+///
+/// When `include_embedding` is true, adds an Embedding node at the start
+/// that proves the token→embedding lookup via LogUp.
 pub fn build_hf_full_graph(
     config: &TransformerConfig,
     hf_config: &HfConfig,
     num_layers: usize,
     seq_len: usize,
 ) -> ComputationGraph {
+    build_hf_full_graph_with_options(config, hf_config, num_layers, seq_len, false)
+}
+
+/// Build the full graph with optional embedding node.
+pub fn build_hf_full_graph_with_options(
+    config: &TransformerConfig,
+    hf_config: &HfConfig,
+    num_layers: usize,
+    seq_len: usize,
+    include_embedding: bool,
+) -> ComputationGraph {
     use crate::compiler::onnx::NormType;
     let d = config.d_model;
 
-    let mut builder = GraphBuilder::new((seq_len, d));
+    let mut builder = if include_embedding {
+        // Start with token IDs as input, then embedding lookup
+        let mut b = GraphBuilder::new((seq_len, 1)); // token IDs: seq_len × 1
+        b.embedding(hf_config.vocab_size, d);
+        b
+    } else {
+        GraphBuilder::new((seq_len, d))
+    };
+
     for _ in 0..num_layers {
         builder.transformer_block(
             hf_config.num_attention_heads,
@@ -1257,12 +1279,20 @@ pub fn load_hf_model_full(
                 if let Ok(tensor) = tensors.tensor(tensor_name) {
                     let shape = tensor.shape();
                     if shape.len() == 2 {
-                        let bw = dtype_byte_width(tensor.dtype());
                         let data_f32 = tensor_to_f32(tensor.data(), tensor.dtype());
-                        let (matrix, _) = quantize_weight_matrix(
+                        // Transpose: safetensors stores (out_features, in_features)
+                        // but matmul expects (in_features, out_features) for input × W
+                        let (raw_matrix, _) = quantize_weight_matrix(
                             &data_f32, shape[0], shape[1], QuantStrategy::Symmetric8,
                         );
-                        weights.add_named_weight(*node_id, key_name, matrix);
+                        // Transpose (out_feat, in_feat) → (in_feat, out_feat)
+                        let mut transposed = M31Matrix::new(shape[1], shape[0]);
+                        for r in 0..shape[0] {
+                            for c in 0..shape[1] {
+                                transposed.set(c, r, raw_matrix.get(r, c));
+                            }
+                        }
+                        weights.add_named_weight(*node_id, key_name, transposed);
                     }
                 }
             }

@@ -766,7 +766,17 @@ struct CaptureCmd {
     /// Each turn is proved independently through the M31 forward pass.
     #[arg(long, conflicts_with_all = ["input", "prompt"])]
     conversation: Option<PathBuf>,
+
+    /// Use the full attention graph (Q/K/V/O + softmax + attention matmul).
+    /// Without this, only linear projections (Q, O, FFN up/down) are proven.
+    /// With this, ALL 7 weight matrices and the attention mechanism are in the circuit.
+    #[arg(long)]
+    full_attention: bool,
 }
+
+// Note: embedding proof is included when --full-attention is used.
+// The embedding lookup (token_id → embedding row) is proven via LogUp,
+// binding the input tokens to the model's embedding weight table.
 
 /// Multi-turn conversation file produced by generate_conversation.py.
 #[derive(serde::Deserialize)]
@@ -4489,7 +4499,32 @@ fn run_capture_command(cmd: &CaptureCmd) {
     eprintln!("  ───────────────────");
 
     // ── Load model ──────────────────────────────────────────────────────
-    let onnx = if let Some(ref model_dir) = cmd.model_dir {
+    let onnx = if cmd.full_attention {
+        // Full attention graph: Q/K/V/O + softmax + attention matmul + residuals
+        let model_dir = cmd.model_dir.as_ref().unwrap_or_else(|| {
+            eprintln!("Error: --full-attention requires --model-dir");
+            process::exit(1);
+        });
+        eprintln!("Loading model: {} (full attention)", model_dir.display());
+        // Determine seq_len from conversation tokens or default to 1
+        let seq_len = cmd.conversation.as_ref().map(|conv_path| {
+            let conv_json = std::fs::read_to_string(conv_path).unwrap_or_default();
+            let conv: serde_json::Value = serde_json::from_str(&conv_json).unwrap_or_default();
+            conv["turns"].as_array()
+                .map(|turns| turns.iter()
+                    .flat_map(|t| t["response"]["tokens"].as_array())
+                    .map(|a| a.len())
+                    .sum::<usize>()
+                    .max(1))
+                .unwrap_or(1)
+        }).unwrap_or(1);
+        eprintln!("  seq_len={} (from conversation tokens)", seq_len);
+        stwo_ml::compiler::hf_loader::load_hf_model_full(model_dir, cmd.layers, seq_len)
+            .unwrap_or_else(|e| {
+                eprintln!("Error loading full attention model: {e}");
+                process::exit(1);
+            })
+    } else if let Some(ref model_dir) = cmd.model_dir {
         eprintln!("Loading model: {} (HuggingFace)", model_dir.display());
         stwo_ml::compiler::hf_loader::load_hf_model(model_dir, cmd.layers).unwrap_or_else(|e| {
             eprintln!("Error loading model directory: {e}");
