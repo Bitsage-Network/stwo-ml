@@ -39,4 +39,7 @@
 //! ```
 
 pub mod device;
+pub mod dispatch;
 pub mod matmul;
+
+pub use dispatch::matmul_m31_auto;

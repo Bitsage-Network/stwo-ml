@@ -938,11 +938,13 @@ where
                     .get_weight(node.id)
                     .ok_or(ModelError::MissingWeight(node.id))?;
 
-                // GPU GEMM for all matrix sizes, CPU fallback
+                // GPU GEMM: CUDA → Metal → CPU fallback
                 #[cfg(feature = "cuda-runtime")]
                 let output = crate::gpu_sumcheck::gpu_matmul_m31_full(&current, weight)
                     .unwrap_or_else(|_| matmul_m31(&current, weight));
-                #[cfg(not(feature = "cuda-runtime"))]
+                #[cfg(all(feature = "metal", not(feature = "cuda-runtime")))]
+                let output = crate::metal::matmul_m31_auto(&current, weight);
+                #[cfg(not(any(feature = "cuda-runtime", feature = "metal")))]
                 let output = matmul_m31(&current, weight);
 
                 let proof = prove_matmul_sumcheck_auto(&current, weight, &output).map_err(|e| {
