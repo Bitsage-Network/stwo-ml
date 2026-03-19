@@ -28,6 +28,7 @@ proof-stream-rerun = ["proof-stream", "proof-stream/rerun"]
 proof-stream-ws = ["proof-stream", "proof-stream/ws-server"]
 server-stream   = ["server", "proof-stream-ws", "dep:ureq"]
 multi-query     = ["server"]
+parallel-audit  = []
 metal = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
 [dependencies]

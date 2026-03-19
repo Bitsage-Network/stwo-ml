@@ -122,7 +122,17 @@ impl<'a> AuditProver<'a> {
             #[cfg(not(feature = "multi-gpu"))]
             let gpu_count = 1;
 
-            let parallelism = entries.len().min(gpu_count);
+            // On CPU: use all available cores for parallel proving.
+            // On GPU: limited by device count.
+            let cpu_threads = std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(4);
+            let parallelism = if gpu_count > 1 {
+                entries.len().min(gpu_count)
+            } else {
+                entries.len().min(cpu_threads)
+            };
+            eprintln!("  [Parallel] Proving {} inferences across {} threads", entries.len(), parallelism);
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(parallelism)
                 .build()
@@ -149,7 +159,40 @@ impl<'a> AuditProver<'a> {
             }
         }
 
-        #[cfg(not(feature = "multi-query"))]
+        #[cfg(all(not(feature = "multi-query"), feature = "parallel-audit"))]
+        {
+            use rayon::prelude::*;
+
+            let cpu_threads = std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(4);
+            let parallelism = entries.len().min(cpu_threads);
+            eprintln!("  [Parallel] Proving {} inferences across {} CPU threads", entries.len(), parallelism);
+
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(parallelism)
+                .build()
+                .map_err(|e| AuditError::ProvingFailed(format!("rayon pool: {e}")))?;
+
+            let results: Vec<(usize, Result<InferenceProofResult, AuditError>)> =
+                pool.install(|| {
+                    entries
+                        .par_iter()
+                        .enumerate()
+                        .map(|(idx, entry)| {
+                            (idx, self.prove_inference(entry, log, &mode, request.verify_on_chain))
+                        })
+                        .collect()
+                });
+
+            let mut sorted = results;
+            sorted.sort_by_key(|(idx, _)| *idx);
+            for (_idx, result) in sorted {
+                inference_results.push(result?);
+            }
+        }
+
+        #[cfg(not(any(feature = "multi-query", feature = "parallel-audit")))]
         for entry in entries {
             let result = self.prove_inference(entry, log, &mode, request.verify_on_chain)?;
             inference_results.push(result);
