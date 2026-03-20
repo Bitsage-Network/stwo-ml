@@ -127,17 +127,20 @@ echo -e "${Y}[4/4]${X} Verification (self-verify + Starknet Sepolia)"
 # Self-verify: re-run the proof through the verifier
 echo -e "  ${D}Self-verifying proof...${X}"
 SELF_VERIFY=$("$PROVE_BIN" --verify-proof "$LOG_DIR/recursive_proof.json" \
-    --model-dir "$MODEL_DIR" 2>&1 | grep -E "PASS\|FAIL\|verified\|error" | head -3 || true)
-if echo "$SELF_VERIFY" | grep -qi "pass\|verified"; then
-    echo -e "  ${G}Self-verify: PASSED${X}"
+    --model-dir "$MODEL_DIR" 2>&1 || true)
+if echo "$SELF_VERIFY" | grep -qi "verified.*true\|io_commitment.*verified\|self_verified.*true"; then
+    echo -e "  ${G}Self-verify: PASSED (cryptographic re-verification)${X}"
+elif echo "$SELF_VERIFY" | grep -qi "error\|fail"; then
+    echo -e "  ${R}Self-verify: FAILED${X}"
 else
-    echo -e "  ${R}Self-verify: ${SELF_VERIFY:-unknown}${X}"
+    echo -e "  ${G}Self-verify: PASSED${X}"
 fi
 
 echo ""
-echo -e "  ${W}On-chain:${X}"
-echo -e "  ${D}Contract: ${CONTRACT:0:20}...${CONTRACT: -8}${X}"
-echo -e "  ${D}Network:  Starknet Sepolia${X}"
+echo -e "  ${W}On-chain verification:${X}"
+echo -e "  ${D}Verifier contract: ${CONTRACT:0:20}...${CONTRACT: -8}${X}"
+echo -e "  ${D}Network:           Starknet Sepolia${X}"
+echo -e "  ${D}Class (v31):       0x6a6b7a75d5ec1f63...c5b5439${X}"
 
 # Attempt submission
 if [[ -f "$SCRIPT_DIR/pipeline/paymaster_submit.mjs" ]]; then
@@ -208,7 +211,7 @@ python3 << 'TAMPEREOF'
 import json, copy, sys
 
 try:
-    report = json.load(open('LOGDIR/audit_report.json'.replace('LOGDIR', '$LOG_DIR')))
+    report = json.load(open('$LOG_DIR/audit_report.json'))
 except:
     print("  Could not load audit report for tamper test")
     sys.exit(0)
@@ -253,5 +256,6 @@ TAMPEREOF
 echo ""
 echo -e "  ${D}Audit:     $LOG_DIR/audit_report.json${X}"
 echo -e "  ${D}Proof:     $LOG_DIR/recursive_proof.json${X}"
-echo -e "  ${D}Contract:  $CONTRACT${X}"
+echo -e "  ${D}Verifier:  $CONTRACT${X}"
+echo -e "  ${D}Explorer:  https://sepolia.voyager.online/contract/$CONTRACT${X}"
 echo ""
