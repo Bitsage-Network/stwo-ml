@@ -389,7 +389,7 @@ pub fn render_crypto(frame: &mut Frame, area: Rect, state: &DashboardState) {
             Constraint::Length(1),   // Spacer
             Constraint::Length(1),   // On-chain header
             Constraint::Length(1),   // Spacer
-            Constraint::Length(4),   // On-chain details
+            Constraint::Length(8),   // On-chain details (expanded)
             Constraint::Length(1),   // Spacer
             Constraint::Length(1),   // Tamper header
             Constraint::Min(4),     // Tamper results
@@ -418,10 +418,17 @@ pub fn render_crypto(frame: &mut Frame, area: Rect, state: &DashboardState) {
         .unwrap_or_else(|| "pending".into());
     let verified_color = if state.verification_count.is_some() { EMERALD } else { SLATE };
 
+    // Show full contract address across two lines
+    let contract_mid = state.contract.len() / 2;
     let onchain = vec![
         Line::from(vec![
-            Span::styled(" contract ", Style::default().fg(GHOST)),
-            Span::styled(truncate_hash(&state.contract, 22), Style::default().fg(EMERALD)),
+            Span::styled(" verifier ", Style::default().fg(GHOST)),
+        ]),
+        Line::from(vec![
+            Span::styled(format!("  {}", &state.contract[..contract_mid.min(state.contract.len())]), Style::default().fg(EMERALD)),
+        ]),
+        Line::from(vec![
+            Span::styled(format!("  {}", &state.contract[contract_mid.min(state.contract.len())..]), Style::default().fg(EMERALD)),
         ]),
         Line::from(vec![
             Span::styled(" network  ", Style::default().fg(GHOST)),
@@ -430,6 +437,14 @@ pub fn render_crypto(frame: &mut Frame, area: Rect, state: &DashboardState) {
         Line::from(vec![
             Span::styled(" proofs   ", Style::default().fg(GHOST)),
             Span::styled(&verified_str, Style::default().fg(verified_color).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::styled(" gas est  ", Style::default().fg(GHOST)),
+            Span::styled("~0.21 STRK (2.1M steps)", Style::default().fg(SILVER)),
+        ]),
+        Line::from(vec![
+            Span::styled(" explorer ", Style::default().fg(GHOST)),
+            Span::styled("sepolia.voyager.online", Style::default().fg(VIOLET)),
         ]),
     ];
     frame.render_widget(Paragraph::new(onchain), layout[8]);
