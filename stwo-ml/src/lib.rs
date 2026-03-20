@@ -64,6 +64,7 @@ pub mod json_serde;
 pub mod kv_state;
 pub mod receipt;
 pub mod starknet;
+pub mod recursive;
 pub mod tee;
 pub mod weight_cache;
 
@@ -75,6 +76,12 @@ pub mod audit;
 
 #[cfg(feature = "cuda-runtime")]
 pub mod gpu_sumcheck;
+
+#[cfg(feature = "metal")]
+pub mod metal;
+
+#[cfg(feature = "tui")]
+pub mod tui;
 
 #[cfg(feature = "multi-gpu")]
 pub mod multi_gpu;

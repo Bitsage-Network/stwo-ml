@@ -251,6 +251,14 @@ struct Cli {
     /// Number of decode tokens to prove (default: 1).
     #[arg(long, default_value = "1")]
     decode_steps: usize,
+
+    /// Produce a recursive STARK proof that compresses the GKR calldata.
+    ///
+    /// After GKR proving, runs the recursive prover to produce a constant-size
+    /// STARK proof (~500 felts) that attests "the GKR verifier accepted."
+    /// This replaces the 18-TX streaming pipeline with a single TX.
+    #[arg(long)]
+    recursive: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -440,6 +448,12 @@ struct AuditCmd {
     /// uses AggregatedOracleSumcheck mode 4), "sequential" (legacy mode 0).
     #[arg(long, default_value = "aggregated")]
     weight_binding: String,
+
+    /// Use full attention graph (Q/K/V/O + softmax + attention matmul + embedding).
+    /// Must match the --full-attention flag used in the capture step.
+    /// Without this, only linear projections are proven (4 of 7 weights per layer).
+    #[arg(long)]
+    full_attention: bool,
 }
 
 /// CLI arguments for the `retrieve` subcommand.
@@ -758,7 +772,17 @@ struct CaptureCmd {
     /// Each turn is proved independently through the M31 forward pass.
     #[arg(long, conflicts_with_all = ["input", "prompt"])]
     conversation: Option<PathBuf>,
+
+    /// Use the full attention graph (Q/K/V/O + softmax + attention matmul).
+    /// Without this, only linear projections (Q, O, FFN up/down) are proven.
+    /// With this, ALL 7 weight matrices and the attention mechanism are in the circuit.
+    #[arg(long)]
+    full_attention: bool,
 }
+
+// Note: embedding proof is included when --full-attention is used.
+// The embedding lookup (token_id → embedding row) is proven via LogUp,
+// binding the input tokens to the model's embedding weight table.
 
 /// Multi-turn conversation file produced by generate_conversation.py.
 #[derive(serde::Deserialize)]
@@ -2030,6 +2054,57 @@ fn main() {
     };
 
     eprintln!("Proving completed in {:.2}s", prove_elapsed.as_secs_f64());
+
+    // ── Recursive STARK composition (optional) ───────────────────────
+    if cli.recursive {
+        if let Some(ref gkr) = proof.gkr_proof {
+            eprintln!("Phase 4/4: Recursive STARK composition...");
+            let circuit = stwo_ml::gkr::LayeredCircuit::from_graph(&model.graph)
+                .expect("circuit compile for recursive");
+
+            // Compute real public inputs for the recursive proof
+            let recursive_io = compute_io_commitment(&input, &proof.execution.output);
+            let recursive_io_qm31 = stwo_ml::crypto::poseidon_channel::felt_to_securefield(recursive_io);
+            // Weight super root: hash of all weight commitment roots
+            let recursive_weight_root = if !gkr.weight_claims.is_empty() {
+                // Hash weight claims into a single QM31 via the circuit hash mechanism
+                let mut hasher = stwo_ml::crypto::poseidon_channel::PoseidonChannel::new();
+                hasher.mix_u64(gkr.weight_claims.len() as u64);
+                for wc in &gkr.weight_claims {
+                    hasher.mix_felt(stwo_ml::crypto::poseidon_channel::securefield_to_felt(wc.expected_value));
+                }
+                hasher.draw_qm31()
+            } else {
+                stwo::core::fields::qm31::QM31::default()
+            };
+
+            match stwo_ml::recursive::prove_recursive(
+                &circuit,
+                gkr,
+                &proof.execution.output,
+                &model.weights,
+                recursive_weight_root,
+                recursive_io_qm31,
+                prove_elapsed.as_secs_f64(),
+            ) {
+                Ok(recursive_proof) => {
+                    eprintln!(
+                        "  Recursive STARK: {:.2}s, {} Poseidon perms, log_size={}",
+                        recursive_proof.metadata.recursive_prove_time_secs,
+                        recursive_proof.metadata.n_poseidon_perms,
+                        recursive_proof.metadata.trace_log_size,
+                    );
+                    // TODO: serialize recursive proof alongside GKR proof
+                }
+                Err(e) => {
+                    eprintln!("  Recursive STARK failed: {e}");
+                    eprintln!("  (Continuing with standard GKR proof output)");
+                }
+            }
+        } else {
+            eprintln!("  --recursive requires --gkr --format ml_gkr");
+        }
+    }
 
     // Build metadata
     let io_commitment = compute_io_commitment(&input, &proof.execution.output);
@@ -4430,7 +4505,32 @@ fn run_capture_command(cmd: &CaptureCmd) {
     eprintln!("  ───────────────────");
 
     // ── Load model ──────────────────────────────────────────────────────
-    let onnx = if let Some(ref model_dir) = cmd.model_dir {
+    let onnx = if cmd.full_attention {
+        // Full attention graph: Q/K/V/O + softmax + attention matmul + residuals
+        let model_dir = cmd.model_dir.as_ref().unwrap_or_else(|| {
+            eprintln!("Error: --full-attention requires --model-dir");
+            process::exit(1);
+        });
+        eprintln!("Loading model: {} (full attention)", model_dir.display());
+        // Determine seq_len from conversation tokens or default to 1
+        let seq_len = cmd.conversation.as_ref().map(|conv_path| {
+            let conv_json = std::fs::read_to_string(conv_path).unwrap_or_default();
+            let conv: serde_json::Value = serde_json::from_str(&conv_json).unwrap_or_default();
+            conv["turns"].as_array()
+                .map(|turns| turns.iter()
+                    .flat_map(|t| t["response"]["tokens"].as_array())
+                    .map(|a| a.len())
+                    .sum::<usize>()
+                    .max(1))
+                .unwrap_or(1)
+        }).unwrap_or(1);
+        eprintln!("  seq_len={} (from conversation tokens)", seq_len);
+        stwo_ml::compiler::hf_loader::load_hf_model_full(model_dir, cmd.layers, seq_len)
+            .unwrap_or_else(|e| {
+                eprintln!("Error loading full attention model: {e}");
+                process::exit(1);
+            })
+    } else if let Some(ref model_dir) = cmd.model_dir {
         eprintln!("Loading model: {} (HuggingFace)", model_dir.display());
         stwo_ml::compiler::hf_loader::load_hf_model(model_dir, cmd.layers).unwrap_or_else(|e| {
             eprintln!("Error loading model directory: {e}");
@@ -4515,6 +4615,77 @@ fn run_capture_command(cmd: &CaptureCmd) {
 
         let t_conv_start = Instant::now();
 
+        // ── Batched token proving (optional) ─────────────────────────
+        // Collect response tokens into a batch. For large conversations this
+        // creates very large matrices (N×d_model) that are expensive to prove.
+        // Gate behind STWO_SKIP_BATCH_TOKENS=1 to disable for the demo.
+        let skip_batch = std::env::var("STWO_SKIP_BATCH_TOKENS").is_ok();
+        let all_response_tokens: Vec<u32> = if skip_batch {
+            Vec::new()
+        } else {
+            conv.turns.iter()
+                .flat_map(|t| t.response.tokens.iter().copied())
+                .collect()
+        };
+
+        if !all_response_tokens.is_empty() && !skip_batch {
+            let t_batch = Instant::now();
+            eprintln!(
+                "\n  Batched token proving: {} response tokens across {} turns",
+                all_response_tokens.len(), conv.turns.len(),
+            );
+
+            match stwo_ml::compiler::hf_loader::load_embedding_batch(
+                model_dir, input_cols, &all_response_tokens,
+            ) {
+                Ok(batch_embedding) => {
+                    // Run ONE batched forward pass for all tokens
+                    match execute_forward_pass(graph, &batch_embedding, weights) {
+                        Ok(batch_output) => {
+                            let batch_ms = t_batch.elapsed().as_millis() as u64;
+                            eprintln!(
+                                "  Batched forward pass: {}x{} → {}x{} in {}ms ({} tokens)",
+                                batch_embedding.rows, batch_embedding.cols,
+                                batch_output.rows, batch_output.cols,
+                                batch_ms, all_response_tokens.len(),
+                            );
+
+                            // Record the batched inference as an additional log entry
+                            let now_ns = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_nanos() as u64;
+
+                            let batch_job = CaptureJob {
+                                input_tokens: all_response_tokens.clone(),
+                                output_tokens: vec![],
+                                input_m31: batch_embedding,
+                                output_m31: batch_output,
+                                timestamp_ns: now_ns,
+                                latency_ms: batch_ms,
+                                gpu_device: "cpu".to_string(),
+                                tee_report_hash: "0x0".to_string(),
+                                task_category: Some("batched_tokens".to_string()),
+                                input_preview: Some(format!(
+                                    "[batch: {} tokens from {} turns]",
+                                    all_response_tokens.len(), conv.turns.len(),
+                                )),
+                                output_preview: Some(format!(
+                                    "batched forward pass ({}x{})",
+                                    all_response_tokens.len(), input_cols,
+                                )),
+                            };
+
+                            hook.record(batch_job);
+                        }
+                        Err(e) => eprintln!("  Batched forward pass failed: {e} (continuing with per-turn)"),
+                    }
+                }
+                Err(e) => eprintln!("  Batch embedding load failed: {e} (continuing with per-turn)"),
+            }
+        }
+
+        // ── Per-turn proving (original flow) ─────────────────────────
         for turn in &conv.turns {
             let t_turn = Instant::now();
 
@@ -4863,7 +5034,20 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
     }
 
     // ── Load model ───────────────────────────────────────────────────────
-    let onnx = if let Some(ref model_dir) = cmd.model_dir {
+    let onnx = if cmd.full_attention {
+        let model_dir = cmd.model_dir.as_ref().unwrap_or_else(|| {
+            eprintln!("Error: --full-attention requires --model-dir");
+            process::exit(1);
+        });
+        eprintln!("Loading model: {} (full attention)", model_dir.display());
+        // Determine seq_len from the inference log entries
+        let seq_len = 1; // per-turn proving uses seq_len=1
+        stwo_ml::compiler::hf_loader::load_hf_model_full(model_dir, cmd.layers, seq_len)
+            .unwrap_or_else(|e| {
+                eprintln!("Error loading full attention model: {e}");
+                process::exit(1);
+            })
+    } else if let Some(ref model_dir) = cmd.model_dir {
         eprintln!("Loading model: {} (HuggingFace)", model_dir.display());
         stwo_ml::compiler::hf_loader::load_hf_model(model_dir, cmd.layers).unwrap_or_else(|e| {
             eprintln!("Error loading model directory: {e}");

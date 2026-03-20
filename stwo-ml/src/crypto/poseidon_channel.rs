@@ -268,6 +268,11 @@ impl PoseidonChannel {
     pub fn digest(&self) -> FieldElement {
         self.digest
     }
+
+    /// Get the current draw counter.
+    pub fn n_draws(&self) -> u32 {
+        self.n_draws
+    }
 }
 
 impl Default for PoseidonChannel {

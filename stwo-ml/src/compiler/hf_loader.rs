@@ -19,6 +19,7 @@ use crate::compiler::quantize_weights::quantize_weight_matrix;
 use crate::compiler::safetensors::{discover_shards, list_tensors_sharded, tensor_to_f32};
 use crate::components::activation::ActivationType;
 use crate::components::matmul::M31Matrix;
+use stwo::core::fields::m31::M31;
 use crate::gadgets::quantize::QuantStrategy;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1034,15 +1035,51 @@ fn build_hf_decode_graph(
     hf_config: &HfConfig,
     num_layers: usize,
 ) -> ComputationGraph {
+    build_hf_full_graph(config, hf_config, num_layers, 1)
+}
+
+/// Build a full transformer graph with attention and configurable batch/seq_len.
+///
+/// This is the most complete graph: includes embedding lookup, Q/K/V/O projections,
+/// attention mechanism (softmax + score matmul), residual connections, and FFN.
+/// Used for both decode (seq_len=1) and batched (seq_len=N) proving.
+///
+/// When `include_embedding` is true, adds an Embedding node at the start
+/// that proves the token→embedding lookup via LogUp.
+pub fn build_hf_full_graph(
+    config: &TransformerConfig,
+    hf_config: &HfConfig,
+    num_layers: usize,
+    seq_len: usize,
+) -> ComputationGraph {
+    build_hf_full_graph_with_options(config, hf_config, num_layers, seq_len, false)
+}
+
+/// Build the full graph with optional embedding node.
+pub fn build_hf_full_graph_with_options(
+    config: &TransformerConfig,
+    hf_config: &HfConfig,
+    num_layers: usize,
+    seq_len: usize,
+    include_embedding: bool,
+) -> ComputationGraph {
     use crate::compiler::onnx::NormType;
     let d = config.d_model;
 
-    let mut builder = GraphBuilder::new((1, d));
+    let mut builder = if include_embedding {
+        // Start with token IDs as input, then embedding lookup
+        let mut b = GraphBuilder::new((seq_len, 1)); // token IDs: seq_len × 1
+        b.embedding(hf_config.vocab_size, d);
+        b
+    } else {
+        GraphBuilder::new((seq_len, d))
+    };
+
     for _ in 0..num_layers {
         builder.transformer_block(
             hf_config.num_attention_heads,
             hf_config.num_key_value_heads,
-            1, // seq_len=1 for decode
+            seq_len,
             config.d_ff,
         );
     }
@@ -1155,6 +1192,177 @@ fn build_decode_weight_name_map(
     }
 
     (matmul_map, attention_map)
+}
+
+/// Load a model with the FULL attention graph for batched proving.
+///
+/// Builds the complete transformer graph with Q/K/V/O projections, attention
+/// mechanism, residual connections, and FFN — proving the entire transformer
+/// including attention. Uses `seq_len` for the attention dimension.
+///
+/// This is the cryptographically complete loading mode: all 7 weight matrices
+/// per layer are mapped, and the attention mechanism is in the circuit.
+pub fn load_hf_model_full(
+    model_dir: &Path,
+    num_layers: Option<usize>,
+    seq_len: usize,
+) -> Result<OnnxModel, OnnxError> {
+    let config_path = model_dir.join("config.json");
+    let hf_config = HfConfig::from_file(&config_path)?;
+    let transformer_config = hf_config.to_transformer_config();
+    let layers = num_layers.unwrap_or(hf_config.num_hidden_layers);
+    let layers = if layers == 0 { hf_config.num_hidden_layers } else { layers };
+
+    eprintln!("Model (full attention, seq_len={}): {} ({})",
+        seq_len, hf_config.model_type, model_dir.display());
+    eprintln!(
+        "  hidden_size={}, heads={}/{} (q/kv), ff={}, layers={}/{}",
+        hf_config.hidden_size, hf_config.num_attention_heads,
+        hf_config.num_key_value_heads, hf_config.intermediate_size,
+        layers, hf_config.num_hidden_layers,
+    );
+
+    // Include embedding node for LogUp proof of token→embedding lookup.
+    // The 151K×896 embedding table is large (136M elements) but the Merkle
+    // root is computed once and cached. Subsequent runs are instant.
+    let graph = build_hf_full_graph_with_options(
+        &transformer_config, &hf_config, layers, seq_len, true,
+    );
+
+    // Use the decode weight mapping (which handles Q/K/V/O + FFN)
+    let shard_paths = discover_shards(model_dir, "model")
+        .map_err(|e| OnnxError::WeightError(format!("Cannot discover shards: {e}")))?;
+
+    let all_tensor_names: Vec<(String, usize)> = list_tensors_sharded(&shard_paths)
+        .map_err(|e| OnnxError::WeightError(format!("Cannot list tensors: {e}")))?;
+
+    let (matmul_map, attention_map) =
+        build_decode_weight_name_map(&graph, layers, &all_tensor_names);
+    eprintln!(
+        "  Weight mapping: {} MatMul + {} Attention entries (all {} weight matrices)",
+        matmul_map.len(), attention_map.len(),
+        matmul_map.len() + attention_map.len(),
+    );
+
+    // Load FFN weights
+    let mut weights =
+        load_weights_from_shards(&shard_paths, &graph, &matmul_map, QuantStrategy::Symmetric8)
+            .map_err(|e| OnnxError::WeightError(format!("Cannot load weights: {e}")))?;
+
+    // Load Attention named weights (Q/K/V/O)
+    let mut tensor_to_shard: HashMap<String, usize> = HashMap::new();
+    for (_, _, name) in &attention_map {
+        for (si, sp) in shard_paths.iter().enumerate() {
+            let file = std::fs::File::open(sp).map_err(|e| OnnxError::IoError(e.to_string()))?;
+            let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| OnnxError::IoError(e.to_string()))?;
+            let tensors = safetensors::SafeTensors::deserialize(&mmap)
+                .map_err(|e| OnnxError::WeightError(e.to_string()))?;
+            if tensors.tensor(name).is_ok() {
+                tensor_to_shard.insert(name.clone(), si);
+                break;
+            }
+        }
+    }
+
+    // Memory-map all needed shards once
+    let mut shard_mmaps: HashMap<usize, (std::fs::File, memmap2::Mmap)> = HashMap::new();
+    for &si in tensor_to_shard.values() {
+        if !shard_mmaps.contains_key(&si) {
+            let file = std::fs::File::open(&shard_paths[si])
+                .map_err(|e| OnnxError::IoError(e.to_string()))?;
+            let mmap = unsafe { memmap2::Mmap::map(&file) }
+                .map_err(|e| OnnxError::IoError(e.to_string()))?;
+            shard_mmaps.insert(si, (file, mmap));
+        }
+    }
+
+    for (node_id, key_name, tensor_name) in &attention_map {
+        if let Some(si) = tensor_to_shard.get(tensor_name) {
+            if let Some((_file, mmap)) = shard_mmaps.get(si) {
+                let tensors = safetensors::SafeTensors::deserialize(mmap)
+                    .map_err(|e| OnnxError::WeightError(e.to_string()))?;
+                if let Ok(tensor) = tensors.tensor(tensor_name) {
+                    let shape = tensor.shape();
+                    if shape.len() == 2 {
+                        let data_f32 = tensor_to_f32(tensor.data(), tensor.dtype());
+                        // Transpose: safetensors stores (out_features, in_features)
+                        // but matmul expects (in_features, out_features) for input × W
+                        let (raw_matrix, _) = quantize_weight_matrix(
+                            &data_f32, shape[0], shape[1], QuantStrategy::Symmetric8,
+                        );
+                        // Transpose (out_feat, in_feat) → (in_feat, out_feat)
+                        let mut transposed = M31Matrix::new(shape[1], shape[0]);
+                        for r in 0..shape[0] {
+                            for c in 0..shape[1] {
+                                transposed.set(c, r, raw_matrix.get(r, c));
+                            }
+                        }
+                        weights.add_named_weight(*node_id, key_name, transposed);
+                    }
+                }
+            }
+        }
+    }
+
+    // Load embedding table for the Embedding node (if present in graph).
+    // The table is 136M elements — first load is slow but the weight commitment
+    // cache handles subsequent runs instantly.
+    let embed_node_id = graph.nodes.iter()
+        .find(|n| matches!(&n.op, GraphOp::Embedding { .. }))
+        .map(|n| n.id);
+
+    if let Some(embed_id) = embed_node_id {
+        eprintln!("  Loading embedding table for LogUp proof...");
+        // Load the full embedding table (vocab_size × hidden_size)
+        for sp in &shard_paths {
+            let file = std::fs::File::open(sp)
+                .map_err(|e| OnnxError::IoError(e.to_string()))?;
+            let mmap = unsafe { memmap2::Mmap::map(&file) }
+                .map_err(|e| OnnxError::IoError(e.to_string()))?;
+            let tensors = safetensors::SafeTensors::deserialize(&mmap)
+                .map_err(|e| OnnxError::WeightError(e.to_string()))?;
+
+            for &name in EMBED_CANDIDATES {
+                if let Ok(tensor) = tensors.tensor(name) {
+                    let shape = tensor.shape();
+                    if shape.len() == 2 {
+                        let data_f32 = tensor_to_f32(tensor.data(), tensor.dtype());
+                        let (matrix, _) = quantize_weight_matrix(
+                            &data_f32, shape[0], shape[1], QuantStrategy::Symmetric8,
+                        );
+                        weights.add_weight(embed_id, matrix);
+                        eprintln!(
+                            "  Embedding table loaded: {} ({}x{}) for node {}",
+                            name, shape[0], shape[1], embed_id,
+                        );
+                        break;
+                    }
+                }
+            }
+            if weights.get_weight(embed_id).is_some() {
+                break;
+            }
+        }
+    }
+
+    eprintln!("  All weights loaded (FFN + Attention + Embedding) ✓");
+
+    let num_params: usize = weights.weights.iter().map(|(_, w)| w.rows * w.cols).sum::<usize>()
+        + weights.named_weights.iter().map(|(_, _, w)| w.rows * w.cols).sum::<usize>();
+    let metadata = crate::compiler::onnx::ModelMetadata {
+        name: format!("{}_{}L_full", hf_config.model_type, layers),
+        num_parameters: num_params,
+        input_shape: (seq_len, hf_config.hidden_size),
+        output_shape: (seq_len, hf_config.hidden_size),
+        num_layers: graph.nodes.len(),
+    };
+
+    Ok(OnnxModel {
+        graph,
+        weights,
+        input_shape: (seq_len, hf_config.hidden_size),
+        metadata,
+    })
 }
 
 /// Load a model from a HuggingFace directory in decode-compatible format.
@@ -1425,6 +1633,97 @@ pub fn load_embedding_row(
         "Embedding tensor not found. Searched for: {}",
         EMBED_CANDIDATES.join(", "),
     )))
+}
+
+/// Load embeddings for a batch of token IDs and stack into (N × hidden_size) matrix.
+///
+/// This is the key function for batched proving: instead of proving N separate
+/// forward passes for N tokens, we stack all embeddings into a single matrix
+/// and prove ONE batched forward pass. GKR cost scales as log(N), not N.
+pub fn load_embedding_batch(
+    model_dir: &Path,
+    hidden_size: usize,
+    token_ids: &[u32],
+) -> Result<M31Matrix, OnnxError> {
+    let n = token_ids.len();
+    if n == 0 {
+        return Err(OnnxError::WeightError("Empty token list".to_string()));
+    }
+
+    let shard_paths = discover_shards(model_dir, "model")
+        .map_err(|e| OnnxError::WeightError(format!("Cannot discover shards: {e}")))?;
+
+    for path in &shard_paths {
+        let file = std::fs::File::open(path)
+            .map_err(|e| OnnxError::IoError(format!("Cannot open {}: {e}", path.display())))?;
+        let mmap = unsafe { memmap2::Mmap::map(&file) }
+            .map_err(|e| OnnxError::IoError(format!("Cannot mmap {}: {e}", path.display())))?;
+        let tensors = safetensors::SafeTensors::deserialize(&mmap)
+            .map_err(|e| OnnxError::WeightError(format!("Cannot parse {}: {e}", path.display())))?;
+
+        for &name in EMBED_CANDIDATES {
+            if let Ok(tensor) = tensors.tensor(name) {
+                let shape = tensor.shape();
+                if shape.len() != 2 {
+                    continue;
+                }
+                let vocab_size = shape[0];
+                let embed_dim = shape[1];
+                if embed_dim != hidden_size {
+                    return Err(OnnxError::WeightError(format!(
+                        "Embedding dim mismatch: tensor has {}, config has {}",
+                        embed_dim, hidden_size,
+                    )));
+                }
+
+                let bw = dtype_byte_width(tensor.dtype());
+                let row_bytes = embed_dim * bw;
+                let raw = tensor.data();
+
+                // Build stacked (N × hidden_size) matrix
+                let mut batch = M31Matrix::new(n, hidden_size);
+
+                for (row_idx, &tid) in token_ids.iter().enumerate() {
+                    let tid = tid as usize;
+                    if tid >= vocab_size {
+                        return Err(OnnxError::WeightError(format!(
+                            "token_id {} exceeds vocab_size {}",
+                            tid, vocab_size,
+                        )));
+                    }
+
+                    let offset = tid * row_bytes;
+                    let row_slice = &raw[offset..offset + row_bytes];
+                    let row_f32 = tensor_to_f32(row_slice, tensor.dtype());
+
+                    // Quantize each element to M31
+                    for (col, &val) in row_f32.iter().enumerate() {
+                        let quantized = quantize_single_m31(val);
+                        batch.set(row_idx, col, quantized);
+                    }
+                }
+
+                eprintln!(
+                    "  Embedding batch: {} tokens from '{}' ({}x{} → {}x{})",
+                    n, name, vocab_size, embed_dim, n, hidden_size,
+                );
+                return Ok(batch);
+            }
+        }
+    }
+
+    Err(OnnxError::WeightError(format!(
+        "Embedding tensor not found. Searched for: {}",
+        EMBED_CANDIDATES.join(", "),
+    )))
+}
+
+/// Quantize a single f32 value to M31.
+fn quantize_single_m31(val: f32) -> M31 {
+    const P: u32 = (1u32 << 31) - 1; // M31 prime
+    let scale = 127.0; // symmetric 8-bit scale
+    let quantized = (val * scale).round().clamp(0.0, (P - 1) as f32);
+    M31::from(quantized as u32)
 }
 
 #[cfg(test)]

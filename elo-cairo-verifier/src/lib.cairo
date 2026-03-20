@@ -18,4 +18,5 @@ pub mod vm31_pool;
 // pub mod mock_proof_verifier;
 // pub mod mock_erc20;
 pub mod aggregated_binding;
+pub mod recursive_verifier;
 pub mod verifier;

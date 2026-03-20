@@ -28,6 +28,9 @@ proof-stream-rerun = ["proof-stream", "proof-stream/rerun"]
 proof-stream-ws = ["proof-stream", "proof-stream/ws-server"]
 server-stream   = ["server", "proof-stream-ws", "dep:ureq"]
 multi-query     = ["server"]
+parallel-audit  = []
+tui = ["dep:ratatui", "dep:crossterm", "serde", "dep:serde_json", "dep:ureq"]
+metal = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
 [dependencies]
 stwo = { path = "../stwo/crates/stwo", features = ["prover"] }
@@ -58,6 +61,11 @@ getrandom = { version = "0.2", optional = true }
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 tokenizers = { version = "0.20", optional = true, default-features = false, features = ["onig"] }
 proof-stream = { path = "../proof-stream", optional = true }
+wgpu = { version = "24", optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1.14", features = ["derive"], optional = true }
+ratatui = { version = "0.29", optional = true }
+crossterm = { version = "0.28", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -82,6 +90,16 @@ required-features = ["cli"]
 name = "prove-server"
 path = "src/bin/prove_server.rs"
 required-features = ["server"]
+
+[[bin]]
+name = "obelysk-demo"
+path = "src/bin/obelysk_demo.rs"
+required-features = ["tui"]
+
+[[bin]]
+name = "obelysk"
+path = "src/bin/obelysk.rs"
+required-features = ["tui"]
 
 [[example]]
 name = "rerun_demo"
