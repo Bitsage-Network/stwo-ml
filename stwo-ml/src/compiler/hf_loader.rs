@@ -1222,12 +1222,11 @@ pub fn load_hf_model_full(
         layers, hf_config.num_hidden_layers,
     );
 
-    // Build with attention but WITHOUT embedding by default.
-    // The 151K×896 embedding table (136M elements) is a massive memory/CPU
-    // bottleneck for weight commitment computation. Enable with OBELYSK_PROVE_EMBEDDING=1.
-    let include_embedding = std::env::var("OBELYSK_PROVE_EMBEDDING").is_ok();
+    // Include embedding node for LogUp proof of token→embedding lookup.
+    // The 151K×896 embedding table is large (136M elements) but the Merkle
+    // root is computed once and cached. Subsequent runs are instant.
     let graph = build_hf_full_graph_with_options(
-        &transformer_config, &hf_config, layers, seq_len, include_embedding,
+        &transformer_config, &hf_config, layers, seq_len, true,
     );
 
     // Use the decode weight mapping (which handles Q/K/V/O + FFN)
@@ -1306,18 +1305,14 @@ pub fn load_hf_model_full(
     }
 
     // Load embedding table for the Embedding node (if present in graph).
-    // Only loads when OBELYSK_PROVE_EMBEDDING=1 — the table is 136M elements
-    // and computing its Poseidon Merkle root takes ~60s on CPU.
-    let embed_node_id = if include_embedding {
-        graph.nodes.iter()
-            .find(|n| matches!(&n.op, GraphOp::Embedding { .. }))
-            .map(|n| n.id)
-    } else {
-        None
-    };
+    // The table is 136M elements — first load is slow but the weight commitment
+    // cache handles subsequent runs instantly.
+    let embed_node_id = graph.nodes.iter()
+        .find(|n| matches!(&n.op, GraphOp::Embedding { .. }))
+        .map(|n| n.id);
 
     if let Some(embed_id) = embed_node_id {
-        eprintln!("  Loading embedding table for LogUp proof (136M elements)...");
+        eprintln!("  Loading embedding table for LogUp proof...");
         // Load the full embedding table (vocab_size × hidden_size)
         for sp in &shard_paths {
             let file = std::fs::File::open(sp)
