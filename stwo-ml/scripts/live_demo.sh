@@ -136,23 +136,32 @@ else
     echo -e "  ${G}Self-verify: PASSED${X}"
 fi
 
+CLASS_HASH="0x6a6b7a75d5ec1f63d715617d352bc0d353042b2a033d98fa28ffbaf6c5b5439"
+REPORT_HASH=$(python3 -c "import json; print(json.load(open('$LOG_DIR/audit_report.json'))['commitments']['audit_report_hash'])" 2>/dev/null || echo "unknown")
+WEIGHT_HASH=$(python3 -c "import json; print(json.load(open('$LOG_DIR/audit_report.json'))['commitments']['weight_commitment'])" 2>/dev/null || echo "unknown")
+IO_ROOT=$(python3 -c "import json; print(json.load(open('$LOG_DIR/audit_report.json'))['commitments']['io_merkle_root'])" 2>/dev/null || echo "unknown")
+
 echo ""
 echo -e "  ${W}On-chain verification:${X}"
-echo -e "  ${D}Verifier contract: ${CONTRACT:0:20}...${CONTRACT: -8}${X}"
-echo -e "  ${D}Network:           Starknet Sepolia${X}"
-echo -e "  ${D}Class (v31):       0x6a6b7a75d5ec1f63...c5b5439${X}"
+echo -e "  ${G}Verifier contract:${X} ${CONTRACT}"
+echo -e "  ${G}Class hash (v31):${X}  ${CLASS_HASH}"
+echo -e "  ${G}Network:${X}           Starknet Sepolia"
+echo -e "  ${G}Explorer:${X}          https://sepolia.voyager.online/contract/${CONTRACT}"
+echo ""
+echo -e "  ${W}Proof commitments:${X}"
+echo -e "  ${G}Report hash:${X}       ${REPORT_HASH}"
+echo -e "  ${G}Weight commit:${X}     ${WEIGHT_HASH}"
+echo -e "  ${G}IO root:${X}           ${IO_ROOT}"
 
 # Attempt submission
 if [[ -f "$SCRIPT_DIR/pipeline/paymaster_submit.mjs" ]]; then
+    echo ""
+    echo -e "  ${D}Submitting via AVNU paymaster...${X}"
     STARKNET_RPC="$RPC_URL" node "$SCRIPT_DIR/pipeline/paymaster_submit.mjs" verify \
         "$LOG_DIR/recursive_proof.json" \
         --network sepolia --contract "$CONTRACT" \
         2>&1 | grep -E "TX|tx|hash|verified|success|submitted" | head -3 || true
 fi
-
-# If paymaster didn't produce output, show proof-ready status
-REPORT_HASH=$(python3 -c "import json; print(json.load(open('$LOG_DIR/audit_report.json'))['commitments']['audit_report_hash'])" 2>/dev/null || echo "see report")
-echo -e "  ${W}Proof hash: ${REPORT_HASH:0:20}...${REPORT_HASH: -8}${X}"
 
 # ── Summary ──────────────────────────────────────────────────────────
 
@@ -178,9 +187,9 @@ p = r['proof']
 print(f"  Model:          {m['name']} ({int(m['parameters']):,} params, {m['layers']} layers)")
 print(f"  Inferences:     {s['total_inferences']} ({s['total_input_tokens']} in, {s['total_output_tokens']} out)")
 print(f"  Prove time:     {p['proving_time_seconds']}s")
-print(f"  Weight commit:  {c['weight_commitment'][:20]}...{c['weight_commitment'][-8:]}")
-print(f"  IO root:        {c['io_merkle_root'][:20]}...{c['io_merkle_root'][-8:]}")
-print(f"  Report hash:    {c['audit_report_hash'][:20]}...{c['audit_report_hash'][-8:]}")
+print(f"  Weight commit:  {c['weight_commitment']}")
+print(f"  IO root:        {c['io_merkle_root']}")
+print(f"  Report hash:    {c['audit_report_hash']}")
 print()
 
 for inf in r.get('inferences', []):
@@ -254,8 +263,8 @@ print("    56 adversarial tests    → \033[0;32mALL PASS\033[0m (in test suite)
 TAMPEREOF
 
 echo ""
-echo -e "  ${D}Audit:     $LOG_DIR/audit_report.json${X}"
-echo -e "  ${D}Proof:     $LOG_DIR/recursive_proof.json${X}"
-echo -e "  ${D}Verifier:  $CONTRACT${X}"
-echo -e "  ${D}Explorer:  https://sepolia.voyager.online/contract/$CONTRACT${X}"
+echo -e "  ${D}Audit report:     $LOG_DIR/audit_report.json${X}"
+echo -e "  ${D}Recursive proof:  $LOG_DIR/recursive_proof.json${X}"
+echo -e "  ${D}Verifier contract: $CONTRACT${X}"
+echo -e "  ${D}Voyager explorer:  https://sepolia.voyager.online/contract/$CONTRACT${X}"
 echo ""
