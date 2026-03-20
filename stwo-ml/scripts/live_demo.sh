@@ -207,7 +207,7 @@ echo ""
 # ── Adversarial test: tamper detection ────────────────────────────
 echo -e "  ${Y}Tamper test:${X}"
 
-python3 << 'TAMPEREOF'
+python3 << TAMPEREOF
 import json, copy, sys
 
 try:
