@@ -402,7 +402,6 @@ fn run_prove_pipeline(
         .args(["capture", "--model-dir", model_dir,
                "--log-dir", &format!("{tmp_dir}/logs"),
                "--conversation", &conv_file,
-               "--model-name", "qwen2-0.5b",
                "--model-name", "qwen2-0.5b"])
         .env("STWO_SKIP_BATCH_TOKENS", "1")
         .stderr(Stdio::piped())
@@ -547,7 +546,10 @@ fn run_prove_pipeline(
         s.pipeline_status[3].done = true;
         s.mode = Mode::Complete;
         s.logs.push("Verification complete ✓".into());
-        s.messages.push(("system".into(), "All proofs verified ✓".into()));
+        s.messages.push(("system".into(), "━━━━━━━━━━━━━━━━━━━━━━━━━━━━".into()));
+        s.messages.push(("system".into(), "  VERIFIED ✓".into()));
+        s.messages.push(("system".into(), "  Every computation proven.".into()));
+        s.messages.push(("system".into(), "━━━━━━━━━━━━━━━━━━━━━━━━━━━━".into()));
     }
 }
 
@@ -663,23 +665,23 @@ fn render_header_section(frame: &mut ratatui::Frame, area: ratatui::layout::Rect
     // Simple header with logo + status
     let is_complete = state.mode == Mode::Complete;
     let status = if is_complete { "VERIFIED" } else if state.mode == Mode::Proving { "PROVING" } else { "READY" };
-    let status_color = if is_complete { Color::Rgb(52, 211, 153) } else { Color::Rgb(163, 230, 53) };
+    let status_color = if is_complete { Color::Indexed(48) } else { Color::Indexed(118) };
 
     let lines = vec![
-        Line::from(Span::styled("  ╔═╗╔╗  ╔═╗╦  ╦ ╦╔═╗╦╔═", Style::default().fg(Color::Rgb(163, 230, 53)))),
+        Line::from(Span::styled("  ╔═╗╔╗  ╔═╗╦  ╦ ╦╔═╗╦╔═", Style::default().fg(Color::Indexed(118)))),
         Line::from(vec![
-            Span::styled("  ║ ║╠╩╗ ╠═ ║  ╚╦╝╔═╝╠╩╗", Style::default().fg(Color::Rgb(163, 230, 53))),
+            Span::styled("  ║ ║╠╩╗ ╠═ ║  ╚╦╝╔═╝╠╩╗", Style::default().fg(Color::Indexed(118))),
             Span::raw("  "),
-            Span::styled(&state.model_name, Style::default().fg(Color::Rgb(52, 211, 153)).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("  {} turns  {}→{}", state.turns.len(), state.tokens_in, state.tokens_out), Style::default().fg(Color::Rgb(100, 100, 115))),
+            Span::styled(&state.model_name, Style::default().fg(Color::Indexed(48)).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  {} turns  {}→{}", state.turns.len(), state.tokens_in, state.tokens_out), Style::default().fg(Color::Indexed(245))),
         ]),
         Line::from(vec![
-            Span::styled("  ╚═╝╚═╝ ╚═╝╩═╝ ╩ ╚═╝╩ ╩", Style::default().fg(Color::Rgb(80, 120, 20))),
+            Span::styled("  ╚═╝╚═╝ ╚═╝╩═╝ ╩ ╚═╝╩ ╩", Style::default().fg(Color::Indexed(70))),
             Span::raw("  "),
             Span::styled("◆ ", Style::default().fg(status_color)),
             Span::styled(status, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
             Span::raw("  "),
-            Span::styled("STWO GKR + Poseidon252 STARK", Style::default().fg(Color::Rgb(80, 80, 95))),
+            Span::styled("STWO GKR + Poseidon252 STARK", Style::default().fg(Color::Indexed(240))),
         ]),
     ];
     frame.render_widget(Paragraph::new(lines), area);
@@ -695,9 +697,9 @@ fn render_chat_messages(frame: &mut ratatui::Frame, area: ratatui::layout::Rect,
     let mut lines: Vec<Line> = Vec::new();
     for (role, content) in &state.messages {
         let (prefix, color) = match role.as_str() {
-            "you" => ("YOU", Color::Rgb(163, 230, 53)),
-            "ai" => ("AI", Color::Rgb(52, 211, 153)),
-            _ => ("SYS", Color::Rgb(100, 100, 115)),
+            "you" => ("YOU", Color::Indexed(118)),    // Lime
+            "ai" => ("AI", Color::Indexed(48)),       // Emerald
+            _ => ("SYS", Color::Indexed(245)),        // Gray
         };
 
         lines.push(Line::from(vec![
@@ -705,16 +707,16 @@ fn render_chat_messages(frame: &mut ratatui::Frame, area: ratatui::layout::Rect,
         ]));
         for chunk in content.chars().collect::<Vec<_>>().chunks(55) {
             let text: String = chunk.iter().collect();
-            let text_color = if role == "system" { Color::Rgb(100, 100, 115) } else { Color::Rgb(200, 200, 210) };
+            let text_color = if role == "system" { Color::Indexed(245) } else { Color::Indexed(252) };
             lines.push(Line::from(Span::styled(format!("  {text}"), Style::default().fg(text_color))));
         }
         lines.push(Line::from(""));
     }
 
     let block = Block::default()
-        .title(Span::styled(" Chat ", Style::default().fg(Color::Rgb(163, 230, 53)).add_modifier(Modifier::BOLD)))
+        .title(Span::styled(" Chat ", Style::default().fg(Color::Indexed(118)).add_modifier(Modifier::BOLD)))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Rgb(80, 80, 95)));
+        .border_style(Style::default().fg(Color::Indexed(240)));
 
     let visible = area.height.saturating_sub(2) as usize;
     let offset = if lines.len() > visible { lines.len() - visible } else { 0 };
@@ -730,7 +732,7 @@ fn render_input(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, state: 
     use ratatui::widgets::*;
 
     let active = state.mode == Mode::Chat;
-    let border_color = if active { Color::Rgb(163, 230, 53) } else { Color::Rgb(80, 80, 95) };
+    let border_color = if active { Color::Indexed(118) } else { Color::Indexed(240) };
     let prompt = if active { " ▸ " } else { " · " };
 
     let block = Block::default()
@@ -740,7 +742,7 @@ fn render_input(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, state: 
 
     let input_text = format!("{prompt}{}", state.input);
     frame.render_widget(
-        Paragraph::new(Span::styled(&input_text, Style::default().fg(Color::Rgb(250, 250, 250)))).block(block),
+        Paragraph::new(Span::styled(&input_text, Style::default().fg(Color::Indexed(255)))).block(block),
         area,
     );
 
@@ -756,9 +758,9 @@ fn render_footer_section(frame: &mut ratatui::Frame, area: ratatui::layout::Rect
     use ratatui::widgets::*;
 
     let status_color = match state.mode {
-        Mode::Complete => Color::Rgb(52, 211, 153),
-        Mode::Proving => Color::Rgb(163, 230, 53),
-        _ => Color::Rgb(100, 100, 115),
+        Mode::Complete => Color::Indexed(48),
+        Mode::Proving => Color::Indexed(118),
+        _ => Color::Indexed(245),
     };
     let status_text = match state.mode {
         Mode::Complete => "VERIFIED ✓",
@@ -769,12 +771,12 @@ fn render_footer_section(frame: &mut ratatui::Frame, area: ratatui::layout::Rect
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" ObelyZK ", Style::default().fg(Color::Black).bg(Color::Rgb(163, 230, 53)).add_modifier(Modifier::BOLD)),
+            Span::styled(" ObelyZK ", Style::default().fg(Color::Black).bg(Color::Indexed(118)).add_modifier(Modifier::BOLD)),
             Span::raw("  "),
             Span::styled(status_text, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
             Span::raw("                              "),
-            Span::styled("Ctrl+C", Style::default().fg(Color::Rgb(163, 230, 53))),
-            Span::styled(" exit", Style::default().fg(Color::Rgb(80, 80, 95))),
+            Span::styled("Ctrl+C", Style::default().fg(Color::Indexed(118))),
+            Span::styled(" exit", Style::default().fg(Color::Indexed(240))),
         ])),
         area,
     );
@@ -798,9 +800,9 @@ fn render_chat_old(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, stat
     let mut lines: Vec<Line> = Vec::new();
     for (role, content) in &state.messages {
         let (prefix, color) = match role.as_str() {
-            "you" => ("You", Color::Rgb(163, 230, 53)),
-            "ai" => ("AI", Color::Rgb(52, 211, 153)),
-            "system" => ("", Color::Rgb(100, 100, 115)),
+            "you" => ("You", Color::Indexed(118)),
+            "ai" => ("AI", Color::Indexed(48)),
+            "system" => ("", Color::Indexed(245)),
             _ => ("", Color::White),
         };
 
@@ -814,16 +816,16 @@ fn render_chat_old(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, stat
         for chunk in content.chars().collect::<Vec<_>>().chunks(50) {
             let text: String = chunk.iter().collect();
             lines.push(Line::from(vec![
-                Span::styled(format!("   {text}"), Style::default().fg(if role == "system" { Color::Rgb(100, 100, 115) } else { Color::Rgb(200, 200, 210) })),
+                Span::styled(format!("   {text}"), Style::default().fg(if role == "system" { Color::Indexed(245) } else { Color::Indexed(252) })),
             ]));
         }
         lines.push(Line::from(""));
     }
 
     let msg_block = Block::default()
-        .title(Span::styled(" Chat ", Style::default().fg(Color::Rgb(163, 230, 53)).add_modifier(Modifier::BOLD)))
+        .title(Span::styled(" Chat ", Style::default().fg(Color::Indexed(118)).add_modifier(Modifier::BOLD)))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Rgb(80, 80, 95)));
+        .border_style(Style::default().fg(Color::Indexed(240)));
 
     // Auto-scroll to bottom
     let visible = layout[0].height.saturating_sub(2) as usize;
@@ -837,9 +839,9 @@ fn render_chat_old(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, stat
 
     // Input
     let input_style = if state.mode == Mode::Chat {
-        Style::default().fg(Color::Rgb(163, 230, 53))
+        Style::default().fg(Color::Indexed(118))
     } else {
-        Style::default().fg(Color::Rgb(80, 80, 95))
+        Style::default().fg(Color::Indexed(240))
     };
 
     let prompt = if state.mode == Mode::Chat { " ▸ " } else { " · " };

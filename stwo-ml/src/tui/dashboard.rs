@@ -19,25 +19,28 @@ use ratatui::{
 // Hierarchy through brightness, not hue variety.
 // Hashes get their own violet treatment — they're the proof.
 
-const BG:          Color = Color::Reset;                // Use terminal default background
-const BG_RAISED:   Color = Color::Rgb(25, 25, 35);     // Slightly raised panels
-const BG_ACTIVE:   Color = Color::Rgb(35, 35, 50);     // Active/hover state
+// ANSI 256-color palette — universal terminal compatibility.
+// No RGB — works in every terminal, no pink/magenta misinterpretation.
 
-const LIME:        Color = Color::Rgb(163, 230, 53);    // Primary signal — ObelyZK lime
-const LIME_DIM:    Color = Color::Rgb(80, 120, 20);     // Subdued lime
-const LIME_GLOW:   Color = Color::Rgb(190, 242, 100);   // Bright lime for emphasis
+const BG:          Color = Color::Reset;                 // Terminal default
+const BG_RAISED:   Color = Color::Indexed(235);          // Gray 4%
+const BG_ACTIVE:   Color = Color::Indexed(236);          // Gray 8%
 
-const EMERALD:     Color = Color::Rgb(52, 211, 153);    // Secondary — verified/success
-const VIOLET:      Color = Color::Rgb(130, 200, 160);   // Muted teal — hashes/crypto
-const VIOLET_DIM:  Color = Color::Rgb(80, 140, 110);    // Subdued teal
+const LIME:        Color = Color::Indexed(118);           // Bright lime #87ff00
+const LIME_DIM:    Color = Color::Indexed(70);            // Medium green #5faf00
+const LIME_GLOW:   Color = Color::Indexed(154);           // Yellow-green #afff00
 
-const WHITE:       Color = Color::Rgb(250, 250, 250);   // Maximum contrast text
-const SILVER:      Color = Color::Rgb(161, 161, 170);   // Secondary text
-const SLATE:       Color = Color::Rgb(100, 100, 115);   // Tertiary text
-const GHOST:       Color = Color::Rgb(80, 80, 95);      // Subtle but visible — borders, gutters
+const EMERALD:     Color = Color::Indexed(48);            // Bright cyan-green #00ff87
+const VIOLET:      Color = Color::Indexed(73);            // Steel blue #5fafaf — for hashes
+const VIOLET_DIM:  Color = Color::Indexed(66);            // Dark teal #5f8787
 
-const RED:         Color = Color::Rgb(220, 160, 80);     // Warm amber for integrity
-const RED_DIM:     Color = Color::Rgb(100, 70, 30);      // Subdued amber
+const WHITE:       Color = Color::Indexed(255);           // Bright white
+const SILVER:      Color = Color::Indexed(249);           // Light gray
+const SLATE:       Color = Color::Indexed(245);           // Medium gray
+const GHOST:       Color = Color::Indexed(240);           // Dark gray — borders
+
+const RED:         Color = Color::Indexed(178);           // Gold/amber #d7af00
+const RED_DIM:     Color = Color::Indexed(136);           // Dark amber #af8700
 
 // ── Box-drawing characters for custom borders ───────────────────────
 const H_LINE: &str = "─";
