@@ -268,3 +268,11 @@ echo -e "  ${D}Recursive proof:  $LOG_DIR/recursive_proof.json${X}"
 echo -e "  ${D}Verifier contract: $CONTRACT${X}"
 echo -e "  ${D}Voyager explorer:  https://sepolia.voyager.online/contract/$CONTRACT${X}"
 echo ""
+
+# Launch TUI dashboard if available
+TUI_BIN="$SCRIPT_DIR/../target/release/obelysk-demo"
+if [[ -f "$TUI_BIN" ]] && [[ -f "$LOG_DIR/audit_report.json" ]]; then
+    echo -e "${D}Launching proof dashboard... (q to exit)${X}"
+    sleep 1
+    "$TUI_BIN" "$LOG_DIR/audit_report.json"
+fi
