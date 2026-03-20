@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Chat engine for Obelysk live demo.
 
-Handles the interactive chat loop, calling llama.cpp server and
-writing conversation.json for the prover.
+Handles the interactive chat loop, calling llama.cpp server,
+writing conversation.json, and launching background proving.
 """
 
 import json
+import os
+import subprocess
 import sys
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -14,11 +17,15 @@ import urllib.error
 PORT = 8192
 BASE = f"http://localhost:{PORT}"
 
+# Background proving state
+_prove_threads: list[threading.Thread] = []
+_prove_results: list[dict] = []
+_prove_lock = threading.Lock()
+
 
 def chat(user_input: str, messages: list) -> tuple[str, int]:
-    """Send a message and get the response. Returns (reply, gen_time_ms)."""
+    """Send a message and get the response."""
     messages.append({"role": "user", "content": user_input})
-
     payload = json.dumps({
         "model": "qwen2-0.5b",
         "messages": messages,
@@ -57,6 +64,24 @@ def tokenize(text: str) -> list[int]:
         return [0]
 
 
+def start_background_prove(turn_index: int, model_dir: str, log_dir: str):
+    """Launch background proving for a turn (async).
+
+    This is a placeholder for the async architecture. In production,
+    each turn would be proved independently in a background thread
+    immediately after capture, so by the time the user finishes
+    chatting, most proofs are already done.
+    """
+    # For now we just record that proving should happen.
+    # The actual proving happens in the audit step after capture.
+    with _prove_lock:
+        _prove_results.append({
+            "turn": turn_index,
+            "status": "queued",
+            "start_time": time.time(),
+        })
+
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: chat_engine.py <output_conversation.json>", file=sys.stderr)
@@ -67,11 +92,11 @@ def main():
     turns = []
     turn_index = 0
 
-    # Colors
     GREEN = "\033[0;32m"
     CYAN = "\033[0;36m"
     WHITE = "\033[1;37m"
     DIM = "\033[0;90m"
+    YELLOW = "\033[1;33m"
     RESET = "\033[0m"
 
     print(f"{WHITE}Chat with Qwen2-0.5B. Type {GREEN}prove{WHITE} when done.{RESET}")
@@ -99,7 +124,7 @@ def main():
         print(f"{CYAN}Qwen: {RESET}{reply}")
         print()
 
-        # Tokenize for the conversation record
+        # Tokenize
         tokens = tokenize(user_input)
         resp_tokens = tokenize(reply)
         last_token = tokens[-1] if tokens else 0
