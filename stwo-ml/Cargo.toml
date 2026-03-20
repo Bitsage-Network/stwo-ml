@@ -29,7 +29,7 @@ proof-stream-ws = ["proof-stream", "proof-stream/ws-server"]
 server-stream   = ["server", "proof-stream-ws", "dep:ureq"]
 multi-query     = ["server"]
 parallel-audit  = []
-tui = ["dep:ratatui", "dep:crossterm", "serde", "dep:serde_json"]
+tui = ["dep:ratatui", "dep:crossterm", "serde", "dep:serde_json", "dep:ureq"]
 metal = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
 [dependencies]
@@ -94,6 +94,11 @@ required-features = ["server"]
 [[bin]]
 name = "obelysk-demo"
 path = "src/bin/obelysk_demo.rs"
+required-features = ["tui"]
+
+[[bin]]
+name = "obelysk"
+path = "src/bin/obelysk.rs"
 required-features = ["tui"]
 
 [[example]]
