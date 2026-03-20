@@ -383,9 +383,9 @@ pub fn render_crypto(frame: &mut Frame, area: Rect, state: &DashboardState) {
         .constraints([
             Constraint::Length(1),   // Header
             Constraint::Length(1),   // Spacer
-            Constraint::Length(2),   // Weight
-            Constraint::Length(2),   // IO
-            Constraint::Length(2),   // Report
+            Constraint::Length(3),   // Weight (2 lines for full hash)
+            Constraint::Length(3),   // IO
+            Constraint::Length(3),   // Report
             Constraint::Length(1),   // Spacer
             Constraint::Length(1),   // On-chain header
             Constraint::Length(1),   // Spacer
@@ -456,20 +456,31 @@ pub fn render_crypto(frame: &mut Frame, area: Rect, state: &DashboardState) {
 fn render_hash_field(frame: &mut Frame, area: Rect, label: &str, value: &Option<String>) {
     let placeholder = "··················································";
     let hash = value.as_deref().unwrap_or(placeholder);
-    let display = if hash.len() > 30 {
-        format!("{}…{}", &hash[..16], &hash[hash.len()-10..])
-    } else {
-        hash.to_string()
-    };
 
-    let lines = vec![
-        Line::from(vec![
-            Span::styled(format!(" {label:<7}"), Style::default().fg(SLATE)),
-        ]),
-        Line::from(vec![
-            Span::styled(format!(" {display}"), Style::default().fg(VIOLET)),
-        ]),
-    ];
+    // Show as much as possible — split across two lines if needed
+    let width = area.width.saturating_sub(2) as usize;
+    let label_width = 8;
+    let hash_space = width.saturating_sub(label_width);
+
+    let lines = if hash.len() <= hash_space {
+        vec![Line::from(vec![
+            Span::styled(format!(" {label:<7} "), Style::default().fg(SLATE)),
+            Span::styled(hash, Style::default().fg(VIOLET)),
+        ])]
+    } else {
+        // Split hash across two lines — show full hash
+        let mid = hash.len() / 2;
+        vec![
+            Line::from(vec![
+                Span::styled(format!(" {label:<7} "), Style::default().fg(SLATE)),
+                Span::styled(&hash[..mid.min(hash_space)], Style::default().fg(VIOLET)),
+            ]),
+            Line::from(vec![
+                Span::styled("         ", Style::default()),
+                Span::styled(&hash[mid.min(hash_space)..], Style::default().fg(VIOLET)),
+            ]),
+        ]
+    };
     frame.render_widget(Paragraph::new(lines), area);
 }
 
