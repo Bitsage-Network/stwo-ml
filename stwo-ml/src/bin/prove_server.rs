@@ -95,6 +95,12 @@ struct LoadedModel {
     weights: Arc<stwo_ml::compiler::graph::GraphWeights>,
     #[cfg(feature = "server-audit")]
     capture_hook: Option<Arc<stwo_ml::audit::capture::CaptureHook>>,
+    /// Path to the HuggingFace model directory (for tokenizer + embedding lookup).
+    #[cfg(feature = "server-infer")]
+    model_dir: Option<std::path::PathBuf>,
+    /// Tokenizer loaded from tokenizer.json in the model directory.
+    #[cfg(feature = "server-infer")]
+    tokenizer: Option<Arc<tokenizers::Tokenizer>>,
 }
 
 struct PrivacyJob {
@@ -177,6 +183,8 @@ struct AppState {
     weight_caches: RwLock<HashMap<String, stwo_ml::weight_cache::SharedWeightCache>>,
     #[cfg(feature = "server-audit")]
     audit_jobs: RwLock<HashMap<String, AuditJob>>,
+    #[cfg(feature = "server-infer")]
+    infer_jobs: RwLock<HashMap<String, InferJob>>,
 }
 
 // =============================================================================
@@ -383,6 +391,88 @@ struct PrivacyBatchSubmitCalldataResponse {
 #[derive(Serialize)]
 struct ErrorResponse {
     error: String,
+}
+
+// =============================================================================
+// Provable Inference API types
+// =============================================================================
+
+#[cfg(feature = "server-infer")]
+#[derive(Deserialize)]
+struct InferRequest {
+    /// ID of a previously loaded model (from POST /api/v1/models or /api/v1/models/hf).
+    model_id: String,
+    /// Text prompt to run inference on.
+    prompt: String,
+    /// Maximum number of tokens to generate (default: 1 for single-step forward pass).
+    #[serde(default = "default_max_tokens")]
+    max_tokens: usize,
+    /// Security level: "auto" | "tee" | "zk-only"
+    #[serde(default = "default_security")]
+    security: String,
+}
+
+#[cfg(feature = "server-infer")]
+fn default_max_tokens() -> usize {
+    1
+}
+
+#[cfg(feature = "server-infer")]
+#[derive(Clone, Serialize)]
+struct InferResultPayload {
+    /// Generated output text (decoded from model logits).
+    output_text: String,
+    /// Input token IDs produced by the tokenizer.
+    input_tokens: Vec<u32>,
+    /// Output token IDs (argmax of logits per step).
+    output_tokens: Vec<u32>,
+    /// On-chain calldata (STARK proof serialized as felt252 hex values).
+    calldata: Vec<String>,
+    /// IO commitment: Poseidon(inputs || outputs).
+    io_commitment: String,
+    /// Poseidon commitment over model weights.
+    weight_commitment: String,
+    /// Running Poseidon hash binding layer intermediates.
+    layer_chain_commitment: String,
+    /// Estimated L1 gas for on-chain verification.
+    estimated_gas: u64,
+    /// Number of matmul sumcheck proofs generated.
+    num_matmul_proofs: usize,
+    /// Number of proven layers in the model.
+    num_layers: usize,
+    /// Wall-clock proving time in milliseconds.
+    prove_time_ms: u64,
+    /// TEE attestation hash (if hardware TEE was used).
+    tee_attestation_hash: Option<String>,
+}
+
+#[cfg(feature = "server-infer")]
+struct InferJob {
+    job_id: String,
+    model_id: String,
+    prompt: String,
+    status: JobStatus,
+    progress_bps: u16,
+    started_at: Instant,
+    completed_at: Option<Instant>,
+    error: Option<String>,
+    result: Option<InferResultPayload>,
+}
+
+#[cfg(feature = "server-infer")]
+#[derive(Serialize)]
+struct InferSubmitResponse {
+    job_id: String,
+    status: JobStatus,
+}
+
+#[cfg(feature = "server-infer")]
+#[derive(Serialize)]
+struct InferStatusResponse {
+    job_id: String,
+    status: JobStatus,
+    progress_bps: u16,
+    elapsed_secs: f64,
 }
 
 // =============================================================================
@@ -686,6 +776,20 @@ async fn load_model(
         input_shape: [onnx.input_shape.0, onnx.input_shape.1],
     };
 
+    // Load tokenizer if this is an HF model directory with tokenizer.json
+    #[cfg(feature = "server-infer")]
+    let (infer_model_dir, infer_tokenizer) = if req.model_dir.is_some() {
+        let tok_path = canonical_path.join("tokenizer.json");
+        let tokenizer = if tok_path.is_file() {
+            tokenizers::Tokenizer::from_file(&tok_path).ok().map(Arc::new)
+        } else {
+            None
+        };
+        (Some(canonical_path.clone()), tokenizer)
+    } else {
+        (None, None)
+    };
+
     let loaded = LoadedModel {
         model_id: model_id.clone(),
         weight_commitment: weight_commitment.clone(),
@@ -695,6 +799,10 @@ async fn load_model(
         weights: Arc::new(onnx.weights),
         #[cfg(feature = "server-audit")]
         capture_hook: create_capture_hook(&model_id, &weight_commitment, desc),
+        #[cfg(feature = "server-infer")]
+        model_dir: infer_model_dir,
+        #[cfg(feature = "server-infer")]
+        tokenizer: infer_tokenizer,
     };
 
     state.models.write().await.insert(model_id.clone(), loaded);
@@ -744,6 +852,17 @@ async fn load_hf_model_handler(
         input_shape: [hf.input_shape.0, hf.input_shape.1],
     };
 
+    // Load tokenizer for inference API
+    #[cfg(feature = "server-infer")]
+    let infer_tokenizer = {
+        let tok_path = path.join("tokenizer.json");
+        if tok_path.is_file() {
+            tokenizers::Tokenizer::from_file(&tok_path).ok().map(Arc::new)
+        } else {
+            None
+        }
+    };
+
     let loaded = LoadedModel {
         model_id: model_id.clone(),
         weight_commitment: weight_commitment.clone(),
@@ -753,6 +872,10 @@ async fn load_hf_model_handler(
         weights: Arc::new(hf.weights),
         #[cfg(feature = "server-audit")]
         capture_hook: create_capture_hook(&model_id, &weight_commitment, desc),
+        #[cfg(feature = "server-infer")]
+        model_dir: Some(path.clone()),
+        #[cfg(feature = "server-infer")]
+        tokenizer: infer_tokenizer,
     };
 
     state.models.write().await.insert(model_id.clone(), loaded);
@@ -1286,6 +1409,320 @@ async fn get_prove_result(
             StatusCode::CONFLICT,
             Json(ErrorResponse {
                 error: format!("Job is still {:?}", job.status),
+            }),
+        )),
+    }
+}
+
+// =============================================================================
+// Provable Inference Handlers
+// =============================================================================
+
+/// POST /api/v1/infer — Submit a text prompt for provable inference.
+///
+/// Tokenizes the prompt, embeds the last token, runs the model forward pass
+/// with STARK proof generation, decodes output logits back to text, and
+/// returns both the generated text and the cryptographic proof.
+#[cfg(feature = "server-infer")]
+async fn submit_infer(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<InferRequest>,
+) -> Result<(StatusCode, Json<InferSubmitResponse>), (StatusCode, Json<ErrorResponse>)> {
+    if req.prompt.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "prompt must not be empty".to_string(),
+            }),
+        ));
+    }
+
+    // Validate model exists and has tokenizer + model_dir
+    let models = state.models.read().await;
+    let model = models.get(&req.model_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!(
+                    "Model '{}' not found. Load it first via POST /api/v1/models/hf",
+                    req.model_id
+                ),
+            }),
+        )
+    })?;
+
+    let tokenizer = model.tokenizer.as_ref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!(
+                    "Model '{}' has no tokenizer. Load an HF model with tokenizer.json.",
+                    req.model_id
+                ),
+            }),
+        )
+    })?;
+
+    let model_dir = model.model_dir.as_ref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!(
+                    "Model '{}' has no model_dir. Load via POST /api/v1/models/hf.",
+                    req.model_id
+                ),
+            }),
+        )
+    })?;
+
+    // Tokenize the prompt
+    let encoding = tokenizer.encode(req.prompt.as_str(), false).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("Tokenization failed: {e}"),
+            }),
+        )
+    })?;
+    let token_ids: Vec<u32> = encoding.get_ids().to_vec();
+    if token_ids.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Prompt produced zero tokens".to_string(),
+            }),
+        ));
+    }
+    let last_token_id = *token_ids.last().unwrap();
+
+    // Extract embedding row for the last token
+    let (_in_rows, in_cols) = model.input_shape;
+    let (input_matrix, _vocab_size) =
+        stwo_ml::compiler::hf_loader::load_embedding_row(model_dir, in_cols, last_token_id)
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Embedding lookup failed: {e}"),
+                    }),
+                )
+            })?;
+
+    let graph = Arc::clone(&model.graph);
+    let weights = Arc::clone(&model.weights);
+    let model_weight_commitment = model.weight_commitment.clone();
+    let model_id_clone = req.model_id.clone();
+    let tokenizer_clone = Arc::clone(tokenizer);
+    let prompt_clone = req.prompt.clone();
+    drop(models);
+
+    let job_id = Uuid::new_v4().to_string();
+    let job = InferJob {
+        job_id: job_id.clone(),
+        model_id: model_id_clone,
+        prompt: prompt_clone,
+        status: JobStatus::Queued,
+        progress_bps: 0,
+        started_at: Instant::now(),
+        completed_at: None,
+        error: None,
+        result: None,
+    };
+
+    state.infer_jobs.write().await.insert(job_id.clone(), job);
+
+    let resp = InferSubmitResponse {
+        job_id: job_id.clone(),
+        status: JobStatus::Queued,
+    };
+
+    // Spawn the proving task
+    let state_clone = state.clone();
+    let jid = job_id.clone();
+    let input_token_ids = token_ids.clone();
+    tokio::task::spawn(async move {
+        // Mark as proving
+        {
+            let mut jobs = state_clone.infer_jobs.write().await;
+            if let Some(j) = jobs.get_mut(&jid) {
+                j.status = JobStatus::Proving;
+                j.progress_bps = 100;
+            }
+        }
+
+        let prove_start = Instant::now();
+
+        // Run CPU+GPU heavy proving on a blocking thread
+        let result = tokio::task::spawn_blocking(move || {
+            // 1. Generate STARK proof over the forward pass
+            let proof_result = prove_for_starknet_onchain(&*graph, &input_matrix, &*weights);
+
+            match proof_result {
+                Ok(proof) => {
+                    // 2. Also run a plain forward pass to get the output matrix for decoding
+                    let output_matrix =
+                        stwo_ml::compiler::prove::forward_pass_only(&*graph, &input_matrix, &*weights);
+
+                    // 3. Decode output logits → token IDs → text
+                    let (output_tokens, output_text) = match output_matrix {
+                        Ok(ref out) => {
+                            // Interpret output as logits: take argmax of each row
+                            let mut out_tokens = Vec::new();
+                            for r in 0..out.rows {
+                                let row_start = r * out.cols;
+                                let row_end = row_start + out.cols;
+                                let row = &out.data[row_start..row_end];
+                                let max_idx = row
+                                    .iter()
+                                    .enumerate()
+                                    .max_by_key(|(_, v)| v.0)
+                                    .map(|(i, _)| i as u32)
+                                    .unwrap_or(0);
+                                out_tokens.push(max_idx);
+                            }
+
+                            let text = tokenizer_clone
+                                .decode(&out_tokens, true)
+                                .unwrap_or_else(|_| {
+                                    out_tokens
+                                        .iter()
+                                        .map(|t| format!("[{}]", t))
+                                        .collect::<Vec<_>>()
+                                        .join("")
+                                });
+                            (out_tokens, text)
+                        }
+                        Err(_) => {
+                            // Forward pass failed — still return the proof but no decoded text
+                            (vec![], "[forward pass decode error]".to_string())
+                        }
+                    };
+
+                    let elapsed_ms = prove_start.elapsed().as_millis() as u64;
+
+                    let calldata: Vec<String> = proof
+                        .combined_calldata
+                        .iter()
+                        .map(|f| format!("0x{:x}", f))
+                        .collect();
+
+                    Ok(InferResultPayload {
+                        output_text,
+                        input_tokens: input_token_ids,
+                        output_tokens,
+                        calldata,
+                        io_commitment: format!("0x{:x}", proof.io_commitment),
+                        weight_commitment: model_weight_commitment.clone(),
+                        layer_chain_commitment: format!(
+                            "0x{:x}",
+                            proof.layer_chain_commitment
+                        ),
+                        estimated_gas: proof.estimated_gas,
+                        num_matmul_proofs: proof.num_matmul_proofs,
+                        num_layers: proof.num_proven_layers,
+                        prove_time_ms: elapsed_ms,
+                        tee_attestation_hash: proof
+                            .tee_attestation_hash
+                            .map(|h| format!("0x{:x}", h)),
+                    })
+                }
+                Err(e) => Err(format!("{e}")),
+            }
+        })
+        .await;
+
+        // Update job status
+        let mut jobs = state_clone.infer_jobs.write().await;
+        if let Some(j) = jobs.get_mut(&jid) {
+            match result {
+                Ok(Ok(payload)) => {
+                    j.status = JobStatus::Completed;
+                    j.progress_bps = 10000;
+                    j.completed_at = Some(Instant::now());
+                    j.result = Some(payload);
+                }
+                Ok(Err(e)) => {
+                    j.status = JobStatus::Failed;
+                    j.error = Some(e);
+                    j.completed_at = Some(Instant::now());
+                }
+                Err(e) => {
+                    j.status = JobStatus::Failed;
+                    j.error = Some(format!("Task panicked: {e}"));
+                    j.completed_at = Some(Instant::now());
+                }
+            }
+        }
+    });
+
+    Ok((StatusCode::ACCEPTED, Json(resp)))
+}
+
+/// GET /api/v1/infer/:job_id — Check inference job status.
+#[cfg(feature = "server-infer")]
+async fn get_infer_status(
+    State(state): State<Arc<AppState>>,
+    Path(job_id): Path<String>,
+) -> Result<Json<InferStatusResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let jobs = state.infer_jobs.read().await;
+    let job = jobs.get(&job_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("Inference job '{job_id}' not found"),
+            }),
+        )
+    })?;
+
+    Ok(Json(InferStatusResponse {
+        job_id: job.job_id.clone(),
+        status: job.status,
+        progress_bps: job.progress_bps,
+        elapsed_secs: job.started_at.elapsed().as_secs_f64(),
+    }))
+}
+
+/// GET /api/v1/infer/:job_id/result — Retrieve inference output + proof.
+#[cfg(feature = "server-infer")]
+async fn get_infer_result(
+    State(state): State<Arc<AppState>>,
+    Path(job_id): Path<String>,
+) -> Result<Json<InferResultPayload>, (StatusCode, Json<ErrorResponse>)> {
+    let jobs = state.infer_jobs.read().await;
+    let job = jobs.get(&job_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("Inference job '{job_id}' not found"),
+            }),
+        )
+    })?;
+
+    match job.status {
+        JobStatus::Completed => {
+            let result = job.result.as_ref().ok_or_else(|| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "Job completed but result is missing (internal error)".to_string(),
+                    }),
+                )
+            })?;
+            Ok(Json(result.clone()))
+        }
+        JobStatus::Failed => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: job
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "Unknown error".to_string()),
+            }),
+        )),
+        _ => Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: format!("Inference job is still {:?}", job.status),
             }),
         )),
     }
@@ -2281,6 +2718,8 @@ async fn main() {
         weight_caches: RwLock::new(HashMap::new()),
         #[cfg(feature = "server-audit")]
         audit_jobs: RwLock::new(HashMap::new()),
+        #[cfg(feature = "server-infer")]
+        infer_jobs: RwLock::new(HashMap::new()),
     });
 
     // Authenticated + rate-limited API routes
@@ -2318,6 +2757,14 @@ async fn main() {
         api_routes = api_routes
             .route("/api/v1/audit", post(submit_audit))
             .route("/api/v1/audit/{job_id}", get(get_audit_status));
+    }
+
+    #[cfg(feature = "server-infer")]
+    {
+        api_routes = api_routes
+            .route("/api/v1/infer", post(submit_infer))
+            .route("/api/v1/infer/{job_id}", get(get_infer_status))
+            .route("/api/v1/infer/{job_id}/result", get(get_infer_result));
     }
 
     #[cfg(all(feature = "multi-query", feature = "proof-stream"))]
@@ -2390,6 +2837,11 @@ async fn main() {
                 {
                     let mut aj = state_cleanup.audit_jobs.write().await;
                     aj.retain(|_, j| evict(&j.completed_at));
+                }
+                #[cfg(feature = "server-infer")]
+                {
+                    let mut ij = state_cleanup.infer_jobs.write().await;
+                    ij.retain(|_, j| evict(&j.completed_at));
                 }
             }
         });
