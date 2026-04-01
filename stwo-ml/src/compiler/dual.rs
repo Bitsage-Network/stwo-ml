@@ -191,6 +191,10 @@ pub fn f32_forward(
             GraphOp::RoPE { .. } => {
                 // RoPE in f32: passthrough (rotation is position-dependent, handled in M31 path)
             }
+
+            GraphOp::MoE { .. } => {
+                todo!("MoE forward pass: decompose into router + TopK + experts")
+            }
         }
     }
 

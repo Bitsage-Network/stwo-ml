@@ -3,13 +3,15 @@
 //! Design: high-contrast dark field, surgical precision typography,
 //! cryptographic data rendered as classified intel. Every element
 //! communicates: this is real, this is verified, this cannot be faked.
+//!
+//! Layout: 3-column body (Pipeline 40% | Crypto 30% | Inference Log 30%)
+//! with streaming on-chain verification steps.
 
 use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    symbols,
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, List, ListItem, Padding, Paragraph, Wrap},
+    widgets::{Paragraph, Wrap},
     Frame,
 };
 
@@ -23,16 +25,13 @@ use ratatui::{
 // No RGB — works in every terminal, no pink/magenta misinterpretation.
 
 const BG:          Color = Color::Reset;                 // Terminal default
-const BG_RAISED:   Color = Color::Indexed(235);          // Gray 4%
 const BG_ACTIVE:   Color = Color::Indexed(236);          // Gray 8%
 
 const LIME:        Color = Color::Indexed(118);           // Bright lime #87ff00
 const LIME_DIM:    Color = Color::Indexed(70);            // Medium green #5faf00
-const LIME_GLOW:   Color = Color::Indexed(154);           // Yellow-green #afff00
 
 const EMERALD:     Color = Color::Indexed(48);            // Bright cyan-green #00ff87
 const VIOLET:      Color = Color::Indexed(73);            // Steel blue #5fafaf — for hashes
-const VIOLET_DIM:  Color = Color::Indexed(66);            // Dark teal #5f8787
 
 const WHITE:       Color = Color::Indexed(255);           // Bright white
 const SILVER:      Color = Color::Indexed(249);           // Light gray
@@ -40,23 +39,64 @@ const SLATE:       Color = Color::Indexed(245);           // Medium gray
 const GHOST:       Color = Color::Indexed(240);           // Dark gray — borders
 
 const RED:         Color = Color::Indexed(178);           // Gold/amber #d7af00
-const RED_DIM:     Color = Color::Indexed(136);           // Dark amber #af8700
+
+const ORANGE:      Color = Color::Indexed(208);           // Orange — on-chain TX highlights
+const LILAC:       Color = Color::Indexed(141);           // Light purple — streaming step names
 
 // ── Box-drawing characters for custom borders ───────────────────────
 const H_LINE: &str = "─";
 const V_LINE: &str = "│";
-const TL: &str = "┌"; const TR: &str = "┐";
-const BL: &str = "└"; const BR: &str = "┘";
-const T_DOWN: &str = "┬"; const T_UP: &str = "┴";
 const DOT: &str = "·";
 const BLOCK_FULL: &str = "█";
-const BLOCK_MED:  &str = "▓";
 const BLOCK_LOW:  &str = "░";
 const ARROW_R: &str = "▸";
 const CHECK: &str = "✓";
 const CROSS: &str = "✗";
 const DIAMOND: &str = "◆";
 const SHIELD: &str = "⊕";
+
+// ── Streaming step status ───────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StepStatus {
+    Pending,
+    Submitting,
+    Confirmed,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+pub struct StreamingStep {
+    pub name: String,
+    pub status: StepStatus,
+    pub tx_hash: Option<String>,
+    pub block: Option<u64>,
+    pub felts: usize,
+}
+
+impl StreamingStep {
+    pub fn new(name: &str) -> Self {
+        Self {
+            name: name.into(),
+            status: StepStatus::Pending,
+            tx_hash: None,
+            block: None,
+            felts: 0,
+        }
+    }
+}
+
+/// The 6 default streaming verification step names.
+pub fn default_streaming_steps() -> Vec<StreamingStep> {
+    vec![
+        StreamingStep::new("stream_init"),
+        StreamingStep::new("output_mle"),
+        StreamingStep::new("layers"),
+        StreamingStep::new("weight_binding"),
+        StreamingStep::new("input_mle"),
+        StreamingStep::new("finalize"),
+    ]
+}
 
 /// Dashboard state.
 #[derive(Debug, Clone)]
@@ -68,35 +108,58 @@ pub struct DashboardState {
     pub tokens_in: usize,
     pub tokens_out: usize,
     pub step: PipelineStep,
+    // 3-step pipeline progress
     pub capture_progress: f64,
     pub prove_progress: f64,
-    pub recursive_progress: f64,
-    pub verify_progress: f64,
+    pub onchain_progress: f64,
+    // Timing
     pub capture_time: Option<f64>,
     pub prove_time: Option<f64>,
-    pub recursive_time: Option<f64>,
+    pub onchain_time: Option<f64>,
+    pub prove_time_secs: f64,
+    pub elapsed_secs: u64,
+    // Commitments
     pub weight_commitment: Option<String>,
     pub io_root: Option<String>,
     pub report_hash: Option<String>,
+    // On-chain
     pub contract: String,
     pub network: String,
     pub verification_count: Option<u64>,
     pub tx_hash: Option<String>,
+    pub deployer_address: Option<String>,
+    pub total_felts: usize,
+    pub gas_used: Option<String>,
+    // Streaming verification
+    pub streaming_steps: Vec<StreamingStep>,
+    // Tamper detection
     pub tamper_io: Option<bool>,
     pub tamper_weight: Option<bool>,
     pub tamper_output: Option<bool>,
+    // Inference log
     pub turns: Vec<(String, String)>,
     pub logs: Vec<String>,
+    // Animation frame counter (for pulsing effects)
+    pub frame_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum PipelineStep { Idle, Capture, Prove, Recursive, Verify, Complete }
+pub enum PipelineStep {
+    Idle,
+    Capture,
+    GkrProve,
+    OnChain,
+    Complete,
+}
 
 impl PipelineStep {
     pub fn as_u8(&self) -> u8 {
         match self {
-            Self::Idle => 0, Self::Capture => 1, Self::Prove => 2,
-            Self::Recursive => 3, Self::Verify => 4, Self::Complete => 5,
+            Self::Idle => 0,
+            Self::Capture => 1,
+            Self::GkrProve => 2,
+            Self::OnChain => 3,
+            Self::Complete => 4,
         }
     }
 }
@@ -109,16 +172,22 @@ impl Default for DashboardState {
             model_layers: 169,
             num_turns: 0, tokens_in: 0, tokens_out: 0,
             step: PipelineStep::Idle,
-            capture_progress: 0.0, prove_progress: 0.0,
-            recursive_progress: 0.0, verify_progress: 0.0,
-            capture_time: None, prove_time: None, recursive_time: None,
+            capture_progress: 0.0, prove_progress: 0.0, onchain_progress: 0.0,
+            capture_time: None, prove_time: None, onchain_time: None,
+            prove_time_secs: 0.0,
+            elapsed_secs: 0,
             weight_commitment: None, io_root: None, report_hash: None,
             contract: "0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005".into(),
             network: "Starknet Sepolia".into(),
             verification_count: None,
             tx_hash: Some("0x2859e0605bd41bed34f65240e2e243cbfeb6c81f4dc60d7d431034f23fd2308".into()),
+            deployer_address: None,
+            total_felts: 0,
+            gas_used: None,
+            streaming_steps: default_streaming_steps(),
             tamper_io: None, tamper_weight: None, tamper_output: None,
             turns: Vec::new(), logs: Vec::new(),
+            frame_count: 0,
         }
     }
 }
@@ -129,7 +198,10 @@ impl Default for DashboardState {
 
 pub fn render(frame: &mut Frame, state: &DashboardState) {
     let area = frame.area();
-    frame.render_widget(Block::default().style(Style::default().bg(BG)), area);
+    frame.render_widget(
+        ratatui::widgets::Block::default().style(Style::default().bg(BG)),
+        area,
+    );
 
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -188,9 +260,21 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState) {
     );
 
     // Model info — right side
+    let is_idle = state.step == PipelineStep::Idle;
     let is_complete = state.step == PipelineStep::Complete;
-    let status_color = if is_complete { EMERALD } else { LIME };
-    let status_text = if is_complete { "VERIFIED" } else { "PROVING" };
+    let (status_text, status_color) = if is_complete {
+        ("VERIFIED", EMERALD)
+    } else if is_idle {
+        ("IDLE", GHOST)
+    } else {
+        ("PROVING", LIME)
+    };
+
+    let elapsed_str = if !is_idle && !is_complete && state.elapsed_secs > 0 {
+        format!("  {}s", state.elapsed_secs)
+    } else {
+        String::new()
+    };
 
     let info = vec![
         Line::from(Span::styled("", Style::default())),
@@ -212,6 +296,10 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState) {
                 Style::default().fg(status_color).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
+                elapsed_str,
+                Style::default().fg(ORANGE).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
                 format!("  {} turns  {}→{} tokens",
                     state.num_turns, state.tokens_in, state.tokens_out),
                 Style::default().fg(SLATE),
@@ -220,7 +308,7 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState) {
         Line::from(vec![
             Span::styled("  ENGINE ", Style::default().fg(SLATE)),
             Span::styled("STWO ", Style::default().fg(LIME_DIM)),
-            Span::styled("GKR sumcheck + Poseidon252 STARK", Style::default().fg(GHOST)),
+            Span::styled("Circle STARK + GKR", Style::default().fg(GHOST)),
         ]),
     ];
 
@@ -236,11 +324,11 @@ fn render_body(frame: &mut Frame, area: Rect, state: &DashboardState) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(38),  // Pipeline
+            Constraint::Percentage(40),  // Pipeline
             Constraint::Length(1),        // Gutter
-            Constraint::Percentage(32),  // Crypto
+            Constraint::Percentage(30),  // Crypto
             Constraint::Length(1),        // Gutter
-            Constraint::Percentage(30),  // Conversation
+            Constraint::Percentage(30),  // Inference Log
         ])
         .split(area);
 
@@ -266,10 +354,9 @@ pub fn render_pipeline(frame: &mut Frame, area: Rect, state: &DashboardState) {
         .constraints([
             Constraint::Length(1),  // Section header
             Constraint::Length(1),  // Spacer
-            Constraint::Length(3),  // Step 1
-            Constraint::Length(3),  // Step 2
-            Constraint::Length(3),  // Step 3
-            Constraint::Length(3),  // Step 4
+            Constraint::Length(3),  // Step 1: Capture
+            Constraint::Length(3),  // Step 2: GKR Prove
+            Constraint::Length(3),  // Step 3: On-Chain
             Constraint::Length(1),  // Spacer
             Constraint::Min(2),    // Coverage
         ])
@@ -283,27 +370,27 @@ pub fn render_pipeline(frame: &mut Frame, area: Rect, state: &DashboardState) {
         layout[0],
     );
 
+    let pulse_lime = if state.frame_count % 4 < 2 { LIME } else { LIME_DIM };
+
     render_step(frame, layout[2], 1, "CAPTURE",
-        "M31 forward pass · 24 layers",
+        "M31 forward pass",
         state.capture_progress, state.capture_time,
-        state.step.as_u8() >= PipelineStep::Capture.as_u8());
+        state.step.as_u8() >= PipelineStep::Capture.as_u8(),
+        state.step == PipelineStep::Capture, pulse_lime);
 
     render_step(frame, layout[3], 2, "GKR PROVE",
-        "96 matmul sumchecks",
+        "Sumcheck + STARK + Binding",
         state.prove_progress, state.prove_time,
-        state.step.as_u8() >= PipelineStep::Prove.as_u8());
+        state.step.as_u8() >= PipelineStep::GkrProve.as_u8(),
+        state.step == PipelineStep::GkrProve, pulse_lime);
 
-    render_step(frame, layout[4], 3, "RECURSIVE",
-        "STARK compress → 1 TX",
-        state.recursive_progress, state.recursive_time,
-        state.step.as_u8() >= PipelineStep::Recursive.as_u8());
+    render_step(frame, layout[4], 3, "ON-CHAIN",
+        "6-step Starknet verification",
+        state.onchain_progress, state.onchain_time,
+        state.step.as_u8() >= PipelineStep::OnChain.as_u8(),
+        state.step == PipelineStep::OnChain, pulse_lime);
 
-    render_step(frame, layout[5], 4, "VERIFY",
-        "Self-verify + on-chain",
-        state.verify_progress, None,
-        state.step.as_u8() >= PipelineStep::Verify.as_u8());
-
-    // Coverage
+    // Coverage stats
     let coverage = vec![
         Line::from(vec![
             Span::styled("  ", Style::default()),
@@ -318,21 +405,22 @@ pub fn render_pipeline(frame: &mut Frame, area: Rect, state: &DashboardState) {
             Span::styled("  per turn · poseidon merkle · io binding", Style::default().fg(GHOST)),
         ]),
     ];
-    frame.render_widget(Paragraph::new(coverage), layout[7]);
+    frame.render_widget(Paragraph::new(coverage), layout[6]);
 }
 
 fn render_step(
     frame: &mut Frame, area: Rect,
     num: u8, name: &str, desc: &str,
     progress: f64, time: Option<f64>, active: bool,
+    is_current: bool, pulse_color: Color,
 ) {
     let done = progress >= 1.0;
     let running = active && !done && progress > 0.0;
 
     let (icon_color, icon) = if done {
         (EMERALD, CHECK)
-    } else if running {
-        (LIME, ARROW_R)
+    } else if running || is_current {
+        (if is_current { pulse_color } else { LIME }, ARROW_R)
     } else if active {
         (LIME_DIM, ARROW_R)
     } else {
@@ -356,8 +444,8 @@ fn render_step(
     let filled = ((progress * bar_width as f64) as usize).min(bar_width);
     let empty = bar_width.saturating_sub(filled);
 
-    let bar_color = if done { EMERALD } else if active { LIME } else { GHOST };
-    let bar_bg = if active { BG_ACTIVE } else { BG };
+    let bar_color = if done { EMERALD } else if is_current { pulse_color } else if active { LIME } else { GHOST };
+    let _bar_bg = if active { BG_ACTIVE } else { BG };
 
     let bar_str = format!(
         "    {}{}{}",
@@ -383,22 +471,19 @@ pub fn render_crypto(frame: &mut Frame, area: Rect, state: &DashboardState) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),   // Header
+            Constraint::Length(1),   // Commitments header
             Constraint::Length(1),   // Spacer
-            Constraint::Length(3),   // Weight (2 lines for full hash)
-            Constraint::Length(3),   // IO
-            Constraint::Length(3),   // Report
+            Constraint::Length(3),   // Weight hash
+            Constraint::Length(3),   // IO hash
+            Constraint::Length(3),   // Report hash
             Constraint::Length(1),   // Spacer
-            Constraint::Length(1),   // On-chain header
+            Constraint::Length(1),   // On-chain verification header
             Constraint::Length(1),   // Spacer
-            Constraint::Length(12),  // On-chain details (with TX hash)
-            Constraint::Length(1),   // Spacer
-            Constraint::Length(1),   // Tamper header
-            Constraint::Min(4),     // Tamper results
+            Constraint::Min(4),     // Streaming steps + totals
         ])
         .split(area);
 
-    // Section header
+    // Commitments header
     frame.render_widget(
         Paragraph::new(Span::styled(" COMMITMENTS", Style::default().fg(VIOLET).add_modifier(Modifier::BOLD))),
         layout[0],
@@ -408,82 +493,93 @@ pub fn render_crypto(frame: &mut Frame, area: Rect, state: &DashboardState) {
     render_hash_field(frame, layout[3], "IO", &state.io_root);
     render_hash_field(frame, layout[4], "REPORT", &state.report_hash);
 
-    // On-chain header
+    // On-chain verification header
     frame.render_widget(
-        Paragraph::new(Span::styled(" ON-CHAIN", Style::default().fg(EMERALD).add_modifier(Modifier::BOLD))),
+        Paragraph::new(Span::styled(" ON-CHAIN VERIFICATION", Style::default().fg(EMERALD).add_modifier(Modifier::BOLD))),
         layout[6],
     );
 
-    // On-chain details
-    let verified_str = state.verification_count
-        .map(|c| format!("{c} verified"))
-        .unwrap_or_else(|| "pending".into());
-    let verified_color = if state.verification_count.is_some() { EMERALD } else { SLATE };
+    // Streaming steps + totals
+    let mut lines: Vec<Line> = Vec::new();
 
-    // Show full contract address across two lines
-    let contract_mid = state.contract.len() / 2;
-    let mut onchain = vec![
-        Line::from(vec![
-            Span::styled(" verifier ", Style::default().fg(GHOST)),
-        ]),
-        Line::from(vec![
-            Span::styled(format!("  {}", &state.contract[..contract_mid.min(state.contract.len())]), Style::default().fg(EMERALD)),
-        ]),
-        Line::from(vec![
-            Span::styled(format!("  {}", &state.contract[contract_mid.min(state.contract.len())..]), Style::default().fg(EMERALD)),
-        ]),
-        Line::from(vec![
-            Span::styled(" network  ", Style::default().fg(GHOST)),
-            Span::styled(&state.network, Style::default().fg(SILVER)),
-        ]),
-        Line::from(vec![
-            Span::styled(" proofs   ", Style::default().fg(GHOST)),
-            Span::styled(&verified_str, Style::default().fg(verified_color).add_modifier(Modifier::BOLD)),
-        ]),
-        Line::from(vec![
-            Span::styled(" gas est  ", Style::default().fg(GHOST)),
-            Span::styled("~0.21 STRK (2.1M steps)", Style::default().fg(SILVER)),
-        ]),
-        Line::from(vec![
-            Span::styled(" explorer ", Style::default().fg(GHOST)),
-            Span::styled("sepolia.voyager.online", Style::default().fg(VIOLET)),
-        ]),
-    ];
+    for step in &state.streaming_steps {
+        let (icon, icon_color) = match step.status {
+            StepStatus::Pending => (DOT, GHOST),
+            StepStatus::Submitting => (ARROW_R, ORANGE),
+            StepStatus::Confirmed => (CHECK, EMERALD),
+            StepStatus::Failed => (CROSS, RED),
+        };
 
-    if let Some(ref tx) = state.tx_hash {
-        let tx_mid = tx.len() / 2;
-        onchain.push(Line::from(Span::styled(" tx hash  ", Style::default().fg(GHOST))));
-        onchain.push(Line::from(Span::styled(
-            format!("  {}", &tx[..tx_mid.min(tx.len())]), Style::default().fg(EMERALD))));
-        onchain.push(Line::from(Span::styled(
-            format!("  {}", &tx[tx_mid.min(tx.len())..]), Style::default().fg(EMERALD))));
+        let name_color = match step.status {
+            StepStatus::Pending => GHOST,
+            StepStatus::Submitting => ORANGE,
+            StepStatus::Confirmed => EMERALD,
+            StepStatus::Failed => RED,
+        };
+
+        // Line 1: icon + step name
+        let line1 = Line::from(vec![
+            Span::styled(format!(" {icon} "), Style::default().fg(icon_color)),
+            Span::styled(&step.name, Style::default().fg(LILAC)),
+        ]);
+        lines.push(line1);
+
+        // Lines 2-3: TX hash split across two lines to fit in column
+        if let Some(ref tx) = step.tx_hash {
+            let chars: Vec<char> = tx.chars().collect();
+            let mid = chars.len() / 2;
+            let first: String = chars[..mid].iter().collect();
+            let second: String = chars[mid..].iter().collect();
+            lines.push(Line::from(vec![
+                Span::styled("   ", Style::default()),
+                Span::styled(first, Style::default().fg(EMERALD)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("   ", Style::default()),
+                Span::styled(second, Style::default().fg(EMERALD)),
+            ]));
+        }
     }
 
-    let _: Vec<Line> = vec![
-    ];
-    frame.render_widget(Paragraph::new(onchain), layout[8]);
+    // Spacer before totals
+    lines.push(Line::from(Span::styled("", Style::default())));
 
-    // Tamper header
-    frame.render_widget(
-        Paragraph::new(Span::styled(" INTEGRITY", Style::default().fg(RED).add_modifier(Modifier::BOLD))),
-        layout[10],
-    );
+    // Total felts
+    if state.total_felts > 0 {
+        lines.push(Line::from(vec![
+            Span::styled(" felts    ", Style::default().fg(GHOST)),
+            Span::styled(
+                format!("{}", state.total_felts),
+                Style::default().fg(ORANGE).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
 
-    // Tamper results
-    let tamper = vec![
-        tamper_line("io commitment", state.tamper_io),
-        tamper_line("weight commitment", state.tamper_weight),
-        tamper_line("inference output", state.tamper_output),
-        Line::from(vec![
-            Span::styled(format!(" {SHIELD} "), Style::default().fg(EMERALD)),
-            Span::styled("56 adversarial tests", Style::default().fg(EMERALD)),
-        ]),
-    ];
-    frame.render_widget(Paragraph::new(tamper), layout[11]);
+    // Gas cost
+    if let Some(ref gas) = state.gas_used {
+        lines.push(Line::from(vec![
+            Span::styled(" gas      ", Style::default().fg(GHOST)),
+            Span::styled(gas, Style::default().fg(SILVER)),
+        ]));
+    }
+
+    // Tamper detection section
+    lines.push(Line::from(Span::styled("", Style::default())));
+    lines.push(Line::from(Span::styled(" INTEGRITY", Style::default().fg(RED).add_modifier(Modifier::BOLD))));
+
+    lines.push(tamper_line("io commitment", state.tamper_io));
+    lines.push(tamper_line("weight commitment", state.tamper_weight));
+    lines.push(tamper_line("inference output", state.tamper_output));
+    lines.push(Line::from(vec![
+        Span::styled(format!(" {SHIELD} "), Style::default().fg(EMERALD)),
+        Span::styled("56 adversarial tests", Style::default().fg(EMERALD)),
+    ]));
+
+    frame.render_widget(Paragraph::new(lines), layout[8]);
 }
 
 fn render_hash_field(frame: &mut Frame, area: Rect, label: &str, value: &Option<String>) {
-    let placeholder = "··················································";
+    let placeholder = "waiting...";
     let hash = value.as_deref().unwrap_or(placeholder);
 
     // Show as much as possible — split across two lines if needed
@@ -491,22 +587,25 @@ fn render_hash_field(frame: &mut Frame, area: Rect, label: &str, value: &Option<
     let label_width = 8;
     let hash_space = width.saturating_sub(label_width);
 
-    let lines = if hash.len() <= hash_space {
+    let char_count = hash.chars().count();
+    let lines = if char_count <= hash_space {
         vec![Line::from(vec![
             Span::styled(format!(" {label:<7} "), Style::default().fg(SLATE)),
             Span::styled(hash, Style::default().fg(VIOLET)),
         ])]
     } else {
-        // Split hash across two lines — show full hash
-        let mid = hash.len() / 2;
+        // Split hash across two lines using char boundaries
+        let mid_chars = char_count / 2;
+        let first: String = hash.chars().take(mid_chars).collect();
+        let second: String = hash.chars().skip(mid_chars).collect();
         vec![
             Line::from(vec![
                 Span::styled(format!(" {label:<7} "), Style::default().fg(SLATE)),
-                Span::styled(&hash[..mid.min(hash_space)], Style::default().fg(VIOLET)),
+                Span::styled(first, Style::default().fg(VIOLET)),
             ]),
             Line::from(vec![
                 Span::styled("         ", Style::default()),
-                Span::styled(&hash[mid.min(hash_space)..], Style::default().fg(VIOLET)),
+                Span::styled(second, Style::default().fg(VIOLET)),
             ]),
         ]
     };
@@ -557,32 +656,38 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &DashboardState) {
 // ── Footer ──────────────────────────────────────────────────────────
 
 fn render_footer(frame: &mut Frame, area: Rect, state: &DashboardState) {
-    let status = match state.step {
-        PipelineStep::Idle =>      ("IDLE",       GHOST),
-        PipelineStep::Capture =>   ("CAPTURING",  LIME),
-        PipelineStep::Prove =>     ("PROVING",    LIME),
-        PipelineStep::Recursive => ("COMPRESS",   EMERALD),
-        PipelineStep::Verify =>    ("VERIFYING",  VIOLET),
-        PipelineStep::Complete =>  ("VERIFIED",   EMERALD),
+    let (status_text, status_color) = match state.step {
+        PipelineStep::Idle =>     ("IDLE",      GHOST),
+        PipelineStep::Capture =>  ("CAPTURING", LIME),
+        PipelineStep::GkrProve => ("PROVING",   LIME),
+        PipelineStep::OnChain =>  ("ON-CHAIN",  ORANGE),
+        PipelineStep::Complete => ("VERIFIED",  EMERALD),
     };
+
+    let elapsed_str = if state.elapsed_secs > 0 {
+        format!(" {}s", state.elapsed_secs)
+    } else {
+        String::new()
+    };
+
+    // Truncate contract to ~20 chars
+    let contract_short = truncate_hash(&state.contract, 20);
 
     let footer = Line::from(vec![
         Span::styled(" ", Style::default()),
         Span::styled(" ObelyZK ", Style::default().fg(BG).bg(LIME).add_modifier(Modifier::BOLD)),
         Span::styled("  ", Style::default()),
-        Span::styled(status.0, Style::default().fg(status.1).add_modifier(Modifier::BOLD)),
+        Span::styled(status_text, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+        Span::styled(&elapsed_str, Style::default().fg(ORANGE)),
         Span::styled("  ", Style::default()),
-        Span::styled(
-            format!("{}in {}out  ", state.tokens_in, state.tokens_out),
-            Style::default().fg(SLATE),
-        ),
-        Span::styled(
-            format!("{} turns", state.num_turns),
-            Style::default().fg(SLATE),
-        ),
-        Span::styled("                    ", Style::default()),
+        Span::styled(&contract_short, Style::default().fg(VIOLET)),
+        Span::styled("  ", Style::default()),
+        Span::styled(&state.network, Style::default().fg(SLATE)),
+        Span::styled("              ", Style::default()),
         Span::styled("q", Style::default().fg(LIME)),
-        Span::styled(" exit", Style::default().fg(GHOST)),
+        Span::styled(" exit  ", Style::default().fg(GHOST)),
+        Span::styled("p", Style::default().fg(LIME)),
+        Span::styled(" prove", Style::default().fg(GHOST)),
     ]);
 
     frame.render_widget(

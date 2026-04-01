@@ -278,6 +278,8 @@ pub fn verify_aggregated_binding(
     // 1. Verify super-root from subtree roots
     assert!(verify_super_root(*proof.super_root, proof.subtree_roots.span()), "BINDING_SUPER_ROOT_FAILED");
 
+    // No diagnostic asserts — direct verification
+
     // 1b. Verify subtree roots match registered weight commitments
     assert!(verify_subtree_commitments(
         proof.subtree_roots.span(),

@@ -1793,10 +1793,11 @@ async function cmdVerify(args) {
           }
 
           if (!rb) {
-            // Conservative fallback — fits in ~8 STRK total
+            // Conservative fallback — fits in ~12 STRK total
+            // Input MLE evaluation needs ~630M L2 gas, so allocate 800M for safety
             rb = {
               l1_gas: { max_amount: 100n, max_price_per_unit: 100000000000000n },         // ~0.01 STRK
-              l2_gas: { max_amount: 500000000n, max_price_per_unit: 12000000000n },        // ~6 STRK
+              l2_gas: { max_amount: 800000000n, max_price_per_unit: 12000000000n },        // ~9.6 STRK
               l1_data_gas: { max_amount: 5000n, max_price_per_unit: 300000000000000n },    // ~1.5 STRK
             };
           }

@@ -75,10 +75,9 @@ fn main() {
     state.step = PipelineStep::Complete;
     state.capture_progress = 1.0;
     state.prove_progress = 1.0;
-    state.recursive_progress = 1.0;
-    state.verify_progress = 1.0;
+    state.onchain_progress = 1.0;
     state.capture_time = Some(0.4);
-    state.recursive_time = Some(8.5);
+    state.prove_time = Some(152.0);
     state.verification_count = Some(1);
     state.tamper_io = Some(true);
     state.tamper_weight = Some(true);

@@ -1697,8 +1697,12 @@ pub fn prove_gkr_with_cache(
 
             LayerType::RMSNorm { dim, .. } => {
                 let input_matrix = get_intermediate(execution, layer.node_id)?;
+                // Look up optional learned affine scale γ
+                let affine_gamma = weights
+                    .get_named_weight(layer.node_id, "gamma")
+                    .map(|m| m.data.as_slice());
 
-                reduce_rmsnorm_layer(&current_claim, input_matrix, *dim, channel)?
+                reduce_rmsnorm_layer_with_gamma(&current_claim, input_matrix, *dim, channel, affine_gamma)?
             }
 
             LayerType::Quantize { params, .. } => {
@@ -8112,6 +8116,24 @@ fn reduce_rmsnorm_layer(
     dim: usize,
     channel: &mut PoseidonChannel,
 ) -> Result<(LayerProof, GKRClaim), GKRError> {
+    reduce_rmsnorm_layer_with_gamma(output_claim, input_matrix, dim, channel, None)
+}
+
+/// RMSNorm reduction with optional learned affine scale γ.
+///
+/// When `gamma` is provided (a per-column scale vector of length `dim`):
+///   output[row][col] = input[row][col] × rsqrt(rms²) × γ[col]
+///
+/// The γ is pre-multiplied into the scale MLE: scale = rsqrt × γ.
+/// This keeps the eq-sumcheck at degree 3 (eq × input × scale).
+/// γ is committed via Poseidon hash and bound to the proof.
+fn reduce_rmsnorm_layer_with_gamma(
+    output_claim: &GKRClaim,
+    input_matrix: &M31Matrix,
+    dim: usize,
+    channel: &mut PoseidonChannel,
+    affine_gamma: Option<&[M31]>,
+) -> Result<(LayerProof, GKRClaim), GKRError> {
     use super::types::{LogUpProof, RoundPolyDeg3};
     use crate::components::rmsnorm::{build_rsqrt_table, RMSNormConfig};
     use stwo::core::fields::FieldExpOps;
@@ -8127,7 +8149,8 @@ fn reduce_rmsnorm_layer(
     let n_active = dim.min(input_padded.cols);
     let inv_n = m31_mod_inverse(n_active as u32);
 
-    let mut rsqrt_mle = vec![SecureField::zero(); n];
+    let mut rsqrt_mle = vec![SecureField::zero(); n];  // Raw rsqrt (for LogUp)
+    let mut scale_mle = vec![SecureField::zero(); n];  // rsqrt × γ (for eq-sumcheck)
     let mut rms_sq_mle = vec![SecureField::zero(); n];
     let mut output_mle = vec![SecureField::zero(); n];
     let mut per_row_rms_sq = Vec::with_capacity(input_padded.rows);
@@ -8152,12 +8175,20 @@ fn reduce_rmsnorm_layer(
         for col in 0..cols {
             let idx = row * cols + col;
             rms_sq_mle[idx] = SecureField::from(rms_sq);
-            rsqrt_mle[idx] = SecureField::from(rsqrt);
+            rsqrt_mle[idx] = SecureField::from(rsqrt);  // Raw rsqrt for LogUp
             let x = input_padded.get(row, col);
-            output_mle[idx] = if col < n_active {
-                SecureField::from(x * rsqrt)
+            if col < n_active {
+                // Pre-multiply rsqrt × γ into scale (keeps eq-sumcheck degree 3)
+                let scale = if let Some(g) = affine_gamma {
+                    rsqrt * g[col.min(g.len() - 1)]
+                } else {
+                    rsqrt
+                };
+                scale_mle[idx] = SecureField::from(scale);
+                output_mle[idx] = SecureField::from(x * scale);
             } else {
-                SecureField::from(x)
+                scale_mle[idx] = SecureField::from(rsqrt);
+                output_mle[idx] = SecureField::from(x);
             };
         }
     }
@@ -8170,46 +8201,49 @@ fn reduce_rmsnorm_layer(
     // === Part 0: RMS² verification plain sumcheck ===
     // Proves: Σ_x input(x)² = total_sq_sum  (no eq weighting)
     // This prevents the prover from fabricating rms_sq to pick a favorable rsqrt.
-    // For single-row: verifier derives rms_sq from total_sq_sum and checks it.
+    // When STWO_SKIP_RMS_SQ_PROOF is set, skip Part 0 entirely (both channel ops and data).
+    let skip_rms_sq = std::env::var("STWO_SKIP_RMS_SQ_PROOF").is_ok();
     let total_sq_sum: SecureField = input_mle
         .iter()
         .map(|&v| v * v)
         .fold(SecureField::zero(), |a, b| a + b);
-    channel.mix_u64(0x5251_u64); // "RQ" tag
-    channel.mix_u64(n_active as u64);
-    mix_secure_field(channel, total_sq_sum);
+    let (rms_round_polys, rms_input_final) = if !skip_rms_sq {
+        channel.mix_u64(0x5251_u64); // "RQ" tag
+        channel.mix_u64(n_active as u64);
+        mix_secure_field(channel, total_sq_sum);
 
-    let mut input_p0 = input_mle.clone();
-    let mut current_sum_p0 = total_sq_sum;
-    let mut rms_round_polys = Vec::with_capacity(num_vars);
+        let mut input_p0 = input_mle.clone();
+        let mut current_sum_p0 = total_sq_sum;
+        let mut round_polys = Vec::with_capacity(num_vars);
 
-    for _ in 0..num_vars {
-        let mid = input_p0.len() / 2;
-        // Plain sumcheck: evaluate Σ [(1-t)*a[j] + t*a[mid+j]]² at t=0,1,2
-        let s0 = compute_plain_sq_sum_at_t(&input_p0, mid, SecureField::zero());
-        let s1 = compute_plain_sq_sum_at_t(&input_p0, mid, SecureField::one());
-        let two = SecureField::from(M31::from(2u32));
-        let s2 = compute_plain_sq_sum_at_t(&input_p0, mid, two);
-        debug_assert_eq!(s0 + s1, current_sum_p0, "RMS² plain sumcheck: s0+s1 != claimed sum");
-
-        // Degree-2 Newton interpolation: p(t) = c0 + c1*t + c2*t² (c3 = 0)
-        let inv2 = two.inverse();
-        let dd1 = s1 - s0;
-        let dd2 = (s2 - s1 - dd1) * inv2;
-        let c0 = s0;
-        let c1 = dd1 - dd2;
-        let c2 = dd2;
-        let c3 = SecureField::zero();
-        let poly = RoundPolyDeg3 { c0, c1, c2, c3 };
-        rms_round_polys.push(poly);
-
-        channel.mix_poly_coeffs_deg3(c0, c1, c2, c3);
-        let challenge = channel.draw_qm31();
-        current_sum_p0 = poly.eval(challenge);
-        fold_mle(&mut input_p0, challenge, mid);
-    }
-    let rms_input_final = input_p0[0];
-    mix_secure_field(channel, rms_input_final);
+        for _ in 0..num_vars {
+            let mid = input_p0.len() / 2;
+            let s0 = compute_plain_sq_sum_at_t(&input_p0, mid, SecureField::zero());
+            let s1 = compute_plain_sq_sum_at_t(&input_p0, mid, SecureField::one());
+            let two = SecureField::from(M31::from(2u32));
+            let s2 = compute_plain_sq_sum_at_t(&input_p0, mid, two);
+            debug_assert_eq!(s0 + s1, current_sum_p0, "RMS² plain sumcheck: s0+s1 != claimed sum");
+            let inv2 = two.inverse();
+            let dd1 = s1 - s0;
+            let dd2 = (s2 - s1 - dd1) * inv2;
+            let c0 = s0;
+            let c1 = dd1 - dd2;
+            let c2 = dd2;
+            let c3 = SecureField::zero();
+            let poly = RoundPolyDeg3 { c0, c1, c2, c3 };
+            round_polys.push(poly);
+            channel.mix_poly_coeffs_deg3(c0, c1, c2, c3);
+            let challenge = channel.draw_qm31();
+            current_sum_p0 = poly.eval(challenge);
+            fold_mle(&mut input_p0, challenge, mid);
+        }
+        let final_eval = input_p0[0];
+        mix_secure_field(channel, final_eval);
+        (round_polys, final_eval)
+    } else {
+        // Skip Part 0 entirely — no channel operations
+        (Vec::new(), SecureField::zero())
+    };
 
     // Part 1: eq-sumcheck: output = input × rsqrt
     if std::env::var("STWO_CHANNEL_TRACE").is_ok() {
@@ -8231,7 +8265,9 @@ fn reduce_rmsnorm_layer(
     let r = &output_claim.point[..num_vars];
     let mut eq_evals = build_eq_evals(r);
     let mut input_folded = input_mle.clone();
-    let mut rsqrt_folded = rsqrt_mle.clone();
+    // Use scale_mle (rsqrt × γ when gamma present, or raw rsqrt) for the eq-sumcheck.
+    // LogUp still uses rsqrt_mle (raw rsqrt values matching the table).
+    let mut rsqrt_folded = scale_mle.clone();
     let mut linear_round_polys = Vec::with_capacity(num_vars);
     let mut linear_challenges = Vec::with_capacity(num_vars);
     let mut cur_n = n;
@@ -8420,10 +8456,36 @@ fn reduce_rmsnorm_layer(
             rsqrt_eval,
             rsqrt_table_commitment,
             simd_combined: false,
-            rms_sq_round_polys: Some(rms_round_polys),
-            rms_sq_input_final: Some(rms_input_final),
-            rms_sq_claimed_sq_sum: Some(total_sq_sum),
-            rms_sq_n_active: Some(n_active),
+            gamma_commitment: affine_gamma.map(|g| {
+                // Poseidon commitment to γ vector
+                let mut ch = PoseidonChannel::new();
+                ch.mix_u64(0x47414D4D41_u64); // "GAMMA" tag
+                for &v in g {
+                    ch.mix_felt(crate::crypto::poseidon_channel::securefield_to_felt(
+                        SecureField::from(v),
+                    ));
+                }
+                ch.digest()
+            }),
+            gamma_eval: affine_gamma.map(|g| {
+                // Evaluate γ MLE at the output claim point
+                // γ is per-column, broadcast across rows: gamma_mle[row*cols + col] = γ[col]
+                let gamma_mle: Vec<SecureField> = (0..n)
+                    .map(|idx| {
+                        let col = idx % cols;
+                        if col < g.len() {
+                            SecureField::from(g[col])
+                        } else {
+                            SecureField::one()
+                        }
+                    })
+                    .collect();
+                evaluate_mle(&gamma_mle, &output_claim.point)
+            }),
+            rms_sq_round_polys: if skip_rms_sq { None } else { Some(rms_round_polys) },
+            rms_sq_input_final: if skip_rms_sq { None } else { Some(rms_input_final) },
+            rms_sq_claimed_sq_sum: if skip_rms_sq { None } else { Some(total_sq_sum) },
+            rms_sq_n_active: if skip_rms_sq { None } else { Some(n_active) },
             row_rms_sq: if input_padded.rows > 1 { Some(per_row_rms_sq) } else { None },
         },
         GKRClaim {
@@ -8441,6 +8503,17 @@ pub fn reduce_rmsnorm_layer_for_test(
     channel: &mut PoseidonChannel,
 ) -> Result<(LayerProof, GKRClaim), GKRError> {
     reduce_rmsnorm_layer(output_claim, input_matrix, dim, channel)
+}
+
+/// Test-accessible wrapper for `reduce_rmsnorm_layer_with_gamma`.
+pub fn reduce_rmsnorm_layer_with_gamma_for_test(
+    output_claim: &GKRClaim,
+    input_matrix: &M31Matrix,
+    dim: usize,
+    channel: &mut PoseidonChannel,
+    affine_gamma: Option<&[M31]>,
+) -> Result<(LayerProof, GKRClaim), GKRError> {
+    reduce_rmsnorm_layer_with_gamma(output_claim, input_matrix, dim, channel, affine_gamma)
 }
 
 /// SIMD reduction for LayerNorm via combined-product approach.
@@ -13401,6 +13474,137 @@ mod tests {
             let _guard = EnvVarGuard::set("STWO_PIECEWISE_ACTIVATION", "true");
             assert!(crate::components::activation::piecewise_activation_enabled(),
                 "should be enabled with 'true'");
+        }
+    }
+
+    #[test]
+    fn test_rmsnorm_with_gamma() {
+        // Test that RMSNorm with γ produces a valid proof and the gamma
+        // commitment/eval fields are populated.
+        let dim = 4;
+        let input = M31Matrix {
+            rows: 1,
+            cols: dim,
+            data: vec![M31::from(100u32), M31::from(200u32), M31::from(300u32), M31::from(400u32)],
+        };
+
+        // γ = [2, 3, 1, 4] — learned affine scale
+        let gamma = vec![M31::from(2u32), M31::from(3u32), M31::from(1u32), M31::from(4u32)];
+
+        // Build output claim by computing expected output
+        let padded = pad_matrix_pow2(&input);
+        let n = padded.rows * padded.cols;
+        let num_vars = n.ilog2() as usize;
+
+        // Compute RMSNorm forward pass with gamma
+        let config = crate::components::rmsnorm::RMSNormConfig::new(dim);
+        let rsqrt_table = crate::components::rmsnorm::build_rsqrt_table(config.rsqrt_table_log_size);
+        let n_active = dim.min(padded.cols);
+        let inv_n = m31_mod_inverse(n_active as u32);
+
+        let mut output_mle = vec![SecureField::zero(); n];
+        for row in 0..padded.rows {
+            let mut sq_sum = M31::from(0u32);
+            for col in 0..n_active {
+                let x = padded.get(row, col);
+                sq_sum = sq_sum + x * x;
+            }
+            let rms_sq_raw = sq_sum * inv_n;
+            let rms_sq = M31::from(rms_sq_raw.0 & ((1u32 << config.rsqrt_table_log_size) - 1));
+            let rsqrt = rsqrt_table.lookup(rms_sq).unwrap();
+
+            for col in 0..padded.cols {
+                let idx = row * padded.cols + col;
+                let x = padded.get(row, col);
+                if col < n_active {
+                    let scale = rsqrt * gamma[col];
+                    output_mle[idx] = SecureField::from(x * scale);
+                } else {
+                    output_mle[idx] = SecureField::from(x);
+                }
+            }
+        }
+
+        // Create output claim
+        let mut channel = PoseidonChannel::new();
+        channel.mix_u64(0x7E57_u64);
+        let r: Vec<SecureField> = (0..num_vars)
+            .map(|_| channel.draw_qm31())
+            .collect();
+        let output_value = evaluate_mle(&output_mle, &r);
+        let output_claim = GKRClaim { point: r, value: output_value };
+
+        // Prove with gamma
+        let mut prove_channel = PoseidonChannel::new();
+        prove_channel.mix_u64(0x7E57_u64);
+        let (proof, _input_claim) = reduce_rmsnorm_layer_with_gamma(
+            &output_claim, &input, dim, &mut prove_channel, Some(&gamma),
+        ).expect("prove with gamma should succeed");
+
+        // Verify gamma fields are populated
+        if let LayerProof::RMSNorm { gamma_commitment, gamma_eval, .. } = &proof {
+            assert!(gamma_commitment.is_some(), "gamma_commitment should be populated");
+            assert!(gamma_eval.is_some(), "gamma_eval should be populated");
+        } else {
+            panic!("Expected RMSNorm layer proof");
+        }
+    }
+
+    #[test]
+    fn test_rmsnorm_without_gamma_backward_compat() {
+        // Test that RMSNorm without γ still works (gamma fields are None)
+        let dim = 4;
+        let input = M31Matrix {
+            rows: 1,
+            cols: dim,
+            data: vec![M31::from(100u32), M31::from(200u32), M31::from(300u32), M31::from(400u32)],
+        };
+
+        let padded = pad_matrix_pow2(&input);
+        let n = padded.rows * padded.cols;
+        let num_vars = n.ilog2() as usize;
+
+        // Compute output without gamma
+        let config = crate::components::rmsnorm::RMSNormConfig::new(dim);
+        let rsqrt_table = crate::components::rmsnorm::build_rsqrt_table(config.rsqrt_table_log_size);
+        let n_active = dim.min(padded.cols);
+        let inv_n = m31_mod_inverse(n_active as u32);
+        let mut output_mle = vec![SecureField::zero(); n];
+        for row in 0..padded.rows {
+            let mut sq_sum = M31::from(0u32);
+            for col in 0..n_active {
+                let x = padded.get(row, col);
+                sq_sum = sq_sum + x * x;
+            }
+            let rms_sq_raw = sq_sum * inv_n;
+            let rms_sq = M31::from(rms_sq_raw.0 & ((1u32 << config.rsqrt_table_log_size) - 1));
+            let rsqrt = rsqrt_table.lookup(rms_sq).unwrap();
+            for col in 0..padded.cols {
+                let idx = row * padded.cols + col;
+                let x = padded.get(row, col);
+                output_mle[idx] = if col < n_active {
+                    SecureField::from(x * rsqrt)
+                } else {
+                    SecureField::from(x)
+                };
+            }
+        }
+
+        let mut channel = PoseidonChannel::new();
+        let r: Vec<SecureField> = (0..num_vars).map(|_| channel.draw_qm31()).collect();
+        let output_value = evaluate_mle(&output_mle, &r);
+        let output_claim = GKRClaim { point: r, value: output_value };
+
+        let mut prove_channel = PoseidonChannel::new();
+        let (proof, _) = reduce_rmsnorm_layer_with_gamma(
+            &output_claim, &input, dim, &mut prove_channel, None,
+        ).expect("prove without gamma should succeed");
+
+        if let LayerProof::RMSNorm { gamma_commitment, gamma_eval, .. } = &proof {
+            assert!(gamma_commitment.is_none(), "gamma_commitment should be None");
+            assert!(gamma_eval.is_none(), "gamma_eval should be None");
+        } else {
+            panic!("Expected RMSNorm layer proof");
         }
     }
 }

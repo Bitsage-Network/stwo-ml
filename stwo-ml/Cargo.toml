@@ -17,6 +17,7 @@ onnx = ["dep:tract-onnx"]
 safetensors = ["dep:safetensors"]
 model-loading = ["onnx", "safetensors"]
 tokenizer = ["dep:tokenizers"]
+binary-proof = ["serde", "dep:bincode"]
 audit = ["serde", "dep:serde_json", "dep:crossbeam", "dep:getrandom"]
 audit-http = ["audit", "dep:ureq", "dep:sha3"]
 aes-fallback = ["audit", "dep:aes-gcm"]
@@ -41,6 +42,7 @@ itertools = "0.12"
 num-traits = "0.2"
 rayon = "1.10"
 serde = { version = "1", features = ["derive"], optional = true }
+bincode = { version = "1", optional = true }
 starknet-crypto = { version = "0.6.2", default-features = false, features = ["alloc"] }
 starknet-ff = { version = "0.3.7", default-features = false, features = ["alloc", "serde"] }
 tract-onnx = { version = "0.21", optional = true, default-features = false }

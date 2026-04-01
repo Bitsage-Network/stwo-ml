@@ -15,6 +15,26 @@ Verifies STWO ML proofs — GKR model walk with per-layer sumchecks, LogUp looku
 
 ## Verified On-Chain (Starknet Sepolia)
 
+### Full GKR Streaming Verification — 6/6 TX SUCCEEDED (March 2026)
+
+First-ever full GKR streaming proof verification of ML inference on Starknet. Model: Qwen2-0.5B, 1 transformer layer (8 GKR layers: 3 RMSNorm + 4 MatMul + 1 SiLU). Streaming v25 protocol, 5,526 felts calldata.
+
+| Step | Entrypoint | TX Hash | Status |
+|------|-----------|---------|--------|
+| 1 | `verify_gkr_stream_init` | [`0x5493...1a1`](https://sepolia.starkscan.co/tx/0x5493310a8e2deb5d2f25b07e2402e84692aaf5926141b5acc203a1892a181a1) | SUCCEEDED |
+| 2 | `verify_gkr_stream_output_mle` | [`0x7cab...7e`](https://sepolia.starkscan.co/tx/0x7cabd35f5382c11334c6509e40b7a758ccd7e03e83e75b66a3c569f5d7b7a7e) | SUCCEEDED |
+| 3 | `verify_gkr_stream_layers` | [`0x5346...918`](https://sepolia.starkscan.co/tx/0x53465edc957c5f8a6054739a0633beecf814ee37e3e22c23a570448a5be5918) | SUCCEEDED |
+| 4 | `verify_gkr_stream_weight_binding` | [`0x5f54...3fc`](https://sepolia.starkscan.co/tx/0x5f549a1e6cc1ebefea3615c2458cdd0fd8f45fd505bf72e5b9dd8417c9be3fc) | SUCCEEDED |
+| 5 | `verify_gkr_stream_input_mle` | [`0x2395...bab`](https://sepolia.starkscan.co/tx/0x239545b66f94387a3d1b5dbc55dedba6b7de1d5384f1930e77e152a986d5bab) | SUCCEEDED |
+| 6 | `verify_gkr_stream_finalize` | [`0x4b08...a41`](https://sepolia.starkscan.co/tx/0x4b081156d4be88ea159533223d2597d76cd3f99911501d8326e156f12051a41) | SUCCEEDED |
+
+**Contract**: [`0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005`](https://sepolia.starkscan.co/contract/0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005)
+**Class hash (v39)**: `0x0473c81da9df0522f5c239f022889f7730ef866fb97e4f092ad1e8793fb22feb`
+
+**Technical stack**: STWO Circle STARKs, GKR sumcheck over M31, Poseidon252 Fiat-Shamir channel, aggregated weight binding with Poseidon Merkle trees, LogUp STARK proofs for activation/normalization layers.
+
+### Earlier Verification Milestones
+
 | Model | Architecture | Layers Verified | Tx Status |
 |-------|-------------|-----------------|-----------|
 | **D8** | Single MatMul | MatMul | Accepted on L2 |
@@ -28,7 +48,8 @@ Verifies STWO ML proofs — GKR model walk with per-layer sumchecks, LogUp looku
 
 | Version | Address | Class Hash | Features |
 |---------|---------|------------|----------|
-| **v12 (Current)** | [`0x0121d1...c005`](https://sepolia.starkscan.co/contract/0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005) | `0x46016a...ffa7` | Packed QM31 single-TX entrypoint (`verify_model_gkr_v4_packed`), ~3.3x calldata reduction |
+| **v39 (Current)** | [`0x0121d1...c005`](https://sepolia.starkscan.co/contract/0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005) | `0x0473c8...2feb` | 6-step streaming GKR verification (v25 protocol), aggregated weight binding, full ML inference verified on-chain |
+| v12 | [`0x0121d1...c005`](https://sepolia.starkscan.co/contract/0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005) | `0x46016a...ffa7` | Packed QM31 single-TX entrypoint (`verify_model_gkr_v4_packed`), ~3.3x calldata reduction |
 | v11 | [`0x0121d1...c005`](https://sepolia.starkscan.co/contract/0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005) | `0x08a5b7...c527` | Subtree commitment fix, zero-tree cache, input validation, deprecated modes removed |
 | v10 | [`0x0121d1...c005`](https://sepolia.starkscan.co/contract/0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005) | `0x644792...e273` | GKR v4 path, deferred proofs, all layer types, 5-min upgrade |
 | v4 | [`0x0068c7...86eb7`](https://sepolia.starkscan.co/contract/0x0068c7023d6edcb1c086bed57e0ce2b3b5dd007f50f0d6beaec3e57427c86eb7) | `0x3b870a...79a56` | Sumcheck, batch, GKR, unified, direct, upgrade |

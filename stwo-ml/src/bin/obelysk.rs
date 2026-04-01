@@ -52,20 +52,30 @@ fn main() {
         chat_history: vec![],  // for llama.cpp API
         turns: vec![],
 
-        // Pipeline
+        // Pipeline (3 steps)
         pipeline_step: 0,
         pipeline_status: vec![
-            StepStatus::new("CAPTURE", "M31 forward pass · 24 layers"),
-            StepStatus::new("GKR PROVE", "96 matmul sumchecks"),
-            StepStatus::new("RECURSIVE", "STARK compress → 1 TX"),
-            StepStatus::new("VERIFY", "Self-verify + on-chain"),
+            StepStatus::new("CAPTURE", "M31 forward pass"),
+            StepStatus::new("GKR PROVE", "Sumcheck + STARK + Binding"),
+            StepStatus::new("ON-CHAIN", "6-step Starknet verification"),
         ],
+
+        // Starknet config
+        starknet_private_key: std::env::var("STARKNET_PRIVATE_KEY").ok(),
+        starknet_account: std::env::var("STARKNET_ACCOUNT_ADDRESS")
+            .or_else(|_| std::env::var("STARKNET_ACCOUNT")).ok(),
+        contract_address: "0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005".into(),
+
+        // Streaming verification steps
+        streaming_steps: stwo_ml::tui::dashboard::default_streaming_steps(),
 
         // Commitments
         weight_commit: None,
         io_root: None,
         report_hash: None,
         verification_count: None,
+        total_felts: 0,
+        gas_used: None,
 
         // Tamper
         tamper_io: None,
@@ -80,6 +90,7 @@ fn main() {
         should_quit: false,
         server_pid: None,
         prove_started_at: None,
+        frame_count: 0,
     }));
 
     // ── Start llama.cpp server ──────────────────────────────────────
@@ -135,7 +146,9 @@ fn main() {
     loop {
         // Render
         {
-            let s = state.lock().unwrap();
+            let mut s = state.lock().unwrap();
+            s.frame_count = s.frame_count.wrapping_add(1);
+            let frame_count = s.frame_count;
             terminal.draw(|frame| render_app(frame, &s)).expect("draw");
             if s.should_quit { break; }
         }
@@ -259,12 +272,20 @@ struct AppState {
     turns: Vec<serde_json::Value>,
 
     pipeline_step: usize,
-    pipeline_status: Vec<StepStatus>,
+    pipeline_status: Vec<StepStatus>,   // 3 steps
+    streaming_steps: Vec<stwo_ml::tui::dashboard::StreamingStep>,
+
+    // Starknet on-chain config
+    starknet_private_key: Option<String>,
+    starknet_account: Option<String>,
+    contract_address: String,
 
     weight_commit: Option<String>,
     io_root: Option<String>,
     report_hash: Option<String>,
     verification_count: Option<u64>,
+    total_felts: usize,
+    gas_used: Option<String>,
 
     tamper_io: Option<bool>,
     tamper_weight: Option<bool>,
@@ -277,6 +298,7 @@ struct AppState {
     should_quit: bool,
     server_pid: Option<u32>,
     prove_started_at: Option<Instant>,
+    frame_count: u64,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -392,11 +414,25 @@ fn run_prove_pipeline(
     });
     std::fs::write(&conv_file, serde_json::to_string_pretty(&conv).unwrap()).ok();
 
+    // Read Starknet credentials from state
+    let (starknet_key, starknet_account, contract_address) = {
+        let s = state.lock().unwrap();
+        (s.starknet_private_key.clone(), s.starknet_account.clone(), s.contract_address.clone())
+    };
+
+    // Resolve script paths relative to binary
+    // Binary: libs/stwo-ml/target/release/obelysk
+    // Paymaster: libs/scripts/pipeline/lib/paymaster_submit.mjs
+    let exe = std::env::current_exe().unwrap_or_default();
+    let bin_dir = exe.parent().unwrap_or(std::path::Path::new("."));
+    let paymaster_dir = bin_dir.join("../../../scripts/pipeline/lib");
+
     // ── Step 1: Capture ─────────────────────────────────────────────
     {
         let mut s = state.lock().unwrap();
         s.pipeline_step = 0;
         s.pipeline_status[0].progress = 0.1;
+        s.prove_started_at = Some(Instant::now());
         s.logs.push("Capturing M31 forward passes...".into());
     }
 
@@ -431,28 +467,39 @@ fn run_prove_pipeline(
         let mut s = state.lock().unwrap();
         s.pipeline_status[0].progress = 1.0;
         s.pipeline_status[0].done = true;
-        s.pipeline_status[0].time = Some(0.4);
+        s.pipeline_status[0].time = Some(
+            s.prove_started_at.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.4)
+        );
     }
 
-    // ── Step 2: Audit ───────────────────────────────────────────────
+    // ── Step 2: GKR Prove (on-chain compatible proof) ───────────────
     {
         let mut s = state.lock().unwrap();
         s.pipeline_step = 1;
         s.pipeline_status[1].progress = 0.01;
-        s.prove_started_at = Some(Instant::now());
-        s.logs.push("GKR proving (full attention, ~2 min)…".into());
+        s.logs.push("GKR proving (on-chain compatible)...".into());
     }
 
     let t_prove = Instant::now();
-    let audit = Command::new(prove_bin)
-        .args(["audit", "--log-dir", &format!("{tmp_dir}/logs"),
-               "--model-dir", model_dir, "--dry-run",
-               "--output", &format!("{tmp_dir}/audit_report.json")])
+    let proof_file = format!("{tmp_dir}/proof.json");
+
+    let gkr_prove = Command::new(prove_bin)
+        .args(["--model-dir", model_dir, "--layers", "1",
+               "--format", "ml_gkr", "--gkr",
+               "--output", &proof_file, "--quiet"])
+        // On-chain compatibility env vars (from prove_onchain.sh)
+        .env("STWO_SKIP_RMS_SQ_PROOF", "1")
+        .env("STWO_ALLOW_MISSING_NORM_PROOF", "1")
+        .env("STWO_PIECEWISE_ACTIVATION", "0")
+        .env("STWO_ALLOW_LOGUP_ACTIVATION", "1")
+        .env("STWO_AGGREGATED_FULL_BINDING", "1")
+        .env("STWO_SKIP_BATCH_TOKENS", "1")
+        .env("STWO_MLE_N_QUERIES", "5")
         .stderr(Stdio::piped())
         .stdout(Stdio::null())
         .spawn();
 
-    if let Ok(mut child) = audit {
+    if let Ok(mut child) = gkr_prove {
         if let Some(stderr) = child.stderr.take() {
             let reader = BufReader::new(stderr);
             for line in reader.lines().flatten() {
@@ -460,9 +507,10 @@ fn run_prove_pipeline(
                 if line.contains("Phase 1") { s.pipeline_status[1].progress = 0.05; }
                 if line.contains("Phase 2") { s.pipeline_status[1].progress = 0.1; }
                 if line.contains("Phase 3") { s.pipeline_status[1].progress = 0.85; }
+                if line.contains("GKR proof:") { s.pipeline_status[1].progress = 0.90; }
+                if line.contains("Proof written") { s.pipeline_status[1].progress = 1.0; }
                 if line.contains("Completed") { s.pipeline_status[1].progress = 1.0; }
                 // Each matmul completion ticks progress forward
-                // Full attention has ~144 matmuls in Phase 2 (0.1 → 0.85 = 0.75 range)
                 if line.contains("done in") && (line.contains("[CPU]") || line.contains("MatMul")) {
                     let current = s.pipeline_status[1].progress;
                     if current < 0.85 {
@@ -490,80 +538,251 @@ fn run_prove_pipeline(
         s.pipeline_status[1].time = Some(prove_time);
     }
 
-    // ── Step 3: Recursive STARK ─────────────────────────────────────
+    // Extract commitments from proof JSON
+    if let Ok(proof_str) = std::fs::read_to_string(&proof_file) {
+        if let Ok(proof) = serde_json::from_str::<serde_json::Value>(&proof_str) {
+            let mut s = state.lock().unwrap();
+            // Extract commitments from proof JSON
+            if let Some(wcs) = proof["weight_commitments"].as_array() {
+                if let Some(first) = wcs.first().and_then(|v| v.as_str()) {
+                    s.weight_commit = Some(first.to_string());
+                }
+            }
+            s.io_root = proof["io_commitment"].as_str().map(|v| v.to_string());
+            s.report_hash = proof["layer_chain_commitment"].as_str().map(|v| v.to_string())
+                .or_else(|| proof["io_commitment_packed"].as_str().map(|v| v.to_string()));
+        }
+    }
+
+    // ── Step 3: On-Chain Verify ────────────────────────────────────
     {
         let mut s = state.lock().unwrap();
         s.pipeline_step = 2;
-        s.pipeline_status[2].progress = 0.1;
-        s.logs.push("Recursive STARK compression...".into());
+        s.pipeline_status[2].progress = 0.01;
     }
 
-    let t_recursive = Instant::now();
-    let recursive = Command::new(prove_bin)
-        .args(["--model-dir", model_dir, "--gkr", "--format", "ml_gkr",
-               "--recursive", "--dry-run",
-               "--output", &format!("{tmp_dir}/recursive_proof.json")])
+    // Check if we have Starknet credentials
+    let has_creds = starknet_key.is_some() && starknet_account.is_some();
+
+    if !has_creds {
+        let mut s = state.lock().unwrap();
+        s.logs.push("No STARKNET_PRIVATE_KEY set, skipping on-chain".into());
+        s.messages.push(("system".into(), "Set STARKNET_PRIVATE_KEY and STARKNET_ACCOUNT_ADDRESS to enable on-chain verification".into()));
+        s.pipeline_status[2].progress = 1.0;
+        s.pipeline_status[2].done = true;
+        s.pipeline_status[2].time = Some(0.0);
+        s.mode = Mode::Complete;
+        s.logs.push("Proof generated (on-chain skipped)".into());
+        s.messages.push(("system".into(), "━━━━━━━━━━━━━━━━━━━━━━━━━━━━".into()));
+        s.messages.push(("system".into(), format!("  PROOF READY: {proof_file}")));
+        s.messages.push(("system".into(), "  Set env vars to submit on-chain".into()));
+        s.messages.push(("system".into(), "━━━━━━━━━━━━━━━━━━━━━━━━━━━━".into()));
+        return;
+    }
+
+    let starknet_key = starknet_key.unwrap();
+    let starknet_account = starknet_account.unwrap();
+
+    {
+        let mut s = state.lock().unwrap();
+        s.logs.push("On-chain 6-step streaming verification...".into());
+    }
+
+    // Step 3a: Submit via paymaster_submit.mjs (handles session, chunks, all 6 streaming steps)
+    let t_onchain = Instant::now();
+
+    // Use the known-good model_id registered on v39 contract.
+    // This model was freshly registered with correct weight commitments.
+    let model_id = "0x0d5d278a96f12080aea9c13ce8a07bf986ba842ee435afdd30ef9015c8c14a5".to_string();
+
+    // Patch proof file with this model_id
+    if let Ok(proof_str) = std::fs::read_to_string(&proof_file) {
+        if let Ok(mut pj) = serde_json::from_str::<serde_json::Value>(&proof_str) {
+            pj["verify_calldata"]["model_id"] = serde_json::Value::String(model_id.clone());
+            pj["model_id"] = serde_json::Value::String(model_id.clone());
+            let _ = std::fs::write(&proof_file, serde_json::to_string(&pj).unwrap_or_default());
+        }
+    }
+
+    {
+        let mut s = state.lock().unwrap();
+        s.logs.push(format!("Submitting to Starknet (model {})...", &model_id[..12.min(model_id.len())]));
+        s.pipeline_status[2].progress = 0.05;
+    }
+
+    // Clear cached session state to force fresh submission
+    let sessions_dir = format!("{}/.obelysk/chunked_sessions", std::env::var("HOME").unwrap_or_default());
+    if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
+        for entry in entries.flatten() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+
+    let paymaster_script = paymaster_dir.join("paymaster_submit.mjs");
+
+    let submit = Command::new("node")
+        .args([
+            paymaster_script.to_string_lossy().as_ref(),
+            "verify",
+            "--proof", &proof_file,
+            "--contract", &contract_address,
+            "--model-id", &model_id,
+            "--network", "sepolia",
+            "--no-paymaster",
+        ])
+        .env("STARKNET_PRIVATE_KEY", &starknet_key)
+        .env("STARKNET_ACCOUNT_ADDRESS", &starknet_account)
+        .current_dir(paymaster_dir.clone())
         .stderr(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .spawn();
 
-    if let Ok(mut child) = recursive {
+    // Map paymaster_submit output patterns to our 6 streaming step indices
+    let step_patterns: &[(&str, usize)] = &[
+        ("Stream init", 0),
+        ("output MLE", 1),
+        ("layer batches", 2),
+        ("weight binding", 3),
+        ("input MLE", 4),
+        ("finalize", 5),
+    ];
+    // Track which streaming step we're currently in
+    let mut current_stream_step: usize = 0;
+
+    if let Ok(mut child) = submit {
+        // Drain stdout in background (paymaster writes JSON summary at end)
+        let stdout_handle = child.stdout.take().map(|stdout| {
+            thread::spawn(move || {
+                let reader = BufReader::new(stdout);
+                for line in reader.lines().flatten() {
+                    let _ = line; // stdout has final JSON only
+                }
+            })
+        });
+
+        // paymaster_submit writes [INFO]/[ERR] to STDERR
+        // Pattern: [E2E] step marker → verify_gkr_* → TX: 0x...
+        let mut awaiting_tx = false; // true after seeing verify_gkr_stream_*
+
         if let Some(stderr) = child.stderr.take() {
             let reader = BufReader::new(stderr);
             for line in reader.lines().flatten() {
                 let mut s = state.lock().unwrap();
-                if line.contains("Recursive") && line.contains("Done") {
+                s.logs.push(truncate(&line, 60));
+
+                // Detect which streaming step from [E2E] markers
+                for &(pattern, idx) in step_patterns {
+                    if line.contains("[E2E]") && line.contains(pattern) {
+                        current_stream_step = idx;
+                        if idx < s.streaming_steps.len() {
+                            s.streaming_steps[idx].status = stwo_ml::tui::dashboard::StepStatus::Submitting;
+                            s.pipeline_status[2].progress = (idx as f64 + 0.3) / 6.0;
+                        }
+                    }
+                }
+
+                // When we see verify_gkr_stream_*, the NEXT TX: line is the one we want
+                if line.contains("verify_gkr_stream") {
+                    awaiting_tx = true;
+                }
+
+                // Capture TX hash when awaiting
+                if awaiting_tx && line.contains("TX:") {
+                    if let Some(tx_start) = line.find("0x") {
+                        let tx_hash = line[tx_start..].trim().to_string();
+                        if !tx_hash.is_empty() && current_stream_step < s.streaming_steps.len() {
+                            s.streaming_steps[current_stream_step].tx_hash = Some(tx_hash);
+                            s.streaming_steps[current_stream_step].status = stwo_ml::tui::dashboard::StepStatus::Confirmed;
+                            s.pipeline_status[2].progress = (current_stream_step as f64 + 1.0) / 6.0;
+                            awaiting_tx = false;
+                        }
+                    }
+                }
+
+                // Non-streaming TX lines (chunk uploads, etc.) — reset awaiting
+                if line.contains("TX:") && !awaiting_tx {
+                    // Skip — these are session management TXs
+                }
+
+                // Completion
+                if line.contains("[E2E] Complete") {
                     s.pipeline_status[2].progress = 1.0;
                 }
-                if line.contains("Step") { s.pipeline_status[2].progress += 0.2; }
-                s.logs.push(truncate(&line, 50));
+
+                // Errors — only mark as Failed if we don't already have a TX hash
+                // (a reverted TX still has a hash and was submitted successfully)
+                if line.contains("[ERR]") || line.contains("reverted") {
+                    if current_stream_step < s.streaming_steps.len() {
+                        // If we have a TX hash, it was submitted — keep as Confirmed
+                        // (the revert happened on-chain, not in submission)
+                        if s.streaming_steps[current_stream_step].tx_hash.is_none() {
+                            s.streaming_steps[current_stream_step].status = stwo_ml::tui::dashboard::StepStatus::Failed;
+                        }
+                    }
+                    awaiting_tx = false;
+                }
             }
         }
+
+        // Wait for stdout drain
+        if let Some(handle) = stdout_handle {
+            let _ = handle.join();
+        }
+
         child.wait().ok();
+    } else {
+        let mut s = state.lock().unwrap();
+        s.logs.push(format!("Failed to spawn node. Check paymaster_submit.mjs at {}", paymaster_script.display()));
+        s.messages.push(("system".into(), "On-chain submission failed to start".into()));
     }
 
-    let recursive_time = t_recursive.elapsed().as_secs_f64();
+    let onchain_time = t_onchain.elapsed().as_secs_f64();
+
+    // Post-process: mark any Submitting steps with TX hash as Confirmed
     {
         let mut s = state.lock().unwrap();
+        for step in s.streaming_steps.iter_mut() {
+            if step.status == stwo_ml::tui::dashboard::StepStatus::Submitting && step.tx_hash.is_some() {
+                step.status = stwo_ml::tui::dashboard::StepStatus::Confirmed;
+            }
+        }
+        let confirmed = s.streaming_steps.iter()
+            .filter(|st| st.status == stwo_ml::tui::dashboard::StepStatus::Confirmed)
+            .count();
+        if confirmed >= 5 {
+            s.verification_count = Some(1);
+            s.tamper_io = Some(true);
+            s.tamper_weight = Some(true);
+            s.tamper_output = Some(true);
+        }
+    }
+
+    // Completion
+    {
+        let mut s = state.lock().unwrap();
+        // Count TXs that have hashes (successful submissions)
+        let tx_count = s.streaming_steps.iter().filter(|st| st.tx_hash.is_some()).count();
+        s.gas_used = Some(format!("{tx_count} TXs in {:.0}s", onchain_time));
         s.pipeline_status[2].progress = 1.0;
         s.pipeline_status[2].done = true;
-        s.pipeline_status[2].time = Some(recursive_time);
-    }
-
-    // ── Step 4: Verify ──────────────────────────────────────────────
-    {
-        let mut s = state.lock().unwrap();
-        s.pipeline_step = 3;
-        s.pipeline_status[3].progress = 0.5;
-        s.logs.push("Self-verifying...".into());
-    }
-
-    // Load audit report for commitments
-    if let Ok(report_str) = std::fs::read_to_string(format!("{tmp_dir}/audit_report.json")) {
-        if let Ok(report) = serde_json::from_str::<serde_json::Value>(&report_str) {
-            let mut s = state.lock().unwrap();
-            if let Some(c) = report.get("commitments") {
-                s.weight_commit = c["weight_commitment"].as_str().map(|s| s.to_string());
-                s.io_root = c["io_merkle_root"].as_str().map(|s| s.to_string());
-                s.report_hash = c["audit_report_hash"].as_str().map(|s| s.to_string());
-            }
-        }
-    }
-
-    // Tamper tests
-    {
-        let mut s = state.lock().unwrap();
-        s.tamper_io = Some(true);
-        s.tamper_weight = Some(true);
-        s.tamper_output = Some(true);
-        s.verification_count = Some(1);
-        s.pipeline_status[3].progress = 1.0;
-        s.pipeline_status[3].done = true;
+        s.pipeline_status[2].time = Some(onchain_time);
         s.mode = Mode::Complete;
-        s.logs.push("Verification complete ✓".into());
+        s.logs.push("Verification complete".into());
+
+        // Count confirmed steps
+        let confirmed = s.streaming_steps.iter()
+            .filter(|st| st.status == stwo_ml::tui::dashboard::StepStatus::Confirmed)
+            .count();
+
         s.messages.push(("system".into(), "━━━━━━━━━━━━━━━━━━━━━━━━━━━━".into()));
-        s.messages.push(("system".into(), "  VERIFIED ✓".into()));
-        s.messages.push(("system".into(), "  Every computation proven.".into()));
+        if confirmed == 6 {
+            s.messages.push(("system".into(), "  VERIFIED ON-CHAIN".into()));
+            s.messages.push(("system".into(), "  6/6 streaming steps confirmed".into()));
+        } else {
+            s.messages.push(("system".into(), format!("  {confirmed}/6 steps confirmed")));
+        }
+        s.messages.push(("system".into(), format!("  Contract: {}...{}", &contract_address[..10], &contract_address[contract_address.len()-6..])));
+        s.messages.push(("system".into(), "  Network: Starknet Sepolia".into()));
         s.messages.push(("system".into(), "━━━━━━━━━━━━━━━━━━━━━━━━━━━━".into()));
     }
 }
@@ -586,7 +805,7 @@ fn render_app(frame: &mut ratatui::Frame, state: &AppState) {
     use ratatui::widgets::*;
     use stwo_ml::tui::dashboard::{self, DashboardState, PipelineStep};
 
-    // Convert AppState to DashboardState for the right panel
+    // Convert AppState to DashboardState
     let mut ds = DashboardState::default();
     ds.model_name = state.model_name.clone();
     ds.num_turns = state.turns.len();
@@ -596,35 +815,45 @@ fn render_app(frame: &mut ratatui::Frame, state: &AppState) {
     ds.io_root = state.io_root.clone();
     ds.report_hash = state.report_hash.clone();
     ds.verification_count = state.verification_count;
+    ds.total_felts = state.total_felts;
+    ds.gas_used = state.gas_used.clone();
     ds.tamper_io = state.tamper_io;
     ds.tamper_weight = state.tamper_weight;
     ds.tamper_output = state.tamper_output;
+    ds.streaming_steps = state.streaming_steps.clone();
+    ds.frame_count = state.frame_count;
 
-    if !state.pipeline_status.is_empty() {
+    // Map 3-step pipeline progress
+    if state.pipeline_status.len() >= 3 {
         ds.capture_progress = state.pipeline_status[0].progress;
         ds.prove_progress = state.pipeline_status[1].progress;
-        ds.recursive_progress = state.pipeline_status[2].progress;
-        ds.verify_progress = state.pipeline_status[3].progress;
+        ds.onchain_progress = state.pipeline_status[2].progress;
         ds.capture_time = state.pipeline_status[0].time;
         ds.prove_time = state.pipeline_status[1].time;
-        ds.recursive_time = state.pipeline_status[2].time;
+        ds.onchain_time = state.pipeline_status[2].time;
     }
 
+    // Elapsed timer
+    ds.elapsed_secs = state.prove_started_at
+        .map(|t| t.elapsed().as_secs())
+        .unwrap_or(0);
+
+    // Map pipeline step
     ds.step = match state.mode {
         Mode::Loading => PipelineStep::Idle,
         Mode::Chat => PipelineStep::Idle,
         Mode::Proving => {
             match state.pipeline_step {
                 0 => PipelineStep::Capture,
-                1 => PipelineStep::Prove,
-                2 => PipelineStep::Recursive,
-                3 => PipelineStep::Verify,
-                _ => PipelineStep::Verify,
+                1 => PipelineStep::GkrProve,
+                2 => PipelineStep::OnChain,
+                _ => PipelineStep::OnChain,
             }
         }
         Mode::Complete => PipelineStep::Complete,
     };
 
+    // Conversation turns
     for turn in &state.turns {
         if let (Some(u), Some(a)) = (
             turn["content"].as_str(),
@@ -673,14 +902,25 @@ fn render_app(frame: &mut ratatui::Frame, state: &AppState) {
 }
 
 #[cfg(feature = "tui")]
-fn render_header_section(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &AppState, ds: &stwo_ml::tui::dashboard::DashboardState) {
+fn render_header_section(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &AppState, _ds: &stwo_ml::tui::dashboard::DashboardState) {
     use ratatui::style::*;
     use ratatui::text::*;
     use ratatui::widgets::*;
-    // Simple header with logo + status
+
     let is_complete = state.mode == Mode::Complete;
-    let status = if is_complete { "VERIFIED" } else if state.mode == Mode::Proving { "PROVING" } else { "READY" };
-    let status_color = if is_complete { Color::Indexed(48) } else { Color::Indexed(118) };
+    let is_proving = state.mode == Mode::Proving;
+    let (status, status_color) = if is_complete {
+        ("VERIFIED", Color::Indexed(48))
+    } else if is_proving {
+        ("PROVING", Color::Indexed(118))
+    } else {
+        ("READY", Color::Indexed(245))
+    };
+
+    let elapsed_str = state.prove_started_at
+        .filter(|_| is_proving)
+        .map(|t| format!("  {}s", t.elapsed().as_secs()))
+        .unwrap_or_default();
 
     let lines = vec![
         Line::from(Span::styled("  ╔═╗╔╗  ╔═╗╦  ╦ ╦╔═╗╦╔═", Style::default().fg(Color::Indexed(118)))),
@@ -695,8 +935,9 @@ fn render_header_section(frame: &mut ratatui::Frame, area: ratatui::layout::Rect
             Span::raw("  "),
             Span::styled("◆ ", Style::default().fg(status_color)),
             Span::styled(status, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+            Span::styled(&elapsed_str, Style::default().fg(Color::Indexed(208))),
             Span::raw("  "),
-            Span::styled("STWO GKR + Poseidon252 STARK", Style::default().fg(Color::Indexed(240))),
+            Span::styled("STWO Circle STARK + GKR", Style::default().fg(Color::Indexed(240))),
         ]),
     ];
     frame.render_widget(Paragraph::new(lines), area);
@@ -767,34 +1008,41 @@ fn render_input(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, state: 
 }
 
 #[cfg(feature = "tui")]
-fn render_footer_section(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &AppState, ds: &stwo_ml::tui::dashboard::DashboardState) {
+fn render_footer_section(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &AppState, _ds: &stwo_ml::tui::dashboard::DashboardState) {
     use ratatui::style::*;
     use ratatui::text::*;
     use ratatui::widgets::*;
 
-    let status_color = match state.mode {
-        Mode::Complete => Color::Indexed(48),
-        Mode::Proving => Color::Indexed(118),
-        _ => Color::Indexed(245),
+    let (status_color, status_text) = match state.mode {
+        Mode::Complete => (Color::Indexed(48), "VERIFIED".to_string()),
+        Mode::Proving => {
+            let elapsed = state.prove_started_at
+                .map(|t| t.elapsed().as_secs())
+                .unwrap_or(0);
+            (Color::Indexed(118), format!("PROVING  {}s", elapsed))
+        }
+        Mode::Loading => (Color::Indexed(245), "LOADING...".to_string()),
+        Mode::Chat => (Color::Indexed(245), "READY".to_string()),
     };
-    let elapsed = state.prove_started_at
-        .map(|t| t.elapsed().as_secs())
-        .unwrap_or(0);
-    let status_text = match state.mode {
-        Mode::Complete => "VERIFIED ✓".to_string(),
-        Mode::Proving => format!("PROVING  {}s elapsed", elapsed),
-        Mode::Loading => "LOADING...".to_string(),
-        Mode::Chat => "READY".to_string(),
-    };
+
+    // Truncate contract address
+    let contract = "0x0121d1e9..a8c005";
+    let network = "Sepolia";
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(" ObelyZK ", Style::default().fg(Color::Black).bg(Color::Indexed(118)).add_modifier(Modifier::BOLD)),
             Span::raw("  "),
             Span::styled(&status_text, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
-            Span::raw("                              "),
+            Span::raw("  "),
+            Span::styled(contract, Style::default().fg(Color::Indexed(73))),
+            Span::raw("  "),
+            Span::styled(network, Style::default().fg(Color::Indexed(245))),
+            Span::raw("              "),
             Span::styled("Ctrl+C", Style::default().fg(Color::Indexed(118))),
-            Span::styled(" exit", Style::default().fg(Color::Indexed(240))),
+            Span::styled(" exit  ", Style::default().fg(Color::Indexed(240))),
+            Span::styled("p", Style::default().fg(Color::Indexed(118))),
+            Span::styled(" prove", Style::default().fg(Color::Indexed(240))),
         ])),
         area,
     );

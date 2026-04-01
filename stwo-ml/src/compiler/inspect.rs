@@ -189,6 +189,17 @@ pub fn summarize_graph(graph: &ComputationGraph, weights: &GraphWeights) -> Mode
                 num_other += 1;
                 ("Identity".to_string(), 0)
             }
+            GraphOp::MoE {
+                num_experts,
+                top_k,
+                hidden_dim,
+                expert_ffn_dim,
+            } => {
+                num_other += 1;
+                // Router: hidden_dim * num_experts, each expert FFN: 2 matmuls
+                let params = hidden_dim * num_experts + num_experts * hidden_dim * expert_ffn_dim * 2;
+                (format!("MoE({num_experts}E top{top_k})"), params)
+            }
         };
 
         let has_weight = weights.get_weight(node.id).is_some();

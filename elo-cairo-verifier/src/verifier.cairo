@@ -1171,7 +1171,7 @@ mod SumcheckVerifierContract {
             self.stream_out_data_m31_start.entry(session_id).write(3 + in_len + 3);
 
             // Store KV-cache fields
-            self.stream_has_kv_cache.entry(session_id).write(has_kv_cache == 1);
+            self.stream_has_kv_cache.entry(session_id).write(has_kv_cache);
             self.stream_kv_cache_commitment.entry(session_id).write(kv_cache_commitment);
             self.stream_prev_kv_cache_commitment.entry(session_id).write(prev_kv_cache_commitment);
 

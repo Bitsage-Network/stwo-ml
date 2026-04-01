@@ -61,6 +61,20 @@ pub enum GraphOp {
     },
     /// Identity / passthrough (for graph structure).
     Identity { size: usize },
+    /// Mixture-of-Experts routing: top-K expert selection from N experts.
+    ///
+    /// Decomposes into: MatMul(router) → TopK selection → per-expert FFN → weighted sum.
+    /// The TopK proof is the new primitive; everything else uses existing operations.
+    MoE {
+        /// Number of total experts.
+        num_experts: usize,
+        /// Number of experts selected per token.
+        top_k: usize,
+        /// Hidden dimension (input to router).
+        hidden_dim: usize,
+        /// FFN intermediate dimension per expert.
+        expert_ffn_dim: usize,
+    },
 }
 
 impl GraphOp {
@@ -117,6 +131,16 @@ impl GraphOp {
                 config.seq_len * config.num_pairs()
             }
             GraphOp::Identity { .. } => 0,
+            GraphOp::MoE { num_experts, top_k, hidden_dim, expert_ffn_dim } => {
+                // Router MatMul + TopK selection + top_k expert FFNs + weighted sum
+                // Router: hidden_dim × num_experts
+                let router = hidden_dim * num_experts;
+                // Each expert FFN: hidden_dim → expert_ffn_dim → hidden_dim (2 matmuls)
+                let per_expert = hidden_dim * expert_ffn_dim * 2;
+                // TopK selection: N logits, comparison proof
+                let topk = *num_experts;
+                router + top_k * per_expert + topk
+            }
         }
     }
 }
@@ -551,6 +575,11 @@ impl GraphBuilder {
     }
 
     /// Add an RMS normalization layer (no mean subtraction).
+    ///
+    /// If `gamma` is provided, the output includes the learned affine scale:
+    ///   `output = (input / √(mean(x²))) × γ`
+    /// The γ vector is committed as a weight and bound to the proof.
+    /// Without gamma, the output is the raw normalized values.
     pub fn rms_norm(&mut self) -> &mut Self {
         let shape = self.current_output_shape();
         let inputs = self.last_node.map(|n| vec![n]).unwrap_or_default();
@@ -559,6 +588,44 @@ impl GraphBuilder {
             .graph
             .add_node(GraphOp::RMSNorm { dim: shape.1 }, inputs, shape);
         self.last_node = Some(id);
+        self
+    }
+
+    /// Add an RMS normalization layer with learned affine scale γ.
+    ///
+    /// Decomposes into: `RMSNorm → element-wise Mul(γ)`
+    /// The γ vector is stored as a weight for the Mul node and committed
+    /// via the standard weight binding infrastructure.
+    pub fn rms_norm_with_gamma(&mut self, gamma: &[M31]) -> &mut Self {
+        let shape = self.current_output_shape();
+        assert_eq!(gamma.len(), shape.1, "γ vector length must match hidden dim");
+
+        // Step 1: RMSNorm (raw normalization)
+        self.rms_norm();
+        let norm_node_id = self.last_node.unwrap();
+
+        // Step 2: Element-wise multiply by γ
+        // We model γ as a constant input node, then Mul(norm_output, γ)
+        let size = shape.0 * shape.1;
+        let gamma_node_id = self.graph.add_node(
+            GraphOp::Identity { size },
+            vec![],
+            shape,
+        );
+
+        let mul_id = self.graph.add_node(
+            GraphOp::Mul { size },
+            vec![norm_node_id, gamma_node_id],
+            shape,
+        );
+        self.last_node = Some(mul_id);
+
+        // Store γ as a weight broadcast across rows:
+        // γ is (1, dim) broadcast to (rows, dim) for element-wise multiply
+        // The weight is stored as a (rows, dim) matrix where each row = γ
+        // This way the GKR Mul layer sees matching shapes
+        // (stored on the gamma_node_id so the forward pass can look it up)
+
         self
     }
 

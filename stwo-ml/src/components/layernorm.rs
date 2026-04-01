@@ -109,7 +109,10 @@ impl FrameworkEval for LayerNormEval {
 
 pub type LayerNormComponent = FrameworkComponent<LayerNormEval>;
 
-/// Build a reciprocal sqrt lookup table.
+/// Build a reciprocal sqrt lookup table using integer-only arithmetic.
+///
+/// For each input value `x`, computes `rsqrt(x) = scale / isqrt(x)` where
+/// `isqrt` is the integer square root (Newton-Raphson, no floating point).
 pub fn build_rsqrt_table(log_size: u32) -> PrecomputedTable {
     PrecomputedTable::build(
         |x| {
@@ -117,14 +120,37 @@ pub fn build_rsqrt_table(log_size: u32) -> PrecomputedTable {
             if val == 0 {
                 M31::from((1u32 << 16) - 1)
             } else {
-                let scale = 1u32 << 16;
-                let sqrt_approx = (val as f64).sqrt();
-                let rsqrt = (scale as f64 / sqrt_approx) as u32;
-                M31::from(rsqrt.min((1u32 << 31) - 2))
+                let scale = 1u64 << 16;
+                // Integer square root via Newton-Raphson
+                let sqrt_val = isqrt(val as u64);
+                let rsqrt = if sqrt_val == 0 {
+                    (1u32 << 16) - 1
+                } else {
+                    (scale / sqrt_val).min((1u64 << 31) - 2) as u32
+                };
+                M31::from(rsqrt)
             }
         },
         log_size,
     )
+}
+
+/// Integer square root via Newton-Raphson. Returns floor(sqrt(n)).
+/// Pure integer — no floating point.
+fn isqrt(n: u64) -> u64 {
+    if n < 2 {
+        return n;
+    }
+    // Initial guess: 2^(ceil(bits/2))
+    let bits = 64 - n.leading_zeros();
+    let mut x = 1u64 << ((bits + 1) / 2);
+    loop {
+        let x1 = (x + n / x) / 2;
+        if x1 >= x {
+            return x;
+        }
+        x = x1;
+    }
 }
 
 /// Generate LayerNorm execution trace columns.

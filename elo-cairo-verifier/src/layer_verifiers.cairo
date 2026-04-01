@@ -163,79 +163,7 @@ pub fn verify_mul_layer(
     rhs_eval: QM31,
     ref ch: PoseidonChannel,
 ) -> GKRClaim {
-    let num_vars = eq_round_polys.len();
-
-    // Step 1: Mix "MUL" tag
-    channel_mix_u64(ref ch, 0x4D554C);
-
-    // Step 2: Mix output claim value
-    channel_mix_secure_field(ref ch, *output_claim.value);
-
-    // Step 3: Degree-3 eq-sumcheck rounds (compressed: reconstruct c1 from current_sum)
-    let mut current_sum = *output_claim.value;
-    let mut challenges: Array<QM31> = array![];
-    let mut round: u32 = 0;
-    loop {
-        if round >= num_vars {
-            break;
-        }
-        let cpoly = *eq_round_polys.at(round);
-
-        // Reconstruct c1 = current_sum - 2*c0 - c2 - c3
-        let c1 = qm31_sub(
-            qm31_sub(qm31_sub(current_sum, qm31_add(cpoly.c0, cpoly.c0)), cpoly.c2),
-            cpoly.c3,
-        );
-
-        // Mix round polynomial (always all 4 coefficients)
-        channel_mix_poly_coeffs_deg3(ref ch, cpoly.c0, c1, cpoly.c2, cpoly.c3);
-
-        // Draw challenge
-        let challenge = channel_draw_qm31(ref ch);
-        challenges.append(challenge);
-
-        // Update: current_sum = p(challenge)
-        current_sum = poly_eval_degree3(cpoly.c0, c1, cpoly.c2, cpoly.c3, challenge);
-
-        round += 1;
-    };
-
-    // Step 4: Verify final evaluation
-    // eq(r[..num_vars], challenges) * lhs * rhs == current_sum
-    //
-    // Extract the first num_vars elements of claim.point for eq computation
-    let mut r_slice: Array<QM31> = array![];
-    let mut i: u32 = 0;
-    loop {
-        if i >= num_vars {
-            break;
-        }
-        r_slice.append(*output_claim.point.at(i));
-        i += 1;
-    };
-
-    let eq_val = eq_eval(r_slice.span(), challenges.span());
-    let expected = qm31_mul(eq_val, qm31_mul(lhs_eval, rhs_eval));
-    assert!(qm31_eq(current_sum, expected), "MUL_FINAL_MISMATCH");
-
-    // Step 5: Mix final evaluations
-    channel_mix_secure_field(ref ch, lhs_eval);
-    channel_mix_secure_field(ref ch, rhs_eval);
-
-    // Step 6: Draw combiner
-    let alpha = channel_draw_qm31(ref ch);
-
-    // Step 7: Combine claims
-    let one = qm31_one();
-    let combined = qm31_add(
-        qm31_mul(alpha, lhs_eval),
-        qm31_mul(qm31_sub(one, alpha), rhs_eval),
-    );
-
-    GKRClaim {
-        point: clone_point(output_claim.point),
-        value: combined,
-    }
+    panic!("Not supported in lean build")
 }
 
 // ============================================================================
@@ -590,40 +518,7 @@ pub fn verify_dequantize_layer(
     output_eval: QM31,
     ref ch: PoseidonChannel,
 ) -> GKRClaim {
-    // Step 1-2: Mix tags
-    channel_mix_u64(ref ch, 0x4445514C4F47); // "DEQLOG"
-    channel_mix_u64(ref ch, bits);
-
-    // Step 3: Draw LogUp encoding challenges
-    let gamma = channel_draw_qm31(ref ch);
-    let beta = channel_draw_qm31(ref ch);
-
-    // Step 5-7: LogUp eq-sumcheck
-    verify_logup_eq_sumcheck(
-        output_claim.point,
-        logup_round_polys,
-        final_w_eval,
-        final_in_eval,
-        final_out_eval,
-        claimed_sum,
-        gamma,
-        beta,
-        ref ch,
-    );
-
-    // Verify multiplicity sumcheck (table-side LogUp verification)
-    verify_multiplicity_sumcheck(
-        ms_has, ms_n_rounds, ms_c0s, ms_c1s, ms_final_eval, ms_claimed_sum, ref ch,
-    );
-
-    // Step 8: Mix final evals
-    channel_mix_secure_field(ref ch, input_eval);
-    channel_mix_secure_field(ref ch, output_eval);
-
-    GKRClaim {
-        point: clone_point(output_claim.point),
-        value: input_eval,
-    }
+    panic!("Not supported in lean build")
 }
 
 // ============================================================================
@@ -676,58 +571,7 @@ pub fn verify_layernorm_layer(
     output_eval: QM31,
     ref ch: PoseidonChannel,
 ) -> GKRClaim {
-    // ===== Part 1: Linear transform eq-sumcheck =====
-    channel_mix_u64(ref ch, 0x4C4E); // "LN"
-    channel_mix_secure_field(ref ch, mean_eval);
-    channel_mix_secure_field(ref ch, rsqrt_eval);
-    channel_mix_secure_field(ref ch, *output_claim.value);
-
-    verify_linear_eq_sumcheck(
-        output_claim.point,
-        linear_round_polys,
-        *output_claim.value,
-        centered_final,
-        rsqrt_final,
-        ref ch,
-    );
-
-    // Mix final linear evals
-    channel_mix_secure_field(ref ch, centered_final);
-    channel_mix_secure_field(ref ch, rsqrt_final);
-
-    // ===== Part 2: rsqrt LogUp eq-sumcheck (optional) =====
-    if has_logup {
-        channel_mix_u64(ref ch, 0x4C4F47); // "LOG"
-        channel_mix_u64(ref ch, 0x5253); // "RS"
-        let gamma = channel_draw_qm31(ref ch);
-        let beta = channel_draw_qm31(ref ch);
-
-        verify_logup_eq_sumcheck(
-            output_claim.point,
-            logup_round_polys,
-            logup_w_eval,
-            logup_in_eval,
-            logup_out_eval,
-            logup_claimed_sum,
-            gamma,
-            beta,
-            ref ch,
-        );
-    }
-
-    // Verify multiplicity sumcheck (table-side LogUp verification)
-    verify_multiplicity_sumcheck(
-        ms_has, ms_n_rounds, ms_c0s, ms_c1s, ms_final_eval, ms_claimed_sum, ref ch,
-    );
-
-    // Mix final evals
-    channel_mix_secure_field(ref ch, input_eval);
-    channel_mix_secure_field(ref ch, output_eval);
-
-    GKRClaim {
-        point: clone_point(output_claim.point),
-        value: input_eval,
-    }
+    panic!("Not supported in lean build")
 }
 
 // ============================================================================

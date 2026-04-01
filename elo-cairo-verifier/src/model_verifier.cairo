@@ -13,12 +13,12 @@
 //   5=Attention, 6=Dequantize, 7=MatMulDualSimd, 8=RMSNorm
 
 use crate::field::{QM31, CM31, qm31_zero, qm31_sub, qm31_add, poly_eval_degree3, log2_ceil, next_power_of_two, unpack_qm31_from_felt, unpack_qm31_pair_from_felt, pack_qm31_to_felt};
-use crate::channel::{PoseidonChannel, channel_mix_secure_field, channel_mix_u64, channel_draw_qm31, channel_draw_qm31s, channel_mix_poly_coeffs_deg3};
+use crate::channel::{PoseidonChannel, channel_mix_secure_field, channel_mix_u64, channel_draw_qm31, channel_mix_poly_coeffs_deg3};
 use crate::types::{GKRClaim, CompressedRoundPoly, CompressedGkrRoundPoly};
 use crate::layer_verifiers::{
-    verify_add_layer, verify_mul_layer, verify_matmul_layer,
-    verify_activation_layer, verify_dequantize_layer,
-    verify_layernorm_layer, verify_rmsnorm_layer,
+    verify_add_layer, verify_matmul_layer,
+    verify_activation_layer,
+    verify_rmsnorm_layer,
     clone_point,
 };
 
@@ -246,21 +246,7 @@ fn dispatch_fresh_sub_matmul(
     ref reader: ProofReader,
     ref ch: PoseidonChannel,
 ) -> GKRClaim {
-    let padded_m = next_power_of_two(m);
-    let padded_n = next_power_of_two(n);
-    let log_rows = log2_ceil(padded_m);
-    let log_cols = log2_ceil(padded_n);
-    let fresh_point = channel_draw_qm31s(ref ch, log_rows + log_cols);
-    channel_mix_secure_field(ref ch, sub_claim_value);
-
-    let fresh_claim = GKRClaim { point: fresh_point, value: sub_claim_value };
-
-    let sub_tag = read_u32(ref reader);
-    assert!(sub_tag == 0, "ATTN_FRESH_SUB_NOT_MATMUL");
-    let (new_claim, _final_b) = dispatch_matmul(
-        @fresh_claim, m, k, n, ref reader, ref ch,
-    );
-    new_claim
+    panic!("Not supported in lean build")
 }
 
 /// Parse and verify a Tag 5 (Attention) layer proof.
@@ -272,80 +258,7 @@ pub fn dispatch_attention(
     ref reader: ProofReader,
     ref ch: PoseidonChannel,
 ) -> GKRClaim {
-    let num_sub_proofs = read_u32(ref reader);
-    let num_heads = read_u32(ref reader);
-    let seq_len = read_u32(ref reader);
-    let d_model = read_u32(ref reader);
-    let causal = read_u32(ref reader);
-    let d_k = d_model / num_heads;
-
-    // Read sub_claim_values
-    let mut sub_claim_values: Array<QM31> = array![];
-    let mut i: u32 = 0;
-    loop {
-        if i >= num_sub_proofs { break; }
-        sub_claim_values.append(read_qm31(ref reader));
-        i += 1;
-    };
-
-    // Mix ATTN metadata
-    channel_mix_u64(ref ch, 0x4154544E); // "ATTN"
-    channel_mix_u64(ref ch, num_heads.into());
-    channel_mix_u64(ref ch, seq_len.into());
-    channel_mix_u64(ref ch, d_model.into());
-    channel_mix_u64(ref ch, causal.into());
-
-    let mut proof_idx: u32 = 0;
-
-    // Sub-proof 0: Output projection (uses parent claim, NO fresh claim)
-    let sub_tag_0 = read_u32(ref reader);
-    assert!(sub_tag_0 == 0, "ATTN_SUB0_NOT_MATMUL");
-    let (_output_proj_claim, _) = dispatch_matmul(
-        current_claim, seq_len, d_model, d_model, ref reader, ref ch,
-    );
-    proof_idx += 1;
-
-    // Per-head sub-proofs (h = num_heads-1..0): context + score
-    let mut h: u32 = 0;
-    loop {
-        if h >= num_heads { break; }
-
-        // Context matmul (fresh claim): dims seq_len × seq_len × d_k
-        let _ctx_claim = dispatch_fresh_sub_matmul(
-            *sub_claim_values.at(proof_idx), seq_len, seq_len, d_k,
-            ref reader, ref ch,
-        );
-        proof_idx += 1;
-
-        // Score matmul (fresh claim): dims seq_len × d_k × seq_len
-        let _score_claim = dispatch_fresh_sub_matmul(
-            *sub_claim_values.at(proof_idx), seq_len, d_k, seq_len,
-            ref reader, ref ch,
-        );
-        proof_idx += 1;
-        h += 1;
-    };
-
-    // V, K, Q projections (fresh claims): dims seq_len × d_model × d_model
-    let _v_claim = dispatch_fresh_sub_matmul(
-        *sub_claim_values.at(proof_idx), seq_len, d_model, d_model,
-        ref reader, ref ch,
-    );
-    proof_idx += 1;
-    let _k_claim = dispatch_fresh_sub_matmul(
-        *sub_claim_values.at(proof_idx), seq_len, d_model, d_model,
-        ref reader, ref ch,
-    );
-    proof_idx += 1;
-    let q_claim = dispatch_fresh_sub_matmul(
-        *sub_claim_values.at(proof_idx), seq_len, d_model, d_model,
-        ref reader, ref ch,
-    );
-    proof_idx += 1;
-
-    assert!(proof_idx == num_sub_proofs, "ATTN_SUBPROOF_COUNT_MISMATCH");
-
-    q_claim // Q projection determines the final input claim
+    panic!("Not supported in lean build")
 }
 
 /// Parse and verify a Tag 11 (AttentionDecode) layer proof.
@@ -359,92 +272,7 @@ pub fn dispatch_attention_decode(
     ref reader: ProofReader,
     ref ch: PoseidonChannel,
 ) -> GKRClaim {
-    let num_sub_proofs = read_u32(ref reader);
-    let num_heads = read_u32(ref reader);
-    let new_tokens = read_u32(ref reader);
-    let full_seq_len = read_u32(ref reader);
-    let d_model = read_u32(ref reader);
-    let causal = read_u32(ref reader);
-    let position_offset = read_u32(ref reader);
-    let d_k = d_model / num_heads;
-
-    // Dimension assertions
-    assert!(new_tokens > 0, "DCOD_NEW_TOKENS_ZERO");
-    assert!(full_seq_len >= new_tokens, "DCOD_FULL_SEQ_LT_NEW_TOKENS");
-    assert!(d_model % num_heads == 0, "DCOD_DMODEL_INDIVISIBLE");
-    assert!(position_offset + new_tokens == full_seq_len, "DCOD_POSITION_MISMATCH");
-    assert!(num_sub_proofs == 4 + 2 * num_heads, "DCOD_SUBPROOF_COUNT_PRECHECK");
-
-    // Read sub_claim_values
-    let mut sub_claim_values: Array<QM31> = array![];
-    let mut i: u32 = 0;
-    loop {
-        if i >= num_sub_proofs { break; }
-        sub_claim_values.append(read_qm31(ref reader));
-        i += 1;
-    };
-
-    // Mix DCOD metadata
-    channel_mix_u64(ref ch, 0x44434F44); // "DCOD"
-    channel_mix_u64(ref ch, num_heads.into());
-    channel_mix_u64(ref ch, new_tokens.into());
-    channel_mix_u64(ref ch, full_seq_len.into());
-    channel_mix_u64(ref ch, d_model.into());
-    channel_mix_u64(ref ch, causal.into());
-    channel_mix_u64(ref ch, position_offset.into());
-
-    let mut proof_idx: u32 = 0;
-
-    // Sub-proof 0: Output projection (uses parent claim, NO fresh claim)
-    // Dims: new_tokens × d_model × d_model
-    let sub_tag_0 = read_u32(ref reader);
-    assert!(sub_tag_0 == 0, "DCOD_SUB0_NOT_MATMUL");
-    let (_output_proj_claim, _) = dispatch_matmul(
-        current_claim, new_tokens, d_model, d_model, ref reader, ref ch,
-    );
-    proof_idx += 1;
-
-    // Per-head sub-proofs (h = num_heads-1..0): context + score
-    let mut h: u32 = 0;
-    loop {
-        if h >= num_heads { break; }
-
-        // Context matmul (fresh claim): dims new_tokens × full_seq_len × d_k
-        let _ctx_claim = dispatch_fresh_sub_matmul(
-            *sub_claim_values.at(proof_idx), new_tokens, full_seq_len, d_k,
-            ref reader, ref ch,
-        );
-        proof_idx += 1;
-
-        // Score matmul (fresh claim): dims new_tokens × d_k × full_seq_len
-        let _score_claim = dispatch_fresh_sub_matmul(
-            *sub_claim_values.at(proof_idx), new_tokens, d_k, full_seq_len,
-            ref reader, ref ch,
-        );
-        proof_idx += 1;
-        h += 1;
-    };
-
-    // V, K, Q projections (fresh claims): dims new_tokens × d_model × d_model
-    let _v_claim = dispatch_fresh_sub_matmul(
-        *sub_claim_values.at(proof_idx), new_tokens, d_model, d_model,
-        ref reader, ref ch,
-    );
-    proof_idx += 1;
-    let _k_claim = dispatch_fresh_sub_matmul(
-        *sub_claim_values.at(proof_idx), new_tokens, d_model, d_model,
-        ref reader, ref ch,
-    );
-    proof_idx += 1;
-    let q_claim = dispatch_fresh_sub_matmul(
-        *sub_claim_values.at(proof_idx), new_tokens, d_model, d_model,
-        ref reader, ref ch,
-    );
-    proof_idx += 1;
-
-    assert!(proof_idx == num_sub_proofs, "DCOD_SUBPROOF_COUNT_MISMATCH");
-
-    q_claim // Q projection determines the final input claim
+    panic!("Not supported in lean build")
 }
 
 /// Parse and verify a Tag 1 (Add) layer proof.
@@ -466,12 +294,7 @@ fn dispatch_mul(
     ref reader: ProofReader,
     ref ch: PoseidonChannel,
 ) -> GKRClaim {
-    let num_rounds = read_u32(ref reader);
-    let round_polys = read_compressed_deg3_polys(ref reader, num_rounds);
-    let lhs = read_qm31(ref reader);
-    let rhs = read_qm31(ref reader);
-
-    verify_mul_layer(current_claim, round_polys.span(), lhs, rhs, ref ch)
+    panic!("Not supported in lean build")
 }
 
 /// Parse and verify a Tag 3 (Activation) layer proof.
@@ -498,15 +321,13 @@ fn dispatch_activation(
     // corrupted all subsequent layer reads (MATMUL_FINAL_MISMATCH).
     let has_act_proof = read_u32(ref reader);
 
-    if has_act_proof == 1 {
+    let result = if has_act_proof == 1 {
         // Activation product proof (Phase A soundness, replaces LogUp for ReLU).
         // Channel transcript: mix "ACT" + claim_value, draw eta, deg3 sumcheck,
         // mix final evals, optional bit evals.
-        return dispatch_activation_product_proof(current_claim, ref reader, ref ch);
-    }
-
-    // has_act_proof == 0: use original LogUp or no-LogUp path
-    if has_logup {
+        dispatch_activation_product_proof(current_claim, ref reader, ref ch)
+    } else if has_logup {
+        // has_act_proof == 0: use original LogUp or no-LogUp path
         verify_activation_layer(
             current_claim, act_type_tag,
             logup_polys.span(), w, in_e, out_e, claimed,
@@ -520,7 +341,51 @@ fn dispatch_activation(
             point: clone_point(current_claim.point),
             value: input_eval,
         }
+    };
+
+    // Skip optional piecewise-linear proof (serialized by Rust, not yet verified in Cairo).
+    // Format: has_flag(u32), if 1: num_rounds(u32), round_polys(c0,c2,c3 × rounds),
+    //         input_eval(qm31), output_eval(qm31), indicator_evals(16 × qm31),
+    //         optional seg_bit_evals(has_flag + 4 × qm31).
+    let has_piecewise = read_u32(ref reader);
+    if has_piecewise == 1 {
+        let pw_rounds = read_u32(ref reader);
+        let mut pri: u32 = 0;
+        loop {
+            if pri >= pw_rounds {
+                break;
+            }
+            let _c0 = read_qm31(ref reader);
+            let _c2 = read_qm31(ref reader);
+            let _c3 = read_qm31(ref reader);
+            pri += 1;
+        };
+        let _pw_input = read_qm31(ref reader);
+        let _pw_output = read_qm31(ref reader);
+        // indicator_evals: always 16
+        let mut iei: u32 = 0;
+        loop {
+            if iei >= 16 {
+                break;
+            }
+            let _ie = read_qm31(ref reader);
+            iei += 1;
+        };
+        // Optional segment bit evals
+        let has_seg = read_u32(ref reader);
+        if has_seg == 1 {
+            let mut si: u32 = 0;
+            loop {
+                if si >= 4 {
+                    break;
+                }
+                let _sb = read_qm31(ref reader);
+                si += 1;
+            };
+        }
     }
+
+    result
 }
 
 /// Read and verify an activation product proof (has_act_proof == 1 path).
@@ -602,30 +467,7 @@ fn dispatch_layernorm(
     ref reader: ProofReader,
     ref ch: PoseidonChannel,
 ) -> GKRClaim {
-    let input_eval = read_qm31(ref reader);
-    let output_eval = read_qm31(ref reader);
-    let mean = read_qm31(ref reader);
-    let rsqrt_var = read_qm31(ref reader);
-    let _rsqrt_table_commitment = read_felt(ref reader);
-    let _simd_combined = read_u32(ref reader);
-
-    let num_linear_rounds = read_u32(ref reader);
-    let linear_polys = read_compressed_deg3_polys(ref reader, num_linear_rounds);
-    let centered_final = read_qm31(ref reader);
-    let rsqrt_final = read_qm31(ref reader);
-
-    let (has_logup, logup_polys, w, in_e, out_e, claimed) = read_optional_logup(ref reader);
-    let (ms_has, ms_n, ms_c0s, ms_c1s, ms_final, ms_claimed) =
-        read_optional_multiplicity_sumcheck(ref reader);
-
-    verify_layernorm_layer(
-        current_claim,
-        linear_polys.span(), centered_final, rsqrt_final,
-        mean, rsqrt_var,
-        has_logup, logup_polys.span(), w, in_e, out_e, claimed,
-        ms_has, ms_n, ms_c0s.span(), ms_c1s.span(), ms_final, ms_claimed,
-        input_eval, output_eval, ref ch,
-    )
+    panic!("Not supported in lean build")
 }
 
 /// Parse and verify a Tag 6 (Dequantize) layer proof.
@@ -635,24 +477,18 @@ fn dispatch_dequantize(
     ref reader: ProofReader,
     ref ch: PoseidonChannel,
 ) -> GKRClaim {
-    let input_eval = read_qm31(ref reader);
-    let output_eval = read_qm31(ref reader);
-    let _table_commitment = read_felt(ref reader);
-
-    let (has_logup, logup_polys, w, in_e, out_e, claimed) = read_optional_logup(ref reader);
-    assert!(has_logup, "DEQUANTIZE_MISSING_LOGUP");
-    let (ms_has, ms_n, ms_c0s, ms_c1s, ms_final, ms_claimed) =
-        read_optional_multiplicity_sumcheck(ref reader);
-
-    verify_dequantize_layer(
-        current_claim, bits,
-        logup_polys.span(), w, in_e, out_e, claimed,
-        ms_has, ms_n, ms_c0s.span(), ms_c1s.span(), ms_final, ms_claimed,
-        input_eval, output_eval, ref ch,
-    )
+    panic!("Not supported in lean build")
 }
 
 /// Parse and verify a Tag 8 (RMSNorm) layer proof.
+///
+/// Serialization order (must match Rust cairo_serde.rs):
+///   Part 0: input_eval, output_eval, rms_sq_eval, rsqrt_eval, rsqrt_table_commitment, simd_combined
+///   Part 0b: RMS² verification proof (has_flag + optional: n_active, sq_sum, rounds, final_eval)
+///   Part 1: Linear eq-sumcheck (num_rounds, deg3 polys, input_final, rsqrt_final)
+///   Part 2: LogUp (optional)
+///   Part 3: Multiplicity sumcheck
+///   Part 4: Row RMS² (optional)
 fn dispatch_rmsnorm(
     current_claim: @GKRClaim,
     ref reader: ProofReader,
@@ -665,14 +501,66 @@ fn dispatch_rmsnorm(
     let _rsqrt_table_commitment = read_felt(ref reader);
     let _simd_combined = read_u32(ref reader);
 
+    // Part 0b: RMS² verification proof — replay channel operations to keep Fiat-Shamir in sync.
+    let has_rms_sq_proof = read_u32(ref reader);
+    if has_rms_sq_proof == 1 {
+        let n_active = read_u32(ref reader);
+        let sq_sum = read_qm31(ref reader);
+        let rms_sq_rounds = read_u32(ref reader);
+
+        // Replay exact channel sequence from Rust verify_rmsnorm_reduction Part 0
+        channel_mix_u64(ref ch, 0x5251); // "RQ" tag
+        channel_mix_u64(ref ch, n_active.into());
+        channel_mix_secure_field(ref ch, sq_sum);
+
+        let mut rms_sum = sq_sum;
+        let mut ri: u32 = 0;
+        loop {
+            if ri >= rms_sq_rounds {
+                break;
+            }
+            let c0 = read_qm31(ref reader);
+            let c2 = read_qm31(ref reader);
+            let c3 = read_qm31(ref reader);
+            // Reconstruct c1 = current_sum - 2*c0 - c2 - c3
+            let c1 = qm31_sub(
+                qm31_sub(qm31_sub(rms_sum, qm31_add(c0, c0)), c2),
+                c3,
+            );
+            channel_mix_poly_coeffs_deg3(ref ch, c0, c1, c2, c3);
+            let challenge = channel_draw_qm31(ref ch);
+            rms_sum = poly_eval_degree3(c0, c1, c2, c3, challenge);
+            ri += 1;
+        };
+        let rms_sq_final = read_qm31(ref reader);
+        channel_mix_secure_field(ref ch, rms_sq_final);
+    }
+
+    // Part 1: Linear eq-sumcheck
     let num_linear_rounds = read_u32(ref reader);
     let linear_polys = read_compressed_deg3_polys(ref reader, num_linear_rounds);
     let input_final = read_qm31(ref reader);
     let rsqrt_final = read_qm31(ref reader);
 
+    // Part 2: LogUp
     let (has_logup, logup_polys, w, in_e, out_e, claimed) = read_optional_logup(ref reader);
+    // Part 3: Multiplicity sumcheck
     let (ms_has, ms_n, ms_c0s, ms_c1s, ms_final, ms_claimed) =
         read_optional_multiplicity_sumcheck(ref reader);
+
+    // Part 4: Row RMS² binding (optional — skip over it)
+    let has_row_rms = read_u32(ref reader);
+    if has_row_rms == 1 {
+        let row_count = read_u32(ref reader);
+        let mut rri: u32 = 0;
+        loop {
+            if rri >= row_count {
+                break;
+            }
+            let _v = read_u32(ref reader);
+            rri += 1;
+        };
+    }
 
     verify_rmsnorm_layer(
         current_claim,
@@ -1059,6 +947,11 @@ pub fn verify_gkr_layers_batch(
         tags_hash = core::poseidon::poseidon_hash_span(
             array![tags_hash, tag.into()].span(),
         );
+
+        // Diagnostic: track reader offset and channel state per layer
+        // assert: offset sanity + which layer we're on
+        let _diag_offset = reader.offset;
+        let _diag_digest = ch.digest;
 
         if tag == 0 {
             // MatMul

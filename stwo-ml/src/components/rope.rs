@@ -142,22 +142,17 @@ pub fn m31_to_float_signed(val: M31) -> f64 {
 }
 
 /// Build the precomputed RoPE rotation table.
+///
+/// Uses integer-only trig (cos_fixed/sin_fixed) for deterministic
+/// cross-platform results. The theta values are precomputed from `config.base`
+/// once (at model registration), then all per-position computation is
+/// pure integer arithmetic.
 pub fn build_rope_table(config: &RoPEConfig) -> RoPETable {
-    let n_pairs = config.num_pairs();
-    let n_pos = config.max_seq_len;
-    let total = n_pos * n_pairs;
+    use crate::components::integer_math::{build_rope_table_integer, precompute_rope_thetas};
 
-    let mut cos_vals = Vec::with_capacity(total);
-    let mut sin_vals = Vec::with_capacity(total);
-
-    for pos in 0..n_pos {
-        for j in 0..n_pairs {
-            let theta = config.base.powf(-2.0 * j as f64 / config.head_dim as f64);
-            let angle = pos as f64 * theta;
-            cos_vals.push(float_to_m31_signed(angle.cos()));
-            sin_vals.push(float_to_m31_signed(angle.sin()));
-        }
-    }
+    let thetas = precompute_rope_thetas(config.head_dim, config.base);
+    let (cos_vals, sin_vals) =
+        build_rope_table_integer(config.max_seq_len, config.head_dim, &thetas, config.position_offset);
 
     RoPETable {
         cos_vals,

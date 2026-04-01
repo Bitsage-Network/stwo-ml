@@ -841,9 +841,19 @@ pub(crate) fn m31_mod_inverse(n: u32) -> M31 {
     M31::from(result as u32)
 }
 
-/// Integer square root (floor).
+/// Integer square root (floor) via Newton-Raphson. Pure integer, no f64.
 fn isqrt(n: usize) -> u32 {
-    (n as f64).sqrt() as u32
+    if n < 2 {
+        return n as u32;
+    }
+    let mut x = 1u64 << (((64 - (n as u64).leading_zeros()) + 1) / 2);
+    loop {
+        let x1 = (x + n as u64 / x) / 2;
+        if x1 >= x {
+            return x as u32;
+        }
+        x = x1;
+    }
 }
 
 /// Softmax over a single row in M31 arithmetic.
@@ -860,10 +870,21 @@ pub fn softmax_row_m31(row: &[M31]) -> Vec<M31> {
     let sum: u64 = exp_vals.iter().map(|v| v.0 as u64).sum();
     // Reduce sum into M31 range
     let sum_m31 = M31::from((sum % ((1u64 << 31) - 1)) as u32);
-    assert!(
-        sum_m31 != M31::from(0u32),
-        "softmax sum is zero mod P — degenerate input (probability 2^{{-31}})"
-    );
+
+    // Guard: if sum == 0 mod P (probability 2^{-31}), return uniform distribution.
+    // This prevents division by zero and ensures well-defined softmax output.
+    // A verifier encountering sum=0 should reject the proof — this fallback
+    // exists only so the prover doesn't crash on degenerate inputs.
+    if sum_m31 == M31::from(0u32) {
+        tracing::warn!("softmax sum is zero mod P — degenerate input, returning uniform distribution");
+        let n = row.len();
+        if n == 0 {
+            return vec![];
+        }
+        let uniform = m31_mod_inverse(n as u32);
+        return vec![uniform; n];
+    }
+
     let inv_sum = m31_mod_inverse(sum_m31.0);
     exp_vals.iter().map(|&v| v * inv_sum).collect()
 }

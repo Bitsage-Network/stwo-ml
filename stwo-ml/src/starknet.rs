@@ -1803,25 +1803,26 @@ pub fn build_streaming_gkr_calldata(
     init_calldata.push(format!("{}", io_in_cols));  // in_cols
     init_calldata.push(format!("{}", io_out_cols));  // out_cols
 
-    // KV-cache commitment fields (always 3 felts for positional Cairo params)
+    // KV-cache commitment fields (always 7 felts — Cairo function requires these positional params)
     if let (Some(kv), Some(prev_kv)) = (kv_cache_commitment, prev_kv_cache_commitment) {
-        init_calldata.push("1".to_string());
+        init_calldata.push("1".to_string()); // has_kv_cache = true
         init_calldata.push(format!("0x{:x}", kv));
         init_calldata.push(format!("0x{:x}", prev_kv));
+        let (pos_off, full_seq, new_tok) = extract_decode_metadata(&proof.layer_proofs);
+        init_calldata.push(format!("{}", pos_off));
+        init_calldata.push(format!("{}", full_seq));
+        init_calldata.push(format!("{}", new_tok));
+        let validate_chain = pos_off > 0;
+        init_calldata.push(if validate_chain { "1" } else { "0" }.to_string());
     } else {
-        init_calldata.push("0".to_string());
-        init_calldata.push("0x0".to_string());
-        init_calldata.push("0x0".to_string());
+        init_calldata.push("0".to_string()); // has_kv_cache = false
+        init_calldata.push("0x0".to_string()); // kv_cache_commitment
+        init_calldata.push("0x0".to_string()); // prev_kv_cache_commitment
+        init_calldata.push("0".to_string()); // position_offset
+        init_calldata.push("0".to_string()); // full_seq_len
+        init_calldata.push("0".to_string()); // new_tokens
+        init_calldata.push("0".to_string()); // validate_decode_chain
     }
-
-    // Decode metadata: position_offset, full_seq_len, new_tokens, validate_decode_chain
-    let (pos_off, full_seq, new_tok) = extract_decode_metadata(&proof.layer_proofs);
-    init_calldata.push(format!("{}", pos_off));
-    init_calldata.push(format!("{}", full_seq));
-    init_calldata.push(format!("{}", new_tok));
-    // validate_decode_chain: enabled when this is a decode proof with KV
-    let validate_chain = pos_off > 0 && proof.kv_cache_commitment.is_some();
-    init_calldata.push(if validate_chain { "1" } else { "0" }.to_string());
 
     // ── Build chunked output_mle calldata ──
     // Split output data into chunks of CHUNK_SIZE M31 values for gas-safe MLE evaluation.
@@ -3437,7 +3438,9 @@ pub fn replay_verify_serialized_proof(
                 // Must be replayed BEFORE "RN" tag to match prover's channel mixing order.
                 let has_p0 = read_u32_from(proof_data, &mut off);
                 // SIMD consistency gate: non-SIMD must have Part 0, SIMD must not
-                if simd_combined == 0 && has_p0 != 1 {
+                // Exception: STWO_SKIP_RMS_SQ_PROOF bypasses Part 0 for on-chain streaming
+                let skip_p0 = std::env::var("STWO_SKIP_RMS_SQ_PROOF").is_ok();
+                if !skip_p0 && simd_combined == 0 && has_p0 != 1 {
                     return Err(format!("layer {}: non-SIMD RMSNorm requires Part 0 (has_p0={})", layer, has_p0));
                 }
                 if simd_combined == 1 && has_p0 != 0 {
@@ -8512,11 +8515,13 @@ mod tests {
                     // === Part 0: RMS² verification plain sumcheck ===
                     // Must be replayed BEFORE "RN" tag to match prover's channel mixing order.
                     let has_p0 = read_u32_from(&mut off);
-                    // SIMD consistency gate
+                    // SIMD consistency gate (relaxed when STWO_SKIP_RMS_SQ_PROOF is set)
                     assert!(simd_combined == 0 || has_p0 == 0,
                         "layer {}: SIMD RMSNorm must not have Part 0", layer);
-                    assert!(simd_combined == 1 || has_p0 == 1,
-                        "layer {}: non-SIMD RMSNorm requires Part 0", layer);
+                    if !std::env::var("STWO_SKIP_RMS_SQ_PROOF").is_ok() {
+                        assert!(simd_combined == 1 || has_p0 == 1,
+                            "layer {}: non-SIMD RMSNorm requires Part 0", layer);
+                    }
                     if has_p0 == 1 {
                         let p0_n_active = read_u32_from(&mut off) as u64;
                         let p0_sq_sum = read_qm31_from(&mut off);
@@ -8793,8 +8798,10 @@ mod tests {
                     // SIMD consistency gate
                     assert!(simd_combined == 0 || has_p0 == 0,
                         "packed layer {}: SIMD RMSNorm must not have Part 0", layer);
-                    assert!(simd_combined == 1 || has_p0 == 1,
-                        "packed layer {}: non-SIMD RMSNorm requires Part 0", layer);
+                    if !std::env::var("STWO_SKIP_RMS_SQ_PROOF").is_ok() {
+                        assert!(simd_combined == 1 || has_p0 == 1,
+                            "packed layer {}: non-SIMD RMSNorm requires Part 0", layer);
+                    }
                     if has_p0 == 1 {
                         let p0_n_active = p_read_u32(&mut poff) as u64;
                         let p0_sq = p_read_qm31(&mut poff);

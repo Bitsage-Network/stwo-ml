@@ -1661,6 +1661,8 @@ pub fn serialize_gkr_model_proof(proof: &crate::gkr::GKRProof, output: &mut Vec<
                 rms_sq_claimed_sq_sum,
                 rms_sq_n_active,
                 row_rms_sq,
+                gamma_commitment: _,
+                gamma_eval: _,
             } => {
                 serialize_u32(8, output); // tag: RMSNorm
                 serialize_qm31(*input_eval, output);
@@ -2144,6 +2146,8 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
                 rms_sq_claimed_sq_sum,
                 rms_sq_n_active,
                 row_rms_sq,
+                gamma_commitment: _,
+                gamma_eval: _,
             } => {
                 serialize_u32(8, output);
                 serialize_qm31(*input_eval, output);
@@ -2530,6 +2534,8 @@ fn serialize_layer_proof_packed_inner(
             rms_sq_claimed_sq_sum,
             rms_sq_n_active,
             row_rms_sq,
+            gamma_commitment: _,
+            gamma_eval: _,
         } => {
             serialize_u32(8, output);
             serialize_qm31_packed(*input_eval, output);
@@ -2538,28 +2544,11 @@ fn serialize_layer_proof_packed_inner(
             serialize_qm31_packed(*rsqrt_eval, output);
             output.push(*rsqrt_table_commitment);
             serialize_u32(if *simd_combined { 1 } else { 0 }, output);
-            // === Part 0: RMS² verification proof (BEFORE linear — matches prover channel order) ===
-            match rms_sq_round_polys {
-                Some(polys) => {
-                    serialize_u32(1, output);
-                    // n_active first (needed to replay mix_u64(n_active) before sq_sum)
-                    serialize_u32(rms_sq_n_active.unwrap_or(0) as u32, output);
-                    // sq_sum before rounds so replay can mix it before drawing round challenges
-                    if let Some(sq_sum) = rms_sq_claimed_sq_sum {
-                        serialize_qm31_packed(*sq_sum, output);
-                    }
-                    serialize_u32(polys.len() as u32, output);
-                    for rp in polys {
-                        serialize_qm31_packed(rp.c0, output);
-                        serialize_qm31_packed(rp.c2, output);
-                        serialize_qm31_packed(rp.c3, output);
-                    }
-                    if let Some(final_eval) = rms_sq_input_final {
-                        serialize_qm31_packed(*final_eval, output);
-                    }
-                }
-                None => serialize_u32(0, output),
-            }
+            // === Part 0: RMS² verification proof ===
+            // Omit for packed/streaming: the Part 0 proof is verified locally by the
+            // Rust self-verifier, but the on-chain Cairo contract doesn't replay it.
+            // Both prover and serializer skip Part 0 channel ops, keeping channels in sync.
+            serialize_u32(0, output); // has_rms_sq_proof = 0
             // === Part 1: Linear eq-sumcheck round polys ===
             serialize_u32(linear_round_polys.len() as u32, output);
             for rp in linear_round_polys {
@@ -3026,6 +3015,8 @@ fn serialize_layer_proof_double_packed_inner(
             rms_sq_claimed_sq_sum,
             rms_sq_n_active,
             row_rms_sq,
+            gamma_commitment: _,
+            gamma_eval: _,
         } => {
             serialize_u32(8, output);
             serialize_qm31_packed(*input_eval, output);
@@ -3034,28 +3025,11 @@ fn serialize_layer_proof_double_packed_inner(
             serialize_qm31_packed(*rsqrt_eval, output);
             output.push(*rsqrt_table_commitment);
             serialize_u32(if *simd_combined { 1 } else { 0 }, output);
-            // === Part 0: RMS² verification proof (BEFORE linear — matches prover channel order) ===
-            match rms_sq_round_polys {
-                Some(polys) => {
-                    serialize_u32(1, output);
-                    // n_active first (needed to replay mix_u64(n_active) before sq_sum)
-                    serialize_u32(rms_sq_n_active.unwrap_or(0) as u32, output);
-                    // sq_sum before rounds so replay can mix it before drawing round challenges
-                    if let Some(sq_sum) = rms_sq_claimed_sq_sum {
-                        serialize_qm31_packed(*sq_sum, output);
-                    }
-                    serialize_u32(polys.len() as u32, output);
-                    for rp in polys {
-                        serialize_qm31_packed(rp.c0, output);
-                        serialize_qm31_packed(rp.c2, output);
-                        serialize_qm31_packed(rp.c3, output);
-                    }
-                    if let Some(final_eval) = rms_sq_input_final {
-                        serialize_qm31_packed(*final_eval, output);
-                    }
-                }
-                None => serialize_u32(0, output),
-            }
+            // === Part 0: RMS² verification proof ===
+            // Omit for packed/streaming: the Part 0 proof is verified locally by the
+            // Rust self-verifier, but the on-chain Cairo contract doesn't replay it.
+            // Both prover and serializer skip Part 0 channel ops, keeping channels in sync.
+            serialize_u32(0, output); // has_rms_sq_proof = 0
             // === Part 1: Linear eq-sumcheck round polys ===
             serialize_u32(linear_round_polys.len() as u32, output);
             for rp in linear_round_polys {

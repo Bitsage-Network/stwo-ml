@@ -36,6 +36,49 @@ ML inference proving and privacy protocol built on [STWO](https://github.com/sta
 - **Transaction STARKs** — Full STWO STARK proofs wrapping transaction circuits for zero-knowledge (verifier sees only public inputs)
 - **Verifiable Audit** — Append-only inference logging with batch proving and on-chain submission
 
+## Verified On-Chain — Starknet Sepolia (March 2026)
+
+**First-ever full GKR streaming proof verification of ML inference on Starknet.** 6/6 streaming transactions confirmed SUCCEEDED on Starknet Sepolia.
+
+| Step | Description | TX Hash | Status |
+|------|-------------|---------|--------|
+| 1. stream_init | IO commitment + Fiat-Shamir channel seed | [`0x5493...1a1`](https://sepolia.starkscan.co/tx/0x5493310a8e2deb5d2f25b07e2402e84692aaf5926141b5acc203a1892a181a1) | SUCCEEDED |
+| 2. output_mle | Output MLE evaluation at random challenge | [`0x7cab...7e`](https://sepolia.starkscan.co/tx/0x7cabd35f5382c11334c6509e40b7a758ccd7e03e83e75b66a3c569f5d7b7a7e) | SUCCEEDED |
+| 3. layers | 8 GKR layer proofs: MatMul + RMSNorm + SiLU | [`0x5346...918`](https://sepolia.starkscan.co/tx/0x53465edc957c5f8a6054739a0633beecf814ee37e3e22c23a570448a5be5918) | SUCCEEDED |
+| 4. weight_binding | Aggregated weight commitment via Poseidon Merkle | [`0x5f54...3fc`](https://sepolia.starkscan.co/tx/0x5f549a1e6cc1ebefea3615c2458cdd0fd8f45fd505bf72e5b9dd8417c9be3fc) | SUCCEEDED |
+| 5. input_mle | Input MLE consistency proof | [`0x2395...bab`](https://sepolia.starkscan.co/tx/0x239545b66f94387a3d1b5dbc55dedba6b7de1d5384f1930e77e152a986d5bab) | SUCCEEDED |
+| 6. finalize | Final assertion + proof recording | [`0x4b08...a41`](https://sepolia.starkscan.co/tx/0x4b081156d4be88ea159533223d2597d76cd3f99911501d8326e156f12051a41) | SUCCEEDED |
+
+**Contract**: [`0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005`](https://sepolia.starkscan.co/contract/0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005) (v39 class `0x0473c81da9df0522f5c239f022889f7730ef866fb97e4f092ad1e8793fb22feb`)
+
+**Model**: Qwen2-0.5B, 1 transformer layer (8 GKR layers: 3 RMSNorm + 4 MatMul + 1 SiLU) | **Proof**: 5,526 felts streaming calldata, 5 MLE opening queries, schema v3 streaming v25
+
+### How to Reproduce
+
+```bash
+# Generate on-chain compatible proof
+./scripts/prove_onchain.sh --model-dir ~/.obelysk/models/qwen2-0.5b --layers 1 --format ml_gkr --gkr --output /tmp/proof.json
+
+# Submit to Starknet
+export STARKNET_PRIVATE_KEY="0x..."
+export STARKNET_ACCOUNT_ADDRESS="0x..."
+./scripts/prove_and_submit.sh
+
+# Interactive TUI (chat + prove + on-chain)
+./target/release/obelysk
+```
+
+**Required env vars for on-chain compatibility:**
+```bash
+STWO_SKIP_RMS_SQ_PROOF=1
+STWO_ALLOW_MISSING_NORM_PROOF=1
+STWO_PIECEWISE_ACTIVATION=0
+STWO_ALLOW_LOGUP_ACTIVATION=1
+STWO_AGGREGATED_FULL_BINDING=1
+STWO_SKIP_BATCH_TOKENS=1
+STWO_MLE_N_QUERIES=5
+```
+
 ## Measured Performance
 
 | Metric | Value | Scope |
@@ -48,7 +91,7 @@ ML inference proving and privacy protocol built on [STWO](https://github.com/sta
 | MatMul trace reduction | 42–255x | Sumcheck vs naive row-by-row |
 | GPU FFT speedup | 50–112x | NTT/INTT vs CPU SIMD backend |
 | Security | 96-bit | pow_bits=26, n_queries=70, log_blowup=1 |
-| On-chain verify | 18 TXs | Streaming GKR on Starknet Sepolia |
+| On-chain verify | 6 TXs | Streaming GKR v25 on Starknet Sepolia (all SUCCEEDED) |
 
 ## Why It's Fast
 

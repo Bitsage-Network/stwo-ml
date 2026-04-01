@@ -1548,6 +1548,10 @@ where
                     layer_index: node.id,
                 });
             }
+
+            GraphOp::MoE { .. } => {
+                todo!("MoE forward pass: decompose into router + TopK + experts")
+            }
         }
     }
 
@@ -2076,6 +2080,10 @@ pub fn forward_pass_only(
             | GraphOp::Conv2D { .. }
             | GraphOp::Identity { .. }
             | GraphOp::RoPE { .. } => current.clone(),
+
+            GraphOp::MoE { .. } => {
+                todo!("MoE forward pass: decompose into router + TopK + experts")
+            }
         };
 
         node_outputs.insert(node.id, output.clone());

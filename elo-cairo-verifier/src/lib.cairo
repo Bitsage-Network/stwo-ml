@@ -13,10 +13,8 @@ pub mod model_verifier;
 // pub mod access_control;  // stripped for lean v18b
 // pub mod view_key;        // stripped for lean v18b
 pub mod vm31_merkle;
-pub mod vm31_verifier;
-pub mod vm31_pool;
-// pub mod mock_proof_verifier;
-// pub mod mock_erc20;
+// pub mod vm31_verifier;   // stripped for lean v32
+// pub mod vm31_pool;       // stripped for lean v32
 pub mod aggregated_binding;
-pub mod recursive_verifier;
+// pub mod recursive_verifier; // stripped for lean v32
 pub mod verifier;

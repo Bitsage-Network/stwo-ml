@@ -276,6 +276,9 @@ impl LayeredCircuit {
             }),
             GraphOp::RMSNorm { dim } => Ok(LayerType::RMSNorm { dim: *dim }),
             GraphOp::RoPE { config } => Ok(LayerType::RoPE { config: *config }),
+            GraphOp::MoE { .. } => Err(GKRError::CompilationError(
+                "MoE layers must be decomposed into router MatMul + TopK + expert FFNs before GKR compilation".to_string(),
+            )),
         }
     }
 

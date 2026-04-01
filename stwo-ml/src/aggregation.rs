@@ -538,6 +538,7 @@ pub fn verify_kv_cache_binding(
 
 /// A claim about a single layer's computation.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct LayerClaim {
     pub layer_index: usize,
     pub claimed_sum: SecureField,
@@ -652,6 +653,7 @@ pub enum AggregationError {
 /// Instead of N individual sumcheck proofs (each with its own round polynomials),
 /// a batch combines them with random lambda weighting: h(x) = Σ λ^i · f_a_i(x)·f_b_i(x).
 /// One set of shared round polynomials + per-matmul final evaluations.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone)]
 pub struct BatchedMatMulProofOnChain {
     /// Padded k dimension (shared by all entries in this batch).
@@ -671,6 +673,7 @@ pub struct BatchedMatMulProofOnChain {
 
 /// Per-matmul entry within a batched proof.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct BatchedMatMulEntryOnChain {
     pub node_id: usize,
     pub m: u32,
@@ -4715,6 +4718,10 @@ where
                 node_outputs.insert(node.id, current.clone());
                 outer_profiler.record_forward_op("other", _op_start.elapsed());
             }
+
+            GraphOp::MoE { .. } => {
+                todo!("MoE forward pass: decompose into router + TopK + experts")
+            }
         }
     }
 
@@ -5377,6 +5384,318 @@ pub fn prove_model_pure_gkr_decode_step_incremental(
     );
 
     Ok((proof, new_kv_commitment))
+}
+
+// ---------------------------------------------------------------------------
+// Streaming Chunk Decode Pipeline
+// ---------------------------------------------------------------------------
+
+/// Configuration for the streaming proof pipeline.
+#[derive(Debug, Clone)]
+pub struct StreamingProofConfig {
+    /// Number of tokens to accumulate before triggering a chunk proof.
+    /// Larger chunks amortize proving overhead but increase latency.
+    /// Typical values: 100 (low latency), 1000 (balanced), 3000 (high throughput).
+    pub chunk_size: usize,
+    /// Maximum number of chunks to accumulate before forcing a proof.
+    /// 0 = unlimited (prove only when chunk_size tokens are ready).
+    pub max_pending_chunks: usize,
+}
+
+impl Default for StreamingProofConfig {
+    fn default() -> Self {
+        Self {
+            chunk_size: 1000,
+            max_pending_chunks: 0,
+        }
+    }
+}
+
+/// A single proven chunk in the streaming proof chain.
+pub struct ProvenChunk {
+    /// The chunk proof.
+    pub proof: AggregatedModelProofOnChain,
+    /// Number of new tokens in this chunk.
+    pub num_tokens: usize,
+    /// Absolute position of the first token in this chunk.
+    pub position_offset: usize,
+    /// KV commitment after this chunk.
+    pub kv_commitment: FieldElement,
+    /// Previous KV commitment (for chain verification).
+    pub prev_kv_commitment: FieldElement,
+    /// Wall-clock proving time for this chunk.
+    pub prove_time_ms: u64,
+}
+
+impl ProvenChunk {
+    /// Throughput in tokens per second for this chunk.
+    pub fn throughput_tok_per_sec(&self) -> f64 {
+        if self.prove_time_ms == 0 {
+            return 0.0;
+        }
+        self.num_tokens as f64 / (self.prove_time_ms as f64 / 1000.0)
+    }
+}
+
+/// Streaming proof pipeline for token-by-token proving.
+///
+/// Accumulates tokens from the inference engine, proves them in chunks,
+/// and maintains a KV-cache commitment chain linking all chunks.
+///
+/// # Architecture
+///
+/// ```text
+/// Token stream → [Buffer] → [Chunk Prover] → [Commitment Chain] → [Proofs]
+///                 (ring)     (GPU GKR)         (Poseidon hash)     (Vec<ProvenChunk>)
+/// ```
+///
+/// # Throughput Model
+///
+/// At chunk_size=1000 with ~15s per chunk proof (GPU-optimized):
+///   1000 / 15 ≈ 67 tok/s per prover GPU
+///
+/// At chunk_size=3000 with ~20s per chunk proof:
+///   3000 / 20 = 150 tok/s per prover GPU
+///
+/// With N prover GPUs: N × single_gpu_throughput
+pub struct StreamingProofPipeline {
+    /// Configuration.
+    config: StreamingProofConfig,
+    /// Computation graph (with mutable seq_len for chunk sizing).
+    graph: ComputationGraph,
+    /// Model weights.
+    weights: GraphWeights,
+    /// KV-cache state (grows with each proven chunk).
+    kv_cache: crate::components::attention::ModelKVCache,
+    /// Incremental KV commitment tracker.
+    kv_commitment: IncrementalKVCommitment,
+    /// Optional weight cache for faster repeated proofs.
+    weight_cache: Option<crate::weight_cache::SharedWeightCache>,
+    /// Token buffer — accumulates tokens until chunk_size is reached.
+    token_buffer: Vec<Vec<M31>>,
+    /// Hidden dimension (width of each token vector).
+    hidden_dim: usize,
+    /// Total tokens proven so far.
+    total_tokens_proven: usize,
+    /// All proven chunks (for chain verification).
+    proven_chunks: Vec<ProvenChunk>,
+}
+
+impl StreamingProofPipeline {
+    /// Create a new streaming pipeline.
+    ///
+    /// `initial_capacity` is the expected maximum sequence length
+    /// (used to size the incremental Merkle trees).
+    pub fn new(
+        graph: ComputationGraph,
+        weights: GraphWeights,
+        hidden_dim: usize,
+        initial_capacity: usize,
+        config: StreamingProofConfig,
+    ) -> Self {
+        let kv_cache = crate::components::attention::ModelKVCache::new();
+        let kv_commitment = IncrementalKVCommitment::from_kv_cache(&kv_cache, initial_capacity);
+        Self {
+            config,
+            graph,
+            weights,
+            kv_cache,
+            kv_commitment,
+            weight_cache: None,
+            token_buffer: Vec::new(),
+            hidden_dim,
+            total_tokens_proven: 0,
+            proven_chunks: Vec::new(),
+        }
+    }
+
+    /// Set the weight cache for faster proving.
+    pub fn with_weight_cache(mut self, cache: crate::weight_cache::SharedWeightCache) -> Self {
+        self.weight_cache = Some(cache);
+        self
+    }
+
+    /// Push a single token's hidden state into the buffer.
+    ///
+    /// Returns `Some(ProvenChunk)` if the buffer reached `chunk_size` and
+    /// a proof was generated. Returns `None` if the token was buffered.
+    pub fn push_token(&mut self, token_hidden: Vec<M31>) -> Result<Option<ProvenChunk>, AggregationError> {
+        assert_eq!(token_hidden.len(), self.hidden_dim,
+            "token hidden dim {} != expected {}",
+            token_hidden.len(), self.hidden_dim);
+
+        self.token_buffer.push(token_hidden);
+
+        if self.token_buffer.len() >= self.config.chunk_size {
+            let chunk = self.prove_buffered_chunk()?;
+            Ok(Some(chunk))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Push multiple tokens at once.
+    ///
+    /// Returns proven chunks for each full chunk_size batch.
+    pub fn push_tokens(&mut self, tokens: Vec<Vec<M31>>) -> Result<Vec<ProvenChunk>, AggregationError> {
+        let mut chunks = Vec::new();
+        for token in tokens {
+            if let Some(chunk) = self.push_token(token)? {
+                chunks.push(chunk);
+            }
+        }
+        Ok(chunks)
+    }
+
+    /// Flush: prove whatever tokens are in the buffer (even if < chunk_size).
+    ///
+    /// Call this at end of generation to prove the final partial chunk.
+    pub fn flush(&mut self) -> Result<Option<ProvenChunk>, AggregationError> {
+        if self.token_buffer.is_empty() {
+            return Ok(None);
+        }
+        let chunk = self.prove_buffered_chunk()?;
+        Ok(Some(chunk))
+    }
+
+    /// Prove the current token buffer as a chunk.
+    fn prove_buffered_chunk(&mut self) -> Result<ProvenChunk, AggregationError> {
+        let chunk_tokens: Vec<Vec<M31>> = std::mem::take(&mut self.token_buffer);
+        let num_tokens = chunk_tokens.len();
+        assert!(num_tokens > 0, "cannot prove empty chunk");
+
+        // Build chunk input matrix: (num_tokens, hidden_dim)
+        let mut data = Vec::with_capacity(num_tokens * self.hidden_dim);
+        for token in &chunk_tokens {
+            data.extend_from_slice(token);
+        }
+        let chunk_input = M31Matrix {
+            rows: num_tokens,
+            cols: self.hidden_dim,
+            data,
+        };
+
+        let position_offset = self.total_tokens_proven;
+
+        // Adapt graph for chunk size
+        let chunk_graph = self.graph.with_seq_len(num_tokens);
+
+        let t_start = std::time::Instant::now();
+
+        // Use the existing incremental decode function (already handles any rows count)
+        let (proof, new_commitment) = prove_model_pure_gkr_decode_step_incremental(
+            &chunk_graph,
+            &chunk_input,
+            &self.weights,
+            &mut self.kv_cache,
+            &mut self.kv_commitment,
+            self.weight_cache.as_ref(),
+        )?;
+
+        let prove_time_ms = t_start.elapsed().as_millis() as u64;
+        let prev_commitment = if let Some(last) = self.proven_chunks.last() {
+            last.kv_commitment
+        } else {
+            // First chunk — prev is the initial (empty) commitment
+            FieldElement::ZERO
+        };
+
+        self.total_tokens_proven += num_tokens;
+
+        let chunk = ProvenChunk {
+            proof,
+            num_tokens,
+            position_offset,
+            kv_commitment: new_commitment,
+            prev_kv_commitment: prev_commitment,
+            prove_time_ms,
+        };
+
+        eprintln!(
+            "[StreamingProof] Chunk: {} tokens @ pos {}, {:.2}s ({:.1} tok/s)",
+            num_tokens,
+            position_offset,
+            prove_time_ms as f64 / 1000.0,
+            chunk.throughput_tok_per_sec(),
+        );
+
+        self.proven_chunks.push(ProvenChunk {
+            proof: AggregatedModelProofOnChain {
+                // Store a minimal reference (the full proof is returned)
+                unified_stark: None,
+                matmul_proofs: Vec::new(),
+                batched_matmul_proofs: Vec::new(),
+                add_claims: Vec::new(),
+                mul_claims: Vec::new(),
+                layernorm_claims: Vec::new(),
+                rmsnorm_claims: Vec::new(),
+                execution: GraphExecution {
+                    intermediates: Vec::new(),
+                    output: M31Matrix { rows: 0, cols: 0, data: Vec::new() },
+                },
+                activation_claims: Vec::new(),
+                attention_proofs: Vec::new(),
+                embedding_claims: Vec::new(),
+                quantize_claims: Vec::new(),
+                dequantize_claims: Vec::new(),
+                layer_chain_commitment: FieldElement::ZERO,
+                io_commitment: FieldElement::ZERO,
+                layernorm_mean_var_commitments: Vec::new(),
+                quantize_params_commitment: FieldElement::ZERO,
+                tiled_matmul_proofs: Vec::new(),
+                gkr_proof: None,
+                gkr_batch_data: None,
+                kv_cache_commitment: Some(new_commitment),
+                prev_kv_cache_commitment: Some(prev_commitment),
+            },
+            num_tokens,
+            position_offset,
+            kv_commitment: new_commitment,
+            prev_kv_commitment: prev_commitment,
+            prove_time_ms,
+        });
+
+        Ok(chunk)
+    }
+
+    /// Total tokens proven across all chunks.
+    pub fn total_tokens(&self) -> usize {
+        self.total_tokens_proven
+    }
+
+    /// Number of tokens waiting in the buffer (not yet proven).
+    pub fn buffered_tokens(&self) -> usize {
+        self.token_buffer.len()
+    }
+
+    /// Number of proven chunks.
+    pub fn num_chunks(&self) -> usize {
+        self.proven_chunks.len()
+    }
+
+    /// Verify the commitment chain: each chunk's prev_kv matches the previous chunk's kv.
+    pub fn verify_commitment_chain(&self) -> Result<(), AggregationError> {
+        for i in 1..self.proven_chunks.len() {
+            let prev = &self.proven_chunks[i - 1];
+            let curr = &self.proven_chunks[i];
+            if curr.prev_kv_commitment != prev.kv_commitment {
+                return Err(AggregationError::VerificationFailed(format!(
+                    "commitment chain break at chunk {}: prev={:?}, expected={:?}",
+                    i, curr.prev_kv_commitment, prev.kv_commitment,
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Average throughput across all proven chunks (tok/s).
+    pub fn average_throughput(&self) -> f64 {
+        let total_ms: u64 = self.proven_chunks.iter().map(|c| c.prove_time_ms).sum();
+        if total_ms == 0 {
+            return 0.0;
+        }
+        self.total_tokens_proven as f64 / (total_ms as f64 / 1000.0)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -12153,5 +12472,94 @@ mod tests {
                 full_val
             );
         }
+    }
+
+    #[test]
+    fn test_streaming_pipeline_config() {
+        let config = StreamingProofConfig::default();
+        assert_eq!(config.chunk_size, 1000);
+
+        let config = StreamingProofConfig {
+            chunk_size: 100,
+            max_pending_chunks: 5,
+        };
+        assert_eq!(config.chunk_size, 100);
+        assert_eq!(config.max_pending_chunks, 5);
+    }
+
+    #[test]
+    fn test_streaming_pipeline_buffer() {
+        // Build a minimal graph for testing the pipeline buffer logic
+        let d = 4;
+        let mut builder = crate::compiler::graph::GraphBuilder::new((1, d));
+        builder.linear(d);
+        let graph = builder.build();
+        let weights = crate::compiler::graph::GraphWeights::new();
+
+        let mut pipeline = StreamingProofPipeline::new(
+            graph,
+            weights,
+            d,
+            1024,
+            StreamingProofConfig {
+                chunk_size: 3,
+                max_pending_chunks: 0,
+            },
+        );
+
+        assert_eq!(pipeline.total_tokens(), 0);
+        assert_eq!(pipeline.buffered_tokens(), 0);
+        assert_eq!(pipeline.num_chunks(), 0);
+
+        // Push 2 tokens — should buffer, not prove
+        let token = vec![M31::from(1u32); d];
+        let result = pipeline.push_token(token.clone());
+        // This will error because there's no weight for the linear node,
+        // but the buffer should grow
+        assert_eq!(pipeline.buffered_tokens(), 1);
+
+        let result = pipeline.push_token(token.clone());
+        assert_eq!(pipeline.buffered_tokens(), 2);
+    }
+
+    #[test]
+    fn test_proven_chunk_throughput() {
+        let chunk = ProvenChunk {
+            proof: AggregatedModelProofOnChain {
+                unified_stark: None,
+                matmul_proofs: Vec::new(),
+                batched_matmul_proofs: Vec::new(),
+                add_claims: Vec::new(),
+                mul_claims: Vec::new(),
+                layernorm_claims: Vec::new(),
+                rmsnorm_claims: Vec::new(),
+                execution: GraphExecution {
+                    intermediates: Vec::new(),
+                    output: M31Matrix { rows: 0, cols: 0, data: Vec::new() },
+                },
+                activation_claims: Vec::new(),
+                attention_proofs: Vec::new(),
+                embedding_claims: Vec::new(),
+                quantize_claims: Vec::new(),
+                dequantize_claims: Vec::new(),
+                layer_chain_commitment: FieldElement::ZERO,
+                io_commitment: FieldElement::ZERO,
+                layernorm_mean_var_commitments: Vec::new(),
+                quantize_params_commitment: FieldElement::ZERO,
+                tiled_matmul_proofs: Vec::new(),
+                gkr_proof: None,
+                gkr_batch_data: None,
+                kv_cache_commitment: None,
+                prev_kv_cache_commitment: None,
+            },
+            num_tokens: 1000,
+            position_offset: 0,
+            kv_commitment: FieldElement::ZERO,
+            prev_kv_commitment: FieldElement::ZERO,
+            prove_time_ms: 15000, // 15 seconds
+        };
+        let throughput = chunk.throughput_tok_per_sec();
+        assert!((throughput - 66.67).abs() < 1.0,
+            "1000 tokens / 15s should be ~66.67 tok/s, got {throughput:.2}");
     }
 }

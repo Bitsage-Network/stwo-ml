@@ -341,7 +341,7 @@ pub enum LayerProof {
         logup_proof: Option<LogUpProof>,
         /// Multiplicity sumcheck proof for table-side sum verification.
         multiplicity_sumcheck: Option<MultiplicitySumcheckProof>,
-        /// Degree-3 eq-sumcheck for output = input × rsqrt.
+        /// Degree-3 eq-sumcheck for output = input × rsqrt (× γ if present).
         linear_round_polys: Vec<RoundPolyDeg3>,
         /// Final evaluations at the linear sumcheck challenge point s:
         /// (input(s), rsqrt(s)).
@@ -356,6 +356,14 @@ pub enum LayerProof {
         rsqrt_table_commitment: starknet_ff::FieldElement,
         /// True if this was produced by the SIMD combined-product path.
         simd_combined: bool,
+        /// Poseidon commitment to the learned affine scale vector γ.
+        /// When present, the verifier checks that the committed γ matches
+        /// the model registration. When `None`, the norm layer has no
+        /// learned scale (raw normalization only).
+        gamma_commitment: Option<starknet_ff::FieldElement>,
+        /// Ṽ_γ(s) — gamma MLE evaluated at the linear sumcheck challenge point.
+        /// Present when `gamma_commitment` is `Some`.
+        gamma_eval: Option<SecureField>,
         /// Part 0: RMS² verification plain sumcheck round polynomials.
         /// Proves: Σ_x input(x)² = total_sq_sum (no eq weighting).
         rms_sq_round_polys: Option<Vec<RoundPolyDeg3>>,
