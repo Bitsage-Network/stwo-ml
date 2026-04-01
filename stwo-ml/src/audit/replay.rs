@@ -122,7 +122,8 @@ pub fn execute_forward_pass(
             | GraphOp::Embedding { .. }
             | GraphOp::Conv2D { .. }
             | GraphOp::Identity { .. }
-            | GraphOp::RoPE { .. } => current.clone(),
+            | GraphOp::RoPE { .. }
+            | GraphOp::MoE { .. } => current.clone(),
         };
 
         node_outputs.insert(node.id, output.clone());

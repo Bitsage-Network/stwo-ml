@@ -252,6 +252,22 @@ struct Cli {
     #[arg(long, default_value = "1")]
     decode_steps: usize,
 
+    /// Run throughput benchmark: prove at multiple sequence lengths and report tok/s.
+    ///
+    /// Measures wall-clock prove time at each seq_len, reports tokens/second.
+    /// Requires --model-dir. Writes results to <output>.bench.json.
+    #[arg(long)]
+    bench: bool,
+
+    /// Sequence lengths for --bench (comma-separated).
+    /// Default: "1,10,100,1000".
+    #[arg(long, default_value = "1,10,100,1000", value_delimiter = ',')]
+    bench_seq_lens: Vec<usize>,
+
+    /// Number of warmup iterations before benchmark (default: 1).
+    #[arg(long, default_value = "1")]
+    bench_warmup: usize,
+
     /// Produce a recursive STARK proof that compresses the GKR calldata.
     ///
     /// After GKR proving, runs the recursive prover to produce a constant-size
@@ -1375,6 +1391,135 @@ fn main() {
             eprintln!("--validate requires --model-dir");
             process::exit(1);
         }
+    }
+
+    // --bench: throughput benchmark across sequence lengths
+    if cli.bench {
+        let model_dir = cli.model_dir.as_ref().unwrap_or_else(|| {
+            eprintln!("Error: --bench requires --model-dir");
+            process::exit(1);
+        });
+
+        eprintln!("=== ObelyZK Throughput Benchmark ===");
+        eprintln!("Model: {}", model_dir.display());
+        eprintln!("Sequence lengths: {:?}", cli.bench_seq_lens);
+        eprintln!("Warmup iterations: {}", cli.bench_warmup);
+        eprintln!("GPU: {}", if cli.gpu { "enabled" } else { "disabled" });
+        eprintln!();
+
+        let layers = cli.layers;
+        let bench_results: Vec<serde_json::Value> = cli.bench_seq_lens.iter().map(|&seq_len| {
+            eprintln!("--- seq_len={seq_len} ---");
+
+            // Load model with this seq_len
+            let model = stwo_ml::compiler::hf_loader::load_hf_model(
+                model_dir,
+                layers,
+            ).unwrap_or_else(|e| {
+                eprintln!("  Error loading model: {e}");
+                process::exit(1);
+            });
+            let graph = model.graph.with_seq_len(seq_len);
+            let weights = model.weights;
+
+            // Generate synthetic input (seq_len × hidden_dim)
+            let d_model = graph.nodes.first().map(|n| n.output_shape.1).unwrap_or(1);
+            let mut input = stwo_ml::components::matmul::M31Matrix::new(seq_len, d_model);
+            for i in 0..(seq_len * d_model) {
+                input.data[i] = M31::from((i as u32 * 7 + 13) % ((1u32 << 20) - 1));
+            }
+
+            // Warmup
+            for w in 0..cli.bench_warmup {
+                eprintln!("  warmup {}/{}", w + 1, cli.bench_warmup);
+                let _ = stwo_ml::aggregation::prove_model_aggregated_onchain_gkr_auto(
+                    &graph, &input, &weights,
+                );
+            }
+
+            // Measured run
+            eprintln!("  proving...");
+            let t_start = Instant::now();
+            let result = stwo_ml::aggregation::prove_model_aggregated_onchain_gkr_auto(
+                &graph, &input, &weights,
+            );
+            let elapsed_ms = t_start.elapsed().as_millis() as u64;
+            let elapsed_s = elapsed_ms as f64 / 1000.0;
+
+            match result {
+                Ok(proof) => {
+                    let tok_per_sec = if elapsed_ms > 0 {
+                        seq_len as f64 / elapsed_s
+                    } else {
+                        0.0
+                    };
+                    let num_layers = proof.num_proven_layers();
+                    let calldata_size = proof.gkr_proof.as_ref()
+                        .map(|g| {
+                            let mut v = Vec::new();
+                            stwo_ml::cairo_serde::serialize_gkr_proof_data_only(g, &mut v);
+                            v.len()
+                        })
+                        .unwrap_or(0);
+
+                    eprintln!("  seq_len={seq_len}: {elapsed_s:.2}s, {tok_per_sec:.1} tok/s, {num_layers} layers, {calldata_size} felts");
+
+                    serde_json::json!({
+                        "seq_len": seq_len,
+                        "prove_time_ms": elapsed_ms,
+                        "tokens_per_second": tok_per_sec,
+                        "num_proven_layers": num_layers,
+                        "calldata_felts": calldata_size,
+                        "gpu": cli.gpu,
+                        "status": "ok"
+                    })
+                }
+                Err(e) => {
+                    eprintln!("  seq_len={seq_len}: FAILED — {e}");
+                    serde_json::json!({
+                        "seq_len": seq_len,
+                        "status": "failed",
+                        "error": format!("{e}"),
+                        "gpu": cli.gpu
+                    })
+                }
+            }
+        }).collect();
+
+        // Write results
+        let bench_json = serde_json::json!({
+            "benchmark": "obelyzk_throughput",
+            "model_dir": model_dir.display().to_string(),
+            "layers": layers,
+            "gpu": cli.gpu,
+            "warmup": cli.bench_warmup,
+            "results": bench_results,
+        });
+
+        let bench_path = cli.output.with_extension("bench.json");
+        std::fs::write(&bench_path, serde_json::to_string_pretty(&bench_json).unwrap())
+            .unwrap_or_else(|e| {
+                eprintln!("Error writing benchmark results: {e}");
+            });
+
+        eprintln!("\n=== Benchmark Complete ===");
+        eprintln!("Results: {}", bench_path.display());
+
+        // Print summary table
+        eprintln!("\n{:<12} {:>12} {:>12} {:>12}", "seq_len", "time (s)", "tok/s", "felts");
+        eprintln!("{}", "-".repeat(52));
+        for r in &bench_results {
+            if r["status"] == "ok" {
+                eprintln!("{:<12} {:>12.2} {:>12.1} {:>12}",
+                    r["seq_len"], r["prove_time_ms"].as_f64().unwrap() / 1000.0,
+                    r["tokens_per_second"].as_f64().unwrap(),
+                    r["calldata_felts"]);
+            } else {
+                eprintln!("{:<12} {:>12}", r["seq_len"], "FAILED");
+            }
+        }
+
+        process::exit(0);
     }
 
     // --generate-cache: compute weight commitment cache and exit (no proving)
