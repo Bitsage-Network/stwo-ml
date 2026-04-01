@@ -8423,6 +8423,8 @@ fn reduce_rmsnorm_layer(
             rsqrt_eval,
             rsqrt_table_commitment,
             simd_combined: false,
+            gamma_commitment: None,
+            gamma_eval: None,
             rms_sq_round_polys: if skip_rms_sq { None } else { Some(rms_round_polys) },
             rms_sq_input_final: if skip_rms_sq { None } else { Some(rms_input_final) },
             rms_sq_claimed_sq_sum: if skip_rms_sq { None } else { Some(total_sq_sum) },

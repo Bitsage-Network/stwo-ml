@@ -1661,6 +1661,8 @@ pub fn serialize_gkr_model_proof(proof: &crate::gkr::GKRProof, output: &mut Vec<
                 rms_sq_claimed_sq_sum,
                 rms_sq_n_active,
                 row_rms_sq,
+                gamma_commitment: _,
+                gamma_eval: _,
             } => {
                 serialize_u32(8, output); // tag: RMSNorm
                 serialize_qm31(*input_eval, output);
@@ -2144,6 +2146,8 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
                 rms_sq_claimed_sq_sum,
                 rms_sq_n_active,
                 row_rms_sq,
+                gamma_commitment: _,
+                gamma_eval: _,
             } => {
                 serialize_u32(8, output);
                 serialize_qm31(*input_eval, output);
@@ -2530,6 +2534,8 @@ fn serialize_layer_proof_packed_inner(
             rms_sq_claimed_sq_sum,
             rms_sq_n_active,
             row_rms_sq,
+            gamma_commitment: _,
+            gamma_eval: _,
         } => {
             serialize_u32(8, output);
             serialize_qm31_packed(*input_eval, output);
@@ -3009,6 +3015,8 @@ fn serialize_layer_proof_double_packed_inner(
             rms_sq_claimed_sq_sum,
             rms_sq_n_active,
             row_rms_sq,
+            gamma_commitment: _,
+            gamma_eval: _,
         } => {
             serialize_u32(8, output);
             serialize_qm31_packed(*input_eval, output);

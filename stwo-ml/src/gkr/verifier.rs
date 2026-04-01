@@ -720,6 +720,8 @@ fn verify_gkr_inner(
                 rms_sq_claimed_sq_sum,
                 rms_sq_n_active,
                 row_rms_sq,
+                gamma_commitment: _,
+                gamma_eval: _,
             } => {
                 // Deferred RMSNorm proof
                 let skip_layer_idx = deferred_skip_layer_indices.get(i).copied().unwrap_or(0);
