@@ -11,6 +11,7 @@ pub mod dequantize;
 pub mod elementwise;
 pub mod embedding;
 pub mod f32_ops;
+pub mod integer_math;
 pub mod layernorm;
 pub mod matmul;
 pub mod poseidon2_air;
