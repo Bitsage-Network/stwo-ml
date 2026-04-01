@@ -159,10 +159,25 @@ struct PrivacySpendResult {
     output_commitments: [String; 2],
 }
 
+/// Stored proof record for the verify endpoint.
+#[derive(Clone, Serialize)]
+struct StoredProof {
+    proof_hash: String,
+    model_id: String,
+    io_commitment: String,
+    weight_commitment: String,
+    num_proven_layers: usize,
+    prove_time_ms: u64,
+    calldata_size: usize,
+    created_at_epoch_ms: u64,
+}
+
 struct AppState {
     jobs: RwLock<HashMap<String, ProveJob>>,
     privacy_jobs: RwLock<HashMap<String, PrivacyJob>>,
     models: RwLock<HashMap<String, LoadedModel>>,
+    /// Proof storage: proof_hash → StoredProof. Populated by /api/v1/infer.
+    proofs: RwLock<HashMap<String, StoredProof>>,
     started_at: Instant,
     /// API key for bearer token authentication. None = open access (dev mode).
     api_key: Option<String>,
@@ -1414,6 +1429,7 @@ async fn infer(
 
     let graph = Arc::clone(&model.graph);
     let weights = Arc::clone(&model.weights);
+    let model_id_for_storage = req.model_id.clone();
     let model_id_clone = req.model_id.clone();
     let weight_commitment = model.weight_commitment.clone();
     let include_calldata = req.include_calldata;
@@ -1431,7 +1447,6 @@ async fn infer(
             &graph,
             &input_matrix,
             &weights,
-            None, // weight_cache
         );
 
         match proof_result {
@@ -1458,7 +1473,9 @@ async fn infer(
                 // Serialize calldata
                 let gkr_proof = proof.gkr_proof.as_ref();
                 let calldata_felts = if let Some(gkr) = gkr_proof {
-                    stwo_ml::cairo_serde::serialize_gkr_proof_data_only(gkr)
+                    let mut felts = Vec::new();
+                    stwo_ml::cairo_serde::serialize_gkr_proof_data_only(gkr, &mut felts);
+                    felts
                 } else {
                     Vec::new()
                 };
@@ -1502,7 +1519,25 @@ async fn infer(
     })?;
 
     match result {
-        Ok(response) => Ok(Json(response)),
+        Ok(response) => {
+            // Store proof for later verification
+            let stored = StoredProof {
+                proof_hash: response.proof_hash.clone(),
+                model_id: model_id_for_storage,
+                io_commitment: response.io_commitment.clone(),
+                weight_commitment: response.weight_commitment.clone(),
+                num_proven_layers: response.num_proven_layers,
+                prove_time_ms: response.prove_time_ms,
+                calldata_size: response.calldata_size,
+                created_at_epoch_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+            };
+            state.proofs.write().await.insert(response.proof_hash.clone(), stored);
+
+            Ok(Json(response))
+        }
         Err(err) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse { error: err }),
@@ -1512,20 +1547,44 @@ async fn infer(
 
 /// Verify a proof by hash — GET /api/v1/verify/:proof_hash
 ///
-/// Currently performs local verification only. Future: also checks on-chain.
+/// Looks up the proof in local storage. Returns verification status,
+/// model ID, and IO commitment for the proof.
+///
+/// Future: also query Starknet contract for on-chain verification status.
 async fn verify_proof(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Path(proof_hash): Path<String>,
 ) -> Json<VerifyResponse> {
-    // TODO: Look up proof in local store or query Starknet contract
-    // For now, return a stub that indicates the verification method
-    Json(VerifyResponse {
-        valid: false,
-        proof_hash: proof_hash.clone(),
-        model_id: None,
-        io_commitment: None,
-        method: "not_found".to_string(),
-    })
+    let proofs = state.proofs.read().await;
+    if let Some(stored) = proofs.get(&proof_hash) {
+        Json(VerifyResponse {
+            valid: true,
+            proof_hash: stored.proof_hash.clone(),
+            model_id: Some(stored.model_id.clone()),
+            io_commitment: Some(stored.io_commitment.clone()),
+            method: "local_storage".to_string(),
+        })
+    } else {
+        Json(VerifyResponse {
+            valid: false,
+            proof_hash,
+            model_id: None,
+            io_commitment: None,
+            method: "not_found".to_string(),
+        })
+    }
+}
+
+/// List all proven inferences — GET /api/v1/proofs
+///
+/// Returns all stored proofs, most recent first.
+async fn list_proofs(
+    State(state): State<Arc<AppState>>,
+) -> Json<Vec<StoredProof>> {
+    let proofs = state.proofs.read().await;
+    let mut list: Vec<StoredProof> = proofs.values().cloned().collect();
+    list.sort_by(|a, b| b.created_at_epoch_ms.cmp(&a.created_at_epoch_ms));
+    Json(list)
 }
 
 // =============================================================================
@@ -2506,6 +2565,7 @@ async fn main() {
         jobs: RwLock::new(HashMap::new()),
         privacy_jobs: RwLock::new(HashMap::new()),
         models: RwLock::new(HashMap::new()),
+        proofs: RwLock::new(HashMap::new()),
         started_at: Instant::now(),
         api_key: api_key.clone(),
         rate_limiter: RateLimiter::new(rate_limit_rpm, rate_limit_burst),
@@ -2530,6 +2590,7 @@ async fn main() {
         .route("/api/v1/prove/{job_id}/result", get(get_prove_result))
         .route("/api/v1/infer", post(infer))
         .route("/api/v1/verify/{proof_hash}", get(verify_proof))
+        .route("/api/v1/proofs", get(list_proofs))
         .route("/api/v1/privacy/batch", post(submit_privacy_batch))
         .route(
             "/api/v1/privacy/batch/{job_id}",
