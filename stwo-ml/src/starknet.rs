@@ -8715,8 +8715,17 @@ mod tests {
         println!("\nSUCCESS: all {} layers pass unpacked roundtrip verify (deferred={})", num_proof_layers, num_deferred);
 
         // === Also verify packed format ===
+        // For packed output, we must re-prove with STWO_SKIP_RMS_SQ_PROOF=1 because
+        // the packed serializer omits Part 0 (RMS² sumcheck). The on-chain Cairo verifier
+        // doesn't replay Part 0, so the proof channel must not include it.
+        std::env::set_var("STWO_SKIP_RMS_SQ_PROOF", "1");
+        let agg_proof_packed =
+            prove_model_pure_gkr(&graph, &input, &weights).expect("GKR proving (packed mode) should succeed");
+        std::env::remove_var("STWO_SKIP_RMS_SQ_PROOF");
+        let gkr_packed = agg_proof_packed.gkr_proof.as_ref().expect("GKR proof (packed)");
+
         let mut packed_proof_felts = Vec::new();
-        crate::cairo_serde::serialize_gkr_proof_data_only_packed(gkr, &mut packed_proof_felts);
+        crate::cairo_serde::serialize_gkr_proof_data_only_packed(gkr_packed, &mut packed_proof_felts);
         println!("packed: {} felts (vs unpacked: {})", packed_proof_felts.len(), proof_data_felts.len());
 
         fn unpack_qm31(f: &FieldElement) -> SecureField {
