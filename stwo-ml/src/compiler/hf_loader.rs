@@ -1090,7 +1090,7 @@ fn load_weights_from_shards(
                 let dim = data.len();
 
                 // Quantize γ to M31 (same strategy as other weights)
-                let (quantized, _params) = quantize_tensor(&data, strategy);
+                let (quantized, _params) = crate::gadgets::quantize::quantize_tensor(&data, strategy);
 
                 // Store as a named weight "gamma" for this norm node
                 let gamma_matrix = M31Matrix {
