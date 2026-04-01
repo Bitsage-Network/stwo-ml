@@ -60,6 +60,8 @@ pub mod gadgets;
 pub mod gkr;
 pub mod gpu;
 pub mod json_serde;
+#[cfg(feature = "binary-proof")]
+pub mod binary_serde;
 #[cfg(any(feature = "cli", feature = "audit", feature = "server"))]
 pub mod kv_state;
 pub mod receipt;

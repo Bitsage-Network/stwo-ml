@@ -538,6 +538,7 @@ pub fn verify_kv_cache_binding(
 
 /// A claim about a single layer's computation.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct LayerClaim {
     pub layer_index: usize,
     pub claimed_sum: SecureField,
@@ -652,6 +653,7 @@ pub enum AggregationError {
 /// Instead of N individual sumcheck proofs (each with its own round polynomials),
 /// a batch combines them with random lambda weighting: h(x) = Σ λ^i · f_a_i(x)·f_b_i(x).
 /// One set of shared round polynomials + per-matmul final evaluations.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone)]
 pub struct BatchedMatMulProofOnChain {
     /// Padded k dimension (shared by all entries in this batch).
@@ -671,6 +673,7 @@ pub struct BatchedMatMulProofOnChain {
 
 /// Per-matmul entry within a batched proof.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct BatchedMatMulEntryOnChain {
     pub node_id: usize,
     pub m: u32,
