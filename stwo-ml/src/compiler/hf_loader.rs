@@ -280,7 +280,8 @@ pub fn validate_model_directory(model_dir: &Path, num_layers: Option<usize>) -> 
                 .iter()
                 .filter(|n| matches!(n.op, GraphOp::MatMul { .. }))
                 .count();
-            let mapped_count = name_map.len();
+            // Count only MatMul weight mappings (keys < 10000), not gamma weights (keys >= 10000)
+            let mapped_count = name_map.keys().filter(|&&k| k < 10000).count();
 
             checks.push(ValidationCheck {
                 name: "Required weight tensors found".into(),
