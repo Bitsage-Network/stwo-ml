@@ -740,27 +740,35 @@ impl GraphBuilder {
     /// This creates 3 MatMul nodes + 1 Activation + 1 Mul:
     ///   - Node A: gate_proj (input × W_gate → d_ff)
     ///   - Node B: activation on gate (SiLU for SwiGLU, GELU for GeGLU)
-    ///   - Node C: up_proj (input × W_up → d_ff)
+    ///   - Node C: up_proj (input × W_up → d_ff) — via Add-style branch from input
     ///   - Node D: element-wise multiply (gate * up)
     ///   - Node E: down_proj (hidden × W_down → d_model)
     ///
-    /// The fork/mul_from pattern handles the two parallel branches.
+    /// The branch is handled the same way as residual connections (Add):
+    /// the input is saved via fork(), then the gate branch runs sequentially,
+    /// then the up branch is computed from the saved input, and mul_from
+    /// combines them. The GKR prover handles this via its deferred proof
+    /// mechanism for binary ops with two input branches.
     pub fn gated_ffn(&mut self, d_ff: usize, act_type: ActivationType) -> &mut Self {
+        // Save input for the up branch (like a residual connection)
         let input_branch = self.fork();
 
-        // Gate branch: input → linear(d_ff) → activation
+        // Gate branch: input → gate_proj(d_ff) → activation
         self.linear(d_ff);
         self.activation(act_type);
-        let gate_branch = self.fork();
+        let gate_output = self.fork();
 
-        // Up branch: input → linear(d_ff)
+        // Up branch: input → up_proj(d_ff)
+        // Reset cursor to input, compute up_proj sequentially
         self.last_node = Some(input_branch);
         self.linear(d_ff);
 
         // Element-wise multiply: gate * up
-        self.mul_from(gate_branch);
+        // This creates a Mul node with two inputs: gate_output and up_output
+        // The GKR prover handles this like Add (trunk + deferred branch)
+        self.mul_from(gate_output);
 
-        // Down projection
+        // Down projection: hidden(d_ff) → output(d_model)
         let d_model = self.graph.nodes[input_branch].output_shape.1;
         self.linear(d_model);
 

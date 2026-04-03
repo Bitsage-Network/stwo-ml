@@ -1540,16 +1540,32 @@ pub fn prove_gkr_with_cache(
         .map(|d| (d.ordinal, d.name.clone(), d.total_memory))
         .collect();
 
-    // Deferred claims from DAG Add layers (rhs branches needing separate proofs).
+    // Deferred claims from DAG Add/Mul layers (skip branches needing separate proofs).
     // Each entry: (rhs_claim, rhs_layer_idx_in_circuit)
     let mut deferred_info: Vec<(GKRClaim, usize)> = Vec::new();
+    // Layers to skip in the main walk (they belong to deferred branches).
+    let mut skip_layers: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
     // ── Phase: layer_walk ──
     profiler.begin_phase("layer_walk", channel.hash_count());
 
     // Walk layers from output → input
     for layer_idx in (0..d).rev() {
+        // Skip layers that belong to deferred branches (resolved after main walk)
+        if skip_layers.contains(&layer_idx) {
+            if std::env::var("STWO_DEBUG_GKR").is_ok() {
+                eprintln!("[GKR walk] layer_idx={} SKIPPED (deferred branch)", layer_idx);
+            }
+            continue;
+        }
         let layer = &circuit.layers[layer_idx];
+        if std::env::var("STWO_DEBUG_GKR").is_ok() {
+            eprintln!("[GKR walk] layer_idx={} node_id={} type={:?} out={:?} in={:?} claim_vars={}",
+                layer_idx, layer.node_id,
+                std::mem::discriminant(&layer.layer_type),
+                layer.output_shape, layer.input_shape,
+                current_claim.point.len());
+        }
         #[cfg(feature = "proof-stream")]
         let _ps_layer_t = std::time::Instant::now();
         emit_proof_event!(|| proof_stream::ProofEvent::LayerStart {
@@ -1657,7 +1673,40 @@ pub fn prove_gkr_with_cache(
             LayerType::Mul { .. } => {
                 let (lhs_vals, rhs_vals) = get_binary_op_intermediates(execution, layer, circuit)?;
 
-                reduce_mul_layer(&current_claim, &lhs_vals, &rhs_vals, channel)?
+                let (proof, _claim) =
+                    reduce_mul_layer(&current_claim, &lhs_vals, &rhs_vals, channel)?;
+
+                // Handle Mul branching the same way as Add:
+                // follow one branch (trunk), defer the other.
+                if let LayerProof::Mul { lhs_eval, rhs_eval, .. } = &proof {
+                    let (trunk_eval, skip_eval, skip_layer_idx, _trunk_idx) =
+                        if layer.input_layers.len() >= 2 && layer.input_layers[1] > layer.input_layers[0] {
+                            (*rhs_eval, *lhs_eval, layer.input_layers[0], 1u8)
+                        } else if layer.input_layers.len() >= 2 {
+                            (*lhs_eval, *rhs_eval, layer.input_layers[1], 0u8)
+                        } else {
+                            (*lhs_eval, SecureField::zero(), 0, 0u8)
+                        };
+                    if layer.input_layers.len() >= 2 {
+                        deferred_info.push((
+                            GKRClaim {
+                                point: current_claim.point.clone(),
+                                value: skip_eval,
+                            },
+                            skip_layer_idx,
+                        ));
+                        // Mark the skip branch layers to be skipped in the main walk.
+                        // Walk backward from skip_layer_idx until we reach a layer
+                        // that's an input to the trunk branch or has no more inputs.
+                        skip_layers.insert(skip_layer_idx);
+                    }
+                    (proof, GKRClaim {
+                        point: current_claim.point.clone(),
+                        value: trunk_eval,
+                    })
+                } else {
+                    unreachable!("reduce_mul_layer returned non-Mul proof");
+                }
             }
 
             LayerType::Activation {
