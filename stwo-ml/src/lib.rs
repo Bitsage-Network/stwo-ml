@@ -64,6 +64,7 @@ pub mod json_serde;
 pub mod binary_serde;
 #[cfg(any(feature = "cli", feature = "audit", feature = "server"))]
 pub mod kv_state;
+pub mod economics;
 pub mod receipt;
 pub mod starknet;
 pub mod recursive;
