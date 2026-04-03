@@ -7777,17 +7777,18 @@ fn reduce_layernorm_layer(
             var_mle[idx] = variance_sf;
             rsqrt_mle[idx] = rsqrt_sf;
 
+            let x = input_padded.get(row, col);
+            // Centered = input - mean for ALL positions (active + padding).
+            // For padding: input=0, mean=actual_mean → centered = -mean.
+            // This is consistent with verifier's check: centered == input - mean.
+            let centered = x - mean;
+            centered_mle[idx] = SecureField::from(centered);
             if col < n_active {
-                let x = input_padded.get(row, col);
-                let centered = x - mean;
-                let out_val = centered * rsqrt;
-                centered_mle[idx] = SecureField::from(centered);
-                output_mle[idx] = SecureField::from(out_val);
+                output_mle[idx] = SecureField::from(centered * rsqrt);
             } else {
-                // Padding: identity passthrough
-                let x = input_padded.get(row, col);
-                centered_mle[idx] = SecureField::from(x);
-                output_mle[idx] = SecureField::from(x);
+                // Padding output: (0 - mean) * rsqrt. Not identity passthrough,
+                // because the verifier expects output = centered * rsqrt everywhere.
+                output_mle[idx] = SecureField::from(centered * rsqrt);
             }
         }
     }

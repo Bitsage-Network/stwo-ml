@@ -1030,12 +1030,17 @@ pub(crate) fn apply_layernorm_detailed(input: &M31Matrix, dim: usize) -> LayerNo
         }
         for col in n..cols {
             let x = input.data[row_start + col];
-            row_out.push(x);
+            // Padding: use same mean/rsqrt as active columns for consistency.
+            // centered = x - mean, output = centered * rsqrt.
+            // For zero-padded x: centered = -mean, output = -mean * rsqrt.
+            let centered = x - mean;
+            let out_val = centered * rsqrt;
+            row_out.push(out_val);
             row_inputs.push(x);
-            row_means.push(M31::from(0));
-            row_vars.push(M31::from(0));
-            row_rsqrt.push(M31::from(1u32 << 16));
-            row_outputs.push(x);
+            row_means.push(mean);
+            row_vars.push(variance);
+            row_rsqrt.push(rsqrt);
+            row_outputs.push(out_val);
         }
 
         (
