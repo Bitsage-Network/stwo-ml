@@ -698,7 +698,13 @@ pub fn open_streaming_pipeline(
 
 /// Build a transformer computation graph matching a HuggingFace architecture.
 ///
-/// Each transformer block: Norm → Q proj → O proj → Norm → FFN up → act → FFN down
+/// Each transformer block: Norm → Q proj → O proj → Norm → Gated FFN (gate×up→down)
+///
+/// Models the real Llama/Qwen/Mistral architecture with SwiGLU gated FFN:
+///   gate = SiLU(input × W_gate)
+///   up   = input × W_up
+///   hidden = gate * up
+///   output = hidden × W_down
 fn build_hf_transformer_graph(config: &TransformerConfig, num_layers: usize) -> ComputationGraph {
     use crate::compiler::onnx::NormType;
     let d = config.d_model;
@@ -721,12 +727,10 @@ fn build_hf_transformer_graph(config: &TransformerConfig, num_layers: usize) -> 
             NormType::LayerNorm => { builder.layer_norm(); }
             NormType::RMSNorm => { builder.rms_norm(); }
         }
-        // FFN up projection (d → d_ff)
-        builder.linear(d_ff);
-        // FFN activation
-        builder.activation(config.activation);
-        // FFN down projection (d_ff → d)
-        builder.linear(d);
+        // Gated FFN: gate_proj(SiLU) × up_proj → down_proj
+        // This models the real SwiGLU/GeGLU architecture used by
+        // Llama, Qwen, Mistral, GLM, Yi, and most modern LLMs.
+        builder.gated_ffn(d_ff, config.activation);
     }
 
     // Final norm
@@ -744,16 +748,18 @@ fn build_hf_transformer_graph(config: &TransformerConfig, num_layers: usize) -> 
 
 /// Build a mapping from graph node indices to HuggingFace tensor names.
 ///
-/// For each transformer block, the graph has 7 nodes:
-///   0: LayerNorm (pre-attention)
+/// For each transformer block with gated FFN, the graph has 9 nodes:
+///   0: Norm      (pre-attention)
 ///   1: MatMul    (Q projection)    → model.layers.{L}.self_attn.q_proj.weight
 ///   2: MatMul    (O projection)    → model.layers.{L}.self_attn.o_proj.weight
-///   3: LayerNorm (post-attention)
-///   4: MatMul    (FFN up)          → model.layers.{L}.mlp.up_proj.weight (or gate_proj)
-///   5: Activation
-///   6: MatMul    (FFN down)        → model.layers.{L}.mlp.down_proj.weight
+///   3: Norm      (post-attention)
+///   4: MatMul    (gate_proj)       → model.layers.{L}.mlp.gate_proj.weight
+///   5: Activation (SiLU on gate)
+///   6: MatMul    (up_proj)         → model.layers.{L}.mlp.up_proj.weight
+///   7: Mul       (gate * up)
+///   8: MatMul    (down_proj)       → model.layers.{L}.mlp.down_proj.weight
 ///
-/// Plus a final LayerNorm at the end.
+/// Plus a final Norm at the end.
 fn build_weight_name_map(
     _graph: &ComputationGraph,
     num_layers: usize,
@@ -765,8 +771,9 @@ fn build_weight_name_map(
         .map(|(name, _)| name.as_str())
         .collect();
 
-    // Each block has 7 nodes. MatMul nodes are at offsets 1, 2, 4, 6 within a block.
-    let nodes_per_block = 7;
+    // Each block has 9 nodes with gated FFN.
+    // MatMul nodes: offsets 1 (Q), 2 (O), 4 (gate), 6 (up), 8 (down).
+    let nodes_per_block = 9;
 
     for layer_idx in 0..num_layers {
         let block_start = layer_idx * nodes_per_block;
@@ -775,10 +782,12 @@ fn build_weight_name_map(
         let q_node = block_start + 1;
         // Node offset 2: O projection
         let o_node = block_start + 2;
-        // Node offset 4: FFN up
-        let up_node = block_start + 4;
-        // Node offset 6: FFN down
-        let down_node = block_start + 6;
+        // Node offset 4: gate_proj (SwiGLU gate branch)
+        let gate_node = block_start + 4;
+        // Node offset 6: up_proj (SwiGLU up branch)
+        let up_node = block_start + 6;
+        // Node offset 8: down_proj
+        let down_node = block_start + 8;
 
         // Try common HuggingFace naming patterns for the Q projection
         let q_candidates = [
@@ -806,11 +815,23 @@ fn build_weight_name_map(
             }
         }
 
-        // FFN up projection (some models use gate_proj, some use up_proj)
-        let up_candidates = [
-            format!("model.layers.{layer_idx}.mlp.up_proj.weight"),
+        // Gate projection (SwiGLU gate branch)
+        let gate_candidates = [
             format!("model.layers.{layer_idx}.mlp.gate_proj.weight"),
             format!("model.layers.{layer_idx}.feed_forward.w1.weight"),
+            format!("transformer.h.{layer_idx}.mlp.gate_proj.weight"),
+        ];
+        for name in &gate_candidates {
+            if tensor_set.contains(name.as_str()) {
+                map.insert(gate_node, name.clone());
+                break;
+            }
+        }
+
+        // Up projection (SwiGLU up branch)
+        let up_candidates = [
+            format!("model.layers.{layer_idx}.mlp.up_proj.weight"),
+            format!("model.layers.{layer_idx}.feed_forward.w3.weight"),
             format!("transformer.h.{layer_idx}.mlp.up_proj.weight"),
         ];
         for name in &up_candidates {
@@ -849,7 +870,7 @@ fn build_weight_name_map(
             }
         }
 
-        // Node offset 3: post-attention norm
+        // Node offset 3: post-attention norm (same offset in 9-node layout)
         let post_norm_node = block_start + 3;
         let post_norm_candidates = [
             format!("model.layers.{layer_idx}.post_attention_layernorm.weight"),
