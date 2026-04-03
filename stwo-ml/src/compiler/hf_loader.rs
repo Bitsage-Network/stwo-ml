@@ -1162,11 +1162,20 @@ fn load_weights_from_shards(
                 let shape = tensor.shape();
                 let (rows, cols) = if shape.len() == 2 { (shape[0], shape[1]) } else { (data.len(), 1) };
 
-                // Quantize and transpose if needed (same as regular MatMul weights)
-                let (quantized, _params) = crate::gadgets::quantize::quantize_tensor(&data, strategy);
+                // HF stores weights as (out_features, in_features).
+                // For input × W_up, we need W_up as (in_features, out_features).
+                // Transpose: (rows, cols) → (cols, rows)
+                let mut transposed = vec![0.0f32; data.len()];
+                for r in 0..rows {
+                    for c in 0..cols {
+                        transposed[c * rows + r] = data[r * cols + c];
+                    }
+                }
+
+                let (quantized, _params) = crate::gadgets::quantize::quantize_tensor(&transposed, strategy);
                 let up_matrix = M31Matrix {
-                    rows,
-                    cols,
+                    rows: cols,   // in_features
+                    cols: rows,   // out_features
                     data: quantized,
                 };
                 weights.add_named_weight(*node_id, "up_proj", up_matrix);

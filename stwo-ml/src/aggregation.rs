@@ -4352,21 +4352,58 @@ where
                     .get_weight(node.id)
                     .ok_or(ModelError::MissingWeight(node.id))?;
 
+                // Gated FFN: if this node has an "up_proj" named weight, compute
+                // gate * up before the down_proj MatMul.
+                // The up_proj input is the ORIGINAL input to the FFN block (before gate_proj),
+                // which we find by walking back through the graph to the norm output.
+                if let Some(up_weight) = weights.get_named_weight(node.id, "up_proj") {
+                    // Find the FFN block input: walk back 3 nodes (down_proj ← SiLU ← gate_proj ← norm)
+                    // The norm output is the input to gate_proj, which is 2 nodes before this one.
+                    // In topo order: ..., norm, gate_proj, silu, DOWN_PROJ(this)
+                    // The gate_proj's input is stored as its intermediate.
+                    let gate_proj_node_id = if node.id >= 2 { node.id - 2 } else { 0 };
+                    let ffn_input = intermediates.iter().rev()
+                        .find(|(id, _)| *id == gate_proj_node_id)
+                        .map(|(_, m)| m.clone())
+                        .unwrap_or_else(|| current.clone());
+
+                    // Compute up = ffn_input × W_up
+                    #[cfg(feature = "cuda-runtime")]
+                    let up_output = crate::gpu_sumcheck::gpu_matmul_m31_full(&ffn_input, up_weight)
+                        .unwrap_or_else(|_| matmul_m31(&ffn_input, up_weight));
+                    #[cfg(not(feature = "cuda-runtime"))]
+                    let up_output = matmul_m31(&ffn_input, up_weight);
+
+                    // Element-wise multiply: hidden = gate_activated * up
+                    assert_eq!(current.rows, up_output.rows, "gate*up row mismatch");
+                    assert_eq!(current.cols, up_output.cols, "gate*up col mismatch");
+                    let hidden_data: Vec<M31> = current.data.iter()
+                        .zip(up_output.data.iter())
+                        .map(|(&g, &u)| g * u)
+                        .collect();
+                    current = M31Matrix {
+                        rows: current.rows,
+                        cols: current.cols,
+                        data: hidden_data,
+                    };
+
+                    eprintln!(
+                        "  [{}/{}] Node {} MatMul {}x{}x{} — gated FFN (gate*up applied)",
+                        step + 1, total_nodes, node.id, m, k, n,
+                    );
+                } else {
+                    eprintln!(
+                        "  [{}/{}] Node {} MatMul {}x{}x{} — forward only (GKR deferred)",
+                        step + 1, total_nodes, node.id, m, k, n,
+                    );
+                }
+
+                // Compute the actual down_proj (or regular matmul)
                 #[cfg(feature = "cuda-runtime")]
                 let output = crate::gpu_sumcheck::gpu_matmul_m31_full(&current, weight)
                     .unwrap_or_else(|_| matmul_m31(&current, weight));
                 #[cfg(not(feature = "cuda-runtime"))]
                 let output = matmul_m31(&current, weight);
-
-                eprintln!(
-                    "  [{}/{}] Node {} MatMul {}x{}x{} — forward only (GKR deferred)",
-                    step + 1,
-                    total_nodes,
-                    node.id,
-                    m,
-                    k,
-                    n,
-                );
 
                 intermediates.push((node.id, current.clone()));
                 node_outputs.insert(node.id, output.clone());
