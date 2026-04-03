@@ -88,6 +88,14 @@ pub enum LayerType {
 
     /// Identity / passthrough (zero-cost in GKR, claim propagates unchanged).
     Identity,
+
+    /// Top-K selection for MoE routing.
+    /// Proves that the K selected expert indices have the K largest router logits.
+    /// Reduction: value binding (LogUp) + threshold range check + completeness.
+    TopK {
+        num_experts: usize,
+        top_k: usize,
+    },
 }
 
 /// SIMD batch configuration for identical transformer blocks.
@@ -276,9 +284,10 @@ impl LayeredCircuit {
             }),
             GraphOp::RMSNorm { dim } => Ok(LayerType::RMSNorm { dim: *dim }),
             GraphOp::RoPE { config } => Ok(LayerType::RoPE { config: *config }),
-            GraphOp::MoE { .. } => Err(GKRError::CompilationError(
-                "MoE layers must be decomposed into router MatMul + TopK + expert FFNs before GKR compilation".to_string(),
-            )),
+            GraphOp::MoE { num_experts, top_k, .. } => Ok(LayerType::TopK {
+                num_experts: *num_experts,
+                top_k: *top_k,
+            }),
         }
     }
 
@@ -355,6 +364,7 @@ impl LayeredCircuit {
                 LayerType::Input => counts.input += 1,
                 LayerType::RoPE { .. } => counts.identity += 1, // RoPE counted with identity for now
                 LayerType::Identity => counts.identity += 1,
+                LayerType::TopK { .. } => counts.identity += 1, // TopK counted with identity for now
             }
         }
         counts

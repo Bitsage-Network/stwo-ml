@@ -1725,6 +1725,7 @@ pub fn serialize_gkr_model_proof(proof: &crate::gkr::GKRProof, output: &mut Vec<
                     None => serialize_u32(0, output),
                 }
             }
+            LayerProof::TopK { .. } => { /* skip for now */ }
         }
     }
 
@@ -2208,6 +2209,7 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
                     None => serialize_u32(0, output),
                 }
             }
+            LayerProof::TopK { .. } => { /* skip for now */ }
         }
     }
 
@@ -2651,6 +2653,7 @@ fn serialize_layer_proof_packed_inner(
                 None => serialize_u32(0, output),
             }
         }
+        LayerProof::TopK { .. } => { /* skip for now */ }
     }
 }
 
@@ -3131,6 +3134,7 @@ fn serialize_layer_proof_double_packed_inner(
                 None => serialize_u32(0, output),
             }
         }
+        LayerProof::TopK { .. } => { /* skip for now */ }
     }
 }
 

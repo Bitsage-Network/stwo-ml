@@ -490,6 +490,34 @@ pub enum LayerProof {
         causal: bool,
         position_offset: usize,
     },
+
+    /// Top-K expert selection proof for MoE routing.
+    ///
+    /// Proves that the K selected experts have the K largest router logits.
+    /// The proof consists of:
+    /// 1. Selected indices + values (K entries)
+    /// 2. Rejected indices + values (N-K entries)
+    /// 3. Threshold proof: min(selected) ≥ max(rejected) via range check
+    /// 4. Completeness: all N indices covered exactly once
+    ///
+    /// The router logits MLE binding is done via the parent MatMul layer proof
+    /// (the router projection is a standard MatMul → TopK takes its output).
+    TopK {
+        /// Number of experts (N).
+        num_experts: usize,
+        /// Number selected (K).
+        top_k: usize,
+        /// Selected expert indices.
+        selected_indices: Vec<u32>,
+        /// Selected expert logit values (as SecureField for channel mixing).
+        selected_values: Vec<SecureField>,
+        /// min(selected) - max(rejected), must be non-negative.
+        /// Encoded as M31 value in [0, P/2] (non-negative signed range).
+        threshold_gap: SecureField,
+        /// Poseidon commitment to the full router logits vector.
+        /// The verifier checks this matches the router MatMul output.
+        logits_commitment: starknet_ff::FieldElement,
+    },
 }
 
 /// Weight claim from a MatMul layer: the evaluation point and expected value

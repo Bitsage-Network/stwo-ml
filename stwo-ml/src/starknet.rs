@@ -1353,6 +1353,7 @@ pub fn build_circuit_descriptor(circuit: &crate::gkr::LayeredCircuit) -> Vec<u32
             crate::gkr::circuit::LayerType::Quantize { .. } => 9,
             crate::gkr::circuit::LayerType::Embedding { .. } => 10,
             crate::gkr::circuit::LayerType::RoPE { .. } => 11,
+            crate::gkr::circuit::LayerType::TopK { .. } => 12,
             crate::gkr::circuit::LayerType::Input => continue,
             crate::gkr::circuit::LayerType::Identity => continue,
         };

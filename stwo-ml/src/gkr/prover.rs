@@ -106,7 +106,7 @@ fn layer_kind_from_type(layer_type: &LayerType) -> proof_stream::LayerKind {
         LayerType::Embedding { .. } => proof_stream::LayerKind::Embedding,
         // Quantize/Dequantize mapped to Add (no dedicated color needed)
         LayerType::Dequantize { .. } | LayerType::Quantize { .. } => proof_stream::LayerKind::Add,
-        LayerType::Input | LayerType::Identity | LayerType::RoPE { .. } => proof_stream::LayerKind::Add,
+        LayerType::Input | LayerType::Identity | LayerType::RoPE { .. } | LayerType::TopK { .. } => proof_stream::LayerKind::Add,
     }
 }
 
@@ -124,7 +124,7 @@ fn estimate_trace_cost(layer_type: &LayerType) -> usize {
             vocab_size,
             embed_dim,
         } => vocab_size * embed_dim,
-        LayerType::Input | LayerType::Identity | LayerType::RoPE { .. } => 0,
+        LayerType::Input | LayerType::Identity | LayerType::RoPE { .. } | LayerType::TopK { .. } => 0,
     }
 }
 
@@ -1752,6 +1752,8 @@ pub fn prove_gkr_with_cache(
                 reduce_dequantize_layer(&current_claim, input_matrix, params, channel)?
             }
 
+            LayerType::TopK { .. } => todo!("TopK GKR reduction"),
+
             LayerType::Input => {
                 // Should not be reached in normal flow
                 break;
@@ -2303,6 +2305,8 @@ pub fn prove_gkr_decode(
                 reduce_dequantize_layer(&current_claim, input_matrix, params, channel)?
             }
 
+            LayerType::TopK { .. } => todo!("TopK GKR reduction"),
+
             LayerType::Input => {
                 break;
             }
@@ -2532,7 +2536,7 @@ pub fn prove_gkr_decode(
                     kind: super::types::DeferredProofKind::Weightless,
                 });
             }
-            LayerType::Embedding { .. } | LayerType::Mul { .. } => {
+            LayerType::Embedding { .. } | LayerType::Mul { .. } | LayerType::TopK { .. } => {
                 // These shouldn't appear as deferred branches in typical transformer blocks,
                 // but handle them for completeness.
                 mix_secure_field(channel, deferred_claim.value);
