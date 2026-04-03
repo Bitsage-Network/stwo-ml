@@ -1,0 +1,33 @@
+# ObelyZK Prove Server — Docker Compose
+#
+# Quick start:
+#   docker compose up
+#
+# With GPU:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up
+
+services:
+  prove-server:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./models:/models
+      - proof-data:/data/proofs
+    environment:
+      - BIND_ADDR=0.0.0.0:8080
+      - RUST_LOG=info
+      # Optional: API key for authentication
+      # - OBELYZK_API_KEY=your-secret-key
+      # Optional: Starknet RPC for on-chain submission
+      # - STARKNET_RPC_URL=https://starknet-sepolia.public.blastapi.io
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  proof-data:
