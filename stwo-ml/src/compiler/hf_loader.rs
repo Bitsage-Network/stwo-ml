@@ -1084,8 +1084,36 @@ fn load_weights_from_shards(
         if shape.len() == 2 {
             let tensor_rows = shape[0];
             let tensor_cols = shape[1];
+            // Check if this is a fused QKV: tensor has 3× the expected output dimension
+            // (Phi-3 qkv_proj [3*d, d] or GPT-2 c_attn [d, 3*d])
+            // Extract just the Q portion (first third)
+            if (tensor_rows == 3 * *n && tensor_cols == *k) || (tensor_cols == 3 * *n && tensor_rows == *k)
+                || (tensor_rows >= 2 * *n && tensor_rows != 2 * *n && tensor_cols == *k && tensor_rows % *n == 0)
+                || (tensor_cols >= 2 * *n && tensor_cols != 2 * *n && tensor_rows == *k && tensor_cols % *n == 0) {
+                let is_col_fused = tensor_cols > tensor_rows;
+                let multiplier = if is_col_fused { tensor_cols / *n } else { tensor_rows / *n };
+
+                if is_col_fused {
+                    // Shape [k, M*n]: take columns 0..n for Q
+                    let q_data: Vec<f32> = (0..tensor_rows)
+                        .flat_map(|r| data[r * tensor_cols..r * tensor_cols + *n].iter().copied())
+                        .collect();
+                    eprintln!("  Splitting fused QKV for node {} ({}×): [{}×{}] → Q [{}×{}]",
+                        idx, multiplier, tensor_rows, tensor_cols, tensor_rows, *n);
+                    *data = q_data;
+                    shape[1] = *n;
+                } else {
+                    // Shape [M*n, k]: take rows 0..n for Q
+                    let q_data = data[..*n * tensor_cols].to_vec();
+                    eprintln!("  Splitting fused QKV for node {} ({}×): [{}×{}] → Q [{}×{}]",
+                        idx, multiplier, tensor_rows, tensor_cols, *n, tensor_cols);
+                    *data = q_data;
+                    shape[0] = *n;
+                }
+            }
+
             // Check if this is a fused gate_up: tensor has 2× the expected output dimension
-            if (tensor_rows == 2 * *n && tensor_cols == *k) || (tensor_cols == 2 * *n && tensor_rows == *k) {
+            else if (tensor_rows == 2 * *n && tensor_cols == *k) || (tensor_cols == 2 * *n && tensor_rows == *k) {
                 let is_transposed = tensor_rows == *k;
                 let (fused_rows, fused_cols) = if is_transposed {
                     (*k, 2 * *n)
