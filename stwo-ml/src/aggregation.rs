@@ -4787,9 +4787,34 @@ where
                 outer_profiler.record_forward_op("other", _op_start.elapsed());
             }
 
-            GraphOp::Identity { .. } | GraphOp::Conv2D { .. } => {
+            GraphOp::Identity { .. } => {
                 node_outputs.insert(node.id, current.clone());
                 outer_profiler.record_forward_op("other", _op_start.elapsed());
+            }
+
+            GraphOp::Conv2D { in_channels, out_channels, kernel_size, stride, padding } => {
+                let kernel = weights
+                    .get_weight(node.id)
+                    .ok_or(ModelError::MissingWeight(node.id))?;
+
+                let config = crate::components::conv2d::Im2ColConfig {
+                    in_channels: *in_channels,
+                    kernel_size: *kernel_size,
+                    stride: *stride,
+                    padding: *padding,
+                    input_h: current.rows,
+                    input_w: if *in_channels > 0 { current.cols / in_channels } else { current.cols },
+                };
+                let (im2col_mat, _kernel_mat, output) =
+                    crate::components::conv2d::conv2d_forward(
+                        &current.data, &kernel.data, &config, *out_channels,
+                    );
+
+                // Store im2col output as intermediate (GKR MatMul proves im2col × kernel)
+                intermediates.push((node.id, im2col_mat));
+                node_outputs.insert(node.id, output.clone());
+                current = output;
+                outer_profiler.record_forward_op("conv2d", _op_start.elapsed());
             }
 
             GraphOp::MoE { .. } => {

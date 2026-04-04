@@ -270,10 +270,19 @@ impl LayeredCircuit {
                 vocab_size: *vocab_size,
                 embed_dim: *embed_dim,
             }),
-            GraphOp::Conv2D { .. } => Err(GKRError::CompilationError(
-                "Conv2D layers must be lowered to im2col + MatMul before GKR compilation"
-                    .to_string(),
-            )),
+            GraphOp::Conv2D { in_channels, out_channels, kernel_size, .. } => {
+                // Conv2D lowers to MatMul: im2col(input) × reshaped_kernel
+                // im2col output: (num_patches, patch_size) where patch_size = in_channels × kernel²
+                // Actual num_patches determined at proving time from input spatial dimensions.
+                // Use 1 as placeholder — the prover derives the real dimensions from the input matrix.
+                let patch_size = in_channels * kernel_size * kernel_size;
+                Ok(LayerType::MatMul {
+                    m: 1, // placeholder — real value comes from input at prove time
+                    k: patch_size,
+                    n: *out_channels,
+                    weight_node_id: node_id,
+                })
+            }
             GraphOp::Quantize { params, size } => Ok(LayerType::Quantize {
                 size: *size,
                 params: params.clone(),
