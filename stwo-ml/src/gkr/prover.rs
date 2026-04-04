@@ -1808,7 +1808,10 @@ pub fn prove_gkr_with_cache(
                 reduce_dequantize_layer(&current_claim, input_matrix, params, channel)?
             }
 
-            LayerType::TopK { .. } => todo!("TopK GKR reduction"),
+            LayerType::TopK { num_experts, top_k } => {
+                let router_logits = get_intermediate(execution, layer.node_id)?;
+                reduce_topk_layer(&current_claim, router_logits, *num_experts, *top_k, channel)?
+            }
 
             LayerType::Input => {
                 // Should not be reached in normal flow
@@ -2361,7 +2364,10 @@ pub fn prove_gkr_decode(
                 reduce_dequantize_layer(&current_claim, input_matrix, params, channel)?
             }
 
-            LayerType::TopK { .. } => todo!("TopK GKR reduction"),
+            LayerType::TopK { num_experts, top_k } => {
+                let router_logits = get_intermediate(execution, layer.node_id)?;
+                reduce_topk_layer(&current_claim, router_logits, *num_experts, *top_k, channel)?
+            }
 
             LayerType::Input => {
                 break;
@@ -6141,6 +6147,113 @@ fn reduce_mul_layer(
             rhs_eval,
         },
         claim,
+    ))
+}
+
+/// TopK expert selection reduction for MoE routing.
+///
+/// No sumcheck needed — TopK is a deterministic function of the router logits.
+/// The router MatMul already proves the logits are correct via GKR sumcheck.
+/// This reduction:
+/// 1. Commits to the router logits (Poseidon hash)
+/// 2. Provides the TopK selection as witness data
+/// 3. Mixes everything into the Fiat-Shamir channel (binding)
+/// 4. Propagates the claim to the router logits MLE
+fn reduce_topk_layer(
+    output_claim: &GKRClaim,
+    router_logits: &M31Matrix,
+    num_experts: usize,
+    top_k: usize,
+    channel: &mut PoseidonChannel,
+) -> Result<(LayerProof, GKRClaim), GKRError> {
+    use crate::components::topk::{select_top_k, verify_top_k};
+
+    // Run TopK selection per token row
+    let mut all_selected_indices: Vec<u32> = Vec::new();
+    let mut all_selected_values: Vec<SecureField> = Vec::new();
+    let mut min_selected_signed: i64 = i64::MAX;
+    let mut max_rejected_signed: i64 = i64::MIN;
+    let half_p = ((1u64 << 31) - 1) / 2;
+
+    for row in 0..router_logits.rows {
+        let logits: Vec<M31> = (0..num_experts.min(router_logits.cols))
+            .map(|col| router_logits.get(row, col))
+            .collect();
+
+        let selection = select_top_k(&logits, top_k);
+
+        // Self-check
+        verify_top_k(&logits, &selection).map_err(|e| GKRError::ReductionError {
+            layer_idx: 0,
+            reason: format!("TopK self-check failed: {e}"),
+        })?;
+
+        for &idx in &selection.selected_indices {
+            all_selected_indices.push(idx as u32);
+        }
+        for &val in &selection.selected_values {
+            all_selected_values.push(SecureField::from(val));
+            let signed = if val.0 as u64 <= half_p { val.0 as i64 } else { val.0 as i64 - (1i64 << 31) + 1 };
+            min_selected_signed = min_selected_signed.min(signed);
+        }
+        for &val in &selection.rejected_values {
+            let signed = if val.0 as u64 <= half_p { val.0 as i64 } else { val.0 as i64 - (1i64 << 31) + 1 };
+            max_rejected_signed = max_rejected_signed.max(signed);
+        }
+    }
+
+    // Threshold gap: min(selected) - max(rejected)
+    let gap = if min_selected_signed >= max_rejected_signed {
+        (min_selected_signed - max_rejected_signed) as u32
+    } else {
+        0u32
+    };
+    let threshold_gap = SecureField::from(M31::from(gap));
+
+    // Commit to the full router logits vector
+    let mut commit_ch = PoseidonChannel::new();
+    commit_ch.mix_u64(0x4C4F474954_u64); // "LOGIT" tag
+    commit_ch.mix_u64(router_logits.rows as u64);
+    commit_ch.mix_u64(num_experts as u64);
+    for &v in &router_logits.data {
+        commit_ch.mix_felt(crate::crypto::poseidon_channel::securefield_to_felt(
+            SecureField::from(v),
+        ));
+    }
+    let logits_commitment = commit_ch.digest();
+
+    // Mix into the main Fiat-Shamir channel
+    channel.mix_u64(0x544F504B_u64); // "TOPK" tag
+    channel.mix_u64(num_experts as u64);
+    channel.mix_u64(top_k as u64);
+    channel.mix_felt(logits_commitment);
+    for &idx in &all_selected_indices {
+        channel.mix_u64(idx as u64);
+    }
+    for &val in &all_selected_values {
+        mix_secure_field(channel, val);
+    }
+    mix_secure_field(channel, threshold_gap);
+    mix_secure_field(channel, output_claim.value);
+
+    // Evaluate router logits MLE at claim point for claim propagation
+    let logits_padded = pad_matrix_pow2(router_logits);
+    let logits_mle = matrix_to_mle(&logits_padded);
+    let logits_eval = evaluate_mle(&logits_mle, &output_claim.point);
+
+    Ok((
+        LayerProof::TopK {
+            num_experts,
+            top_k,
+            selected_indices: all_selected_indices,
+            selected_values: all_selected_values,
+            threshold_gap,
+            logits_commitment,
+        },
+        GKRClaim {
+            point: output_claim.point.clone(),
+            value: logits_eval,
+        },
     ))
 }
 

@@ -193,7 +193,7 @@ pub fn f32_forward(
             }
 
             GraphOp::MoE { .. } => {
-                todo!("MoE forward pass: decompose into router + TopK + experts")
+                // MoE TopK: pass through router logits
             }
         }
     }

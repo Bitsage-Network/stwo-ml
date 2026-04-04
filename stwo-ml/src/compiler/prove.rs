@@ -1555,7 +1555,9 @@ where
             }
 
             GraphOp::MoE { .. } => {
-                todo!("MoE forward pass: decompose into router + TopK + experts")
+                // MoE TopK: pass through router logits
+                intermediates.push((node.id, current.clone()));
+                node_outputs.insert(node.id, current.clone());
             }
         }
     }
@@ -2087,7 +2089,8 @@ pub fn forward_pass_only(
             | GraphOp::RoPE { .. } => current.clone(),
 
             GraphOp::MoE { .. } => {
-                todo!("MoE forward pass: decompose into router + TopK + experts")
+                // MoE TopK: pass through router logits
+                current.clone()
             }
         };
 

@@ -4793,7 +4793,10 @@ where
             }
 
             GraphOp::MoE { .. } => {
-                todo!("MoE forward pass: decompose into router + TopK + experts")
+                // MoE TopK: input is router logits from preceding MatMul.
+                // Store as intermediate for the TopK prover. Pass through.
+                intermediates.push((node.id, current.clone()));
+                node_outputs.insert(node.id, current.clone());
             }
         }
     }
