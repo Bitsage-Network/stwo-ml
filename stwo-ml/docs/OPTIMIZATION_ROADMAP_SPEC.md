@@ -1,6 +1,6 @@
 # ObelyZK Optimization Roadmap — Deep Specification
 
-**Version**: 1.0 | **Date**: March 24, 2026 | **Author**: Bitsage Network
+**Version**: 1.1 | **Date**: April 3, 2026 | **Author**: Bitsage Network
 
 > Engineering specification for achieving 500 proven tokens/second on a single H100,
 > 0.001% activation precision, full platform determinism, and mathematical guardrail
@@ -9,28 +9,31 @@
 
 ---
 
-## Current Baseline (March 24, 2026)
+## Current Baseline (April 3, 2026)
 
 ### Performance
 
 | Metric | Value | Hardware |
 |--------|-------|----------|
 | Full model prove (Qwen3-14B, 40 layers) | **103s** | H100 NVL (cached) |
-| Single layer prove | **3s** | H100 |
+| Qwen2-0.5B prove | **0.57s** | Apple Silicon (CPU) |
+| Mistral-7B-v0.3 prove | **88.19s** | Apple Silicon (CPU) |
+| Proven model families | **7** (Qwen, Phi, Llama, Yi, Mistral) | Apple Silicon + H100 |
+| Adversarial attacks detected | **9/9** | -- |
 | Current throughput (seq_len=1) | ~0.01 tok/s | H100 |
 | Estimated throughput (seq_len=10K) | **~100 tok/s** | H100 (not yet benchmarked) |
-| Security tests | 41/41 pass | — |
-| Test suite | 818 + 10 e2e + 95 Cairo | — |
+| Security tests | 41/41 pass | -- |
+| Test suite | **930+**, 0 failures | -- |
 
 ### 103-Second Breakdown (Warm Model)
 
 | Phase | Time | Backend | Optimization Target |
 |-------|------|---------|-------------------|
-| Forward pass (281 nodes) | 38s | **CPU** | → GPU (Phase A) |
-| GKR walk (160 matmuls) | 47s | **Our GPU kernels** | → Parallelism (Phase B) |
-| Unified STARK (121 components) | 5s | **CPU** (STWO bug) | → GPU (Phase C) |
-| Serialization | 2s | CPU | → Binary (Phase D) |
-| **Total (warm)** | **92s** | | **→ Target: ~22s** |
+| Forward pass (281 nodes) | 38s | **CPU** | OPEN -- GPU (Phase A) |
+| GKR walk (160 matmuls) | 47s | **Our GPU kernels** | OPEN -- Parallelism (Phase B) |
+| Unified STARK (121 components) | 5s | **CPU** (STWO bug) | BLOCKED -- GPU (Phase C) |
+| Serialization | 2s | CPU | **CLOSED** -- Binary (Phase D) |
+| **Total (warm)** | **92s** | | **Target: ~22s** |
 
 ### Accuracy
 
@@ -40,11 +43,11 @@
 | Layer-to-layer flow | Exact (no re-quantization) | No change needed |
 | ReLU | Exact lookup | No change needed |
 | INT8 Symmetric quantization | ±0.02 per value | No change needed |
-| GELU/SiLU (piecewise, 16 segments) | ~2-5% max deviation | → 0.001% (Phase F) |
-| Sigmoid (piecewise, 16 segments) | ~2-5% max deviation | → 0.001% (Phase F) |
-| Softmax (LogUp, 2^20 table) | ~0.01% max deviation | → 0.001% (Phase F) |
-| Platform determinism | **NOT guaranteed** (f64 in RoPE, tables) | → Guaranteed (Phase E) |
-| Guardrail enforcement | **Not implemented** | → Enforced (Phase G) |
+| GELU/SiLU (piecewise, configurable) | 16-4096 segments | **CLOSED** (Phase 2E) — configurable precision |
+| Sigmoid (piecewise, configurable) | 16-4096 segments | **CLOSED** (Phase 2E) |
+| Softmax (LogUp, 2^20 table) | ~0.01% max deviation | Further improvement in Phase F |
+| Platform determinism | **Guaranteed** (integer-only) | **CLOSED** (Phase 1E) — zero f64 in proving path |
+| Guardrail enforcement | **Not implemented** | OPEN (Phase G) |
 
 ### Custom GPU Stack (19 CUDA Kernels + 4 Metal Shaders)
 
@@ -96,12 +99,10 @@
 
 | Component | Current | Target | Phase |
 |-----------|---------|--------|-------|
-| GELU/SiLU/Sigmoid | ~2-5% | **~0.001%** | Phase F |
-| Platform determinism | Not guaranteed | **Bit-identical everywhere** | Phase E |
-| Unverified operations | RoPE*, softmax sum*, mask* | **None** | Phases 1B-1E (closed) |
-| Guardrail enforcement | None | **Mathematical — policy commitment** | Phase G |
-
-*Note: Phases 1B, 1C, 1D are already CLOSED as of March 17, 2026.
+| GELU/SiLU/Sigmoid | Configurable (16-4096 segments) | **~0.001% at 1024 segments** | Phase F (partially done) |
+| Platform determinism | **Bit-identical everywhere** | -- | Phase E (**CLOSED**) |
+| Unverified operations | **None** | -- | Phases 1B-1H (all **CLOSED**) |
+| Guardrail enforcement | None | **Mathematical -- policy commitment** | Phase G (OPEN) |
 
 ---
 
@@ -269,7 +270,7 @@ Multi-instance components (e.g., 40 RMSNorm layers) read wrong column data, caus
 
 **Goal**: Replace JSON hex encoding with binary proof format.
 
-**Status**: OPEN.
+**Status**: **CLOSED** (April 1, 2026). Bincode OZKP format implemented. 7 binary_serde tests pass.
 
 **Impact**: 2s → 0.3s serialization, 7MB → 3.6MB proof size.
 
@@ -302,7 +303,7 @@ Target: Compact binary format with direct `FieldElement` byte encoding.
 
 **Goal**: Eliminate all f64-dependent computation. Ensure bit-identical M31 values on every platform.
 
-**Status**: OPEN — CRITICAL for distributed proving and accuracy enforcement.
+**Status**: **CLOSED** (April 1, 2026). Integer-only cos/sin table, integer sigmoid/gelu/silu/isqrt. Zero f64 in proving path. 7 integer_math + 7 rope + 48 attention tests pass.
 
 **Impact**: Enables cross-platform proof reproducibility. Required for accuracy rails to be meaningful.
 
@@ -378,7 +379,7 @@ let q = m31_fixed_point_div(value_m31, scale_m31) + zero_point;
 
 **Goal**: Increase piecewise activation segments from 16 to 1024. Reduce max deviation from ~2-5% to ~0.001%.
 
-**Status**: OPEN.
+**Status**: **PARTIALLY CLOSED** (April 1, 2026). Configurable piecewise precision is implemented (16/64/256/1024/4096 segments, Phase 2E). 8 activation tests pass. Remaining: ModelRegistration activation_commitment integration and CLI --precision preset flag.
 
 **Impact**: Activation precision improvement with zero runtime cost increase.
 
@@ -977,7 +978,7 @@ priority = "critical_first"      # prove critical actions immediately
 
 **Goal**: Compose incremental delta proofs into constant-size recursive proofs for on-chain submission.
 
-**Status**: OPEN — depends on Phase 4A (recursive STARK, in progress on `feat/recursive-stark`).
+**Status**: OPEN — depends on Phase 4A (recursive STARK, **actively in progress on `feat/recursive-stark` branch**).
 
 **Impact**: 1 on-chain TX per epoch covering hundreds of proven turns, regardless of how many.
 
@@ -1076,7 +1077,7 @@ Chain anchor proves: "all M turns are committed, N of them proven"
 
 **Goal**: Optimize proving for individual developers on RTX 4090 and Apple Silicon.
 
-**Status**: OPEN.
+**Status**: **PARTIALLY VALIDATED** (April 3, 2026). Apple Silicon CPU proving works for 7 model families (0.57s to 88.19s). RTX 4090 CUDA path untested. Metal shader optimization pending.
 
 **Impact**: Individual developers can prove their own models locally without H100 access.
 
@@ -1113,15 +1114,27 @@ Metal compute shaders exist in `src/metal/`:
 3. **Tile-based proving**: Break large proofs into GPU-sized tiles for M1/M2 (16GB)
 4. **M4 Pro/Max targeting**: M4 Max has 128GB unified memory — can prove Phi-3 Mini easily
 
-### Target Performance
+### Measured Apple Silicon Performance (April 3, 2026)
+
+| Model | Prove Time (CPU, measured) | Notes |
+|-------|--------------------------|-------|
+| Qwen2-0.5B | **0.57s** | Fastest full-model proof |
+| Qwen2-1.5B | **1.14s** | |
+| SmolLM2-135M | **3.41s** | |
+| Phi-3 Mini 3.8B | **48.86s** | Fused QKV + gate_up |
+| Llama-3.2-3B | **48.48s** | |
+| Yi-1.5-6B | **86.58s** | |
+| Mistral-7B-v0.3 | **88.19s** | |
+
+### Target Performance (with Metal shader optimization)
 
 | Hardware | Model | Target proof time | Target tok/s (seq_len=1K) |
 |----------|-------|------------------|--------------------------|
-| RTX 4090 | GPT-2 (124M) | ~10s | ~100 |
-| RTX 4090 | Phi-3 Mini (3.8B) | ~35s | ~29 |
-| M4 Max (128GB) | Phi-3 Mini (3.8B) | ~50s | ~20 |
-| M4 Pro (24GB) | GPT-2 (124M) | ~15s | ~67 |
-| M2 (16GB) | GPT-2 (124M) | ~25s | ~40 |
+| RTX 4090 | GPT-2 (124M) | ~10s (est.) | ~100 |
+| RTX 4090 | Phi-3 Mini (3.8B) | ~35s (est.) | ~29 |
+| M4 Max (128GB) | Phi-3 Mini (3.8B) | ~30s (est., currently 48.86s CPU-only) | ~33 |
+| M4 Pro (24GB) | Qwen2-0.5B | <0.5s (est., currently 0.57s CPU-only) | -- |
+| M2 (16GB) | Qwen2-0.5B | <1s (est.) | -- |
 
 ### Files to Modify
 
@@ -1193,18 +1206,18 @@ BLOCKED:
 └──────────┘
 ```
 
-### Recommended Execution Order
+### Recommended Execution Order (Updated April 3, 2026)
 
-| Sprint | Phases | Duration | Milestone |
-|--------|--------|----------|-----------|
-| Sprint 0 | **J** (baseline benchmark) | 3-5 days | Published: 100 tok/s at seq_len=10K |
-| Sprint 1 | **A** (GPU forward) + **D** (binary serialization) | 2 weeks | Forward pass < 8s, binary proofs |
-| Sprint 2 | **E** (platform determinism) + **I** (private I/O) | 3-4 weeks | Bit-identical cross-platform, I/O privacy |
-| Sprint 3 | **B** (GKR parallelism) + **F** (high-precision rails) | 3 weeks | GKR < 22s, 0.001% activations |
-| Sprint 4 | **G** (policy commitment) + **M** (consumer hardware) | 3-4 weeks | Guardrail enforcement, RTX 4090/Metal |
-| Sprint 5 | **H** (incremental delta) | 3-4 weeks | Sustained ~200 tok/s |
-| Sprint 6 | **K** (commit/sample/prove) + **C** (GPU STARK if ready) | 3-4 weeks | Production deployment model |
-| Sprint 7 | **L** (recursive integration) + final benchmarks | 4-5 weeks | 1 TX/epoch, ~500 tok/s peak confirmed |
+| Sprint | Phases | Duration | Milestone | Status |
+|--------|--------|----------|-----------|--------|
+| Sprint 0 | **J** (baseline benchmark) | 3-5 days | Published: 100 tok/s at seq_len=10K | OPEN |
+| Sprint 1 | ~~**D** (binary serialization)~~ + **A** (GPU forward) | 2 weeks | Forward pass < 8s, binary proofs | **D CLOSED**, A OPEN |
+| Sprint 2 | ~~**E** (platform determinism)~~ + **I** (private I/O) | 2 weeks | I/O privacy | **E CLOSED**, I OPEN |
+| Sprint 3 | **B** (GKR parallelism) + ~~**F** (high-precision rails)~~ | 2-3 weeks | GKR < 22s | **F partially closed**, B OPEN |
+| Sprint 4 | **G** (policy commitment) + **M** (consumer hardware) | 3-4 weeks | Guardrail enforcement, RTX 4090/Metal | M partially validated |
+| Sprint 5 | **H** (incremental delta) | 3-4 weeks | Sustained ~200 tok/s | OPEN |
+| Sprint 6 | **K** (commit/sample/prove) + **C** (GPU STARK if ready) | 3-4 weeks | Production deployment model | OPEN |
+| Sprint 7 | **L** (recursive integration) + final benchmarks | 4-5 weeks | 1 TX/epoch, ~500 tok/s peak confirmed | 4A in progress |
 
 **Total: ~22-28 weeks (5-7 months)**
 

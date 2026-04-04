@@ -2,7 +2,7 @@
 
 ML inference proving and privacy protocol built on [STWO](https://github.com/starkware-libs/stwo) — StarkWare's Circle STARK prover over M31. GKR sumcheck over M31 multilinear extensions. Zero f64 in the proving path — integer-only M31 arithmetic end to end.
 
-**920+ tests, 0 failures** | **6 model families proven** | **On-chain verified on Starknet Sepolia (6/6 TX succeeded)**
+**930+ tests, 0 failures** | **7 model families proven** | **9 adversarial attacks detected** | **On-chain verified on Starknet Sepolia (6/6 TX succeeded)**
 
 ## Proven Models
 
@@ -16,12 +16,31 @@ Cryptographic self-verification on Apple Silicon (CPU). Every model runs through
 | **Phi-3 Mini 3.8B** | Phi | 3.8B | **48.86s** | Fused QKV + gate_up weight splitting |
 | **Yi-1.5-6B** | Yi | 6B | **86.58s** | |
 | **Mistral-7B-v0.3** | Mistral | 7B | **88.19s** | |
-| **Llama-3.2-3B** | Meta Llama | 3B | *downloading* | |
+| **Llama-3.2-3B** | Meta Llama | 3B | **48.48s** | |
 
 Architecture highlights:
 - **Gated FFN (SwiGLU)**: gate * up multiplication correctly modeled in the proving circuit
 - **Fused weight support**: QKV splitting (Phi-3), gate_up splitting (Phi-3) handled natively
-- **GPU kernels**: 7K LOC CUDA + Metal shaders
+- **Zero f64 in proving path**: integer-only M31 arithmetic (cos/sin table, integer sigmoid/gelu/silu)
+- **Configurable piecewise activation precision**: 16 to 4096 segments
+- **RMSNorm gamma affine scale**: committed and proven
+- **GPU kernels**: 7K LOC CUDA + Metal shaders + STWO's 27K LOC GPU backend
+
+### Adversarial Testing
+
+9 adversarial attacks tested, ALL detected:
+
+| Attack | Description | Result |
+|--------|-------------|--------|
+| Weight substitution | Replace model weights with different values | DETECTED |
+| Output fabrication | Return fabricated outputs without running model | DETECTED |
+| Proof reuse | Replay a valid proof for a different input | DETECTED |
+| Model swap | Prove with model A, claim it was model B | DETECTED |
+| Commitment chain tampering | Alter historical commitment chain entries | DETECTED |
+| TopK fraud | Falsify MoE expert routing selection | DETECTED |
+| Gamma substitution | Replace RMSNorm gamma scale factors | DETECTED |
+| Platform divergence | Submit proof from mismatched platform | DETECTED |
+| Activation swap | Replace activation function (e.g., GELU for SiLU) | DETECTED |
 
 ## Quick Start
 

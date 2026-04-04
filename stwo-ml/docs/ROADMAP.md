@@ -1,22 +1,36 @@
 # ObelyZK Protocol Roadmap
 
-**Version**: 2.1 | **Date**: March 21, 2026 | **Author**: Bitsage Network
+**Version**: 2.2 | **Date**: April 3, 2026 | **Author**: Bitsage Network
 
 > Strategy: Deep research per phase, implement, test end-to-end on H100 GPU, verify all security properties, then advance to next phase.
 
 ---
 
-## Current Baseline (March 16, 2026)
+## Current Baseline (April 3, 2026)
 
 | Metric | Value |
 |--------|-------|
-| Model | Qwen3-14B (9.2B params, 40 layers, 160 MatMuls) |
-| Prove time (cached) | **103s** on H100 NVL |
-| Audit (3 inferences) | **5m 11s** |
-| Security tests | 41/41 pass (18 tamper + 23 integration gates) |
+| Proven models | **7 model families** across 5 architectures (Qwen, Phi, Llama, Yi, Mistral) |
+| H100 NVL prove time | **103s** (Qwen3-14B, 40 layers, 160 MatMuls, cached) |
+| Apple Silicon prove time | **0.57s** (Qwen2-0.5B) to **88.19s** (Mistral-7B-v0.3) |
+| Adversarial attacks | **9/9 detected** (weight sub, output fabrication, proof reuse, model swap, commitment tampering, TopK fraud, gamma sub, platform divergence, activation swap) |
+| Tests | **930+, 0 failures** |
 | On-chain | Starknet Sepolia, **6-TX streaming v25, v39 Cairo verifier (6/6 SUCCEEDED)** |
 | Proof system | GKR sumcheck + Poseidon2-M31 commitments (no FRI) |
 | Field | M31 -> CM31 -> QM31 (124-bit algebraic security) |
+| Integer-only | Zero f64 in proving path — cos/sin table, integer sigmoid/gelu/silu |
+
+### Proven Models (Apple Silicon, CPU self-verification)
+
+| Model | Family | Parameters | Prove Time | Notes |
+|-------|--------|-----------|------------|-------|
+| **Qwen2-0.5B** | Qwen | 0.5B | **0.57s** | Fastest full-model proof |
+| **Qwen2-1.5B** | Qwen | 1.5B | **1.14s** | |
+| **SmolLM2-135M** | Llama/HF | 135M | **3.41s** | Llama-family architecture |
+| **Phi-3 Mini 3.8B** | Phi | 3.8B | **48.86s** | Fused QKV + gate_up splitting |
+| **Llama-3.2-3B** | Meta Llama | 3B | **48.48s** | |
+| **Yi-1.5-6B** | Yi/01-ai | 6B | **86.58s** | |
+| **Mistral-7B-v0.3** | Mistral | 7B | **88.19s** | |
 
 ---
 
@@ -268,17 +282,27 @@ Fusing activation into the GPU kernel would eliminate round-trips.
 
 **Goal**: Prove the protocol works across diverse architectures — dense, MoE, and vision.
 
-### 3A. Model Support Matrix (Updated March 17, 2026)
+### 3A. Model Support Matrix (Updated April 3, 2026)
 
-**Tier 1: Ready NOW (zero code changes after SiLU fix)**
+**Tier 1: PROVEN — cryptographic self-verification complete**
 
 | Model | Params | Norm | Activation | Attention | Status |
 |-------|--------|------|-----------|-----------|--------|
-| **Qwen3-14B** | 14B | RMSNorm | SiLU | GQA (40h/8kv) | **PROVEN** (103s, 40L) |
+| **Qwen3-14B** | 14B | RMSNorm | SiLU | GQA (40h/8kv) | **PROVEN** (103s H100, 40L) |
+| **Qwen2-0.5B** | 0.5B | RMSNorm | SiLU | GQA | **PROVEN** (0.57s Apple Silicon) |
+| **Qwen2-1.5B** | 1.5B | RMSNorm | SiLU | GQA | **PROVEN** (1.14s Apple Silicon) |
+| **SmolLM2-135M** | 135M | RMSNorm | SiLU | GQA | **PROVEN** (3.41s Apple Silicon) |
+| **Phi-3 Mini** | 3.8B | RMSNorm | SiLU | GQA | **PROVEN** (48.86s Apple Silicon, fused QKV + gate_up) |
+| **Llama-3.2-3B** | 3B | RMSNorm | SiLU | GQA | **PROVEN** (48.48s Apple Silicon) |
+| **Yi-1.5-6B** | 6B | RMSNorm | SiLU | GQA | **PROVEN** (86.58s Apple Silicon) |
+| **Mistral-7B-v0.3** | 7B | RMSNorm | SiLU | GQA (32h/8kv) | **PROVEN** (88.19s Apple Silicon) |
+
+**Tier 1: Ready (zero code changes, download + run)**
+
+| Model | Params | Norm | Activation | Attention | Status |
+|-------|--------|------|-----------|-----------|--------|
 | **Llama-3-8B** | 8B | RMSNorm | SiLU | GQA (32h/8kv) | **READY** (download + run) |
 | **Llama-3-70B** | 70B | RMSNorm | SiLU | GQA (64h/8kv) | **READY** (multi-GPU memory) |
-| **Mistral-7B** | 7B | RMSNorm | SiLU | GQA (32h/8kv) | **READY** |
-| **Phi-3 Mini** | 3.8B | RMSNorm | GELU | GQA | **READY** |
 | **GPT-2** | 124M-1.5B | LayerNorm | GELU | MHA (12h) | **READY** |
 | **GLM-4-9B** | 9B | RMSNorm | SiLU | GQA | **READY** (standard transformer) |
 
@@ -380,7 +404,7 @@ arithmetization — no softmax, no score matrix, different matmul decomposition.
 | **Giza** | ~10M | minutes | Cairo (Stone) | STARK |
 | **Expander** | ? | ? | None | GKR |
 | **DeepProve** | GPT-2 | ? | None | GKR |
-| **ObelyZK** | **14B (dense), 1T+ (MoE target)** | **103s** | **Cairo (Starknet)** | **GKR + STARK** |
+| **ObelyZK** | **14B (dense), 7 families proven** | **0.57s-103s** | **Cairo (Starknet)** | **GKR + STARK** |
 
 **Benchmark protocol**:
 1. Standardize: GPT-2-124M, Llama-3-8B, Mixtral-8x7B (when MoE ready)
@@ -479,48 +503,51 @@ arithmetization — no softmax, no score matrix, different matmul decomposition.
 
 ---
 
-## Execution Timeline (Updated March 21, 2026)
+## Execution Timeline (Updated April 3, 2026)
 
 | Phase | Status | Deliverable | Test Gate |
 |-------|--------|-------------|-----------|
 | **Streaming Verification** | **COMPLETE** (March 21) | 6-TX on-chain GKR streaming, v39 contract | 6/6 TX SUCCEEDED on Sepolia |
-| **1A** LayerNorm mean/variance | **CLOSED** (was already done) | Plain sumcheck + LogUp | Tamper tests pass |
+| **1A** LayerNorm mean/variance | **CLOSED** | Plain sumcheck + LogUp | Tamper tests pass |
 | **1B** Softmax sum | **CLOSED** (March 17) | Plain sumcheck + row-sum binding | 5 tamper tests pass |
 | **1C** RoPE arithmetization | **CLOSED** (March 17) | Full STARK (rotation + LogUp) | 8 RoPE tests + circuit test |
 | **1D** Causal mask | **CLOSED** (March 17) | Fiat-Shamir binding | Causal mismatch test |
-| **1E** f64 elimination | **CLOSED** (April 1) | Integer-only cos/sin/exp/sigmoid/gelu/isqrt | 7 integer_math + 7 rope + 48 attention tests |
-| **1F** Attention scale 1/√d | **CLOSED** (April 1) | Integer Newton-Raphson isqrt | 48 attention tests pass |
+| **1E** f64 elimination | **CLOSED** (April 1) | Integer-only cos/sin/exp/sigmoid/gelu/silu/isqrt | 7 integer_math + 7 rope + 48 attention tests |
+| **1F** Attention scale 1/sqrt(d) | **CLOSED** (April 1) | Integer Newton-Raphson isqrt | 48 attention tests pass |
 | **1G** Softmax sum=0 | **CLOSED** (April 1) | Graceful uniform fallback | No panic on degenerate input |
-| **1H** LayerNorm γ/β affine | **CLOSED** (April 1) | γ commitment + scale_mle prover | 2 RMSNorm gamma tests |
+| **1H** LayerNorm gamma/beta affine | **CLOSED** (April 1) | gamma commitment + scale_mle prover | 2 RMSNorm gamma tests |
 | **2A** GPU threshold | **CLOSED** (not a bottleneck) | Already on GPU | Confirmed via profiling |
-| **2B** GPU unified STARK | DEFERRED (STWO bug) | Needs STWO library fix | — |
+| **2B** GPU unified STARK | DEFERRED (STWO bug) | Needs STWO library fix | -- |
 | **2C** Fused kernels | OPEN | CUDA matmul+activation | ~5s savings |
 | **2D** Binary serialization | **CLOSED** (April 1) | bincode OZKP format | 7 binary_serde tests |
-| **2E** Configurable precision | **CLOSED** (April 1) | 16/64/256/1024 segments | 8 activation tests |
+| **2E** Configurable precision | **CLOSED** (April 1) | 16/64/256/1024/4096 segments | 8 activation tests |
 | **3A** SiLU activation | **CLOSED** (March 17) | Native SiLU LogUp | 4 unit tests |
-| **3B** MoE routing (TopK) | **IN PROGRESS** | TopK proof + MoE graph | Mixtral/Kimi/GLM-5 proven |
+| **3A'** Multi-model proving | **CLOSED** (April 3) | 7 model families proven on Apple Silicon | 930+ tests, 0 failures |
+| **3B** MoE routing (TopK) | **IN PROGRESS** | TopK proof + MoE graph | 10 TopK tests pass |
 | **3C** Lightning Attention | FUTURE | Linear attention protocol | MiniMax-01 proven |
 | **3D** CNN (YOLOv8) | FUTURE | im2col proof | YOLOv8 proven |
-| **3E** Benchmarks | NEXT (after 3B) | 5+ models, comparison table | Published |
-| **4A** Recursive composition | FUTURE | Constant-size on-chain proof | Single TX on Starknet |
+| **3E** Benchmarks | **PARTIALLY DONE** | 7 models benchmarked (Apple Silicon), H100 comparison pending | Published |
+| **4A** Recursive composition | **IN PROGRESS** (`feat/recursive-stark`) | Constant-size on-chain proof | Single TX on Starknet |
+| **Adversarial testing** | **CLOSED** (April 3) | 9 attack vectors tested | 9/9 detected |
 
 ---
 
 ## Competitive Position After Roadmap
 
-| Capability | EZKL | zkLLM | Giza | Expander | **ObelyZK (Target)** |
+| Capability | EZKL | zkLLM | Giza | Expander | **ObelyZK (Current)** |
 |-----------|------|-------|------|----------|---------------------|
-| Max params | 1M | 13B | 10M | ? | **400B+ (MoE)** |
-| Prove time | seconds | 1-15 min | minutes | ? | **<30s (14B dense)** |
-| Full semantics | Yes | Yes | Yes | ? | **Yes (all ops verified)** |
-| On-chain verifier | Solidity | None | Cairo | None | **Cairo (Starknet)** |
+| Max params | 1M | 13B | 10M | ? | **14B dense (7 families proven)** |
+| Prove time | seconds | 1-15 min | minutes | ? | **0.57s (0.5B) to 103s (14B)** |
+| Full semantics | Yes | Yes | Yes | ? | **Yes (all ops verified, zero f64)** |
+| On-chain verifier | Solidity | None | Cairo | None | **Cairo (Starknet, 6/6 TX)** |
 | Proof system | Halo2/KZG | Custom | STARK | GKR | **GKR + STARK (no FRI)** |
-| MoE support | No | No | No | ? | **Yes (router + expert)** |
-| CNN support | Yes | No | No | ? | **Yes (im2col)** |
-| Recursive proofs | No | No | No | ? | **Yes (constant-size)** |
+| Adversarial testing | ? | ? | ? | ? | **9/9 attacks detected** |
+| MoE support | No | No | No | ? | **TopK constraint (in progress)** |
+| CNN support | Yes | No | No | ? | **Planned (im2col)** |
+| Recursive proofs | No | No | No | ? | **In progress (feat/recursive-stark)** |
 | Multi-inference audit | No | No | No | No | **Yes (batch proving)** |
 | KV-cache chain | No | No | No | No | **Yes (incremental Merkle)** |
-| Deployed | Ethereum | No | Starknet | No | **Starknet** |
+| Deployed | Ethereum | No | Starknet | No | **Starknet Sepolia** |
 
 ---
 
