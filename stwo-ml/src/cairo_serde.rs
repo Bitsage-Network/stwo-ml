@@ -1725,7 +1725,18 @@ pub fn serialize_gkr_model_proof(proof: &crate::gkr::GKRProof, output: &mut Vec<
                     None => serialize_u32(0, output),
                 }
             }
-            LayerProof::TopK { .. } => { /* skip for now */ }
+            LayerProof::TopK {
+                num_experts, top_k, selected_indices, selected_values,
+                threshold_gap, logits_commitment,
+            } => {
+                serialize_u32(12, output); // tag: TopK
+                serialize_u32(*num_experts as u32, output);
+                serialize_u32(*top_k as u32, output);
+                for &idx in selected_indices { serialize_u32(idx, output); }
+                for &val in selected_values { serialize_qm31(val, output); }
+                serialize_qm31(*threshold_gap, output);
+                output.push(*logits_commitment);
+            }
         }
     }
 
@@ -2209,7 +2220,18 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
                     None => serialize_u32(0, output),
                 }
             }
-            LayerProof::TopK { .. } => { /* skip for now */ }
+            LayerProof::TopK {
+                num_experts, top_k, selected_indices, selected_values,
+                threshold_gap, logits_commitment,
+            } => {
+                serialize_u32(12, output); // tag: TopK
+                serialize_u32(*num_experts as u32, output);
+                serialize_u32(*top_k as u32, output);
+                for &idx in selected_indices { serialize_u32(idx, output); }
+                for &val in selected_values { serialize_qm31(val, output); }
+                serialize_qm31(*threshold_gap, output);
+                output.push(*logits_commitment);
+            }
         }
     }
 
@@ -2653,7 +2675,18 @@ fn serialize_layer_proof_packed_inner(
                 None => serialize_u32(0, output),
             }
         }
-        LayerProof::TopK { .. } => { /* skip for now */ }
+        LayerProof::TopK {
+                num_experts, top_k, selected_indices, selected_values,
+                threshold_gap, logits_commitment,
+            } => {
+                serialize_u32(12, output); // tag: TopK
+                serialize_u32(*num_experts as u32, output);
+                serialize_u32(*top_k as u32, output);
+                for &idx in selected_indices { serialize_u32(idx, output); }
+                for &val in selected_values { serialize_qm31(val, output); }
+                serialize_qm31(*threshold_gap, output);
+                output.push(*logits_commitment);
+            }
     }
 }
 
@@ -3134,7 +3167,18 @@ fn serialize_layer_proof_double_packed_inner(
                 None => serialize_u32(0, output),
             }
         }
-        LayerProof::TopK { .. } => { /* skip for now */ }
+        LayerProof::TopK {
+                num_experts, top_k, selected_indices, selected_values,
+                threshold_gap, logits_commitment,
+            } => {
+                serialize_u32(12, output); // tag: TopK
+                serialize_u32(*num_experts as u32, output);
+                serialize_u32(*top_k as u32, output);
+                for &idx in selected_indices { serialize_u32(idx, output); }
+                for &val in selected_values { serialize_qm31(val, output); }
+                serialize_qm31(*threshold_gap, output);
+                output.push(*logits_commitment);
+            }
     }
 }
 

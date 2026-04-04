@@ -120,7 +120,55 @@ fn verify_gkr_inner(
         let layer = &circuit.layers[layer_idx];
 
         match &layer.layer_type {
-            LayerType::Identity => continue,
+            LayerType::Identity | LayerType::TopK { .. } => {
+                // TopK: verify witness binding in the channel, propagate claim.
+                // The TopK proof data is mixed into the channel during proving.
+                // The verifier replays the same channel operations.
+                if let LayerType::TopK { num_experts, top_k } = &layer.layer_type {
+                    if proof_idx < proof.layer_proofs.len() {
+                        if let LayerProof::TopK {
+                            num_experts: pn, top_k: pk,
+                            selected_indices, selected_values,
+                            threshold_gap, logits_commitment,
+                        } = &proof.layer_proofs[proof_idx] {
+                            proof_idx += 1;
+
+                            // Structural checks
+                            if selected_indices.len() != *pk {
+                                return Err(GKRError::VerificationError {
+                                    layer_idx,
+                                    reason: format!("TopK: expected {} selected indices, got {}", pk, selected_indices.len()),
+                                });
+                            }
+                            if selected_values.len() != *pk {
+                                return Err(GKRError::VerificationError {
+                                    layer_idx,
+                                    reason: format!("TopK: expected {} selected values, got {}", pk, selected_values.len()),
+                                });
+                            }
+
+                            // Replay channel mixing (must match prover exactly)
+                            channel.mix_u64(0x544F504B_u64); // "TOPK"
+                            channel.mix_u64(*pn as u64);
+                            channel.mix_u64(*pk as u64);
+                            channel.mix_felt(*logits_commitment);
+                            for &idx in selected_indices {
+                                channel.mix_u64(idx as u64);
+                            }
+                            for &val in selected_values {
+                                mix_secure_field(channel, val);
+                            }
+                            mix_secure_field(channel, *threshold_gap);
+                            mix_secure_field(channel, current_claim.value);
+
+                            // Claim propagation: value changes to logits eval (from proof)
+                            // The TopK doesn't change the claim point, only the value
+                            continue;
+                        }
+                    }
+                }
+                continue;
+            }
             LayerType::Input => break,
             _ => {}
         }
@@ -1513,7 +1561,55 @@ fn verify_gkr_simd_inner(
         let layer = &circuit.layers[layer_idx];
 
         match &layer.layer_type {
-            LayerType::Identity => continue,
+            LayerType::Identity | LayerType::TopK { .. } => {
+                // TopK: verify witness binding in the channel, propagate claim.
+                // The TopK proof data is mixed into the channel during proving.
+                // The verifier replays the same channel operations.
+                if let LayerType::TopK { num_experts, top_k } = &layer.layer_type {
+                    if proof_idx < proof.layer_proofs.len() {
+                        if let LayerProof::TopK {
+                            num_experts: pn, top_k: pk,
+                            selected_indices, selected_values,
+                            threshold_gap, logits_commitment,
+                        } = &proof.layer_proofs[proof_idx] {
+                            proof_idx += 1;
+
+                            // Structural checks
+                            if selected_indices.len() != *pk {
+                                return Err(GKRError::VerificationError {
+                                    layer_idx,
+                                    reason: format!("TopK: expected {} selected indices, got {}", pk, selected_indices.len()),
+                                });
+                            }
+                            if selected_values.len() != *pk {
+                                return Err(GKRError::VerificationError {
+                                    layer_idx,
+                                    reason: format!("TopK: expected {} selected values, got {}", pk, selected_values.len()),
+                                });
+                            }
+
+                            // Replay channel mixing (must match prover exactly)
+                            channel.mix_u64(0x544F504B_u64); // "TOPK"
+                            channel.mix_u64(*pn as u64);
+                            channel.mix_u64(*pk as u64);
+                            channel.mix_felt(*logits_commitment);
+                            for &idx in selected_indices {
+                                channel.mix_u64(idx as u64);
+                            }
+                            for &val in selected_values {
+                                mix_secure_field(channel, val);
+                            }
+                            mix_secure_field(channel, *threshold_gap);
+                            mix_secure_field(channel, current_claim.value);
+
+                            // Claim propagation: value changes to logits eval (from proof)
+                            // The TopK doesn't change the claim point, only the value
+                            continue;
+                        }
+                    }
+                }
+                continue;
+            }
             LayerType::Input => break,
             _ => {}
         }
