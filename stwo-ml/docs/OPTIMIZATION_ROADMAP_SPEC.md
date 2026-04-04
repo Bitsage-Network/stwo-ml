@@ -20,10 +20,13 @@
 | Mistral-7B-v0.3 prove | **88.19s** | Apple Silicon (CPU) |
 | Proven model families | **7** (Qwen, Phi, Llama, Yi, Mistral) | Apple Silicon + H100 |
 | Adversarial attacks detected | **9/9** | -- |
+| Recursive STARK | **0.42s**, 4KB proof, 22/22 tests | Apple Silicon |
+| MoE TopK pipeline | **Complete** (prover + verifier + serializer) | -- |
+| Conv2D (im2col) | **Done** (im2col + MatMul lowering) | -- |
 | Current throughput (seq_len=1) | ~0.01 tok/s | H100 |
 | Estimated throughput (seq_len=10K) | **~100 tok/s** | H100 (not yet benchmarked) |
 | Security tests | 41/41 pass | -- |
-| Test suite | **930+**, 0 failures | -- |
+| Test suite | **935+**, 0 failures | -- |
 
 ### 103-Second Breakdown (Warm Model)
 

@@ -1,6 +1,6 @@
 # ObelyZK Python SDK
 
-Python client for the ObelyZK provable inference API.
+Python client for the ObelyZK provable inference API. Supports 7 model families with cryptographic self-verification.
 
 ## Install
 
@@ -18,8 +18,8 @@ import obelyzk
 # Connect to prove-server
 client = obelyzk.Client("http://localhost:8080")
 
-# Load a model
-model = client.load_model("/path/to/model.onnx")
+# Load a HuggingFace model (any of the 7 proven families)
+model = client.load_hf_model("~/.obelysk/models/qwen2-0.5b")
 print(f"Model ID: {model.model_id}")
 print(f"Weight commitment: {model.weight_commitment}")
 
@@ -45,29 +45,59 @@ for p in proofs:
     print(f"  {p.proof_hash[:16]}... model={p.model_id[:16]}... layers={p.num_proven_layers}")
 ```
 
+## Supported Models
+
+All 7 proven model families work with the SDK:
+
+| Model | Prove Time (Apple Silicon) |
+|-------|---------------------------|
+| Qwen2-0.5B | 0.57s |
+| Qwen2-1.5B | 1.14s |
+| SmolLM2-135M | 3.41s |
+| Phi-3 Mini 3.8B | 48.86s |
+| Llama-3.2-3B | 48.48s |
+| Yi-1.5-6B | 86.58s |
+| Mistral-7B-v0.3 | 88.19s |
+
+## REST API Endpoints
+
+The SDK communicates with the prove-server REST API:
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/health` | Server status, GPU/TEE detection, loaded models |
+| `POST` | `/api/v1/models` | Load ONNX model, compute weight commitment |
+| `GET` | `/api/v1/models/{id}` | Get model info |
+| `POST` | `/api/v1/infer` | Provable inference -- run model + generate proof |
+| `GET` | `/api/v1/verify/:hash` | Verify a proof by hash |
+| `GET` | `/api/v1/proofs` | List all generated proofs |
+| `POST` | `/api/v1/prove` | Submit prove job (returns 202 + job_id) |
+| `GET` | `/api/v1/prove/{id}` | Poll job status + progress |
+| `GET` | `/api/v1/prove/{id}/result` | Get completed proof (calldata, commitments, gas) |
+
 ## API Reference
 
 ### `Client(base_url, api_key=None, timeout=300)`
 
 Create a client connected to an ObelyZK prove-server.
 
-### `client.load_model(model_path)` → `ModelInfo`
+### `client.load_model(model_path)` -> `ModelInfo`
 
 Load an ONNX model on the server.
 
-### `client.load_hf_model(model_dir, num_layers=None)` → `ModelInfo`
+### `client.load_hf_model(model_dir, num_layers=None)` -> `ModelInfo`
 
-Load a HuggingFace model directory.
+Load a HuggingFace model directory. Supports Qwen, Phi, Llama, Yi, Mistral, and other transformer architectures with SafeTensors weights.
 
-### `client.infer(model_id, input_data, ...)` → `InferResult`
+### `client.infer(model_id, input_data, ...)` -> `InferResult`
 
-Run provable inference. Returns output + proof.
+Run provable inference. Returns output + proof. The proof covers every matmul, activation, normalization, and attention operation.
 
-### `client.verify(proof_hash)` → `VerifyResult`
+### `client.verify(proof_hash)` -> `VerifyResult`
 
-Verify a proof by hash.
+Verify a proof by hash. Returns verification status and method (local or on-chain).
 
-### `client.list_proofs()` → `list[StoredProof]`
+### `client.list_proofs()` -> `list[StoredProof]`
 
 List all proven inferences.
 
@@ -79,4 +109,14 @@ Every call to `client.infer()` generates a cryptographic proof (GKR sumcheck ove
 2. Every matmul, activation, normalization, and attention operation was executed correctly
 3. The proof is verifiable on Starknet (on-chain) or locally (off-chain)
 
-No IEEE 754 floating-point is used in the proving path. All arithmetic is native M31 field operations — deterministic across every platform.
+No IEEE 754 floating-point is used in the proving path. All arithmetic is native M31 field operations -- deterministic across every platform.
+
+## Docker
+
+```bash
+# Start prove-server with Docker
+docker compose up prove-server
+
+# With GPU support
+docker compose -f docker-compose.gpu.yml up prove-server
+```

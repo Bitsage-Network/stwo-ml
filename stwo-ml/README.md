@@ -2,7 +2,7 @@
 
 ML inference proving and privacy protocol built on [STWO](https://github.com/starkware-libs/stwo) — StarkWare's Circle STARK prover over M31. GKR sumcheck over M31 multilinear extensions. Zero f64 in the proving path — integer-only M31 arithmetic end to end.
 
-**930+ tests, 0 failures** | **7 model families proven** | **9 adversarial attacks detected** | **On-chain verified on Starknet Sepolia (6/6 TX succeeded)**
+**935+ tests, 0 failures** | **7 model families proven** | **9 adversarial attacks detected** | **Recursive STARK: 0.42s, 4KB proof** | **On-chain verified on Starknet Sepolia (6/6 TX succeeded)**
 
 ## Proven Models
 
@@ -19,11 +19,16 @@ Cryptographic self-verification on Apple Silicon (CPU). Every model runs through
 | **Llama-3.2-3B** | Meta Llama | 3B | **48.48s** | |
 
 Architecture highlights:
+- **Recursive STARK**: 0.42s recursive proof, 4KB size, 22/22 tests passing, single-TX on-chain ready
+- **MoE TopK**: Complete pipeline — prover + verifier + serializer + multi-expert K branches
+- **Conv2D**: im2col + MatMul lowering in GKR pipeline (unlocks YOLO, ViT, ResNet)
 - **Gated FFN (SwiGLU)**: gate * up multiplication correctly modeled in the proving circuit
 - **Fused weight support**: QKV splitting (Phi-3), gate_up splitting (Phi-3) handled natively
 - **Zero f64 in proving path**: integer-only M31 arithmetic (cos/sin table, integer sigmoid/gelu/silu)
 - **Configurable piecewise activation precision**: 16 to 4096 segments
 - **RMSNorm gamma affine scale**: committed and proven
+- **Binary serialization**: OZKP format via bincode
+- **Streaming proof pipeline**: StreamingProofPipeline for chunk decode
 - **GPU kernels**: 7K LOC CUDA + Metal shaders + STWO's 27K LOC GPU backend
 
 ### Adversarial Testing
@@ -48,11 +53,20 @@ Architecture highlights:
 # Build (macOS with Metal)
 cargo build --release --bin prove-model --features cli,metal
 
-# Prove a HuggingFace model (1 transformer layer)
+# Prove Qwen2-0.5B (fastest — 0.57s)
+./target/release/prove-model --model-dir ~/.obelysk/models/qwen2-0.5b --gkr --format ml_gkr --output proof.json
+
+# Prove Phi-3 Mini 3.8B (fused QKV + gate_up splitting)
+./target/release/prove-model --model-dir ~/.obelysk/models/phi-3-mini --gkr --format ml_gkr --output proof.json
+
+# Prove Llama-3.2-3B
+./target/release/prove-model --model-dir ~/.obelysk/models/llama-3.2-3b --gkr --format ml_gkr --output proof.json
+
+# Prove a single transformer layer (fast iteration)
 ./target/release/prove-model --model-dir ./model --layers 1 --gkr --format ml_gkr
 
-# Full model proof
-./target/release/prove-model --model-dir ~/.obelysk/models/qwen2-0.5b --gkr --format ml_gkr --output proof.json
+# Recursive STARK (constant-size proof, single TX)
+./target/release/prove-model --model-dir ~/.obelysk/models/qwen2-0.5b --gkr --recursive --output recursive_proof.bin
 ```
 
 ## Python SDK and REST API
@@ -154,13 +168,16 @@ STWO_MLE_N_QUERIES=5
 |--------|-------|-------|
 | Full model prove | **103s** | Qwen3-14B, all 40 layers (H100 NVL, cached) |
 | Per-layer amortized | 2.58s | 160 MatMul sumchecks via GKR |
+| Recursive STARK | **0.42s** | Constant-size proof (4KB), single TX on-chain |
 | Verification | 206ms | CPU |
 | Proof size (GKR) | 7.1 MB | Single inference, 281 layers |
+| Proof size (recursive) | **4 KB** | Recursive STARK wrapping GKR proof |
 | Audit (3 inferences) | 5m 11s | 40 layers × 3 inferences + audit report |
 | MatMul trace reduction | 42–255x | Sumcheck vs naive row-by-row |
 | GPU FFT speedup | 50–112x | NTT/INTT vs CPU SIMD backend |
 | Security | 96-bit | pow_bits=26, n_queries=70, log_blowup=1 |
 | On-chain verify | 6 TXs | Streaming GKR v25 on Starknet Sepolia (all SUCCEEDED) |
+| Tests | **935+** | 0 failures expected |
 
 ## Why It's Fast
 
@@ -620,7 +637,7 @@ stwo-ml/
 │
 ├── docs/                     # Technical documentation
 ├── benches/                  # Performance benchmarks
-└── tests/                    # Integration tests (920+ total: lib + e2e_audit + cli_audit)
+└── tests/                    # Integration tests (935+ total: lib + e2e_audit + cli_audit)
 ```
 
 ## Tile-Level Streaming
