@@ -23,3 +23,5 @@ pub mod tiled_matmul;
 pub mod topk;
 #[cfg(test)]
 mod tamper_tests;
+#[cfg(test)]
+mod adversarial_tests;
