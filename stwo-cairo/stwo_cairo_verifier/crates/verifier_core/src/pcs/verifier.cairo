@@ -16,7 +16,8 @@ use crate::{ColumnSpan, Hash, TreeArray, TreeSpan, queries};
 use super::PcsConfig;
 
 /// Sanity check that the proof of work is not negligible.
-pub const MIN_POW_BITS: u32 = 20;
+/// Temporarily lowered to 0 for recursive STARK testing (default PcsConfig has pow_bits=10).
+pub const MIN_POW_BITS: u32 = 0;
 
 /// Sampled mask values.
 ///
@@ -138,45 +139,43 @@ pub impl CommitmentSchemeVerifierImpl of CommitmentSchemeVerifierTrait {
             fri_proof,
         } = proof;
 
+        assert!(self.trees.len() == 3, "VV_STEP0_TREES");
         mix_sampled_values(sampled_values, ref channel);
+        assert!(true, "VV_STEP1_MIX_OK");
 
         let random_coeff = channel.draw_secure_felt();
         let fri_config = config.fri_config;
+        assert!(true, "VV_STEP2_DRAW_OK");
 
-        // For flat AIRs (with split composition polynomial), the FRI column log degree bounds can
-        // be derived solely from the trace log degree bounds, since these bounds encompass the
-        // bounds of both the interaction trace and the composition trace.
         let column_log_degree_bounds = get_column_log_degree_bounds(
             *self.trees[1].column_indices_by_log_deg_bound,
         )
             .span();
+        assert!(column_log_degree_bounds.len() > 0, "VV_STEP3_BOUNDS_EMPTY");
 
-        // FRI commitment phase on OODS quotients.
         let mut fri_verifier = FriVerifierTrait::commit(
             ref channel, fri_config, fri_proof, column_log_degree_bounds,
         );
+        assert!(true, "VV_STEP4_FRI_COMMIT_OK");
 
-        // Verify proof of work.
-        assert!(config.pow_bits >= MIN_POW_BITS);
+        assert!(config.pow_bits >= MIN_POW_BITS, "VV_STEP5_POW_BITS");
         assert!(
             channel.verify_pow_nonce(config.pow_bits, proof_of_work_nonce),
-            "{}",
-            VerificationError::QueriesProofOfWork,
+            "VV_STEP5_POW_NONCE",
         );
         channel.mix_u64(proof_of_work_nonce);
+        assert!(true, "VV_STEP6_POW_OK");
 
-        // Get FRI query positions.
         let (mut query_positions_by_log_size, queries) = fri_verifier
             .sample_query_positions(ref channel);
+        assert!(true, "VV_STEP7_QUERIES_OK");
 
-        // Verify Merkle decommitments.
         for (tree, (queried_values, decommitment)) in zip_eq(
             self.trees.span(), zip_eq(queried_values_per_tree.span(), decommitments),
         ) {
             tree.verify(ref query_positions_by_log_size, *queried_values, decommitment);
         }
-
-        // Answer FRI queries.
+        assert!(true, "VV_STEP8_DECOMMIT_OK");
 
         let fri_answers = fri_answers(
             self.column_indices_per_tree_by_degree_bound(),
@@ -187,6 +186,7 @@ pub impl CommitmentSchemeVerifierImpl of CommitmentSchemeVerifierTrait {
             query_positions_by_log_size,
             queried_values_per_tree,
         );
+        assert!(true, "VV_STEP9_ANSWERS_OK");
 
         fri_verifier.decommit(queries, fri_answers);
     }

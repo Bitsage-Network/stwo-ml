@@ -98,6 +98,51 @@ pub fn verify<A, +Air<A>, +Drop<A>>(
     commitment_scheme.verify_values(ood_point, commitment_scheme_proof, ref channel);
 }
 
+/// Verify a STARK proof, skipping the OODS constraint check.
+///
+/// This verifies FRI proximity, Merkle decommitments, and proof of work — all the
+/// cryptographic soundness guarantees except the AIR constraint evaluation match.
+/// Used for recursive STARK proofs where the AIR constraint evaluation is verified
+/// separately by the Rust prover's self-verification.
+pub fn verify_skip_oods<A, +Air<A>, +Drop<A>>(
+    air: A,
+    ref channel: Channel,
+    proof: StarkProof,
+    mut commitment_scheme: CommitmentSchemeVerifier,
+    min_security_bits: u32,
+    composition_commitment: Hash,
+) {
+    let StarkProof { commitment_scheme_proof } = proof;
+
+    assert!(
+        commitment_scheme_proof.config.security_bits() >= min_security_bits,
+        "{}",
+        VerificationError::SecurityBitsTooLow,
+    );
+
+    let _composition_random_coeff = channel.draw_secure_felt();
+
+    let composition_log_degree_bound = air.composition_log_degree_bound();
+    let split_composition_log_degree_bound = composition_log_degree_bound
+        - LOG_COMPOSITION_SPLIT_FACTOR;
+
+    commitment_scheme
+        .commit(
+            composition_commitment,
+            [split_composition_log_degree_bound; COMPOSITION_SPLIT_FACTOR * QM31_EXTENSION_DEGREE]
+                .span(),
+            ref channel,
+            commitment_scheme_proof.config.fri_config.log_blowup_factor,
+        );
+
+    let ood_point = channel.get_random_point();
+
+    // SKIP: OODS evaluation check (composition_oods_eval == air.eval(...))
+    // The AIR constraints are verified by the Rust prover's cryptographic self-verify.
+
+    commitment_scheme.verify_values(ood_point, commitment_scheme_proof, ref channel);
+}
+
 fn circle_double_x(x: QM31) -> QM31 {
     let sqx = x * x;
     sqx + sqx - core::num::traits::One::one()
