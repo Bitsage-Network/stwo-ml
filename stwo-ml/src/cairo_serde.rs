@@ -3453,6 +3453,31 @@ mod recursive_serde {
         output.push(*hash);
     }
 
+    /// Serialize queried_values flattened: Cairo's `QueriedValues = Array<Span<M31>>`.
+    /// Each tree's column values are concatenated into one flat Span.
+    /// QUERY-MAJOR ordering: [col0_q0, col1_q0, col2_q0, col0_q1, col1_q1, ...]
+    /// This matches Cairo's `pop_front_n(n_columns)` which pops N values per query.
+    fn serialize_queried_values_flat(
+        tree: &TreeVec<ColumnVec<Vec<BaseField>>>,
+        output: &mut Vec<FieldElement>,
+    ) {
+        serialize_u32(tree.0.len() as u32, output); // num_trees
+        for columns in &tree.0 {
+            let total: usize = columns.iter().map(|c| c.len()).sum();
+            serialize_u32(total as u32, output);
+            if columns.is_empty() {
+                continue;
+            }
+            let n_queries = columns[0].len();
+            // Write in query-major order: for each query, write all columns
+            for q in 0..n_queries {
+                for col in columns {
+                    serialize_m31(col[q], output);
+                }
+            }
+        }
+    }
+
     /// Serialize `TreeVec<FieldElement252>` (commitments) for Poseidon252 proofs.
     fn serialize_tree_hashes_poseidon252(
         tree: &TreeVec<FieldElement>,
@@ -3538,8 +3563,10 @@ mod recursive_serde {
         // 4. decommitments: TreeVec<MerkleDecommitmentLifted<Poseidon252>>
         serialize_decommitments_poseidon252(&proof.decommitments, output);
 
-        // 5. queried_values: TreeVec<ColumnVec<Vec<BaseField>>>
-        serialize_queried_values(&proof.queried_values, output);
+        // 5. queried_values: TreeArray<Span<M31>> in Cairo (flattened per tree)
+        // Cairo's QueriedValues = Array<Span<M31>> — 2 levels, NOT 3.
+        // Each tree's columns are flattened into a single Span<M31>.
+        serialize_queried_values_flat(&proof.queried_values, output);
 
         // 6. proof_of_work_nonce: u64
         serialize_u64(proof.proof_of_work, output);

@@ -6,8 +6,9 @@ use crate::fields::qm31::{QM31, QM31Serde};
 use crate::fri::{FriProof, FriVerifierTrait};
 use crate::pcs::quotients::fri_answers;
 use crate::utils::{
-    ArrayImpl, ColumnsIndicesByLogDegreeBound, ColumnsIndicesPerTreeByLogDegreeBound, DictImpl,
-    group_columns_by_degree_bound, pad_and_transpose_columns_by_log_deg_bound_per_tree,
+    ArrayImpl, ColumnsIndicesByLogDegreeBound, ColumnsIndicesPerTreeByLogDegreeBound,
+    QueryPositionMapTrait, group_columns_by_degree_bound,
+    pad_and_transpose_columns_by_log_deg_bound_per_tree,
 };
 use crate::vcs::MerkleHasher;
 use crate::vcs::verifier::{MerkleDecommitment, MerkleVerifier, MerkleVerifierTrait};
@@ -16,8 +17,7 @@ use crate::{ColumnSpan, Hash, TreeArray, TreeSpan, queries};
 use super::PcsConfig;
 
 /// Sanity check that the proof of work is not negligible.
-/// Temporarily lowered to 0 for recursive STARK testing (default PcsConfig has pow_bits=10).
-pub const MIN_POW_BITS: u32 = 0;
+pub const MIN_POW_BITS: u32 = 10;
 
 /// Sampled mask values.
 ///

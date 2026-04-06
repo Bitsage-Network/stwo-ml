@@ -1582,3 +1582,128 @@ mod tests {
         println!("\n=== END STAGGERED VECTORS ===\n");
     }
 }
+
+    #[test]
+    fn test_poseidon252_digest_matches_js_reference() {
+        use stwo::core::channel::Channel;
+        use stwo::core::channel::Poseidon252Channel;
+
+        let mut ch = Poseidon252Channel::default();
+        let qm31 = QM31(
+            CM31(M31::from(1), M31::from(2)),
+            CM31(M31::from(3), M31::from(4)),
+        );
+        ch.mix_felts(&[qm31]);
+        let digest = ch.digest();
+        eprintln!("STWO Poseidon252Channel mix_felts([QM31(1,2,3,4)]) = 0x{:064x}", digest);
+        // From starknet.js: poseidon_hash_many([0, 0x10000000200000008000000180000004])
+        // = 0x0e029e34eb10ff7719b4a23d283495d23f65760b9d9a9b7885f0350879a7f1c
+        let expected = starknet_ff::FieldElement::from_hex_be(
+            "0x0e029e34eb10ff7719b4a23d283495d23f65760b9d9a9b7885f0350879a7f1c"
+        ).unwrap();
+        assert_eq!(digest, expected, "STWO Poseidon252Channel mix_felts must match starknet.js");
+    }
+
+    #[test]
+    fn test_poseidon252_merkle_leaf_hash() {
+        use stwo::core::vcs_lifted::poseidon252_merkle::Poseidon252MerkleHasher;
+        use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
+
+        // Hash a leaf with 3 M31 values (like preprocessed tree)
+        let vals = [M31::from(100), M31::from(200), M31::from(300)];
+        let mut hasher = Poseidon252MerkleHasher::default_with_initial_state();
+        hasher.update_leaf(&vals);
+        let hash = hasher.finalize();
+        eprintln!("Rust leaf hash (3 M31s [100,200,300]): 0x{:064x}", hash);
+        
+        // Hash a leaf with 4 M31 values (like QM31 in composition)
+        let vals4 = [M31::from(1), M31::from(2), M31::from(3), M31::from(4)];
+        let mut hasher4 = Poseidon252MerkleHasher::default_with_initial_state();
+        hasher4.update_leaf(&vals4);
+        let hash4 = hasher4.finalize();
+        eprintln!("Rust leaf hash (4 M31s [1,2,3,4]): 0x{:064x}", hash4);
+    }
+
+    #[test]
+    fn test_vanishing_poly_rust_vs_cairo() {
+        // Verify that Rust coset_vanishing and Cairo eval_vanishing
+        // produce the same result for a CanonicCoset
+        use stwo::core::channel::Channel;
+        use stwo::core::channel::Poseidon252Channel;
+        use stwo::core::constraints::coset_vanishing;
+        use stwo::core::poly::circle::CanonicCoset;
+        use stwo::core::circle::CirclePoint;
+        use stwo::core::fields::qm31::SecureField;
+
+        let log_size = 11u32; // max_log_degree_bound
+
+        // Create a deterministic OOD-like point
+        let mut ch = Poseidon252Channel::default();
+        ch.mix_u64(999);
+        let ood_point = CirclePoint::<SecureField>::get_random_point(&mut ch);
+
+        // Rust: coset_vanishing(CanonicCoset::new(11).coset, point)
+        let rust_vanishing = coset_vanishing(CanonicCoset::new(log_size).coset, ood_point);
+
+        // Cairo equivalent: double_x^(log_size-1)(point.x)
+        let mut x = ood_point.x;
+        for _ in 1..log_size {
+            x = CirclePoint::<SecureField>::double_x(x);
+        }
+        let cairo_vanishing = x;
+
+        eprintln!("Rust coset_vanishing: {:?}", rust_vanishing);
+        eprintln!("Cairo eval_vanishing: {:?}", cairo_vanishing);
+        assert_eq!(rust_vanishing, cairo_vanishing,
+            "Vanishing polynomial must match between Rust and Cairo");
+    }
+
+    #[test]
+    fn test_felt252_limb_extraction() {
+        // Verify 28-bit limb extraction from a known felt252
+        // Value: 0x070dac250c73e84fcdc4d60219e7bbb64ca3c175f7878bd5ed956cccce8b224a
+        // Lowest 28 bits (7 hex digits from right): 0xe8b224a
+        // Next 28 bits: shift right 28, mask 28 bits
+
+        // Binary: ...1100_1110_1000_1011_0010_0010_0100_1010
+        // Lowest 28 bits = 0xe8b224a = 244122186
+        let expected_limb0: u32 = 0x0e8b224a;
+        eprintln!("Expected limb[0] = {} (0x{:x})", expected_limb0, expected_limb0);
+
+        // For Cairo: felt252_extract_limb does (value / 2^(28*i)) & 0xFFFFFFF
+        // = (value >> 0) & 0xFFFFFFF = 0xe8b224a
+        // This matches Rust's felt252_to_limbs which extracts bits from bytes
+
+        // The key question: does Cairo's M31 reduction (mod 2^31-1) change the value?
+        // 0xe8b224a = 244122186 < 2^31-1 = 2147483647 → NO reduction needed
+        let p = (1u64 << 31) - 1;
+        assert!(expected_limb0 < p as u32, "limb fits in M31");
+        eprintln!("Limb 0 fits in M31 (no reduction): {} < {}", expected_limb0, p);
+    }
+
+    #[cfg(feature = "cli")]
+    #[test]
+    fn test_felt252_limb_decomposition_matches() {
+        use crate::recursive::air::felt252_to_limbs;
+
+        let digest = starknet_ff::FieldElement::from_hex_be(
+            "0x070dac250c73e84fcdc4d60219e7bbb64ca3c175f7878bd5ed956cccce8b224a"
+        ).unwrap();
+
+        let limbs = felt252_to_limbs(&digest);
+        eprintln!("Rust felt252_to_limbs for 0x070dac...224a:");
+        for (i, limb) in limbs.iter().enumerate() {
+            eprintln!("  limb[{}] = {} (0x{:x})", i, limb.0, limb.0);
+        }
+
+        // Cairo's felt252_extract_limb(value, i) does:
+        //   (value / pow2(i * 28)) & 0xFFFFFFF
+        // which is: bits [28*i .. 28*(i+1)) of the value
+        // This is equivalent to felt252_to_limbs which extracts 28-bit chunks from LSB
+
+        // Manually compute limb[0] from hex:
+        // 0x...ce8b224a → last 7 hex = 0xe8b224a (28 bits)
+        // 0xe8b224a = 244_122_186
+        eprintln!("\nExpected limb[0] from hex: 0xe8b224a = {}", 0x0e8b224au32);
+        assert_eq!(limbs[0].0, 0x0e8b224au32, "limb[0] should be lowest 28 bits");
+    }

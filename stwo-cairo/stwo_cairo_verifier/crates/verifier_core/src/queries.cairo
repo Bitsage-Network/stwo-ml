@@ -1,4 +1,3 @@
-use core::dict::{Felt252Dict, SquashedFelt252DictTrait};
 use crate::channel::{Channel, ChannelTrait};
 use crate::circle::CosetImpl;
 use super::utils::{ArrayImpl, pow2};
@@ -19,30 +18,61 @@ pub impl QueriesImpl of QueriesImplTrait {
     ///
     /// Panics if `log_domain_size` is >=32.
     fn generate(ref channel: Channel, log_domain_size: u32, n_queries: usize) -> Queries {
-        let mut positions_dict: Felt252Dict<felt252> = Default::default();
-        let mut n_dict_entries = 0;
         let domain_size: NonZero<u32> = pow2(log_domain_size).try_into().unwrap();
-        while n_dict_entries != n_queries {
+        let mut positions: Array<u32> = array![];
+        let mut collected = 0_usize;
+        while collected != n_queries {
             let mut random_words = channel.draw_u32s();
             for word in random_words {
                 let (_, position) = DivRem::div_rem(*word, domain_size);
-                positions_dict.insert(position.into(), 0);
-                n_dict_entries += 1;
-                if n_dict_entries == n_queries {
+                positions.append(position);
+                collected += 1;
+                if collected == n_queries {
                     break;
                 }
             }
         }
 
-        // A squashed dict's entries are sorted by key in ascending order.
-        let dict_entries = positions_dict.squash().into_entries();
-        let mut sorted_positions: Array<u32> = array![];
+        // Sort positions using insertion sort (n_queries is small, typically 8-64).
+        let mut sorted: Array<u32> = array![];
+        let positions_span = positions.span();
+        let mut i: usize = 0;
+        while i < positions_span.len() {
+            let val = *positions_span[i];
+            // Find insertion point in sorted array
+            let mut inserted = false;
+            let mut new_sorted: Array<u32> = array![];
+            let sorted_span = sorted.span();
+            let mut j: usize = 0;
+            while j < sorted_span.len() {
+                let s = *sorted_span[j];
+                if !inserted && val < s {
+                    new_sorted.append(val);
+                    inserted = true;
+                }
+                new_sorted.append(s);
+                j += 1;
+            };
+            if !inserted {
+                new_sorted.append(val);
+            }
+            sorted = new_sorted;
+            i += 1;
+        };
 
-        for (position, _, _) in dict_entries {
-            sorted_positions.append(position.try_into().unwrap());
-        }
+        // Deduplicate
+        let mut deduped: Array<u32> = array![];
+        let sorted_span = sorted.span();
+        let mut k: usize = 0;
+        while k < sorted_span.len() {
+            let val = *sorted_span[k];
+            if k == 0 || val != *sorted_span[k - 1] {
+                deduped.append(val);
+            }
+            k += 1;
+        };
 
-        Queries { positions: sorted_positions.span(), log_domain_size }
+        Queries { positions: deduped.span(), log_domain_size }
     }
 
     fn len(self: @Queries) -> usize {

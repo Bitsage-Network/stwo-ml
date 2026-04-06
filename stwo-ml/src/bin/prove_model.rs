@@ -290,6 +290,14 @@ struct Cli {
     /// This replaces the 18-TX streaming pipeline with a single TX.
     #[arg(long)]
     recursive: bool,
+
+    /// After generating a recursive proof, submit it on-chain in a single TX.
+    ///
+    /// Requires --recursive (implies --gkr --format ml_gkr).
+    /// Uses STARKNET_PRIVATE_KEY from env. Calls scripts/submit_recursive.mjs.
+    /// Prints TX hash and Starkscan explorer link on success.
+    #[arg(long)]
+    on_chain: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1630,10 +1638,29 @@ fn main() {
     }
 
     let t_e2e = Instant::now();
-    let is_e2e = cli.submit_gkr || cli.submit_paymaster;
+    let is_e2e = cli.submit_gkr || cli.submit_paymaster || cli.on_chain;
+
+    // Early validation for --on-chain: requires --recursive, which implies --gkr --format ml_gkr.
+    if cli.on_chain {
+        if !cli.recursive {
+            eprintln!("Error: --on-chain requires --recursive");
+            eprintln!("  Add: --recursive --gkr --format ml_gkr");
+            process::exit(1);
+        }
+        if !cli.gkr || cli.format != OutputFormat::MlGkr {
+            eprintln!("Error: --on-chain requires --gkr --format ml_gkr (via --recursive)");
+            eprintln!("  Add: --gkr --format ml_gkr --recursive --on-chain");
+            process::exit(1);
+        }
+        if std::env::var("STARKNET_PRIVATE_KEY").is_err() {
+            eprintln!("Error: --on-chain requires STARKNET_PRIVATE_KEY environment variable");
+            eprintln!("  export STARKNET_PRIVATE_KEY=0x...");
+            process::exit(1);
+        }
+    }
 
     // Early validation: catch incompatible flag combinations before loading model.
-    if is_e2e && cli.format != OutputFormat::MlGkr {
+    if is_e2e && !cli.on_chain && cli.format != OutputFormat::MlGkr {
         eprintln!("Error: --submit-gkr/--submit-paymaster require --format ml_gkr");
         eprintln!("  Add: --format ml_gkr");
         process::exit(1);
@@ -2836,10 +2863,11 @@ fn main() {
                 "verify_calldata": verify_calldata_obj,
                 "register_calldata": register_calldata_obj,
                 "recursive_proof": if let (Some(ref cd), Some(ref summ)) = (&recursive_calldata, &recursive_summary) {
+                    let recursive_contract = std::env::var("RECURSIVE_CONTRACT")
+                        .unwrap_or_else(|_| "0x707819dea6210ab58b358151419a604ffdb16809b568bf6f8933067c2a28715".to_string());
                     serde_json::json!({
                         "entrypoint": "verify_recursive",
-                        "contract": "RecursiveVerifierContract (not yet deployed — see elo-cairo-verifier/src/recursive_verifier.cairo)",
-                        "note": "Single-TX recursive STARK verification. Requires stwo-cairo-verifier's verify() to be wired in the Cairo contract.",
+                        "contract": recursive_contract,
                         "total_felts": summ.total_felts,
                         "log_size": summ.log_size,
                         "n_commitments": summ.n_commitments,
@@ -3129,6 +3157,27 @@ fn main() {
         submit_gkr_via_paymaster(&cli);
         if is_e2e {
             eprintln!("[E2E] Submission (paymaster): {:.1}s", t_submit.elapsed().as_secs_f64());
+            let total = t_e2e.elapsed();
+            let secs = total.as_secs();
+            eprintln!("[E2E] Total: {:.1}s ({}m {}s)", total.as_secs_f64(), secs / 60, secs % 60);
+        }
+    }
+
+    // --on-chain: submit recursive STARK proof on-chain via scripts/submit_recursive.mjs
+    if cli.on_chain {
+        if !cli.recursive {
+            eprintln!("Error: --on-chain requires --recursive (which implies --gkr --format ml_gkr)");
+            process::exit(1);
+        }
+        if recursive_calldata.is_none() {
+            eprintln!("Error: --on-chain requires a successfully generated recursive proof");
+            eprintln!("  The recursive STARK composition may have failed. Check output above.");
+            process::exit(1);
+        }
+        let t_submit = Instant::now();
+        submit_recursive_proof_onchain(&cli);
+        if is_e2e {
+            eprintln!("[E2E] Submission (recursive on-chain): {:.1}s", t_submit.elapsed().as_secs_f64());
             let total = t_e2e.elapsed();
             let secs = total.as_secs();
             eprintln!("[E2E] Total: {:.1}s ({}m {}s)", total.as_secs_f64(), secs / 60, secs % 60);
@@ -3655,6 +3704,140 @@ fn submit_gkr_via_paymaster(cli: &Cli) {
             }
             process::exit(1);
         }
+    }
+}
+
+// ─── Recursive On-Chain Submission ──────────────────────────────────────
+
+/// Submit a recursive STARK proof on-chain via `scripts/submit_recursive.mjs`.
+///
+/// Reads the proof JSON from `cli.output`, invokes the Node.js script as a
+/// subprocess, and parses the result for TX hash and explorer link.
+fn submit_recursive_proof_onchain(cli: &Cli) {
+    // Validate STARKNET_PRIVATE_KEY is set
+    if std::env::var("STARKNET_PRIVATE_KEY").is_err() {
+        eprintln!("Error: STARKNET_PRIVATE_KEY environment variable is not set.");
+        eprintln!("  Export your deployer private key:");
+        eprintln!("    export STARKNET_PRIVATE_KEY=0x...");
+        process::exit(1);
+    }
+
+    // Locate submit_recursive.mjs
+    let mut script_candidates: Vec<PathBuf> = Vec::new();
+
+    // 1. Explicit env override
+    if let Ok(path) = std::env::var("OBELYSK_RECURSIVE_SCRIPT") {
+        if !path.is_empty() {
+            script_candidates.push(PathBuf::from(path));
+        }
+    }
+
+    // 2. Relative to binary location
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            for depth in &["../../..", "../../../.."] {
+                script_candidates.push(
+                    exe_dir.join(depth).join("scripts/submit_recursive.mjs"),
+                );
+            }
+        }
+    }
+
+    // 3. Relative to CWD
+    script_candidates.push(PathBuf::from("scripts/submit_recursive.mjs"));
+
+    // 4. Compile-time manifest dir
+    script_candidates.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/submit_recursive.mjs"),
+    );
+
+    let script_path = match script_candidates.iter().find(|p| p.exists()).cloned() {
+        Some(p) => p,
+        None => {
+            eprintln!("Error: submit_recursive.mjs not found");
+            eprintln!("  Searched:");
+            for p in &script_candidates {
+                eprintln!("    {}", p.display());
+            }
+            eprintln!();
+            eprintln!("  Set OBELYSK_RECURSIVE_SCRIPT=/path/to/submit_recursive.mjs");
+            process::exit(1);
+        }
+    };
+
+    let proof_path = cli.output.display().to_string();
+    let contract = std::env::var("RECURSIVE_CONTRACT")
+        .unwrap_or_else(|_| "0x707819dea6210ab58b358151419a604ffdb16809b568bf6f8933067c2a28715".to_string());
+    let rpc = std::env::var("STARKNET_RPC")
+        .unwrap_or_else(|_| "https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_8/demo".to_string());
+
+    eprintln!();
+    eprintln!("=== Recursive On-Chain Submission ===");
+    eprintln!("  Script:   {}", script_path.display());
+    eprintln!("  Proof:    {}", proof_path);
+    eprintln!("  Contract: {}", contract);
+    eprintln!("  Model ID: {}", cli.model_id);
+
+    let output = match std::process::Command::new("node")
+        .arg(&script_path)
+        .arg(&proof_path)
+        .env("RECURSIVE_CONTRACT", &contract)
+        .env("STARKNET_RPC", &rpc)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                eprintln!("Error: 'node' not found in PATH. Install Node.js >= 18 to use --on-chain.");
+            } else {
+                eprintln!("Error: failed to invoke submit_recursive.mjs: {e}");
+            }
+            process::exit(1);
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Print all output for visibility
+    for line in stdout.lines() {
+        if !line.starts_with("RESULT_JSON:") {
+            eprintln!("  {}", line);
+        }
+    }
+    if !stderr.is_empty() {
+        for line in stderr.lines() {
+            eprintln!("  [err] {}", line);
+        }
+    }
+
+    // Parse structured result
+    if let Some(json_line) = stdout.lines().find(|l| l.starts_with("RESULT_JSON:")) {
+        let json_str = &json_line["RESULT_JSON:".len()..];
+        if let Ok(result) = serde_json::from_str::<serde_json::Value>(json_str) {
+            if result["success"].as_bool() == Some(true) {
+                let tx = result["tx_hash"].as_str().unwrap_or("unknown");
+                let url = result["explorer_url"].as_str().unwrap_or("");
+                let count = result["verification_count"].as_u64().unwrap_or(0);
+                eprintln!();
+                eprintln!("=== Recursive STARK Verified On-Chain ===");
+                eprintln!("  TX:            {}", tx);
+                eprintln!("  Verifications: {}", count);
+                eprintln!("  Explorer:      {}", url);
+                eprintln!("==========================================");
+                return;
+            } else {
+                let err = result["error"].as_str().unwrap_or("unknown error");
+                eprintln!("On-chain submission failed: {}", err);
+            }
+        }
+    }
+
+    if !output.status.success() {
+        eprintln!("Error: submit_recursive.mjs exited with code {:?}", output.status.code());
+        process::exit(1);
     }
 }
 

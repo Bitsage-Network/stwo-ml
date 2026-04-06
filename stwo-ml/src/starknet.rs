@@ -412,6 +412,54 @@ pub fn prove_full_attestation_with_policy(
         .map(|w| format!("0x{:x}", w))
         .collect();
 
+    // 7. Attempt recursive STARK composition (optional — does not abort on failure)
+    //    Only available when the `cli` feature is enabled (recursive prover + serialization).
+    #[cfg(feature = "cli")]
+    let recursive_calldata = {
+        use crate::aggregation::compute_io_commitment;
+        let io_comm_felt = compute_io_commitment(input, &aggregated.execution.output);
+        let io_qm31 = crate::crypto::poseidon_channel::felt_to_securefield(io_comm_felt);
+
+        // Weight super root: hash of all weight commitment roots.
+        // Mirrors the logic in prove_model.rs's --recursive handling.
+        let weight_root = if !gkr_proof.weight_claims.is_empty() {
+            let mut hasher = crate::crypto::poseidon_channel::PoseidonChannel::new();
+            hasher.mix_u64(gkr_proof.weight_claims.len() as u64);
+            for wc in &gkr_proof.weight_claims {
+                hasher.mix_felt(crate::crypto::poseidon_channel::securefield_to_felt(wc.expected_value));
+            }
+            // draw_qm31 = draw a QM31 from the channel after mixing weight claims
+            hasher.draw_qm31()
+        } else {
+            stwo::core::fields::qm31::QM31::default()
+        };
+
+        match crate::recursive::prove_recursive(
+            &circuit,
+            gkr_proof,
+            &aggregated.execution.output,
+            weights,
+            weight_root,
+            io_qm31,
+            t_prove.as_secs_f64(),
+        ) {
+            Ok(rp) => {
+                let cd = crate::cairo_serde::serialize_recursive_proof_calldata(&rp);
+                info!(
+                    "Recursive STARK: {:.2}s, {} felts",
+                    rp.metadata.recursive_prove_time_secs, cd.len()
+                );
+                Some(cd.iter().map(|f| format!("0x{:x}", f)).collect::<Vec<_>>())
+            }
+            Err(e) => {
+                info!("Recursive STARK skipped: {e}");
+                None
+            }
+        }
+    };
+    #[cfg(not(feature = "cli"))]
+    let recursive_calldata: Option<Vec<String>> = None;
+
     Ok(FullAttestationResult {
         gkr_proof: gkr_proof.clone(),
         streaming_calldata: streaming,
@@ -420,6 +468,7 @@ pub fn prove_full_attestation_with_policy(
         num_layers: gkr_proof.layer_proofs.len(),
         prove_time_ms: t_total.as_millis() as u64,
         circuit_depth: circuit.layers.len(),
+        recursive_calldata,
     })
 }
 
@@ -469,6 +518,9 @@ pub struct FullAttestationResult {
     pub prove_time_ms: u64,
     /// Circuit depth (for on-chain verifier).
     pub circuit_depth: usize,
+    /// Recursive STARK calldata (if recursive prover succeeded).
+    /// Each element is a hex string like "0x...".
+    pub recursive_calldata: Option<Vec<String>>,
 }
 
 /// Prove and serialize for Starknet on-chain verification with weight cache.

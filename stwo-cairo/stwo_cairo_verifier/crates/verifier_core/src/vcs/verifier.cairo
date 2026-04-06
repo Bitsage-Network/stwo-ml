@@ -1,10 +1,8 @@
 use core::array::{ArrayTrait, SpanTrait, ToSpanTrait};
-use core::dict::{Felt252Dict, Felt252DictTrait};
 use core::fmt::{Debug, Error, Formatter};
-use core::nullable::NullableTrait;
 use core::option::OptionTrait;
 use crate::BaseField;
-use crate::utils::{ColumnsIndicesByLogDegreeBound, SpanExTrait};
+use crate::utils::{ColumnsIndicesByLogDegreeBound, QueryPositionMap, QueryPositionMapTrait, SpanExTrait};
 use crate::vcs::hasher::MerkleHasher;
 
 pub struct MerkleDecommitment<impl H: MerkleHasher> {
@@ -95,7 +93,7 @@ pub trait MerkleVerifierTrait<impl H: MerkleHasher> {
     /// * The computed root does not match the expected root.
     fn verify(
         self: @MerkleVerifier<H>,
-        ref queries_per_log_size: Felt252Dict<Nullable<Span<usize>>>,
+        ref queries_per_log_size: QueryPositionMap,
         queried_values: Span<BaseField>,
         decommitment: MerkleDecommitment<H>,
     );
@@ -112,20 +110,18 @@ impl MerkleVerifierImpl<
     /// This assumption implies that the `column_witness` in `decommitment` is empty.
     fn verify(
         self: @MerkleVerifier<H>,
-        ref queries_per_log_size: Felt252Dict<Nullable<Span<usize>>>,
+        ref queries_per_log_size: QueryPositionMap,
         mut queried_values: Span<BaseField>,
         decommitment: MerkleDecommitment<H>,
     ) {
         let MerkleDecommitment { mut hash_witness, mut column_witness } = decommitment;
 
         let mut column_indices_by_log_deg_bound = *self.column_indices_by_log_deg_bound;
-        let mut layer_log_size: felt252 = (*self.tree_height).into();
+        let mut layer_log_size: u32 = *self.tree_height;
         let mut prev_layer_hashes: Array<(usize, H::Hash)> = array![];
 
         let layer_cols = column_indices_by_log_deg_bound.pop_back().unwrap();
-        let layer_column_queries = queries_per_log_size
-            .get(layer_log_size)
-            .deref_or(array![].span());
+        let layer_column_queries = queries_per_log_size.get(layer_log_size);
 
         let n_columns_in_layer = layer_cols.len();
         assert!(n_columns_in_layer != 0);
@@ -150,9 +146,7 @@ impl MerkleVerifierImpl<
             // Prepare read buffer for queried values to the current layer.
 
             // Extract the requested queries to the current layer.
-            let mut layer_column_queries = queries_per_log_size
-                .get(layer_log_size)
-                .deref_or(array![].span());
+            let mut layer_column_queries = queries_per_log_size.get(layer_log_size);
 
             // Merge previous layer queries and column queries.
             while let Some(current_query) =

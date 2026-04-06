@@ -43,7 +43,7 @@ print(result.calldata)  # felts for Starknet verification
 
 ```bash
 curl -sSf https://raw.githubusercontent.com/obelyzk/stwo-ml/main/install.sh | sh
-obelysk prove --model smollm2-135m --input "Hello world"
+obelysk prove --model smollm2-135m --input "Hello world" --on-chain
 ```
 
 Output:
@@ -92,7 +92,7 @@ Any HuggingFace transformer with SafeTensors weights is supported. GPU proving u
 
 ## On-Chain Verification
 
-ObelyZK produces a **recursive STARK proof** that compresses the entire GKR computation into approximately 981 felts -- a 260x reduction from the streaming format. This means a full 30-layer SmolLM2-135M proof verifies in a single Starknet transaction, with no multi-step coordination needed.
+ObelyZK produces a **fully trustless recursive STARK proof** that compresses the entire GKR computation into approximately 981 felts -- a 260x reduction from the streaming format. This means a full 30-layer SmolLM2-135M proof verifies in a single Starknet transaction, with no multi-step coordination needed. The recursive verifier performs complete cryptographic verification on-chain: OODS sampling, Merkle decommitment, FRI layer folding, and proof-of-work.
 
 For larger models or when finer-grained verification is preferred, a **streaming verifier** breaks the proof into sequential steps that can be submitted independently. Both paths produce the same cryptographic guarantee: the model inference is correct and the weights match their committed Poseidon roots.
 
@@ -100,8 +100,10 @@ For larger models or when finer-grained verification is preferred, a **streaming
 
 | Contract | Address |
 |---|---|
-| Recursive Verifier | `0x16919296b3990c10db6d714a04d2b6a1f62f007ed93e1b5816de1033beb248c` |
+| Recursive Verifier (Phase 1) | `0x707819dea6210ab58b358151419a604ffdb16809b568bf6f8933067c2a28715` |
 | Streaming Verifier | `0x376fa0c4a9cf3d069e6a5b91bad6e131e7a800f9fced49bd72253a0b0983039` |
+
+The fully trustless recursive class (`0x006d4ff233...ce820`) has been verified on devnet and is pending Sepolia deployment.
 
 See [docs/ON_CHAIN_VERIFICATION.md](docs/ON_CHAIN_VERIFICATION.md) for the full protocol specification, calldata encoding, and contract ABI.
 
@@ -117,10 +119,10 @@ cd stwo-ml
 ./scripts/setup.sh
 ```
 
-Generate a proof locally:
+Generate a proof and submit on-chain:
 
 ```bash
-obelysk prove --model-dir ./models/smollm2-135m --gkr --recursive
+obelysk prove --model-dir ./models/smollm2-135m --gkr --recursive --on-chain
 ```
 
 Or start a prove server that exposes an HTTP/WebSocket API:
@@ -172,13 +174,15 @@ All SDKs default to `https://api.obelysk.com` and can be pointed at a self-hoste
                              v
                     +------------------+
                     |  Starknet        |
+                    |  On-Chain STARK  |
                     |  Verification    |
-                    |  (1 TX, ~981     |
-                    |   felts)         |
+                    |  (OODS + Merkle  |
+                    |   + FRI + PoW)   |
+                    |  1 TX, ~981 felts|
                     +------------------+
 ```
 
-The GKR prover generates a sumcheck proof for every layer in the computation graph. Weight Poseidon commitments are aggregated via an oracle sumcheck. The entire proof tree is then compressed into a recursive STARK -- a single proof that attests to the validity of all inner proofs -- and submitted on-chain.
+The GKR prover generates a sumcheck proof for every layer in the computation graph. Weight Poseidon commitments are aggregated via an oracle sumcheck. The entire proof tree is then compressed into a recursive STARK -- a single proof that attests to the validity of all inner proofs. The on-chain verifier performs full cryptographic STARK verification: OODS sampling, Merkle decommitment, FRI layer folding, and proof-of-work validation.
 
 ---
 
@@ -202,6 +206,9 @@ See [docs/ENV_VARS.md](docs/ENV_VARS.md) for the full reference. The most import
 | Variable | Default | Description |
 |---|---|---|
 | `OBELYZK_API_URL` | `https://api.obelysk.com` | Prover API endpoint (SDKs and CLI) |
+| `STARKNET_PRIVATE_KEY` | -- | Account private key for on-chain submission |
+| `STARKNET_RPC` | Alchemy Sepolia | Starknet RPC endpoint URL |
+| `RECURSIVE_CONTRACT` | Phase 1 address | Recursive verifier contract address |
 | `STWO_GPU_MERKLE_THRESHOLD` | `4096` | Minimum leaf count before GPU Merkle kicks in |
 | `STWO_WEIGHT_BINDING` | `aggregated` | Weight binding mode: `aggregated` (default), `individual`, or `sequential` |
 
@@ -215,7 +222,7 @@ See [docs/ENV_VARS.md](docs/ENV_VARS.md) for the full reference. The most import
 | Paper | [obelyzk-paper.pdf](obelyzk-paper.pdf) |
 | Recursive STARK Spec | [docs/RECURSIVE_STARK.md](docs/RECURSIVE_STARK.md) |
 | On-Chain Verification | [docs/ON_CHAIN_VERIFICATION.md](docs/ON_CHAIN_VERIFICATION.md) |
-| Starknet Explorer (Recursive) | [Voyager](https://sepolia.voyager.online/contract/0x16919296b3990c10db6d714a04d2b6a1f62f007ed93e1b5816de1033beb248c) |
+| Starknet Explorer (Recursive) | [Voyager](https://sepolia.voyager.online/contract/0x707819dea6210ab58b358151419a604ffdb16809b568bf6f8933067c2a28715) |
 | Starknet Explorer (Streaming) | [Voyager](https://sepolia.voyager.online/contract/0x376fa0c4a9cf3d069e6a5b91bad6e131e7a800f9fced49bd72253a0b0983039) |
 | npm | [@obelyzk/sdk](https://www.npmjs.com/package/@obelyzk/sdk) |
 | PyPI | [obelyzk](https://pypi.org/project/obelyzk/) |

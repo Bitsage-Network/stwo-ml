@@ -1,6 +1,4 @@
 use core::array::ArrayImpl;
-use core::dict::Felt252Dict;
-use core::nullable::{FromNullableResult, Nullable, match_nullable};
 use core::num::traits::{One, Zero};
 use stwo_verifier_utils::zip_eq::zip_eq;
 use crate::circle::{
@@ -15,8 +13,8 @@ use crate::fields::qm31::{
 use crate::fields::{BatchInvertible, Invertible};
 use crate::poly::circle::{CanonicCosetImpl, CircleDomainImpl, CircleEvaluationImpl};
 use crate::utils::{
-    ArrayImpl as ArrayUtilImpl, ColumnsIndicesPerTreeByLogDegreeBound, SpanExTrait, SpanImpl,
-    bit_reverse_index, pack_qm31,
+    ArrayImpl as ArrayUtilImpl, ColumnsIndicesPerTreeByLogDegreeBound, QueryPositionMap,
+    QueryPositionMapTrait, SpanExTrait, SpanImpl, bit_reverse_index, pack_qm31,
 };
 use crate::{TreeArray, TreeSpan};
 use super::verifier::{QueriedValues, SampledValues};
@@ -42,7 +40,7 @@ pub fn fri_answers(
     oods_point: CirclePoint<QM31>,
     sample_values_per_column_per_tree: SampledValues,
     random_coeff: QM31,
-    mut query_positions_per_log_size: Felt252Dict<Nullable<Span<usize>>>,
+    mut query_positions_per_log_size: QueryPositionMap,
     queried_values_per_tree: QueriedValues,
 ) -> Array<Span<QM31>> {
     // Note that `log_size` is equal to 1 + largest log size of a trace column (the additional 1
@@ -64,20 +62,18 @@ pub fn fri_answers(
             log_blowup_factor,
         );
 
-        let queries_for_log_size =
-            match match_nullable(query_positions_per_log_size.get(log_size.into())) {
-            FromNullableResult::NotNull(value) => value.unbox(),
-            FromNullableResult::Null => {
-                // If there are no queries for this log size, we also cannot have any samples for
-                // it.
-                assert!(sample_batches_by_point.is_empty());
-                // If queries existed, they would need to be consumed by `fri_answers_for_log_size`
-                // even when there are no samples.
+        let queries_for_log_size = query_positions_per_log_size.get(log_size);
+        if queries_for_log_size.is_empty() {
+            // If there are no queries for this log size, we also cannot have any samples for
+            // it.
+            assert!(sample_batches_by_point.is_empty());
+            // If queries existed, they would need to be consumed by `fri_answers_for_log_size`
+            // even when there are no samples.
 
-                // Skip answers generation for this log size.
-                continue;
-            },
-        };
+            // Skip answers generation for this log size.
+            continue;
+        }
+        let queries_for_log_size = queries_for_log_size;
 
         answers
             .append(

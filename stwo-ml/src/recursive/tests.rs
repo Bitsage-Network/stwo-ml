@@ -397,3 +397,43 @@ mod chain_debug {
         assert_eq!(chain_breaks, 0, "Chain has {chain_breaks} breaks — transcript not continuous");
     }
 }
+
+#[test]
+fn test_poseidon_hash_many_matches_reference() {
+    use starknet_crypto::poseidon_hash_many;
+    use starknet_ff::FieldElement;
+    
+    // From starknet.js computePoseidonHashOnElements:
+    let h0 = poseidon_hash_many(&[]);
+    assert_eq!(format!("{:#066x}", h0), "0x02272be0f580fd156823304800919530eaa97430e972d7213ee13f4fbf7a5dbc");
+    
+    let h1 = poseidon_hash_many(&[FieldElement::ONE]);
+    assert_eq!(format!("{:#066x}", h1), "0x00579e8877c7755365d5ec1ec7d3a94a457eff5d1f40482bbe9729c064cdead2");
+    
+    let h2 = poseidon_hash_many(&[FieldElement::ONE, FieldElement::TWO]);
+    assert_eq!(format!("{:#066x}", h2), "0x0371cb6995ea5e7effcd2e174de264b5b407027a75a231a70c2c8d196107f0e7");
+    
+    eprintln!("All poseidon_hash_many tests passed — matches starknet.js reference");
+}
+
+#[test]
+fn test_mix_felts_poseidon252_matches_js() {
+    use stwo::core::channel::poseidon252::Poseidon252Channel;
+    use stwo::core::channel::Channel;
+    use stwo::core::fields::m31::M31;
+    use stwo::core::fields::qm31::SecureField;
+
+    let mut ch = Poseidon252Channel::default();
+    let qm31 = SecureField::from_m31_array([
+        M31::from(1), M31::from(2), M31::from(3), M31::from(4),
+    ]);
+    ch.mix_felts(&[qm31]);
+    let digest = ch.digest();
+    eprintln!("Rust mix_felts digest: 0x{:064x}", digest);
+    // From starknet.js: poseidon_hash_many([0, 0x10000000200000008000000180000004])
+    // = 0xe029e34eb10ff7719b4a23d283495d23f65760b9d9a9b7885f0350879a7f1c
+    let expected = starknet_ff::FieldElement::from_hex_be(
+        "0x0e029e34eb10ff7719b4a23d283495d23f65760b9d9a9b7885f0350879a7f1c"
+    ).unwrap();
+    assert_eq!(digest, expected, "mix_felts must match starknet.js reference");
+}

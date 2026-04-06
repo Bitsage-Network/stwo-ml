@@ -96,7 +96,20 @@ obelysk prove --model smollm2-135m --input "test" --recursive
 This downloads the model weights on first run, executes inference, generates a recursive
 STARK proof, and writes `proof.json` to the current directory.
 
-### Submit on-chain
+### Prove and submit on-chain (one command)
+
+```bash
+export STARKNET_PRIVATE_KEY="<your-key>"
+export STARKNET_RPC="https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_8/<YOUR_KEY>"
+export RECURSIVE_CONTRACT="0x707819dea6210ab58b358151419a604ffdb16809b568bf6f8933067c2a28715"
+
+obelysk prove --model smollm2-135m --input "test" --recursive --on-chain
+```
+
+The `--on-chain` flag proves the model and submits the recursive STARK proof to Starknet
+in a single command. It requires `STARKNET_PRIVATE_KEY` to be set.
+
+### Submit a pre-generated proof
 
 ```bash
 obelysk submit --proof proof.json --network sepolia
@@ -182,11 +195,13 @@ result = client.prove(model="smollm2-135m", input="Hello world", recursive=True)
 
 ## On-Chain Verification
 
-ObelyZK generates recursive STARK proofs that verify in a single Starknet transaction.
+ObelyZK generates fully trustless recursive STARK proofs that verify in a single
+Starknet transaction. The on-chain verifier performs complete cryptographic STARK
+verification: OODS sampling, Merkle decommitment, FRI layer folding, and proof-of-work.
 
 | Property | Value |
 |----------|-------|
-| Proof type | Recursive STARK (default) |
+| Proof type | Recursive STARK (fully trustless) |
 | Calldata size | ~981 felts |
 | Verification cost | ~$0.02 on Sepolia |
 | Transaction count | 1 (recursive path) |
@@ -198,7 +213,7 @@ Visit `https://sepolia.starkscan.co/tx/<tx_hash>` to inspect the verification tr
 ### Verifier contract (Sepolia)
 
 ```
-0x16919296b3990c10db6d714a04d2b6a1f62f007ed93e1b5816de1033beb248c
+0x707819dea6210ab58b358151419a604ffdb16809b568bf6f8933067c2a28715
 ```
 
 ### Query verification status
@@ -208,8 +223,8 @@ Call `is_recursive_proof_verified` on the contract with the proof hash:
 ```typescript
 import { Contract, RpcProvider } from "starknet";
 
-const provider = new RpcProvider({ nodeUrl: "https://starknet-sepolia.public.blastapi.io" });
-const contract = new Contract(abi, "0x16919296b3990c10db6d714a04d2b6a1f62f007ed93e1b5816de1033beb248c", provider);
+const provider = new RpcProvider({ nodeUrl: process.env.STARKNET_RPC });
+const contract = new Contract(abi, "0x707819dea6210ab58b358151419a604ffdb16809b568bf6f8933067c2a28715", provider);
 
 const verified = await contract.is_recursive_proof_verified(proofHash);
 console.log("Verified:", verified);
@@ -250,7 +265,9 @@ the prover or prove-server.
 | `STWO_ALLOW_MISSING_ACTIVATION_PROOF` | Accept proofs without activation LogUp (`1` or `0`) | `0` |
 | `STWO_PROFILE` | Enable phase profiling output (`1` or `0`) | `0` |
 | `STARKNET_PRIVATE_KEY` | Account private key for on-chain submission | -- |
-| `STARKNET_RPC` | Starknet RPC endpoint URL | Sepolia default |
+| `STARKNET_RPC` | Starknet RPC endpoint URL | Alchemy Sepolia |
+| `RECURSIVE_CONTRACT` | Recursive verifier contract address | Phase 1 default |
+| `OBELYSK_RECURSIVE_SCRIPT` | Path to `submit_recursive.mjs` (for CLI) | auto-detect |
 
 ---
 
@@ -345,4 +362,4 @@ Response:
 | PyPI | https://pypi.org/project/obelyzk |
 | Documentation | https://docs.obelysk.com |
 | Paper | https://arxiv.org/abs/2026.obelyzk |
-| Starknet Contract | https://sepolia.starkscan.co/contract/0x16919296b3990c10db6d714a04d2b6a1f62f007ed93e1b5816de1033beb248c |
+| Starknet Contract | https://sepolia.starkscan.co/contract/0x707819dea6210ab58b358151419a604ffdb16809b568bf6f8933067c2a28715 |

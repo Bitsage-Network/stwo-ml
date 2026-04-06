@@ -1808,6 +1808,9 @@ struct AttestRequest {
     /// Submit on-chain after proving (default: true)
     #[serde(default = "default_true")]
     submit_onchain: bool,
+    /// Use recursive STARK proof for single-TX submission (default: true when available)
+    #[serde(default = "default_true")]
+    recursive: bool,
 }
 
 #[derive(Serialize)]
@@ -1940,168 +1943,294 @@ async fn attest(
         // Check if we have Starknet credentials
         let starknet_key = std::env::var("STARKNET_PRIVATE_KEY").ok();
         let starknet_account = std::env::var("STARKNET_ACCOUNT_ADDRESS").ok();
-        let contract = std::env::var("CONTRACT_ADDRESS")
-            .or_else(|_| std::env::var("OBELYSK_CONTRACT"))
-            .unwrap_or_else(|_| "0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005".to_string());
 
-        if starknet_key.is_some() && starknet_account.is_some() {
-            // Build streaming proof artifact for register_and_submit.mjs
-            let streaming = &attestation.streaming_calldata;
-            let batch_json: Vec<serde_json::Value> = streaming.stream_batches.iter().map(|b| {
-                serde_json::json!({
-                    "batch_idx": b.batch_idx,
-                    "num_layers": b.num_layers,
-                    "calldata": b.calldata,
-                })
-            }).collect();
-            let output_chunks_json: Vec<serde_json::Value> = streaming.output_mle_chunks.iter().map(|c| {
-                serde_json::json!({
-                    "chunk_offset": c.chunk_offset,
-                    "chunk_len": c.chunk_len,
-                    "is_last": c.is_last,
-                    "calldata": c.calldata,
-                })
-            }).collect();
-            let input_chunks_json: Vec<serde_json::Value> = streaming.input_mle_chunks.iter().map(|c| {
-                serde_json::json!({
-                    "chunk_offset": c.chunk_offset,
-                    "chunk_len": c.chunk_len,
-                    "is_last": c.is_last,
-                    "calldata": c.calldata,
-                })
-            }).collect();
+        if starknet_key.is_some() {
+            // Decide submission path: recursive (single TX) vs streaming (multi TX)
+            let use_recursive = req.recursive && attestation.recursive_calldata.is_some();
 
-            let artifact = serde_json::json!({
-                "format": "ml_gkr",
-                "model_id": model_id_for_artifact,
-                "weight_commitments": attestation.weight_commitments,
-                "io_commitment": attestation.io_commitment,
-                "verify_calldata": {
-                    "schema_version": 3,
-                    "entrypoint": "verify_gkr_stream",
-                    "mode": "streaming",
+            if use_recursive {
+                // Recursive path: single TX via submit_recursive.mjs
+                let recursive_contract = std::env::var("RECURSIVE_CONTRACT")
+                    .unwrap_or_else(|_| "0x707819dea6210ab58b358151419a604ffdb16809b568bf6f8933067c2a28715".to_string());
+
+                let recursive_cd = attestation.recursive_calldata.as_ref().unwrap();
+                let artifact = serde_json::json!({
+                    "format": "ml_gkr",
                     "model_id": model_id_for_artifact,
-                    "total_felts": streaming.session_metadata.total_felts,
-                    "circuit_depth": attestation.circuit_depth,
-                    "num_layers": attestation.num_layers,
-                    "layer_tags": streaming.session_metadata.layer_tags,
-                    "init_calldata": streaming.init_calldata,
-                    "output_mle_chunks": output_chunks_json,
-                    "stream_batches": batch_json,
-                    "weight_binding_chunks": streaming.weight_binding_chunks.iter().map(|c| {
-                        serde_json::json!({
-                            "chunk_idx": c.chunk_idx,
-                            "is_last": c.is_last,
-                            "entrypoint": c.entrypoint,
-                            "calldata": c.calldata,
-                        })
-                    }).collect::<Vec<serde_json::Value>>(),
-                    "input_mle_chunks": input_chunks_json,
-                    "finalize_calldata": streaming.finalize_calldata,
-                    "chunks": streaming.upload_chunks,
-                }
-            });
-
-            // Write artifact to temp file
-            let tmp_path = format!("/tmp/attest-{}.json", proof_id);
-            if let Err(e) = std::fs::write(&tmp_path, serde_json::to_string(&artifact).unwrap_or_default()) {
-                return Ok(Json(AttestResponse {
-                    proof_id, io_commitment, weight_commitment: model_weight_commitment,
-                    num_proven_layers: num_layers, prove_time_ms: prove_elapsed,
-                    calldata_felts, estimated_gas,
-                    onchain: OnChainStatus {
-                        submitted: false, tx_hashes: vec![], network: "starknet-sepolia".into(),
-                        contract, verified: false, explorer_url: None,
-                        error: Some(format!("Failed to write proof artifact: {e}")),
+                    "io_commitment": attestation.io_commitment,
+                    "recursive_proof": {
+                        "entrypoint": "verify_recursive",
+                        "contract": &recursive_contract,
+                        "total_felts": recursive_cd.len(),
+                        "calldata": recursive_cd,
                     },
-                }));
-            }
+                });
 
-            // Find register_and_submit.mjs relative to the binary
-            let exe = std::env::current_exe().unwrap_or_default();
-            let scripts_dir = exe.parent().unwrap_or(std::path::Path::new("."))
-                .join("../../../scripts/pipeline");
-            let submit_script = if scripts_dir.join("register_and_submit.mjs").exists() {
-                scripts_dir.join("register_and_submit.mjs")
-            } else {
-                // Fallback: check working directory
-                std::path::PathBuf::from("scripts/pipeline/register_and_submit.mjs")
-            };
+                let tmp_path = format!("/tmp/attest-recursive-{}.json", proof_id);
+                if let Err(e) = std::fs::write(&tmp_path, serde_json::to_string(&artifact).unwrap_or_default()) {
+                    return Ok(Json(AttestResponse {
+                        proof_id, io_commitment, weight_commitment: model_weight_commitment,
+                        num_proven_layers: num_layers, prove_time_ms: prove_elapsed,
+                        calldata_felts, estimated_gas,
+                        onchain: OnChainStatus {
+                            submitted: false, tx_hashes: vec![], network: "starknet-sepolia".into(),
+                            contract: recursive_contract, verified: false, explorer_url: None,
+                            error: Some(format!("Failed to write recursive artifact: {e}")),
+                        },
+                    }));
+                }
 
-            let rpc_url = std::env::var("STARKNET_RPC")
-                .unwrap_or_else(|_| "https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_7/demo".into());
+                // Locate submit_recursive.mjs
+                let exe = std::env::current_exe().unwrap_or_default();
+                let scripts_dir = exe.parent().unwrap_or(std::path::Path::new("."))
+                    .join("../../../scripts");
+                let submit_script = if scripts_dir.join("submit_recursive.mjs").exists() {
+                    scripts_dir.join("submit_recursive.mjs")
+                } else {
+                    std::path::PathBuf::from("scripts/submit_recursive.mjs")
+                };
 
-            eprintln!("[attest] Submitting on-chain via {}", submit_script.display());
+                let rpc_url = std::env::var("STARKNET_RPC")
+                    .unwrap_or_else(|_| "https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_8/demo".into());
 
-            // Call register_and_submit.mjs
-            // Find node binary — check common locations
-            let node_bin = [
-                "/home/ubuntu/.nvm/versions/node/v20.20.2/bin/node",
-                "/usr/local/bin/node",
-                "/usr/bin/node",
-                "node",
-            ].iter().find(|p| std::path::Path::new(p).exists())
-                .unwrap_or(&"node");
+                eprintln!("[attest] Submitting recursive proof on-chain via {}", submit_script.display());
 
-            match tokio::process::Command::new(node_bin)
-                .arg(submit_script.to_str().unwrap_or("register_and_submit.mjs"))
-                .arg(&tmp_path)
-                .arg("--skip-register") // model should already be registered
-                .env("STARKNET_RPC", &rpc_url)
-                .env("STARKNET_ACCOUNT", starknet_account.as_ref().unwrap())
-                .env("STARKNET_PRIVATE_KEY", starknet_key.as_ref().unwrap())
-                .env("CONTRACT_ADDRESS", &contract)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .output()
-                .await
-            {
-                Ok(output) => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    let stderr = String::from_utf8_lossy(&output.stderr);
+                let node_bin = [
+                    "/home/ubuntu/.nvm/versions/node/v20.20.2/bin/node",
+                    "/usr/local/bin/node",
+                    "/usr/bin/node",
+                    "node",
+                ].iter().find(|p| std::path::Path::new(p).exists())
+                    .unwrap_or(&"node");
 
-                    // Parse TX hashes from output
-                    let tx_hashes: Vec<String> = stdout.lines()
-                        .chain(stderr.lines())
-                        .filter(|l| l.contains("TX:") || l.contains("0x"))
-                        .filter_map(|l| {
-                            l.find("0x").map(|start| {
-                                let hash = &l[start..];
-                                hash.split_whitespace().next().unwrap_or(hash).to_string()
+                match tokio::process::Command::new(node_bin)
+                    .arg(submit_script.to_str().unwrap_or("submit_recursive.mjs"))
+                    .arg(&tmp_path)
+                    .env("STARKNET_RPC", &rpc_url)
+                    .env("STARKNET_PRIVATE_KEY", starknet_key.as_ref().unwrap())
+                    .env("RECURSIVE_CONTRACT", &recursive_contract)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .output()
+                    .await
+                {
+                    Ok(output) => {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+
+                        // Parse structured RESULT_JSON line
+                        let result_json = stdout.lines()
+                            .find(|l| l.starts_with("RESULT_JSON:"))
+                            .and_then(|l| serde_json::from_str::<serde_json::Value>(&l["RESULT_JSON:".len()..]).ok());
+
+                        if let Some(ref rj) = result_json {
+                            let success = rj["success"].as_bool() == Some(true);
+                            let tx_hash = rj["tx_hash"].as_str().unwrap_or("").to_string();
+                            let explorer = rj["explorer_url"].as_str().map(|s| s.to_string());
+
+                            OnChainStatus {
+                                submitted: success,
+                                tx_hashes: if tx_hash.is_empty() { vec![] } else { vec![tx_hash] },
+                                network: "starknet-sepolia".to_string(),
+                                contract: recursive_contract,
+                                verified: success,
+                                explorer_url: explorer,
+                                error: if !success { rj["error"].as_str().map(|s| s.to_string()) } else { None },
+                            }
+                        } else {
+                            let submitted = output.status.success();
+                            OnChainStatus {
+                                submitted,
+                                tx_hashes: vec![],
+                                network: "starknet-sepolia".to_string(),
+                                contract: recursive_contract,
+                                verified: submitted,
+                                explorer_url: None,
+                                error: if !submitted { Some(String::from_utf8_lossy(&output.stderr).to_string()) } else { None },
+                            }
+                        }
+                    }
+                    Err(e) => OnChainStatus {
+                        submitted: false,
+                        tx_hashes: vec![],
+                        network: "starknet-sepolia".to_string(),
+                        contract: recursive_contract,
+                        verified: false,
+                        explorer_url: None,
+                        error: Some(format!("Failed to spawn recursive submission: {e}")),
+                    },
+                }
+            } else if starknet_account.is_some() {
+                // Streaming path: multi-TX via register_and_submit.mjs
+                let contract = std::env::var("CONTRACT_ADDRESS")
+                    .or_else(|_| std::env::var("OBELYSK_CONTRACT"))
+                    .unwrap_or_else(|_| "0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005".to_string());
+
+                let streaming = &attestation.streaming_calldata;
+                let batch_json: Vec<serde_json::Value> = streaming.stream_batches.iter().map(|b| {
+                    serde_json::json!({
+                        "batch_idx": b.batch_idx,
+                        "num_layers": b.num_layers,
+                        "calldata": b.calldata,
+                    })
+                }).collect();
+                let output_chunks_json: Vec<serde_json::Value> = streaming.output_mle_chunks.iter().map(|c| {
+                    serde_json::json!({
+                        "chunk_offset": c.chunk_offset,
+                        "chunk_len": c.chunk_len,
+                        "is_last": c.is_last,
+                        "calldata": c.calldata,
+                    })
+                }).collect();
+                let input_chunks_json: Vec<serde_json::Value> = streaming.input_mle_chunks.iter().map(|c| {
+                    serde_json::json!({
+                        "chunk_offset": c.chunk_offset,
+                        "chunk_len": c.chunk_len,
+                        "is_last": c.is_last,
+                        "calldata": c.calldata,
+                    })
+                }).collect();
+
+                let artifact = serde_json::json!({
+                    "format": "ml_gkr",
+                    "model_id": model_id_for_artifact,
+                    "weight_commitments": attestation.weight_commitments,
+                    "io_commitment": attestation.io_commitment,
+                    "verify_calldata": {
+                        "schema_version": 3,
+                        "entrypoint": "verify_gkr_stream",
+                        "mode": "streaming",
+                        "model_id": model_id_for_artifact,
+                        "total_felts": streaming.session_metadata.total_felts,
+                        "circuit_depth": attestation.circuit_depth,
+                        "num_layers": attestation.num_layers,
+                        "layer_tags": streaming.session_metadata.layer_tags,
+                        "init_calldata": streaming.init_calldata,
+                        "output_mle_chunks": output_chunks_json,
+                        "stream_batches": batch_json,
+                        "weight_binding_chunks": streaming.weight_binding_chunks.iter().map(|c| {
+                            serde_json::json!({
+                                "chunk_idx": c.chunk_idx,
+                                "is_last": c.is_last,
+                                "entrypoint": c.entrypoint,
+                                "calldata": c.calldata,
                             })
-                        })
-                        .filter(|h| h.len() > 10)
-                        .collect();
+                        }).collect::<Vec<serde_json::Value>>(),
+                        "input_mle_chunks": input_chunks_json,
+                        "finalize_calldata": streaming.finalize_calldata,
+                        "chunks": streaming.upload_chunks,
+                    }
+                });
 
-                    let submitted = output.status.success();
-                    let first_tx = tx_hashes.first().cloned();
+                let tmp_path = format!("/tmp/attest-{}.json", proof_id);
+                if let Err(e) = std::fs::write(&tmp_path, serde_json::to_string(&artifact).unwrap_or_default()) {
+                    return Ok(Json(AttestResponse {
+                        proof_id, io_commitment, weight_commitment: model_weight_commitment,
+                        num_proven_layers: num_layers, prove_time_ms: prove_elapsed,
+                        calldata_felts, estimated_gas,
+                        onchain: OnChainStatus {
+                            submitted: false, tx_hashes: vec![], network: "starknet-sepolia".into(),
+                            contract, verified: false, explorer_url: None,
+                            error: Some(format!("Failed to write proof artifact: {e}")),
+                        },
+                    }));
+                }
 
-                    OnChainStatus {
-                        submitted,
-                        tx_hashes,
+                let exe = std::env::current_exe().unwrap_or_default();
+                let scripts_dir = exe.parent().unwrap_or(std::path::Path::new("."))
+                    .join("../../../scripts/pipeline");
+                let submit_script = if scripts_dir.join("register_and_submit.mjs").exists() {
+                    scripts_dir.join("register_and_submit.mjs")
+                } else {
+                    std::path::PathBuf::from("scripts/pipeline/register_and_submit.mjs")
+                };
+
+                let rpc_url = std::env::var("STARKNET_RPC")
+                    .unwrap_or_else(|_| "https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_7/demo".into());
+
+                eprintln!("[attest] Submitting streaming proof on-chain via {}", submit_script.display());
+
+                let node_bin = [
+                    "/home/ubuntu/.nvm/versions/node/v20.20.2/bin/node",
+                    "/usr/local/bin/node",
+                    "/usr/bin/node",
+                    "node",
+                ].iter().find(|p| std::path::Path::new(p).exists())
+                    .unwrap_or(&"node");
+
+                match tokio::process::Command::new(node_bin)
+                    .arg(submit_script.to_str().unwrap_or("register_and_submit.mjs"))
+                    .arg(&tmp_path)
+                    .arg("--skip-register")
+                    .env("STARKNET_RPC", &rpc_url)
+                    .env("STARKNET_ACCOUNT", starknet_account.as_ref().unwrap())
+                    .env("STARKNET_PRIVATE_KEY", starknet_key.as_ref().unwrap())
+                    .env("CONTRACT_ADDRESS", &contract)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .output()
+                    .await
+                {
+                    Ok(output) => {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+
+                        let tx_hashes: Vec<String> = stdout.lines()
+                            .chain(stderr.lines())
+                            .filter(|l| l.contains("TX:") || l.contains("0x"))
+                            .filter_map(|l| {
+                                l.find("0x").map(|start| {
+                                    let hash = &l[start..];
+                                    hash.split_whitespace().next().unwrap_or(hash).to_string()
+                                })
+                            })
+                            .filter(|h| h.len() > 10)
+                            .collect();
+
+                        let submitted = output.status.success();
+                        let first_tx = tx_hashes.first().cloned();
+
+                        OnChainStatus {
+                            submitted,
+                            tx_hashes,
+                            network: "starknet-sepolia".to_string(),
+                            contract: contract.clone(),
+                            verified: submitted,
+                            explorer_url: first_tx.map(|h| format!("https://sepolia.starkscan.co/tx/{h}")),
+                            error: if !submitted { Some(stderr.to_string()) } else { None },
+                        }
+                    }
+                    Err(e) => OnChainStatus {
+                        submitted: false,
+                        tx_hashes: vec![],
                         network: "starknet-sepolia".to_string(),
                         contract: contract.clone(),
-                        verified: submitted,
-                        explorer_url: first_tx.map(|h| format!("https://sepolia.starkscan.co/tx/{h}")),
-                        error: if !submitted { Some(stderr.to_string()) } else { None },
-                    }
+                        verified: false,
+                        explorer_url: None,
+                        error: Some(format!("Failed to spawn submission: {e}")),
+                    },
                 }
-                Err(e) => OnChainStatus {
+            } else {
+                // Have STARKNET_PRIVATE_KEY but no STARKNET_ACCOUNT_ADDRESS,
+                // and recursive not available — cannot submit
+                let contract = std::env::var("CONTRACT_ADDRESS")
+                    .or_else(|_| std::env::var("OBELYSK_CONTRACT"))
+                    .unwrap_or_default();
+                OnChainStatus {
                     submitted: false,
                     tx_hashes: vec![],
                     network: "starknet-sepolia".to_string(),
-                    contract: contract.clone(),
+                    contract,
                     verified: false,
                     explorer_url: None,
-                    error: Some(format!("Failed to spawn submission: {e}")),
-                },
+                    error: Some("STARKNET_ACCOUNT_ADDRESS not set (required for streaming; use recursive=true for single-TX)".to_string()),
+                }
             }
         } else {
             OnChainStatus {
                 submitted: false,
                 tx_hashes: vec![],
                 network: "starknet-sepolia".to_string(),
-                contract,
+                contract: String::new(),
                 verified: false,
                 explorer_url: None,
                 error: Some("No STARKNET_PRIVATE_KEY configured on prover".to_string()),

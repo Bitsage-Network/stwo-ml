@@ -15,7 +15,7 @@
 //! ```
 
 use num_traits::Zero;
-use stwo::core::channel::MerkleChannel;
+use stwo::core::channel::{Channel, MerkleChannel};
 use stwo::core::fields::m31::M31;
 use stwo::core::fields::qm31::{QM31, SecureField};
 use stwo::core::pcs::PcsConfig;
@@ -143,6 +143,15 @@ pub fn prove_recursive(
     // in the M31 AIR — the STARK proof itself uses Poseidon252 for Fiat-Shamir and
     // Merkle commitments, matching what the Cairo verifier expects.
     let channel = &mut <Poseidon252MerkleChannel as MerkleChannel>::C::default();
+    // Mix PcsConfig into channel BEFORE any tree commits.
+    // MUST use individual mix_u64 calls to match Cairo verifier's PcsConfig::mix_into
+    // (Cairo mixes 4 separate u64s; Rust's config.mix_into packs into a single QM31).
+    eprintln!("  [Recursive] Channel after default: {:?}", channel.digest());
+    channel.mix_u64(config.pow_bits as u64);
+    channel.mix_u64(config.fri_config.log_blowup_factor as u64);
+    channel.mix_u64(config.fri_config.n_queries as u64);
+    channel.mix_u64(config.fri_config.log_last_layer_degree_bound as u64);
+    eprintln!("  [Recursive] Channel after PcsConfig: {:?}", channel.digest());
     let mut commitment_scheme =
         CommitmentSchemeProver::<SimdBackend, Poseidon252MerkleChannel>::new(config, &twiddles);
 
@@ -163,6 +172,7 @@ pub fn prove_recursive(
             convert_evaluations::<SimdBackend, SimdBackend, M31>(simd_evals),
         );
         tree_builder.commit(channel);
+        eprintln!("  [Recursive] Channel after preprocessed commit: {:?}", channel.digest());
     }
 
     // Tree 1: Execution trace (655 columns)
@@ -180,6 +190,17 @@ pub fn prove_recursive(
             convert_evaluations::<SimdBackend, SimdBackend, M31>(simd_evals),
         );
         tree_builder.commit(channel);
+        eprintln!("  [Recursive] Channel after trace commit: {:?}", channel.digest());
+    }
+
+    eprintln!("  [Recursive] Channel before prove(): {:?}", channel.digest());
+
+    // Print final digest limbs for Cairo comparison
+    {
+        let fd = starknet_ff::FieldElement::from_hex_be(
+            &format!("0x{:064x}", channel.digest())
+        ).unwrap_or(starknet_ff::FieldElement::ZERO);
+        // The final digest used in the AIR comes from the WITNESS, not the channel
     }
 
     // ── Step 4: Prove ────────────────────────────────────────────────
@@ -203,6 +224,10 @@ pub fn prove_recursive(
 
     let final_digest_felt = last_channel_op.unwrap_or(starknet_ff::FieldElement::ZERO);
     let final_limbs = super::air::felt252_to_limbs(&final_digest_felt);
+
+    // Print limbs for Cairo comparison
+    eprintln!("  [Recursive] Initial limbs: {:?}", zero_limbs.iter().map(|l| l.0).collect::<Vec<_>>());
+    eprintln!("  [Recursive] Final limbs: {:?}", final_limbs.iter().map(|l| l.0).collect::<Vec<_>>());
 
     eprintln!(
         "  [Recursive] Final digest: {:?} (production: {:?}, match: {})",

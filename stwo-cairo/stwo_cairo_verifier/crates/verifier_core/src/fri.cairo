@@ -1,6 +1,6 @@
 use core::array::SpanIter;
-use core::dict::Felt252Dict;
 use core::iter::{IntoIterator, Iterator};
+use core::nullable::NullableTrait;
 use stwo_verifier_utils::zip_eq::zip_eq;
 use crate::channel::{Channel, ChannelTrait};
 use crate::circle::CosetImpl;
@@ -11,7 +11,8 @@ use crate::poly::line::{LineDomain, LineDomainImpl, LineEvaluationImpl, LinePoly
 use crate::poly::utils::fri_fold;
 use crate::queries::{Queries, QueriesImpl};
 use crate::utils::{
-    ArrayImpl, OptionImpl, SpanExTrait, bit_reverse_index, group_columns_by_degree_bound, pow2,
+    ArrayImpl, OptionImpl, QueryPositionMap, QueryPositionMapTrait, SpanExTrait,
+    bit_reverse_index, group_columns_by_degree_bound, pow2,
 };
 use crate::vcs::MerkleHasher;
 use crate::vcs::verifier::{MerkleDecommitment, MerkleVerifier, MerkleVerifierTrait};
@@ -156,7 +157,7 @@ pub impl FriVerifierImpl of FriVerifierTrait {
     /// Output is of the form `(unique_log_sizes, queries_by_log_size)`.
     fn sample_query_positions(
         self: @FriVerifier, ref channel: Channel,
-    ) -> (Felt252Dict<Nullable<Span<usize>>>, Queries) {
+    ) -> (QueryPositionMap, Queries) {
         // The sizes of input circle polynomial commitment domains.
         let mut column_log_sizes = array![];
 
@@ -269,8 +270,8 @@ fn decommit_last_layer(verifier: FriVerifier, mut queries: Queries, mut query_ev
 /// Returned column query positions are mapped by their log size.
 fn get_query_positions_by_log_size(
     mut queries: Queries, mut unique_column_log_sizes: Span<u32>,
-) -> Felt252Dict<Nullable<Span<usize>>> {
-    let mut query_positions_by_log_size: Felt252Dict<Nullable<Span<usize>>> = Default::default();
+) -> QueryPositionMap {
+    let mut query_positions_by_log_size = QueryPositionMapTrait::new();
 
     for column_log_size in unique_column_log_sizes {
         let n_folds = queries.log_domain_size - *column_log_size;
@@ -279,8 +280,7 @@ fn get_query_positions_by_log_size(
             queries = queries.fold(n_folds);
         }
 
-        query_positions_by_log_size
-            .insert((*column_log_size).into(), NullableTrait::new(queries.positions));
+        query_positions_by_log_size.insert(*column_log_size, queries.positions);
     }
 
     query_positions_by_log_size
@@ -331,7 +331,7 @@ impl FriFirstLayerVerifierImpl of FriFirstLayerVerifierTrait {
         let mut column_queries = queries;
         let mut column_commitment_domains = *self.column_commitment_domains;
         let mut fri_witness = (*self.proof.fri_witness).into_iter();
-        let mut decommitment_positions_by_log_size: Felt252Dict = Default::default();
+        let mut decommitment_positions_by_log_size = QueryPositionMapTrait::new();
         // For decommitment, each QM31 col must be split into its constituent M31 coordinate cols.
         let mut degree_bound_by_column = array![];
         let mut sparse_evals_by_column = array![];
@@ -355,10 +355,7 @@ impl FriFirstLayerVerifierImpl of FriFirstLayerVerifierTrait {
             // Columns of the same size have the same decommitment positions.
             // TODO(andrew): Do without nullable.
             decommitment_positions_by_log_size
-                .insert(
-                    column_domain_log_size.into(),
-                    NullableTrait::new(column_decommitment_positions),
-                );
+                .insert(column_domain_log_size, column_decommitment_positions);
 
             for subset_eval in sparse_evaluation.subset_evals.span() {
                 for eval in subset_eval.span() {
@@ -462,10 +459,8 @@ impl FriInnerLayerVerifierImpl of FriInnerLayerVerifierTrait {
             column_indices_by_log_deg_bound,
         };
 
-        let mut decommitment_positions_dict: Felt252Dict<Nullable<Span<usize>>> =
-            Default::default();
-        decommitment_positions_dict
-            .insert(column_log_size.into(), NullableTrait::new(decommitment_positions));
+        let mut decommitment_positions_dict = QueryPositionMapTrait::new();
+        decommitment_positions_dict.insert(column_log_size, decommitment_positions);
 
         merkle_verifier
             .verify(
