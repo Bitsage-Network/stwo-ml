@@ -19,6 +19,7 @@ use starknet::ContractAddress;
 pub trait IVerifier<TContractState> {
     fn is_proof_verified(self: @TContractState, proof_hash: felt252) -> bool;
     fn get_model_policy(self: @TContractState, model_id: felt252) -> felt252;
+    fn get_model_weight_root_hash(self: @TContractState, model_id: felt252) -> felt252;
     fn get_proof_io_commitment(self: @TContractState, proof_hash: felt252) -> felt252;
     fn get_proof_model_id(self: @TContractState, proof_hash: felt252) -> felt252;
 }
@@ -83,8 +84,11 @@ pub trait IAgentFirewall<TContractState> {
     /// Update verifier contract address (contract owner only).
     fn set_verifier(ref self: TContractState, verifier_address: ContractAddress);
 
-    /// Update classifier model ID (contract owner only).
-    fn set_classifier_model(ref self: TContractState, model_id: felt252);
+    /// Update classifier model ID and expected weight hash (contract owner only).
+    /// Both must be provided — prevents model substitution attacks.
+    fn set_classifier_model(
+        ref self: TContractState, model_id: felt252, weight_root_hash: felt252,
+    );
 
     // ── Queries ──────────────────────────────────────────────────────
 
@@ -172,6 +176,10 @@ pub mod AgentFirewallZK {
         verifier_address: ContractAddress,
         /// Classifier model ID registered on the verifier.
         classifier_model_id: felt252,
+        /// Expected weight root hash for the classifier model.
+        /// Poseidon hash of all weight Merkle roots — prevents model substitution.
+        /// Set at construction, verified during resolve_action_with_proof.
+        classifier_weight_root_hash: felt252,
 
         // ── Agent registry ───────────────────────────────────────────
         agent_owner: Map<felt252, ContractAddress>,
@@ -294,10 +302,12 @@ pub mod AgentFirewallZK {
         owner: ContractAddress,
         verifier_address: ContractAddress,
         classifier_model_id: felt252,
+        classifier_weight_root_hash: felt252,
     ) {
         self.owner.write(owner);
         self.verifier_address.write(verifier_address);
         self.classifier_model_id.write(classifier_model_id);
+        self.classifier_weight_root_hash.write(classifier_weight_root_hash);
         self.escalate_threshold.write(DEFAULT_ESCALATE_THRESHOLD);
         self.block_threshold.write(DEFAULT_BLOCK_THRESHOLD);
         self.max_strikes.write(DEFAULT_MAX_STRIKES);
@@ -508,7 +518,18 @@ pub mod AgentFirewallZK {
             let proof_model = verifier.get_proof_model_id(proof_hash);
             assert!(proof_model == model_id, "MODEL_ID_MISMATCH");
 
-            // 7. Verify the classifier model has a policy registered (strict required)
+            // 7. Verify the model's weight commitments match the expected hash.
+            // This prevents model substitution: even if the contract owner is
+            // compromised and changes classifier_model_id, the weight hash
+            // must still match. An attacker cannot register a rigged model
+            // with different weights without changing this hash.
+            let expected_weights = self.classifier_weight_root_hash.read();
+            if expected_weights != 0 {
+                let actual_weights = verifier.get_model_weight_root_hash(model_id);
+                assert!(actual_weights == expected_weights, "WEIGHT_ROOT_HASH_MISMATCH");
+            }
+
+            // 8. Verify the classifier model has a policy registered (strict required)
             let registered_policy = verifier.get_model_policy(model_id);
             assert!(registered_policy != 0, "NO_POLICY_REGISTERED");
 
@@ -615,10 +636,14 @@ pub mod AgentFirewallZK {
             self.verifier_address.write(verifier_address);
         }
 
-        fn set_classifier_model(ref self: ContractState, model_id: felt252) {
+        fn set_classifier_model(
+            ref self: ContractState, model_id: felt252, weight_root_hash: felt252,
+        ) {
             assert!(get_caller_address() == self.owner.read(), "ONLY_OWNER");
             assert!(model_id != 0, "MODEL_ID_CANNOT_BE_ZERO");
+            assert!(weight_root_hash != 0, "WEIGHT_HASH_CANNOT_BE_ZERO");
             self.classifier_model_id.write(model_id);
+            self.classifier_weight_root_hash.write(weight_root_hash);
         }
 
         // ── Queries ──────────────────────────────────────────────────

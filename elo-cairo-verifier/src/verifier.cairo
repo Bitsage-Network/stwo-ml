@@ -200,6 +200,9 @@ pub trait ISumcheckVerifier<TContractState> {
     /// Get the registered policy commitment for a model. Returns 0 if none set.
     fn get_model_policy(self: @TContractState, model_id: felt252) -> felt252;
 
+    /// Get the aggregate weight root hash for a model. Returns 0 if not registered.
+    fn get_model_weight_root_hash(self: @TContractState, model_id: felt252) -> felt252;
+
     /// Get the IO commitment for a verified proof. Returns 0 if not found.
     fn get_proof_io_commitment(self: @TContractState, proof_hash: felt252) -> felt252;
 
@@ -777,6 +780,10 @@ mod SumcheckVerifierContract {
 
         fn is_proof_verified(self: @ContractState, proof_hash: felt252) -> bool {
             self.verified_proofs.entry(proof_hash).read()
+        }
+
+        fn get_model_weight_root_hash(self: @ContractState, model_id: felt252) -> felt252 {
+            self.model_weight_root_hash.entry(model_id).read()
         }
 
         fn get_proof_io_commitment(self: @ContractState, proof_hash: felt252) -> felt252 {

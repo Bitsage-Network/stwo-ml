@@ -26,8 +26,14 @@ fn deploy_firewall() -> IAgentFirewallDispatcher {
     let contract = declare("AgentFirewallZK").unwrap().contract_class();
     let verifier_address: ContractAddress = 0x9999_felt252.try_into().unwrap();
     let classifier_model_id: felt252 = 0x42;
+    let classifier_weight_root_hash: felt252 = 0xCAFEBABE; // test weight hash
     let (address, _) = contract
-        .deploy(@array![owner().into(), verifier_address.into(), classifier_model_id])
+        .deploy(@array![
+            owner().into(),
+            verifier_address.into(),
+            classifier_model_id,
+            classifier_weight_root_hash,
+        ])
         .unwrap();
     IAgentFirewallDispatcher { contract_address: address }
 }
@@ -404,7 +410,7 @@ fn test_set_classifier_model_zero_rejected() {
     let fw = deploy_firewall();
     start_cheat_caller_address(fw.contract_address, owner());
 
-    fw.set_classifier_model(0);
+    fw.set_classifier_model(0, 0xDEAD);
 }
 
 // ============================================================================
