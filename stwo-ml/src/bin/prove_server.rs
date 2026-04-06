@@ -334,6 +334,55 @@ struct VerifyResponse {
     method: String,
 }
 
+// =============================================================================
+// Transaction Classifier API — POST /api/v1/classify
+// =============================================================================
+
+/// Request for the ZKML transaction classifier endpoint.
+///
+/// Encodes transaction features, runs the classifier MLP, generates a GKR proof,
+/// and returns the proven threat score + decision.
+#[derive(Deserialize)]
+struct ClassifyRequest {
+    /// Target contract address (hex felt252).
+    target: String,
+    /// Transaction value (decimal string, u256).
+    #[serde(default)]
+    value: String,
+    /// Function selector (hex, 4 bytes).
+    #[serde(default)]
+    selector: String,
+    /// Calldata hex (after selector).
+    #[serde(default)]
+    calldata: String,
+    /// Agent's current trust score (0-100000).
+    #[serde(default)]
+    agent_trust_score: u32,
+    /// Agent's current strike count.
+    #[serde(default)]
+    agent_strikes: u32,
+    /// Agent age in blocks since registration.
+    #[serde(default)]
+    agent_age_blocks: u32,
+}
+
+/// Response from the classifier endpoint.
+#[derive(Serialize)]
+struct ClassifyResponse {
+    /// Decision: "approve", "escalate", or "block".
+    decision: String,
+    /// Threat score (0-100000).
+    threat_score: u32,
+    /// Raw classifier output scores: [safe, suspicious, malicious].
+    scores: [u32; 3],
+    /// IO commitment (Poseidon hash of classifier input + output).
+    io_commitment: String,
+    /// Policy commitment (strict policy hash).
+    policy_commitment: String,
+    /// Wall-clock proving time in milliseconds.
+    prove_time_ms: u64,
+}
+
 fn normalize_canonical_proof_hash(value: &str) -> Result<String, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -2062,6 +2111,98 @@ async fn attest(
     }))
 }
 
+/// Classify a transaction via ZKML — POST /api/v1/classify
+///
+/// Runs the transaction classifier MLP, generates a GKR proof under
+/// PolicyConfig::strict(), and returns the proven threat score + decision.
+/// The proof can be submitted to the ObelyskVerifier for on-chain verification.
+async fn classify(
+    Json(req): Json<ClassifyRequest>,
+) -> Result<Json<ClassifyResponse>, (StatusCode, Json<ErrorResponse>)> {
+    use stwo_ml::classifier::*;
+    use stwo_ml::policy::PolicyConfig;
+
+    // Parse target address
+    let target = starknet_ff::FieldElement::from_hex_be(&req.target).map_err(|e| {
+        (StatusCode::BAD_REQUEST, Json(ErrorResponse {
+            error: format!("invalid target address: {e}"),
+        }))
+    })?;
+
+    // Parse value (u256 as decimal → two u128 halves)
+    let value_u128: u128 = req.value.parse().unwrap_or(0);
+    let value: [u128; 2] = [0, value_u128]; // low half only for now
+
+    // Parse selector
+    let selector: u32 = u32::from_str_radix(
+        req.selector.trim_start_matches("0x").trim_start_matches("0X"),
+        16,
+    ).unwrap_or(0);
+
+    // Parse calldata prefix (first 8 u32 words)
+    let calldata_hex = req.calldata.trim_start_matches("0x").trim_start_matches("0X");
+    let calldata_bytes: Vec<u8> = (0..calldata_hex.len())
+        .step_by(2)
+        .filter_map(|i| u8::from_str_radix(&calldata_hex[i..i.min(calldata_hex.len()).max(i + 2)], 16).ok())
+        .collect();
+    let mut calldata_prefix = [0u32; 8];
+    for (i, chunk) in calldata_bytes.chunks(4).take(8).enumerate() {
+        let mut buf = [0u8; 4];
+        buf[..chunk.len()].copy_from_slice(chunk);
+        calldata_prefix[i] = u32::from_be_bytes(buf);
+    }
+
+    // Build transaction features
+    let tx = TransactionFeatures {
+        target,
+        value,
+        selector,
+        calldata_prefix,
+        calldata_len: calldata_bytes.len() as u32,
+        agent_trust_score: req.agent_trust_score,
+        agent_strikes: req.agent_strikes,
+        agent_age_blocks: req.agent_age_blocks,
+        target_flags: TargetFlags::default(),
+        value_features: ValueFeatures::default(),
+        selector_features: SelectorFeatures {
+            is_transfer: selector == 0xa9059cbb || selector == 0x23b872dd,
+            is_approve: selector == 0x095ea7b3,
+            is_swap: selector == 0x38ed1739 || selector == 0x7ff36ab5 || selector == 0x18cbafe5,
+            is_unknown: selector == 0,
+        },
+        behavioral: BehavioralFeatures::default(),
+    };
+
+    // Build classifier model (test weights — replace with trained model in production)
+    let model = build_test_classifier();
+    let policy = PolicyConfig::strict();
+
+    // Run classifier + prove on a blocking thread (CPU-heavy)
+    let result = tokio::task::spawn_blocking(move || {
+        evaluate_transaction(&tx, &model, &policy)
+    })
+    .await
+    .map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
+            error: format!("classify task failed: {e}"),
+        }))
+    })?
+    .map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
+            error: format!("classification failed: {e}"),
+        }))
+    })?;
+
+    Ok(Json(ClassifyResponse {
+        decision: result.decision.to_string(),
+        threat_score: result.threat_score,
+        scores: result.scores,
+        io_commitment: format!("{:#066x}", result.io_commitment),
+        policy_commitment: format!("{:#066x}", result.policy_commitment),
+        prove_time_ms: result.prove_time_ms,
+    }))
+}
+
 /// List all proven inferences — GET /api/v1/proofs
 ///
 /// Returns all stored proofs, most recent first.
@@ -3129,6 +3270,7 @@ async fn main() {
         .route("/api/v1/prove/:job_id/result", get(get_prove_result))
         .route("/api/v1/infer", post(infer))
         .route("/api/v1/verify/:proof_hash", get(verify_proof))
+        .route("/api/v1/classify", post(classify))
         .route("/api/v1/proofs", get(list_proofs))
         .route("/api/v1/attest", post(attest))
         .route("/api/v1/privacy/batch", post(submit_privacy_batch))
