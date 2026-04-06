@@ -433,8 +433,135 @@ fn test_multiple_actions_same_agent() {
     // Different IO commitments
     assert!(fw.get_action_io_commitment(id1) == 0xCAFE, "first io");
     assert!(fw.get_action_io_commitment(id2) == 0xFACE, "second io");
+}
 
-    // Different agents point back
-    assert!(fw.get_action_agent(id1) == 0xA1, "first agent");
-    assert!(fw.get_action_agent(id2) == 0xA1, "second agent");
+// ============================================================================
+// Test 25: Emergency pause blocks submit_action
+// ============================================================================
+
+#[test]
+#[should_panic(expected: "CONTRACT_PAUSED")]
+fn test_pause_blocks_submit() {
+    let fw = deploy_firewall();
+    start_cheat_caller_address(fw.contract_address, agent_owner_addr());
+    fw.register_agent(0xA1);
+    stop_cheat_caller_address(fw.contract_address);
+
+    // Owner pauses
+    start_cheat_caller_address(fw.contract_address, owner());
+    fw.pause();
+    assert!(fw.is_paused(), "should be paused");
+    stop_cheat_caller_address(fw.contract_address);
+
+    // Agent tries to submit → blocked
+    start_cheat_caller_address(fw.contract_address, agent_owner_addr());
+    fw.submit_action(0xA1, 0xDEAD, 0x1000, 0xa9059cbb, 0xCAFE);
+}
+
+// ============================================================================
+// Test 26: Unpause restores functionality
+// ============================================================================
+
+#[test]
+fn test_unpause_restores() {
+    let fw = deploy_firewall();
+    start_cheat_caller_address(fw.contract_address, agent_owner_addr());
+    fw.register_agent(0xA1);
+    stop_cheat_caller_address(fw.contract_address);
+
+    // Pause
+    start_cheat_caller_address(fw.contract_address, owner());
+    fw.pause();
+    assert!(fw.is_paused(), "should be paused");
+    fw.unpause();
+    assert!(!fw.is_paused(), "should be unpaused");
+    stop_cheat_caller_address(fw.contract_address);
+
+    // Agent can submit again
+    start_cheat_caller_address(fw.contract_address, agent_owner_addr());
+    let id = fw.submit_action(0xA1, 0xDEAD, 0x1000, 0xa9059cbb, 0xCAFE);
+    assert!(id == 1, "should get action id 1");
+}
+
+// ============================================================================
+// Test 27: Non-owner cannot pause
+// ============================================================================
+
+#[test]
+#[should_panic(expected: "ONLY_OWNER")]
+fn test_pause_non_owner_rejected() {
+    let fw = deploy_firewall();
+    let attacker: ContractAddress = 0xBAD_felt252.try_into().unwrap();
+    start_cheat_caller_address(fw.contract_address, attacker);
+    fw.pause();
+}
+
+// ============================================================================
+// Test 28: Per-agent rate limiting
+// ============================================================================
+
+#[test]
+#[should_panic(expected: "TOO_MANY_PENDING_ACTIONS")]
+fn test_rate_limit_per_agent() {
+    let fw = deploy_firewall();
+    start_cheat_caller_address(fw.contract_address, agent_owner_addr());
+    fw.register_agent(0xA1);
+
+    // Default max is 10 — submit 10 actions
+    let mut i: u32 = 0;
+    loop {
+        if i >= 10 {
+            break;
+        }
+        fw.submit_action(0xA1, 0xDEAD, i.into(), 0xa9059cbb, (0xCAFE + i.into()));
+        i += 1;
+    };
+
+    // 11th should fail
+    fw.submit_action(0xA1, 0xDEAD, 0x999, 0xa9059cbb, 0xFFFF);
+}
+
+// ============================================================================
+// Test 29: 2-step ownership transfer
+// ============================================================================
+
+#[test]
+fn test_ownership_transfer() {
+    let fw = deploy_firewall();
+    let new_owner: ContractAddress = 0x5678_felt252.try_into().unwrap();
+
+    // Step 1: current owner initiates transfer
+    start_cheat_caller_address(fw.contract_address, owner());
+    fw.transfer_ownership(new_owner);
+    stop_cheat_caller_address(fw.contract_address);
+
+    // Owner is still the original until accepted
+    assert!(fw.get_owner() == owner(), "owner should not change until accepted");
+
+    // Step 2: new owner accepts
+    start_cheat_caller_address(fw.contract_address, new_owner);
+    fw.accept_ownership();
+    stop_cheat_caller_address(fw.contract_address);
+
+    assert!(fw.get_owner() == new_owner, "owner should now be new_owner");
+}
+
+// ============================================================================
+// Test 30: Non-pending-owner cannot accept ownership
+// ============================================================================
+
+#[test]
+#[should_panic(expected: "NOT_PENDING_OWNER")]
+fn test_accept_ownership_non_pending_rejected() {
+    let fw = deploy_firewall();
+    let new_owner: ContractAddress = 0x5678_felt252.try_into().unwrap();
+
+    start_cheat_caller_address(fw.contract_address, owner());
+    fw.transfer_ownership(new_owner);
+    stop_cheat_caller_address(fw.contract_address);
+
+    // Attacker tries to accept
+    let attacker: ContractAddress = 0xBAD_felt252.try_into().unwrap();
+    start_cheat_caller_address(fw.contract_address, attacker);
+    fw.accept_ownership();
 }

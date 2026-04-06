@@ -82,6 +82,18 @@ pub trait IAgentFirewall<TContractState> {
         max_strikes: u32,
     );
 
+    /// Emergency pause (contract owner only). Blocks submit + resolve.
+    fn pause(ref self: TContractState);
+
+    /// Unpause (contract owner only).
+    fn unpause(ref self: TContractState);
+
+    /// Initiate ownership transfer (2-step pattern, owner only).
+    fn transfer_ownership(ref self: TContractState, new_owner: ContractAddress);
+
+    /// Accept pending ownership transfer (new owner only).
+    fn accept_ownership(ref self: TContractState);
+
     /// Update verifier contract address (contract owner only).
     fn set_verifier(ref self: TContractState, verifier_address: ContractAddress);
 
@@ -137,6 +149,9 @@ pub trait IAgentFirewall<TContractState> {
 
     /// Get the current thresholds.
     fn get_thresholds(self: @TContractState) -> (u32, u32, u32);
+
+    /// Check if the contract is paused.
+    fn is_paused(self: @TContractState) -> bool;
 }
 
 /// Extract a single M31 value (31-bit unsigned) from packed felt252 array.
@@ -182,6 +197,10 @@ pub mod AgentFirewallZK {
     struct Storage {
         /// Contract owner.
         owner: ContractAddress,
+        /// Pending ownership transfer target (2-step transfer).
+        pending_owner: ContractAddress,
+        /// Emergency pause flag — blocks submit_action and resolve_action_with_proof.
+        paused: bool,
         /// ObelyskVerifier contract address.
         verifier_address: ContractAddress,
         /// Classifier model ID registered on the verifier.
@@ -213,6 +232,12 @@ pub mod AgentFirewallZK {
         action_proof_hash: Map<u64, felt252>,
         action_submitted_at: Map<u64, u64>,
 
+        // ── Per-agent rate limiting ──────────────────────────────────
+        /// agent_id → number of currently pending (unresolved) actions.
+        agent_pending_count: Map<felt252, u32>,
+        /// Maximum pending actions per agent (default: 10).
+        max_pending_per_agent: u32,
+
         // ── Proof replay protection ──────────────────────────────────
         /// proof_hash → whether this proof has been used to resolve an action.
         /// Prevents the same proof from being replayed across multiple actions.
@@ -237,6 +262,9 @@ pub mod AgentFirewallZK {
         TrustScoreUpdated: TrustScoreUpdated,
         AgentFrozen: AgentFrozen,
         ThresholdsUpdated: ThresholdsUpdated,
+        Paused: Paused,
+        Unpaused: Unpaused,
+        OwnershipTransferred: OwnershipTransferred,
     }
 
     #[derive(Drop, starknet::Event)]
@@ -306,6 +334,22 @@ pub mod AgentFirewallZK {
         updated_by: ContractAddress,
     }
 
+    #[derive(Drop, starknet::Event)]
+    struct Paused {
+        by: ContractAddress,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    struct Unpaused {
+        by: ContractAddress,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    struct OwnershipTransferred {
+        previous_owner: ContractAddress,
+        new_owner: ContractAddress,
+    }
+
     // ── Constructor ──────────────────────────────────────────────────
 
     #[constructor]
@@ -320,6 +364,8 @@ pub mod AgentFirewallZK {
         self.verifier_address.write(verifier_address);
         self.classifier_model_id.write(classifier_model_id);
         self.classifier_weight_root_hash.write(classifier_weight_root_hash);
+        self.paused.write(false);
+        self.max_pending_per_agent.write(10);
         self.escalate_threshold.write(DEFAULT_ESCALATE_THRESHOLD);
         self.block_threshold.write(DEFAULT_BLOCK_THRESHOLD);
         self.max_strikes.write(DEFAULT_MAX_STRIKES);
@@ -375,6 +421,9 @@ pub mod AgentFirewallZK {
             selector: u32,
             io_commitment: felt252,
         ) -> u64 {
+            // Contract must not be paused
+            assert!(!self.paused.read(), "CONTRACT_PAUSED");
+
             // Agent must be registered and active
             assert!(self.agent_registered.entry(agent_id).read(), "AGENT_NOT_REGISTERED");
             assert!(self.agent_active.entry(agent_id).read(), "AGENT_FROZEN");
@@ -382,6 +431,11 @@ pub mod AgentFirewallZK {
             // Caller must be agent owner
             let caller = get_caller_address();
             assert!(caller == self.agent_owner.entry(agent_id).read(), "NOT_AGENT_OWNER");
+
+            // Per-agent rate limit: max pending actions
+            let pending = self.agent_pending_count.entry(agent_id).read();
+            assert!(pending < self.max_pending_per_agent.read(), "TOO_MANY_PENDING_ACTIONS");
+            self.agent_pending_count.entry(agent_id).write(pending + 1);
 
             // IO commitment must be non-zero (zero is meaningless)
             assert!(io_commitment != 0, "IO_COMMITMENT_ZERO");
@@ -410,6 +464,9 @@ pub mod AgentFirewallZK {
             original_io_len: u32,
             packed_raw_io: Array<felt252>,
         ) {
+            // Contract must not be paused
+            assert!(!self.paused.read(), "CONTRACT_PAUSED");
+
             // Action must exist and not be resolved
             let agent_id = self.action_agent.entry(action_id).read();
             assert!(agent_id != 0, "ACTION_NOT_FOUND");
@@ -643,11 +700,16 @@ pub mod AgentFirewallZK {
                 }
             }
 
-            // 10. Record resolution
+            // 10. Record resolution + decrement pending count
             self.action_decision.entry(action_id).write(decision);
             self.action_threat_score.entry(action_id).write(threat_score);
             self.action_proof_hash.entry(action_id).write(proof_hash);
             self.action_resolved.entry(action_id).write(true);
+
+            let pending = self.agent_pending_count.entry(agent_id).read();
+            if pending > 0 {
+                self.agent_pending_count.entry(agent_id).write(pending - 1);
+            }
 
             self.emit(ActionResolved {
                 action_id, agent_id, decision, threat_score, proof_hash
@@ -659,12 +721,30 @@ pub mod AgentFirewallZK {
             assert!(agent_id != 0, "ACTION_NOT_FOUND");
             assert!(self.action_decision.entry(action_id).read() == 2, "NOT_ESCALATED");
 
+            // Escalated actions also expire
+            let submitted_at = self.action_submitted_at.entry(action_id).read();
+            assert!(get_block_timestamp() - submitted_at <= MAX_ACTION_AGE, "ACTION_EXPIRED");
+
+            // Agent owner OR contract owner can approve escalated
             let caller = get_caller_address();
-            assert!(caller == self.agent_owner.entry(agent_id).read(), "NOT_AGENT_OWNER");
+            let agent_owner = self.agent_owner.entry(agent_id).read();
+            assert!(
+                caller == agent_owner || caller == self.owner.read(),
+                "NOT_AGENT_OR_CONTRACT_OWNER"
+            );
 
             self.action_decision.entry(action_id).write(1); // approved
+
+            // Decrement pending count
+            let pending = self.agent_pending_count.entry(agent_id).read();
+            if pending > 0 {
+                self.agent_pending_count.entry(agent_id).write(pending - 1);
+            }
+
             self.emit(ActionResolved {
-                action_id, agent_id, decision: 1, threat_score: 0, proof_hash: 0
+                action_id, agent_id, decision: 1,
+                threat_score: self.action_threat_score.entry(action_id).read(),
+                proof_hash: self.action_proof_hash.entry(action_id).read(),
             });
         }
 
@@ -673,12 +753,39 @@ pub mod AgentFirewallZK {
             assert!(agent_id != 0, "ACTION_NOT_FOUND");
             assert!(self.action_decision.entry(action_id).read() == 2, "NOT_ESCALATED");
 
+            // Escalated actions also expire
+            let submitted_at = self.action_submitted_at.entry(action_id).read();
+            assert!(get_block_timestamp() - submitted_at <= MAX_ACTION_AGE, "ACTION_EXPIRED");
+
+            // Agent owner OR contract owner can reject
             let caller = get_caller_address();
-            assert!(caller == self.agent_owner.entry(agent_id).read(), "NOT_AGENT_OWNER");
+            let agent_owner = self.agent_owner.entry(agent_id).read();
+            assert!(
+                caller == agent_owner || caller == self.owner.read(),
+                "NOT_AGENT_OR_CONTRACT_OWNER"
+            );
 
             self.action_decision.entry(action_id).write(3); // blocked
+
+            // Rejection = 1 additional strike (owner agrees it was suspicious)
+            let strikes = self.agent_strikes.entry(agent_id).read() + 1;
+            self.agent_strikes.entry(agent_id).write(strikes);
+            if strikes >= self.max_strikes.read() {
+                self.agent_active.entry(agent_id).write(false);
+                let trust = self.agent_trust_score.entry(agent_id).read();
+                self.emit(AgentFrozen { agent_id, strikes, final_trust_score: trust });
+            }
+
+            // Decrement pending count
+            let pending = self.agent_pending_count.entry(agent_id).read();
+            if pending > 0 {
+                self.agent_pending_count.entry(agent_id).write(pending - 1);
+            }
+
             self.emit(ActionResolved {
-                action_id, agent_id, decision: 3, threat_score: 0, proof_hash: 0
+                action_id, agent_id, decision: 3,
+                threat_score: self.action_threat_score.entry(action_id).read(),
+                proof_hash: self.action_proof_hash.entry(action_id).read(),
             });
         }
 
@@ -701,6 +808,37 @@ pub mod AgentFirewallZK {
                 escalate_threshold, block_threshold, max_strikes,
                 updated_by: get_caller_address(),
             });
+        }
+
+        fn pause(ref self: ContractState) {
+            assert!(get_caller_address() == self.owner.read(), "ONLY_OWNER");
+            assert!(!self.paused.read(), "ALREADY_PAUSED");
+            self.paused.write(true);
+            self.emit(Paused { by: get_caller_address() });
+        }
+
+        fn unpause(ref self: ContractState) {
+            assert!(get_caller_address() == self.owner.read(), "ONLY_OWNER");
+            assert!(self.paused.read(), "NOT_PAUSED");
+            self.paused.write(false);
+            self.emit(Unpaused { by: get_caller_address() });
+        }
+
+        fn transfer_ownership(ref self: ContractState, new_owner: ContractAddress) {
+            assert!(get_caller_address() == self.owner.read(), "ONLY_OWNER");
+            let zero_addr: ContractAddress = 0_felt252.try_into().unwrap();
+            assert!(new_owner != zero_addr, "NEW_OWNER_CANNOT_BE_ZERO");
+            self.pending_owner.write(new_owner);
+        }
+
+        fn accept_ownership(ref self: ContractState) {
+            let caller = get_caller_address();
+            assert!(caller == self.pending_owner.read(), "NOT_PENDING_OWNER");
+            let previous = self.owner.read();
+            self.owner.write(caller);
+            let zero_addr: ContractAddress = 0_felt252.try_into().unwrap();
+            self.pending_owner.write(zero_addr);
+            self.emit(OwnershipTransferred { previous_owner: previous, new_owner: caller });
         }
 
         fn set_verifier(ref self: ContractState, verifier_address: ContractAddress) {
@@ -789,6 +927,10 @@ pub mod AgentFirewallZK {
                 self.block_threshold.read(),
                 self.max_strikes.read(),
             )
+        }
+
+        fn is_paused(self: @ContractState) -> bool {
+            self.paused.read()
         }
     }
 }
