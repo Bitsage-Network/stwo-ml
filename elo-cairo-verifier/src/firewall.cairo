@@ -412,12 +412,19 @@ pub mod AgentFirewallZK {
             assert!(!self.used_proof_hashes.entry(proof_hash).read(), "PROOF_ALREADY_USED");
             self.used_proof_hashes.entry(proof_hash).write(true);
 
-            // 3. Recompute io_commitment from calldata and verify against proof.
+            // 3. Validate packed IO data is non-empty and well-formed.
+            let packed_span = packed_raw_io.span();
+            assert!(packed_span.len() > 0, "PACKED_IO_EMPTY");
+
+            // Minimum: at least 1 felt (holds up to 8 M31 values).
+            // For classifier (1x64 → 1x3): 73 M31 values → 10 packed felts.
+            // We validate the exact structure below after io_commitment check.
+
+            // 4. Recompute io_commitment from calldata and verify against proof.
             // This is the CRITICAL security check: we don't trust any caller-supplied
             // score — we verify the raw IO data matches the proof, then extract the
             // output neurons ourselves.
             let mut commitment_input: Array<felt252> = array![original_io_len.into()];
-            let packed_span = packed_raw_io.span();
             let mut ci: u32 = 0;
             loop {
                 if ci >= packed_span.len() {
@@ -436,24 +443,64 @@ pub mod AgentFirewallZK {
             let proof_io = verifier.get_proof_io_commitment(proof_hash);
             assert!(proof_io == action_io, "PROOF_IO_MISMATCH");
 
-            // 4. Extract output neurons from packed IO data.
-            // Layout: [in_rows, in_cols, in_len, ...input..., out_rows, out_cols, out_len, score0, score1, score2]
+            // 5. Validate IO structure and extract output neurons.
+            // Layout: [in_rows, in_cols, in_len, ...input_data...,
+            //          out_rows, out_cols, out_len, ...output_data...]
+
+            // Total M31 capacity of packed array
+            let packed_m31_capacity: u32 = packed_span.len() * 8;
+
+            // Header: must have at least 6 header felts (3 input meta + 3 output meta)
+            assert!(original_io_len >= 6, "IO_TOO_SHORT");
+            assert!(original_io_len <= packed_m31_capacity, "IO_LEN_EXCEEDS_PACKED");
+
+            // Extract input dimensions
+            let in_rows: u32 = extract_m31(packed_span, 0);
+            let in_cols: u32 = extract_m31(packed_span, 1);
             let in_len: u32 = extract_m31(packed_span, 2);
+
+            // Validate input dimensions are consistent
+            assert!(in_rows == 1, "CLASSIFIER_BATCH_NOT_1");
+            assert!(in_len == in_rows * in_cols, "INPUT_DIMENSION_MISMATCH");
+
+            // Output section starts after input header + data
             let out_start: u32 = 3 + in_len;
+            // Ensure we can read output header (3 values: out_rows, out_cols, out_len)
+            assert!(out_start + 3 <= packed_m31_capacity, "OUTPUT_HEADER_OUT_OF_BOUNDS");
+
+            let out_rows: u32 = extract_m31(packed_span, out_start);
+            let out_cols: u32 = extract_m31(packed_span, out_start + 1);
             let out_len: u32 = extract_m31(packed_span, out_start + 2);
-            assert!(out_len >= 3, "CLASSIFIER_OUTPUT_TOO_SHORT");
 
-            let score_safe: u64 = extract_m31(packed_span, out_start + 3).into();
-            let score_suspicious: u64 = extract_m31(packed_span, out_start + 4).into();
-            let score_malicious: u64 = extract_m31(packed_span, out_start + 5).into();
+            // Validate output dimensions
+            assert!(out_rows == 1, "OUTPUT_BATCH_NOT_1");
+            assert!(out_cols == 3, "CLASSIFIER_MUST_HAVE_3_OUTPUTS");
+            assert!(out_len == 3, "OUTPUT_LEN_MISMATCH");
+            assert!(out_len == out_rows * out_cols, "OUTPUT_DIMENSION_MISMATCH");
 
-            // 5. Compute threat score on-chain (not caller-supplied!)
-            let total = score_safe + score_suspicious + score_malicious;
+            // Validate total IO length matches original_io_len
+            let expected_io_len: u32 = 3 + in_len + 3 + out_len; // 3 input header + data + 3 output header + data
+            assert!(original_io_len == expected_io_len, "IO_LEN_TOTAL_MISMATCH");
+
+            // Ensure we can read all 3 output scores
+            let score_start: u32 = out_start + 3;
+            assert!(score_start + 3 <= packed_m31_capacity, "SCORES_OUT_OF_BOUNDS");
+
+            // Extract the 3 classifier output neurons
+            let score_safe: u64 = extract_m31(packed_span, score_start).into();
+            let score_suspicious: u64 = extract_m31(packed_span, score_start + 1).into();
+            let score_malicious: u64 = extract_m31(packed_span, score_start + 2).into();
+
+            // 6. Compute threat score on-chain (not caller-supplied!)
+            let total: u64 = score_safe + score_suspicious + score_malicious;
             let threat_score: u32 = if total == 0 {
-                50000 // ambiguous → escalate
+                50000 // ambiguous → escalate by default
             } else {
                 // threat = (malicious / total) * 100000
-                ((score_malicious * 100000) / total).try_into().unwrap()
+                // Max: 100000 (when malicious == total), always fits u32
+                let raw: u64 = (score_malicious * 100000) / total;
+                // Defensive clamp (mathematically unnecessary but safe)
+                if raw > 100000 { 100000 } else { raw.try_into().unwrap() }
             };
 
             // 6. Verify the proof came from the registered classifier model.
