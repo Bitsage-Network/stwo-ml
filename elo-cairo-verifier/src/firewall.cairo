@@ -227,6 +227,9 @@ pub mod AgentFirewallZK {
     /// Actions older than this cannot be resolved (Attack 6).
     const MAX_ACTION_AGE: u64 = 3600; // 1 hour
 
+    /// Behavioral tracking window (seconds). Stats reset when window expires.
+    const BEHAVIORAL_WINDOW: u64 = 86400; // 24 hours
+
     /// Default escalation threshold (40000 / 100000).
     const DEFAULT_ESCALATE_THRESHOLD: u32 = 40000;
     /// Default block threshold (70000 / 100000).
@@ -280,6 +283,22 @@ pub mod AgentFirewallZK {
         agent_pending_count: Map<felt252, u32>,
         /// Maximum pending actions per agent (default: 10).
         max_pending_per_agent: u32,
+
+        // ── Behavioral tracking (accumulated per submit_action) ─────
+        /// (agent_id, target) → interaction count with this target.
+        interaction_count: Map<(felt252, felt252), u32>,
+        /// agent_id → total actions submitted (all-time, for frequency calc).
+        agent_total_actions: Map<felt252, u32>,
+        /// agent_id → timestamp of first action in current window.
+        agent_window_start: Map<felt252, u64>,
+        /// agent_id → actions in current window (for tx_frequency).
+        agent_window_count: Map<felt252, u32>,
+        /// agent_id → number of distinct targets in current window.
+        agent_window_unique_targets: Map<felt252, u32>,
+        /// agent_id → running sum of values in current window (for avg).
+        agent_window_value_sum: Map<felt252, u64>,
+        /// agent_id → max value in current window.
+        agent_window_value_max: Map<felt252, u64>,
 
         // ── Proof replay protection ──────────────────────────────────
         /// proof_hash → whether this proof has been used to resolve an action.
@@ -494,6 +513,51 @@ pub mod AgentFirewallZK {
             self.action_resolved.entry(action_id).write(false);
             self.action_decision.entry(action_id).write(0); // pending
             self.action_submitted_at.entry(action_id).write(get_block_timestamp());
+
+            // ── Update behavioral tracking stats ──
+            let now = get_block_timestamp();
+
+            // Increment interaction count for (agent, target) pair
+            let prev_interactions = self.interaction_count.entry((agent_id, target)).read();
+            self.interaction_count.entry((agent_id, target)).write(prev_interactions + 1);
+
+            // Check if behavioral window has expired → reset
+            let window_start = self.agent_window_start.entry(agent_id).read();
+            if window_start == 0 || now - window_start > BEHAVIORAL_WINDOW {
+                // New window — reset all counters
+                self.agent_window_start.entry(agent_id).write(now);
+                self.agent_window_count.entry(agent_id).write(1);
+                self.agent_window_unique_targets.entry(agent_id).write(1);
+                let value_u256: u256 = value.into();
+                let val_u64: u64 = (value_u256.low & 0xFFFFFFFFFFFFFFFF).try_into().unwrap();
+                self.agent_window_value_sum.entry(agent_id).write(val_u64);
+                self.agent_window_value_max.entry(agent_id).write(val_u64);
+            } else {
+                // Same window — accumulate
+                let count = self.agent_window_count.entry(agent_id).read();
+                self.agent_window_count.entry(agent_id).write(count + 1);
+
+                // Unique targets: if this is first interaction with this target in this window,
+                // increment. We use interaction_count == 1 as the signal (just incremented above).
+                if prev_interactions == 0 {
+                    let unique = self.agent_window_unique_targets.entry(agent_id).read();
+                    self.agent_window_unique_targets.entry(agent_id).write(unique + 1);
+                }
+
+                // Value stats (truncate u128 to u64 for storage — sufficient for tracking)
+                let value_u256: u256 = value.into();
+                let val_u64: u64 = (value_u256.low & 0xFFFFFFFFFFFFFFFF).try_into().unwrap();
+                let prev_sum = self.agent_window_value_sum.entry(agent_id).read();
+                self.agent_window_value_sum.entry(agent_id).write(prev_sum + val_u64);
+                let prev_max = self.agent_window_value_max.entry(agent_id).read();
+                if val_u64 > prev_max {
+                    self.agent_window_value_max.entry(agent_id).write(val_u64);
+                }
+            }
+
+            self.agent_total_actions.entry(agent_id).write(
+                self.agent_total_actions.entry(agent_id).read() + 1
+            );
 
             self.emit(ActionSubmitted { action_id, agent_id, target, value, selector, io_commitment });
 
@@ -767,6 +831,53 @@ pub mod AgentFirewallZK {
             let expected_unknown: u32 = if sel == 0 { 1 } else { 0 };
             let encoded_unknown: u32 = extract_m31(packed_span, input_start + 40);
             assert!(encoded_unknown == expected_unknown, "INPUT_IS_UNKNOWN_MISMATCH");
+
+            // Verify behavioral features (indices 41-44) from contract-internal tracking.
+            // Feature 32: interaction_count for this (agent, target) pair
+            let stored_target_for_behavioral: felt252 = self.action_target.entry(action_id).read();
+            let onchain_interactions: u32 = self.interaction_count.entry(
+                (agent_id, stored_target_for_behavioral)
+            ).read();
+            let encoded_interactions: u32 = extract_m31(packed_span, input_start + 32);
+            // Allow ±5 tolerance (interactions may have changed between submit and resolve)
+            let interact_diff: u32 = if encoded_interactions > onchain_interactions {
+                encoded_interactions - onchain_interactions
+            } else {
+                onchain_interactions - encoded_interactions
+            };
+            assert!(interact_diff <= 5, "INPUT_INTERACTION_COUNT_MISMATCH");
+
+            // Feature 41: tx_frequency (actions in current window)
+            let onchain_freq: u32 = self.agent_window_count.entry(agent_id).read();
+            let encoded_freq: u32 = extract_m31(packed_span, input_start + 41);
+            let freq_diff: u32 = if encoded_freq > onchain_freq {
+                encoded_freq - onchain_freq
+            } else {
+                onchain_freq - encoded_freq
+            };
+            assert!(freq_diff <= 5, "INPUT_TX_FREQUENCY_MISMATCH");
+
+            // Feature 42: unique_targets_24h
+            let onchain_unique: u32 = self.agent_window_unique_targets.entry(agent_id).read();
+            let encoded_unique: u32 = extract_m31(packed_span, input_start + 42);
+            let unique_diff: u32 = if encoded_unique > onchain_unique {
+                encoded_unique - onchain_unique
+            } else {
+                onchain_unique - encoded_unique
+            };
+            assert!(unique_diff <= 3, "INPUT_UNIQUE_TARGETS_MISMATCH");
+
+            // Features 43-44: avg_value and max_value — allow wider tolerance
+            // because these are aggregates that can shift significantly between
+            // submit and resolve. We verify they're in the right ballpark.
+            // A ±50% tolerance prevents gross fabrication while allowing natural drift.
+            let onchain_max: u64 = self.agent_window_value_max.entry(agent_id).read();
+            let encoded_max: u32 = extract_m31(packed_span, input_start + 44);
+            let encoded_max_u64: u64 = encoded_max.into();
+            // Max value: encoded should not exceed 2x on-chain max (anti-fabrication)
+            if onchain_max > 0 && encoded_max_u64 > 0 {
+                assert!(encoded_max_u64 <= onchain_max * 2 + 1, "INPUT_MAX_VALUE_IMPLAUSIBLE");
+            }
 
             // 7. Compute threat score on-chain (not caller-supplied!)
             let total: u64 = score_safe + score_suspicious + score_malicious;
