@@ -59,9 +59,14 @@ if (vc.stream_batches) {
   }
 }
 
-// 4. weight_binding
-if (vc.weight_binding_calldata) {
-  writeCalldata("stream_weight_binding.txt", vc.weight_binding_calldata);
+// 4. weight_binding (chunked or legacy)
+if (vc.weight_binding_chunks) {
+  for (let i = 0; i < vc.weight_binding_chunks.length; i++) {
+    writeCalldata(`stream_weight_binding_${i}.txt`, vc.weight_binding_chunks[i].calldata);
+  }
+} else if (vc.weight_binding_calldata) {
+  // Legacy: single weight binding calldata
+  writeCalldata("stream_weight_binding_0.txt", vc.weight_binding_calldata);
 }
 
 // 5. input_mle chunks

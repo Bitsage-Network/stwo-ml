@@ -41,7 +41,28 @@ fn main() {
             let dir = exe.parent().unwrap_or(std::path::Path::new("."));
             dir.join("prove-model").to_string_lossy().to_string()
         });
-    let port: u16 = 8192;
+    let port: u16 = std::env::var("OBELYSK_PORT")
+        .ok().and_then(|p| p.parse().ok()).unwrap_or(8192);
+
+    let contract_address = std::env::var("OBELYSK_CONTRACT")
+        .or_else(|_| std::env::var("STARKNET_CONTRACT_ADDRESS"))
+        .unwrap_or_default();
+
+    let network = std::env::var("OBELYSK_NETWORK")
+        .unwrap_or_else(|_| "Starknet Sepolia".into());
+
+    let model_id = std::env::var("OBELYSK_MODEL_ID")
+        .unwrap_or_else(|_| "0x0d5d278a96f12080aea9c13ce8a07bf986ba842ee435afdd30ef9015c8c14a5".into());
+
+    // Derive model name from directory
+    let model_name = std::path::Path::new(&model_dir)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".into());
+
+    // Proof persistence directory
+    let proofs_dir = format!("{home}/.obelysk/proofs");
+    std::fs::create_dir_all(&proofs_dir).ok();
 
     // ── Shared state ────────────────────────────────────────────────
     let state = Arc::new(Mutex::new(AppState {
@@ -49,27 +70,27 @@ fn main() {
         input: String::new(),
         cursor_pos: 0,
         messages: vec![],
-        chat_history: vec![],  // for llama.cpp API
+        chat_history: vec![],
         turns: vec![],
 
-        // Pipeline (3 steps)
         pipeline_step: 0,
         pipeline_status: vec![
             StepStatus::new("CAPTURE", "M31 forward pass"),
             StepStatus::new("GKR PROVE", "Sumcheck + STARK + Binding"),
-            StepStatus::new("ON-CHAIN", "6-step Starknet verification"),
+            StepStatus::new("ON-CHAIN", "Starknet streaming verification"),
         ],
 
-        // Starknet config
         starknet_private_key: std::env::var("STARKNET_PRIVATE_KEY").ok(),
         starknet_account: std::env::var("STARKNET_ACCOUNT_ADDRESS")
             .or_else(|_| std::env::var("STARKNET_ACCOUNT")).ok(),
-        contract_address: "0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005".into(),
+        contract_address: contract_address.clone(),
+        network: network.clone(),
+        model_id: model_id.clone(),
 
-        // Streaming verification steps
         streaming_steps: stwo_ml::tui::dashboard::default_streaming_steps(),
 
-        // Commitments
+        policy_name: None,
+        policy_commitment: None,
         weight_commit: None,
         io_root: None,
         report_hash: None,
@@ -77,13 +98,13 @@ fn main() {
         total_felts: 0,
         gas_used: None,
 
-        // Tamper
         tamper_io: None,
         tamper_weight: None,
         tamper_output: None,
 
-        // Meta
-        model_name: "qwen2-0.5b".into(),
+        model_name,
+        model_params: String::new(),
+        model_layers: 0,
         tokens_in: 0,
         tokens_out: 0,
         logs: vec!["Starting ObelyZK...".into()],
@@ -91,6 +112,21 @@ fn main() {
         server_pid: None,
         prove_started_at: None,
         frame_count: 0,
+
+        coverage_matmul: 0,
+        coverage_activation: 0,
+        coverage_norm: 0,
+
+        current_layer: None,
+        layers_done: 0,
+        layers_total: 0,
+
+        proof_path: None,
+
+        input_history: Vec::new(),
+        history_idx: None,
+
+        port,
     }));
 
     // ── Start llama.cpp server ──────────────────────────────────────
@@ -153,74 +189,175 @@ fn main() {
             if s.should_quit { break; }
         }
 
-        // Handle input
+        // Handle input (including resize)
         if event::poll(Duration::from_millis(50)).unwrap_or(false) {
-            if let Ok(Event::Key(key)) = event::read() {
-                let mut s = state.lock().unwrap();
+            match event::read() {
+                Ok(Event::Resize(_, _)) => {
+                    // ratatui handles resize automatically on next draw
+                    continue;
+                }
+                Ok(Event::Key(key)) => {
+                    let mut s = state.lock().unwrap();
 
-                match key.code {
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        s.should_quit = true;
+                    // Global shortcuts
+                    match key.code {
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            s.should_quit = true;
+                            continue;
+                        }
+                        KeyCode::Esc => {
+                            s.should_quit = true;
+                            continue;
+                        }
+                        _ => {}
                     }
-                    KeyCode::Esc => {
-                        s.should_quit = true;
+
+                    // Error mode: 'r' to retry, 'q' to quit
+                    if matches!(s.mode, Mode::Error(_)) {
+                        match key.code {
+                            KeyCode::Char('r') => {
+                                s.mode = Mode::Chat;
+                                s.pipeline_step = 0;
+                                for step in &mut s.pipeline_status {
+                                    step.progress = 0.0;
+                                    step.done = false;
+                                    step.time = None;
+                                }
+                                s.streaming_steps = stwo_ml::tui::dashboard::default_streaming_steps();
+                                s.messages.push(("system".into(), "Retrying — ready for input".into()));
+                            }
+                            KeyCode::Char('q') => { s.should_quit = true; }
+                            _ => {}
+                        }
+                        continue;
                     }
-                    KeyCode::Enter => {
-                        if s.mode == Mode::Chat && !s.input.is_empty() {
-                            let input = s.input.clone();
-                            s.input.clear();
-                            s.cursor_pos = 0;
 
-                            if input.to_lowercase() == "prove" || input.to_lowercase() == "done" {
-                                // Start proving
-                                s.mode = Mode::Proving;
-                                s.messages.push(("system".into(), "Starting proof pipeline...".into()));
-                                s.logs.push("Prove requested".into());
+                    // Complete mode: 'r' to start new session, 'q' to quit
+                    if s.mode == Mode::Complete {
+                        match key.code {
+                            KeyCode::Char('r') | KeyCode::Enter => {
+                                s.mode = Mode::Chat;
+                                s.pipeline_step = 0;
+                                for step in &mut s.pipeline_status {
+                                    step.progress = 0.0;
+                                    step.done = false;
+                                    step.time = None;
+                                }
+                                s.streaming_steps = stwo_ml::tui::dashboard::default_streaming_steps();
+                                s.prove_started_at = None;
+                                s.tamper_io = None;
+                                s.tamper_weight = None;
+                                s.tamper_output = None;
+                                s.weight_commit = None;
+                                s.io_root = None;
+                                s.report_hash = None;
+                                s.messages.push(("system".into(), "New session — ready for input".into()));
+                            }
+                            KeyCode::Char('q') => { s.should_quit = true; }
+                            _ => {}
+                        }
+                        continue;
+                    }
 
-                                // Spawn proving in background
-                                let state_prove = Arc::clone(&state);
-                                let model_dir_c = model_dir.clone();
-                                let prove_bin_c = prove_bin.clone();
-                                let turns_c = s.turns.clone();
-                                thread::spawn(move || {
-                                    run_prove_pipeline(state_prove, &model_dir_c, &prove_bin_c, &turns_c, port);
-                                });
-                            } else {
-                                // Send chat message
-                                s.messages.push(("you".into(), input.clone()));
-                                s.tokens_in += input.split_whitespace().count();
+                    match key.code {
+                        KeyCode::Enter => {
+                            if s.mode == Mode::Chat && !s.input.is_empty() {
+                                let input = s.input.clone();
 
-                                // Chat in background
-                                let state_chat = Arc::clone(&state);
-                                let port_c = port;
-                                thread::spawn(move || {
-                                    send_chat(state_chat, &input, port_c);
-                                });
+                                // Save to input history
+                                s.input_history.push(input.clone());
+                                s.history_idx = None;
+                                s.input.clear();
+                                s.cursor_pos = 0;
+
+                                if input.to_lowercase() == "prove" || input.to_lowercase() == "done" {
+                                    if s.turns.is_empty() {
+                                        s.messages.push(("system".into(), "Chat first — nothing to prove yet".into()));
+                                    } else {
+                                        s.mode = Mode::Proving;
+                                        s.messages.push(("system".into(), "Starting proof pipeline...".into()));
+                                        s.logs.push("Prove requested".into());
+
+                                        let state_prove = Arc::clone(&state);
+                                        let model_dir_c = model_dir.clone();
+                                        let prove_bin_c = prove_bin.clone();
+                                        let turns_c = s.turns.clone();
+                                        let port_c = s.port;
+                                        thread::spawn(move || {
+                                            run_prove_pipeline(state_prove, &model_dir_c, &prove_bin_c, &turns_c, port_c);
+                                        });
+                                    }
+                                } else if input.to_lowercase() == "quit" || input.to_lowercase() == "exit" {
+                                    s.should_quit = true;
+                                } else {
+                                    s.messages.push(("you".into(), input.clone()));
+                                    s.tokens_in += input.split_whitespace().count();
+
+                                    let state_chat = Arc::clone(&state);
+                                    let port_c = s.port;
+                                    thread::spawn(move || {
+                                        send_chat(state_chat, &input, port_c);
+                                    });
+                                }
                             }
                         }
-                    }
-                    KeyCode::Char(c) => {
-                        if s.mode == Mode::Chat {
-                            let pos = s.cursor_pos;
-                            s.input.insert(pos, c);
-                            s.cursor_pos += 1;
+                        KeyCode::Char(c) => {
+                            if s.mode == Mode::Chat {
+                                let pos = s.cursor_pos;
+                                s.input.insert(pos, c);
+                                s.cursor_pos += 1;
+                                s.history_idx = None;
+                            }
                         }
-                    }
-                    KeyCode::Backspace => {
-                        if s.cursor_pos > 0 && s.mode == Mode::Chat {
-                            s.cursor_pos -= 1;
-                            let pos = s.cursor_pos;
-                            s.input.remove(pos);
+                        KeyCode::Backspace => {
+                            if s.cursor_pos > 0 && s.mode == Mode::Chat {
+                                s.cursor_pos -= 1;
+                                let pos = s.cursor_pos;
+                                s.input.remove(pos);
+                            }
                         }
+                        KeyCode::Left => {
+                            if s.cursor_pos > 0 { s.cursor_pos -= 1; }
+                        }
+                        KeyCode::Right => {
+                            if s.cursor_pos < s.input.len() { s.cursor_pos += 1; }
+                        }
+                        // Home/End for input navigation
+                        KeyCode::Home => { s.cursor_pos = 0; }
+                        KeyCode::End => { s.cursor_pos = s.input.len(); }
+                        // Input history navigation
+                        KeyCode::Up => {
+                            if s.mode == Mode::Chat && !s.input_history.is_empty() {
+                                let idx = match s.history_idx {
+                                    Some(0) => 0,
+                                    Some(i) => i - 1,
+                                    None => s.input_history.len() - 1,
+                                };
+                                s.history_idx = Some(idx);
+                                s.input = s.input_history[idx].clone();
+                                s.cursor_pos = s.input.len();
+                            }
+                        }
+                        KeyCode::Down => {
+                            if s.mode == Mode::Chat {
+                                if let Some(idx) = s.history_idx {
+                                    if idx + 1 < s.input_history.len() {
+                                        let next = idx + 1;
+                                        s.history_idx = Some(next);
+                                        s.input = s.input_history[next].clone();
+                                        s.cursor_pos = s.input.len();
+                                    } else {
+                                        s.history_idx = None;
+                                        s.input.clear();
+                                        s.cursor_pos = 0;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
                     }
-                    KeyCode::Left => {
-                        if s.cursor_pos > 0 { s.cursor_pos -= 1; }
-                    }
-                    KeyCode::Right => {
-                        if s.cursor_pos < s.input.len() { s.cursor_pos += 1; }
-                    }
-                    _ => {}
                 }
+                _ => {}
             }
         }
     }
@@ -242,7 +379,7 @@ fn main() {
 
 #[cfg(feature = "tui")]
 #[derive(Debug, Clone, PartialEq)]
-enum Mode { Loading, Chat, Proving, Complete }
+enum Mode { Loading, Chat, Proving, Complete, Error(String) }
 
 #[cfg(feature = "tui")]
 #[derive(Debug, Clone)]
@@ -279,7 +416,11 @@ struct AppState {
     starknet_private_key: Option<String>,
     starknet_account: Option<String>,
     contract_address: String,
+    network: String,
+    model_id: String,
 
+    policy_name: Option<String>,
+    policy_commitment: Option<String>,
     weight_commit: Option<String>,
     io_root: Option<String>,
     report_hash: Option<String>,
@@ -292,6 +433,8 @@ struct AppState {
     tamper_output: Option<bool>,
 
     model_name: String,
+    model_params: String,
+    model_layers: u32,
     tokens_in: usize,
     tokens_out: usize,
     logs: Vec<String>,
@@ -299,6 +442,26 @@ struct AppState {
     server_pid: Option<u32>,
     prove_started_at: Option<Instant>,
     frame_count: u64,
+
+    // Dynamic coverage stats
+    coverage_matmul: u32,
+    coverage_activation: u32,
+    coverage_norm: u32,
+
+    // Per-layer progress
+    current_layer: Option<String>,
+    layers_done: u32,
+    layers_total: u32,
+
+    // Proof persistence
+    proof_path: Option<String>,
+
+    // Input history
+    input_history: Vec<String>,
+    history_idx: Option<usize>,
+
+    // Port for llama.cpp
+    port: u16,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -414,10 +577,11 @@ fn run_prove_pipeline(
     });
     std::fs::write(&conv_file, serde_json::to_string_pretty(&conv).unwrap()).ok();
 
-    // Read Starknet credentials from state
-    let (starknet_key, starknet_account, contract_address) = {
+    // Read config from state
+    let (starknet_key, starknet_account, contract_address, network, model_id) = {
         let s = state.lock().unwrap();
-        (s.starknet_private_key.clone(), s.starknet_account.clone(), s.contract_address.clone())
+        (s.starknet_private_key.clone(), s.starknet_account.clone(),
+         s.contract_address.clone(), s.network.clone(), s.model_id.clone())
     };
 
     // Resolve script paths relative to binary
@@ -455,12 +619,34 @@ fn run_prove_pipeline(
                         s.weight_commit = Some(hash.trim().to_string());
                     }
                 }
+                // Parse policy banner: "Policy: standard (0x03af...)"
+                if line.starts_with("Policy: ") {
+                    let rest = line.trim_start_matches("Policy: ").trim();
+                    if let Some(paren) = rest.find(" (") {
+                        s.policy_name = Some(rest[..paren].to_string());
+                        let commit = rest[paren+2..].trim_end_matches(')');
+                        s.policy_commitment = Some(commit.to_string());
+                    } else {
+                        s.policy_name = Some(rest.to_string());
+                    }
+                }
                 if line.contains("turn ") { s.pipeline_status[0].progress += 0.3; }
                 if line.contains("complete") { s.pipeline_status[0].progress = 1.0; }
-                s.logs.push(truncate(&line, 50));
+                s.logs.push(truncate(&line, 60));
             }
         }
-        child.wait().ok();
+        let exit_status = child.wait();
+        if let Ok(status) = exit_status {
+            if !status.success() {
+                let mut s = state.lock().unwrap();
+                s.mode = Mode::Error(format!("Capture failed (exit {})", status.code().unwrap_or(-1)));
+                return;
+            }
+        }
+    } else {
+        let mut s = state.lock().unwrap();
+        s.mode = Mode::Error("Failed to spawn capture process".into());
+        return;
     }
 
     {
@@ -504,12 +690,79 @@ fn run_prove_pipeline(
             let reader = BufReader::new(stderr);
             for line in reader.lines().flatten() {
                 let mut s = state.lock().unwrap();
+
+                // Phase tracking
                 if line.contains("Phase 1") { s.pipeline_status[1].progress = 0.05; }
                 if line.contains("Phase 2") { s.pipeline_status[1].progress = 0.1; }
                 if line.contains("Phase 3") { s.pipeline_status[1].progress = 0.85; }
                 if line.contains("GKR proof:") { s.pipeline_status[1].progress = 0.90; }
                 if line.contains("Proof written") { s.pipeline_status[1].progress = 1.0; }
                 if line.contains("Completed") { s.pipeline_status[1].progress = 1.0; }
+
+                // Per-layer progress: parse "Layer N/M: LayerName"
+                if line.contains("Layer ") && line.contains("/") {
+                    if let Some(frac) = line.split("Layer ").nth(1) {
+                        let parts: Vec<&str> = frac.splitn(2, '/').collect();
+                        if parts.len() == 2 {
+                            if let Ok(done) = parts[0].trim().parse::<u32>() {
+                                let rest = parts[1];
+                                let total_str = rest.split(|c: char| !c.is_ascii_digit()).next().unwrap_or("0");
+                                if let Ok(total) = total_str.parse::<u32>() {
+                                    s.layers_done = done;
+                                    s.layers_total = total;
+                                    // Extract layer name after ": "
+                                    if let Some(name) = rest.split(": ").nth(1) {
+                                        s.current_layer = Some(name.trim().to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Coverage stats from circuit analysis: "Circuit: N matmul, M activation, K norm"
+                if line.contains("Circuit:") || line.contains("circuit:") {
+                    // Parse "96 matmul" style
+                    for word in ["matmul", "MatMul"] {
+                        if let Some(idx) = line.find(word) {
+                            let before = &line[..idx];
+                            if let Some(num_str) = before.split_whitespace().last() {
+                                if let Ok(n) = num_str.parse::<u32>() { s.coverage_matmul = n; }
+                            }
+                        }
+                    }
+                    for word in ["silu", "gelu", "activation", "SiLU", "GELU"] {
+                        if let Some(idx) = line.find(word) {
+                            let before = &line[..idx];
+                            if let Some(num_str) = before.split_whitespace().last() {
+                                if let Ok(n) = num_str.parse::<u32>() { s.coverage_activation = n; }
+                            }
+                        }
+                    }
+                    for word in ["rmsnorm", "layernorm", "norm", "RMSNorm", "LayerNorm"] {
+                        if let Some(idx) = line.find(word) {
+                            let before = &line[..idx];
+                            if let Some(num_str) = before.split_whitespace().last() {
+                                if let Ok(n) = num_str.parse::<u32>() { s.coverage_norm = n; }
+                            }
+                        }
+                    }
+                }
+
+                // Model params from stderr: "params: 247,726,080" or "Parameters: 247M"
+                if line.contains("params:") || line.contains("Parameters:") {
+                    if let Some(p) = line.split(':').nth(1) {
+                        let trimmed = p.trim().to_string();
+                        if !trimmed.is_empty() { s.model_params = trimmed; }
+                    }
+                }
+                // Model layers: "layers: 24" or "Layers: 169"
+                if (line.contains("layers:") || line.contains("Layers:")) && !line.contains("Layer ") {
+                    if let Some(p) = line.split(':').nth(1) {
+                        if let Ok(n) = p.trim().parse::<u32>() { s.model_layers = n; }
+                    }
+                }
+
                 // Each matmul completion ticks progress forward
                 if line.contains("done in") && (line.contains("[CPU]") || line.contains("MatMul")) {
                     let current = s.pipeline_status[1].progress;
@@ -517,6 +770,7 @@ fn run_prove_pipeline(
                         s.pipeline_status[1].progress = (current + 0.005).min(0.85);
                     }
                 }
+
                 // Forward pass nodes
                 if line.contains("forward pass") && !line.contains("Phase") {
                     let current = s.pipeline_status[1].progress;
@@ -524,10 +778,23 @@ fn run_prove_pipeline(
                         s.pipeline_status[1].progress = (current + 0.001).min(0.1);
                     }
                 }
-                s.logs.push(truncate(&line, 50));
+
+                s.logs.push(truncate(&line, 60));
             }
         }
-        child.wait().ok();
+        let exit_status = child.wait();
+        if let Ok(status) = exit_status {
+            if !status.success() {
+                let mut s = state.lock().unwrap();
+                s.mode = Mode::Error(format!("GKR prover exited with code {}", status.code().unwrap_or(-1)));
+                s.logs.push("GKR prove failed".into());
+                return;
+            }
+        }
+    } else {
+        let mut s = state.lock().unwrap();
+        s.mode = Mode::Error(format!("Failed to spawn prover at {prove_bin}"));
+        return;
     }
 
     let prove_time = t_prove.elapsed().as_secs_f64();
@@ -538,11 +805,10 @@ fn run_prove_pipeline(
         s.pipeline_status[1].time = Some(prove_time);
     }
 
-    // Extract commitments from proof JSON
+    // Extract commitments from proof JSON + persist to ~/.obelysk/proofs/
     if let Ok(proof_str) = std::fs::read_to_string(&proof_file) {
         if let Ok(proof) = serde_json::from_str::<serde_json::Value>(&proof_str) {
             let mut s = state.lock().unwrap();
-            // Extract commitments from proof JSON
             if let Some(wcs) = proof["weight_commitments"].as_array() {
                 if let Some(first) = wcs.first().and_then(|v| v.as_str()) {
                     s.weight_commit = Some(first.to_string());
@@ -551,7 +817,24 @@ fn run_prove_pipeline(
             s.io_root = proof["io_commitment"].as_str().map(|v| v.to_string());
             s.report_hash = proof["layer_chain_commitment"].as_str().map(|v| v.to_string())
                 .or_else(|| proof["io_commitment_packed"].as_str().map(|v| v.to_string()));
+
+            // Persist proof to ~/.obelysk/proofs/
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            let proofs_dir = format!("{home}/.obelysk/proofs");
+            std::fs::create_dir_all(&proofs_dir).ok();
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs()).unwrap_or(0);
+            let persist_path = format!("{proofs_dir}/proof-{ts}.json");
+            if std::fs::copy(&proof_file, &persist_path).is_ok() {
+                s.proof_path = Some(persist_path.clone());
+                s.logs.push(format!("Proof saved: {persist_path}"));
+            }
         }
+    } else {
+        let mut s = state.lock().unwrap();
+        s.mode = Mode::Error("Proof file not generated — check prover logs".into());
+        return;
     }
 
     // ── Step 3: On-Chain Verify ────────────────────────────────────
@@ -591,11 +874,7 @@ fn run_prove_pipeline(
     // Step 3a: Submit via paymaster_submit.mjs (handles session, chunks, all 6 streaming steps)
     let t_onchain = Instant::now();
 
-    // Use the known-good model_id registered on v39 contract.
-    // This model was freshly registered with correct weight commitments.
-    let model_id = "0x0d5d278a96f12080aea9c13ce8a07bf986ba842ee435afdd30ef9015c8c14a5".to_string();
-
-    // Patch proof file with this model_id
+    // Patch proof file with model_id from config
     if let Ok(proof_str) = std::fs::read_to_string(&proof_file) {
         if let Ok(mut pj) = serde_json::from_str::<serde_json::Value>(&proof_str) {
             pj["verify_calldata"]["model_id"] = serde_json::Value::String(model_id.clone());
@@ -627,7 +906,7 @@ fn run_prove_pipeline(
             "--proof", &proof_file,
             "--contract", &contract_address,
             "--model-id", &model_id,
-            "--network", "sepolia",
+            "--network", &network.to_lowercase().replace("starknet ", ""),
             "--no-paymaster",
         ])
         .env("STARKNET_PRIVATE_KEY", &starknet_key)
@@ -781,8 +1060,12 @@ fn run_prove_pipeline(
         } else {
             s.messages.push(("system".into(), format!("  {confirmed}/6 steps confirmed")));
         }
-        s.messages.push(("system".into(), format!("  Contract: {}...{}", &contract_address[..10], &contract_address[contract_address.len()-6..])));
-        s.messages.push(("system".into(), "  Network: Starknet Sepolia".into()));
+        if !contract_address.is_empty() {
+            let ca_start = &contract_address[..contract_address.len().min(10)];
+            let ca_end = if contract_address.len() > 6 { &contract_address[contract_address.len()-6..] } else { "" };
+            s.messages.push(("system".into(), format!("  Contract: {ca_start}...{ca_end}")));
+        }
+        s.messages.push(("system".into(), format!("  Network: {network}")));
         s.messages.push(("system".into(), "━━━━━━━━━━━━━━━━━━━━━━━━━━━━".into()));
     }
 }
@@ -805,15 +1088,25 @@ fn render_app(frame: &mut ratatui::Frame, state: &AppState) {
     use ratatui::widgets::*;
     use stwo_ml::tui::dashboard::{self, DashboardState, PipelineStep};
 
+    // ── Loading / Welcome screen ─────────────────────────────────
+    if state.mode == Mode::Loading {
+        render_welcome(frame, state);
+        return;
+    }
+
     // Convert AppState to DashboardState
     let mut ds = DashboardState::default();
     ds.model_name = state.model_name.clone();
+    ds.model_params = state.model_params.clone();
+    ds.model_layers = state.model_layers;
     ds.num_turns = state.turns.len();
     ds.tokens_in = state.tokens_in;
     ds.tokens_out = state.tokens_out;
     ds.weight_commitment = state.weight_commit.clone();
     ds.io_root = state.io_root.clone();
     ds.report_hash = state.report_hash.clone();
+    ds.contract = state.contract_address.clone();
+    ds.network = state.network.clone();
     ds.verification_count = state.verification_count;
     ds.total_felts = state.total_felts;
     ds.gas_used = state.gas_used.clone();
@@ -822,6 +1115,20 @@ fn render_app(frame: &mut ratatui::Frame, state: &AppState) {
     ds.tamper_output = state.tamper_output;
     ds.streaming_steps = state.streaming_steps.clone();
     ds.frame_count = state.frame_count;
+    // Dynamic coverage
+    ds.coverage_matmul = state.coverage_matmul;
+    ds.coverage_activation = state.coverage_activation;
+    ds.coverage_norm = state.coverage_norm;
+    // Per-layer progress
+    ds.current_layer = state.current_layer.clone();
+    ds.layers_done = state.layers_done;
+    ds.layers_total = state.layers_total;
+    // Error
+    if let Mode::Error(ref msg) = state.mode {
+        ds.error_message = Some(msg.clone());
+    }
+    // Proof path
+    ds.proof_path = state.proof_path.clone();
 
     // Map 3-step pipeline progress
     if state.pipeline_status.len() >= 3 {
@@ -851,6 +1158,7 @@ fn render_app(frame: &mut ratatui::Frame, state: &AppState) {
             }
         }
         Mode::Complete => PipelineStep::Complete,
+        Mode::Error(_) => PipelineStep::Error,
     };
 
     // Conversation turns
@@ -902,6 +1210,182 @@ fn render_app(frame: &mut ratatui::Frame, state: &AppState) {
 }
 
 #[cfg(feature = "tui")]
+fn render_welcome(frame: &mut ratatui::Frame, state: &AppState) {
+    use ratatui::layout::*;
+    use ratatui::style::*;
+    use ratatui::text::*;
+    use ratatui::widgets::*;
+
+    let area = frame.area();
+
+    // Cipher Noir colors
+    let lime = Color::Indexed(118);
+    let lime_dim = Color::Indexed(70);
+    let emerald = Color::Indexed(48);
+    let ghost = Color::Indexed(240);
+    let slate = Color::Indexed(245);
+    let silver = Color::Indexed(249);
+    let white = Color::Indexed(255);
+    let violet = Color::Indexed(73);
+    let orange = Color::Indexed(208);
+
+    // Animated spinner frame
+    let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let spin_idx = (state.frame_count / 2) as usize % spinner.len();
+    let spin_char = spinner[spin_idx];
+
+    // Pulsing dot for loading indicator
+    let pulse = if state.frame_count % 6 < 3 { lime } else { lime_dim };
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(4),      // Top padding
+            Constraint::Length(3),   // Logo
+            Constraint::Length(2),   // Tagline
+            Constraint::Length(1),   // Divider
+            Constraint::Length(2),   // Spacer
+            Constraint::Length(7),   // System info card
+            Constraint::Length(2),   // Spacer
+            Constraint::Length(3),   // Loading status
+            Constraint::Length(2),   // Spacer
+            Constraint::Length(3),   // Log tail
+            Constraint::Min(2),      // Bottom
+        ])
+        .split(area);
+
+    // ── Logo ───────────────────────────────────────────────────────
+    let logo = vec![
+        Line::from(vec![
+            Span::styled("    ╔═╗╔╗  ╔═╗╦  ╦ ╦╔═╗╦╔═", Style::default().fg(lime)),
+        ]),
+        Line::from(vec![
+            Span::styled("    ║ ║╠╩╗ ╠═ ║  ╚╦╝╔═╝╠╩╗", Style::default().fg(lime)),
+        ]),
+        Line::from(vec![
+            Span::styled("    ╚═╝╚═╝ ╚═╝╩═╝ ╩ ╚═╝╩ ╩", Style::default().fg(lime_dim)),
+        ]),
+    ];
+    frame.render_widget(
+        Paragraph::new(logo).alignment(Alignment::Center),
+        layout[1],
+    );
+
+    // ── Tagline ────────────────────────────────────────────────────
+    let tagline = vec![
+        Line::from(Span::styled(
+            "V E R I F I A B L E   M L   I N F E R E N C E",
+            Style::default().fg(silver),
+        )),
+        Line::from(Span::styled(
+            "Every computation proved. Every proof verified on-chain.",
+            Style::default().fg(ghost),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(tagline).alignment(Alignment::Center),
+        layout[2],
+    );
+
+    // ── Divider ────────────────────────────────────────────────────
+    let divider_width = area.width.min(50) as usize;
+    let divider = "─".repeat(divider_width);
+    frame.render_widget(
+        Paragraph::new(Span::styled(divider, Style::default().fg(ghost)))
+            .alignment(Alignment::Center),
+        layout[3],
+    );
+
+    // ── System info card ───────────────────────────────────────────
+    let model_display = if state.model_name.is_empty() {
+        "loading...".to_string()
+    } else {
+        state.model_name.clone()
+    };
+
+    let server_status = if state.server_pid.is_some() {
+        format!("{spin_char} starting llama-server")
+    } else {
+        "· waiting".into()
+    };
+
+    let info = vec![
+        Line::from(vec![
+            Span::styled("    ┌── ", Style::default().fg(ghost)),
+            Span::styled("ENVIRONMENT", Style::default().fg(slate)),
+        ]),
+        Line::from(vec![
+            Span::styled("    │", Style::default().fg(ghost)),
+        ]),
+        Line::from(vec![
+            Span::styled("    │  Model     ", Style::default().fg(ghost)),
+            Span::styled(&model_display, Style::default().fg(white).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::styled("    │  Engine    ", Style::default().fg(ghost)),
+            Span::styled("STWO ", Style::default().fg(lime_dim)),
+            Span::styled("Circle STARK + GKR", Style::default().fg(ghost)),
+        ]),
+        Line::from(vec![
+            Span::styled("    │  Network   ", Style::default().fg(ghost)),
+            Span::styled(&state.network, Style::default().fg(violet)),
+        ]),
+        Line::from(vec![
+            Span::styled("    │  Server    ", Style::default().fg(ghost)),
+            Span::styled(&server_status, Style::default().fg(pulse)),
+        ]),
+        Line::from(vec![
+            Span::styled("    └", Style::default().fg(ghost)),
+            Span::styled("──────────────────────────────────", Style::default().fg(ghost)),
+        ]),
+    ];
+    frame.render_widget(
+        Paragraph::new(info),
+        layout[5],
+    );
+
+    // ── Loading indicator ──────────────────────────────────────────
+    let dots = ".".repeat(((state.frame_count / 4) % 4) as usize);
+    let loading = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(format!("    {spin_char} "), Style::default().fg(pulse)),
+            Span::styled(format!("Loading model{dots}"), Style::default().fg(silver)),
+        ]),
+        Line::from(vec![
+            Span::styled("      This takes 5-30s depending on model size", Style::default().fg(ghost)),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(loading), layout[7]);
+
+    // ── Log tail ───────────────────────────────────────────────────
+    let log_count = state.logs.len();
+    let log_lines: Vec<Line> = state.logs.iter()
+        .skip(if log_count > 3 { log_count - 3 } else { 0 })
+        .map(|l| {
+            Line::from(Span::styled(
+                format!("      {l}"),
+                Style::default().fg(ghost),
+            ))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(log_lines), layout[9]);
+
+    // ── Footer ─────────────────────────────────────────────────────
+    let footer_area = layout[10];
+    if footer_area.height >= 1 {
+        let footer = Line::from(vec![
+            Span::styled(" ObelyZK ", Style::default().fg(Color::Black).bg(lime).add_modifier(Modifier::BOLD)),
+            Span::styled("  LOADING", Style::default().fg(pulse).add_modifier(Modifier::BOLD)),
+            Span::styled("    Ctrl+C", Style::default().fg(lime)),
+            Span::styled(" exit", Style::default().fg(ghost)),
+        ]);
+        let footer_y = Rect::new(footer_area.x, footer_area.y + footer_area.height - 1, footer_area.width, 1);
+        frame.render_widget(Paragraph::new(footer), footer_y);
+    }
+}
+
+#[cfg(feature = "tui")]
 fn render_header_section(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &AppState, _ds: &stwo_ml::tui::dashboard::DashboardState) {
     use ratatui::style::*;
     use ratatui::text::*;
@@ -909,7 +1393,10 @@ fn render_header_section(frame: &mut ratatui::Frame, area: ratatui::layout::Rect
 
     let is_complete = state.mode == Mode::Complete;
     let is_proving = state.mode == Mode::Proving;
-    let (status, status_color) = if is_complete {
+    let is_error = matches!(state.mode, Mode::Error(_));
+    let (status, status_color) = if is_error {
+        ("ERROR", Color::Indexed(178))
+    } else if is_complete {
         ("VERIFIED", Color::Indexed(48))
     } else if is_proving {
         ("PROVING", Color::Indexed(118))
@@ -919,15 +1406,27 @@ fn render_header_section(frame: &mut ratatui::Frame, area: ratatui::layout::Rect
 
     let elapsed_str = state.prove_started_at
         .filter(|_| is_proving)
-        .map(|t| format!("  {}s", t.elapsed().as_secs()))
+        .map(|t| {
+            let secs = t.elapsed().as_secs();
+            if secs < 60 { format!("  {}s", secs) }
+            else { format!("  {}m {:02}s", secs / 60, secs % 60) }
+        })
         .unwrap_or_default();
+
+    let model_display = if state.model_name.is_empty() { "no model" } else { &state.model_name };
+    let params_display = if state.model_params.is_empty() {
+        String::new()
+    } else {
+        format!("  {} params", state.model_params)
+    };
 
     let lines = vec![
         Line::from(Span::styled("  ╔═╗╔╗  ╔═╗╦  ╦ ╦╔═╗╦╔═", Style::default().fg(Color::Indexed(118)))),
         Line::from(vec![
             Span::styled("  ║ ║╠╩╗ ╠═ ║  ╚╦╝╔═╝╠╩╗", Style::default().fg(Color::Indexed(118))),
             Span::raw("  "),
-            Span::styled(&state.model_name, Style::default().fg(Color::Indexed(48)).add_modifier(Modifier::BOLD)),
+            Span::styled(model_display, Style::default().fg(Color::Indexed(48)).add_modifier(Modifier::BOLD)),
+            Span::styled(&params_display, Style::default().fg(Color::Indexed(249))),
             Span::styled(format!("  {} turns  {}→{}", state.turns.len(), state.tokens_in, state.tokens_out), Style::default().fg(Color::Indexed(245))),
         ]),
         Line::from(vec![
@@ -988,11 +1487,21 @@ fn render_input(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, state: 
     use ratatui::widgets::*;
 
     let active = state.mode == Mode::Chat;
-    let border_color = if active { Color::Indexed(118) } else { Color::Indexed(240) };
+    let border_color = if active { Color::Indexed(118) }
+        else if matches!(state.mode, Mode::Error(_)) { Color::Indexed(178) }
+        else { Color::Indexed(240) };
     let prompt = if active { " ▸ " } else { " · " };
 
+    let title = match state.mode {
+        Mode::Chat => " Type message, 'prove' to verify ",
+        Mode::Proving => " Proving... ",
+        Mode::Complete => " Verified — press Enter for new session ",
+        Mode::Error(_) => " Error — press 'r' to retry ",
+        Mode::Loading => " Loading model... ",
+    };
+
     let block = Block::default()
-        .title(if active { " Type message, 'prove' to verify " } else { " Proving... " })
+        .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color));
 
@@ -1019,15 +1528,28 @@ fn render_footer_section(frame: &mut ratatui::Frame, area: ratatui::layout::Rect
             let elapsed = state.prove_started_at
                 .map(|t| t.elapsed().as_secs())
                 .unwrap_or(0);
-            (Color::Indexed(118), format!("PROVING  {}s", elapsed))
+            let elapsed_fmt = if elapsed < 60 {
+                format!("{}s", elapsed)
+            } else {
+                format!("{}m {:02}s", elapsed / 60, elapsed % 60)
+            };
+            (Color::Indexed(118), format!("PROVING  {elapsed_fmt}"))
         }
         Mode::Loading => (Color::Indexed(245), "LOADING...".to_string()),
         Mode::Chat => (Color::Indexed(245), "READY".to_string()),
+        Mode::Error(_) => (Color::Indexed(178), "ERROR  r=retry q=quit".to_string()),
     };
 
-    // Truncate contract address
-    let contract = "0x0121d1e9..a8c005";
-    let network = "Sepolia";
+    // Truncate contract address dynamically
+    let contract_display = if state.contract_address.is_empty() {
+        "no contract".to_string()
+    } else if state.contract_address.len() > 20 {
+        format!("{}..{}", &state.contract_address[..10], &state.contract_address[state.contract_address.len()-6..])
+    } else {
+        state.contract_address.clone()
+    };
+
+    let network_short = state.network.replace("Starknet ", "");
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -1035,101 +1557,21 @@ fn render_footer_section(frame: &mut ratatui::Frame, area: ratatui::layout::Rect
             Span::raw("  "),
             Span::styled(&status_text, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
             Span::raw("  "),
-            Span::styled(contract, Style::default().fg(Color::Indexed(73))),
+            Span::styled(&contract_display, Style::default().fg(Color::Indexed(73))),
             Span::raw("  "),
-            Span::styled(network, Style::default().fg(Color::Indexed(245))),
-            Span::raw("              "),
+            Span::styled(&network_short, Style::default().fg(Color::Indexed(245))),
+            Span::raw("    "),
             Span::styled("Ctrl+C", Style::default().fg(Color::Indexed(118))),
             Span::styled(" exit  ", Style::default().fg(Color::Indexed(240))),
-            Span::styled("p", Style::default().fg(Color::Indexed(118))),
-            Span::styled(" prove", Style::default().fg(Color::Indexed(240))),
+            Span::styled("↑↓", Style::default().fg(Color::Indexed(118))),
+            Span::styled(" history  ", Style::default().fg(Color::Indexed(240))),
+            Span::styled("prove", Style::default().fg(Color::Indexed(118))),
+            Span::styled(" verify", Style::default().fg(Color::Indexed(240))),
         ])),
         area,
     );
 }
 
-// Keep old render_chat for reference but unused
-#[cfg(feature = "tui")]
-#[allow(dead_code)]
-fn render_chat_old(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &AppState) {
-    use ratatui::layout::*;
-    use ratatui::style::*;
-    use ratatui::text::*;
-    use ratatui::widgets::*;
-
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(3)])
-        .split(area);
-
-    // Messages
-    let mut lines: Vec<Line> = Vec::new();
-    for (role, content) in &state.messages {
-        let (prefix, color) = match role.as_str() {
-            "you" => ("You", Color::Indexed(118)),
-            "ai" => ("AI", Color::Indexed(48)),
-            "system" => ("", Color::Indexed(245)),
-            _ => ("", Color::White),
-        };
-
-        if !prefix.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled(format!(" {prefix} "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
-            ]));
-        }
-
-        // Wrap content
-        for chunk in content.chars().collect::<Vec<_>>().chunks(50) {
-            let text: String = chunk.iter().collect();
-            lines.push(Line::from(vec![
-                Span::styled(format!("   {text}"), Style::default().fg(if role == "system" { Color::Indexed(245) } else { Color::Indexed(252) })),
-            ]));
-        }
-        lines.push(Line::from(""));
-    }
-
-    let msg_block = Block::default()
-        .title(Span::styled(" Chat ", Style::default().fg(Color::Indexed(118)).add_modifier(Modifier::BOLD)))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Indexed(240)));
-
-    // Auto-scroll to bottom
-    let visible = layout[0].height.saturating_sub(2) as usize;
-    let offset = if lines.len() > visible { lines.len() - visible } else { 0 };
-    let visible_lines: Vec<Line> = lines.into_iter().skip(offset).collect();
-
-    frame.render_widget(
-        Paragraph::new(visible_lines).block(msg_block).wrap(Wrap { trim: false }),
-        layout[0],
-    );
-
-    // Input
-    let input_style = if state.mode == Mode::Chat {
-        Style::default().fg(Color::Indexed(118))
-    } else {
-        Style::default().fg(Color::Indexed(240))
-    };
-
-    let prompt = if state.mode == Mode::Chat { " ▸ " } else { " · " };
-    let input_text = format!("{prompt}{}", state.input);
-
-    let input_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(input_style);
-
-    frame.render_widget(
-        Paragraph::new(Span::styled(&input_text, input_style)).block(input_block),
-        layout[1],
-    );
-
-    // Cursor
-    if state.mode == Mode::Chat {
-        frame.set_cursor_position((
-            layout[1].x + state.cursor_pos as u16 + 4,
-            layout[1].y + 1,
-        ));
-    }
-}
 
 #[cfg(not(feature = "tui"))]
 fn main() {

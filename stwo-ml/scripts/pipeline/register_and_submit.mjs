@@ -9,13 +9,13 @@
 //   5. Delegates to streaming_submit.mjs steps (init → output_mle → layers → weight_binding → input_mle → finalize)
 //
 // Usage:
-//   node register_and_submit.mjs <proof.json> [--skip-register] [--skip-session]
+//   node register_and_submit.mjs <proof.json> [--skip-register] [--skip-session] [--policy 0x...]
 //
 // Env vars:
 //   STARKNET_ACCOUNT, STARKNET_PRIVATE_KEY, AVNU_API_KEY
 //   CONTRACT_ADDRESS (default: 0x0121d1...)
 
-import { Account, RpcProvider, CallData, Signer } from "starknet";
+import { Account, RpcProvider, CallData } from "starknet";
 import { readFileSync, writeFileSync, mkdirSync, readdirSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
@@ -36,6 +36,8 @@ const args = process.argv.slice(2);
 const proofPath = args.find((a) => !a.startsWith("--"));
 const skipRegister = args.includes("--skip-register");
 const skipSession = args.includes("--skip-session");
+const policyFlagIdx = args.indexOf("--policy");
+const policyOverride = policyFlagIdx !== -1 ? args[policyFlagIdx + 1] : null;
 
 if (!proofPath) {
   console.error(
@@ -66,12 +68,14 @@ function sleep(ms) {
 
 async function main() {
   const provider = new RpcProvider({ nodeUrl: RPC_URL });
-  const signer = new Signer(PRIVATE_KEY);
-  const account = new Account({ provider, address: ACCOUNT_ADDRESS, signer });
+  const account = new Account(provider, ACCOUNT_ADDRESS, PRIVATE_KEY);
 
   const modelId = vc.model_id;
+  const policyHash = policyOverride || vc.policy_commitment || "0x0";
   console.log(`Model ID: ${modelId}`);
   console.log(`Contract: ${CONTRACT}`);
+  console.log(`  Policy: ${proof.policy || "standard"}`);
+  console.log(`  Policy commitment: ${policyHash}`);
 
   // Step 1: Register model (weight commitments + circuit)
   if (!skipRegister) {
@@ -127,6 +131,25 @@ async function main() {
       console.log(`  streaming circuit registered.`);
     } catch (e) {
       console.log(`  streaming circuit registration: ${e.message} (may already exist)`);
+    }
+
+    // Register policy if a non-zero policy hash is present
+    if (policyHash !== "0x0" && policyHash !== "0") {
+      try {
+        const policyTx = await account.execute({
+          contractAddress: CONTRACT,
+          entrypoint: "register_model_policy",
+          calldata: CallData.compile({
+            model_id: modelId,
+            policy_hash: policyHash,
+          }),
+        });
+        console.log(`  register_model_policy TX: ${policyTx.transaction_hash}`);
+        await provider.waitForTransaction(policyTx.transaction_hash);
+        console.log(`  policy registered.`);
+      } catch (e) {
+        console.log(`  policy registration: ${e.message} (may already exist)`);
+      }
     }
   }
 
@@ -231,8 +254,17 @@ async function main() {
     }
   }
 
-  if (vc.weight_binding_calldata) {
-    writeCalldata("stream_weight_binding.txt", vc.weight_binding_calldata);
+  // Weight binding: support both chunked (new) and flat (legacy) formats
+  if (vc.weight_binding_chunks) {
+    for (let i = 0; i < vc.weight_binding_chunks.length; i++) {
+      writeCalldata(
+        `stream_weight_binding_${i}.txt`,
+        vc.weight_binding_chunks[i].calldata
+      );
+    }
+  } else if (vc.weight_binding_calldata) {
+    // Legacy: single weight binding calldata (backward compat)
+    writeCalldata("stream_weight_binding_0.txt", vc.weight_binding_calldata);
   }
 
   if (vc.input_mle_chunks) {
@@ -352,15 +384,50 @@ function discoverSteps(dir, files) {
     });
   }
 
-  const weightBinding = files.find((f) =>
-    f.startsWith("stream_weight_binding")
-  );
-  if (weightBinding) {
-    steps.push({
-      name: "stream_weight_binding",
-      file: weightBinding,
-      entrypoint: "verify_gkr_stream_weight_binding",
+  // Weight binding: may be chunked (stream_weight_binding_0.txt, ..._1.txt, etc.)
+  // Entrypoint comes from the proof JSON chunk metadata. Non-final chunks use
+  // verify_gkr_stream_weight_binding_chunk, final chunk uses verify_gkr_stream_weight_binding.
+  const weightBindingFiles = files
+    .filter((f) => f.startsWith("stream_weight_binding_"))
+    .sort((a, b) => {
+      const na = parseInt(a.match(/(\d+)/)?.[1] || "0", 10);
+      const nb = parseInt(b.match(/(\d+)/)?.[1] || "0", 10);
+      return na - nb;
     });
+  if (weightBindingFiles.length > 0) {
+    // Determine entrypoints from the proof JSON chunk metadata
+    const wbChunks = vc.weight_binding_chunks || [];
+    for (let i = 0; i < weightBindingFiles.length; i++) {
+      const f = weightBindingFiles[i];
+      // Use entrypoint from chunk metadata if available, otherwise infer:
+      // last chunk = verify, others = chunk accumulation
+      let entrypoint;
+      if (wbChunks[i] && wbChunks[i].entrypoint) {
+        entrypoint = wbChunks[i].entrypoint;
+      } else if (i === weightBindingFiles.length - 1 && weightBindingFiles.length === 1) {
+        entrypoint = "verify_gkr_stream_weight_binding";
+      } else if (i === weightBindingFiles.length - 1) {
+        // Last of multiple chunks still uses _chunk entrypoint with is_last flag
+        entrypoint = "verify_gkr_stream_weight_binding_chunk";
+      } else {
+        entrypoint = "verify_gkr_stream_weight_binding_chunk";
+      }
+      steps.push({
+        name: f.replace(".txt", ""),
+        file: f,
+        entrypoint,
+      });
+    }
+  } else {
+    // Legacy: single file named stream_weight_binding.txt
+    const weightBinding = files.find((f) => f === "stream_weight_binding.txt");
+    if (weightBinding) {
+      steps.push({
+        name: "stream_weight_binding",
+        file: weightBinding,
+        entrypoint: "verify_gkr_stream_weight_binding",
+      });
+    }
   }
 
   const finInputMle = files

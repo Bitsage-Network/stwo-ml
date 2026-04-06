@@ -221,6 +221,21 @@ struct Cli {
     #[arg(long)]
     profile: bool,
 
+    /// Proof generation policy: 'strict', 'standard', or 'relaxed'.
+    ///
+    /// Controls soundness gates, weight binding, and serialization.
+    /// Overrides all STWO_* environment variables when set.
+    ///
+    ///   strict   — Production: all soundness gates enforced, full weight binding
+    ///   standard — On-chain streaming: matches prove-server defaults
+    ///   relaxed  — Development: all gates permissive
+    #[arg(long, default_value = "standard")]
+    policy: String,
+
+    /// Path to a custom policy JSON file (overrides --policy preset).
+    #[arg(long, value_name = "FILE")]
+    policy_file: Option<PathBuf>,
+
     /// Path to a KV-cache directory for prefill/decode batch proving.
     ///
     /// When set, loads (or creates) a ModelKVCache from the given directory.
@@ -904,6 +919,48 @@ fn main() {
     }
     if cli.profile {
         stwo_ml::set_profile(true);
+    }
+
+    // ── Resolve proof policy ────────────────────────────────────────────
+    let resolved_policy: stwo_ml::policy::PolicyConfig = if let Some(ref pf) = cli.policy_file {
+        #[cfg(feature = "serde")]
+        {
+            stwo_ml::policy::from_file(pf).unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            })
+        }
+        #[cfg(not(feature = "serde"))]
+        {
+            let _ = pf;
+            eprintln!("Error: --policy-file requires the 'serde' feature");
+            process::exit(1);
+        }
+    } else {
+        stwo_ml::policy::from_preset_name(&cli.policy).unwrap_or_else(|| {
+            eprintln!(
+                "Error: unknown policy '{}'. Valid options: {}",
+                cli.policy,
+                stwo_ml::policy::PRESET_NAMES.join(", ")
+            );
+            process::exit(1);
+        })
+    };
+
+    // Warn if STWO_* env vars conflict with explicit policy
+    let env_conflicts = stwo_ml::policy::detect_env_conflicts();
+    if !env_conflicts.is_empty() && !cli.quiet {
+        eprintln!(
+            "Note: --policy {} overrides {} STWO_* env var(s): {}",
+            cli.policy,
+            env_conflicts.len(),
+            env_conflicts.join(", ")
+        );
+    }
+
+    // Print policy banner
+    if !stwo_ml::is_quiet() {
+        eprintln!("Policy: {}", stwo_ml::policy::summary_line(&resolved_policy));
     }
 
     // Dispatch to subcommands if specified
@@ -1821,7 +1878,7 @@ fn main() {
         let t_prefill = Instant::now();
         let _prefill_proof = stwo_ml::aggregation::prove_model_pure_gkr_prefill_with_cache(
             &model.graph, &input, &model.weights, &mut kvc,
-            weight_cache.as_ref(),
+            weight_cache.as_ref(), None,
         ).unwrap_or_else(|e| {
             eprintln!("Error: prefill failed: {e}");
             process::exit(1);
@@ -1849,7 +1906,7 @@ fn main() {
             let t_step = Instant::now();
             let _proof = stwo_ml::aggregation::prove_model_pure_gkr_decode_step(
                 &model.graph, &token, &model.weights, &mut kvc,
-                weight_cache.as_ref(),
+                weight_cache.as_ref(), None,
             ).unwrap_or_else(|e| {
                 eprintln!("Error: decode step {} failed: {e}", step + 1);
                 process::exit(1);
@@ -1921,12 +1978,12 @@ fn main() {
                 eprintln!("  KV-cache enabled: prefill batch proving");
                 stwo_ml::aggregation::prove_model_pure_gkr_prefill_with_cache(
                     &model.graph, &input, &model.weights, kvc,
-                    weight_cache.as_ref(),
+                    weight_cache.as_ref(), Some(&resolved_policy),
                 )
             } else {
                 stwo_ml::aggregation::prove_model_pure_gkr_auto_with_cache(
                     &model.graph, &input, &model.weights,
-                    weight_cache.as_ref(),
+                    weight_cache.as_ref(), Some(&resolved_policy),
                 )
             }
         } else if cli.multi_gpu {
@@ -1999,6 +2056,7 @@ fn main() {
                 &model.graph,
                 &input,
                 &model.weights,
+                None,
             )
         } else {
             stwo_ml::aggregation::prove_model_aggregated_onchain(
@@ -2201,6 +2259,8 @@ fn main() {
     eprintln!("Proving completed in {:.2}s", prove_elapsed.as_secs_f64());
 
     // ── Recursive STARK composition (optional) ───────────────────────
+    let mut recursive_calldata: Option<Vec<starknet_ff::FieldElement>> = None;
+    let mut recursive_summary: Option<stwo_ml::cairo_serde::RecursiveCalldataSummary> = None;
     if cli.recursive {
         if let Some(ref gkr) = proof.gkr_proof {
             eprintln!("Phase 4/4: Recursive STARK composition...");
@@ -2212,7 +2272,6 @@ fn main() {
             let recursive_io_qm31 = stwo_ml::crypto::poseidon_channel::felt_to_securefield(recursive_io);
             // Weight super root: hash of all weight commitment roots
             let recursive_weight_root = if !gkr.weight_claims.is_empty() {
-                // Hash weight claims into a single QM31 via the circuit hash mechanism
                 let mut hasher = stwo_ml::crypto::poseidon_channel::PoseidonChannel::new();
                 hasher.mix_u64(gkr.weight_claims.len() as u64);
                 for wc in &gkr.weight_claims {
@@ -2239,36 +2298,35 @@ fn main() {
                         recursive_proof.metadata.n_poseidon_perms,
                         recursive_proof.metadata.trace_log_size,
                     );
-                    // Serialize recursive proof metadata
-                    let recursive_size = recursive_proof.metadata.trace_log_size;
-                    let recursive_rows = 1usize << recursive_size;
-                    let recursive_cols = stwo_ml::recursive::air::COLS_PER_ROW;
-                    // Estimated calldata: ~(2 commitments + sampled values + FRI proof)
-                    // For log_size=10 (1024 rows): ~200-500 felts
-                    let est_felts = recursive_rows * 2 + 100; // rough estimate
+
+                    // Serialize recursive proof into calldata felts for single-TX submission
+                    let calldata = stwo_ml::cairo_serde::serialize_recursive_proof_calldata(
+                        &recursive_proof,
+                    );
+                    let summary = stwo_ml::cairo_serde::recursive_proof_calldata_summary(
+                        &recursive_proof,
+                    );
+
+                    let gkr_felts = proof.gkr_proof.as_ref().map(|g| {
+                        let mut v = Vec::new();
+                        stwo_ml::cairo_serde::serialize_gkr_proof_data_only(g, &mut v);
+                        v.len()
+                    }).unwrap_or(0);
+
                     eprintln!(
-                        "  Recursive proof: {}x{} trace, ~{} estimated calldata felts (vs {} GKR felts)",
-                        recursive_rows, recursive_cols, est_felts,
-                        proof.gkr_proof.as_ref().map(|g| {
-                            let mut v = Vec::new();
-                            stwo_ml::cairo_serde::serialize_gkr_proof_data_only(g, &mut v);
-                            v.len()
-                        }).unwrap_or(0),
+                        "  Recursive calldata: {} felts (header: {}, commitments: {}, FRI layers: {}, queries: {})",
+                        summary.total_felts, summary.header_felts,
+                        summary.n_commitments, summary.n_fri_layers, summary.n_queries,
                     );
                     eprintln!(
-                        "  Compression: GKR {} felts → Recursive ~{} felts ({:.0}x reduction)",
-                        proof.gkr_proof.as_ref().map(|g| {
-                            let mut v = Vec::new();
-                            stwo_ml::cairo_serde::serialize_gkr_proof_data_only(g, &mut v);
-                            v.len()
-                        }).unwrap_or(0),
-                        est_felts,
-                        proof.gkr_proof.as_ref().map(|g| {
-                            let mut v = Vec::new();
-                            stwo_ml::cairo_serde::serialize_gkr_proof_data_only(g, &mut v);
-                            v.len() as f64 / est_felts as f64
-                        }).unwrap_or(0.0),
+                        "  Compression: GKR {} felts -> Recursive {} felts ({:.1}x reduction)",
+                        gkr_felts,
+                        summary.total_felts,
+                        if summary.total_felts > 0 { gkr_felts as f64 / summary.total_felts as f64 } else { 0.0 },
                     );
+
+                    recursive_calldata = Some(calldata);
+                    recursive_summary = Some(summary);
                 }
                 Err(e) => {
                     eprintln!("  Recursive STARK failed: {e}");
@@ -2540,7 +2598,7 @@ fn main() {
                                     // Auto-select streaming verification (v25) for large proofs.
                                     // Streaming passes proof data as calldata (no storage reads),
                                     // avoiding the step limit hit by verify_gkr_execute.
-                                    match build_streaming_gkr_calldata(gkr_p, &circuit, model_id, &raw_io, proof.kv_cache_commitment, proof.prev_kv_cache_commitment) {
+                                    match build_streaming_gkr_calldata(gkr_p, &circuit, model_id, &raw_io, proof.kv_cache_commitment, proof.prev_kv_cache_commitment, proof.policy_commitment) {
                                         Ok(streaming) => {
                                             let num_batches = streaming.stream_batches.len();
                                             eprintln!(
@@ -2577,7 +2635,14 @@ fn main() {
                                                     })
                                                 }).collect::<Vec<_>>(),
                                                 "stream_batches": batch_json,
-                                                "weight_binding_calldata": streaming.weight_binding_calldata,
+                                                "weight_binding_chunks": streaming.weight_binding_chunks.iter().map(|c| {
+                                                    serde_json::json!({
+                                                        "chunk_idx": c.chunk_idx,
+                                                        "is_last": c.is_last,
+                                                        "entrypoint": c.entrypoint,
+                                                        "calldata": c.calldata,
+                                                    })
+                                                }).collect::<Vec<_>>(),
                                                 "input_mle_chunks": streaming.input_mle_chunks.iter().map(|c| {
                                                     serde_json::json!({
                                                         "chunk_offset": c.chunk_offset,
@@ -2770,6 +2835,23 @@ fn main() {
                     .and_then(|p| serde_json::to_value(p).ok()),
                 "verify_calldata": verify_calldata_obj,
                 "register_calldata": register_calldata_obj,
+                "recursive_proof": if let (Some(ref cd), Some(ref summ)) = (&recursive_calldata, &recursive_summary) {
+                    serde_json::json!({
+                        "entrypoint": "verify_recursive",
+                        "contract": "RecursiveVerifierContract (not yet deployed — see elo-cairo-verifier/src/recursive_verifier.cairo)",
+                        "note": "Single-TX recursive STARK verification. Requires stwo-cairo-verifier's verify() to be wired in the Cairo contract.",
+                        "total_felts": summ.total_felts,
+                        "log_size": summ.log_size,
+                        "n_commitments": summ.n_commitments,
+                        "n_fri_layers": summ.n_fri_layers,
+                        "n_queries": summ.n_queries,
+                        "calldata": cd.iter()
+                            .map(|f| format!("0x{:x}", f))
+                            .collect::<Vec<_>>(),
+                    })
+                } else {
+                    serde_json::json!(null)
+                },
             });
             let output_str = serde_json::to_string_pretty(&json_obj).unwrap();
             let len = output_str.len();
@@ -7234,6 +7316,7 @@ fn run_decode_mode(
             &mut kv_cache,
             &mut kv_commitment,
             weight_cache,
+            None,
         )
         .unwrap_or_else(|e| {
             eprintln!("Decode step {} failed: {e}", step);

@@ -22,7 +22,7 @@ audit = ["serde", "dep:serde_json", "dep:crossbeam", "dep:getrandom"]
 audit-http = ["audit", "dep:ureq", "dep:sha3"]
 aes-fallback = ["audit", "dep:aes-gcm"]
 cli = ["model-loading", "tokenizer", "audit", "audit-http", "dep:clap", "dep:serde_json", "serde", "dep:getrandom"]
-server = ["model-loading", "dep:axum", "dep:tower-http", "dep:uuid", "dep:tokio", "dep:serde_json", "serde", "dep:getrandom"]
+server = ["model-loading", "dep:axum", "dep:tower-http", "dep:uuid", "dep:tokio", "dep:serde_json", "serde", "dep:getrandom", "dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util"]
 server-audit = ["server", "audit"]
 proof-stream = ["dep:proof-stream"]
 proof-stream-rerun = ["proof-stream", "proof-stream/rerun"]
@@ -60,6 +60,9 @@ sha2 = "0.10"
 ureq = { version = "3", optional = true }
 sha3 = { version = "0.10", optional = true }
 getrandom = { version = "0.2", optional = true }
+reqwest = { version = "0.12", features = ["json"], optional = true }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"], optional = true }
+futures-util = { version = "0.3", optional = true }
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 tokenizers = { version = "0.20", optional = true, default-features = false, features = ["onig"] }
 proof-stream = { path = "../proof-stream", optional = true }

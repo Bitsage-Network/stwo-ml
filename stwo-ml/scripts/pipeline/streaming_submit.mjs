@@ -17,7 +17,8 @@
 //     --private-key 0x... \
 //     --network sepolia \
 //     --mode gasless \
-//     --max-retries 3
+//     --max-retries 3 \
+//     --policy 0x...            (optional, for documentation)
 //
 // Calldata dir structure:
 //   stream_init.txt
@@ -37,7 +38,7 @@
 //   STARKNET_PRIVATE_KEY  — private key
 //   AVNU_API_KEY          — Avnu API key (sponsored mode only)
 
-import { Account, RpcProvider, Signer } from "starknet";
+import { Account, RpcProvider } from "starknet";
 import { readFileSync, readdirSync } from "fs";
 
 // ── Config ───────────────────────────────────────────────────────────
@@ -96,6 +97,9 @@ function parseArgs() {
         break;
       case "--max-retries":
         opts.maxRetries = parseInt(args[++i], 10);
+        break;
+      case "--policy":
+        opts.policy = args[++i];
         break;
     }
   }
@@ -164,14 +168,35 @@ function discoverSteps(dir) {
     steps.push({ name: f.replace(".txt", ""), file: f, entrypoint: "verify_gkr_stream_layers" });
   }
 
-  // Weight binding (packed QM31, separate TX before input MLE)
-  const weightBinding = files.find((f) => f.startsWith("stream_weight_binding"));
-  if (weightBinding) {
-    steps.push({
-      name: "stream_weight_binding",
-      file: weightBinding,
-      entrypoint: "verify_gkr_stream_weight_binding",
+  // Weight binding: may be chunked (stream_weight_binding_0.txt, ..._1.txt, etc.)
+  const weightBindingFiles = files
+    .filter((f) => f.startsWith("stream_weight_binding_"))
+    .sort((a, b) => {
+      const na = parseInt(a.match(/(\d+)/)?.[1] || "0", 10);
+      const nb = parseInt(b.match(/(\d+)/)?.[1] || "0", 10);
+      return na - nb;
     });
+  if (weightBindingFiles.length > 0) {
+    for (let i = 0; i < weightBindingFiles.length; i++) {
+      const f = weightBindingFiles[i];
+      // Last chunk of a single-chunk set uses the verify entrypoint;
+      // multi-chunk sets use _chunk for all (final chunk has is_last flag in calldata).
+      const entrypoint =
+        weightBindingFiles.length === 1
+          ? "verify_gkr_stream_weight_binding"
+          : "verify_gkr_stream_weight_binding_chunk";
+      steps.push({ name: f.replace(".txt", ""), file: f, entrypoint });
+    }
+  } else {
+    // Legacy fallback: single stream_weight_binding.txt
+    const weightBinding = files.find((f) => f === "stream_weight_binding.txt");
+    if (weightBinding) {
+      steps.push({
+        name: "stream_weight_binding",
+        file: weightBinding,
+        entrypoint: "verify_gkr_stream_weight_binding",
+      });
+    }
   }
 
   const finInputMleFiles = files
@@ -269,8 +294,7 @@ async function main() {
 
   const provider = new RpcProvider({ nodeUrl: rpcUrl });
 
-  const signer = new Signer(opts.privateKey);
-  const account = new Account({ provider, address: opts.accountAddress, signer });
+  const account = new Account(provider, opts.accountAddress, opts.privateKey);
 
   // Discover streaming steps from calldata directory
   const steps = discoverSteps(opts.calldataDir);
@@ -284,6 +308,22 @@ async function main() {
   console.error(`  Network:  ${opts.network}`);
   console.error(`  Mode:     ${opts.mode}`);
   console.error(`  Retries:  ${opts.maxRetries}`);
+  if (opts.policy) {
+    console.error(`  Policy:   ${opts.policy}`);
+  }
+
+  // Log policy hash from init calldata (last element of verify_gkr_stream_init params)
+  const initStep = steps.find((s) => s.name === "stream_init");
+  if (initStep) {
+    const initPath = `${opts.calldataDir}/${initStep.file}`;
+    const initFelts = readCalldata(initPath, null);
+    const policyHash = initFelts[initFelts.length - 1];
+    if (policyHash && policyHash !== "0x0" && policyHash !== "0") {
+      console.error(`  Policy commitment: ${policyHash}`);
+    } else {
+      console.error(`  Policy: standard`);
+    }
+  }
   console.error("");
 
   const results = [];

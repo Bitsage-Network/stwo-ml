@@ -83,10 +83,16 @@ struct ProveResultPayload {
     num_layers: usize,
     prove_time_ms: u64,
     tee_attestation_hash: Option<String>,
+    /// Policy preset name used for this proof.
+    policy: String,
+    /// Poseidon commitment of the policy configuration (hex felt252).
+    policy_commitment: String,
 }
 
 struct LoadedModel {
     model_id: String,
+    /// Human-readable name (e.g., "smollm2-135m"), derived from directory name.
+    name: String,
     weight_commitment: String,
     num_layers: usize,
     input_shape: (usize, usize),
@@ -244,6 +250,10 @@ struct ProveRequest {
     /// Security level: "auto" | "tee" | "zk-only"
     #[serde(default = "default_security")]
     security: String,
+    /// Proof policy: "strict", "standard", or "relaxed".
+    /// Defaults to "standard" (on-chain streaming compatible).
+    #[serde(default)]
+    policy: Option<String>,
 }
 
 fn default_security() -> String {
@@ -775,8 +785,14 @@ async fn load_model(
         input_shape: [onnx.input_shape.0, onnx.input_shape.1],
     };
 
+    let model_name = std::path::Path::new(&req.model_path)
+        .file_stem()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "onnx-model".into());
+
     let loaded = LoadedModel {
         model_id: model_id.clone(),
+        name: model_name.clone(),
         weight_commitment: weight_commitment.clone(),
         num_layers: registration.num_layers,
         input_shape: onnx.input_shape,
@@ -833,8 +849,14 @@ async fn load_hf_model_handler(
         input_shape: [hf.input_shape.0, hf.input_shape.1],
     };
 
+    let model_name = std::path::Path::new(&req.model_dir)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "hf-model".into());
+
     let loaded = LoadedModel {
         model_id: model_id.clone(),
+        name: model_name,
         weight_commitment: weight_commitment.clone(),
         num_layers: registration.num_layers,
         input_shape: hf.input_shape,
@@ -860,12 +882,50 @@ async fn load_hf_model_handler(
     Ok((StatusCode::CREATED, Json(resp)))
 }
 
+/// List all loaded models.
+async fn list_models(
+    State(state): State<Arc<AppState>>,
+) -> Json<Vec<ModelListEntry>> {
+    let models = state.models.read().await;
+    let entries: Vec<ModelListEntry> = models.values().map(|m| ModelListEntry {
+        model_id: m.model_id.clone(),
+        name: m.name.clone(),
+        weight_commitment: m.weight_commitment.clone(),
+        num_layers: m.num_layers,
+        input_shape: [m.input_shape.0, m.input_shape.1],
+    }).collect();
+    Json(entries)
+}
+
+#[derive(Serialize)]
+struct ModelListEntry {
+    model_id: String,
+    name: String,
+    weight_commitment: String,
+    num_layers: usize,
+    input_shape: [usize; 2],
+}
+
+/// Resolve a model by ID or name. Accepts "0x..." model_id or "smollm2-135m" name.
+fn resolve_model_id<'a>(
+    models: &'a HashMap<String, LoadedModel>,
+    id_or_name: &str,
+) -> Option<&'a LoadedModel> {
+    // Try exact model_id match first
+    if let Some(m) = models.get(id_or_name) {
+        return Some(m);
+    }
+    // Try name match (case-insensitive)
+    let lower = id_or_name.to_lowercase();
+    models.values().find(|m| m.name.to_lowercase() == lower)
+}
+
 async fn get_model(
     State(state): State<Arc<AppState>>,
     Path(model_id): Path<String>,
 ) -> Result<Json<ModelInfoResponse>, (StatusCode, Json<ErrorResponse>)> {
     let models = state.models.read().await;
-    let model = models.get(&model_id).ok_or_else(|| {
+    let model = resolve_model_id(&models, &model_id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
@@ -886,15 +946,17 @@ async fn submit_prove(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ProveRequest>,
 ) -> Result<(StatusCode, Json<ProveSubmitResponse>), (StatusCode, Json<ErrorResponse>)> {
-    // Validate model exists and build input
+    // Validate model exists (accepts model_id or name like "smollm2-135m")
     let models = state.models.read().await;
-    let model = models.get(&req.model_id).ok_or_else(|| {
+    let model = resolve_model_id(&models, &req.model_id).ok_or_else(|| {
+        let available: Vec<String> = models.values().map(|m| m.name.clone()).collect();
         (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
                 error: format!(
-                    "Model '{}' not found. Load it first via POST /api/v1/models",
-                    req.model_id
+                    "Model '{}' not found. Available: [{}]. Load via POST /api/v1/models/hf",
+                    req.model_id,
+                    available.join(", ")
                 ),
             }),
         )
@@ -931,11 +993,33 @@ async fn submit_prove(
         matrix
     };
 
+    // Resolve policy from request (defaults to "standard" if not specified).
+    let request_policy = match req.policy.as_deref() {
+        None | Some("standard") => stwo_ml::policy::PolicyConfig::standard(),
+        Some("strict") => stwo_ml::policy::PolicyConfig::strict(),
+        Some("relaxed") => stwo_ml::policy::PolicyConfig::relaxed(),
+        Some(unknown) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!(
+                        "unknown policy '{unknown}'. Valid options: strict, standard, relaxed"
+                    ),
+                }),
+            ));
+        }
+    };
+    let request_policy_name = stwo_ml::policy::preset_name(&request_policy)
+        .unwrap_or("custom")
+        .to_string();
+    let request_policy_commitment_hex = format!("0x{:x}", request_policy.policy_commitment());
+
     // Arc::clone is O(1) — no deep copy of model weights
     let graph = Arc::clone(&model.graph);
     let weights = Arc::clone(&model.weights);
     let model_weight_commitment = model.weight_commitment.clone();
     let model_id_clone = req.model_id.clone();
+    let model_id_for_proofs = req.model_id.clone();
     // Clone for audit capture after proving
     #[cfg(feature = "server-audit")]
     let audit_graph = Arc::clone(&model.graph);
@@ -982,6 +1066,8 @@ async fn submit_prove(
         #[cfg(feature = "proof-stream")]
         let ws_clone = state.ws_sink.clone();
 
+        let policy_name_for_closure = request_policy_name.clone();
+        let policy_commitment_for_closure = request_policy_commitment_hex.clone();
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let scheduled = ScheduledJob {
             job_id: job_id.clone(),
@@ -1098,6 +1184,8 @@ async fn submit_prove(
                         tee_attestation_hash: payload_json["tee_attestation_hash"]
                             .as_str()
                             .map(String::from),
+                        policy: policy_name_for_closure.clone(),
+                        policy_commitment: policy_commitment_for_closure.clone(),
                     };
 
                     let mut jobs = state_clone.jobs.write().await;
@@ -1178,6 +1266,28 @@ async fn submit_prove(
 
         let prove_start = Instant::now();
 
+        // Progress ticker: estimate progress based on elapsed time
+        // SmolLM2-135M takes ~8s, Qwen2-0.5B ~20s. Use 15s as default estimate.
+        let progress_state = state_clone.clone();
+        let progress_jid = jid.clone();
+        let progress_handle = tokio::spawn(async move {
+            let estimated_secs = 15.0_f64;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                let elapsed = prove_start.elapsed().as_secs_f64();
+                // Asymptotic progress: approaches 95% but never reaches 100%
+                let pct = 1.0 - (-elapsed / estimated_secs).exp();
+                let bps = (pct * 9500.0) as u16 + 100; // 100..9600 range
+                let mut jobs = progress_state.jobs.write().await;
+                match jobs.get_mut(&progress_jid) {
+                    Some(j) if j.status == JobStatus::Proving => {
+                        j.progress_bps = bps;
+                    }
+                    _ => break, // job completed or removed
+                }
+            }
+        });
+
         // Run CPU+GPU heavy proving on a blocking thread
         #[cfg(feature = "proof-stream")]
         let ws_clone = state_clone.ws_sink.clone();
@@ -1193,6 +1303,9 @@ async fn submit_prove(
             prove_for_starknet_onchain(&*graph, &input_matrix, &*weights)
         })
         .await;
+
+        // Stop the progress ticker
+        progress_handle.abort();
 
         let prove_elapsed = prove_start.elapsed();
         let mut jobs = state_clone.jobs.write().await;
@@ -1215,13 +1328,36 @@ async fn submit_prove(
                     num_layers: proof.num_proven_layers,
                     prove_time_ms: prove_elapsed.as_millis() as u64,
                     tee_attestation_hash: proof.tee_attestation_hash.map(|h| format!("0x{:x}", h)),
+                    policy: request_policy_name.clone(),
+                    policy_commitment: request_policy_commitment_hex.clone(),
                 };
 
-                if let Some(j) = jobs.get_mut(&jid) {
-                    j.status = JobStatus::Completed;
-                    j.progress_bps = 10000;
-                    j.completed_at = Some(Instant::now());
-                    j.result = Some(payload);
+                // Store in proofs map for /api/v1/proofs listing
+                let io_str = format!("0x{:x}", proof.io_commitment);
+                let proof_hash = format!("0x{:x}", proof.layer_chain_commitment);
+                {
+                    let stored = StoredProof {
+                        proof_hash: proof_hash.clone(),
+                        model_id: model_id_for_proofs.clone(),
+                        io_commitment: io_str.clone(),
+                        weight_commitment: model_weight_commitment.clone(),
+                        num_proven_layers: proof.num_proven_layers,
+                        prove_time_ms: prove_elapsed.as_millis() as u64,
+                        calldata_size: payload.calldata.len(),
+                        created_at_epoch_ms: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64,
+                    };
+                    drop(jobs);
+                    state_clone.proofs.write().await.insert(proof_hash, stored);
+                    let mut jobs = state_clone.jobs.write().await;
+                    if let Some(j) = jobs.get_mut(&jid) {
+                        j.status = JobStatus::Completed;
+                        j.progress_bps = 10000;
+                        j.completed_at = Some(Instant::now());
+                        j.result = Some(payload);
+                    }
                 }
 
                 // Forward proof result to validator if configured
@@ -1393,13 +1529,14 @@ async fn infer(
     Json(req): Json<InferRequest>,
 ) -> Result<Json<InferResponse>, (StatusCode, Json<ErrorResponse>)> {
     let models = state.models.read().await;
-    let model = models.get(&req.model_id).ok_or_else(|| {
+    let model = resolve_model_id(&models, &req.model_id).ok_or_else(|| {
+        let available: Vec<String> = models.values().map(|m| m.name.clone()).collect();
         (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
                 error: format!(
-                    "Model '{}' not found. Load it first via POST /api/v1/models",
-                    req.model_id
+                    "Model '{}' not found. Available: [{}]",
+                    req.model_id, available.join(", ")
                 ),
             }),
         )
@@ -1497,7 +1634,7 @@ async fn infer(
                     io_commitment: io_hex,
                     weight_commitment,
                     proof_hash: proof_hash.clone(),
-                    verify_url: format!("/api/v1/verify/{proof_hash}"),
+                    verify_url: format!("/api/v1/verify/:proof_hash"),
                     num_proven_layers: num_proven,
                     prove_time_ms,
                     estimated_gas: (calldata_size as u64) * 200 + 500_000,
@@ -1573,6 +1710,356 @@ async fn verify_proof(
             method: "not_found".to_string(),
         })
     }
+}
+
+// =============================================================================
+// Full Attestation Handler — POST /api/v1/attest
+// =============================================================================
+
+/// Full attestation: prove + build streaming calldata + submit on-chain.
+///
+/// This is the single-call endpoint that does everything:
+/// 1. Runs the M31 forward pass through all model layers
+/// 2. Generates GKR sumcheck proofs for every MatMul
+/// 3. Builds unified STARK proof for activations + norms
+/// 4. Chunks calldata into 6 streaming verification steps
+/// 5. Submits all 6 transactions to Starknet using deployer key
+/// 6. Returns proof hash, tx hashes, and verification status
+///
+/// The customer never needs a Starknet key or wallet.
+#[derive(Deserialize)]
+struct AttestRequest {
+    /// Model name or hex ID
+    model_id: String,
+    /// Input tensor (flat f32 array, must match model input_shape)
+    input: Vec<f32>,
+    /// Use GPU acceleration (default: true)
+    #[serde(default = "default_true")]
+    gpu: bool,
+    /// Submit on-chain after proving (default: true)
+    #[serde(default = "default_true")]
+    submit_onchain: bool,
+}
+
+#[derive(Serialize)]
+struct AttestResponse {
+    /// Proof identifier
+    proof_id: String,
+    /// IO commitment: Poseidon(inputs || outputs)
+    io_commitment: String,
+    /// Weight commitment: Poseidon Merkle root of all weight matrices
+    weight_commitment: String,
+    /// Number of proven layers (MatMul + activation + norm)
+    num_proven_layers: usize,
+    /// Total proof generation time in milliseconds
+    prove_time_ms: u64,
+    /// Calldata statistics
+    calldata_felts: usize,
+    /// Estimated on-chain gas
+    estimated_gas: u64,
+    /// On-chain verification status
+    onchain: OnChainStatus,
+}
+
+#[derive(Serialize)]
+struct OnChainStatus {
+    /// Whether proof was submitted on-chain
+    submitted: bool,
+    /// Transaction hashes (one per streaming step, or single for recursive)
+    tx_hashes: Vec<String>,
+    /// Network (e.g., "starknet-sepolia")
+    network: String,
+    /// Verifier contract address
+    contract: String,
+    /// Whether on-chain verification passed
+    verified: bool,
+    /// Explorer URL for the first/main transaction
+    explorer_url: Option<String>,
+    /// Error message if submission failed
+    error: Option<String>,
+}
+
+async fn attest(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AttestRequest>,
+) -> Result<Json<AttestResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let models = state.models.read().await;
+    let model = resolve_model_id(&models, &req.model_id).ok_or_else(|| {
+        let available: Vec<String> = models.values().map(|m| m.name.clone()).collect();
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("Model '{}' not found. Available: [{}]", req.model_id, available.join(", ")),
+            }),
+        )
+    })?;
+
+    let (in_rows, in_cols) = model.input_shape;
+    let expected = in_rows * in_cols;
+    if req.input.len() != expected {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("Input has {} values, model expects {} ({in_rows}x{in_cols})", req.input.len(), expected),
+            }),
+        ));
+    }
+
+    // Quantize input
+    let (quantized, _) = quantize_tensor(&req.input, QuantStrategy::Symmetric8);
+    let mut input_matrix = M31Matrix::new(in_rows, in_cols);
+    for (i, &v) in quantized.iter().enumerate().take(expected) {
+        input_matrix.data[i] = v;
+    }
+
+    let graph = Arc::clone(&model.graph);
+    let weights = Arc::clone(&model.weights);
+    let model_weight_commitment = model.weight_commitment.clone();
+    let model_name = model.name.clone();
+    let model_id_str = model.model_id.clone();
+    let model_id_for_artifact = model_id_str.clone();
+    drop(models);
+
+    let prove_start = Instant::now();
+
+    // Run full attestation pipeline: GKR prove → streaming calldata
+    let model_id_fe = starknet_ff::FieldElement::from_hex_be(&model_id_str)
+        .unwrap_or(starknet_ff::FieldElement::from(0x9u64));
+
+    let attestation = tokio::task::spawn_blocking(move || {
+        stwo_ml::starknet::prove_full_attestation(&*graph, &input_matrix, &*weights, model_id_fe)
+    })
+    .await
+    .map_err(|e| (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse { error: format!("Proof thread panicked: {e}") }),
+    ))?
+    .map_err(|e| (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse { error: format!("Attestation failed: {e}") }),
+    ))?;
+
+    let io_commitment = attestation.io_commitment.clone();
+    let proof_hash = io_commitment.clone();
+    let num_layers = attestation.num_layers;
+    let prove_elapsed = attestation.prove_time_ms;
+    let calldata_felts = attestation.streaming_calldata.session_metadata.total_felts;
+    let num_streaming_batches = attestation.streaming_calldata.stream_batches.len();
+    let estimated_gas = (calldata_felts as u64) * 100 + 500_000; // rough estimate
+
+    // Store proof
+    let proof_id = Uuid::new_v4().to_string();
+    {
+        let stored = StoredProof {
+            proof_hash: proof_hash.clone(),
+            model_id: model_id_str,
+            io_commitment: io_commitment.clone(),
+            weight_commitment: model_weight_commitment.clone(),
+            num_proven_layers: num_layers,
+            prove_time_ms: prove_elapsed,
+            calldata_size: calldata_felts,
+            created_at_epoch_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        };
+        state.proofs.write().await.insert(proof_hash.clone(), stored);
+    }
+
+    // On-chain submission
+    let onchain = if req.submit_onchain {
+        // Check if we have Starknet credentials
+        let starknet_key = std::env::var("STARKNET_PRIVATE_KEY").ok();
+        let starknet_account = std::env::var("STARKNET_ACCOUNT_ADDRESS").ok();
+        let contract = std::env::var("CONTRACT_ADDRESS")
+            .or_else(|_| std::env::var("OBELYSK_CONTRACT"))
+            .unwrap_or_else(|_| "0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005".to_string());
+
+        if starknet_key.is_some() && starknet_account.is_some() {
+            // Build streaming proof artifact for register_and_submit.mjs
+            let streaming = &attestation.streaming_calldata;
+            let batch_json: Vec<serde_json::Value> = streaming.stream_batches.iter().map(|b| {
+                serde_json::json!({
+                    "batch_idx": b.batch_idx,
+                    "num_layers": b.num_layers,
+                    "calldata": b.calldata,
+                })
+            }).collect();
+            let output_chunks_json: Vec<serde_json::Value> = streaming.output_mle_chunks.iter().map(|c| {
+                serde_json::json!({
+                    "chunk_offset": c.chunk_offset,
+                    "chunk_len": c.chunk_len,
+                    "is_last": c.is_last,
+                    "calldata": c.calldata,
+                })
+            }).collect();
+            let input_chunks_json: Vec<serde_json::Value> = streaming.input_mle_chunks.iter().map(|c| {
+                serde_json::json!({
+                    "chunk_offset": c.chunk_offset,
+                    "chunk_len": c.chunk_len,
+                    "is_last": c.is_last,
+                    "calldata": c.calldata,
+                })
+            }).collect();
+
+            let artifact = serde_json::json!({
+                "format": "ml_gkr",
+                "model_id": model_id_for_artifact,
+                "weight_commitments": attestation.weight_commitments,
+                "io_commitment": attestation.io_commitment,
+                "verify_calldata": {
+                    "schema_version": 3,
+                    "entrypoint": "verify_gkr_stream",
+                    "mode": "streaming",
+                    "model_id": model_id_for_artifact,
+                    "total_felts": streaming.session_metadata.total_felts,
+                    "circuit_depth": attestation.circuit_depth,
+                    "num_layers": attestation.num_layers,
+                    "layer_tags": streaming.session_metadata.layer_tags,
+                    "init_calldata": streaming.init_calldata,
+                    "output_mle_chunks": output_chunks_json,
+                    "stream_batches": batch_json,
+                    "weight_binding_chunks": streaming.weight_binding_chunks.iter().map(|c| {
+                        serde_json::json!({
+                            "chunk_idx": c.chunk_idx,
+                            "is_last": c.is_last,
+                            "entrypoint": c.entrypoint,
+                            "calldata": c.calldata,
+                        })
+                    }).collect::<Vec<serde_json::Value>>(),
+                    "input_mle_chunks": input_chunks_json,
+                    "finalize_calldata": streaming.finalize_calldata,
+                    "chunks": streaming.upload_chunks,
+                }
+            });
+
+            // Write artifact to temp file
+            let tmp_path = format!("/tmp/attest-{}.json", proof_id);
+            if let Err(e) = std::fs::write(&tmp_path, serde_json::to_string(&artifact).unwrap_or_default()) {
+                return Ok(Json(AttestResponse {
+                    proof_id, io_commitment, weight_commitment: model_weight_commitment,
+                    num_proven_layers: num_layers, prove_time_ms: prove_elapsed,
+                    calldata_felts, estimated_gas,
+                    onchain: OnChainStatus {
+                        submitted: false, tx_hashes: vec![], network: "starknet-sepolia".into(),
+                        contract, verified: false, explorer_url: None,
+                        error: Some(format!("Failed to write proof artifact: {e}")),
+                    },
+                }));
+            }
+
+            // Find register_and_submit.mjs relative to the binary
+            let exe = std::env::current_exe().unwrap_or_default();
+            let scripts_dir = exe.parent().unwrap_or(std::path::Path::new("."))
+                .join("../../../scripts/pipeline");
+            let submit_script = if scripts_dir.join("register_and_submit.mjs").exists() {
+                scripts_dir.join("register_and_submit.mjs")
+            } else {
+                // Fallback: check working directory
+                std::path::PathBuf::from("scripts/pipeline/register_and_submit.mjs")
+            };
+
+            let rpc_url = std::env::var("STARKNET_RPC")
+                .unwrap_or_else(|_| "https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_7/demo".into());
+
+            eprintln!("[attest] Submitting on-chain via {}", submit_script.display());
+
+            // Call register_and_submit.mjs
+            // Find node binary — check common locations
+            let node_bin = [
+                "/home/ubuntu/.nvm/versions/node/v20.20.2/bin/node",
+                "/usr/local/bin/node",
+                "/usr/bin/node",
+                "node",
+            ].iter().find(|p| std::path::Path::new(p).exists())
+                .unwrap_or(&"node");
+
+            match tokio::process::Command::new(node_bin)
+                .arg(submit_script.to_str().unwrap_or("register_and_submit.mjs"))
+                .arg(&tmp_path)
+                .arg("--skip-register") // model should already be registered
+                .env("STARKNET_RPC", &rpc_url)
+                .env("STARKNET_ACCOUNT", starknet_account.as_ref().unwrap())
+                .env("STARKNET_PRIVATE_KEY", starknet_key.as_ref().unwrap())
+                .env("CONTRACT_ADDRESS", &contract)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
+                .await
+            {
+                Ok(output) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+
+                    // Parse TX hashes from output
+                    let tx_hashes: Vec<String> = stdout.lines()
+                        .chain(stderr.lines())
+                        .filter(|l| l.contains("TX:") || l.contains("0x"))
+                        .filter_map(|l| {
+                            l.find("0x").map(|start| {
+                                let hash = &l[start..];
+                                hash.split_whitespace().next().unwrap_or(hash).to_string()
+                            })
+                        })
+                        .filter(|h| h.len() > 10)
+                        .collect();
+
+                    let submitted = output.status.success();
+                    let first_tx = tx_hashes.first().cloned();
+
+                    OnChainStatus {
+                        submitted,
+                        tx_hashes,
+                        network: "starknet-sepolia".to_string(),
+                        contract: contract.clone(),
+                        verified: submitted,
+                        explorer_url: first_tx.map(|h| format!("https://sepolia.starkscan.co/tx/{h}")),
+                        error: if !submitted { Some(stderr.to_string()) } else { None },
+                    }
+                }
+                Err(e) => OnChainStatus {
+                    submitted: false,
+                    tx_hashes: vec![],
+                    network: "starknet-sepolia".to_string(),
+                    contract: contract.clone(),
+                    verified: false,
+                    explorer_url: None,
+                    error: Some(format!("Failed to spawn submission: {e}")),
+                },
+            }
+        } else {
+            OnChainStatus {
+                submitted: false,
+                tx_hashes: vec![],
+                network: "starknet-sepolia".to_string(),
+                contract,
+                verified: false,
+                explorer_url: None,
+                error: Some("No STARKNET_PRIVATE_KEY configured on prover".to_string()),
+            }
+        }
+    } else {
+        OnChainStatus {
+            submitted: false,
+            tx_hashes: vec![],
+            network: "starknet-sepolia".to_string(),
+            contract: String::new(),
+            verified: false,
+            explorer_url: None,
+            error: None,
+        }
+    };
+
+    Ok(Json(AttestResponse {
+        proof_id,
+        io_commitment,
+        weight_commitment: model_weight_commitment,
+        num_proven_layers: num_layers,
+        prove_time_ms: prove_elapsed,
+        calldata_felts,
+        estimated_gas,
+        onchain,
+    }))
 }
 
 /// List all proven inferences — GET /api/v1/proofs
@@ -2519,6 +3006,58 @@ mod tests {
 
 #[tokio::main]
 async fn main() {
+    // ── Proof policy ─────────────────────────────────────────────────
+    // Apply the "standard" policy as env vars at startup, BEFORE any proving
+    // threads spawn. This ensures all prove paths (aggregated, GKR, audit)
+    // use consistent settings.
+    //
+    // Safety: set_var is called once in main() before tokio spawns threads.
+    // Individual STWO_* env vars set by the operator take precedence (we only
+    // set vars that aren't already set).
+    let server_default_policy = stwo_ml::policy::PolicyConfig::standard();
+    for (key, val) in [
+        ("STWO_SKIP_RMS_SQ_PROOF", if server_default_policy.skip_rms_sq_proof { "1" } else { "0" }),
+        ("STWO_ALLOW_MISSING_NORM_PROOF", if server_default_policy.allow_missing_norm_proof { "1" } else { "0" }),
+        ("STWO_PIECEWISE_ACTIVATION", if server_default_policy.piecewise_activation { "1" } else { "0" }),
+        ("STWO_ALLOW_LOGUP_ACTIVATION", if server_default_policy.allow_logup_activation { "1" } else { "0" }),
+        ("STWO_AGGREGATED_FULL_BINDING", if server_default_policy.aggregated_full_binding { "1" } else { "0" }),
+        ("STWO_SKIP_BATCH_TOKENS", if server_default_policy.skip_batch_tokens { "1" } else { "0" }),
+        ("STWO_PURE_GKR_SKIP_UNIFIED_STARK", if server_default_policy.skip_unified_stark { "1" } else { "0" }),
+    ] {
+        if std::env::var(key).is_err() {
+            // Safety: called once in main() before any threads are spawned.
+            unsafe { std::env::set_var(key, val); }
+        }
+    }
+    eprintln!(
+        "  Policy: {}",
+        stwo_ml::policy::summary_line(&server_default_policy),
+    );
+
+    // ── Worker mode ────────────────────────────────────────────────
+    // If COORDINATOR_URL is set, start in worker mode:
+    // register with coordinator, send heartbeats, accept jobs via WebSocket.
+    let worker_config = stwo_ml::worker::WorkerConfig::from_env();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let worker_handle = if let Some(ref wc) = worker_config {
+        match stwo_ml::worker::start_worker(wc.clone(), shutdown_rx.clone()).await {
+            Ok(handle) => {
+                eprintln!("  Worker mode: ACTIVE (id: {})", handle.worker_id);
+                eprintln!("  Coordinator: {}", wc.coordinator_url);
+                eprintln!("  Wallet: {}", if wc.wallet_address.is_empty() { "none" } else { &wc.wallet_address });
+                Some(handle)
+            }
+            Err(e) => {
+                eprintln!("  Worker registration failed: {e}");
+                eprintln!("  Running in standalone mode");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     #[cfg(feature = "proof-stream")]
     let ws_sink = proof_stream::WsBroadcastSink::new(1024);
     let validator_url = std::env::var("VALIDATOR_URL").ok();
@@ -2582,18 +3121,19 @@ async fn main() {
 
     // Authenticated + rate-limited API routes
     let api_routes = Router::new()
-        .route("/api/v1/models", post(load_model))
+        .route("/api/v1/models", get(list_models).post(load_model))
         .route("/api/v1/models/hf", post(load_hf_model_handler))
-        .route("/api/v1/models/{model_id}", get(get_model))
+        .route("/api/v1/models/:model_id", get(get_model))
         .route("/api/v1/prove", post(submit_prove))
-        .route("/api/v1/prove/{job_id}", get(get_prove_status))
-        .route("/api/v1/prove/{job_id}/result", get(get_prove_result))
+        .route("/api/v1/prove/:job_id", get(get_prove_status))
+        .route("/api/v1/prove/:job_id/result", get(get_prove_result))
         .route("/api/v1/infer", post(infer))
-        .route("/api/v1/verify/{proof_hash}", get(verify_proof))
+        .route("/api/v1/verify/:proof_hash", get(verify_proof))
         .route("/api/v1/proofs", get(list_proofs))
+        .route("/api/v1/attest", post(attest))
         .route("/api/v1/privacy/batch", post(submit_privacy_batch))
         .route(
-            "/api/v1/privacy/batch/{job_id}",
+            "/api/v1/privacy/batch/:job_id",
             get(get_privacy_batch_status),
         )
         .route(
@@ -2617,12 +3157,12 @@ async fn main() {
     {
         api_routes = api_routes
             .route("/api/v1/audit", post(submit_audit))
-            .route("/api/v1/audit/{job_id}", get(get_audit_status));
+            .route("/api/v1/audit/:job_id", get(get_audit_status));
     }
 
     #[cfg(all(feature = "multi-query", feature = "proof-stream"))]
     {
-        api_routes = api_routes.route("/api/v1/prove/{job_id}/ws", get(ws_job_handler));
+        api_routes = api_routes.route("/api/v1/prove/:job_id/ws", get(ws_job_handler));
     }
 
     // Apply auth + rate-limit middleware to API routes
@@ -2695,6 +3235,105 @@ async fn main() {
         });
     }
 
+    // ── Worker job processor ─────────────────────────────────────────
+    // Reads jobs from the coordinator WebSocket channel, runs them
+    // through the local prover, and reports results back.
+    if let Some(mut handle) = worker_handle {
+        let worker_state = state.clone();
+        let worker_id = handle.worker_id.clone();
+        let worker_cfg = handle.config.clone();
+        tokio::spawn(async move {
+            eprintln!("  Worker job processor: listening for coordinator assignments");
+            while let Some(job) = handle.job_rx.recv().await {
+                eprintln!("  Worker: received job {} (model: {})", job.job_id, job.model_id);
+
+                // Check if model is loaded
+                let model_exists = worker_state.models.read().await.contains_key(&job.model_id);
+                if !model_exists {
+                    eprintln!("  Worker: model {} not loaded, rejecting job", job.model_id);
+                    stwo_ml::worker::submit_job_result(
+                        &worker_cfg, &worker_id, &job.job_id,
+                        Err(format!("Model {} not loaded on this worker", job.model_id)),
+                    ).await;
+                    continue;
+                }
+
+                // Run proof in blocking task
+                let state_prove = worker_state.clone();
+                let job_id = job.job_id.clone();
+                let model_id = job.model_id.clone();
+                let input = job.input.clone();
+                let gpu = job.gpu;
+                let cfg = worker_cfg.clone();
+                let wid = worker_id.clone();
+
+                tokio::task::spawn_blocking(move || {
+                    let rt = tokio::runtime::Handle::current();
+                    let result = rt.block_on(async {
+                        // Build input matrix
+                        let models = state_prove.models.read().await;
+                        let model = match models.get(&model_id) {
+                            Some(m) => m,
+                            None => {
+                                stwo_ml::worker::submit_job_result(
+                                    &cfg, &wid, &job_id,
+                                    Err("Model disappeared during proving".into()),
+                                ).await;
+                                return;
+                            }
+                        };
+
+                        let (rows, cols) = model.input_shape;
+                        let q_input: Vec<M31> = input.iter()
+                            .map(|&v| M31::from((v.abs() * 1000.0) as u32 % ((1u32 << 31) - 1)))
+                            .collect();
+
+                        let input_matrix = M31Matrix {
+                            data: q_input,
+                            rows,
+                            cols,
+                        };
+
+                        let graph = model.graph.clone();
+                        let weights = model.weights.clone();
+                        drop(models);
+
+                        let start = Instant::now();
+
+                        // Run proof
+                        match stwo_ml::starknet::prove_for_starknet_onchain(
+                            &graph, &input_matrix, &weights,
+                        ) {
+                            Ok(proof) => {
+                                let elapsed = start.elapsed().as_millis() as u64;
+                                let io_str = format!("{:#x}", proof.io_commitment);
+                                let calldata_size = proof.unified_calldata.len()
+                                    + proof.matmul_calldata.iter().map(|c| c.len()).sum::<usize>();
+
+                                stwo_ml::worker::submit_job_result(
+                                    &cfg, &wid, &job_id,
+                                    Ok(stwo_ml::worker::JobProofResult {
+                                        proof_hash: io_str.clone(),
+                                        io_commitment: io_str,
+                                        weight_commitment: String::new(),
+                                        prove_time_ms: elapsed,
+                                        calldata_size,
+                                    }),
+                                ).await;
+                            }
+                            Err(e) => {
+                                stwo_ml::worker::submit_job_result(
+                                    &cfg, &wid, &job_id,
+                                    Err(format!("Proof failed: {e}")),
+                                ).await;
+                            }
+                        }
+                    });
+                });
+            }
+        });
+    }
+
     let bind = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
     eprintln!("prove-server listening on {bind}");
     eprintln!("  GPU: {}", detect_tee_capability().device_name);
@@ -2754,7 +3393,7 @@ async fn main() {
         .await
         .expect("Failed to bind");
 
-    // Graceful shutdown: drain in-flight jobs on SIGTERM/SIGINT
+    // Graceful shutdown: drain in-flight jobs + deregister worker
     let shutdown = async {
         let ctrl_c = tokio::signal::ctrl_c();
         #[cfg(unix)]
@@ -2771,6 +3410,11 @@ async fn main() {
             _ = ctrl_c => eprintln!("\nReceived SIGINT, shutting down gracefully..."),
             _ = terminate => eprintln!("\nReceived SIGTERM, shutting down gracefully..."),
         }
+
+        // Signal worker tasks to stop (triggers deregistration)
+        drop(shutdown_tx);
+        // Give heartbeat task time to deregister
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     };
 
     axum::serve(

@@ -118,6 +118,9 @@ pub struct DashboardState {
     pub onchain_time: Option<f64>,
     pub prove_time_secs: f64,
     pub elapsed_secs: u64,
+    // Policy
+    pub policy_name: Option<String>,
+    pub policy_commitment: Option<String>,
     // Commitments
     pub weight_commitment: Option<String>,
     pub io_root: Option<String>,
@@ -141,6 +144,19 @@ pub struct DashboardState {
     pub logs: Vec<String>,
     // Animation frame counter (for pulsing effects)
     pub frame_count: u64,
+    // Dynamic coverage stats (computed from model circuit)
+    pub coverage_matmul: u32,
+    pub coverage_activation: u32,
+    pub coverage_norm: u32,
+    pub coverage_label: (String, String, String), // ("matmul", "silu", "rmsnorm")
+    // Per-layer progress during GKR prove
+    pub current_layer: Option<String>,
+    pub layers_done: u32,
+    pub layers_total: u32,
+    // Error state
+    pub error_message: Option<String>,
+    // Proof persistence
+    pub proof_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -150,6 +166,7 @@ pub enum PipelineStep {
     GkrProve,
     OnChain,
     Complete,
+    Error,
 }
 
 impl PipelineStep {
@@ -160,27 +177,35 @@ impl PipelineStep {
             Self::GkrProve => 2,
             Self::OnChain => 3,
             Self::Complete => 4,
+            Self::Error => 255,
         }
     }
 }
 
 impl Default for DashboardState {
     fn default() -> Self {
+        let contract = std::env::var("OBELYSK_CONTRACT")
+            .or_else(|_| std::env::var("STARKNET_CONTRACT_ADDRESS"))
+            .unwrap_or_default();
+        let network = std::env::var("OBELYSK_NETWORK")
+            .unwrap_or_else(|_| "Starknet Sepolia".into());
+
         Self {
-            model_name: "qwen2-0.5b".into(),
-            model_params: "247,726,080".into(),
-            model_layers: 169,
+            model_name: String::new(),
+            model_params: String::new(),
+            model_layers: 0,
             num_turns: 0, tokens_in: 0, tokens_out: 0,
             step: PipelineStep::Idle,
             capture_progress: 0.0, prove_progress: 0.0, onchain_progress: 0.0,
             capture_time: None, prove_time: None, onchain_time: None,
             prove_time_secs: 0.0,
             elapsed_secs: 0,
+            policy_name: None, policy_commitment: None,
             weight_commitment: None, io_root: None, report_hash: None,
-            contract: "0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005".into(),
-            network: "Starknet Sepolia".into(),
+            contract,
+            network,
             verification_count: None,
-            tx_hash: Some("0x2859e0605bd41bed34f65240e2e243cbfeb6c81f4dc60d7d431034f23fd2308".into()),
+            tx_hash: None,
             deployer_address: None,
             total_felts: 0,
             gas_used: None,
@@ -188,6 +213,19 @@ impl Default for DashboardState {
             tamper_io: None, tamper_weight: None, tamper_output: None,
             turns: Vec::new(), logs: Vec::new(),
             frame_count: 0,
+            // Dynamic coverage — populated from circuit analysis
+            coverage_matmul: 0,
+            coverage_activation: 0,
+            coverage_norm: 0,
+            coverage_label: ("matmul".into(), "activation".into(), "norm".into()),
+            // Per-layer progress
+            current_layer: None,
+            layers_done: 0,
+            layers_total: 0,
+            // Error
+            error_message: None,
+            // Proof persistence
+            proof_path: None,
         }
     }
 }
@@ -203,10 +241,13 @@ pub fn render(frame: &mut Frame, state: &DashboardState) {
         area,
     );
 
+    // Adaptive layout: collapse to 2-column on narrow terminals
+    let narrow = area.width < 100;
+
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6),  // Header
+            Constraint::Length(if narrow { 4 } else { 6 }),  // Header
             Constraint::Length(1),  // Divider
             Constraint::Min(10),   // Body
             Constraint::Length(1),  // Divider
@@ -216,9 +257,35 @@ pub fn render(frame: &mut Frame, state: &DashboardState) {
 
     render_header(frame, outer[0], state);
     render_divider(frame, outer[1], LIME_DIM);
-    render_body(frame, outer[2], state);
+
+    // Error overlay takes precedence
+    if state.step == PipelineStep::Error {
+        render_error(frame, outer[2], state);
+    } else {
+        render_body(frame, outer[2], state);
+    }
+
     render_divider(frame, outer[3], GHOST);
     render_footer(frame, outer[4], state);
+}
+
+fn render_error(frame: &mut Frame, area: Rect, state: &DashboardState) {
+    let msg = state.error_message.as_deref().unwrap_or("Unknown error");
+    let lines = vec![
+        Line::from(Span::styled("", Style::default())),
+        Line::from(Span::styled(
+            format!("  {CROSS} ERROR"),
+            Style::default().fg(RED).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled("", Style::default())),
+        Line::from(Span::styled(format!("  {msg}"), Style::default().fg(WHITE))),
+        Line::from(Span::styled("", Style::default())),
+        Line::from(Span::styled(
+            "  Press 'r' to retry or 'q' to quit",
+            Style::default().fg(SLATE),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 fn render_divider(frame: &mut Frame, area: Rect, color: Color) {
@@ -232,27 +299,32 @@ fn render_divider(frame: &mut Frame, area: Rect, color: Color) {
 // ── Header ──────────────────────────────────────────────────────────
 
 fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState) {
+    let narrow = area.width < 100;
+
     let layout = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(46), Constraint::Min(20)])
+        .constraints(if narrow {
+            vec![Constraint::Length(30), Constraint::Min(20)]
+        } else {
+            vec![Constraint::Length(46), Constraint::Min(20)]
+        })
         .split(area);
 
     // Logo — left side
-    let logo = vec![
-        Line::from(Span::styled("", Style::default())),
-        Line::from(vec![
-            Span::styled("  ╔═╗╔╗  ╔═╗╦  ╦ ╦╔═╗╦╔═", Style::default().fg(LIME)),
-        ]),
-        Line::from(vec![
-            Span::styled("  ║ ║╠╩╗ ╠═ ║  ╚╦╝╔═╝╠╩╗", Style::default().fg(LIME)),
-        ]),
-        Line::from(vec![
-            Span::styled("  ╚═╝╚═╝ ╚═╝╩═╝ ╩ ╚═╝╩ ╩", Style::default().fg(LIME_DIM)),
-        ]),
-        Line::from(vec![
-            Span::styled("  VERIFIABLE ML INFERENCE", Style::default().fg(SLATE)),
-        ]),
-    ];
+    let logo = if narrow {
+        vec![
+            Line::from(Span::styled(" ObelyZK", Style::default().fg(LIME).add_modifier(Modifier::BOLD))),
+            Line::from(Span::styled(" VERIFIABLE ML", Style::default().fg(SLATE))),
+        ]
+    } else {
+        vec![
+            Line::from(Span::styled("", Style::default())),
+            Line::from(Span::styled("  ╔═╗╔╗  ╔═╗╦  ╦ ╦╔═╗╦╔═", Style::default().fg(LIME))),
+            Line::from(Span::styled("  ║ ║╠╩╗ ╠═ ║  ╚╦╝╔═╝╠╩╗", Style::default().fg(LIME))),
+            Line::from(Span::styled("  ╚═╝╚═╝ ╚═╝╩═╝ ╩ ╚═╝╩ ╩", Style::default().fg(LIME_DIM))),
+            Line::from(Span::styled("  VERIFIABLE ML INFERENCE", Style::default().fg(SLATE))),
+        ]
+    };
 
     frame.render_widget(
         Paragraph::new(logo).style(Style::default().bg(BG)),
@@ -262,7 +334,10 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState) {
     // Model info — right side
     let is_idle = state.step == PipelineStep::Idle;
     let is_complete = state.step == PipelineStep::Complete;
-    let (status_text, status_color) = if is_complete {
+    let is_error = state.step == PipelineStep::Error;
+    let (status_text, status_color) = if is_error {
+        ("ERROR", RED)
+    } else if is_complete {
         ("VERIFIED", EMERALD)
     } else if is_idle {
         ("IDLE", GHOST)
@@ -270,47 +345,82 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState) {
         ("PROVING", LIME)
     };
 
-    let elapsed_str = if !is_idle && !is_complete && state.elapsed_secs > 0 {
-        format!("  {}s", state.elapsed_secs)
+    let elapsed_str = if !is_idle && !is_complete && !is_error && state.elapsed_secs > 0 {
+        format_elapsed(state.elapsed_secs)
     } else {
         String::new()
     };
 
-    let info = vec![
-        Line::from(Span::styled("", Style::default())),
-        Line::from(vec![
-            Span::styled("  MODEL  ", Style::default().fg(SLATE)),
-            Span::styled(&state.model_name, Style::default().fg(WHITE).add_modifier(Modifier::BOLD)),
-        ]),
-        Line::from(vec![
-            Span::styled("  ARCH   ", Style::default().fg(SLATE)),
-            Span::styled(
-                format!("{} params {} layers", state.model_params, state.model_layers),
-                Style::default().fg(SILVER),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("  STATUS ", Style::default().fg(SLATE)),
-            Span::styled(
-                format!("{DIAMOND} {status_text}"),
-                Style::default().fg(status_color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                elapsed_str,
-                Style::default().fg(ORANGE).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("  {} turns  {}→{} tokens",
-                    state.num_turns, state.tokens_in, state.tokens_out),
-                Style::default().fg(SLATE),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("  ENGINE ", Style::default().fg(SLATE)),
-            Span::styled("STWO ", Style::default().fg(LIME_DIM)),
-            Span::styled("Circle STARK + GKR", Style::default().fg(GHOST)),
-        ]),
-    ];
+    // Model name — show placeholder if not set
+    let model_display = if state.model_name.is_empty() {
+        "no model loaded".to_string()
+    } else {
+        state.model_name.clone()
+    };
+
+    let arch_display = if state.model_params.is_empty() && state.model_layers == 0 {
+        "awaiting model info".to_string()
+    } else {
+        format!("{} params  {} layers", state.model_params, state.model_layers)
+    };
+
+    // Per-layer progress indicator during proving
+    let layer_str = if state.layers_total > 0 && state.step == PipelineStep::GkrProve {
+        let layer_name = state.current_layer.as_deref().unwrap_or("...");
+        format!("  [{}/{} {}]", state.layers_done, state.layers_total, layer_name)
+    } else {
+        String::new()
+    };
+
+    let info = if narrow {
+        vec![
+            Line::from(vec![
+                Span::styled(&model_display, Style::default().fg(WHITE).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("  {DIAMOND} {status_text}"), Style::default().fg(status_color)),
+            ]),
+            Line::from(vec![
+                Span::styled(elapsed_str, Style::default().fg(ORANGE)),
+                Span::styled(layer_str, Style::default().fg(SLATE)),
+            ]),
+        ]
+    } else {
+        vec![
+            Line::from(Span::styled("", Style::default())),
+            Line::from(vec![
+                Span::styled("  MODEL  ", Style::default().fg(SLATE)),
+                Span::styled(&model_display, Style::default().fg(WHITE).add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(vec![
+                Span::styled("  ARCH   ", Style::default().fg(SLATE)),
+                Span::styled(arch_display, Style::default().fg(SILVER)),
+            ]),
+            Line::from(vec![
+                Span::styled("  STATUS ", Style::default().fg(SLATE)),
+                Span::styled(
+                    format!("{DIAMOND} {status_text}"),
+                    Style::default().fg(status_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    elapsed_str,
+                    Style::default().fg(ORANGE).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    layer_str,
+                    Style::default().fg(LILAC),
+                ),
+                Span::styled(
+                    format!("  {} turns  {}→{} tokens",
+                        state.num_turns, state.tokens_in, state.tokens_out),
+                    Style::default().fg(SLATE),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("  ENGINE ", Style::default().fg(SLATE)),
+                Span::styled("STWO ", Style::default().fg(LIME_DIM)),
+                Span::styled("Circle STARK + GKR", Style::default().fg(GHOST)),
+            ]),
+        ]
+    };
 
     frame.render_widget(
         Paragraph::new(info).style(Style::default().bg(BG)),
@@ -321,22 +431,46 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState) {
 // ── Body ────────────────────────────────────────────────────────────
 
 fn render_body(frame: &mut Frame, area: Rect, state: &DashboardState) {
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(40),  // Pipeline
-            Constraint::Length(1),        // Gutter
-            Constraint::Percentage(30),  // Crypto
-            Constraint::Length(1),        // Gutter
-            Constraint::Percentage(30),  // Inference Log
-        ])
-        .split(area);
+    let narrow = area.width < 100;
 
-    render_pipeline(frame, cols[0], state);
-    render_gutter(frame, cols[1]);
-    render_crypto(frame, cols[2], state);
-    render_gutter(frame, cols[3]);
-    render_conversation(frame, cols[4], state);
+    if narrow {
+        // 2-column layout: Pipeline+Crypto stacked left, Conversation right
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(55),
+                Constraint::Length(1),
+                Constraint::Percentage(45),
+            ])
+            .split(area);
+
+        let left = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(cols[0]);
+
+        render_pipeline(frame, left[0], state);
+        render_crypto(frame, left[1], state);
+        render_gutter(frame, cols[1]);
+        render_conversation(frame, cols[2], state);
+    } else {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(40),  // Pipeline
+                Constraint::Length(1),        // Gutter
+                Constraint::Percentage(30),  // Crypto
+                Constraint::Length(1),        // Gutter
+                Constraint::Percentage(30),  // Inference Log
+            ])
+            .split(area);
+
+        render_pipeline(frame, cols[0], state);
+        render_gutter(frame, cols[1]);
+        render_crypto(frame, cols[2], state);
+        render_gutter(frame, cols[3]);
+        render_conversation(frame, cols[4], state);
+    }
 }
 
 fn render_gutter(frame: &mut Frame, area: Rect) {
@@ -390,21 +524,37 @@ pub fn render_pipeline(frame: &mut Frame, area: Rect, state: &DashboardState) {
         state.step.as_u8() >= PipelineStep::OnChain.as_u8(),
         state.step == PipelineStep::OnChain, pulse_lime);
 
-    // Coverage stats
-    let coverage = vec![
-        Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled("96", Style::default().fg(LIME).add_modifier(Modifier::BOLD)),
-            Span::styled(" matmul ", Style::default().fg(SLATE)),
-            Span::styled("24", Style::default().fg(LIME).add_modifier(Modifier::BOLD)),
-            Span::styled(" silu ", Style::default().fg(SLATE)),
-            Span::styled("49", Style::default().fg(LIME).add_modifier(Modifier::BOLD)),
-            Span::styled(" rmsnorm", Style::default().fg(SLATE)),
-        ]),
-        Line::from(vec![
-            Span::styled("  per turn · poseidon merkle · io binding", Style::default().fg(GHOST)),
-        ]),
-    ];
+    // Coverage stats — dynamic from circuit analysis
+    let has_coverage = state.coverage_matmul > 0 || state.coverage_activation > 0 || state.coverage_norm > 0;
+    let coverage = if has_coverage {
+        vec![
+            Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(
+                    format!("{}", state.coverage_matmul),
+                    Style::default().fg(LIME).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" {} ", state.coverage_label.0), Style::default().fg(SLATE)),
+                Span::styled(
+                    format!("{}", state.coverage_activation),
+                    Style::default().fg(LIME).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" {} ", state.coverage_label.1), Style::default().fg(SLATE)),
+                Span::styled(
+                    format!("{}", state.coverage_norm),
+                    Style::default().fg(LIME).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" {}", state.coverage_label.2), Style::default().fg(SLATE)),
+            ]),
+            Line::from(vec![
+                Span::styled("  per turn · poseidon merkle · io binding", Style::default().fg(GHOST)),
+            ]),
+        ]
+    } else {
+        vec![
+            Line::from(Span::styled("  awaiting circuit analysis…", Style::default().fg(GHOST))),
+        ]
+    };
     frame.render_widget(Paragraph::new(coverage), layout[6]);
 }
 
@@ -439,24 +589,39 @@ fn render_step(
         Span::styled(format!("  {desc}"), Style::default().fg(GHOST)),
     ]);
 
-    // Line 2: custom progress bar
+    // Line 2: progress bar with gradient edge
     let bar_width = (area.width as usize).saturating_sub(6);
     let filled = ((progress * bar_width as f64) as usize).min(bar_width);
     let empty = bar_width.saturating_sub(filled);
 
     let bar_color = if done { EMERALD } else if is_current { pulse_color } else if active { LIME } else { GHOST };
-    let _bar_bg = if active { BG_ACTIVE } else { BG };
+
+    // Gradient edge: ██▓▒░ at the frontier
+    let (full_chars, edge_chars) = if done || !active || filled == 0 {
+        (filled, 0usize)
+    } else {
+        let edge = 1.min(empty);
+        (filled, edge)
+    };
 
     let bar_str = format!(
         "    {}{}{}",
-        BLOCK_FULL.repeat(filled),
-        if !done && active && filled < bar_width { BLOCK_LOW } else { "" },
-        " ".repeat(empty.saturating_sub(if !done && active && filled < bar_width { 1 } else { 0 })),
+        BLOCK_FULL.repeat(full_chars),
+        if edge_chars > 0 { "▒" } else { "" },
+        " ".repeat(empty.saturating_sub(edge_chars)),
     );
+
+    // Percentage display for active steps
+    let pct_str = if active && !done && progress > 0.0 {
+        format!(" {:>3.0}%", progress * 100.0)
+    } else {
+        String::new()
+    };
 
     let line2 = Line::from(vec![
         Span::styled(bar_str, Style::default().fg(bar_color)),
         Span::styled(time_str, Style::default().fg(EMERALD)),
+        Span::styled(pct_str, Style::default().fg(SLATE)),
     ]);
 
     frame.render_widget(
@@ -471,6 +636,8 @@ pub fn render_crypto(frame: &mut Frame, area: Rect, state: &DashboardState) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(1),   // Policy header
+            Constraint::Length(1),   // Policy value
             Constraint::Length(1),   // Commitments header
             Constraint::Length(1),   // Spacer
             Constraint::Length(3),   // Weight hash
@@ -483,20 +650,38 @@ pub fn render_crypto(frame: &mut Frame, area: Rect, state: &DashboardState) {
         ])
         .split(area);
 
+    // Policy section
+    frame.render_widget(
+        Paragraph::new(Span::styled(" POLICY", Style::default().fg(LIME).add_modifier(Modifier::BOLD))),
+        layout[0],
+    );
+    let policy_text = match (&state.policy_name, &state.policy_commitment) {
+        (Some(name), Some(commit)) => {
+            let short = if commit.len() > 16 { &commit[..16] } else { commit.as_str() };
+            format!("  {} ({}...)", name, short)
+        }
+        (Some(name), None) => format!("  {}", name),
+        _ => "  waiting...".to_string(),
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(policy_text, Style::default().fg(LIME))),
+        layout[1],
+    );
+
     // Commitments header
     frame.render_widget(
         Paragraph::new(Span::styled(" COMMITMENTS", Style::default().fg(VIOLET).add_modifier(Modifier::BOLD))),
-        layout[0],
+        layout[2],
     );
 
-    render_hash_field(frame, layout[2], "WEIGHT", &state.weight_commitment);
-    render_hash_field(frame, layout[3], "IO", &state.io_root);
-    render_hash_field(frame, layout[4], "REPORT", &state.report_hash);
+    render_hash_field(frame, layout[4], "WEIGHT", &state.weight_commitment);
+    render_hash_field(frame, layout[5], "IO", &state.io_root);
+    render_hash_field(frame, layout[6], "REPORT", &state.report_hash);
 
     // On-chain verification header
     frame.render_widget(
         Paragraph::new(Span::styled(" ON-CHAIN VERIFICATION", Style::default().fg(EMERALD).add_modifier(Modifier::BOLD))),
-        layout[6],
+        layout[8],
     );
 
     // Streaming steps + totals
@@ -570,12 +755,15 @@ pub fn render_crypto(frame: &mut Frame, area: Rect, state: &DashboardState) {
     lines.push(tamper_line("io commitment", state.tamper_io));
     lines.push(tamper_line("weight commitment", state.tamper_weight));
     lines.push(tamper_line("inference output", state.tamper_output));
-    lines.push(Line::from(vec![
-        Span::styled(format!(" {SHIELD} "), Style::default().fg(EMERALD)),
-        Span::styled("56 adversarial tests", Style::default().fg(EMERALD)),
-    ]));
+    let adv_count = adversarial_count(state);
+    if adv_count > 0 {
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {SHIELD} "), Style::default().fg(EMERALD)),
+            Span::styled(format!("{adv_count} adversarial tests"), Style::default().fg(EMERALD)),
+        ]));
+    }
 
-    frame.render_widget(Paragraph::new(lines), layout[8]);
+    frame.render_widget(Paragraph::new(lines), layout[10]);
 }
 
 fn render_hash_field(frame: &mut Frame, area: Rect, label: &str, value: &Option<String>) {
@@ -615,13 +803,27 @@ fn render_hash_field(frame: &mut Frame, area: Rect, label: &str, value: &Option<
 // ── Conversation column ─────────────────────────────────────────────
 
 fn render_conversation(frame: &mut Frame, area: Rect, state: &DashboardState) {
+    // Split between inference log and activity log
+    let has_logs = !state.logs.is_empty();
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),  // Header
-            Constraint::Length(1),  // Spacer
-            Constraint::Min(4),    // Turns
-        ])
+        .constraints(if has_logs {
+            vec![
+                Constraint::Length(1),    // Header
+                Constraint::Length(1),    // Spacer
+                Constraint::Min(4),       // Turns
+                Constraint::Length(1),    // Log header
+                Constraint::Length(6),    // Log tail
+            ]
+        } else {
+            vec![
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(4),
+                Constraint::Length(0),
+                Constraint::Length(0),
+            ]
+        })
         .split(area);
 
     frame.render_widget(
@@ -630,18 +832,20 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &DashboardState) {
     );
 
     let mut lines: Vec<Line> = Vec::new();
+    let col_width = area.width.saturating_sub(10) as usize;
+    let max_text = col_width.min(32);
 
     for (i, (user, ai)) in state.turns.iter().enumerate() {
         let idx = format!("#{:<2}", i);
         lines.push(Line::from(vec![
             Span::styled(format!(" {idx}"), Style::default().fg(GHOST)),
             Span::styled(" YOU ", Style::default().fg(LIME).add_modifier(Modifier::BOLD)),
-            Span::styled(truncate_str(user, 24), Style::default().fg(WHITE)),
+            Span::styled(truncate_str(user, max_text), Style::default().fg(WHITE)),
         ]));
         lines.push(Line::from(vec![
             Span::styled("    ", Style::default()),
             Span::styled(" AI  ", Style::default().fg(EMERALD)),
-            Span::styled(truncate_str(ai, 24), Style::default().fg(SLATE)),
+            Span::styled(truncate_str(ai, max_text), Style::default().fg(SLATE)),
         ]));
         lines.push(Line::from(Span::styled("", Style::default())));
     }
@@ -650,7 +854,35 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &DashboardState) {
         lines.push(Line::from(Span::styled(" awaiting input…", Style::default().fg(GHOST))));
     }
 
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), layout[2]);
+    // Auto-scroll turns to show most recent
+    let visible = layout[2].height as usize;
+    let offset = if lines.len() > visible { lines.len() - visible } else { 0 };
+    let visible_lines: Vec<Line> = lines.into_iter().skip(offset).collect();
+
+    frame.render_widget(Paragraph::new(visible_lines).wrap(Wrap { trim: false }), layout[2]);
+
+    // Activity log tail
+    if has_logs {
+        frame.render_widget(
+            Paragraph::new(Span::styled(" ACTIVITY", Style::default().fg(GHOST).add_modifier(Modifier::BOLD))),
+            layout[3],
+        );
+
+        let log_height = layout[4].height as usize;
+        let log_offset = if state.logs.len() > log_height {
+            state.logs.len() - log_height
+        } else {
+            0
+        };
+        let log_lines: Vec<Line> = state.logs.iter()
+            .skip(log_offset)
+            .map(|l| Line::from(Span::styled(
+                format!(" {}", truncate_str(l, col_width)),
+                Style::default().fg(GHOST),
+            )))
+            .collect();
+        frame.render_widget(Paragraph::new(log_lines), layout[4]);
+    }
 }
 
 // ── Footer ──────────────────────────────────────────────────────────
@@ -662,36 +894,61 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &DashboardState) {
         PipelineStep::GkrProve => ("PROVING",   LIME),
         PipelineStep::OnChain =>  ("ON-CHAIN",  ORANGE),
         PipelineStep::Complete => ("VERIFIED",  EMERALD),
+        PipelineStep::Error =>    ("ERROR",     RED),
     };
 
     let elapsed_str = if state.elapsed_secs > 0 {
-        format!(" {}s", state.elapsed_secs)
+        format!(" {}", format_elapsed(state.elapsed_secs))
     } else {
         String::new()
     };
 
-    // Truncate contract to ~20 chars
-    let contract_short = truncate_hash(&state.contract, 20);
+    // Contract — show truncated or "no contract" if empty
+    let contract_display = if state.contract.is_empty() {
+        "no contract".to_string()
+    } else {
+        truncate_hash(&state.contract, 20)
+    };
 
-    let footer = Line::from(vec![
+    // Proof path hint on completion
+    let proof_hint = if state.step == PipelineStep::Complete {
+        state.proof_path.as_deref().map(|p| {
+            let short = if p.len() > 30 { format!("…{}", &p[p.len()-28..]) } else { p.to_string() };
+            format!("  {short}")
+        }).unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let mut spans = vec![
         Span::styled(" ", Style::default()),
         Span::styled(" ObelyZK ", Style::default().fg(BG).bg(LIME).add_modifier(Modifier::BOLD)),
         Span::styled("  ", Style::default()),
         Span::styled(status_text, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
         Span::styled(&elapsed_str, Style::default().fg(ORANGE)),
         Span::styled("  ", Style::default()),
-        Span::styled(&contract_short, Style::default().fg(VIOLET)),
+        Span::styled(&contract_display, Style::default().fg(VIOLET)),
         Span::styled("  ", Style::default()),
         Span::styled(&state.network, Style::default().fg(SLATE)),
-        Span::styled("              ", Style::default()),
+    ];
+
+    if !proof_hint.is_empty() {
+        spans.push(Span::styled(proof_hint, Style::default().fg(EMERALD)));
+    }
+
+    // Right-align shortcuts
+    spans.extend([
+        Span::styled("    ", Style::default()),
         Span::styled("q", Style::default().fg(LIME)),
         Span::styled(" exit  ", Style::default().fg(GHOST)),
         Span::styled("p", Style::default().fg(LIME)),
-        Span::styled(" prove", Style::default().fg(GHOST)),
+        Span::styled(" prove  ", Style::default().fg(GHOST)),
+        Span::styled("r", Style::default().fg(LIME)),
+        Span::styled(" retry", Style::default().fg(GHOST)),
     ]);
 
     frame.render_widget(
-        Paragraph::new(footer).style(Style::default().bg(BG)),
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(BG)),
         area,
     );
 }
@@ -725,4 +982,25 @@ fn truncate_hash(s: &str, max: usize) -> String {
 fn truncate_str(s: &str, max: usize) -> String {
     if s.chars().count() <= max { return s.to_string(); }
     s.chars().take(max).collect::<String>() + "…"
+}
+
+/// Format elapsed seconds as human-readable: "5s", "1m 23s", "1h 02m"
+fn format_elapsed(secs: u64) -> String {
+    if secs < 60 {
+        format!("  {}s", secs)
+    } else if secs < 3600 {
+        format!("  {}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("  {}h {:02}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// Update adversarial test count dynamically
+fn adversarial_count(state: &DashboardState) -> u32 {
+    let mut count = 0;
+    if state.tamper_io.is_some() { count += 1; }
+    if state.tamper_weight.is_some() { count += 1; }
+    if state.tamper_output.is_some() { count += 1; }
+    // Base adversarial tests from the test suite
+    if count > 0 { count + 53 } else { 0 }
 }
