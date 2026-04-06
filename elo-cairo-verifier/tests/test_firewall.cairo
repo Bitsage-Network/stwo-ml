@@ -337,3 +337,98 @@ fn test_is_agent_registered() {
     fw.register_agent(0xA1);
     assert!(fw.is_agent_registered(0xA1), "registered agent should return true");
 }
+
+// ============================================================================
+// Test 19: Zero IO commitment rejected on submit
+// ============================================================================
+
+#[test]
+#[should_panic(expected: "IO_COMMITMENT_ZERO")]
+fn test_submit_action_zero_io_commitment_rejected() {
+    let fw = deploy_firewall();
+    start_cheat_caller_address(fw.contract_address, agent_owner_addr());
+
+    fw.register_agent(0xA1);
+    fw.submit_action(0xA1, 0xDEAD, 0x1000, 0); // zero io_commitment → rejected
+}
+
+// ============================================================================
+// Test 20: get_agent_owner returns correct address
+// ============================================================================
+
+#[test]
+fn test_get_agent_owner() {
+    let fw = deploy_firewall();
+    let agent_addr = agent_owner_addr();
+    start_cheat_caller_address(fw.contract_address, agent_addr);
+
+    fw.register_agent(0xA1);
+    assert!(fw.get_agent_owner(0xA1) == agent_addr, "agent owner should match caller");
+}
+
+// ============================================================================
+// Test 21: get_action_agent returns correct agent
+// ============================================================================
+
+#[test]
+fn test_get_action_agent() {
+    let fw = deploy_firewall();
+    start_cheat_caller_address(fw.contract_address, agent_owner_addr());
+
+    fw.register_agent(0xA1);
+    let action_id = fw.submit_action(0xA1, 0xDEAD, 0x1000, 0xCAFE);
+    assert!(fw.get_action_agent(action_id) == 0xA1, "action agent should match");
+}
+
+// ============================================================================
+// Test 22: set_verifier zero address rejected
+// ============================================================================
+
+#[test]
+#[should_panic(expected: "VERIFIER_CANNOT_BE_ZERO")]
+fn test_set_verifier_zero_rejected() {
+    let fw = deploy_firewall();
+    start_cheat_caller_address(fw.contract_address, owner());
+
+    let zero_addr: ContractAddress = 0_felt252.try_into().unwrap();
+    fw.set_verifier(zero_addr);
+}
+
+// ============================================================================
+// Test 23: set_classifier_model zero rejected
+// ============================================================================
+
+#[test]
+#[should_panic(expected: "MODEL_ID_CANNOT_BE_ZERO")]
+fn test_set_classifier_model_zero_rejected() {
+    let fw = deploy_firewall();
+    start_cheat_caller_address(fw.contract_address, owner());
+
+    fw.set_classifier_model(0);
+}
+
+// ============================================================================
+// Test 24: Multiple sequential actions for same agent
+// ============================================================================
+
+#[test]
+fn test_multiple_actions_same_agent() {
+    let fw = deploy_firewall();
+    start_cheat_caller_address(fw.contract_address, agent_owner_addr());
+
+    fw.register_agent(0xA1);
+    let id1 = fw.submit_action(0xA1, 0xDEAD, 0x100, 0xCAFE);
+    let id2 = fw.submit_action(0xA1, 0xBEEF, 0x200, 0xFACE);
+
+    // Both pending
+    assert!(fw.get_action_decision(id1) == 0, "first should be pending");
+    assert!(fw.get_action_decision(id2) == 0, "second should be pending");
+
+    // Different IO commitments
+    assert!(fw.get_action_io_commitment(id1) == 0xCAFE, "first io");
+    assert!(fw.get_action_io_commitment(id2) == 0xFACE, "second io");
+
+    // Different agents point back
+    assert!(fw.get_action_agent(id1) == 0xA1, "first agent");
+    assert!(fw.get_action_agent(id2) == 0xA1, "second agent");
+}

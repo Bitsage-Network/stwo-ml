@@ -98,6 +98,12 @@ pub trait IAgentFirewall<TContractState> {
     /// Get whether an agent is registered.
     fn is_agent_registered(self: @TContractState, agent_id: felt252) -> bool;
 
+    /// Get the agent's owner address.
+    fn get_agent_owner(self: @TContractState, agent_id: felt252) -> ContractAddress;
+
+    /// Get which agent submitted an action.
+    fn get_action_agent(self: @TContractState, action_id: u64) -> felt252;
+
     /// Get the action decision (0=pending, 1=approved, 2=escalated, 3=blocked).
     fn get_action_decision(self: @TContractState, action_id: u64) -> u8;
 
@@ -174,6 +180,11 @@ pub mod AgentFirewallZK {
         action_proof_hash: Map<u64, felt252>,
         action_submitted_at: Map<u64, u64>,
 
+        // ── Proof replay protection ──────────────────────────────────
+        /// proof_hash → whether this proof has been used to resolve an action.
+        /// Prevents the same proof from being replayed across multiple actions.
+        used_proof_hashes: Map<felt252, bool>,
+
         // ── Thresholds ───────────────────────────────────────────────
         escalate_threshold: u32,
         block_threshold: u32,
@@ -192,6 +203,7 @@ pub mod AgentFirewallZK {
         ActionResolved: ActionResolved,
         TrustScoreUpdated: TrustScoreUpdated,
         AgentFrozen: AgentFrozen,
+        ThresholdsUpdated: ThresholdsUpdated,
     }
 
     #[derive(Drop, starknet::Event)]
@@ -250,6 +262,14 @@ pub mod AgentFirewallZK {
         agent_id: felt252,
         strikes: u32,
         final_trust_score: u64,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    struct ThresholdsUpdated {
+        escalate_threshold: u32,
+        block_threshold: u32,
+        max_strikes: u32,
+        updated_by: ContractAddress,
     }
 
     // ── Constructor ──────────────────────────────────────────────────
@@ -326,6 +346,9 @@ pub mod AgentFirewallZK {
             let caller = get_caller_address();
             assert!(caller == self.agent_owner.entry(agent_id).read(), "NOT_AGENT_OWNER");
 
+            // IO commitment must be non-zero (zero is meaningless)
+            assert!(io_commitment != 0, "IO_COMMITMENT_ZERO");
+
             let action_id = self.next_action_id.read();
             self.next_action_id.write(action_id + 1);
 
@@ -353,31 +376,46 @@ pub mod AgentFirewallZK {
             assert!(agent_id != 0, "ACTION_NOT_FOUND");
             assert!(!self.action_resolved.entry(action_id).read(), "ACTION_ALREADY_RESOLVED");
 
+            // Caller must be agent owner or contract owner
+            let caller = get_caller_address();
+            let agent_owner = self.agent_owner.entry(agent_id).read();
+            assert!(
+                caller == agent_owner || caller == self.owner.read(),
+                "NOT_AGENT_OR_CONTRACT_OWNER"
+            );
+
+            // Agent must still be active (frozen agents can't resolve)
+            assert!(self.agent_active.entry(agent_id).read(), "AGENT_FROZEN");
+
             // 1. Verify the ZKML proof was verified on ObelyskVerifier
             let verifier = IVerifierDispatcher {
                 contract_address: self.verifier_address.read()
             };
             assert!(verifier.is_proof_verified(proof_hash), "PROOF_NOT_VERIFIED");
 
-            // 2. Verify the proof's IO commitment matches this action's commitment.
+            // 2. Verify proof hasn't been used for another action (replay protection)
+            assert!(!self.used_proof_hashes.entry(proof_hash).read(), "PROOF_ALREADY_USED");
+            self.used_proof_hashes.entry(proof_hash).write(true);
+
+            // 3. Verify the proof's IO commitment matches this action's commitment.
             // This proves the classifier scored THIS specific transaction, not a different one.
             let proof_io = verifier.get_proof_io_commitment(proof_hash);
             let action_io = self.action_io_commitment.entry(action_id).read();
             assert!(proof_io == action_io, "IO_COMMITMENT_MISMATCH");
 
-            // 3. Verify the proof came from the registered classifier model.
+            // 4. Verify the proof came from the registered classifier model.
             let model_id = self.classifier_model_id.read();
             let proof_model = verifier.get_proof_model_id(proof_hash);
             assert!(proof_model == model_id, "MODEL_ID_MISMATCH");
 
-            // 4. Verify the classifier model has a policy registered (strict required)
+            // 5. Verify the classifier model has a policy registered (strict required)
             let registered_policy = verifier.get_model_policy(model_id);
             assert!(registered_policy != 0, "NO_POLICY_REGISTERED");
 
-            // 3. Validate threat score is in range
+            // 6. Validate threat score is in range
             assert!(threat_score <= 100000, "SCORE_OUT_OF_RANGE");
 
-            // 4. Apply decision based on thresholds
+            // 7. Apply decision based on thresholds
             let block_threshold = self.block_threshold.read();
             let escalate_threshold = self.escalate_threshold.read();
 
@@ -389,7 +427,7 @@ pub mod AgentFirewallZK {
                 1 // approve
             };
 
-            // 5. Update EMA trust score (alpha = 0.3)
+            // 8. Update EMA trust score (alpha = 0.3)
             let prev_score = self.agent_trust_score.entry(agent_id).read();
             let new_score = (EMA_ALPHA_NUM * threat_score.into()
                 + (EMA_ALPHA_DEN - EMA_ALPHA_NUM) * prev_score)
@@ -399,7 +437,7 @@ pub mod AgentFirewallZK {
                 agent_id, old_score: prev_score, new_score, raw_score: threat_score
             });
 
-            // 6. Strike mechanism (strikes on escalate or block)
+            // 9. Strike mechanism (strikes on escalate or block)
             if threat_score >= escalate_threshold {
                 let strikes = self.agent_strikes.entry(agent_id).read() + 1;
                 self.agent_strikes.entry(agent_id).write(strikes);
@@ -413,7 +451,7 @@ pub mod AgentFirewallZK {
                 }
             }
 
-            // 7. Record resolution
+            // 10. Record resolution
             self.action_decision.entry(action_id).write(decision);
             self.action_threat_score.entry(action_id).write(threat_score);
             self.action_proof_hash.entry(action_id).write(proof_hash);
@@ -467,15 +505,22 @@ pub mod AgentFirewallZK {
             self.escalate_threshold.write(escalate_threshold);
             self.block_threshold.write(block_threshold);
             self.max_strikes.write(max_strikes);
+            self.emit(ThresholdsUpdated {
+                escalate_threshold, block_threshold, max_strikes,
+                updated_by: get_caller_address(),
+            });
         }
 
         fn set_verifier(ref self: ContractState, verifier_address: ContractAddress) {
             assert!(get_caller_address() == self.owner.read(), "ONLY_OWNER");
+            let zero_addr: ContractAddress = 0_felt252.try_into().unwrap();
+            assert!(verifier_address != zero_addr, "VERIFIER_CANNOT_BE_ZERO");
             self.verifier_address.write(verifier_address);
         }
 
         fn set_classifier_model(ref self: ContractState, model_id: felt252) {
             assert!(get_caller_address() == self.owner.read(), "ONLY_OWNER");
+            assert!(model_id != 0, "MODEL_ID_CANNOT_BE_ZERO");
             self.classifier_model_id.write(model_id);
         }
 
@@ -508,6 +553,14 @@ pub mod AgentFirewallZK {
 
         fn is_agent_registered(self: @ContractState, agent_id: felt252) -> bool {
             self.agent_registered.entry(agent_id).read()
+        }
+
+        fn get_agent_owner(self: @ContractState, agent_id: felt252) -> ContractAddress {
+            self.agent_owner.entry(agent_id).read()
+        }
+
+        fn get_action_agent(self: @ContractState, action_id: u64) -> felt252 {
+            self.action_agent.entry(action_id).read()
         }
 
         fn get_action_decision(self: @ContractState, action_id: u64) -> u8 {
