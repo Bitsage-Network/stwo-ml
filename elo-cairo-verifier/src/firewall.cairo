@@ -49,11 +49,19 @@ pub trait IAgentFirewall<TContractState> {
     ///
     /// The proof must have been verified on the ObelyskVerifier contract.
     /// The classifier model must have the strict policy registered.
+    ///
+    /// The threat score is NOT caller-supplied — it is extracted from the
+    /// packed IO data and computed on-chain. The caller provides packed_raw_io
+    /// as calldata, which is verified against the proof's io_commitment via
+    /// Poseidon hash. The 3 output neurons (safe, suspicious, malicious) are
+    /// extracted and the threat score is computed as:
+    ///   threat_score = (malicious * 100000) / (safe + suspicious + malicious)
     fn resolve_action_with_proof(
         ref self: TContractState,
         action_id: u64,
         proof_hash: felt252,
-        threat_score: u32,
+        original_io_len: u32,
+        packed_raw_io: Array<felt252>,
     );
 
     /// Approve an escalated action (agent owner only, for human-in-the-loop).
@@ -126,13 +134,19 @@ pub trait IAgentFirewall<TContractState> {
     fn get_thresholds(self: @TContractState) -> (u32, u32, u32);
 }
 
+/// Extract a single M31 value (31-bit unsigned) from packed felt252 array.
+/// Each felt252 holds 8 M31 values. Re-exported from crate::field for firewall use.
+fn extract_m31(packed_felts: Span<felt252>, m31_index: u32) -> u32 {
+    crate::field::extract_m31_from_packed(packed_felts, m31_index)
+}
+
 #[starknet::contract]
 pub mod AgentFirewallZK {
     use starknet::storage::{
         StoragePointerReadAccess, StoragePointerWriteAccess, Map, StoragePathEntry,
     };
     use starknet::{ContractAddress, get_caller_address, get_block_timestamp};
-    use super::{IVerifierDispatcher, IVerifierDispatcherTrait};
+    use super::{IVerifierDispatcher, IVerifierDispatcherTrait, extract_m31};
 
     // ── Constants ────────────────────────────────────────────────────
 
@@ -369,7 +383,8 @@ pub mod AgentFirewallZK {
             ref self: ContractState,
             action_id: u64,
             proof_hash: felt252,
-            threat_score: u32,
+            original_io_len: u32,
+            packed_raw_io: Array<felt252>,
         ) {
             // Action must exist and not be resolved
             let agent_id = self.action_agent.entry(action_id).read();
@@ -397,23 +412,58 @@ pub mod AgentFirewallZK {
             assert!(!self.used_proof_hashes.entry(proof_hash).read(), "PROOF_ALREADY_USED");
             self.used_proof_hashes.entry(proof_hash).write(true);
 
-            // 3. Verify the proof's IO commitment matches this action's commitment.
-            // This proves the classifier scored THIS specific transaction, not a different one.
-            let proof_io = verifier.get_proof_io_commitment(proof_hash);
-            let action_io = self.action_io_commitment.entry(action_id).read();
-            assert!(proof_io == action_io, "IO_COMMITMENT_MISMATCH");
+            // 3. Recompute io_commitment from calldata and verify against proof.
+            // This is the CRITICAL security check: we don't trust any caller-supplied
+            // score — we verify the raw IO data matches the proof, then extract the
+            // output neurons ourselves.
+            let mut commitment_input: Array<felt252> = array![original_io_len.into()];
+            let packed_span = packed_raw_io.span();
+            let mut ci: u32 = 0;
+            loop {
+                if ci >= packed_span.len() {
+                    break;
+                }
+                commitment_input.append(*packed_span.at(ci));
+                ci += 1;
+            };
+            let recomputed_io = core::poseidon::poseidon_hash_span(commitment_input.span());
 
-            // 4. Verify the proof came from the registered classifier model.
+            // Verify against the stored action io_commitment
+            let action_io = self.action_io_commitment.entry(action_id).read();
+            assert!(recomputed_io == action_io, "IO_COMMITMENT_MISMATCH");
+
+            // Also verify against the proof's stored io_commitment (belt + suspenders)
+            let proof_io = verifier.get_proof_io_commitment(proof_hash);
+            assert!(proof_io == action_io, "PROOF_IO_MISMATCH");
+
+            // 4. Extract output neurons from packed IO data.
+            // Layout: [in_rows, in_cols, in_len, ...input..., out_rows, out_cols, out_len, score0, score1, score2]
+            let in_len: u32 = extract_m31(packed_span, 2);
+            let out_start: u32 = 3 + in_len;
+            let out_len: u32 = extract_m31(packed_span, out_start + 2);
+            assert!(out_len >= 3, "CLASSIFIER_OUTPUT_TOO_SHORT");
+
+            let score_safe: u64 = extract_m31(packed_span, out_start + 3).into();
+            let score_suspicious: u64 = extract_m31(packed_span, out_start + 4).into();
+            let score_malicious: u64 = extract_m31(packed_span, out_start + 5).into();
+
+            // 5. Compute threat score on-chain (not caller-supplied!)
+            let total = score_safe + score_suspicious + score_malicious;
+            let threat_score: u32 = if total == 0 {
+                50000 // ambiguous → escalate
+            } else {
+                // threat = (malicious / total) * 100000
+                ((score_malicious * 100000) / total).try_into().unwrap()
+            };
+
+            // 6. Verify the proof came from the registered classifier model.
             let model_id = self.classifier_model_id.read();
             let proof_model = verifier.get_proof_model_id(proof_hash);
             assert!(proof_model == model_id, "MODEL_ID_MISMATCH");
 
-            // 5. Verify the classifier model has a policy registered (strict required)
+            // 7. Verify the classifier model has a policy registered (strict required)
             let registered_policy = verifier.get_model_policy(model_id);
             assert!(registered_policy != 0, "NO_POLICY_REGISTERED");
-
-            // 6. Validate threat score is in range
-            assert!(threat_score <= 100000, "SCORE_OUT_OF_RANGE");
 
             // 7. Apply decision based on thresholds
             let block_threshold = self.block_threshold.read();
