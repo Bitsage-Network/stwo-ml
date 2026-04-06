@@ -344,7 +344,7 @@ struct VerifyResponse {
 /// and returns the proven threat score + decision.
 #[derive(Deserialize)]
 struct ClassifyRequest {
-    /// Target contract address (hex felt252).
+    /// Target contract address (hex felt252). Required.
     target: String,
     /// Transaction value (decimal string, u256).
     #[serde(default)]
@@ -355,7 +355,7 @@ struct ClassifyRequest {
     /// Calldata hex (after selector).
     #[serde(default)]
     calldata: String,
-    /// Agent's current trust score (0-100000).
+    /// Agent's current trust score (0-100000). Clamped to range.
     #[serde(default)]
     agent_trust_score: u32,
     /// Agent's current strike count.
@@ -364,11 +364,31 @@ struct ClassifyRequest {
     /// Agent age in blocks since registration.
     #[serde(default)]
     agent_age_blocks: u32,
+    /// Target contract metadata.
+    #[serde(default)]
+    target_verified: bool,
+    #[serde(default)]
+    target_is_proxy: bool,
+    #[serde(default)]
+    target_has_source: bool,
+    #[serde(default)]
+    target_interaction_count: u32,
+    /// Behavioral features.
+    #[serde(default)]
+    tx_frequency: u32,
+    #[serde(default)]
+    unique_targets_24h: u32,
+    #[serde(default)]
+    avg_value_24h: u32,
+    #[serde(default)]
+    max_value_24h: u32,
 }
 
 /// Response from the classifier endpoint.
 #[derive(Serialize)]
 struct ClassifyResponse {
+    /// Unique request ID for tracking.
+    request_id: String,
     /// Decision: "approve", "escalate", or "block".
     decision: String,
     /// Threat score (0-100000).
@@ -2117,33 +2137,64 @@ async fn attest(
 /// PolicyConfig::strict(), and returns the proven threat score + decision.
 /// The proof can be submitted to the ObelyskVerifier for on-chain verification.
 async fn classify(
+    State(state): State<Arc<AppState>>,
     Json(req): Json<ClassifyRequest>,
 ) -> Result<Json<ClassifyResponse>, (StatusCode, Json<ErrorResponse>)> {
     use stwo_ml::classifier::*;
     use stwo_ml::policy::PolicyConfig;
 
-    // Parse target address
+    // Generate unique request ID
+    let request_id = uuid::Uuid::new_v4().to_string();
+
+    // ── Input validation ────────────────────────────────────────────
+
+    // Target address (required, must be valid hex)
+    if req.target.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse {
+            error: "target address is required".to_string(),
+        })));
+    }
     let target = starknet_ff::FieldElement::from_hex_be(&req.target).map_err(|e| {
         (StatusCode::BAD_REQUEST, Json(ErrorResponse {
             error: format!("invalid target address: {e}"),
         }))
     })?;
 
-    // Parse value (u256 as decimal → two u128 halves)
-    let value_u128: u128 = req.value.parse().unwrap_or(0);
-    let value: [u128; 2] = [0, value_u128]; // low half only for now
+    // Value (u256 as decimal — parse both halves for large values)
+    let value_str = if req.value.is_empty() { "0" } else { &req.value };
+    let value_u128: u128 = value_str.parse().map_err(|e| {
+        (StatusCode::BAD_REQUEST, Json(ErrorResponse {
+            error: format!("invalid value (must be decimal u128): {e}"),
+        }))
+    })?;
+    let value: [u128; 2] = [0, value_u128];
 
-    // Parse selector
-    let selector: u32 = u32::from_str_radix(
-        req.selector.trim_start_matches("0x").trim_start_matches("0X"),
-        16,
-    ).unwrap_or(0);
+    // Selector (hex, 4 bytes)
+    let selector_hex = req.selector.trim_start_matches("0x").trim_start_matches("0X");
+    let selector: u32 = if selector_hex.is_empty() {
+        0
+    } else {
+        u32::from_str_radix(selector_hex, 16).map_err(|e| {
+            (StatusCode::BAD_REQUEST, Json(ErrorResponse {
+                error: format!("invalid selector (must be hex u32): {e}"),
+            }))
+        })?
+    };
 
-    // Parse calldata prefix (first 8 u32 words)
+    // Calldata (hex, variable length — parse safely)
     let calldata_hex = req.calldata.trim_start_matches("0x").trim_start_matches("0X");
-    let calldata_bytes: Vec<u8> = (0..calldata_hex.len())
+    // Ensure even length for hex pairs
+    let safe_hex = if calldata_hex.len() % 2 != 0 {
+        format!("0{calldata_hex}")
+    } else {
+        calldata_hex.to_string()
+    };
+    let calldata_bytes: Vec<u8> = (0..safe_hex.len())
         .step_by(2)
-        .filter_map(|i| u8::from_str_radix(&calldata_hex[i..i.min(calldata_hex.len()).max(i + 2)], 16).ok())
+        .filter_map(|i| {
+            safe_hex.get(i..i + 2)
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+        })
         .collect();
     let mut calldata_prefix = [0u32; 8];
     for (i, chunk) in calldata_bytes.chunks(4).take(8).enumerate() {
@@ -2152,32 +2203,58 @@ async fn classify(
         calldata_prefix[i] = u32::from_be_bytes(buf);
     }
 
-    // Build transaction features
+    // Clamp trust score to valid range
+    let agent_trust_score = req.agent_trust_score.min(100_000);
+
+    // ── Build features ──────────────────────────────────────────────
+
+    // Derive value features from the parsed value
+    let log2_value = if value_u128 > 0 { (128 - value_u128.leading_zeros()) } else { 0 };
+    let is_max_approval = value_u128 == u128::MAX;
+
     let tx = TransactionFeatures {
         target,
         value,
         selector,
         calldata_prefix,
         calldata_len: calldata_bytes.len() as u32,
-        agent_trust_score: req.agent_trust_score,
+        agent_trust_score,
         agent_strikes: req.agent_strikes,
         agent_age_blocks: req.agent_age_blocks,
-        target_flags: TargetFlags::default(),
-        value_features: ValueFeatures::default(),
+        target_flags: TargetFlags {
+            is_verified: req.target_verified,
+            is_proxy: req.target_is_proxy,
+            has_source: req.target_has_source,
+            interaction_count: req.target_interaction_count,
+        },
+        value_features: ValueFeatures {
+            log2_value,
+            value_balance_ratio: 0, // TODO: needs agent balance context
+            is_max_approval,
+            is_zero_value: value_u128 == 0,
+        },
         selector_features: SelectorFeatures {
             is_transfer: selector == 0xa9059cbb || selector == 0x23b872dd,
             is_approve: selector == 0x095ea7b3,
             is_swap: selector == 0x38ed1739 || selector == 0x7ff36ab5 || selector == 0x18cbafe5,
             is_unknown: selector == 0,
         },
-        behavioral: BehavioralFeatures::default(),
+        behavioral: BehavioralFeatures {
+            tx_frequency: req.tx_frequency,
+            unique_targets_24h: req.unique_targets_24h,
+            avg_value_24h: req.avg_value_24h,
+            max_value_24h: req.max_value_24h,
+        },
     };
 
+    // ── Prove ───────────────────────────────────────────────────────
+
     // Build classifier model (test weights — replace with trained model in production)
+    // TODO: cache the model in AppState to avoid rebuilding on every request
     let model = build_test_classifier();
     let policy = PolicyConfig::strict();
 
-    // Run classifier + prove on a blocking thread (CPU-heavy)
+    // Run classifier + prove on a blocking thread (CPU-heavy, ~1s release / ~10s debug)
     let result = tokio::task::spawn_blocking(move || {
         evaluate_transaction(&tx, &model, &policy)
     })
@@ -2194,6 +2271,7 @@ async fn classify(
     })?;
 
     Ok(Json(ClassifyResponse {
+        request_id,
         decision: result.decision.to_string(),
         threat_score: result.threat_score,
         scores: result.scores,
