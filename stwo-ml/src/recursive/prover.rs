@@ -39,7 +39,7 @@ use crate::gkr::types::GKRProof;
 
 use super::air::{build_recursive_trace, RecursiveVerifierEval};
 use super::types::{RecursiveProof, RecursiveProofMetadata, RecursivePublicInputs};
-use super::witness::generate_witness;
+use super::witness::generate_witness_with_policy;
 
 /// Error type for recursive proving.
 #[derive(Debug)]
@@ -95,17 +95,32 @@ pub fn prove_recursive(
     io_commitment: QM31,
     gkr_prove_time_secs: f64,
 ) -> Result<RecursiveProof, RecursiveError> {
+    prove_recursive_with_policy(circuit, gkr_proof, output, weights, weight_super_root, io_commitment, gkr_prove_time_secs, None)
+}
+
+/// Generate a recursive STARK proof with explicit policy binding.
+pub fn prove_recursive_with_policy(
+    circuit: &LayeredCircuit,
+    gkr_proof: &GKRProof,
+    output: &M31Matrix,
+    weights: &GraphWeights,
+    weight_super_root: QM31,
+    io_commitment: QM31,
+    gkr_prove_time_secs: f64,
+    policy: Option<&crate::policy::PolicyConfig>,
+) -> Result<RecursiveProof, RecursiveError> {
     let t_start = std::time::Instant::now();
 
     // ── Step 1: Generate witness ─────────────────────────────────────
     eprintln!("  [Recursive] Step 1/4: Generating verifier witness...");
-    let witness = generate_witness(
+    let witness = generate_witness_with_policy(
         circuit,
         gkr_proof,
         output,
         Some(weights),
         weight_super_root,
         io_commitment,
+        policy,
     )
     .map_err(|e| RecursiveError::GkrVerificationFailed(format!("{e:?}")))?;
 

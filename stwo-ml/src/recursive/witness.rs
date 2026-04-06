@@ -385,6 +385,22 @@ pub fn generate_witness(
     weight_super_root: QM31,
     io_commitment: QM31,
 ) -> Result<GkrVerifierWitness, crate::gkr::types::GKRError> {
+    generate_witness_with_policy(circuit, proof, output, weights, weight_super_root, io_commitment, None)
+}
+
+/// Generate witness with explicit policy binding.
+///
+/// The policy must match the one used during proving — otherwise the
+/// Fiat-Shamir channel diverges and verification fails in Pass 1.
+pub fn generate_witness_with_policy(
+    circuit: &crate::gkr::circuit::LayeredCircuit,
+    proof: &crate::gkr::types::GKRProof,
+    output: &crate::components::matmul::M31Matrix,
+    weights: Option<&crate::compiler::graph::GraphWeights>,
+    weight_super_root: QM31,
+    io_commitment: QM31,
+    policy: Option<&crate::policy::PolicyConfig>,
+) -> Result<GkrVerifierWitness, crate::gkr::types::GKRError> {
     use crate::components::matmul::{
         evaluate_mle_pub as evaluate_mle, matrix_to_mle_pub as matrix_to_mle, pad_matrix_pow2,
     };
@@ -393,8 +409,11 @@ pub fn generate_witness(
     // ── Pass 1: production verification ──────────────────────────────
     // Run the real verifier to (a) confirm validity, (b) measure hash_count,
     // and (c) capture the final channel digest.
+    // Policy must match the prover's policy for channel alignment.
     let mut prod_channel = crate::crypto::poseidon_channel::PoseidonChannel::new();
-    let _claim = if let Some(w) = weights {
+    let _claim = if let Some(p) = policy {
+        crate::gkr::verifier::verify_gkr_with_policy(circuit, proof, output, weights, &mut prod_channel, p)?
+    } else if let Some(w) = weights {
         crate::gkr::verifier::verify_gkr_with_weights(circuit, proof, output, w, &mut prod_channel)?
     } else {
         crate::gkr::verifier::verify_gkr(circuit, proof, output, &mut prod_channel)?

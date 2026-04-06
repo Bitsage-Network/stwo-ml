@@ -2309,7 +2309,7 @@ fn main() {
                 stwo::core::fields::qm31::QM31::default()
             };
 
-            match stwo_ml::recursive::prove_recursive(
+            match stwo_ml::recursive::prove_recursive_with_policy(
                 &circuit,
                 gkr,
                 &proof.execution.output,
@@ -2317,6 +2317,7 @@ fn main() {
                 recursive_weight_root,
                 recursive_io_qm31,
                 prove_elapsed.as_secs_f64(),
+                Some(&resolved_policy),
             ) {
                 Ok(recursive_proof) => {
                     eprintln!(

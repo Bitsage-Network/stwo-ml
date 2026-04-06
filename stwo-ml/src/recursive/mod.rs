@@ -38,7 +38,7 @@ pub use air::{
     build_recursive_trace, RecursiveTraceData, RecursiveVerifierComponent, RecursiveVerifierEval,
     COLS_PER_ROW,
 };
-pub use prover::{prove_recursive, RecursiveError};
+pub use prover::{prove_recursive, prove_recursive_with_policy, RecursiveError};
 pub use verifier::verify_recursive;
 pub use types::{GkrVerifierWitness, RecursiveProof, RecursivePublicInputs, WitnessOp};
 pub use witness::{generate_witness, InstrumentedChannel};
