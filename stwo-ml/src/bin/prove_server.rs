@@ -2378,9 +2378,10 @@ async fn classify(
 
     // ── Prove ───────────────────────────────────────────────────────
 
-    // Build classifier model (test weights — replace with trained model in production)
+    // Build classifier model with trained weights.
+    // Weights trained on 75K labeled transactions (10 exploit patterns + 8 safe DeFi patterns).
     // TODO: cache the model in AppState to avoid rebuilding on every request
-    let model = build_test_classifier();
+    let model = build_trained_classifier();
     let policy = PolicyConfig::strict();
 
     // Run classifier + prove on a blocking thread (CPU-heavy, ~1s release / ~10s debug)

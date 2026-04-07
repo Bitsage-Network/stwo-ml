@@ -78,6 +78,27 @@ pub fn build_test_classifier() -> ClassifierModel {
     ClassifierModel { graph, weights }
 }
 
+/// Create a classifier model with trained weights.
+///
+/// These weights were trained on 75K labeled transactions (10 real exploit
+/// patterns + 8 safe DeFi patterns) and quantized to M31. See
+/// `training/train.py` and `training/data_sources.py` for the pipeline.
+///
+/// The weights are embedded as const arrays — no file I/O at runtime.
+pub fn build_trained_classifier() -> ClassifierModel {
+    use super::trained_weights::*;
+
+    let graph = build_classifier_graph();
+    let weights = load_weights_from_arrays(
+        &LAYER0_WEIGHTS,
+        &LAYER2_WEIGHTS,
+        &LAYER4_WEIGHTS,
+    )
+    .expect("trained weight dimensions must match architecture");
+
+    ClassifierModel { graph, weights }
+}
+
 /// Load classifier weights from raw M31 arrays.
 ///
 /// Each array contains row-major weight values. The arrays must have
@@ -169,5 +190,27 @@ mod tests {
         let too_short = vec![0u32; 100];
         let result = load_weights_from_arrays(&too_short, &[], &[]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_build_trained_classifier() {
+        let model = build_trained_classifier();
+        assert_eq!(model.graph.nodes.len(), 5);
+
+        let w0 = model.weights.get_weight(0).unwrap();
+        assert_eq!(w0.rows, 64);
+        assert_eq!(w0.cols, 64);
+
+        let w2 = model.weights.get_weight(2).unwrap();
+        assert_eq!(w2.rows, 64);
+        assert_eq!(w2.cols, 32);
+
+        let w4 = model.weights.get_weight(4).unwrap();
+        assert_eq!(w4.rows, 32);
+        assert_eq!(w4.cols, NUM_CLASSES);
+
+        // Verify weights are non-trivial (not all zeros)
+        let sum: u64 = w0.data.iter().map(|m| m.0 as u64).sum();
+        assert!(sum > 0, "trained weights should be non-zero");
     }
 }
