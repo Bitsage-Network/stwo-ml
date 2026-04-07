@@ -253,8 +253,8 @@ def main():
         data = np.load(args.dataset)
         features, labels = data["features"], data["labels"]
     else:
-        print("Generating synthetic dataset (60K samples)...")
-        features, labels = generate_dataset(40000, 12000, 8000)
+        print("Generating synthetic dataset v2 (100K samples)...")
+        features, labels = generate_dataset(scale=1.0)
 
     print(f"Dataset: {features.shape[0]} samples, {features.shape[1]} features")
     print(f"Labels: safe={np.sum(labels==0)}, suspicious={np.sum(labels==1)}, malicious={np.sum(labels==2)}")
