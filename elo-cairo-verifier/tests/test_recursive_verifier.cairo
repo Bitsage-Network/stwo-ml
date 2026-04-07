@@ -333,7 +333,6 @@ fn test_re_register_model_updates_policy() {
 use super::test_recursive_data;
 
 #[test]
-#[ignore]  // Requires --max-n-steps 500000000 (STARK verification is expensive)
 fn test_verify_recursive_proof_valid() {
     let verifier = deploy_verifier();
     as_owner(@verifier);
@@ -359,7 +358,6 @@ fn test_verify_recursive_proof_valid() {
 }
 
 #[test]
-#[ignore]  // Requires --max-n-steps 500000000
 #[should_panic(expected: 'Already verified')]
 fn test_verify_proof_replay_rejected() {
     let verifier = deploy_verifier();
@@ -387,7 +385,6 @@ fn test_verify_proof_replay_rejected() {
 }
 
 #[test]
-#[ignore]  // Requires --max-n-steps 500000000
 #[should_panic]  // STARK verification rejects tampered proof
 fn test_verify_bit_flip_rejected() {
     let verifier = deploy_verifier();
