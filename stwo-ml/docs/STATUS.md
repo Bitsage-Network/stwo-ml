@@ -83,7 +83,7 @@ On top of the prover, we built a **transaction classifier** and **on-chain firew
 
 | Contract | Address | Purpose |
 |----------|---------|---------|
-| **Recursive Verifier** | [`0x707819de...`](https://sepolia.starkscan.co/contract/0x1c208a5fe731c0d03b098b524f274c537587ea1d43d903838cc4a2bf90c40c7) | 1-TX STARK verification (OODS+Merkle+FRI+PoW) |
+| **Recursive Verifier** | [`0x1c208a5f...`](https://sepolia.starkscan.co/contract/0x1c208a5fe731c0d03b098b524f274c537587ea1d43d903838cc4a2bf90c40c7) | 1-TX STARK verification (OODS+Merkle+FRI+PoW) |
 | **Streaming Verifier** | [`0x0121d1e9...`](https://sepolia.starkscan.co/contract/0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005) | 6-TX GKR streaming verification |
 | **AgentFirewallZK** | [`0x043b51f6...`](https://sepolia.starkscan.co/contract/0x043b51f6f571137d0e7c3afa4ca689e84271ba97c5b6fc83349a3fe1275634f0) | Agent management, action gating, trust scoring |
 | **ContractRegistry** | [`0x075f9812...`](https://sepolia.starkscan.co/contract/0x075f9812753666ee506509de0de10bdea3ad1a79d4ed31817a0e2534c9d90607) | Target contract attestations (is_verified, has_source) |
