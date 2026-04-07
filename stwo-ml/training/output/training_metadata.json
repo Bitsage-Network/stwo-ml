@@ -1,14 +1,14 @@
 {
-  "dataset_size": 85000,
-  "train_size": 57800,
-  "val_size": 10200,
-  "test_size": 17000,
-  "epochs": 150,
+  "dataset_size": 75000,
+  "train_size": 51000,
+  "val_size": 9000,
+  "test_size": 15000,
+  "epochs": 200,
   "lr": 0.001,
   "batch_size": 256,
-  "best_val_f1": 0.9995141923078424,
-  "test_f1": 0.9989897609680843,
-  "training_time_s": 27.499303102493286,
+  "best_val_f1": 1.0,
+  "test_f1": 1.0,
+  "training_time_s": 32.71585988998413,
   "total_weights": 6240,
-  "quantization_agreement": 0.3323529411764706
+  "quantization_agreement": 0.3280666666666667
 }

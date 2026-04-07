@@ -203,7 +203,7 @@ The published packages have mismatched contents:
 
 **Severity**: Medium
 
-`https://api.obelysk.xyz` is referenced in documentation and SDK code, but its operational status is unverified. The `prove-server` binary exists in the codebase and has a WebSocket streaming dashboard, but whether it is deployed and accepting requests at the documented URL is unknown.
+`https://api.bitsage.network` is referenced in documentation and SDK code, but its operational status is unverified. The `prove-server` binary exists in the codebase and has a WebSocket streaming dashboard, but whether it is deployed and accepting requests at the documented URL is unknown.
 
 ### 3.7 No Adversarial Testing
 

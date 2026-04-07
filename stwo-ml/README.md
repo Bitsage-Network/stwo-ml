@@ -24,7 +24,7 @@ npm install @obelyzk/sdk
 ```typescript
 import { createObelyzkClient } from "@obelyzk/sdk";
 
-const client = createObelyzkClient(); // defaults to https://api.obelysk.xyz
+const client = createObelyzkClient(); // defaults to https://api.bitsage.network
 const proof = await client.prove("smollm2-135m", {
   input: "Hello world",
   gpu: true,
@@ -44,7 +44,7 @@ pip install obelyzk
 ```python
 from obelyzk import ObelyzkClient
 
-client = ObelyzkClient()  # defaults to https://api.obelysk.xyz
+client = ObelyzkClient()  # defaults to https://api.bitsage.network
 result = client.prove("smollm2-135m", input="Hello world", gpu=True)
 
 print(result.tx_hash)
@@ -194,7 +194,7 @@ Any HuggingFace transformer with SafeTensors weights is supported. The HF loader
 | `obelyzk` (Python) | `pip install obelyzk` | [sdk/python/README.md](sdk/python/README.md) |
 | `@obelyzk/cli` | `npm install -g @obelyzk/cli` | [sdk/cli/README.md](sdk/cli/README.md) |
 
-All SDKs default to `https://api.obelysk.xyz`. Set `OBELYZK_API_URL` to point at a self-hosted prover.
+All SDKs default to `https://api.bitsage.network`. Set `OBELYZK_API_URL` to point at a self-hosted prover.
 
 ---
 
@@ -241,7 +241,7 @@ The most important configuration options. Full reference: [docs/ENV_VARS.md](doc
 
 | Variable | Default | Description |
 |---|---|---|
-| `OBELYZK_API_URL` | `https://api.obelysk.xyz` | Prover API endpoint for SDKs and CLI |
+| `OBELYZK_API_URL` | `https://api.bitsage.network` | Prover API endpoint for SDKs and CLI |
 | `STARKNET_PRIVATE_KEY` | -- | Account private key for on-chain TX submission |
 | `STARKNET_RPC` | Alchemy Sepolia | Starknet JSON-RPC endpoint |
 | `RECURSIVE_CONTRACT` | Deployed address | Recursive verifier contract address |

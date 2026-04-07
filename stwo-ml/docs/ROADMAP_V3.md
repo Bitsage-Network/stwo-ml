@@ -251,13 +251,13 @@ These items build the infrastructure needed for external users and production de
 
 ### Item 9: Deploy Prove-Server as Hosted API
 
-**Description**: Deploy the `prove-server` binary on the A10G instance behind `api.obelysk.xyz`. Add health checks, rate limiting, API key authentication, and monitoring.
+**Description**: Deploy the `prove-server` binary on the A10G instance behind `api.bitsage.network`. Add health checks, rate limiting, API key authentication, and monitoring.
 
 **Why it matters**: The hosted API is the primary access point for SDK users. Without it, all proving requires building from source and having GPU access. This is the bridge between "research project" and "developer product."
 
 **Estimated effort**: 5-7 days
 
-**Dependencies**: A10G instance is already running. DNS for `api.obelysk.xyz` must be configured.
+**Dependencies**: A10G instance is already running. DNS for `api.bitsage.network` must be configured.
 
 **Work items**:
 1. Set up nginx reverse proxy on A10G with TLS (Let's Encrypt).
@@ -271,8 +271,8 @@ These items build the infrastructure needed for external users and production de
 9. Document the API in a minimal OpenAPI spec.
 
 **Acceptance criteria**:
-- `curl https://api.obelysk.xyz/health` returns 200 with server status.
-- `curl -X POST https://api.obelysk.xyz/api/v1/prove -H "X-API-Key: ..." -d '{"model":"smollm2-135m","input":"Hello"}'` returns a valid proof.
+- `curl https://api.bitsage.network/health` returns 200 with server status.
+- `curl -X POST https://api.bitsage.network/api/v1/prove -H "X-API-Key: ..." -d '{"model":"smollm2-135m","input":"Hello"}'` returns a valid proof.
 - Rate limiting rejects excessive requests with 429.
 - Invalid API keys receive 401.
 
