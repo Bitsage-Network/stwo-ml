@@ -83,8 +83,8 @@ A recursive STARK proof has been verified on Starknet Sepolia in a single transa
 
 | Field | Value |
 |-------|-------|
-| Contract | `0x707819dea6210ab58b358151419a604ffdb16809b568bf6f8933067c2a28715` |
-| Class hash | `0x05057fff1ced4c9044d3613256b0e9718e05b07760b6570c5f883aad73e163ea` |
+| Contract | `0x526fcdb940f92dc50bc3a234ffafe6d08d7b2e3b69f6cb41678331ee6a5a03c` |
+| Class hash | `0x0300ff964fe615d094af601074b76b7193b564e0c7215c7b98bc046334c35bcf` |
 | First verified proof TX | `0x276c6a448829c0f3975080914a89c2a9611fc41912aff1fddfe29d8f3364ddc` |
 | MIN_POW_BITS | 10 (production) |
 | Verification type | Full STARK: OODS sampling + Merkle decommitment + FRI layer folding + PoW |
@@ -317,7 +317,7 @@ The streaming GKR verifier contract has a timelock upgrade mechanism (`propose_u
 
 | Contract | Address | Purpose | Status |
 |----------|---------|---------|--------|
-| Recursive Verifier | `0x707819dea6210ab58b358151419a604ffdb16809b568bf6f8933067c2a28715` | Trustless STARK verification (1 TX) | Live on Sepolia |
+| Recursive Verifier | `0x526fcdb940f92dc50bc3a234ffafe6d08d7b2e3b69f6cb41678331ee6a5a03c` | Trustless STARK verification (1 TX) | Live on Sepolia |
 | Streaming Verifier v32 | `0x376fa0c4a9cf3d069e6a5b91bad6e131e7a800f9fced49bd72253a0b0983039` | Multi-TX GKR verification | Live on Sepolia |
 | Deployer v2 | `0x57a93709bb92879f0f9f2cb81a87f9ca47d2d7e54af87dbde2831b0b7e81c1f` | Account for contract operations | Active |
 | Deployer v1 | `0x0759a4374389b0e3cfcc59d49310b6bc75bb12bbf8ce550eb5c2f026918bb344` | Legacy deployer | DEPRECATED |

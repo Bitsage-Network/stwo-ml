@@ -369,7 +369,7 @@ let model = ClassifierModel {
 | **AgentFirewallZK** | [`0x043b51f6f571137d0e7c3afa4ca689e84271ba97c5b6fc83349a3fe1275634f0`](https://sepolia.starkscan.co/contract/0x043b51f6f571137d0e7c3afa4ca689e84271ba97c5b6fc83349a3fe1275634f0) | Live, agent registered |
 | **ContractRegistry** | [`0x075f9812753666ee506509de0de10bdea3ad1a79d4ed31817a0e2534c9d90607`](https://sepolia.starkscan.co/contract/0x075f9812753666ee506509de0de10bdea3ad1a79d4ed31817a0e2534c9d90607) | Live, linked to firewall |
 | **ObelyskVerifier** | [`0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005`](https://sepolia.starkscan.co/contract/0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005) | Live, streaming GKR |
-| **Recursive Verifier** | [`0x707819dea6210ab58b358151419a604ffdb16809b568bf6f8933067c2a28715`](https://sepolia.starkscan.co/contract/0x707819dea6210ab58b358151419a604ffdb16809b568bf6f8933067c2a28715) | Live, 1-TX STARK |
+| **Recursive Verifier** | [`0x526fcdb940f92dc50bc3a234ffafe6d08d7b2e3b69f6cb41678331ee6a5a03c`](https://sepolia.starkscan.co/contract/0x526fcdb940f92dc50bc3a234ffafe6d08d7b2e3b69f6cb41678331ee6a5a03c) | Live, 1-TX STARK |
 | **Prover (A10G GPU)** | `https://prover.bitsage.network` | Live, `/api/v1/classify` |
 
 ## Prove-Server API

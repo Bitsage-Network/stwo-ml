@@ -608,9 +608,9 @@ All success criteria met. The recursive STARK verifier is **live on Starknet Sep
 
 | Field | Value |
 |-------|-------|
-| **Contract** | `0x707819dea6210ab58b358151419a604ffdb16809b568bf6f8933067c2a28715` |
-| **Class hash** | `0x05057fff1ced4c9044d3613256b0e9718e05b07760b6570c5f883aad73e163ea` |
-| **First verified proof** | [`0x276c6a44...`](https://sepolia.starkscan.co/tx/0x276c6a448829c0f3975080914a89c2a9611fc41912aff1fddfe29d8f3364ddc) |
+| **Contract** | `0x526fcdb940f92dc50bc3a234ffafe6d08d7b2e3b69f6cb41678331ee6a5a03c` |
+| **Class hash** | `0x0300ff964fe615d094af601074b76b7193b564e0c7215c7b98bc046334c35bcf` |
+| **First verified proof** | [`0x276c6a44...`](https://sepolia.starkscan.co/tx/0x61a60a7fcf899d38da5e0f4632746f48843e1c537dabe57ea7df42ad71c0ba6) |
 | **MIN_POW_BITS** | 10 (production) |
 
 ### Benchmarks (A10G GPU, SmolLM2-135M 30-layer)

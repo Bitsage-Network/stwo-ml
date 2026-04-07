@@ -118,13 +118,13 @@ by stwo-cairo-verifier (Cairo's native Poseidon for Fiat-Shamir and Merkle).
 
 | Field | Value |
 |-------|-------|
-| **Contract address** | `0x707819dea6210ab58b358151419a604ffdb16809b568bf6f8933067c2a28715` |
-| **Class hash** | `0x05057fff1ced4c9044d3613256b0e9718e05b07760b6570c5f883aad73e163ea` |
+| **Contract address** | `0x526fcdb940f92dc50bc3a234ffafe6d08d7b2e3b69f6cb41678331ee6a5a03c` |
+| **Class hash** | `0x0300ff964fe615d094af601074b76b7193b564e0c7215c7b98bc046334c35bcf` |
 | **Source** | `elo-cairo-verifier/src/recursive_verifier.cairo` |
 | **Deployer** | `0x0759a4374389b0e3cfcc59d49310b6bc75bb12bbf8ce550eb5c2f026918bb344` |
-| **Declare TX** | `0x024a1644356e9ca09cc1658797b6240f2215d29a895689d1bcf5bc17177c4796` |
-| **Deploy TX** | `0x7ece3bd67b20376b777d68a3e5d92eee6c3d82d37477df2e33f478be55f68c1` |
-| **First verification** | `0x276c6a448829c0f3975080914a89c2a9611fc41912aff1fddfe29d8f3364ddc` |
+| **Declare TX** | `0x0684d0b2914a16a6637cfe2ba1b5da4f705f4156e2220e36b0e369ba7bab7a61` |
+| **Deploy TX** | `0x7b7715e4710b7f9e329bb91cffbdc05ac54b1e68b88989bee9fa60ec2dcdb9c` |
+| **First verification** | `0x61a60a7fcf899d38da5e0f4632746f48843e1c537dabe57ea7df42ad71c0ba6` |
 | **MIN_POW_BITS** | 10 (production hardened) |
 | **Status** | **Live on Sepolia. Fully trustless STARK verification.** |
 
@@ -487,7 +487,7 @@ remaining step is deploying the class to Sepolia.
 The fully trustless class hash (`0x006d4ff2332af0f7b1ac4601e266f7bcd7ef3b529f72012677b15445289ce820`)
 needs to be declared on Sepolia. This requires a Juno full node because the
 class size exceeds Alchemy's gateway limits. Once declared, the Phase 1 contract
-at `0x707819dea6210ab58b358151419a604ffdb16809b568bf6f8933067c2a28715`
+at `0x526fcdb940f92dc50bc3a234ffafe6d08d7b2e3b69f6cb41678331ee6a5a03c`
 will be upgraded via the timelock mechanism:
 
 1. Declare the class via Juno node
@@ -524,7 +524,7 @@ Environment variables for on-chain submission:
 ```bash
 export STARKNET_PRIVATE_KEY="<your-key>"
 export STARKNET_RPC="<your-rpc-url>"              # defaults to Alchemy Sepolia
-export RECURSIVE_CONTRACT="0x707819dea6210ab58b358151419a604ffdb16809b568bf6f8933067c2a28715"
+export RECURSIVE_CONTRACT="0x526fcdb940f92dc50bc3a234ffafe6d08d7b2e3b69f6cb41678331ee6a5a03c"
 ```
 
 ### API: `/api/v1/attest` Endpoint

@@ -73,13 +73,13 @@ contract classes cost approximately:
 
 | Field | Value |
 |-------|-------|
-| **Contract** | `0x707819dea6210ab58b358151419a604ffdb16809b568bf6f8933067c2a28715` |
-| **Class hash** | `0x05057fff1ced4c9044d3613256b0e9718e05b07760b6570c5f883aad73e163ea` |
+| **Contract** | `0x526fcdb940f92dc50bc3a234ffafe6d08d7b2e3b69f6cb41678331ee6a5a03c` |
+| **Class hash** | `0x0300ff964fe615d094af601074b76b7193b564e0c7215c7b98bc046334c35bcf` |
 | **Deployer** | `0x0759a4374389b0e3cfcc59d49310b6bc75bb12bbf8ce550eb5c2f026918bb344` |
 | **Source** | `elo-cairo-verifier/src/recursive_verifier.cairo` |
-| **Declare TX** | `0x024a1644356e9ca09cc1658797b6240f2215d29a895689d1bcf5bc17177c4796` |
-| **Deploy TX** | `0x7ece3bd67b20376b777d68a3e5d92eee6c3d82d37477df2e33f478be55f68c1` |
-| **First verified proof** | `0x276c6a448829c0f3975080914a89c2a9611fc41912aff1fddfe29d8f3364ddc` |
+| **Declare TX** | `0x0684d0b2914a16a6637cfe2ba1b5da4f705f4156e2220e36b0e369ba7bab7a61` |
+| **Deploy TX** | `0x7b7715e4710b7f9e329bb91cffbdc05ac54b1e68b88989bee9fa60ec2dcdb9c` |
+| **First verified proof** | `0x61a60a7fcf899d38da5e0f4632746f48843e1c537dabe57ea7df42ad71c0ba6` |
 | **MIN_POW_BITS** | 10 |
 | **Constructor** | `{ owner: DEPLOYER_ADDRESS }` |
 | **Status** | **LIVE on Sepolia -- fully trustless STARK verification** |
@@ -144,7 +144,7 @@ Key entrypoints (streaming flow):
 
 | Version | Class Hash | Notes |
 |---------|------------|-------|
-| **Trustless recursive** | `0x05057fff1ced4c9044d3613256b0e9718e05b07760b6570c5f883aad73e163ea` | **LIVE** -- full OODS+Merkle+FRI+PoW |
+| **Trustless recursive** | `0x0300ff964fe615d094af601074b76b7193b564e0c7215c7b98bc046334c35bcf` | **LIVE** -- full OODS+Merkle+FRI+PoW |
 | Trustless (test, pow=0) | `0x0223790f285eec0571cde551a331e42db0833a2f8eff121a2058ff7772649567` | Test deploy, MIN_POW_BITS=0 |
 | Trustless (old, dict) | `0x006d4ff2332af0f7b1ac4601e266f7bcd7ef3b529f72012677b15445289ce820` | Rejected by sequencer (Sierra 1.8.0 libfunc) |
 | v32 | `0x5dca646786c36f9d68bab802d5c5c4995c37aa7c25bfa59ff20144a283f0956` | Production streaming |
