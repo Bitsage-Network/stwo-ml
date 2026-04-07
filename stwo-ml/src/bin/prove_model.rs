@@ -2866,7 +2866,16 @@ fn main() {
                 "register_calldata": register_calldata_obj,
                 "recursive_proof": if let (Some(ref cd), Some(ref summ)) = (&recursive_calldata, &recursive_summary) {
                     let recursive_contract = std::env::var("RECURSIVE_CONTRACT")
-                        .unwrap_or_else(|_| "0x707819dea6210ab58b358151419a604ffdb16809b568bf6f8933067c2a28715".to_string());
+                        .unwrap_or_else(|_| "0x604ff202cf107d754afcc86c760fbf54430c13591ef72db214bb5c82de4c696".to_string());
+                    // Pack QM31 public inputs as felt252 for on-chain registration
+                    let pack_qm31 = |limbs: &[starknet_ff::FieldElement]| -> String {
+                        let shift31 = starknet_ff::FieldElement::from(1u64 << 31);
+                        let mut result = limbs[0];
+                        result = result * shift31 + limbs[1];
+                        result = result * shift31 + limbs[2];
+                        result = result * shift31 + limbs[3];
+                        format!("0x{:x}", result)
+                    };
                     serde_json::json!({
                         "entrypoint": "verify_recursive",
                         "contract": recursive_contract,
@@ -2875,6 +2884,9 @@ fn main() {
                         "n_commitments": summ.n_commitments,
                         "n_fri_layers": summ.n_fri_layers,
                         "n_queries": summ.n_queries,
+                        "circuit_hash": pack_qm31(&cd[0..4]),
+                        "io_commitment": pack_qm31(&cd[4..8]),
+                        "weight_super_root": pack_qm31(&cd[8..12]),
                         "calldata": cd.iter()
                             .map(|f| format!("0x{:x}", f))
                             .collect::<Vec<_>>(),
@@ -3769,7 +3781,7 @@ fn submit_recursive_proof_onchain(cli: &Cli) {
 
     let proof_path = cli.output.display().to_string();
     let contract = std::env::var("RECURSIVE_CONTRACT")
-        .unwrap_or_else(|_| "0x707819dea6210ab58b358151419a604ffdb16809b568bf6f8933067c2a28715".to_string());
+        .unwrap_or_else(|_| "0x604ff202cf107d754afcc86c760fbf54430c13591ef72db214bb5c82de4c696".to_string());
     let rpc = std::env::var("STARKNET_RPC")
         .unwrap_or_else(|_| "https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_8/demo".to_string());
 

@@ -1951,7 +1951,7 @@ async fn attest(
             if use_recursive {
                 // Recursive path: single TX via submit_recursive.mjs
                 let recursive_contract = std::env::var("RECURSIVE_CONTRACT")
-                    .unwrap_or_else(|_| "0x707819dea6210ab58b358151419a604ffdb16809b568bf6f8933067c2a28715".to_string());
+                    .unwrap_or_else(|_| "0x604ff202cf107d754afcc86c760fbf54430c13591ef72db214bb5c82de4c696".to_string());
 
                 let recursive_cd = attestation.recursive_calldata.as_ref().unwrap();
                 let artifact = serde_json::json!({

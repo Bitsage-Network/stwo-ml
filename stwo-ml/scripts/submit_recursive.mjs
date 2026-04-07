@@ -13,8 +13,20 @@
 import { Account, RpcProvider, CallData } from "starknet";
 import { readFileSync } from "fs";
 
+// Pack 4 M31 limbs (from calldata) into a single felt252
+// Layout: a * 2^93 + b * 2^62 + c * 2^31 + d (Horner form matching Rust)
+function packQm31ToFelt252(limbs) {
+  const shift = 1n << 31n;
+  const parse = (x) => BigInt(typeof x === "string" ? x : "0x" + x.toString(16));
+  let r = parse(limbs[0]);
+  r = r * shift + parse(limbs[1]);
+  r = r * shift + parse(limbs[2]);
+  r = r * shift + parse(limbs[3]);
+  return "0x" + r.toString(16);
+}
+
 const DEFAULT_RPC = process.env.STARKNET_RPC || "https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_8/demo";
-const DEFAULT_CONTRACT = "0x707819dea6210ab58b358151419a604ffdb16809b568bf6f8933067c2a28715";
+const DEFAULT_CONTRACT = "0x604ff202cf107d754afcc86c760fbf54430c13591ef72db214bb5c82de4c696";
 const DEFAULT_ACCOUNT = "0x57a93709bb92879f0f9f2cb81a87f9ca47d2d7e54af87dbde2831b0b7e81c1f";
 
 const RPC = process.env.STARKNET_RPC || DEFAULT_RPC;
@@ -52,9 +64,15 @@ async function main() {
   }
 
   const calldata = recursive.calldata;
+  // Extract real circuit_hash and weight_super_root from proof
+  const circuitHash = recursive.circuit_hash || packQm31ToFelt252(calldata.slice(0, 4));
+  const weightSuperRoot = recursive.weight_super_root || packQm31ToFelt252(calldata.slice(8, 12));
+
   console.log("Contract:      " + CONTRACT);
   console.log("Model ID:      " + modelId);
   console.log("IO Commitment: " + ioCommitment);
+  console.log("Circuit Hash:  " + circuitHash);
+  console.log("Weight Root:   " + weightSuperRoot);
   console.log("Calldata:      " + calldata.length + " felts");
 
   // Step 1: Register model (skip if already registered)
@@ -75,8 +93,8 @@ async function main() {
         entrypoint: "register_model_recursive",
         calldata: CallData.compile({
           model_id: modelId,
-          circuit_hash: "0x1",
-          weight_super_root: "0x1",
+          circuit_hash: circuitHash,
+          weight_super_root: weightSuperRoot,
         }),
       });
       await provider.waitForTransaction(regTx.transaction_hash);
