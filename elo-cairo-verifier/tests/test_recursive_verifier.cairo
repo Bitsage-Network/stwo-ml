@@ -97,6 +97,66 @@ fn test_verification_count_default_zero() {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// GROUP A2: Registration Edge Cases
+// ═══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_register_multiple_models() {
+    let verifier = deploy_verifier();
+    as_owner(@verifier);
+
+    verifier.register_model_recursive(0x1, 0xAA, 0xBB);
+    verifier.register_model_recursive(0x2, 0xCC, 0xDD);
+
+    let info1 = verifier.get_recursive_model_info(0x1);
+    let info2 = verifier.get_recursive_model_info(0x2);
+
+    assert!(info1.circuit_hash == 0xAA, "model 1 circuit_hash wrong");
+    assert!(info2.circuit_hash == 0xCC, "model 2 circuit_hash wrong");
+    assert!(info1.weight_super_root == 0xBB, "model 1 weight_root wrong");
+    assert!(info2.weight_super_root == 0xDD, "model 2 weight_root wrong");
+}
+
+#[test]
+fn test_re_register_model_overwrites() {
+    let verifier = deploy_verifier();
+    as_owner(@verifier);
+
+    verifier.register_model_recursive(MODEL_ID, 0x111, 0x222);
+    verifier.register_model_recursive(MODEL_ID, 0x333, 0x444);
+
+    let info = verifier.get_recursive_model_info(MODEL_ID);
+    assert!(info.circuit_hash == 0x333, "re-register should overwrite circuit_hash");
+    assert!(info.weight_super_root == 0x444, "re-register should overwrite weight_root");
+}
+
+#[test]
+fn test_register_model_owner_stored_correctly() {
+    let verifier = deploy_verifier();
+    as_owner(@verifier);
+
+    verifier.register_model_recursive(MODEL_ID, CIRCUIT_HASH, WEIGHT_ROOT);
+
+    let info = verifier.get_recursive_model_info(MODEL_ID);
+    let owner: ContractAddress = OWNER_ADDR.try_into().unwrap();
+    assert!(info.owner == owner, "owner should be the registrar");
+}
+
+#[test]
+fn test_register_with_zero_circuit_hash() {
+    let verifier = deploy_verifier();
+    as_owner(@verifier);
+
+    // Zero circuit_hash is allowed at registration time
+    // but verify_recursive will reject it with "Model not registered"
+    // because the check is `model.circuit_hash != 0`
+    verifier.register_model_recursive(MODEL_ID, 0, WEIGHT_ROOT);
+
+    let info = verifier.get_recursive_model_info(MODEL_ID);
+    assert!(info.circuit_hash == 0, "zero circuit_hash should be stored");
+}
+
+// ═══════════════════════════════════════════════════════════════
 // GROUP B: Pre-STARK Adversarial Rejection Tests
 // ═══════════════════════════════════════════════════════════════
 
@@ -156,81 +216,154 @@ fn test_verify_weight_binding_mismatch() {
 // and the proof header (QM31 limbs). The STARK proof binds IO through Fiat-Shamir.
 // A separate io_commitment mismatch test would require matching encodings.
 
+#[test]
+#[should_panic(expected: "Proof too short")]
+fn test_verify_empty_proof_rejected() {
+    let verifier = deploy_verifier();
+    as_owner(@verifier);
+    verifier.register_model_recursive(MODEL_ID, CIRCUIT_HASH, WEIGHT_ROOT);
+
+    let empty_proof: Array<felt252> = array![];
+    verifier.verify_recursive(MODEL_ID, IO_COMMITMENT, empty_proof);
+}
+
+#[test]
+#[should_panic(expected: "Proof too short")]
+fn test_verify_proof_boundary_19_felts_rejected() {
+    let verifier = deploy_verifier();
+    as_owner(@verifier);
+    verifier.register_model_recursive(MODEL_ID, CIRCUIT_HASH, WEIGHT_ROOT);
+
+    // Exactly 19 felts — one short of the 20 minimum
+    let mut short: Array<felt252> = array![];
+    let mut i: u32 = 0;
+    while i < 19 {
+        short.append(0);
+        i += 1;
+    };
+    verifier.verify_recursive(MODEL_ID, IO_COMMITMENT, short);
+}
+
+#[test]
+#[should_panic(expected: 'Model not registered')]
+fn test_verify_model_with_zero_circuit_hash_rejected() {
+    let verifier = deploy_verifier();
+    as_owner(@verifier);
+
+    // Register model with circuit_hash=0, then try to verify
+    // The verify_recursive check is `model.circuit_hash != 0`
+    // so this should be rejected even though the model was "registered"
+    verifier.register_model_recursive(MODEL_ID, 0, WEIGHT_ROOT);
+
+    let fake_proof = build_fake_proof(0, IO_COMMITMENT, WEIGHT_ROOT);
+    verifier.verify_recursive(MODEL_ID, IO_COMMITMENT, fake_proof);
+}
+
+#[test]
+#[should_panic(expected: 'Circuit hash mismatch')]
+fn test_verify_swapped_models_rejected() {
+    let verifier = deploy_verifier();
+    as_owner(@verifier);
+
+    // Register two models with different circuit hashes
+    verifier.register_model_recursive(0x1, 0xAAA, WEIGHT_ROOT);
+    verifier.register_model_recursive(0x2, 0xBBB, WEIGHT_ROOT);
+
+    // Try to verify model 0x1 with model 0x2's circuit hash
+    let wrong_proof = build_fake_proof(0xBBB, IO_COMMITMENT, WEIGHT_ROOT);
+    verifier.verify_recursive(0x1, IO_COMMITMENT, wrong_proof);
+}
+
 // ═══════════════════════════════════════════════════════════════
 // GROUP C: Real STARK Proof Tests (require test data from A10G)
 // These tests are commented out until test_recursive_data.cairo
 // is generated from a real proof run.
 // ═══════════════════════════════════════════════════════════════
 
-// #[test]
-// fn test_verify_recursive_proof_valid() {
-//     use super::test_recursive_data;
-//     let verifier = deploy_verifier();
-//     as_owner(@verifier);
-//
-//     verifier.register_model_recursive(
-//         test_recursive_data::smollm2_model_id(),
-//         test_recursive_data::smollm2_circuit_hash(),
-//         test_recursive_data::smollm2_weight_root(),
-//     );
-//
-//     let result = verifier.verify_recursive(
-//         test_recursive_data::smollm2_model_id(),
-//         test_recursive_data::smollm2_io_commitment(),
-//         test_recursive_data::smollm2_calldata(),
-//     );
-//     assert!(result, "proof should be valid");
-//
-//     let count = verifier.get_recursive_verification_count(
-//         test_recursive_data::smollm2_model_id()
-//     );
-//     assert!(count == 1, "count should be 1 after verification");
-// }
+use super::test_recursive_data;
 
-// #[test]
-// #[should_panic(expected: "Already verified")]
-// fn test_verify_proof_replay_rejected() {
-//     use super::test_recursive_data;
-//     let verifier = deploy_verifier();
-//     as_owner(@verifier);
-//
-//     verifier.register_model_recursive(
-//         test_recursive_data::smollm2_model_id(),
-//         test_recursive_data::smollm2_circuit_hash(),
-//         test_recursive_data::smollm2_weight_root(),
-//     );
-//
-//     // First submission succeeds
-//     verifier.verify_recursive(
-//         test_recursive_data::smollm2_model_id(),
-//         test_recursive_data::smollm2_io_commitment(),
-//         test_recursive_data::smollm2_calldata(),
-//     );
-//
-//     // Second submission of same proof should panic
-//     verifier.verify_recursive(
-//         test_recursive_data::smollm2_model_id(),
-//         test_recursive_data::smollm2_io_commitment(),
-//         test_recursive_data::smollm2_calldata(),
-//     );
-// }
+#[test]
+#[ignore]  // Requires --max-n-steps 500000000 (STARK verification is expensive)
+fn test_verify_recursive_proof_valid() {
+    let verifier = deploy_verifier();
+    as_owner(@verifier);
 
-// #[test]
-// #[should_panic]  // Exact error depends on stwo_verifier_core internals
-// fn test_verify_bit_flip_rejected() {
-//     use super::test_recursive_data;
-//     let verifier = deploy_verifier();
-//     as_owner(@verifier);
-//
-//     verifier.register_model_recursive(
-//         test_recursive_data::smollm2_model_id(),
-//         test_recursive_data::smollm2_circuit_hash(),
-//         test_recursive_data::smollm2_weight_root(),
-//     );
-//
-//     // Tamper: flip a felt in the STARK body (index 20)
-//     let mut tampered = test_recursive_data::smollm2_calldata();
-//     let original = *tampered.at(20);
-//     // Can't mutate Array directly in Cairo — would need to rebuild
-//     // with the tampered value. Left as design note.
-// }
+    verifier.register_model_recursive(
+        test_recursive_data::smollm2_model_id(),
+        test_recursive_data::smollm2_circuit_hash(),
+        test_recursive_data::smollm2_weight_root(),
+    );
+
+    let result = verifier.verify_recursive(
+        test_recursive_data::smollm2_model_id(),
+        test_recursive_data::smollm2_io_commitment(),
+        test_recursive_data::smollm2_calldata(),
+    );
+    assert!(result, "proof should be valid");
+
+    let count = verifier.get_recursive_verification_count(
+        test_recursive_data::smollm2_model_id()
+    );
+    assert!(count == 1, "count should be 1 after verification");
+}
+
+#[test]
+#[ignore]  // Requires --max-n-steps 500000000
+#[should_panic(expected: 'Already verified')]
+fn test_verify_proof_replay_rejected() {
+    let verifier = deploy_verifier();
+    as_owner(@verifier);
+
+    verifier.register_model_recursive(
+        test_recursive_data::smollm2_model_id(),
+        test_recursive_data::smollm2_circuit_hash(),
+        test_recursive_data::smollm2_weight_root(),
+    );
+
+    verifier.verify_recursive(
+        test_recursive_data::smollm2_model_id(),
+        test_recursive_data::smollm2_io_commitment(),
+        test_recursive_data::smollm2_calldata(),
+    );
+
+    // Second submission → should panic
+    verifier.verify_recursive(
+        test_recursive_data::smollm2_model_id(),
+        test_recursive_data::smollm2_io_commitment(),
+        test_recursive_data::smollm2_calldata(),
+    );
+}
+
+#[test]
+#[ignore]  // Requires --max-n-steps 500000000
+#[should_panic]  // STARK verification rejects tampered proof
+fn test_verify_bit_flip_rejected() {
+    let verifier = deploy_verifier();
+    as_owner(@verifier);
+
+    verifier.register_model_recursive(
+        test_recursive_data::smollm2_model_id(),
+        test_recursive_data::smollm2_circuit_hash(),
+        test_recursive_data::smollm2_weight_root(),
+    );
+
+    let real = test_recursive_data::smollm2_calldata();
+    let mut tampered: Array<felt252> = array![];
+    let real_span = real.span();
+    let mut i: u32 = 0;
+    loop {
+        if i >= real_span.len() { break; }
+        if i == 20 {
+            tampered.append(*real_span.at(i) + 0xDEAD);
+        } else {
+            tampered.append(*real_span.at(i));
+        }
+        i += 1;
+    };
+
+    verifier.verify_recursive(
+        test_recursive_data::smollm2_model_id(),
+        test_recursive_data::smollm2_io_commitment(),
+        tampered,
+    );
+}
