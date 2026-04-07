@@ -966,6 +966,11 @@ fn main() {
         );
     }
 
+    // Sync env vars to match the resolved policy. This ensures that any
+    // downstream code calling PolicyConfig::from_env() (e.g. the streaming
+    // calldata self-verifier) produces the same policy commitment as the prover.
+    stwo_ml::policy::apply_to_env(&resolved_policy);
+
     // Print policy banner
     if !stwo_ml::is_quiet() {
         eprintln!("Policy: {}", stwo_ml::policy::summary_line(&resolved_policy));

@@ -390,6 +390,39 @@ pub fn detect_env_conflicts() -> Vec<&'static str> {
         .collect()
 }
 
+/// Sync environment variables to match a resolved PolicyConfig.
+///
+/// This ensures that any downstream code calling `PolicyConfig::from_env()`
+/// (e.g. the streaming calldata self-verifier) produces the same policy
+/// commitment as the prover that used an explicit `--policy` preset.
+pub fn apply_to_env(policy: &PolicyConfig) {
+    let set = |name: &str, val: bool| {
+        if val {
+            std::env::set_var(name, "1");
+        } else {
+            std::env::remove_var(name);
+        }
+    };
+    set("STWO_ALLOW_MISSING_NORM_PROOF", policy.allow_missing_norm_proof);
+    set("STWO_ALLOW_LOGUP_ACTIVATION", policy.allow_logup_activation);
+    set("STWO_ALLOW_MISSING_SEGMENT_BINDING", policy.allow_missing_segment_binding);
+    if policy.skip_rms_sq_proof {
+        std::env::set_var("STWO_SKIP_RMS_SQ_PROOF", "1");
+    } else {
+        std::env::remove_var("STWO_SKIP_RMS_SQ_PROOF");
+    }
+    set("STWO_PIECEWISE_ACTIVATION", policy.piecewise_activation);
+    set("STWO_SKIP_BATCH_TOKENS", policy.skip_batch_tokens);
+    set("STWO_PURE_GKR_SKIP_UNIFIED_STARK", policy.skip_unified_stark);
+    set("STWO_AGGREGATED_FULL_BINDING", policy.aggregated_full_binding);
+    set("STWO_AGGREGATED_RLC_ONLY", policy.aggregated_rlc_only);
+    if !policy.io_packing { std::env::set_var("STWO_NO_IO_PACK", "1"); }
+    else { std::env::remove_var("STWO_NO_IO_PACK"); }
+    if !policy.packed_proof { std::env::set_var("STWO_NO_PACKED", "1"); }
+    else { std::env::remove_var("STWO_NO_PACKED"); }
+    set("STWO_VALIDATE_DECODE_CHAIN", policy.validate_decode_chain);
+}
+
 /// Weight mode flags derived from [`PolicyConfig`].
 ///
 /// Drop-in replacement for the `WeightModeFlags` struct in `gkr/prover.rs`.
