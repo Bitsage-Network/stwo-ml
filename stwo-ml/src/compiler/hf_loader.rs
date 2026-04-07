@@ -741,8 +741,9 @@ fn build_hf_transformer_graph(config: &TransformerConfig, num_layers: usize) -> 
     let d_ff = config.d_ff;
 
     let mut builder = GraphBuilder::new((1, d));
+    let mut moe_slot_infos: Vec<(usize, crate::compiler::graph::MoESlotInfo)> = Vec::new();
 
-    for _ in 0..num_layers {
+    for layer_idx in 0..num_layers {
         // Pre-attention norm
         match config.norm_type {
             NormType::LayerNorm => { builder.layer_norm(); }
@@ -760,7 +761,8 @@ fn build_hf_transformer_graph(config: &TransformerConfig, num_layers: usize) -> 
         // FFN: dense (gated FFN) or MoE (multi-expert gated FFN)
         if config.num_experts > 0 && config.num_experts_per_tok > 0 {
             // MoE: router → TopK → K parallel expert FFNs → weighted sum
-            builder.moe_ffn(config.num_experts, config.num_experts_per_tok, d_ff, config.activation);
+            let moe_info = builder.moe_ffn(config.num_experts, config.num_experts_per_tok, d_ff, config.activation);
+            moe_slot_infos.push((layer_idx, moe_info));
         } else {
             // Dense: single gated FFN (SwiGLU)
             builder.gated_ffn(d_ff, config.activation);

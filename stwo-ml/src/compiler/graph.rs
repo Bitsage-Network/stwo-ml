@@ -169,6 +169,89 @@ pub struct GraphWeights {
     pub named_weights: Vec<(usize, String, M31Matrix)>,
 }
 
+/// Information about MoE template slots created by `moe_ffn()`.
+#[derive(Clone, Debug)]
+pub struct MoESlotInfo {
+    /// Router MatMul node ID.
+    pub router_node_id: usize,
+    /// Node IDs of the gate_proj MatMul for each template expert slot.
+    pub slot_gate_ids: Vec<usize>,
+    /// Node IDs of the down_proj MatMul for each template expert slot.
+    pub slot_down_ids: Vec<usize>,
+    /// Total number of experts available.
+    pub num_experts: usize,
+    /// Number of experts selected per token.
+    pub top_k: usize,
+}
+
+/// MoE expert weight bank: stores all expert weights for dynamic binding.
+///
+/// For Mixtral-8x7B with 8 experts and top_k=2:
+/// - The graph has 2 template expert branches (slot 0, slot 1)
+/// - At runtime, TopK selects which 2 of 8 experts to use
+/// - `bind_experts()` swaps the selected experts' weights into the template slots
+#[derive(Clone, Debug)]
+pub struct MoEWeightBank {
+    /// Per-expert weight triples: (gate_proj, up_proj, down_proj) per expert.
+    /// Indexed by expert_idx (0..num_experts).
+    pub experts: Vec<MoEExpertWeights>,
+    /// Template node IDs for expert slots in the graph.
+    /// slot_gate_ids[i] = node_id of the i-th template expert's gate MatMul
+    /// slot_down_ids[i] = node_id of the i-th template expert's down MatMul
+    pub slot_gate_ids: Vec<usize>,
+    pub slot_down_ids: Vec<usize>,
+    /// Router MatMul node ID.
+    pub router_node_id: usize,
+    /// Number of experts available.
+    pub num_experts: usize,
+    /// Number of experts selected per token.
+    pub top_k: usize,
+}
+
+/// Weight triple for a single MoE expert.
+#[derive(Clone, Debug)]
+pub struct MoEExpertWeights {
+    pub gate_proj: M31Matrix,  // w1 in Mixtral convention
+    pub up_proj: M31Matrix,    // w3
+    pub down_proj: M31Matrix,  // w2
+}
+
+impl MoEWeightBank {
+    /// Bind selected expert weights into the graph's template slots.
+    ///
+    /// After TopK selects `selected_indices`, this copies the corresponding
+    /// expert weights into the template MatMul nodes in `weights`.
+    pub fn bind_experts(&self, selected_indices: &[usize], weights: &mut GraphWeights) {
+        assert_eq!(selected_indices.len(), self.top_k);
+        for (slot, &expert_idx) in selected_indices.iter().enumerate() {
+            assert!(expert_idx < self.num_experts, "expert index out of range");
+            let expert = &self.experts[expert_idx];
+
+            // Replace gate_proj weight for this slot
+            if let Some(entry) = weights.weights.iter_mut().find(|(id, _)| *id == self.slot_gate_ids[slot]) {
+                entry.1 = expert.gate_proj.clone();
+            } else {
+                weights.weights.push((self.slot_gate_ids[slot], expert.gate_proj.clone()));
+            }
+
+            // Replace down_proj weight
+            if let Some(entry) = weights.weights.iter_mut().find(|(id, _)| *id == self.slot_down_ids[slot]) {
+                entry.1 = expert.down_proj.clone();
+            } else {
+                weights.weights.push((self.slot_down_ids[slot], expert.down_proj.clone()));
+            }
+
+            // Replace up_proj as named weight on down_proj node
+            let up_key = (self.slot_down_ids[slot], "up_proj".to_string());
+            if let Some(entry) = weights.named_weights.iter_mut().find(|(id, n, _)| *id == up_key.0 && n == &up_key.1) {
+                entry.2 = expert.up_proj.clone();
+            } else {
+                weights.named_weights.push((up_key.0, up_key.1, expert.up_proj.clone()));
+            }
+        }
+    }
+}
+
 impl GraphWeights {
     pub fn new() -> Self {
         Self {
@@ -796,18 +879,24 @@ impl GraphBuilder {
     /// the forward pass evaluates ALL experts (not just top-K). The TopK proof
     /// verifies that the routing decision was correct. A production implementation
     /// would sparse-evaluate only selected experts.
+    /// Build an MoE FFN layer with router + K expert template slots.
+    ///
+    /// Returns `MoESlotInfo` containing the template node IDs for weight binding.
+    /// At runtime, `MoEWeightBank::bind_experts()` swaps the selected experts'
+    /// weights into these slots based on the TopK routing decision.
     pub fn moe_ffn(
         &mut self,
         num_experts: usize,
         top_k: usize,
         d_ff: usize,
         act_type: ActivationType,
-    ) -> &mut Self {
+    ) -> MoESlotInfo {
         let input_branch = self.fork();
         let d_model = self.graph.nodes[input_branch].output_shape.1;
 
         // Step 1: Router projection (d_model → num_experts)
         self.linear(num_experts);
+        let router_node_id = self.last_node.unwrap();
 
         // Step 2: TopK selection node
         let inputs = self.last_node.map(|n| vec![n]).unwrap_or_default();
@@ -837,27 +926,46 @@ impl GraphBuilder {
         // forward pass by scaling each expert's output before summing.
         // The proof verifies each expert FFN independently.
 
+        let mut slot_gate_ids = Vec::with_capacity(top_k);
+        let mut slot_down_ids = Vec::with_capacity(top_k);
+
         if top_k == 1 {
             // Single expert: just a gated FFN
             self.last_node = Some(input_branch);
+            let before = self.graph.nodes.len();
             self.gated_ffn(d_ff, act_type);
+            // gated_ffn creates: gate_matmul, activation, down_matmul
+            slot_gate_ids.push(before);      // gate_proj node
+            slot_down_ids.push(before + 2);  // down_proj node
         } else {
             // Multi-expert: K parallel FFN branches + accumulated sum
             // Expert 0: the "base" branch
             self.last_node = Some(input_branch);
+            let before_0 = self.graph.nodes.len();
             self.gated_ffn(d_ff, act_type);
+            slot_gate_ids.push(before_0);
+            slot_down_ids.push(before_0 + 2);
 
             // Experts 1..K: each adds to the accumulated output
             for _expert_idx in 1..top_k {
                 let accumulated = self.fork();
                 self.last_node = Some(input_branch);
+                let before_e = self.graph.nodes.len();
                 self.gated_ffn(d_ff, act_type);
+                slot_gate_ids.push(before_e);
+                slot_down_ids.push(before_e + 2);
                 // Add expert output to accumulated sum
                 self.add_from(accumulated);
             }
         }
 
-        self
+        MoESlotInfo {
+            router_node_id,
+            slot_gate_ids,
+            slot_down_ids,
+            num_experts,
+            top_k,
+        }
     }
 
     /// Add an embedding lookup layer.
@@ -1486,7 +1594,7 @@ mod tests {
         let d_ff = 16;
         let mut builder = GraphBuilder::new((1, d));
         builder.identity(); // input anchor
-        builder.moe_ffn(8, 2, d_ff, ActivationType::SiLU);
+        let _moe_info = builder.moe_ffn(8, 2, d_ff, ActivationType::SiLU);
         let graph = builder.build();
 
         // Expected structure:
@@ -1525,7 +1633,7 @@ mod tests {
         let d_ff = 16;
         let mut builder = GraphBuilder::new((1, d));
         builder.identity();
-        builder.moe_ffn(4, 1, d_ff, ActivationType::SiLU);
+        let _moe_info = builder.moe_ffn(4, 1, d_ff, ActivationType::SiLU);
         let graph = builder.build();
 
         // No Add node needed for K=1
