@@ -1,0 +1,14 @@
+{
+  "dataset_size": 60000,
+  "train_size": 40800,
+  "val_size": 7200,
+  "test_size": 12000,
+  "epochs": 50,
+  "lr": 0.003,
+  "batch_size": 256,
+  "best_val_f1": 1.0,
+  "test_f1": 1.0,
+  "training_time_s": 6.753390789031982,
+  "total_weights": 6240,
+  "quantization_agreement": 0.3249166666666667
+}
