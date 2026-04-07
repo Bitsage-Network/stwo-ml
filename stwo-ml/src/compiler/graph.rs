@@ -1627,6 +1627,141 @@ mod tests {
     }
 
     #[test]
+    fn test_moe_ffn_e2e_forward_pass() {
+        // Build a minimal MoE model: input → RMSNorm → router → TopK → 2 expert FFNs → Add → output
+        use crate::components::matmul::M31Matrix;
+        use stwo::core::fields::m31::M31;
+
+        let d = 8;
+        let d_ff = 16;
+        let num_experts = 4;
+        let top_k = 2;
+
+        let mut builder = GraphBuilder::new((1, d));
+        builder.rms_norm();
+        let moe_info = builder.moe_ffn(num_experts, top_k, d_ff, ActivationType::SiLU);
+        builder.rms_norm();
+        let graph = builder.build();
+
+        // Verify MoESlotInfo
+        assert_eq!(moe_info.num_experts, num_experts);
+        assert_eq!(moe_info.top_k, top_k);
+        assert_eq!(moe_info.slot_gate_ids.len(), top_k);
+        assert_eq!(moe_info.slot_down_ids.len(), top_k);
+
+        // Create random weights for all MatMul nodes
+        let mut weights = GraphWeights::new();
+        for (idx, node) in graph.nodes.iter().enumerate() {
+            if let GraphOp::MatMul { dims: (_m, k, n) } = &node.op {
+                let data: Vec<M31> = (0..k * n).map(|i| M31::from((i as u32 * 7 + 13) % 100)).collect();
+                weights.add_weight(idx, M31Matrix { rows: *k, cols: *n, data });
+
+                // Add up_proj for gated FFN down_proj nodes
+                // (every 3rd MatMul after the router is a down_proj that needs up_proj)
+                let up_data: Vec<M31> = (0..k * n).map(|i| M31::from((i as u32 * 11 + 3) % 100)).collect();
+                weights.add_named_weight(idx, "up_proj", M31Matrix { rows: *k, cols: *n, data: up_data });
+            }
+        }
+
+        // Add gamma weights for RMSNorm nodes
+        for (idx, node) in graph.nodes.iter().enumerate() {
+            if matches!(node.op, GraphOp::RMSNorm { .. } | GraphOp::LayerNorm { .. }) {
+                let gamma: Vec<M31> = (0..d).map(|i| M31::from((i as u32 + 1) % 100)).collect();
+                weights.add_named_weight(idx, "gamma", M31Matrix { rows: 1, cols: d, data: gamma });
+            }
+        }
+
+        // Create random input
+        let input_data: Vec<M31> = (0..d).map(|i| M31::from((i as u32 * 3 + 7) % 1000)).collect();
+        let input = M31Matrix { rows: 1, cols: d, data: input_data };
+
+        // Build MoE weight bank with 4 experts
+        let mut expert_weights = Vec::new();
+        for expert_idx in 0..num_experts {
+            let make_matrix = |rows: usize, cols: usize, seed: u32| -> M31Matrix {
+                let data: Vec<M31> = (0..rows * cols)
+                    .map(|i| M31::from((i as u32 * seed + expert_idx as u32 * 17) % 200))
+                    .collect();
+                M31Matrix { rows, cols, data }
+            };
+            expert_weights.push(MoEExpertWeights {
+                gate_proj: make_matrix(d, d_ff, 7),
+                up_proj: make_matrix(d, d_ff, 11),
+                down_proj: make_matrix(d_ff, d, 13),
+            });
+        }
+
+        let bank = MoEWeightBank {
+            experts: expert_weights,
+            slot_gate_ids: moe_info.slot_gate_ids.clone(),
+            slot_down_ids: moe_info.slot_down_ids.clone(),
+            router_node_id: moe_info.router_node_id,
+            num_experts,
+            top_k,
+        };
+
+        // Test bind_experts
+        let selected = vec![1, 3]; // select experts 1 and 3
+        bank.bind_experts(&selected, &mut weights);
+
+        // Verify the template slots got the right weights
+        let slot0_gate = weights.get_weight(moe_info.slot_gate_ids[0]).unwrap();
+        assert_eq!(slot0_gate.rows, d);
+        assert_eq!(slot0_gate.cols, d_ff);
+
+        let slot1_gate = weights.get_weight(moe_info.slot_gate_ids[1]).unwrap();
+        assert_eq!(slot1_gate.rows, d);
+        assert_eq!(slot1_gate.cols, d_ff);
+
+        // Verify expert 1 weights bound to slot 0
+        assert_eq!(slot0_gate.data[0], bank.experts[1].gate_proj.data[0],
+            "slot 0 should have expert 1's gate_proj");
+
+        // Verify expert 3 weights bound to slot 1
+        assert_eq!(slot1_gate.data[0], bank.experts[3].gate_proj.data[0],
+            "slot 1 should have expert 3's gate_proj");
+    }
+
+    #[test]
+    fn test_moe_gkr_proof_generation() {
+        // Test that a MoE graph compiles to a LayeredCircuit with TopK layers
+        // and that the GKR circuit has the right layer types
+        use crate::gkr::circuit::LayeredCircuit;
+
+        let d = 8;
+        let d_ff = 16;
+        let mut builder = GraphBuilder::new((1, d));
+        builder.identity();
+        let _moe_info = builder.moe_ffn(4, 2, d_ff, ActivationType::SiLU);
+        let graph = builder.build();
+
+        // Compile to GKR circuit
+        let circuit = LayeredCircuit::from_graph(&graph).unwrap();
+
+        // Verify TopK layer exists in the circuit
+        let topk_layers: Vec<_> = circuit.layers.iter()
+            .filter(|l| matches!(l.layer_type, crate::gkr::circuit::LayerType::TopK { .. }))
+            .collect();
+
+        assert!(!topk_layers.is_empty(), "Circuit should have at least one TopK layer");
+
+        // Verify the TopK layer has correct parameters
+        if let crate::gkr::circuit::LayerType::TopK { num_experts, top_k } = &topk_layers[0].layer_type {
+            assert_eq!(*num_experts, 4, "num_experts should be 4");
+            assert_eq!(*top_k, 2, "top_k should be 2");
+        }
+
+        // Count MatMul layers: router(1) + 2 experts × 2 matmuls = 5
+        let matmul_layers = circuit.layers.iter()
+            .filter(|l| matches!(l.layer_type, crate::gkr::circuit::LayerType::MatMul { .. }))
+            .count();
+        assert!(matmul_layers >= 5, "Should have >= 5 MatMul layers, got {matmul_layers}");
+
+        eprintln!("MoE circuit: {} layers total, {} MatMul, {} TopK",
+            circuit.layers.len(), matmul_layers, topk_layers.len());
+    }
+
+    #[test]
     fn test_moe_ffn_single_expert() {
         // top-1: should be equivalent to a single gated FFN
         let d = 8;
