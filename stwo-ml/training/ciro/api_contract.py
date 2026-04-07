@@ -279,7 +279,7 @@ class DataLakeStats:
 # ═══════════════════════════════════════════════════════════════════════
 
 API_ENDPOINTS = {
-    "base_url": "/api/singularity/{org}/blockchain",
+    "base_url": "/api/v1/blockchain",
 
     "labeled_transactions": {
         "method": "GET",

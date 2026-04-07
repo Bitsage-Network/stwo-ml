@@ -48,7 +48,7 @@ class CiroClient:
         self.api_key = api_key
         self.org = org
         self.timeout = timeout
-        self._api_base = f"{self.base_url}/api/singularity/{org}/blockchain"
+        self._api_base = f"{self.base_url}/api/v1/blockchain"
 
     def _request(
         self,
@@ -89,19 +89,20 @@ class CiroClient:
 
     def fetch_labeled_transactions(
         self,
-        label: Optional[str] = None,
-        source: Optional[str] = None,
-        min_confidence: float = 0.5,
-        since: Optional[str] = None,
+        network: Optional[str] = None,
+        risk_level: Optional[str] = None,
+        label_source: Optional[str] = None,
         limit: int = 1000,
         offset: int = 0,
     ) -> dict:
-        """Fetch labeled transactions from CIRO's data lake."""
+        """
+        Fetch labeled transactions from CIRO's data lake.
+        Maps to: GET /api/v1/blockchain/transactions/labeled
+        """
         params = {
-            "label": label,
-            "source": source,
-            "min_confidence": min_confidence,
-            "since": since,
+            "network": network,
+            "riskLevel": risk_level,
+            "labelSource": label_source,
             "limit": limit,
             "offset": offset,
         }
@@ -109,9 +110,9 @@ class CiroClient:
 
     def fetch_all_labeled(
         self,
-        min_confidence: float = 0.5,
+        network: Optional[str] = "STARKNET",
         max_total: int = 100000,
-        page_size: int = 5000,
+        page_size: int = 1000,
     ) -> list[dict]:
         """Fetch all labeled transactions with pagination."""
         all_txs = []
@@ -119,7 +120,7 @@ class CiroClient:
 
         while offset < max_total:
             resp = self.fetch_labeled_transactions(
-                min_confidence=min_confidence,
+                network=network,
                 limit=page_size,
                 offset=offset,
             )
@@ -182,53 +183,49 @@ class CiroClient:
     def ciro_tx_to_features(tx: dict) -> TransactionFeatures:
         """
         Convert a CIRO LabeledTransaction to ObelyZK's TransactionFeatures.
-        Maps CIRO's rich fields to the classifier's 48-feature schema.
+
+        CIRO response fields (from blockchain-intelligence.service.ts):
+          txHash, network, blockNumber, fromAddress, toAddress, value,
+          status, functionName, labels[], riskLevel, riskScore,
+          labelSource, blockTimestamp
         """
         # Parse value
-        value_str = tx.get("value", "0")
+        value_str = tx.get("value", "0") or "0"
         try:
-            value = int(value_str)
+            value = int(value_str) if not value_str.startswith("0x") else int(value_str, 16)
         except (ValueError, TypeError):
             value = 0
 
-        # Parse selector
-        selector_str = tx.get("selector", "0x0")
-        try:
-            selector = int(selector_str, 16) if selector_str.startswith("0x") else int(selector_str)
-        except (ValueError, TypeError):
-            selector = 0
-
-        # Parse calldata prefix (first 8 × 4-byte words)
-        calldata_hex = tx.get("calldata_hex", "")
-        calldata_bytes = bytes.fromhex(calldata_hex[2:] if calldata_hex.startswith("0x") else calldata_hex) if calldata_hex else b""
-        calldata_prefix = []
-        for i in range(8):
-            start = i * 4
-            if start + 4 <= len(calldata_bytes):
-                word = int.from_bytes(calldata_bytes[start:start+4], "big")
-            else:
-                word = 0
-            calldata_prefix.append(word)
+        # Parse function selector from functionName (CIRO provides name, not raw selector)
+        # Map common function names to selectors
+        func_name = tx.get("functionName", "") or ""
+        FUNC_TO_SELECTOR = {
+            "transfer": 0xA9059CBB,
+            "transferFrom": 0x23B872DD,
+            "approve": 0x095EA7B3,
+            "swap": 0x38ED1739,
+            "swapExactTokensForTokens": 0x38ED1739,
+            "swapExactETHForTokens": 0x7FF36AB5,
+            "flashLoan": 0x5CFFE9DE,
+            "multicall": 0xAC9650D8,
+            "withdraw": 0x3CCFD60B,
+            "deposit": 0xB6B55F25,
+            "mint": 0x40C10F19,
+        }
+        selector = FUNC_TO_SELECTOR.get(func_name, 0)
 
         # Compute derived features
         log2_val = max(0, value.bit_length() - 1) if value > 0 else 0
 
-        # Value balance ratio — CIRO may provide sender balance context
-        avg_val_24h_str = tx.get("sender_avg_value_24h", "0")
-        try:
-            avg_val_24h = int(avg_val_24h_str)
-        except (ValueError, TypeError):
-            avg_val_24h = 0
+        # Risk-based features (CIRO provides riskLevel and riskScore)
+        risk_level = tx.get("riskLevel", "UNKNOWN")
+        risk_score = tx.get("riskScore", 0) or 0
 
-        max_val_24h_str = tx.get("sender_max_value_24h", "0")
-        try:
-            max_val_24h = int(max_val_24h_str)
-        except (ValueError, TypeError):
-            max_val_24h = 0
+        # Labels from CIRO
+        labels = tx.get("labels", []) or []
 
-        # Estimate balance ratio from 24h max (rough proxy)
-        balance_proxy = max(max_val_24h * 2, int(1e20))
-        ratio = min(100000, int((value / balance_proxy) * 100000)) if balance_proxy > 0 else 0
+        # Use target address (toAddress in CIRO)
+        target = tx.get("toAddress", "0x0") or "0x0"
 
         # Selector feature flags
         TRANSFER_SELS = {0xA9059CBB, 0x23B872DD}
@@ -236,52 +233,61 @@ class CiroClient:
         SWAP_SELS = {0x38ED1739, 0x7FF36AB5, 0x18CBAFE5}
 
         return TransactionFeatures(
-            target=tx.get("target", "0x0"),
+            target=target,
             value=value,
             selector=selector,
-            calldata_prefix=calldata_prefix,
-            calldata_len=tx.get("calldata_len", len(calldata_bytes)),
-            agent_trust_score=0,  # filled from firewall contract, not CIRO
+            calldata_len=0,  # CIRO doesn't provide raw calldata
+            agent_trust_score=int(risk_score * 1000),  # map 0-100 → 0-100000
             agent_strikes=0,
-            agent_age_blocks=tx.get("sender_age_blocks", 0),
-            is_verified=tx.get("target_verified", False),
-            is_proxy=tx.get("target_is_proxy", False),
-            has_source=tx.get("target_has_source", False),
-            interaction_count=tx.get("target_interaction_count", 0),
+            agent_age_blocks=0,
+            is_verified="verified" in labels or risk_level == "LOW",
+            is_proxy="proxy" in labels,
+            has_source="source" in labels,
+            interaction_count=0,  # not available per-tx from CIRO
             log2_value=log2_val,
-            value_balance_ratio=ratio,
+            value_balance_ratio=min(int(risk_score * 1000), 100000),
             is_max_approval=value >= 2**128 - 1,
             is_zero_value=value == 0,
             is_transfer=selector in TRANSFER_SELS,
             is_approve=selector in APPROVE_SELS,
             is_swap=selector in SWAP_SELS,
             is_unknown=selector not in (TRANSFER_SELS | APPROVE_SELS | SWAP_SELS) and selector != 0,
-            tx_frequency=tx.get("sender_tx_count_24h", 0),
-            unique_targets_24h=tx.get("sender_unique_targets_24h", 0),
-            avg_value_24h=avg_val_24h & M31_MASK,
-            max_value_24h=max_val_24h & M31_MASK,
+            tx_frequency=0,
+            unique_targets_24h=0,
+            avg_value_24h=0,
+            max_value_24h=0,
         )
 
     @staticmethod
-    def ciro_label_to_int(label: str) -> int:
-        """Convert CIRO label string to classifier label integer."""
-        mapping = {"safe": 0, "suspicious": 1, "malicious": 2}
-        return mapping.get(label, 1)  # default to suspicious for unknown
+    def ciro_label_to_int(risk_level: str) -> int:
+        """
+        Convert CIRO riskLevel to classifier label integer.
+        CIRO levels: CRITICAL, HIGH, MEDIUM, LOW, UNKNOWN
+        Classifier labels: 0=safe, 1=suspicious, 2=malicious
+        """
+        mapping = {
+            "LOW": 0,           # safe
+            "UNKNOWN": 1,       # suspicious (insufficient data)
+            "MEDIUM": 1,        # suspicious
+            "HIGH": 2,          # malicious
+            "CRITICAL": 2,      # malicious
+        }
+        return mapping.get(risk_level, 1)
 
     # ── Full Training Pipeline ─────────────────────────────────────────
 
     def fetch_training_dataset(
         self,
-        min_confidence: float = 0.5,
+        network: Optional[str] = "STARKNET",
         max_total: int = 100000,
     ) -> tuple[np.ndarray, np.ndarray]:
         """
         Fetch labeled transactions from CIRO and convert to
         ObelyZK's (N, 64) feature matrix + (N,) label array.
         """
-        print(f"Fetching labeled transactions from CIRO (min_confidence={min_confidence})...")
+        print(f"Fetching labeled transactions from CIRO (network={network})...")
         txs = self.fetch_all_labeled(
-            min_confidence=min_confidence,
+            network=network,
             max_total=max_total,
         )
 
@@ -295,7 +301,7 @@ class CiroClient:
             try:
                 tx_features = self.ciro_tx_to_features(tx)
                 encoded = encode_features(tx_features)
-                label = self.ciro_label_to_int(tx.get("label", "unlabeled"))
+                label = self.ciro_label_to_int(tx.get("riskLevel", "UNKNOWN"))
                 features_list.append(encoded)
                 labels_list.append(label)
             except Exception as e:
