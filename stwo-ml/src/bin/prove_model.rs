@@ -2469,12 +2469,13 @@ fn main() {
                             if let Some(kvc) = proof.kv_cache_commitment {
                                 verify_channel.mix_felt(kvc);
                             }
-                            match stwo_ml::gkr::verify_gkr_with_weights(
+                            match stwo_ml::gkr::verify_gkr_with_policy(
                                 &circuit,
                                 gkr_p,
                                 &proof.execution.output,
-                                &model.weights,
+                                Some(&model.weights),
                                 &mut verify_channel,
+                                &resolved_policy,
                             ) {
                                 Ok(_claim) => {
                                     eprintln!("  cryptographic_self_verify: passed");

@@ -69,3 +69,4 @@ pub use types::{
 };
 pub use profiler::PhaseProfiler;
 pub use verifier::verify_gkr_with_weights;
+pub use verifier::verify_gkr_with_policy;
