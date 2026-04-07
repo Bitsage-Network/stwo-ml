@@ -411,7 +411,13 @@ pub fn apply_to_env(policy: &PolicyConfig) {
     } else {
         std::env::remove_var("STWO_SKIP_RMS_SQ_PROOF");
     }
-    set("STWO_PIECEWISE_ACTIVATION", policy.piecewise_activation);
+    // STWO_PIECEWISE_ACTIVATION defaults to true in from_env() (env_bool_default_true),
+    // so we must explicitly set "0" when false, not just remove the var.
+    if policy.piecewise_activation {
+        std::env::set_var("STWO_PIECEWISE_ACTIVATION", "1");
+    } else {
+        std::env::set_var("STWO_PIECEWISE_ACTIVATION", "0");
+    }
     set("STWO_SKIP_BATCH_TOKENS", policy.skip_batch_tokens);
     set("STWO_PURE_GKR_SKIP_UNIFIED_STARK", policy.skip_unified_stark);
     set("STWO_AGGREGATED_FULL_BINDING", policy.aggregated_full_binding);
@@ -420,7 +426,30 @@ pub fn apply_to_env(policy: &PolicyConfig) {
     else { std::env::remove_var("STWO_NO_IO_PACK"); }
     if !policy.packed_proof { std::env::set_var("STWO_NO_PACKED", "1"); }
     else { std::env::remove_var("STWO_NO_PACKED"); }
+    if !policy.double_packed_proof { std::env::set_var("STWO_NO_DOUBLE_PACK", "1"); }
+    else { std::env::remove_var("STWO_NO_DOUBLE_PACK"); }
     set("STWO_VALIDATE_DECODE_CHAIN", policy.validate_decode_chain);
+    // Sync weight binding mode
+    match policy.weight_binding_mode {
+        WeightBindingMode::Individual => {
+            std::env::remove_var("STWO_WEIGHT_BINDING");
+            std::env::remove_var("STWO_GKR_TRUSTLESS_MODE2");
+            std::env::remove_var("STWO_GKR_TRUSTLESS_MODE3");
+        }
+        WeightBindingMode::Aggregated => {
+            std::env::set_var("STWO_WEIGHT_BINDING", "aggregated");
+            std::env::remove_var("STWO_GKR_TRUSTLESS_MODE2");
+            std::env::remove_var("STWO_GKR_TRUSTLESS_MODE3");
+        }
+        WeightBindingMode::TrustlessMode2 => {
+            std::env::set_var("STWO_GKR_TRUSTLESS_MODE2", "1");
+            std::env::remove_var("STWO_GKR_TRUSTLESS_MODE3");
+        }
+        WeightBindingMode::TrustlessMode3 => {
+            std::env::set_var("STWO_GKR_TRUSTLESS_MODE3", "1");
+        }
+        _ => {}
+    }
 }
 
 /// Weight mode flags derived from [`PolicyConfig`].

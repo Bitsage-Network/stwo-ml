@@ -3756,9 +3756,14 @@ pub fn replay_verify_serialized_proof(
             ch.mix_felt(prev_kv);
         }
     }
+    let trace = std::env::var("STWO_CHANNEL_TRACE").is_ok();
+    if trace {
+        eprintln!("[VERIFIER] seeding: depth={}, input_rows={}, input_cols={}", circuit_depth, input_rows, input_cols);
+        eprintln!("[VERIFIER] output: {}x{} padded to {}x{}", output_rows, output_cols, padded_rows, padded_cols);
+    }
     ch.mix_u64(circuit_depth as u64);
-    ch.mix_u64(input_rows);
-    ch.mix_u64(input_cols);
+    ch.mix_u64(input_rows as u64);
+    ch.mix_u64(input_cols as u64);
 
     // Bind policy commitment — must match prove_gkr's channel seeding.
     let resolved_policy = crate::policy::resolve(None);
@@ -3767,10 +3772,19 @@ pub fn replay_verify_serialized_proof(
     if !skip_policy && policy_commitment != FieldElement::ZERO {
         ch.mix_felt(policy_commitment);
     }
+    if trace {
+        eprintln!("[VERIFIER] ch after seeding+policy: {:?}", ch.digest());
+        eprintln!("[VERIFIER] policy_commitment: {:?}, skip={}", policy_commitment, skip_policy);
+    }
 
     let log_out = (padded_rows * padded_cols).ilog2() as usize;
     let r_out = ch.draw_qm31s(log_out);
     let output_value = crate::components::matmul::evaluate_mle_pub(&output_mle, &r_out);
+    if trace {
+        eprintln!("[VERIFIER] log_out={}, r_out.len={}", log_out, r_out.len());
+        eprintln!("[VERIFIER] output_value: {:?}", output_value);
+        eprintln!("[VERIFIER] ch after output mix: {:?}", ch.digest());
+    }
     mix_secure_field(&mut ch, output_value);
 
     let mut off = 0usize;

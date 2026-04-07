@@ -1500,21 +1500,24 @@ pub fn prove_gkr_with_cache(
     // Resolve policy configuration (explicit config or env var fallback).
     let resolved_policy = crate::policy::resolve(policy);
 
+    let trace = std::env::var("STWO_CHANNEL_TRACE").is_ok();
     // Seed channel with circuit metadata
+    if trace {
+        eprintln!("[PROVER] seeding: depth={}, input_shape=({}, {})", d, circuit.input_shape.0, circuit.input_shape.1);
+    }
     channel.mix_u64(d as u64);
     channel.mix_u64(circuit.input_shape.0 as u64);
     channel.mix_u64(circuit.input_shape.1 as u64);
 
     // Bind policy commitment into Fiat-Shamir transcript.
-    // When non-zero, this cryptographically ties the proof to the specific policy
-    // under which it was generated. The Cairo verifier must mix at the same position.
-    // Zero commitment (legacy proofs with no explicit policy) skips the mix.
     let policy_commitment = resolved_policy.policy_commitment();
-    // Skip policy commitment when STWO_SKIP_POLICY_COMMITMENT is set
-    // (Cairo on-chain verifier doesn't mix policy yet).
     let skip_policy = std::env::var("STWO_SKIP_POLICY_COMMITMENT").is_ok();
     if !skip_policy && policy_commitment != starknet_ff::FieldElement::ZERO {
         channel.mix_felt(policy_commitment);
+    }
+    if trace {
+        eprintln!("[PROVER] ch after seeding+policy: {:?}", channel.digest());
+        eprintln!("[PROVER] policy_commitment: {:?}, skip={}", policy_commitment, skip_policy);
     }
 
     // Start with claim on output layer: evaluate the output MLE at a random point
@@ -1527,6 +1530,11 @@ pub fn prove_gkr_with_cache(
 
     let r_out = channel.draw_qm31s(log_out_rows + log_out_cols);
     let output_value = evaluate_mle(&output_mle, &r_out);
+    if trace {
+        eprintln!("[PROVER] output: {}x{} padded to {}x{}", output.rows, output.cols, output_padded.rows, output_padded.cols);
+        eprintln!("[PROVER] log_out={}, r_out.len={}", log_out_rows + log_out_cols, r_out.len());
+        eprintln!("[PROVER] output_value: {:?}", output_value);
+    }
 
     // Mix output claim into channel
     mix_secure_field(channel, output_value);
@@ -2821,18 +2829,24 @@ pub fn prove_gkr_gpu_with_cache(
     // Resolve policy configuration (explicit config or env var fallback).
     let resolved_policy = crate::policy::resolve(policy);
 
+    let trace = std::env::var("STWO_CHANNEL_TRACE").is_ok();
     // Seed channel with circuit metadata (same as CPU prover)
+    if trace {
+        eprintln!("[PROVER-GPU] seeding: depth={}, input_shape=({}, {})", d, circuit.input_shape.0, circuit.input_shape.1);
+    }
     channel.mix_u64(d as u64);
     channel.mix_u64(circuit.input_shape.0 as u64);
     channel.mix_u64(circuit.input_shape.1 as u64);
 
     // Bind policy commitment into Fiat-Shamir transcript (same position as CPU prover).
     let policy_commitment = resolved_policy.policy_commitment();
-    // Skip policy commitment when STWO_SKIP_POLICY_COMMITMENT is set
-    // (Cairo on-chain verifier doesn't mix policy yet).
     let skip_policy = std::env::var("STWO_SKIP_POLICY_COMMITMENT").is_ok();
     if !skip_policy && policy_commitment != starknet_ff::FieldElement::ZERO {
         channel.mix_felt(policy_commitment);
+    }
+    if trace {
+        eprintln!("[PROVER-GPU] ch after seeding+policy: {:?}", channel.digest());
+        eprintln!("[PROVER-GPU] policy_commitment: {:?}, skip={}", policy_commitment, skip_policy);
     }
 
     // Start with claim on output layer
@@ -2845,6 +2859,12 @@ pub fn prove_gkr_gpu_with_cache(
 
     let r_out = channel.draw_qm31s(log_out_rows + log_out_cols);
     let output_value = evaluate_mle(&output_mle, &r_out);
+
+    if trace {
+        eprintln!("[PROVER-GPU] output: {}x{} padded to {}x{}", output.rows, output.cols, output_padded.rows, output_padded.cols);
+        eprintln!("[PROVER-GPU] log_out={}, r_out.len={}", log_out_rows + log_out_cols, r_out.len());
+        eprintln!("[PROVER-GPU] output_value: {:?}", output_value);
+    }
 
     mix_secure_field(channel, output_value);
 
