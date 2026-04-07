@@ -119,7 +119,7 @@ by stwo-cairo-verifier (Cairo's native Poseidon for Fiat-Shamir and Merkle).
 | Field | Value |
 |-------|-------|
 | **Contract address** | `0x1c208a5fe731c0d03b098b524f274c537587ea1d43d903838cc4a2bf90c40c7` |
-| **Class hash** | `0x0300ff964fe615d094af601074b76b7193b564e0c7215c7b98bc046334c35bcf` |
+| **Class hash** | `0x056a8b05376d4133e14451884dcef650d469c137bed273dd1bba3f39e5df28a5` |
 | **Source** | `elo-cairo-verifier/src/recursive_verifier.cairo` |
 | **Deployer** | `0x0759a4374389b0e3cfcc59d49310b6bc75bb12bbf8ce550eb5c2f026918bb344` |
 | **Declare TX** | `0x0684d0b2914a16a6637cfe2ba1b5da4f705f4156e2220e36b0e369ba7bab7a61` |
@@ -144,6 +144,9 @@ This contract performs **full cryptographic STARK verification** on-chain:
 | `is_recursive_proof_verified(proof_hash)` | Query whether a proof has been verified |
 | `get_recursive_verification_count(model_id)` | Get total verifications for a model |
 | `get_recursive_model_info(model_id)` | Get model registration details |
+| `propose_upgrade(new_class_hash)` | Owner-only. Start upgrade with 5-minute timelock |
+| `execute_upgrade()` | Owner-only. Finalize upgrade after timelock expires |
+| `cancel_upgrade()` | Owner-only. Cancel a pending upgrade |
 
 **Key deployment details:**
 
@@ -482,22 +485,17 @@ remaining step is deploying the class to Sepolia.
   proof, reconstructs the AIR, and calls stwo-cairo-verifier's `verify()` with
   the correct commitment scheme and security parameters.
 
-### 8.2 Sepolia Deployment
+### 8.2 Sepolia Deployment (Complete)
 
-The fully trustless class hash (`0x006d4ff2332af0f7b1ac4601e266f7bcd7ef3b529f72012677b15445289ce820`)
-needs to be declared on Sepolia. This requires a Juno full node because the
-class size exceeds Alchemy's gateway limits. Once declared, the Phase 1 contract
-at `0x1c208a5fe731c0d03b098b524f274c537587ea1d43d903838cc4a2bf90c40c7`
-will be upgraded via the timelock mechanism:
+The recursive verifier contract at `0x1c208a5fe731c0d03b098b524f274c537587ea1d43d903838cc4a2bf90c40c7`
+is deployed with class `0x056a8b05376d4133e14451884dcef650d469c137bed273dd1bba3f39e5df28a5`.
+This is the final production class with full OODS + Merkle + FRI + PoW verification
+and an upgrade timelock mechanism (propose/execute/cancel, 5-minute delay).
 
-1. Declare the class via Juno node
-2. `propose_upgrade(new_class_hash)` on the Phase 1 contract
-3. Wait 5 minutes (timelock)
-4. `execute_upgrade()` to finalize
+A single Starknet transaction cryptographically verifies that the GKR verifier
+accepted the original ML inference proof. The streaming pipeline is fully optional.
 
-After the upgrade, a single Starknet transaction cryptographically verifies that
-the GKR verifier accepted the original ML inference proof. The streaming
-pipeline becomes fully optional.
+32 Cairo tests pass, including 8 upgrade timelock tests.
 
 ---
 
@@ -589,7 +587,7 @@ structured JSON result.
 
 ## Appendix B: Contract Upgrade Procedure
 
-The streaming GKR verifier supports upgrades via a timelock mechanism:
+Both the streaming GKR verifier and the recursive verifier support upgrades via a timelock mechanism:
 
 1. Declare the new class: `account.declare({ contract: sierra, casm })`
 2. Propose upgrade: `account.execute({ entrypoint: "propose_upgrade", calldata: [new_class_hash] })`

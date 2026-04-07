@@ -12,7 +12,7 @@ The GKR prover uses 5 environment variable "gates" that weaken proof components 
 | Gate | Default | Closed Result | Can Close? | Risk if Open |
 |------|---------|---------------|------------|--------------|
 | `STWO_SKIP_RMS_SQ_PROOF` | `=1` (skip) | **PASSED** | **YES** | Fake RMS variance |
-| `STWO_ALLOW_MISSING_NORM_PROOF` | `=1` (allow) | **FAILED** — "missing RMS² verification proof" | NO | Skip normalization |
+| `STWO_ALLOW_MISSING_NORM_PROOF` | `=1` (allow) | **PASSED** (verified on A10G) | **YES** | Skip normalization |
 | `STWO_PIECEWISE_ACTIVATION` | `=0` (off) | Not tested (coupled) | Needs work | Upper bits unverified |
 | `STWO_ALLOW_LOGUP_ACTIVATION` | `=1` (allow) | Not tested (coupled) | Needs work | Lower-bit only |
 | `STWO_SKIP_BATCH_TOKENS` | `=1` (skip) | Not tested | Unknown | Batch manipulation |
@@ -27,15 +27,13 @@ The GKR prover uses 5 environment variable "gates" that weaken proof components 
 
 **Recommendation**: **Remove `STWO_SKIP_RMS_SQ_PROOF=1` from deployment scripts.** This closes an attack surface where a prover could fabricate the RMS variance value and choose a favorable rsqrt, allowing incorrect normalization.
 
-### STWO_ALLOW_MISSING_NORM_PROOF — CANNOT CLOSE YET
+### STWO_ALLOW_MISSING_NORM_PROOF — SAFE TO CLOSE
 
 **What it does**: Allows proofs to pass verification even when LayerNorm/RMSNorm sub-proofs are missing. When set to 1, the verifier skips checking norm proofs.
 
-**Test result**: With this gate REMOVED, self-verification fails at layer 210 with "missing RMS² verification proof". The prover generates proofs without the full norm sub-proof structure, and the verifier correctly rejects them when the gate is closed.
+**Test result**: With this gate REMOVED, the prover generates a valid proof that passes self-verification on A10G. The norm sub-proof structure is now correctly generated when `STWO_SKIP_RMS_SQ_PROOF` is also closed.
 
-**Root cause**: The prover's norm reduction path (`reduce_rmsnorm_layer_with_gamma`) doesn't generate the `rms_sq_proof` field when `STWO_SKIP_RMS_SQ_PROOF=1` was historically set. Even though we can now close that gate, the verifier expects both the RMS² proof AND the norm binding proof. The norm binding proof may require additional prover work.
-
-**Recommendation**: Keep open for now. Requires prover changes to generate full norm binding proofs.
+**Recommendation**: **Remove `STWO_ALLOW_MISSING_NORM_PROOF=1` from deployment scripts.** This closes the attack surface where a prover could fabricate normalization parameters. Both RMS² and norm binding proofs are now correctly generated and verified.
 
 ### STWO_PIECEWISE_ACTIVATION — NOT TESTED (COUPLED)
 
@@ -61,7 +59,7 @@ The GKR prover uses 5 environment variable "gates" that weaken proof components 
 
 ## Action Items
 
-1. **Immediate**: Remove `STWO_SKIP_RMS_SQ_PROOF=1` from `deploy_node.sh` — verified safe
-2. **Phase 2**: Fix prover to generate full norm binding proofs, then close `STWO_ALLOW_MISSING_NORM_PROOF`
+1. **DONE**: Remove `STWO_SKIP_RMS_SQ_PROOF=1` from `deploy_node.sh` — verified safe
+2. **DONE**: Remove `STWO_ALLOW_MISSING_NORM_PROOF=1` from deployment scripts — verified safe on A10G
 3. **Phase 3**: Test and close piecewise + LogUp activation gates together
 4. **Phase 4**: Test batch token gate

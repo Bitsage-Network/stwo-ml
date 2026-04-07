@@ -138,7 +138,7 @@ Every proof is verified trustlessly on Starknet. The Cairo contract performs com
 | Contract | Address |
 |---|---|
 | Recursive Verifier | [`0x1c208a5fe731c0d03b098b524f274c537587ea1d43d903838cc4a2bf90c40c7`](https://sepolia.voyager.online/contract/0x1c208a5fe731c0d03b098b524f274c537587ea1d43d903838cc4a2bf90c40c7) |
-| Class Hash | `0x05057fff1ced4c9044d3613256b0e9718e05b07760b6570c5f883aad73e163ea` |
+| Class Hash | `0x056a8b05376d4133e14451884dcef650d469c137bed273dd1bba3f39e5df28a5` |
 | Deployer | [`0x0759a4374389b0e3cfcc59d49310b6bc75bb12bbf8ce550eb5c2f026918bb344`](https://sepolia.voyager.online/contract/0x0759a4374389b0e3cfcc59d49310b6bc75bb12bbf8ce550eb5c2f026918bb344) |
 
 ### Verified Transaction
@@ -196,6 +196,8 @@ Any HuggingFace transformer with SafeTensors weights is supported. The HF loader
 
 All SDKs default to `https://api.bitsage.network`. Set `OBELYZK_API_URL` to point at a self-hosted prover.
 
+The hosted API is live at `https://api.bitsage.network` and `https://prover.bitsage.network` with HTTPS, Bearer token authentication, and a rate limit of 60 requests/minute.
+
 ---
 
 ## Self-Hosting
@@ -231,7 +233,13 @@ Exposes:
 - `GET /ws` -- WebSocket endpoint for real-time proof streaming
 - `GET /` -- web dashboard with live proof visualization
 
-See [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) for VM deployment scripts, Docker setup, and multi-GPU configuration.
+For production deployment with HTTPS, nginx, and certbot:
+
+```bash
+DOMAIN=api.example.com ./scripts/deploy_api.sh
+```
+
+See [scripts/pipeline/GETTING_STARTED.md](scripts/pipeline/GETTING_STARTED.md) for VM deployment scripts, Docker setup, and multi-GPU configuration.
 
 ---
 

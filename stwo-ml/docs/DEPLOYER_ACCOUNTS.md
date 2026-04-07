@@ -74,7 +74,7 @@ contract classes cost approximately:
 | Field | Value |
 |-------|-------|
 | **Contract** | `0x1c208a5fe731c0d03b098b524f274c537587ea1d43d903838cc4a2bf90c40c7` |
-| **Class hash** | `0x0300ff964fe615d094af601074b76b7193b564e0c7215c7b98bc046334c35bcf` |
+| **Class hash** | `0x056a8b05376d4133e14451884dcef650d469c137bed273dd1bba3f39e5df28a5` |
 | **Deployer** | `0x0759a4374389b0e3cfcc59d49310b6bc75bb12bbf8ce550eb5c2f026918bb344` |
 | **Source** | `elo-cairo-verifier/src/recursive_verifier.cairo` |
 | **Declare TX** | `0x0684d0b2914a16a6637cfe2ba1b5da4f705f4156e2220e36b0e369ba7bab7a61` |
@@ -82,11 +82,14 @@ contract classes cost approximately:
 | **First verified proof** | `0x61a60a7fcf899d38da5e0f4632746f48843e1c537dabe57ea7df42ad71c0ba6` |
 | **MIN_POW_BITS** | 10 |
 | **Constructor** | `{ owner: DEPLOYER_ADDRESS }` |
+| **Upgrade timelock** | `propose_upgrade` / `execute_upgrade` / `cancel_upgrade` (5-minute delay) |
+| **Cairo tests** | 32 passing (including 8 upgrade tests) |
 | **Status** | **LIVE on Sepolia -- fully trustless STARK verification** |
 
 Performs full on-chain STARK verification: OODS sampling, Merkle decommitment,
 FRI layer folding, and proof-of-work validation. A single Starknet transaction
-verifies an entire ML model execution.
+verifies an entire ML model execution. Supports upgrade timelock for class
+upgrades (propose -> 5-minute delay -> execute/cancel).
 
 Entrypoints:
 - `register_model_recursive(model_id, circuit_hash, weight_super_root)`
@@ -94,6 +97,9 @@ Entrypoints:
 - `is_recursive_proof_verified(proof_hash) -> bool`
 - `get_recursive_verification_count(model_id) -> u64`
 - `get_recursive_model_info(model_id) -> RecursiveModelInfo`
+- `propose_upgrade(new_class_hash)` -- owner-only, starts 5-minute timelock
+- `execute_upgrade()` -- owner-only, finalizes upgrade after timelock
+- `cancel_upgrade()` -- owner-only, cancels pending upgrade
 
 **Deployment notes**: The contract required removing all `Felt252Dict` usage from
 the stwo-cairo verifier to avoid the `squashed_felt252_dict_entries` libfunc
@@ -144,7 +150,8 @@ Key entrypoints (streaming flow):
 
 | Version | Class Hash | Notes |
 |---------|------------|-------|
-| **Trustless recursive** | `0x0300ff964fe615d094af601074b76b7193b564e0c7215c7b98bc046334c35bcf` | **LIVE** -- full OODS+Merkle+FRI+PoW |
+| **Trustless recursive** | `0x056a8b05376d4133e14451884dcef650d469c137bed273dd1bba3f39e5df28a5` | **LIVE** -- full OODS+Merkle+FRI+PoW + upgrade timelock |
+| Trustless recursive (prev) | `0x0300ff964fe615d094af601074b76b7193b564e0c7215c7b98bc046334c35bcf` | Superseded -- no upgrade mechanism |
 | Trustless (test, pow=0) | `0x0223790f285eec0571cde551a331e42db0833a2f8eff121a2058ff7772649567` | Test deploy, MIN_POW_BITS=0 |
 | Trustless (old, dict) | `0x006d4ff2332af0f7b1ac4601e266f7bcd7ef3b529f72012677b15445289ce820` | Rejected by sequencer (Sierra 1.8.0 libfunc) |
 | v32 | `0x5dca646786c36f9d68bab802d5c5c4995c37aa7c25bfa59ff20144a283f0956` | Production streaming |

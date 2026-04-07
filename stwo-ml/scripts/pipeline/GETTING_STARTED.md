@@ -351,6 +351,28 @@ The script will:
 4. Start `prove-server` on port 8080
 5. Register the node on-chain if not already registered
 
+### Production API Deployment
+
+For a production-grade deployment with HTTPS, use `deploy_api.sh`:
+
+```bash
+cd stwo-ml
+
+DOMAIN=api.example.com \
+STARKNET_PRIVATE_KEY=0x... \
+./scripts/deploy_api.sh
+```
+
+This script automates the full deployment stack:
+
+1. Builds `prove-model` and `prove-server` with GPU features (auto-detects CUDA)
+2. Creates a systemd service for `prove-server`
+3. Configures nginx as a reverse proxy
+4. Provisions HTTPS certificates via certbot (Let's Encrypt)
+5. Sets up Bearer token authentication and rate limiting (60 req/min)
+
+The hosted API at `https://api.bitsage.network` and `https://prover.bitsage.network` was deployed using this script.
+
 ---
 
 ## 7. Contract Interface Reference

@@ -84,7 +84,7 @@ A recursive STARK proof has been verified on Starknet Sepolia in a single transa
 | Field | Value |
 |-------|-------|
 | Contract | `0x1c208a5fe731c0d03b098b524f274c537587ea1d43d903838cc4a2bf90c40c7` |
-| Class hash | `0x0300ff964fe615d094af601074b76b7193b564e0c7215c7b98bc046334c35bcf` |
+| Class hash | `0x056a8b05376d4133e14451884dcef650d469c137bed273dd1bba3f39e5df28a5` |
 | First verified proof TX | `0x276c6a448829c0f3975080914a89c2a9611fc41912aff1fddfe29d8f3364ddc` |
 | MIN_POW_BITS | 10 (production) |
 | Verification type | Full STARK: OODS sampling + Merkle decommitment + FRI layer folding + PoW |
@@ -115,7 +115,8 @@ A second verification path exists for smaller models or when recursive proving i
 |-----------|--------|
 | A10G GPU instance | Running at `44.251.24.184` |
 | Juno Sepolia node | Configured with snap-sync for class declaration |
-| Automated deployment | `deploy_node.sh`, `deploy_recursive_v2.mjs` |
+| Hosted API | **Live** at `https://api.bitsage.network` (HTTPS, Bearer auth, 60 req/min rate limit) |
+| Automated deployment | `deploy_node.sh`, `deploy_api.sh` (nginx + certbot), `deploy_recursive_v2.mjs` |
 | Policy system | `PolicyConfig` with strict/standard/relaxed presets, Poseidon commitment hashing |
 | Phase profiler | Per-phase wall-clock + Poseidon hash counts (`STWO_PROFILE=1`) |
 | Proof streaming | WebSocket broadcast via `prove-server` with Three.js dashboard |
@@ -199,11 +200,11 @@ The published packages have mismatched contents:
 
 **Impact**: Developers who install the published SDK cannot actually prove or verify models without building from source. The "3 lines of code" promise in documentation is aspirational.
 
-### 3.6 Hosted API Status Unknown
+### 3.6 Hosted API
 
-**Severity**: Medium
+**Severity**: Resolved
 
-`https://api.bitsage.network` is referenced in documentation and SDK code, but its operational status is unverified. The `prove-server` binary exists in the codebase and has a WebSocket streaming dashboard, but whether it is deployed and accepting requests at the documented URL is unknown.
+The hosted API is live at `https://api.bitsage.network` and `https://prover.bitsage.network` with HTTPS (nginx + Let's Encrypt). Authentication is via Bearer token. Rate limit: 60 requests/minute. Deployment is automated via `scripts/deploy_api.sh` which handles build, systemd service, nginx reverse proxy, and certbot certificate provisioning.
 
 ### 3.7 No Adversarial Testing
 
@@ -221,18 +222,14 @@ No malicious proof submissions have been tested against the trustless recursive 
 
 The Rust-side prover has tamper tests (9/9 adversarial attacks detected in the GKR layer), but the on-chain contract has not been subjected to adversarial inputs.
 
-### 3.8 No Cairo Tests for Recursive Verifier
+### 3.8 Cairo Test Coverage for Recursive Verifier
 
-**Severity**: High
+**Severity**: Medium (improved)
 
-The trustless recursive verifier contract (`elo-cairo-verifier/src/recursive_verifier.cairo`) has no automated test suite. The streaming verifier has 41 test files, but the recursive contract -- which is now the primary verification path -- has zero snforge tests.
-
-The contract was validated by submitting a real proof and observing acceptance, but there are no tests for:
-- Tampered proof rejection.
-- Wrong model_id.
-- Duplicate proof submission.
-- Unauthorized model registration.
-- Edge cases in deserialization.
+The trustless recursive verifier contract (`elo-cairo-verifier/src/recursive_verifier.cairo`) now has 32 passing Cairo tests (up from 0), including 8 upgrade timelock tests. Coverage includes model registration, proof verification, duplicate detection, and upgrade lifecycle (propose/execute/cancel). Remaining gaps:
+- No tampered proof rejection tests (bit-flip in STARK data).
+- No fuzzing of deserialization edge cases.
+- No adversarial calldata submissions.
 
 ### 3.9 Single Model Verified On-Chain
 
@@ -252,11 +249,11 @@ Only SmolLM2-135M has been end-to-end verified on Starknet Sepolia via the recur
 
 The deployer account v2 private key (`0x0123456789abcdef...`) is stored in plaintext in `docs/DEPLOYER_ACCOUNTS.md` and referenced in deployment scripts. While this is a testnet key, the documentation explicitly warns against using it on mainnet -- but the rotation procedure is not documented and there is no multisig or timelock on the deployer account.
 
-### 3.12 Recursive Contract Lacks Upgrade Mechanism
+### 3.12 Contract Upgrade Timelock
 
-**Severity**: Medium
+**Severity**: Low (resolved)
 
-The streaming GKR verifier contract has a timelock upgrade mechanism (`propose_upgrade` -> 5-minute delay -> `execute_upgrade`). The recursive verifier contract does not. If a bug is found in the recursive contract, it cannot be upgraded -- a new contract must be deployed and all model registrations must be migrated manually.
+Both the streaming GKR verifier and the recursive verifier contract now have a timelock upgrade mechanism (`propose_upgrade` -> 5-minute delay -> `execute_upgrade` / `cancel_upgrade`). The recursive contract was upgraded to class `0x056a8b05376d4133e14451884dcef650d469c137bed273dd1bba3f39e5df28a5` which includes full upgrade support. 32 Cairo tests pass, including 8 upgrade-specific tests.
 
 ---
 
@@ -274,8 +271,8 @@ The streaming GKR verifier contract has a timelock upgrade mechanism (`propose_u
 | Policy enforcement | **NOT ACTIVE** | Policy commitment skipped in all deployment configurations. |
 | Access control | **BASIC** | Owner-only model registration. No multisig, no role-based access, no governance. |
 | Key management | **WEAK** | Testnet keys in plaintext in docs and scripts. Single deployer account. No rotation procedure. |
-| Denial of service | **NOT TESTED** | No testing of oversized inputs, resource exhaustion, or rate limiting on the contract or prover. |
-| Contract upgradeability | **PARTIAL** | Streaming contract has timelock mechanism. Recursive contract does not. |
+| Denial of service | **BASIC** | Hosted API has rate limiting (60 req/min) and Bearer token auth. Contract-level DoS not tested. |
+| Contract upgradeability | **COMPLETE** | Both streaming and recursive contracts have timelock upgrade mechanism (propose/execute/cancel, 5-minute delay). |
 | Supply chain | **MODERATE** | Depends on STWO fork (path dep), stwo-cairo-verifier, starknet.js. No vendoring or pinning of Cairo dependencies. |
 
 ---
