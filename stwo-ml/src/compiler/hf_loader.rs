@@ -272,8 +272,9 @@ pub fn validate_model_directory(model_dir: &Path, num_layers: Option<usize>) -> 
 
         if let Ok(all_tensors) = list_tensors_sharded(&shard_paths) {
             let transformer_config = cfg.to_transformer_config();
-            let graph = build_hf_transformer_graph(&transformer_config, layers);
-            let name_map = build_weight_name_map(&graph, layers, &all_tensors);
+            let (graph, moe_infos) = build_hf_transformer_graph(&transformer_config, layers);
+            let mut name_map = build_weight_name_map(&graph, layers, &all_tensors);
+            add_moe_weight_names(&mut name_map, &moe_infos, &all_tensors);
 
             let matmul_count = graph
                 .nodes
@@ -574,7 +575,7 @@ pub fn load_hf_model(model_dir: &Path, num_layers: Option<usize>) -> Result<Onnx
     );
 
     // ── Step 3: Build computation graph ──
-    let graph = build_hf_transformer_graph(&transformer_config, layers);
+    let (graph, moe_infos) = build_hf_transformer_graph(&transformer_config, layers);
 
     // ── Step 4: Load weights (guaranteed to exist by validation) ──
     let shard_paths = discover_shards(model_dir, "model")
@@ -596,7 +597,8 @@ pub fn load_hf_model(model_dir: &Path, num_layers: Option<usize>) -> Result<Onnx
         .map_err(|e| OnnxError::WeightError(format!("Cannot list tensors: {e}")))?;
     eprintln!("  Total tensors across shards: {}", all_tensor_names.len());
 
-    let name_map = build_weight_name_map(&graph, layers, &all_tensor_names);
+    let mut name_map = build_weight_name_map(&graph, layers, &all_tensor_names);
+    add_moe_weight_names(&mut name_map, &moe_infos, &all_tensor_names);
     eprintln!("  Weight name mapping: {} entries", name_map.len());
 
     let weights =
@@ -692,7 +694,7 @@ pub fn open_streaming_pipeline(
     };
 
     // Build computation graph
-    let graph = build_hf_transformer_graph(&transformer_config, layers);
+    let (graph, moe_infos) = build_hf_transformer_graph(&transformer_config, layers);
 
     // Discover shards
     let shard_paths = discover_shards(model_dir, "model")
@@ -735,7 +737,7 @@ pub fn open_streaming_pipeline(
 ///   up   = input × W_up
 ///   hidden = gate * up
 ///   output = hidden × W_down
-fn build_hf_transformer_graph(config: &TransformerConfig, num_layers: usize) -> ComputationGraph {
+fn build_hf_transformer_graph(config: &TransformerConfig, num_layers: usize) -> (ComputationGraph, Vec<(usize, crate::compiler::graph::MoESlotInfo)>) {
     use crate::compiler::onnx::NormType;
     let d = config.d_model;
     let d_ff = config.d_ff;
@@ -775,7 +777,7 @@ fn build_hf_transformer_graph(config: &TransformerConfig, num_layers: usize) -> 
         NormType::RMSNorm => { builder.rms_norm(); }
     }
 
-    builder.build()
+    (builder.build(), moe_slot_infos)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -983,6 +985,61 @@ fn build_weight_name_map(
     }
 
     map
+}
+
+/// Add MoE expert weight tensor names to the weight name map.
+///
+/// Maps Mixtral-style tensor names to the template expert slot node IDs.
+/// The MoEWeightBank will load ALL expert weights; at runtime, bind_experts()
+/// selects which experts' weights go into the template slots.
+fn add_moe_weight_names(
+    map: &mut HashMap<usize, String>,
+    moe_slot_infos: &[(usize, crate::compiler::graph::MoESlotInfo)],
+    available_tensors: &[(String, usize)],
+) {
+    let tensor_set: std::collections::HashSet<&str> = available_tensors
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+
+    for (layer_idx, info) in moe_slot_infos {
+        // Router gate weight
+        let router_name = format!(
+            "model.layers.{layer_idx}.block_sparse_moe.gate.weight"
+        );
+        if tensor_set.contains(router_name.as_str()) {
+            map.insert(info.router_node_id, router_name);
+        }
+
+        // Per-expert weights: stored in MoEWeightBank, not in the graph directly.
+        // We use a special key range (30000 + expert_idx * 100 + slot) to identify
+        // MoE expert tensors. These are loaded into the bank, not the graph weights.
+        for expert_idx in 0..info.num_experts {
+            // w1 = gate_proj
+            let w1_name = format!(
+                "model.layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w1.weight"
+            );
+            if tensor_set.contains(w1_name.as_str()) {
+                map.insert(30000 + layer_idx * 1000 + expert_idx * 10, w1_name);
+            }
+
+            // w3 = up_proj
+            let w3_name = format!(
+                "model.layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w3.weight"
+            );
+            if tensor_set.contains(w3_name.as_str()) {
+                map.insert(30000 + layer_idx * 1000 + expert_idx * 10 + 1, w3_name);
+            }
+
+            // w2 = down_proj
+            let w2_name = format!(
+                "model.layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w2.weight"
+            );
+            if tensor_set.contains(w2_name.as_str()) {
+                map.insert(30000 + layer_idx * 1000 + expert_idx * 10 + 2, w2_name);
+            }
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2129,7 +2186,7 @@ mod tests {
             norm_type: crate::compiler::onnx::NormType::LayerNorm,
         };
 
-        let graph = build_hf_transformer_graph(&config, 2);
+        let (graph, moe_infos) = build_hf_transformer_graph(&config, 2);
 
         // 2 blocks × 7 ops + 1 final LN = 15
         assert_eq!(graph.num_layers(), 15);
