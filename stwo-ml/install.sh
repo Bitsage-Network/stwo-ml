@@ -5,7 +5,7 @@
 # Verifiable ML inference. One command to install, one command to run.
 #
 # Usage:
-#   curl -sSf https://raw.githubusercontent.com/bitsage-network/stwo-ml/main/install.sh | bash
+#   curl -sSf https://raw.githubusercontent.com/Bitsage-Network/stwo-ml/main/stwo-ml/install.sh | bash
 #
 # What this does:
 #   1. Clones the stwo-ml repository (or updates it)
@@ -47,7 +47,7 @@ echo -e "    ${GHOST}${DIM}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}$
 echo ""
 
 INSTALL_DIR="$HOME/.obelysk/src"
-REPO_URL="https://github.com/bitsage-network/stwo-ml.git"
+REPO_URL="https://github.com/Bitsage-Network/stwo-ml.git"
 BRANCH="main"
 
 # ── Step 1: Get the source ──────────────────────────────────────────
