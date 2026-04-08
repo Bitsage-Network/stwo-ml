@@ -344,3 +344,17 @@ No external third-party audit has been conducted.
 ---
 
 *This document was prepared for internal use. It reflects the system state as of April 6, 2026. All claims have been cross-referenced against the codebase, deployment scripts, and on-chain transaction records.*
+
+## Appendix: Design Issue Found During E2E Testing (April 8, 2026)
+
+### weight_super_root is Input-Dependent
+
+**Finding**: The `weight_super_root` stored in the recursive proof changes with each inference input, even for the same model. This is because it's computed as `Poseidon(num_claims, claim[0].expected_value, ...)` where `expected_value` is the weight MLE evaluated at a Fiat-Shamir challenge point — which depends on the input through the transcript.
+
+**Impact**: Model registration on-chain must be updated for each unique input's proof, defeating the purpose of one-time registration.
+
+**Root cause**: The weight binding uses evaluated claims (input-dependent) instead of committed roots (input-independent).
+
+**Fix**: Replace `weight_super_root` with `Poseidon(weight_merkle_roots)` — a hash of the individual weight Poseidon Merkle roots, which are model-fixed and input-independent. The Merkle roots are already computed during GKR proving (in `apply_aggregated_oracle_sumcheck`).
+
+**Workaround**: Register with `weight_super_root=0` (skip check) until the fix is implemented. The STARK proof still cryptographically verifies the computation — the binding is weaker but the proof is still valid.
