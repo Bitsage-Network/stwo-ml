@@ -13,6 +13,31 @@ ObelyZK proves that a transformer model (LLaMA, Qwen, Phi, SmolLM, Mistral) prod
 
 ---
 
+## Try It Now
+
+No SDK required. The hosted API is live at `https://api.bitsage.network`.
+
+```bash
+# Health check (no auth)
+curl https://api.bitsage.network/health
+
+# Prove a model (requires API key — set OBELYSK_API_KEY)
+curl -X POST https://api.bitsage.network/api/v1/infer \
+  -H "Authorization: Bearer $OBELYSK_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model_id":"smollm2-135m","input":[1.0,2.0,3.0],"gpu":true}'
+
+# Check on-chain verification count for a model
+starkli call 0x1c208a5fe731c0d03b098b524f274c537587ea1d43d903838cc4a2bf90c40c7 \
+  get_recursive_verification_count 0x7214ee0e9c30e3e6748651d42f941c4b875a5b0a549223f92471a58585c980
+```
+
+Auth: pass `Authorization: Bearer <API_KEY>` on every request (env: `OBELYSK_API_KEY`).
+
+Contract: [`0x1c208a5fe731c0d03b098b524f274c537587ea1d43d903838cc4a2bf90c40c7`](https://sepolia.starkscan.co/contract/0x1c208a5fe731c0d03b098b524f274c537587ea1d43d903838cc4a2bf90c40c7) (Starknet Sepolia)
+
+---
+
 ## Quick Start
 
 ### Path 1: TypeScript SDK
@@ -181,6 +206,10 @@ See [docs/ON_CHAIN_VERIFICATION.md](docs/ON_CHAIN_VERIFICATION.md) for the full 
 | Mistral-7B | Mistral | 7B | 4,096 | Proven, on-chain ready |
 | Mixtral-8x7B | MoE | 47B | 4,096 | MoE routing proven |
 | Qwen3-14B | Qwen | 14B | 5,120 | Proven on H100 |
+
+**Decode (multi-turn).** Prefill + N decode steps with KV-cache commitment chaining. Each decode step produces a GKR proof bound to the previous KV-cache Poseidon root, enabling verifiable multi-turn conversations.
+
+**MoE (Mixture of Experts).** TopK routing with dynamic expert weight binding. The prover detects MoE architecture automatically and binds per-expert weight commitments through the GKR channel (17 tests pass).
 
 Any HuggingFace transformer with SafeTensors weights is supported. The HF loader auto-detects architecture, tensor naming conventions, and MoE routing.
 

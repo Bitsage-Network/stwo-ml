@@ -118,15 +118,16 @@ by stwo-cairo-verifier (Cairo's native Poseidon for Fiat-Shamir and Merkle).
 
 | Field | Value |
 |-------|-------|
-| **Contract address** | `0x1c208a5fe731c0d03b098b524f274c537587ea1d43d903838cc4a2bf90c40c7` |
-| **Class hash** | `0x056a8b05376d4133e14451884dcef650d469c137bed273dd1bba3f39e5df28a5` |
+| **Contract address** | [`0x1c208a5fe731c0d03b098b524f274c537587ea1d43d903838cc4a2bf90c40c7`](https://sepolia.starkscan.co/contract/0x1c208a5fe731c0d03b098b524f274c537587ea1d43d903838cc4a2bf90c40c7) |
+| **Class hash** | [`0x056a8b05376d4133e14451884dcef650d469c137bed273dd1bba3f39e5df28a5`](https://sepolia.starkscan.co/class/0x056a8b05376d4133e14451884dcef650d469c137bed273dd1bba3f39e5df28a5) |
 | **Source** | `elo-cairo-verifier/src/recursive_verifier.cairo` |
 | **Deployer** | `0x0759a4374389b0e3cfcc59d49310b6bc75bb12bbf8ce550eb5c2f026918bb344` |
-| **Declare TX** | `0x0684d0b2914a16a6637cfe2ba1b5da4f705f4156e2220e36b0e369ba7bab7a61` |
-| **Deploy TX** | `0x7b7715e4710b7f9e329bb91cffbdc05ac54b1e68b88989bee9fa60ec2dcdb9c` |
-| **First verification** | `0x61a60a7fcf899d38da5e0f4632746f48843e1c537dabe57ea7df42ad71c0ba6` |
+| **Declare TX** | [`0x0684d0b2914a16a6637cfe2ba1b5da4f705f4156e2220e36b0e369ba7bab7a61`](https://sepolia.starkscan.co/tx/0x0684d0b2914a16a6637cfe2ba1b5da4f705f4156e2220e36b0e369ba7bab7a61) |
+| **Deploy TX** | [`0x7b7715e4710b7f9e329bb91cffbdc05ac54b1e68b88989bee9fa60ec2dcdb9c`](https://sepolia.starkscan.co/tx/0x7b7715e4710b7f9e329bb91cffbdc05ac54b1e68b88989bee9fa60ec2dcdb9c) |
+| **First verification** | [`0x61a60a7fcf899d38da5e0f4632746f48843e1c537dabe57ea7df42ad71c0ba6`](https://sepolia.starkscan.co/tx/0x61a60a7fcf899d38da5e0f4632746f48843e1c537dabe57ea7df42ad71c0ba6) |
 | **MIN_POW_BITS** | 10 (production hardened) |
 | **Status** | **Live on Sepolia. Fully trustless STARK verification.** |
+| **Explorer** | [View on Starkscan](https://sepolia.starkscan.co/contract/0x1c208a5fe731c0d03b098b524f274c537587ea1d43d903838cc4a2bf90c40c7) |
 
 This contract performs **full cryptographic STARK verification** on-chain:
 
@@ -485,7 +486,14 @@ remaining step is deploying the class to Sepolia.
   proof, reconstructs the AIR, and calls stwo-cairo-verifier's `verify()` with
   the correct commitment scheme and security parameters.
 
-### 8.2 Sepolia Deployment (Complete)
+### 8.2 Verified Models
+
+| Model | Calldata | Prove Time | TX |
+|-------|----------|------------|-----|
+| SmolLM2-135M (30-layer) | 942 felts | 102s | [`0x276c6a44...`](https://sepolia.starkscan.co/tx/0x276c6a448829c0f3975080914a89c2a9611fc41912aff1fddfe29d8f3364ddc) |
+| Qwen2-0.5B | 924 felts | 287s | Verified on Sepolia |
+
+### 8.3 Sepolia Deployment (Complete)
 
 The recursive verifier contract at `0x1c208a5fe731c0d03b098b524f274c537587ea1d43d903838cc4a2bf90c40c7`
 is deployed with class `0x056a8b05376d4133e14451884dcef650d469c137bed273dd1bba3f39e5df28a5`.

@@ -333,6 +333,46 @@ https://sepolia.starkscan.co/tx/<tx_hash>
 
 ---
 
+## 5b. Multi-Turn Conversations (KV-Cache Decode)
+
+ObelyZK supports verifiable multi-turn inference via prefill + decode steps. Each decode step produces a GKR proof bound to the previous KV-cache Poseidon root, forming a commitment chain that proves the entire conversation history.
+
+```bash
+prove-model --model-dir ~/.obelysk/models/smollm2-135m \
+  --decode --decode-steps 10 --prefill-len 5 \
+  --gkr --format ml_gkr
+```
+
+Flags:
+
+| Flag | Description |
+|------|-------------|
+| `--decode` | Enable decode-step proving (prefill + autoregressive steps) |
+| `--decode-steps N` | Number of autoregressive decode steps after prefill |
+| `--prefill-len N` | Number of tokens in the initial prefill pass |
+
+Each decode step appends to an incremental Merkle tree over KV-cache entries. The on-chain contract verifies the commitment chain, so a verifier can confirm that token N was generated from the same context as tokens 1..N-1.
+
+Add `--recursive` to wrap the entire decode chain in a single recursive STARK for 1-TX on-chain verification.
+
+---
+
+## 5c. MoE Models (Mixtral)
+
+Mixture-of-Experts architectures (e.g., Mixtral-8x7B) are supported. The HF loader auto-detects MoE routing layers, and the prover generates per-expert weight binding proofs with TopK routing verification.
+
+No special flags are needed. The compiler detects MoE architecture from `config.json` and maps expert tensor names automatically:
+
+```bash
+prove-model --model-dir ~/.obelysk/models/mixtral-8x7b \
+  --gkr --format ml_gkr --recursive \
+  --output proof.json
+```
+
+The GKR proof includes dynamic expert weight binding: for each token, only the TopK-selected experts are activated, and the prover binds their weight commitments through the Fiat-Shamir channel. 17 MoE-specific tests validate this path.
+
+---
+
 ## 6. Automated Node Deployment
 
 The `deploy_node.sh` script sets up both a Juno Starknet node and a `prove-server` instance on a single machine. It handles CUDA detection, model downloads, systemd service files, and on-chain registration.
