@@ -49,6 +49,7 @@ pub mod model;
 pub mod prove;
 pub mod trained_weights;
 pub mod types;
+pub mod weight_registry;
 
 // Re-export key types for convenience
 pub use encoder::encode_transaction;
