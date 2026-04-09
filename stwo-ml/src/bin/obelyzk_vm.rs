@@ -39,11 +39,23 @@ use stwo_ml::vm::queue::{ProvingQueue, ProvingStatus};
 // State
 // ═══════════════════════════════════════════════════════════════════
 
+/// Per-conversation session with KV-cache for multi-turn proving.
+struct ChatSession {
+    session_id: String,
+    model_id: String,
+    kv_cache: stwo_ml::components::attention::ModelKVCache,
+    token_history: Vec<u32>,
+    last_accessed: Instant,
+    turns: usize,
+}
+
 struct VmState {
     local_provider: Option<Arc<LocalProvider>>,
     upstream_provider: Option<Arc<OpenAiCompatProvider>>,
     proving_queue: Arc<ProvingQueue>,
     attestations: RwLock<HashMap<String, InferenceAttestation>>,
+    /// Multi-turn conversation sessions with KV-cache.
+    sessions: RwLock<HashMap<String, ChatSession>>,
     started_at: Instant,
 }
 
@@ -61,6 +73,9 @@ struct ChatCompletionRequest {
     temperature: Option<f32>,
     #[serde(default)]
     stream: bool,
+    /// ObelyZK extension: continue a conversation session.
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -109,6 +124,15 @@ struct ObelyzkMeta {
     trust_model: String,
     io_commitment: Option<String>,
     attestation_id: String,
+    /// Session ID for multi-turn conversations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    /// Number of conversation turns so far.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    turns: Option<usize>,
+    /// Inference latency in ms (fast path only, excludes proving).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inference_time_ms: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -187,42 +211,74 @@ async fn chat_completions(
 
     // ── SSE Streaming path ─────────────────────────────────────────
     if req.stream {
-        return chat_completions_stream(state, req.model, prompt).await;
+        let sid = req.session_id.clone().unwrap_or_else(|| format!("ses-{}", uuid::Uuid::new_v4()));
+        return chat_completions_stream(state, req.model, prompt, sid).await;
     }
 
-    // ── Synchronous path (existing: blocks until proof is done) ────
+    // ── Synchronous path ────────────────────────────────────────────
     let proof_id = format!("proof-{}", uuid::Uuid::new_v4());
     let attestation_id = format!("att-{}", uuid::Uuid::new_v4());
-
-    let local = state.local_provider.as_ref()
-        .ok_or_else(|| api_error(StatusCode::SERVICE_UNAVAILABLE, "no local provider"))?;
-    let local = Arc::clone(local);
-
-    let result = tokio::task::spawn_blocking(move || {
-        local.infer_text(&prompt, None)
-            .map(|(text, mut res, _)| {
-                res.trust_model = TrustModel::ZkProof { weight_commitment: local.weight_commitment.clone() };
-                (text, res)
-            })
-            .map_err(|e| format!("{e}"))
-    })
-    .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("join: {e}")))?
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, &e))?;
-
-    let (text, inference_result) = result;
+    let session_id = req.session_id.clone().unwrap_or_else(|| format!("ses-{}", uuid::Uuid::new_v4()));
     let now_secs = epoch_secs();
-    let io_hex = inference_result.io_commitment.map(|c| format!("0x{:x}", c));
-    let trust_str = trust_model_str(&inference_result.trust_model);
+
+    // Route: local provider (ZK proof) or upstream (commitment only)
+    let (text, trust_str, io_hex, num_tokens) = if let Some(ref local) = state.local_provider {
+        let local = Arc::clone(local);
+        let result = tokio::task::spawn_blocking(move || {
+            local.infer_text(&prompt, None)
+                .map(|(text, res, _)| (text, res))
+                .map_err(|e| format!("{e}"))
+        })
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("join: {e}")))?
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, &e))?;
+        let (text, res) = result;
+        let trust = trust_model_str(&res.trust_model);
+        let io = res.io_commitment.map(|c| format!("0x{:x}", c));
+        (text, trust, io, res.num_tokens)
+    } else if let Some(ref upstream) = state.upstream_provider {
+        // Forward to upstream (vLLM, Ollama, TGI, etc.)
+        let messages: Vec<ChatMessage> = req.messages.iter()
+            .map(|m| ChatMessage { role: m.role.clone(), content: m.content.clone() })
+            .collect();
+        let result = upstream.chat(&messages, req.max_tokens, req.temperature).await
+            .map_err(|e| api_error(StatusCode::BAD_GATEWAY, &format!("upstream: {e}")))?;
+        let trust = trust_model_str(&result.trust_model);
+        let io = result.io_commitment.map(|c| format!("0x{:x}", c));
+        (result.text, trust, io, result.num_tokens)
+    } else {
+        return Err(api_error(StatusCode::SERVICE_UNAVAILABLE, "no provider configured"));
+    };
+
+    // Create/update session
+    {
+        let mut sessions = state.sessions.write().await;
+        let session = sessions.entry(session_id.clone()).or_insert_with(|| ChatSession {
+            session_id: session_id.clone(),
+            model_id: req.model.clone(),
+            kv_cache: stwo_ml::components::attention::ModelKVCache::new(),
+            token_history: Vec::new(),
+            last_accessed: Instant::now(),
+            turns: 0,
+        });
+        session.turns += 1;
+        session.last_accessed = Instant::now();
+    }
+
+    let turns = state.sessions.read().await.get(&session_id).map(|s| s.turns).unwrap_or(1);
 
     Ok(Json(ChatCompletionResponse {
         id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
         object: "chat.completion".into(),
         created: now_secs,
-        model: inference_result.model_id.clone(),
+        model: req.model,
         choices: vec![ChatChoice { index: 0, message: ChatMessageOut { role: "assistant".into(), content: text }, finish_reason: "stop".into() }],
-        usage: ChatUsage { prompt_tokens: inference_result.num_tokens, completion_tokens: 1, total_tokens: inference_result.num_tokens + 1 },
-        obelyzk: Some(ObelyzkMeta { proof_id, proof_status: "complete".into(), trust_model: trust_str.into(), io_commitment: io_hex, attestation_id }),
+        usage: ChatUsage { prompt_tokens: num_tokens, completion_tokens: 1, total_tokens: num_tokens + 1 },
+        obelyzk: Some(ObelyzkMeta {
+            proof_id, proof_status: "complete".into(), trust_model: trust_str.into(),
+            io_commitment: io_hex, attestation_id,
+            session_id: Some(session_id), turns: Some(turns), inference_time_ms: None,
+        }),
     }).into_response())
 }
 
@@ -238,9 +294,10 @@ async fn chat_completions_stream(
     state: Arc<VmState>,
     model: String,
     prompt: String,
+    session_id: String,
 ) -> Result<axum::response::Response, (StatusCode, Json<ErrorBody>)> {
     let local = state.local_provider.as_ref()
-        .ok_or_else(|| api_error(StatusCode::SERVICE_UNAVAILABLE, "no local provider"))?;
+        .ok_or_else(|| api_error(StatusCode::SERVICE_UNAVAILABLE, "no local provider (streaming requires local model)"))?;
     let local = Arc::clone(local);
 
     let proof_id = format!("proof-{}", uuid::Uuid::new_v4());
@@ -333,7 +390,8 @@ async fn chat_completions_stream(
                 "proof_id": proof_id,
                 "proof_status": "proving",
                 "trust_model": "zk_proof",
-                "inference_time_ms": inference_ms
+                "inference_time_ms": inference_ms,
+                "session_id": session_id
             }
         }).to_string()),
         // OpenAI [DONE] sentinel
@@ -398,6 +456,36 @@ async fn list_models(
         "object": "list",
         "data": models,
     }))
+}
+
+/// List active sessions.
+async fn list_sessions(
+    State(state): State<Arc<VmState>>,
+) -> Json<serde_json::Value> {
+    let sessions = state.sessions.read().await;
+    let list: Vec<serde_json::Value> = sessions.values().map(|s| {
+        serde_json::json!({
+            "session_id": s.session_id,
+            "model_id": s.model_id,
+            "turns": s.turns,
+            "tokens": s.token_history.len(),
+            "age_secs": s.last_accessed.elapsed().as_secs(),
+        })
+    }).collect();
+    Json(serde_json::json!({ "sessions": list, "count": list.len() }))
+}
+
+/// Delete a session.
+async fn delete_session(
+    State(state): State<Arc<VmState>>,
+    Path(session_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
+    let removed = state.sessions.write().await.remove(&session_id).is_some();
+    if removed {
+        Ok(Json(serde_json::json!({ "deleted": session_id })))
+    } else {
+        Err(api_error(StatusCode::NOT_FOUND, "session not found"))
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -479,8 +567,27 @@ async fn main() {
         upstream_provider,
         proving_queue,
         attestations: RwLock::new(HashMap::new()),
+        sessions: RwLock::new(HashMap::new()),
         started_at: Instant::now(),
     });
+
+    // Session eviction — prune expired sessions every 60s (TTL: 5 min)
+    {
+        let s = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                let mut sessions = s.sessions.write().await;
+                let before = sessions.len();
+                sessions.retain(|_, sess| sess.last_accessed.elapsed() < std::time::Duration::from_secs(300));
+                let evicted = before - sessions.len();
+                if evicted > 0 {
+                    eprintln!("[vm] evicted {} expired sessions ({} active)", evicted, sessions.len());
+                }
+            }
+        });
+    }
 
     let app = Router::new()
         // OpenAI-compatible endpoints
@@ -488,6 +595,8 @@ async fn main() {
         .route("/v1/models", get(list_models))
         // ObelyZK extensions
         .route("/v1/proofs/:proof_id", get(get_proof_status))
+        .route("/v1/sessions", get(list_sessions))
+        .route("/v1/sessions/:session_id", axum::routing::delete(delete_session))
         .route("/health", get(health))
         .with_state(state);
 
