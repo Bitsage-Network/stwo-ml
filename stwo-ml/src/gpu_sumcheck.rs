@@ -254,9 +254,15 @@ extern "C" __global__ void sumcheck_round_kernel(
     // Final reduction across warps (only warp 0, using shuffle again)
     if (warp_id == 0 && lane_id < (BLOCK_SIZE / WARP_SIZE)) {
         uint32_t w = lane_id;
-        local_s0 = (QM31){s_warp[(w*3+0)*4], s_warp[(w*3+0)*4+1], s_warp[(w*3+0)*4+2], s_warp[(w*3+0)*4+3]};
-        local_s1 = (QM31){s_warp[(w*3+1)*4], s_warp[(w*3+1)*4+1], s_warp[(w*3+1)*4+2], s_warp[(w*3+1)*4+3]};
-        local_s2 = (QM31){s_warp[(w*3+2)*4], s_warp[(w*3+2)*4+1], s_warp[(w*3+2)*4+2], s_warp[(w*3+2)*4+3]};
+        uint32_t base0 = (w * 3 + 0) * 4;
+        uint32_t base1 = (w * 3 + 1) * 4;
+        uint32_t base2 = (w * 3 + 2) * 4;
+        local_s0.a0 = s_warp[base0]; local_s0.a1 = s_warp[base0+1];
+        local_s0.a2 = s_warp[base0+2]; local_s0.a3 = s_warp[base0+3];
+        local_s1.a0 = s_warp[base1]; local_s1.a1 = s_warp[base1+1];
+        local_s1.a2 = s_warp[base1+2]; local_s1.a3 = s_warp[base1+3];
+        local_s2.a0 = s_warp[base2]; local_s2.a1 = s_warp[base2+1];
+        local_s2.a2 = s_warp[base2+2]; local_s2.a3 = s_warp[base2+3];
 
         // Reduce 8 warp results with shuffle (log2(8) = 3 steps)
         for (int offset = (BLOCK_SIZE / WARP_SIZE) / 2; offset > 0; offset >>= 1) {
