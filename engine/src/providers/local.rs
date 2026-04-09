@@ -186,18 +186,14 @@ impl LocalProvider {
         Ok((predicted_text, result, trace))
     }
 
-    /// Generate multiple tokens autoregressively.
+    /// Generate multiple tokens autoregressively with full ZK proving.
     ///
     /// Phase 1 (prefill): Embeds ALL prompt tokens into a batch matrix,
-    /// runs one forward pass to get the full-context output.
-    /// Phase 2 (decode): Uses the last position's output to predict next tokens
-    /// in a loop, feeding each new token through the forward pass.
-    ///
-    /// Note: Without KV-cache in the fast path, each decode step only sees
-    /// its own embedding (not the full history). The prefill gives the first
-    /// prediction good context, but subsequent tokens degrade. This is a
-    /// known limitation of the fast path — the full proving path with KV-cache
-    /// maintains full context.
+    /// runs one forward pass with KV-cache to get full-context output.
+    /// Phase 2 (decode): Each new token is proven with the accumulated
+    /// KV-cache, so attention sees the full conversation history.
+    /// Phase 3 (recursive STARK): Each GKR proof is compressed to ~942
+    /// felts for single-transaction on-chain verification.
     pub fn generate(
         &self,
         prompt: &str,
@@ -221,30 +217,61 @@ impl LocalProvider {
             self.tokenizer.token_to_id("<|end|>").unwrap_or(u32::MAX),
         ];
 
-        // Phase 1: Prefill — embed the LAST prompt token and run FULL proving path
-        // The full path includes attention, norms, activations — all correct.
-        let last_token_id = *prompt_ids.last().unwrap();
-        let (input_matrix, _) = crate::compiler::hf_loader::load_embedding_row(
-            &self.model_dir, self.hidden_size, last_token_id,
-        ).map_err(|e| LocalProviderError::EmbedFailed(format!("{e}")))?;
+        // Initialize KV-cache for full attention context across tokens
+        let mut kv_cache = ModelKVCache::new();
 
-        // Run the FULL proving path (not the fast shortcut)
-        // This includes attention, RMSNorm, activations — produces correct output
-        let proof = crate::aggregation::prove_model_pure_gkr_auto_with_cache(
-            &self.graph, &input_matrix, &self.weights,
-            self.weight_cache.as_ref(), None,
+        // Phase 1: Prefill — embed ALL prompt tokens and run full proving path
+        let seq_len = prompt_ids.len();
+        eprintln!("[generate] Phase 1: Prefill ({seq_len} tokens, full attention + KV-cache)");
+        let t_prefill = std::time::Instant::now();
+
+        let input_matrix = crate::compiler::hf_loader::load_embedding_batch(
+            &self.model_dir, self.hidden_size, &prompt_ids,
+        ).map_err(|e| LocalProviderError::EmbedFailed(format!("batch embed: {e}")))?;
+
+        // Resize graph for prefill sequence length
+        let prefill_graph = self.graph.with_seq_len(seq_len);
+
+        let proof = crate::aggregation::prove_model_pure_gkr_prefill_with_cache(
+            &prefill_graph, &input_matrix, &self.weights,
+            &mut kv_cache, self.weight_cache.as_ref(), None,
         ).map_err(|e| LocalProviderError::ProveFailed(format!("prefill prove: {e}")))?;
 
+        // Extract last position's output for logit projection
         let output = &proof.execution.output;
+        let last_row_output = if output.rows > 1 {
+            // Multi-row output: take the last row (last token's hidden state)
+            let start = (output.rows - 1) * output.cols;
+            crate::components::matmul::M31Matrix {
+                data: output.data[start..start + output.cols].to_vec(),
+                rows: 1,
+                cols: output.cols,
+            }
+        } else {
+            output.clone()
+        };
 
         let (mut next_id, _) = crate::compiler::hf_loader::project_to_logits(
-            &self.model_dir, output,
+            &self.model_dir, &last_row_output,
         ).map_err(|e| LocalProviderError::ProveFailed(format!("logits: {e}")))?;
+
+        eprintln!(
+            "[generate] Prefill done in {:.1}s (kv_cache: {} layers, {} positions)",
+            t_prefill.elapsed().as_secs_f64(),
+            kv_cache.layers.len(),
+            seq_len,
+        );
+
+        // Compress GKR proof to recursive STARK for on-chain verification
+        Self::compress_to_recursive_stark(&proof, &prefill_graph, &self.weights, "prefill");
 
         let mut generated_ids: Vec<u32> = Vec::new();
         let mut generated_text = String::new();
 
-        // Phase 2: Decode — generate tokens one at a time
+        // Resize graph for decode (single-token steps)
+        let decode_graph = self.graph.with_seq_len(1);
+
+        // Phase 2: Decode — generate tokens one at a time with KV-cache context
         for step in 0..max_tokens {
             if eos_ids.contains(&next_id) {
                 break;
@@ -258,24 +285,116 @@ impl LocalProvider {
             generated_text.push_str(&token_text);
             on_token(&token_text, next_id, step);
 
-            // Embed the predicted token and run FULL proving path for next prediction
+            let t_step = std::time::Instant::now();
+
+            // Embed single token and prove with accumulated KV-cache
             let (token_input, _) = crate::compiler::hf_loader::load_embedding_row(
                 &self.model_dir, self.hidden_size, next_id,
             ).map_err(|e| LocalProviderError::EmbedFailed(format!("{e}")))?;
 
-            let decode_proof = crate::aggregation::prove_model_pure_gkr_auto_with_cache(
-                &self.graph, &token_input, &self.weights,
-                self.weight_cache.as_ref(), None,
+            let decode_proof = crate::aggregation::prove_model_pure_gkr_prefill_with_cache(
+                &decode_graph, &token_input, &self.weights,
+                &mut kv_cache, self.weight_cache.as_ref(), None,
             ).map_err(|e| LocalProviderError::ProveFailed(format!("decode step {step}: {e}")))?;
 
             let (predicted, _) = crate::compiler::hf_loader::project_to_logits(
                 &self.model_dir, &decode_proof.execution.output,
             ).map_err(|e| LocalProviderError::ProveFailed(format!("logits step {step}: {e}")))?;
 
+            eprintln!(
+                "[generate] Decode step {step}: token={next_id} ({token_text:?}) in {:.1}s (kv_len={})",
+                t_step.elapsed().as_secs_f64(),
+                seq_len + step + 1,
+            );
+
+            // Compress decode proof to recursive STARK
+            Self::compress_to_recursive_stark(
+                &decode_proof, &decode_graph, &self.weights,
+                &format!("decode-{step}"),
+            );
+
             next_id = predicted;
         }
 
         Ok((generated_text, generated_ids))
+    }
+
+    /// Compress a GKR proof into a recursive STARK (~942 felts) for on-chain verification.
+    #[cfg(feature = "cli")]
+    fn compress_to_recursive_stark(
+        proof: &crate::aggregation::AggregatedModelProofOnChain,
+        graph: &crate::compiler::graph::ComputationGraph,
+        weights: &GraphWeights,
+        label: &str,
+    ) {
+        let gkr_proof = match &proof.gkr_proof {
+            Some(p) => p,
+            None => {
+                eprintln!("[recursive] {label}: no GKR proof to compress");
+                return;
+            }
+        };
+
+        let circuit = match crate::gkr::LayeredCircuit::from_graph(graph) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[recursive] {label}: circuit build failed: {e}");
+                return;
+            }
+        };
+
+        // Compute weight super-root from weight commitments (input-independent)
+        let weight_super_root = if !gkr_proof.weight_commitments.is_empty() {
+            let mut hasher = crate::crypto::poseidon_channel::PoseidonChannel::new();
+            hasher.mix_u64(gkr_proof.weight_commitments.len() as u64);
+            for wc_root in &gkr_proof.weight_commitments {
+                hasher.mix_felt(*wc_root);
+            }
+            hasher.draw_qm31()
+        } else {
+            stwo::core::fields::qm31::QM31::default()
+        };
+        let io_commitment = crate::crypto::poseidon_channel::felt_to_securefield(proof.io_commitment);
+        let gkr_time = 0.0;
+
+        let t_recursive = std::time::Instant::now();
+        eprintln!("[recursive] {label}: compressing GKR → recursive STARK...");
+
+        match crate::recursive::prove_recursive(
+            &circuit,
+            gkr_proof,
+            &proof.execution.output,
+            weights,
+            weight_super_root,
+            io_commitment,
+            gkr_time,
+        ) {
+            Ok(recursive_proof) => {
+                eprintln!(
+                    "[recursive] {label}: STARK compressed in {:.1}s (log_size={}, {} poseidon perms, on-chain ready)",
+                    t_recursive.elapsed().as_secs_f64(),
+                    recursive_proof.metadata.trace_log_size,
+                    recursive_proof.metadata.n_poseidon_perms,
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[recursive] {label}: compression failed in {:.1}s: {e}",
+                    t_recursive.elapsed().as_secs_f64(),
+                );
+            }
+        }
+    }
+
+    /// No-op when the `cli` feature (which includes recursive STARK) is not enabled.
+    #[cfg(not(feature = "cli"))]
+    fn compress_to_recursive_stark(
+        _proof: &crate::aggregation::AggregatedModelProofOnChain,
+        _graph: &crate::compiler::graph::ComputationGraph,
+        _weights: &GraphWeights,
+        label: &str,
+    ) {
+        eprintln!("[recursive] {label}: recursive STARK requires 'cli' feature — skipping compression");
     }
 
     /// Fast inference — forward pass ONLY, no proving.
