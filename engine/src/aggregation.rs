@@ -4740,6 +4740,20 @@ where
         }
     } else { None };
 
+    // GPU-resident current tensor (when GPU forward is active)
+    #[cfg(feature = "cuda-runtime")]
+    let mut gpu_current: Option<crate::gpu_forward::GpuTensor> = None;
+    #[cfg(feature = "cuda-runtime")]
+    let mut gpu_node_outputs: std::collections::HashMap<usize, crate::gpu_forward::GpuTensor> = std::collections::HashMap::new();
+
+    // Upload initial input to GPU if GPU forward is active
+    #[cfg(feature = "cuda-runtime")]
+    if let Some((ref exec, _)) = gpu_forward {
+        if let Ok(t) = exec.upload(&current) {
+            gpu_current = Some(t);
+        }
+    }
+
     let topo = graph.topological_order();
     let total_nodes = topo.len();
     eprintln!("Phase 1/3: Forward pass ({} nodes)...", total_nodes);
@@ -4752,6 +4766,13 @@ where
             if let Some(inp) = node_outputs.get(&first_input) {
                 current = inp.clone();
             }
+            // Also update GPU tensor if we have one cached
+            #[cfg(feature = "cuda-runtime")]
+            if gpu_forward.is_some() {
+                if let Some(gt) = gpu_node_outputs.remove(&first_input) {
+                    gpu_current = Some(gt);
+                }
+            }
         }
 
         let _op_start = std::time::Instant::now();
@@ -4759,7 +4780,6 @@ where
         match &node.op {
             GraphOp::MatMul { dims } => {
                 let (m, k, n) = *dims;
-                // For MoE: check dynamically-bound weights first, then original
                 let active_w = moe_weights.as_ref().unwrap_or(weights);
                 let weight = active_w
                     .get_weight(node.id)
@@ -4770,35 +4790,80 @@ where
                 // gate * up before the down_proj MatMul.
                 if let Some(up_weight) = active_w.get_named_weight(node.id, "up_proj")
                     .or_else(|| weights.get_named_weight(node.id, "up_proj")) {
-                    // Find the FFN block input: walk back 3 nodes (down_proj ← SiLU ← gate_proj ← norm)
-                    // The norm output is the input to gate_proj, which is 2 nodes before this one.
-                    // In topo order: ..., norm, gate_proj, silu, DOWN_PROJ(this)
-                    // The gate_proj's input is stored as its intermediate.
                     let gate_proj_node_id = if node.id >= 2 { node.id - 2 } else { 0 };
                     let ffn_input = intermediates.iter().rev()
                         .find(|(id, _)| *id == gate_proj_node_id)
                         .map(|(_, m)| m.clone())
                         .unwrap_or_else(|| current.clone());
 
-                    // Compute up = ffn_input × W_up
+                    // GPU path: use pre-uploaded weights and on-device matmul + elementwise mul
                     #[cfg(feature = "cuda-runtime")]
-                    let up_output = crate::gpu_sumcheck::gpu_matmul_m31_full(&ffn_input, up_weight)
-                        .unwrap_or_else(|_| matmul_m31(&ffn_input, up_weight));
+                    let up_output = if let Some((ref exec, ref gpu_weights)) = gpu_forward {
+                        // Try GPU path: upload ffn_input, matmul with pre-uploaded up_weight
+                        if let Ok(g_ffn) = exec.upload(&ffn_input) {
+                            if let Ok(g_up_w) = exec.upload(up_weight) {
+                                if let Ok(g_up_out) = exec.matmul(&g_ffn, &g_up_w) {
+                                    // GPU elementwise mul: current * up_out
+                                    if let Some(ref g_cur) = gpu_current {
+                                        if let Ok(g_hidden) = exec.mul(g_cur, &g_up_out) {
+                                            // Download hidden to CPU for intermediates
+                                            let hidden_cpu = exec.download(&g_hidden).unwrap_or_else(|_| {
+                                                // Fallback
+                                                let data: Vec<M31> = current.data.iter().zip(matmul_m31(&ffn_input, up_weight).data.iter()).map(|(&g, &u)| g * u).collect();
+                                                M31Matrix { rows: current.rows, cols: current.cols, data }
+                                            });
+                                            gpu_current = Some(g_hidden);
+                                            current = hidden_cpu;
+                                            // Skip CPU path
+                                            matmul_m31(&ffn_input, up_weight) // dummy, not used
+                                        } else {
+                                            crate::gpu_sumcheck::gpu_matmul_m31_full(&ffn_input, up_weight)
+                                                .unwrap_or_else(|_| matmul_m31(&ffn_input, up_weight))
+                                        }
+                                    } else {
+                                        crate::gpu_sumcheck::gpu_matmul_m31_full(&ffn_input, up_weight)
+                                            .unwrap_or_else(|_| matmul_m31(&ffn_input, up_weight))
+                                    }
+                                } else {
+                                    crate::gpu_sumcheck::gpu_matmul_m31_full(&ffn_input, up_weight)
+                                        .unwrap_or_else(|_| matmul_m31(&ffn_input, up_weight))
+                                }
+                            } else {
+                                crate::gpu_sumcheck::gpu_matmul_m31_full(&ffn_input, up_weight)
+                                    .unwrap_or_else(|_| matmul_m31(&ffn_input, up_weight))
+                            }
+                        } else {
+                            crate::gpu_sumcheck::gpu_matmul_m31_full(&ffn_input, up_weight)
+                                .unwrap_or_else(|_| matmul_m31(&ffn_input, up_weight))
+                        }
+                    } else {
+                        crate::gpu_sumcheck::gpu_matmul_m31_full(&ffn_input, up_weight)
+                            .unwrap_or_else(|_| matmul_m31(&ffn_input, up_weight))
+                    };
                     #[cfg(not(feature = "cuda-runtime"))]
                     let up_output = matmul_m31(&ffn_input, up_weight);
 
-                    // Element-wise multiply: hidden = gate_activated * up
-                    assert_eq!(current.rows, up_output.rows, "gate*up row mismatch");
-                    assert_eq!(current.cols, up_output.cols, "gate*up col mismatch");
-                    let hidden_data: Vec<M31> = current.data.iter()
-                        .zip(up_output.data.iter())
-                        .map(|(&g, &u)| g * u)
-                        .collect();
-                    current = M31Matrix {
-                        rows: current.rows,
-                        cols: current.cols,
-                        data: hidden_data,
-                    };
+                    // CPU element-wise multiply (fallback when GPU path didn't set current)
+                    #[cfg(feature = "cuda-runtime")]
+                    if gpu_forward.is_none() || gpu_current.is_none() {
+                        assert_eq!(current.rows, up_output.rows, "gate*up row mismatch");
+                        assert_eq!(current.cols, up_output.cols, "gate*up col mismatch");
+                        let hidden_data: Vec<M31> = current.data.iter()
+                            .zip(up_output.data.iter())
+                            .map(|(&g, &u)| g * u)
+                            .collect();
+                        current = M31Matrix { rows: current.rows, cols: current.cols, data: hidden_data };
+                    }
+                    #[cfg(not(feature = "cuda-runtime"))]
+                    {
+                        assert_eq!(current.rows, up_output.rows, "gate*up row mismatch");
+                        assert_eq!(current.cols, up_output.cols, "gate*up col mismatch");
+                        let hidden_data: Vec<M31> = current.data.iter()
+                            .zip(up_output.data.iter())
+                            .map(|(&g, &u)| g * u)
+                            .collect();
+                        current = M31Matrix { rows: current.rows, cols: current.cols, data: hidden_data };
+                    }
 
                     eprintln!(
                         "  [{}/{}] Node {} MatMul {}x{}x{} — gated FFN (gate*up applied)",
@@ -4812,9 +4877,35 @@ where
                 }
 
                 // Compute the actual down_proj (or regular matmul)
+                // GPU path: use GpuForwardExecutor for on-device matmul
                 #[cfg(feature = "cuda-runtime")]
-                let output = crate::gpu_sumcheck::gpu_matmul_m31_full(&current, weight)
-                    .unwrap_or_else(|_| matmul_m31(&current, weight));
+                let output = if let (Some((ref exec, ref gpu_weights)), Some(ref g_cur)) = (&gpu_forward, &gpu_current) {
+                    // Use pre-uploaded weight if available, otherwise upload on the fly
+                    let g_weight = if let Some(gw) = gpu_weights.get(&node.id) {
+                        // Can't move out of HashMap — re-upload (TODO: Arc/Rc for zero-copy)
+                        exec.upload(weight).ok()
+                    } else {
+                        exec.upload(weight).ok()
+                    };
+
+                    if let Some(gw) = g_weight {
+                        if let Ok(g_out) = exec.matmul(g_cur, &gw) {
+                            let cpu_out = exec.download(&g_out).unwrap_or_else(|_| matmul_m31(&current, weight));
+                            // Store GPU output for next node
+                            gpu_node_outputs.insert(node_id, g_out);
+                            cpu_out
+                        } else {
+                            crate::gpu_sumcheck::gpu_matmul_m31_full(&current, weight)
+                                .unwrap_or_else(|_| matmul_m31(&current, weight))
+                        }
+                    } else {
+                        crate::gpu_sumcheck::gpu_matmul_m31_full(&current, weight)
+                            .unwrap_or_else(|_| matmul_m31(&current, weight))
+                    }
+                } else {
+                    crate::gpu_sumcheck::gpu_matmul_m31_full(&current, weight)
+                        .unwrap_or_else(|_| matmul_m31(&current, weight))
+                };
                 #[cfg(not(feature = "cuda-runtime"))]
                 let output = matmul_m31(&current, weight);
 
@@ -4905,6 +4996,13 @@ where
                 intermediates.push((node.id, current.clone()));
                 node_outputs.insert(node.id, output.clone());
                 current = output;
+                // Sync GPU tensor for Add residual (important: residual adds connect distant nodes)
+                #[cfg(feature = "cuda-runtime")]
+                if let Some((ref exec, _)) = gpu_forward {
+                    if let Ok(gt) = exec.upload(&current) {
+                        gpu_current = Some(gt);
+                    }
+                }
                 outer_profiler.record_forward_op("add", _op_start.elapsed());
             }
 
@@ -4945,6 +5043,12 @@ where
                 intermediates.push((node.id, current.clone()));
                 node_outputs.insert(node.id, output.clone());
                 current = output;
+                #[cfg(feature = "cuda-runtime")]
+                if let Some((ref exec, _)) = gpu_forward {
+                    if let Ok(gt) = exec.upload(&current) {
+                        gpu_current = Some(gt);
+                    }
+                }
                 outer_profiler.record_forward_op("mul", _op_start.elapsed());
             }
 
