@@ -409,8 +409,29 @@ pub fn generate_witness_with_policy(
     // ── Pass 1: production verification ──────────────────────────────
     // Run the real verifier to (a) confirm validity, (b) measure hash_count,
     // and (c) capture the final channel digest.
-    // Policy must match the prover's policy for channel alignment.
+    //
+    // IMPORTANT: The channel must be seeded identically to the prover's outer
+    // wrapper (prove_model_pure_gkr_inner), which mixes io_commitment and
+    // policy_commitment BEFORE passing the channel to the GKR prover.
+    //
+    // The prover does:
+    //   let io_commitment = compute_io_commitment(input, &fwd.output);
+    //   gkr_channel.mix_felt(io_commitment);  // FieldElement
+    //   gkr_channel.mix_felt(policy_commitment);  // FieldElement
+    //
+    // We reconstruct these from the proof's stored io_commitment.
     let mut prod_channel = crate::crypto::poseidon_channel::PoseidonChannel::new();
+
+    // Seed with io_commitment (matching prover's outer wrapper)
+    // The proof's GKR proof stores the io_commitment as a FieldElement.
+    let io_felt = proof.io_commitment;
+    prod_channel.mix_felt(io_felt);
+
+    // Seed with policy commitment (matching prover's outer wrapper)
+    let resolved_policy = crate::policy::resolve(policy);
+    let policy_commitment_felt = resolved_policy.policy_commitment();
+    prod_channel.mix_felt(policy_commitment_felt);
+
     let _claim = if let Some(p) = policy {
         crate::gkr::verifier::verify_gkr_with_policy(circuit, proof, output, weights, &mut prod_channel, p)?
     } else if let Some(w) = weights {
@@ -426,7 +447,11 @@ pub fn generate_witness_with_policy(
     let mut channel = InstrumentedChannel::new();
     let d = circuit.layers.len();
 
-    // Seed channel identically to prover
+    // Seed channel identically to prover's outer wrapper
+    channel.mix_felt(proof.io_commitment);
+    channel.mix_felt(policy_commitment_felt);
+
+    // Seed channel identically to GKR prover internal
     channel.mix_u64(d as u64);
     channel.mix_u64(circuit.input_shape.0 as u64);
     channel.mix_u64(circuit.input_shape.1 as u64);
