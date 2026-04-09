@@ -34,6 +34,8 @@ pub struct ProvingJob {
     pub trace: ExecutionTrace,
     /// The original input matrix (embedding) for re-proving from scratch.
     pub input_matrix: Option<crate::components::matmul::M31Matrix>,
+    /// Pre-computed forward pass result for trace replay proving (no re-execution).
+    pub forward_result: Option<crate::aggregation::ForwardPassResult>,
     pub graph: Arc<ComputationGraph>,
     pub weights: Arc<GraphWeights>,
     pub weight_cache: Option<SharedWeightCache>,
@@ -100,20 +102,27 @@ impl ProvingQueue {
                         );
 
                         let t_start = Instant::now();
-                        // Use pre-computed proof from the trace if available,
-                        // otherwise run the full proving pipeline from the input matrix.
+                        // Priority order:
+                        // 1. Pre-computed proof in trace (synchronous path)
+                        // 2. Forward result (trace replay — no re-execution)
+                        // 3. Input matrix (full re-execution + proving)
                         let result: Result<crate::aggregation::AggregatedModelProofOnChain, String> =
                             if let Some(proof) = job.trace.proof {
                                 Ok(proof)
+                            } else if let (Some(fwd), Some(ref input)) = (job.forward_result, &job.input_matrix) {
+                                // Trace replay: prove from captured forward pass
+                                eprintln!("[prove-worker-{worker_id}] using trace replay path");
+                                crate::aggregation::prove_from_forward_result(
+                                    &job.graph, input, &job.weights, fwd,
+                                    job.weight_cache.as_ref(), None,
+                                ).map_err(|e| format!("{e}"))
                             } else if let Some(ref input) = job.input_matrix {
-                                // Run full execution + proving from the original input
+                                // Full re-execution + proving
                                 crate::aggregation::prove_model_aggregated_onchain_gkr_auto(
-                                    &job.graph,
-                                    input,
-                                    &job.weights,
+                                    &job.graph, input, &job.weights,
                                 ).map_err(|e| format!("{e}"))
                             } else {
-                                Err("No proof and no input_matrix — cannot prove".into())
+                                Err("No proof, no forward_result, and no input_matrix".into())
                             };
 
                         let proving_result = match result {

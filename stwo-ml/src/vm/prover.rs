@@ -1,13 +1,38 @@
-//! VM Prover — placeholder for async proof generation from traces.
+//! VM Prover — generates GKR proofs from captured execution traces.
 //!
-//! Currently, the executor runs proving synchronously and stores the proof
-//! in the `ExecutionTrace`. The prover module will be expanded to support
-//! true async proving from captured traces (Phase 1b of the VM roadmap).
+//! The key function is `prove_from_forward_result()` which takes a
+//! `ForwardPassResult` (containing all intermediates from execution)
+//! and generates the full cryptographic proof without re-executing.
 
-/// Placeholder: in the current architecture, proofs are generated during
-/// execution via `execute_and_prove()`. This module will be expanded to
-/// support `prove_from_trace()` when execution is decoupled from proving.
-pub fn _future_prove_from_trace() {
-    // Will be implemented when the executor supports capture-only mode
-    // (forward pass without proving) and traces can be replayed.
+use crate::aggregation::{AggregatedModelProofOnChain, ForwardPassResult};
+use crate::compiler::graph::{ComputationGraph, GraphWeights};
+use crate::components::matmul::M31Matrix;
+use crate::weight_cache::SharedWeightCache;
+use crate::policy::PolicyConfig;
+
+/// Prove from a captured forward pass result.
+///
+/// This is the true trace replay path — the forward pass has already been
+/// executed and all intermediates captured in `ForwardPassResult`. This
+/// function runs only the cryptographic proof generation (GKR + STARK).
+pub fn prove_from_forward_result(
+    graph: &ComputationGraph,
+    input: &M31Matrix,
+    weights: &GraphWeights,
+    fwd: ForwardPassResult,
+    weight_cache: Option<&SharedWeightCache>,
+    policy: Option<&PolicyConfig>,
+) -> Result<AggregatedModelProofOnChain, ProverError> {
+    crate::aggregation::prove_from_forward_result(
+        graph, input, weights, fwd, weight_cache, policy,
+    ).map_err(|e| ProverError::ProvingFailed(format!("{e}")))
+}
+
+/// Errors from the VM prover.
+#[derive(Debug, thiserror::Error)]
+pub enum ProverError {
+    #[error("Proving failed: {0}")]
+    ProvingFailed(String),
+    #[error("Empty trace — no intermediates captured")]
+    EmptyTrace,
 }

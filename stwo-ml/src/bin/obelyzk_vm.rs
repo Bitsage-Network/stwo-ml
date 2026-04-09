@@ -347,6 +347,7 @@ async fn chat_completions_stream(
         let job = stwo_ml::vm::queue::ProvingJob {
             job_id: pid.clone(),
             input_matrix: Some(input_matrix),
+            forward_result: None, // TODO: capture ForwardPassResult from traced execution
             trace: stwo_ml::vm::trace::ExecutionTrace {
                 model_id: local_prove.model_name.clone(),
                 input_tokens: token_ids.clone(),
