@@ -5486,9 +5486,60 @@ where
 
     #[allow(unused_variables)]
     let gkr_proof = {
+        // Check for SIMD block batching — N identical transformer blocks → 1 proof
+        let use_simd = circuit.simd_config.is_some()
+            && std::env::var("OBELYZK_DISABLE_SIMD").ok().as_deref() != Some("1");
+
         #[cfg(feature = "cuda-runtime")]
         {
-            if gpu_active {
+            if gpu_active && use_simd {
+                let simd_config = circuit.simd_config.as_ref().unwrap();
+                eprintln!(
+                    "  [SIMD] Block batching: {} identical blocks (log₂={} extra rounds)",
+                    simd_config.num_blocks, simd_config.simd_log_size,
+                );
+
+                // Split the merged execution into per-block executions
+                let block_boundaries = graph.find_block_boundaries();
+                let n_blocks = simd_config.num_blocks;
+                let mut block_executions: Vec<crate::compiler::graph::GraphExecution> = Vec::with_capacity(n_blocks);
+
+                for block_idx in 0..n_blocks {
+                    if block_idx < block_boundaries.len() {
+                        let range = &block_boundaries[block_idx];
+                        let mut block_intermediates = HashMap::new();
+                        let mut block_outputs = HashMap::new();
+
+                        for &(ref node_id, ref matrix) in &intermediates {
+                            if *node_id >= range.start && *node_id < range.end {
+                                block_intermediates.insert(*node_id, matrix.clone());
+                            }
+                        }
+                        for (&node_id, matrix) in &node_outputs {
+                            if node_id >= range.start && node_id < range.end {
+                                block_outputs.insert(node_id, matrix.clone());
+                            }
+                        }
+
+                        block_executions.push(crate::compiler::graph::GraphExecution {
+                            intermediates: block_intermediates,
+                            node_outputs: block_outputs,
+                            output: current.clone(),
+                        });
+                    }
+                }
+
+                if block_executions.len() == n_blocks {
+                    crate::gkr::prove_gkr_simd_gpu_with_cache(
+                        &circuit, &block_executions, weights, &mut gkr_channel, weight_cache,
+                    ).map_err(|e| AggregationError::ProvingError(format!("GKR SIMD GPU proving: {e}")))?
+                } else {
+                    eprintln!("  [SIMD] Block split failed ({} vs expected {}), falling back to standard GKR",
+                        block_executions.len(), n_blocks);
+                    crate::gkr::prove_gkr_gpu_with_cache(&circuit, &gkr_execution, weights, &mut gkr_channel, weight_cache, Some(&resolved_policy))
+                        .map_err(|e| AggregationError::ProvingError(format!("GKR GPU proving: {e}")))?
+                }
+            } else if gpu_active {
                 crate::gkr::prove_gkr_gpu_with_cache(&circuit, &gkr_execution, weights, &mut gkr_channel, weight_cache, Some(&resolved_policy))
                     .map_err(|e| AggregationError::ProvingError(format!("GKR GPU proving: {e}")))?
             } else {
