@@ -1,5 +1,11 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Bitsage-Network/Obelysk-Protocol/main/apps/web/public/obelysk-logo.png" alt="ObelyZK" width="180"/>
+
+```
+ ╔═╗╔╗  ╔═╗╦  ╦ ╦╔═╗╦╔═  ┏━┓┏━┓
+ ║ ║╠╩╗ ╠═ ║  ╚╦╝╔═╝╠╩╗  ┣┳┛┗━┓
+ ╚═╝╚═╝ ╚═╝╩═╝ ╩ ╚═╝╩ ╩  ╹┗╸┗━┛
+```
+
 </p>
 
 # obelyzk.rs
