@@ -5,6 +5,10 @@
 //! - Audit report summary with commitment hashes
 //! - On-chain verification status
 //! - Tamper detection results
+//! - VM runtime: GPU workers, proving queue, conversation sessions
 
 #[cfg(feature = "tui")]
 pub mod dashboard;
+
+#[cfg(feature = "tui")]
+pub mod vm_dashboard;
