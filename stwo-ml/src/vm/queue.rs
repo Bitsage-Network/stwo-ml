@@ -32,6 +32,8 @@ pub enum ProvingStatus {
 pub struct ProvingJob {
     pub job_id: String,
     pub trace: ExecutionTrace,
+    /// The original input matrix (embedding) for re-proving from scratch.
+    pub input_matrix: Option<crate::components::matmul::M31Matrix>,
     pub graph: Arc<ComputationGraph>,
     pub weights: Arc<GraphWeights>,
     pub weight_cache: Option<SharedWeightCache>,
@@ -99,17 +101,19 @@ impl ProvingQueue {
 
                         let t_start = Instant::now();
                         // Use pre-computed proof from the trace if available,
-                        // otherwise run the full proving pipeline.
+                        // otherwise run the full proving pipeline from the input matrix.
                         let result: Result<crate::aggregation::AggregatedModelProofOnChain, String> =
                             if let Some(proof) = job.trace.proof {
                                 Ok(proof)
-                            } else {
-                                // Trace has no proof — run full execution + proving
+                            } else if let Some(ref input) = job.input_matrix {
+                                // Run full execution + proving from the original input
                                 crate::aggregation::prove_model_aggregated_onchain_gkr_auto(
                                     &job.graph,
-                                    &job.trace.output, // use trace output as input proxy
+                                    input,
                                     &job.weights,
                                 ).map_err(|e| format!("{e}"))
+                            } else {
+                                Err("No proof and no input_matrix — cannot prove".into())
                             };
 
                         let proving_result = match result {

@@ -266,7 +266,6 @@ async fn chat_completions_stream(
 
     // Phase 2: Queue full proof in background
     let local_prove = Arc::clone(&local);
-    let prompt_for_prove = prompt.clone();
     let pid = proof_id_for_bg.clone();
     let queue = Arc::clone(&state.proving_queue);
 
@@ -274,10 +273,11 @@ async fn chat_completions_stream(
     tokio::task::spawn(async move {
         let job = stwo_ml::vm::queue::ProvingJob {
             job_id: pid.clone(),
+            input_matrix: Some(input_matrix),
             trace: stwo_ml::vm::trace::ExecutionTrace {
                 model_id: local_prove.model_name.clone(),
                 input_tokens: token_ids.clone(),
-                output: stwo_ml::components::matmul::M31Matrix::new(1, 1), // placeholder
+                output: stwo_ml::components::matmul::M31Matrix::new(1, 1),
                 io_commitment: None,
                 policy_commitment: starknet_ff::FieldElement::ZERO,
                 kv_commitment_before: None,
@@ -286,7 +286,7 @@ async fn chat_completions_stream(
                 inference_time_ms: inference_ms,
                 num_tokens: token_ids.len(),
                 position_offset: 0,
-                proof: None, // no pre-computed proof — worker will generate
+                proof: None,
             },
             graph: Arc::clone(&local_prove.graph),
             weights: Arc::clone(&local_prove.weights),
