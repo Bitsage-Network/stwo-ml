@@ -35,7 +35,7 @@ obelyzk verify     # Verify a proof
 
 ```
 obelyzk.rs/
-├── stwo-ml/         — The ObelyZK proving engine (crate: obelyzk)
+├── engine/          — The ObelyZK proving engine (crate: obelyzk)
 │   └── src/
 │       ├── gkr/                  GKR sumcheck prover (CPU + 19 CUDA kernels)
 │       ├── vm/                   VM runtime (trace, executor, queue, providers)
@@ -45,10 +45,11 @@ obelyzk.rs/
 │       ├── recursive/            Recursive STARK compression (46K → 942 felts)
 │       └── aggregation.rs        Proving pipeline + batched throughput
 │
-├── stwo/            — STWO Circle STARK prover (StarkWare fork + our GPU backend)
+├── stwo-gpu/        — STWO Circle STARK prover + our GPU backend
 │
 ├── elo-cairo-verifier/           Recursive STARK verifier on Starknet
-├── stwo-cairo/                   STWO STARK verifier in Cairo
+├── stark-cairo/                  STWO STARK verifier in Cairo
+├── verifier/                     ML proof verifier
 ├── proof-stream/                 Real-time proof visualization (WebSocket)
 └── sdk/                          Python, TypeScript, CLI SDKs
 ```
@@ -99,16 +100,37 @@ Recursive STARK: 46,148 felts → 942 felts. One Starknet transaction.
 
 ## Supported Models
 
-| Architecture | Models | Trust Model |
-|-------------|--------|-------------|
-| LLaMA | Llama-3.2-3B, SmolLM2-135M | ZK proof |
-| Qwen | Qwen2-0.5B, Qwen3-14B | ZK proof |
-| Phi | Phi-3-mini | ZK proof |
-| Mistral | Mistral-7B, Mixtral-8x7B (MoE) | ZK proof |
-| Yi | Yi-1.5-6B | ZK proof |
-| Claude | claude-sonnet, claude-opus | TLS attestation |
-| GPT | gpt-4o, o1, o3 | TLS attestation |
-| Any vLLM/Ollama | All HuggingFace models | IO commitment |
+Every model. Every provider. Every trust level.
+
+**Open-weight models — full ZK proof (GKR + recursive STARK):**
+
+| Architecture | Models | Status |
+|-------------|--------|--------|
+| LLaMA | Llama-3.x, SmolLM2, CodeLlama | Proven |
+| Qwen | Qwen2, Qwen3-14B | Proven |
+| Phi | Phi-3, Phi-4 | Proven |
+| Mistral | Mistral-7B, Mixtral-8x7B (MoE) | Proven |
+| Yi | Yi-1.5-6B | Proven |
+| Gemma | Gemma-2 | HF auto-detect |
+| MiniMax | MiniMax-01, MiniMax-Text | HF auto-detect |
+| GLM | ChatGLM, GLM-4 | HF auto-detect |
+| DeepSeek | DeepSeek-V2, DeepSeek-R1 | HF auto-detect |
+| Falcon | Falcon-7B, Falcon-40B | HF auto-detect |
+| MPT | MPT-7B, MPT-30B | HF auto-detect |
+| RWKV | RWKV-6 | HF auto-detect |
+| Any HuggingFace | SafeTensors format | Auto-detect architecture |
+
+**Closed-source APIs — TLS attestation (cryptographic proof of API call):**
+
+| Provider | Models | Trust |
+|----------|--------|-------|
+| Anthropic | Claude Opus, Sonnet, Haiku | TLS attestation |
+| OpenAI | GPT-4o, o1, o3, GPT-4 | TLS attestation |
+| Google | Gemini Pro, Ultra, Flash | TLS attestation |
+| xAI | Grok-2, Grok-3 | TLS attestation |
+| MiniMax | abab-7B-chat | TLS attestation |
+| DeepSeek | DeepSeek-Chat API | TLS attestation |
+| Any OpenAI-compatible | vLLM, TGI, Ollama, LM Studio | IO commitment |
 
 ---
 
@@ -126,7 +148,7 @@ npm install -g @obelyzk/cli  # CLI
 
 ```bash
 rustup toolchain install nightly-2025-07-14
-cd stwo-ml && cargo build --release --bin obelyzk --features "server,cuda-runtime"
+cd engine && cargo build --release --bin obelyzk --features "server,cuda-runtime"
 ```
 
 ---
