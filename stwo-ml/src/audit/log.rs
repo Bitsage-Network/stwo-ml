@@ -778,7 +778,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("stwo_ml_test_log_{}", d))
+        std::env::temp_dir().join(format!("obelyzk_test_log_{}", d))
     }
 
     #[test]

@@ -14,7 +14,7 @@
 //! Or use `prove_model_with` directly for explicit backend control:
 //!
 //! ```ignore
-//! use stwo_ml::compiler::prove::prove_model_with;
+//! use obelyzk::compiler::prove::prove_model_with;
 //! use stwo::prover::backend::gpu::GpuBackend;
 //! use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
 //!

@@ -16,7 +16,7 @@ fn main() {
         execute,
     };
     use ratatui::prelude::*;
-    use stwo_ml::tui::dashboard::{self, DashboardState, PipelineStep};
+    use obelyzk::tui::dashboard::{self, DashboardState, PipelineStep};
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {

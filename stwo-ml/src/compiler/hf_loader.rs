@@ -2373,7 +2373,7 @@ mod tests {
 
     #[test]
     fn test_validation_empty_dir() {
-        let tmp = std::env::temp_dir().join("stwo_ml_empty_model");
+        let tmp = std::env::temp_dir().join("obelyzk_empty_model");
         std::fs::create_dir_all(&tmp).unwrap();
 
         let report = validate_model_directory(&tmp, Some(1));
@@ -2385,7 +2385,7 @@ mod tests {
     #[test]
     fn test_load_embedding_row() {
         // Create a small fake model dir with embed_tokens in a safetensors file.
-        let tmp = std::env::temp_dir().join("stwo_ml_embed_row_test");
+        let tmp = std::env::temp_dir().join("obelyzk_embed_row_test");
         std::fs::create_dir_all(&tmp).unwrap();
 
         let vocab_size = 8;
@@ -2428,7 +2428,7 @@ mod tests {
 
     #[test]
     fn test_load_embedding_row_missing_tensor() {
-        let tmp = std::env::temp_dir().join("stwo_ml_embed_no_tensor");
+        let tmp = std::env::temp_dir().join("obelyzk_embed_no_tensor");
         std::fs::create_dir_all(&tmp).unwrap();
 
         // SafeTensors file with a tensor that has a different name

@@ -25,7 +25,7 @@
 //! # Usage
 //!
 //! ```rust,ignore
-//! use stwo_ml::components::matmul::MatMulComponent;
+//! use obelyzk::components::matmul::MatMulComponent;
 //!
 //! // Define matrix dimensions
 //! let component = MatMulComponent::new(128, 64, 32); // A(128×64) × B(64×32) = C(128×32)

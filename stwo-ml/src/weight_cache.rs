@@ -33,7 +33,7 @@
 //! ## Integration
 //!
 //! ```rust,no_run
-//! # use stwo_ml::weight_cache::{shared_cache_for_model, save_shared_cache};
+//! # use obelyzk::weight_cache::{shared_cache_for_model, save_shared_cache};
 //! let cache = shared_cache_for_model("/path/to/model");
 //! // ... pass cache to prove_model_pure_gkr_auto_with_cache ...
 //! save_shared_cache(&cache, "/path/to/model");
@@ -1253,7 +1253,7 @@ mod tests {
 
     #[test]
     fn test_cache_save_load_roundtrip() {
-        let dir = std::env::temp_dir().join("stwo_ml_cache_test");
+        let dir = std::env::temp_dir().join("obelyzk_cache_test");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("test_cache.swcf");
 
@@ -1300,7 +1300,7 @@ mod tests {
 
     #[test]
     fn test_load_or_new_wrong_model() {
-        let dir = std::env::temp_dir().join("stwo_ml_cache_test2");
+        let dir = std::env::temp_dir().join("obelyzk_cache_test2");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("wrong_model.swcf");
 
@@ -1383,7 +1383,7 @@ mod tests {
 
     #[test]
     fn test_root_cache_save_load_roundtrip() {
-        let dir = std::env::temp_dir().join("stwo_ml_root_cache_test");
+        let dir = std::env::temp_dir().join("obelyzk_root_cache_test");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("root_cache.swcf");
 
@@ -1473,7 +1473,7 @@ mod tests {
         use crate::components::matmul::M31Matrix;
         use crate::compiler::graph::GraphWeights;
 
-        let dir = std::env::temp_dir().join("stwo_ml_fp_test");
+        let dir = std::env::temp_dir().join("obelyzk_fp_test");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("fp_cache.swcf");
 
@@ -1517,7 +1517,7 @@ mod tests {
         use crate::components::matmul::M31Matrix;
         use crate::compiler::graph::GraphWeights;
 
-        let dir = std::env::temp_dir().join("stwo_ml_validated_test");
+        let dir = std::env::temp_dir().join("obelyzk_validated_test");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("validated.swcf");
 

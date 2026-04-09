@@ -161,7 +161,7 @@ mod tests {
 
         let checkpoint = ExecutionCheckpoint::from_matrix(3, &matrix);
 
-        let dir = std::env::temp_dir().join("stwo_ml_checkpoint_test");
+        let dir = std::env::temp_dir().join("obelyzk_checkpoint_test");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("test_ckpt.json");
 

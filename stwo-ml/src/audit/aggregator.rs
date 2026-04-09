@@ -312,7 +312,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("stwo_ml_agg_{}_{}", prefix, d))
+        std::env::temp_dir().join(format!("obelyzk_agg_{}_{}", prefix, d))
     }
 
     /// Create a minimal session directory with meta.json and N log entries.

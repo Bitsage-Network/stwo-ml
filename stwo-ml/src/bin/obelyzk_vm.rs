@@ -30,12 +30,12 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use futures_util::stream;
 
-use stwo_ml::providers::local::LocalProvider;
-use stwo_ml::providers::openai_compat::OpenAiCompatProvider;
-use stwo_ml::providers::anthropic::{AnthropicProvider, OpenAiProvider};
-use stwo_ml::providers::tls_attestation::TlsAttestation;
-use stwo_ml::providers::types::*;
-use stwo_ml::vm::queue::{ProvingQueue, ProvingStatus};
+use obelyzk::providers::local::LocalProvider;
+use obelyzk::providers::openai_compat::OpenAiCompatProvider;
+use obelyzk::providers::anthropic::{AnthropicProvider, OpenAiProvider};
+use obelyzk::providers::tls_attestation::TlsAttestation;
+use obelyzk::providers::types::*;
+use obelyzk::vm::queue::{ProvingQueue, ProvingStatus};
 
 // ═══════════════════════════════════════════════════════════════════
 // State
@@ -45,7 +45,7 @@ use stwo_ml::vm::queue::{ProvingQueue, ProvingStatus};
 struct ChatSession {
     session_id: String,
     model_id: String,
-    kv_cache: stwo_ml::components::attention::ModelKVCache,
+    kv_cache: obelyzk::components::attention::ModelKVCache,
     token_history: Vec<u32>,
     last_accessed: Instant,
     turns: usize,
@@ -316,7 +316,7 @@ async fn chat_completions(
         let session = sessions.entry(session_id.clone()).or_insert_with(|| ChatSession {
             session_id: session_id.clone(),
             model_id: req.model.clone(),
-            kv_cache: stwo_ml::components::attention::ModelKVCache::new(),
+            kv_cache: obelyzk::components::attention::ModelKVCache::new(),
             token_history: Vec::new(),
             last_accessed: Instant::now(),
             turns: 0,
@@ -387,7 +387,7 @@ async fn chat_completions_stream(
         let session = sessions.entry(session_id.clone()).or_insert_with(|| ChatSession {
             session_id: session_id.clone(),
             model_id: model.clone(),
-            kv_cache: stwo_ml::components::attention::ModelKVCache::new(),
+            kv_cache: obelyzk::components::attention::ModelKVCache::new(),
             token_history: Vec::new(),
             last_accessed: Instant::now(),
             turns: 0,
@@ -404,14 +404,14 @@ async fn chat_completions_stream(
 
     // Submit to proving queue via background task
     tokio::task::spawn(async move {
-        let job = stwo_ml::vm::queue::ProvingJob {
+        let job = obelyzk::vm::queue::ProvingJob {
             job_id: pid.clone(),
             input_matrix: Some(input_matrix),
             forward_result: None, // TODO: capture ForwardPassResult from traced execution
-            trace: stwo_ml::vm::trace::ExecutionTrace {
+            trace: obelyzk::vm::trace::ExecutionTrace {
                 model_id: local_prove.model_name.clone(),
                 input_tokens: token_ids.clone(),
-                output: stwo_ml::components::matmul::M31Matrix::new(1, 1),
+                output: obelyzk::components::matmul::M31Matrix::new(1, 1),
                 io_commitment: None,
                 policy_commitment: starknet_ff::FieldElement::ZERO,
                 kv_commitment_before: None,
@@ -601,7 +601,7 @@ async fn prove_batch(
             proof.io_commitment, proof.layer_chain_commitment,
         ])),
         "calldata_size": proof.gkr_proof.as_ref().map(|g| g.layer_proofs.len() * 100).unwrap_or(0),
-        "gpu": stwo_ml::backend::gpu_is_available(),
+        "gpu": obelyzk::backend::gpu_is_available(),
     })))
 }
 
@@ -854,7 +854,7 @@ async fn run_benchmark(args: &[String]) {
     let provider = LocalProvider::load(&PathBuf::from(&model_dir), None)
         .unwrap_or_else(|e| { eprintln!("Error: {e}"); std::process::exit(1); });
 
-    let gpu_name = stwo_ml::backend::gpu_device_name().unwrap_or_else(|| "CPU".into());
+    let gpu_name = obelyzk::backend::gpu_device_name().unwrap_or_else(|| "CPU".into());
     println!("  \x1b[90mMODEL\x1b[0m    \x1b[97;1m{}\x1b[0m", provider.model_name);
     println!("  \x1b[90mGPU\x1b[0m      \x1b[36m{}\x1b[0m", gpu_name);
     println!("  \x1b[90mTOKENS\x1b[0m   \x1b[97;1m{}\x1b[0m", num_tokens);
@@ -885,7 +885,7 @@ async fn run_benchmark(args: &[String]) {
             println!("  \x1b[90mThroughput:\x1b[0m    \x1b[92;1m{:.1} tok/s\x1b[0m", tok_per_sec);
             println!("  \x1b[90mPer token:\x1b[0m     {:.1}ms", (elapsed * 1000.0) / num_tokens as f64);
             println!("  \x1b[90mIO commitment:\x1b[0m \x1b[35m0x{:x}\x1b[0m", proof.io_commitment);
-            println!("  \x1b[90mGPU:\x1b[0m           {}", if stwo_ml::backend::gpu_is_available() { "\x1b[36mactive\x1b[0m" } else { "\x1b[90minactive\x1b[0m" });
+            println!("  \x1b[90mGPU:\x1b[0m           {}", if obelyzk::backend::gpu_is_available() { "\x1b[36mactive\x1b[0m" } else { "\x1b[90minactive\x1b[0m" });
             println!("  \x1b[92m════════════════════════════════════════\x1b[0m");
             println!();
         }

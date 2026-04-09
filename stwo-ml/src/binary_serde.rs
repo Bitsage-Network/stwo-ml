@@ -7,7 +7,7 @@
 //! # Usage
 //!
 //! ```ignore
-//! use stwo_ml::binary_serde::{proof_to_bytes, proof_from_bytes};
+//! use obelyzk::binary_serde::{proof_to_bytes, proof_from_bytes};
 //!
 //! let bytes = proof_to_bytes(&gkr_proof)?;
 //! let recovered = proof_from_bytes(&bytes)?;

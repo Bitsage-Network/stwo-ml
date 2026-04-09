@@ -22,8 +22,8 @@
 //! # Quick Start
 //!
 //! ```rust,no_run
-//! use stwo_ml::classifier::{evaluate_transaction, build_test_classifier, TransactionFeatures};
-//! use stwo_ml::policy::PolicyConfig;
+//! use obelyzk::classifier::{evaluate_transaction, build_test_classifier, TransactionFeatures};
+//! use obelyzk::policy::PolicyConfig;
 //!
 //! let model = build_test_classifier();
 //! let policy = PolicyConfig::strict();

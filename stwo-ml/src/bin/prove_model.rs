@@ -33,7 +33,7 @@ use clap::{Parser, Subcommand};
 /// Returns true if --quiet was set.
 #[inline]
 fn is_quiet() -> bool {
-    stwo_ml::is_quiet()
+    obelyzk::is_quiet()
 }
 use starknet_ff::FieldElement;
 use stwo::core::fields::m31::M31;
@@ -42,19 +42,19 @@ use stwo::prover::backend::gpu::cuda_executor::{
     get_cuda_executor, upload_poseidon252_round_constants,
 };
 
-use stwo_ml::aggregation::compute_io_commitment;
-use stwo_ml::cairo_serde::{
+use obelyzk::aggregation::compute_io_commitment;
+use obelyzk::cairo_serde::{
     deserialize_raw_io, serialize_ml_proof_for_recursive, serialize_ml_proof_to_file,
     DirectProofMetadata, MLClaimMetadata,
 };
-use stwo_ml::compiler::hf_loader::load_hf_model_decode;
-use stwo_ml::compiler::inspect::summarize_model;
-use stwo_ml::compiler::onnx::{load_onnx, OnnxModel};
-use stwo_ml::components::matmul::M31Matrix;
-use stwo_ml::gadgets::quantize::{quantize_tensor, QuantStrategy};
-use stwo_ml::json_serde;
-use stwo_ml::starknet::build_starknet_proof_direct;
-use stwo_ml::tee::{detect_tee_capability, SecurityLevel};
+use obelyzk::compiler::hf_loader::load_hf_model_decode;
+use obelyzk::compiler::inspect::summarize_model;
+use obelyzk::compiler::onnx::{load_onnx, OnnxModel};
+use obelyzk::components::matmul::M31Matrix;
+use obelyzk::gadgets::quantize::{quantize_tensor, QuantStrategy};
+use obelyzk::json_serde;
+use obelyzk::starknet::build_starknet_proof_direct;
+use obelyzk::tee::{detect_tee_capability, SecurityLevel};
 
 /// Output format for the proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -900,7 +900,7 @@ fn load_model(cli: &Cli) -> OnnxModel {
     if let Some(ref model_dir) = cli.model_dir {
         // HuggingFace directory mode — validation is built into load_hf_model
         eprintln!("Loading HuggingFace model from: {}", model_dir.display());
-        stwo_ml::compiler::hf_loader::load_hf_model(model_dir, cli.layers).unwrap_or_else(|e| {
+        obelyzk::compiler::hf_loader::load_hf_model(model_dir, cli.layers).unwrap_or_else(|e| {
             eprintln!("Error loading model directory: {e}");
             process::exit(1);
         })
@@ -923,17 +923,17 @@ fn main() {
     let cli = Cli::parse();
 
     if cli.quiet {
-        stwo_ml::set_quiet(true);
+        obelyzk::set_quiet(true);
     }
     if cli.profile {
-        stwo_ml::set_profile(true);
+        obelyzk::set_profile(true);
     }
 
     // ── Resolve proof policy ────────────────────────────────────────────
-    let resolved_policy: stwo_ml::policy::PolicyConfig = if let Some(ref pf) = cli.policy_file {
+    let resolved_policy: obelyzk::policy::PolicyConfig = if let Some(ref pf) = cli.policy_file {
         #[cfg(feature = "serde")]
         {
-            stwo_ml::policy::from_file(pf).unwrap_or_else(|e| {
+            obelyzk::policy::from_file(pf).unwrap_or_else(|e| {
                 eprintln!("Error: {e}");
                 process::exit(1);
             })
@@ -945,18 +945,18 @@ fn main() {
             process::exit(1);
         }
     } else {
-        stwo_ml::policy::from_preset_name(&cli.policy).unwrap_or_else(|| {
+        obelyzk::policy::from_preset_name(&cli.policy).unwrap_or_else(|| {
             eprintln!(
                 "Error: unknown policy '{}'. Valid options: {}",
                 cli.policy,
-                stwo_ml::policy::PRESET_NAMES.join(", ")
+                obelyzk::policy::PRESET_NAMES.join(", ")
             );
             process::exit(1);
         })
     };
 
     // Warn if STWO_* env vars conflict with explicit policy
-    let env_conflicts = stwo_ml::policy::detect_env_conflicts();
+    let env_conflicts = obelyzk::policy::detect_env_conflicts();
     if !env_conflicts.is_empty() && !cli.quiet {
         eprintln!(
             "Note: --policy {} overrides {} STWO_* env var(s): {}",
@@ -969,11 +969,11 @@ fn main() {
     // Sync env vars to match the resolved policy. This ensures that any
     // downstream code calling PolicyConfig::from_env() (e.g. the streaming
     // calldata self-verifier) produces the same policy commitment as the prover.
-    stwo_ml::policy::apply_to_env(&resolved_policy);
+    obelyzk::policy::apply_to_env(&resolved_policy);
 
     // Print policy banner
-    if !stwo_ml::is_quiet() {
-        eprintln!("Policy: {}", stwo_ml::policy::summary_line(&resolved_policy));
+    if !obelyzk::is_quiet() {
+        eprintln!("Policy: {}", obelyzk::policy::summary_line(&resolved_policy));
     }
 
     // Dispatch to subcommands if specified
@@ -1094,11 +1094,11 @@ fn main() {
                                     .get("num_layer_proofs")
                                     .and_then(|v| v.as_u64())
                                     .unwrap_or(0) as usize;
-                                stwo_ml::starknet::verify_proof_fast_ml_gkr(
+                                obelyzk::starknet::verify_proof_fast_ml_gkr(
                                     &gkr_calldata, &io_calldata, &wc, nlp,
                                 )
                             } else {
-                                stwo_ml::starknet::verify_proof_fast(&gkr_calldata)
+                                obelyzk::starknet::verify_proof_fast(&gkr_calldata)
                             };
 
                             eprintln!("  proof health check ({} felts):", health.total_felts);
@@ -1303,7 +1303,7 @@ fn main() {
             eprintln!("Loading model for forward-pass verification...");
             let model = load_model(&cli);
 
-            let replay_output = stwo_ml::audit::replay::execute_forward_pass(
+            let replay_output = obelyzk::audit::replay::execute_forward_pass(
                 &model.graph,
                 &input_matrix,
                 &model.weights,
@@ -1384,7 +1384,7 @@ fn main() {
             }
 
             eprintln!("Re-verifying GKR proof cryptographically...");
-            let native_proof = serde_json::from_value::<stwo_ml::gkr::GKRProof>(
+            let native_proof = serde_json::from_value::<obelyzk::gkr::GKRProof>(
                 native_proof_val.unwrap().clone(),
             )
             .unwrap_or_else(|e| {
@@ -1394,7 +1394,7 @@ fn main() {
                 process::exit(1);
             });
 
-            let circuit = stwo_ml::gkr::LayeredCircuit::from_graph(&model.graph)
+            let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&model.graph)
                 .unwrap_or_else(|e| {
                     eprintln!(
                         "VERIFICATION FAILED: could not build circuit for GKR verification: {e}"
@@ -1402,8 +1402,8 @@ fn main() {
                     process::exit(1);
                 });
 
-            let mut ch = stwo_ml::crypto::poseidon_channel::PoseidonChannel::new();
-            match stwo_ml::gkr::verify_gkr_with_weights(
+            let mut ch = obelyzk::crypto::poseidon_channel::PoseidonChannel::new();
+            match obelyzk::gkr::verify_gkr_with_weights(
                 &circuit,
                 &native_proof,
                 &output_matrix,
@@ -1444,7 +1444,7 @@ fn main() {
     if cli.validate {
         if let Some(ref model_dir) = cli.model_dir {
             let report =
-                stwo_ml::compiler::hf_loader::validate_model_directory(model_dir, cli.layers);
+                obelyzk::compiler::hf_loader::validate_model_directory(model_dir, cli.layers);
             eprintln!();
             eprintln!("  ── Model Validation ──");
             eprintln!("{}", report.format_report());
@@ -1482,7 +1482,7 @@ fn main() {
             eprintln!("--- seq_len={seq_len} ---");
 
             // Load model with this seq_len
-            let model = stwo_ml::compiler::hf_loader::load_hf_model(
+            let model = obelyzk::compiler::hf_loader::load_hf_model(
                 model_dir,
                 layers,
             ).unwrap_or_else(|e| {
@@ -1494,7 +1494,7 @@ fn main() {
 
             // Generate synthetic input (seq_len × hidden_dim)
             let d_model = graph.nodes.first().map(|n| n.output_shape.1).unwrap_or(1);
-            let mut input = stwo_ml::components::matmul::M31Matrix::new(seq_len, d_model);
+            let mut input = obelyzk::components::matmul::M31Matrix::new(seq_len, d_model);
             for i in 0..(seq_len * d_model) {
                 input.data[i] = M31::from((i as u32 * 7 + 13) % ((1u32 << 20) - 1));
             }
@@ -1502,7 +1502,7 @@ fn main() {
             // Warmup
             for w in 0..cli.bench_warmup {
                 eprintln!("  warmup {}/{}", w + 1, cli.bench_warmup);
-                let _ = stwo_ml::aggregation::prove_model_aggregated_onchain_gkr_auto(
+                let _ = obelyzk::aggregation::prove_model_aggregated_onchain_gkr_auto(
                     &graph, &input, &weights,
                 );
             }
@@ -1510,7 +1510,7 @@ fn main() {
             // Measured run
             eprintln!("  proving...");
             let t_start = Instant::now();
-            let result = stwo_ml::aggregation::prove_model_aggregated_onchain_gkr_auto(
+            let result = obelyzk::aggregation::prove_model_aggregated_onchain_gkr_auto(
                 &graph, &input, &weights,
             );
             let elapsed_ms = t_start.elapsed().as_millis() as u64;
@@ -1527,7 +1527,7 @@ fn main() {
                     let calldata_size = proof.gkr_proof.as_ref()
                         .map(|g| {
                             let mut v = Vec::new();
-                            stwo_ml::cairo_serde::serialize_gkr_proof_data_only(g, &mut v);
+                            obelyzk::cairo_serde::serialize_gkr_proof_data_only(g, &mut v);
                             v.len()
                         })
                         .unwrap_or(0);
@@ -1605,7 +1605,7 @@ fn main() {
         eprintln!("Model loaded in {:.2}s", t_cache.elapsed().as_secs_f64());
 
         let model_id = if cli.model_id.is_empty() { "unknown".to_string() } else { cli.model_id.clone() };
-        let cache = stwo_ml::weight_cache::shared_cache_for_model_mmap(
+        let cache = obelyzk::weight_cache::shared_cache_for_model_mmap(
             model_dir, &model_id, &model.weights,
         );
 
@@ -1619,7 +1619,7 @@ fn main() {
         }
 
         eprintln!("Computing Merkle roots for {total_weights} weight matrices...");
-        let computed = stwo_ml::weight_cache::prewarm_weight_roots_gpu_exclusive(
+        let computed = obelyzk::weight_cache::prewarm_weight_roots_gpu_exclusive(
             &model.weights, &cache, Some(model_dir.as_path()),
         );
 
@@ -1749,7 +1749,7 @@ fn main() {
                 .graph
                 .nodes
                 .iter()
-                .filter(|n| matches!(n.op, stwo_ml::compiler::graph::GraphOp::MatMul { .. }))
+                .filter(|n| matches!(n.op, obelyzk::compiler::graph::GraphOp::MatMul { .. }))
                 .count();
             if weight_count > 0 {
                 let derived = starknet_crypto::poseidon_hash_many(&[
@@ -1776,7 +1776,7 @@ fn main() {
         .nodes
         .iter()
         .find_map(|n| match &n.op {
-            stwo_ml::compiler::graph::GraphOp::Activation {
+            obelyzk::compiler::graph::GraphOp::Activation {
                 activation_type, ..
             } => Some(*activation_type as u8),
             _ => None,
@@ -1814,7 +1814,7 @@ fn main() {
     // Multi-GPU: print device discovery info
     #[cfg(feature = "multi-gpu")]
     if cli.multi_gpu {
-        let devices = stwo_ml::multi_gpu::discover_devices();
+        let devices = obelyzk::multi_gpu::discover_devices();
         if devices.is_empty() {
             eprintln!("Error: --multi-gpu specified but no GPUs found");
             process::exit(1);
@@ -1837,7 +1837,7 @@ fn main() {
     if cli.decode {
         let weight_cache = cli.model_dir.as_ref().map(|dir| {
             let model_id_str = if cli.model_id.is_empty() { "unknown".to_string() } else { cli.model_id.clone() };
-            stwo_ml::weight_cache::shared_cache_for_model_mmap(
+            obelyzk::weight_cache::shared_cache_for_model_mmap(
                 dir, &model_id_str, &model.weights,
             )
         });
@@ -1852,7 +1852,7 @@ fn main() {
     // Falls back to validated file I/O if mmap fails.
     let weight_cache = cli.model_dir.as_ref().map(|dir| {
         let model_id = if cli.model_id.is_empty() { "unknown".to_string() } else { cli.model_id.clone() };
-        stwo_ml::weight_cache::shared_cache_for_model_mmap(
+        obelyzk::weight_cache::shared_cache_for_model_mmap(
             dir, &model_id, &model.weights,
         )
     });
@@ -1870,10 +1870,10 @@ fn main() {
             eprintln!("Loading KV-cache from {}", cache_path.display());
             // For now, create a fresh cache — binary serialization is future work.
             // The KV-cache persists across calls within the same process via &mut ref.
-            stwo_ml::components::attention::ModelKVCache::new()
+            obelyzk::components::attention::ModelKVCache::new()
         } else {
             eprintln!("Creating new KV-cache (will save to {})", cache_path.display());
-            stwo_ml::components::attention::ModelKVCache::new()
+            obelyzk::components::attention::ModelKVCache::new()
         }
     });
 
@@ -1888,7 +1888,7 @@ fn main() {
             process::exit(1);
         }
         // Force profiling on
-        stwo_ml::set_profile(true);
+        obelyzk::set_profile(true);
 
         let mut kvc = model_kv_cache.take().unwrap();
 
@@ -1898,7 +1898,7 @@ fn main() {
             let cache_count = wc.read().map(|c| c.len()).unwrap_or(0);
             if cache_count < total_weights {
                 eprintln!("[BENCH] Pre-warming {} weight Merkle roots...", total_weights - cache_count);
-                stwo_ml::weight_cache::prewarm_weight_roots_gpu_exclusive(
+                obelyzk::weight_cache::prewarm_weight_roots_gpu_exclusive(
                     &model.weights, wc, cli.model_dir.as_deref(),
                 );
             }
@@ -1908,7 +1908,7 @@ fn main() {
         let (_, d_model) = model.input_shape;
         eprintln!("[BENCH] Prefill ({} tokens, d_model={})...", input.rows, d_model);
         let t_prefill = Instant::now();
-        let _prefill_proof = stwo_ml::aggregation::prove_model_pure_gkr_prefill_with_cache(
+        let _prefill_proof = obelyzk::aggregation::prove_model_pure_gkr_prefill_with_cache(
             &model.graph, &input, &model.weights, &mut kvc,
             weight_cache.as_ref(), None,
         ).unwrap_or_else(|e| {
@@ -1917,7 +1917,7 @@ fn main() {
         });
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
         // Consume prefill profile
-        let _ = stwo_ml::gkr::profiler::take_profile_json();
+        let _ = obelyzk::gkr::profiler::take_profile_json();
         eprintln!("[BENCH] Prefill: {:.0}ms", prefill_ms);
 
         // Phase 2: Decode steps
@@ -1936,7 +1936,7 @@ fn main() {
             let cache_len: usize = kvc.layers.values().next().map(|c| c.cached_len).unwrap_or(0);
 
             let t_step = Instant::now();
-            let _proof = stwo_ml::aggregation::prove_model_pure_gkr_decode_step(
+            let _proof = obelyzk::aggregation::prove_model_pure_gkr_decode_step(
                 &model.graph, &token, &model.weights, &mut kvc,
                 weight_cache.as_ref(), None,
             ).unwrap_or_else(|e| {
@@ -1946,7 +1946,7 @@ fn main() {
             let step_ms = t_step.elapsed().as_secs_f64() * 1000.0;
 
             // Extract per-phase timing from profiler JSON
-            let profile_json = stwo_ml::gkr::profiler::take_profile_json();
+            let profile_json = obelyzk::gkr::profiler::take_profile_json();
             let ph = parse_profile_phases(&profile_json);
 
             // RSS memory (Unix only)
@@ -2008,12 +2008,12 @@ fn main() {
             eprintln!("Using full ML GKR pipeline (--format ml_gkr)");
             if let Some(ref mut kvc) = model_kv_cache {
                 eprintln!("  KV-cache enabled: prefill batch proving");
-                stwo_ml::aggregation::prove_model_pure_gkr_prefill_with_cache(
+                obelyzk::aggregation::prove_model_pure_gkr_prefill_with_cache(
                     &model.graph, &input, &model.weights, kvc,
                     weight_cache.as_ref(), Some(&resolved_policy),
                 )
             } else {
-                stwo_ml::aggregation::prove_model_pure_gkr_auto_with_cache(
+                obelyzk::aggregation::prove_model_pure_gkr_auto_with_cache(
                     &model.graph, &input, &model.weights,
                     weight_cache.as_ref(), Some(&resolved_policy),
                 )
@@ -2024,14 +2024,14 @@ fn main() {
             {
                 let memory_budget = (cli.chunk_budget_gb * 1e9) as usize;
                 let (chunks, metrics) =
-                    stwo_ml::compiler::chunked::prove_model_chunked_multi_gpu_with_metrics(
+                    obelyzk::compiler::chunked::prove_model_chunked_multi_gpu_with_metrics(
                         &model.graph,
                         &input,
                         &model.weights,
                         memory_budget,
                     )
                     .map_err(|e| {
-                        stwo_ml::aggregation::AggregationError::ProvingError(
+                        obelyzk::aggregation::AggregationError::ProvingError(
                             format!("Multi-GPU chunked proving: {e}"),
                         )
                     })?;
@@ -2052,13 +2052,13 @@ fn main() {
                     );
                 }
 
-                stwo_ml::compiler::chunked::compose_chunk_proofs_auto(
+                obelyzk::compiler::chunked::compose_chunk_proofs_auto(
                     &chunks,
                     &model.graph,
                     &input,
                     &model.weights,
                 )
-                .map_err(|e| stwo_ml::aggregation::AggregationError::ProvingError(
+                .map_err(|e| obelyzk::aggregation::AggregationError::ProvingError(
                     format!("Chunk composition: {e}"),
                 ))
             }
@@ -2071,27 +2071,27 @@ fn main() {
             // LogUp GKR pipeline: standard pipeline + STWO-native GKR for LogUp components
             eprintln!("Using STWO-native GKR for LogUp verification");
             if use_gpu {
-                stwo_ml::aggregation::prove_model_aggregated_onchain_logup_gkr_auto(
+                obelyzk::aggregation::prove_model_aggregated_onchain_logup_gkr_auto(
                     &model.graph,
                     &input,
                     &model.weights,
                 )
             } else {
-                stwo_ml::aggregation::prove_model_aggregated_onchain_logup_gkr(
+                obelyzk::aggregation::prove_model_aggregated_onchain_logup_gkr(
                     &model.graph,
                     &input,
                     &model.weights,
                 )
             }
         } else if use_gpu {
-            stwo_ml::aggregation::prove_model_aggregated_onchain_auto(
+            obelyzk::aggregation::prove_model_aggregated_onchain_auto(
                 &model.graph,
                 &input,
                 &model.weights,
                 None,
             )
         } else {
-            stwo_ml::aggregation::prove_model_aggregated_onchain(
+            obelyzk::aggregation::prove_model_aggregated_onchain(
                 &model.graph,
                 &input,
                 &model.weights,
@@ -2144,7 +2144,7 @@ fn main() {
                     );
                 }
                 let t_prewarm = Instant::now();
-                let computed = stwo_ml::weight_cache::prewarm_weight_roots_gpu_exclusive(
+                let computed = obelyzk::weight_cache::prewarm_weight_roots_gpu_exclusive(
                     prewarm_weights, wc, prewarm_dir.as_deref(),
                 );
                 if !is_quiet() {
@@ -2169,7 +2169,7 @@ fn main() {
         std::thread::scope(|s| {
             let _prewarm = prewarm_cache.as_ref().map(|wc| {
                 s.spawn(|| {
-                    stwo_ml::weight_cache::prewarm_weight_roots(
+                    obelyzk::weight_cache::prewarm_weight_roots(
                         prewarm_weights, wc, prewarm_dir.as_deref(),
                     )
                 })
@@ -2195,7 +2195,7 @@ fn main() {
 
             let _prewarm = prewarm_cache.as_ref().map(|wc| {
                 s.spawn(|| {
-                    stwo_ml::weight_cache::prewarm_weight_roots(
+                    obelyzk::weight_cache::prewarm_weight_roots(
                         prewarm_weights, wc, prewarm_dir.as_deref(),
                     )
                 })
@@ -2236,7 +2236,7 @@ fn main() {
     // Save weight commitment cache to disk (only writes if dirty).
     let t_post = Instant::now();
     if let (Some(cache), Some(dir)) = (&weight_cache, &cli.model_dir) {
-        match stwo_ml::weight_cache::save_shared_cache(cache, dir) {
+        match obelyzk::weight_cache::save_shared_cache(cache, dir) {
             Ok(true) => {
                 let count = cache.read().map(|c| c.len()).unwrap_or(0);
                 eprintln!("Weight commitment cache: saved {count} entries to {}", dir.display());
@@ -2255,7 +2255,7 @@ fn main() {
 
     // Write profile JSON to <output>.profile.json if --profile was set.
     if cli.profile {
-        if let Some(json) = stwo_ml::gkr::profiler::take_profile_json() {
+        if let Some(json) = obelyzk::gkr::profiler::take_profile_json() {
             let profile_path = cli.output.with_extension("profile.json");
             match std::fs::write(&profile_path, &json) {
                 Ok(_) => eprintln!("Profile JSON written to {}", profile_path.display()),
@@ -2265,9 +2265,9 @@ fn main() {
     }
 
     // Generate TEE attestation if applicable
-    let tee_attestation = if matches!(resolved, stwo_ml::tee::ResolvedSecurityLevel::ZkPlusTee) {
+    let tee_attestation = if matches!(resolved, obelyzk::tee::ResolvedSecurityLevel::ZkPlusTee) {
         eprintln!("Generating TEE attestation...");
-        match stwo_ml::tee::TeeModelProver::with_security(cli.security) {
+        match obelyzk::tee::TeeModelProver::with_security(cli.security) {
             Ok(tee_prover) if tee_prover.is_tee() => {
                 eprintln!(
                     "  TEE: {} (hw={}, secboot={}, dbg={})",
@@ -2292,23 +2292,23 @@ fn main() {
 
     // ── Recursive STARK composition (optional) ───────────────────────
     let mut recursive_calldata: Option<Vec<starknet_ff::FieldElement>> = None;
-    let mut recursive_summary: Option<stwo_ml::cairo_serde::RecursiveCalldataSummary> = None;
+    let mut recursive_summary: Option<obelyzk::cairo_serde::RecursiveCalldataSummary> = None;
     if cli.recursive {
         if let Some(ref gkr) = proof.gkr_proof {
             eprintln!("Phase 4/4: Recursive STARK composition...");
-            let circuit = stwo_ml::gkr::LayeredCircuit::from_graph(&model.graph)
+            let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&model.graph)
                 .expect("circuit compile for recursive");
 
             // Compute real public inputs for the recursive proof
             let recursive_io = compute_io_commitment(&input, &proof.execution.output);
-            let recursive_io_qm31 = stwo_ml::crypto::poseidon_channel::felt_to_securefield(recursive_io);
+            let recursive_io_qm31 = obelyzk::crypto::poseidon_channel::felt_to_securefield(recursive_io);
             // Weight super root: Poseidon hash of all weight Merkle roots.
             // Uses weight_commitments (Poseidon Merkle roots of weight matrices)
             // instead of weight_claims (Fiat-Shamir-dependent evaluated values).
             // This makes weight_super_root INPUT-INDEPENDENT — same model weights
             // always produce the same root regardless of inference input.
             let recursive_weight_root = if !gkr.weight_commitments.is_empty() {
-                let mut hasher = stwo_ml::crypto::poseidon_channel::PoseidonChannel::new();
+                let mut hasher = obelyzk::crypto::poseidon_channel::PoseidonChannel::new();
                 hasher.mix_u64(gkr.weight_commitments.len() as u64);
                 for wc_root in &gkr.weight_commitments {
                     hasher.mix_felt(*wc_root);
@@ -2318,7 +2318,7 @@ fn main() {
                 stwo::core::fields::qm31::QM31::default()
             };
 
-            match stwo_ml::recursive::prove_recursive_with_policy(
+            match obelyzk::recursive::prove_recursive_with_policy(
                 &circuit,
                 gkr,
                 &proof.execution.output,
@@ -2337,16 +2337,16 @@ fn main() {
                     );
 
                     // Serialize recursive proof into calldata felts for single-TX submission
-                    let calldata = stwo_ml::cairo_serde::serialize_recursive_proof_calldata(
+                    let calldata = obelyzk::cairo_serde::serialize_recursive_proof_calldata(
                         &recursive_proof,
                     );
-                    let summary = stwo_ml::cairo_serde::recursive_proof_calldata_summary(
+                    let summary = obelyzk::cairo_serde::recursive_proof_calldata_summary(
                         &recursive_proof,
                     );
 
                     let gkr_felts = proof.gkr_proof.as_ref().map(|g| {
                         let mut v = Vec::new();
-                        stwo_ml::cairo_serde::serialize_gkr_proof_data_only(g, &mut v);
+                        obelyzk::cairo_serde::serialize_gkr_proof_data_only(g, &mut v);
                         v.len()
                     }).unwrap_or(0);
 
@@ -2423,7 +2423,7 @@ fn main() {
             len
         }
         OutputFormat::MlGkr => {
-            use stwo_ml::starknet::{
+            use obelyzk::starknet::{
                 build_chunked_gkr_calldata, build_circuit_descriptor,
                 build_gkr_serializable_proof_parallel,
                 build_register_gkr_calldata, build_verify_model_gkr_calldata,
@@ -2469,16 +2469,16 @@ fn main() {
             // This catches prover bugs and ensures no corrupt proof is emitted.
             let cryptographic_self_verified =
                 if let Some(gkr_p) = proof.gkr_proof.as_ref() {
-                    match stwo_ml::gkr::LayeredCircuit::from_graph(&model.graph) {
+                    match obelyzk::gkr::LayeredCircuit::from_graph(&model.graph) {
                         Ok(circuit) => {
                             let mut verify_channel =
-                                stwo_ml::crypto::poseidon_channel::PoseidonChannel::new();
+                                obelyzk::crypto::poseidon_channel::PoseidonChannel::new();
                             // Mix KV-cache commitment before GKR verification
                             // (must match prover's channel seeding in aggregation.rs)
                             if let Some(kvc) = proof.kv_cache_commitment {
                                 verify_channel.mix_felt(kvc);
                             }
-                            match stwo_ml::gkr::verify_gkr_with_policy(
+                            match obelyzk::gkr::verify_gkr_with_policy(
                                 &circuit,
                                 gkr_p,
                                 &proof.execution.output,
@@ -2519,7 +2519,7 @@ fn main() {
             // (V1 soundness gate rejects non-Sequential weight opening modes)
             let use_starknet_gkr_v4 = use_starknet_gkr_v4_env
                 || gkr_proof.weight_opening_mode
-                    == stwo_ml::gkr::types::WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
+                    == obelyzk::gkr::types::WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
             let use_starknet_gkr_v3 = std::env::var("STWO_STARKNET_GKR_V3")
                 .ok()
                 .map(|v| {
@@ -2549,10 +2549,10 @@ fn main() {
 
             // Build complete verify_model_gkr calldata (all parameters pre-assembled)
             let verify_calldata_obj = if let Some(gkr_p) = proof.gkr_proof.as_ref() {
-                match stwo_ml::gkr::LayeredCircuit::from_graph(&model.graph) {
+                match obelyzk::gkr::LayeredCircuit::from_graph(&model.graph) {
                     Ok(circuit) => {
                         let raw_io =
-                            stwo_ml::cairo_serde::serialize_raw_io(&input, &proof.execution.output);
+                            obelyzk::cairo_serde::serialize_raw_io(&input, &proof.execution.output);
                         // For V4, try IO-packed first (direct calldata, no storage reads),
                         // then packed, then unpacked
                         let no_io_pack = std::env::var("STWO_NO_IO_PACK")
@@ -2812,7 +2812,7 @@ fn main() {
 
             // Build register_model_gkr calldata so paymaster can auto-register.
             let register_calldata_obj = if let Some(gkr_p) = proof.gkr_proof.as_ref() {
-                match stwo_ml::gkr::LayeredCircuit::from_graph(&model.graph) {
+                match obelyzk::gkr::LayeredCircuit::from_graph(&model.graph) {
                     Ok(circuit) => {
                         let circuit_desc = build_circuit_descriptor(&circuit);
                         let mut reg_wc = gkr_p.weight_commitments.clone();
@@ -2832,7 +2832,7 @@ fn main() {
 
             // When using packed-IO entrypoint, the on-chain io_commitment is computed
             // from the packed felts (not the unpacked raw_io_data). Include both.
-            let packed_io_commitment = stwo_ml::aggregation::compute_io_commitment_packed(
+            let packed_io_commitment = obelyzk::aggregation::compute_io_commitment_packed(
                 &input, &proof.execution.output,
             );
 
@@ -2921,7 +2921,7 @@ fn main() {
                 activation_type,
             };
             let direct_proof = build_starknet_proof_direct(&proof, &input, direct_metadata);
-            let verify_calldata = stwo_ml::starknet::build_verify_model_direct_calldata(
+            let verify_calldata = obelyzk::starknet::build_verify_model_direct_calldata(
                 &direct_proof,
                 "__SESSION_ID__",
             );
@@ -3081,13 +3081,13 @@ fn main() {
             eprintln!("Warning: no calldata found in proof file for health check");
         } else if cli.dry_run {
             let result = if is_ml_gkr {
-                stwo_ml::starknet::dry_run_onchain_ml_gkr(
+                obelyzk::starknet::dry_run_onchain_ml_gkr(
                     &gkr_calldata, &io_calldata_felts, &wc_felts, nlp,
                     cli.rpc_url.as_deref(), Some(&cli.contract),
                 )
             } else {
                 let fallback = if gkr_calldata.is_empty() { &io_calldata_felts } else { &gkr_calldata };
-                stwo_ml::starknet::dry_run_onchain(
+                obelyzk::starknet::dry_run_onchain(
                     fallback, cli.rpc_url.as_deref(), Some(&cli.contract),
                 )
             };
@@ -3115,12 +3115,12 @@ fn main() {
         } else {
             // --health-check only
             let report = if is_ml_gkr {
-                stwo_ml::starknet::verify_proof_fast_ml_gkr(
+                obelyzk::starknet::verify_proof_fast_ml_gkr(
                     &gkr_calldata, &io_calldata_felts, &wc_felts, nlp,
                 )
             } else {
                 let fallback = if gkr_calldata.is_empty() { &io_calldata_felts } else { &gkr_calldata };
-                stwo_ml::starknet::verify_proof_fast(fallback)
+                obelyzk::starknet::verify_proof_fast(fallback)
             };
             eprintln!("=== Health Check ===");
             for check in &report.checks {
@@ -3218,12 +3218,12 @@ fn main() {
 fn submit_gkr_onchain(
     cli: &Cli,
     model: &OnnxModel,
-    proof: &stwo_ml::aggregation::AggregatedModelProofOnChain,
+    proof: &obelyzk::aggregation::AggregatedModelProofOnChain,
     input: &M31Matrix,
     model_id: FieldElement,
     _io_commitment: FieldElement,
 ) {
-    use stwo_ml::starknet::{
+    use obelyzk::starknet::{
         build_circuit_descriptor, build_register_gkr_calldata, build_verify_model_gkr_calldata,
         build_verify_model_gkr_v2_calldata, build_verify_model_gkr_v3_calldata,
         build_verify_model_gkr_v4_calldata, CHUNKED_GKR_THRESHOLD,
@@ -3243,7 +3243,7 @@ fn submit_gkr_onchain(
     };
 
     // Compile the LayeredCircuit for dimension extraction
-    let circuit = stwo_ml::gkr::LayeredCircuit::from_graph(&model.graph).unwrap_or_else(|e| {
+    let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&model.graph).unwrap_or_else(|e| {
         eprintln!("Error compiling GKR circuit: {e}");
         process::exit(1);
     });
@@ -3265,7 +3265,7 @@ fn submit_gkr_onchain(
     // Auto-promote to V4 when aggregated oracle sumcheck is active
     let use_starknet_gkr_v4 = use_starknet_gkr_v4_env
         || gkr_proof.weight_opening_transcript_mode
-            == stwo_ml::gkr::types::WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
+            == obelyzk::gkr::types::WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
     let use_starknet_gkr_v3 = !use_starknet_gkr_v4
         && std::env::var("STWO_STARKNET_GKR_V3")
             .ok()
@@ -3295,7 +3295,7 @@ fn submit_gkr_onchain(
     eprintln!("  Entrypoint: {}", verify_entrypoint);
 
     // Step 1: Build verify_model_gkr calldata (raw IO data for on-chain recomputation)
-    let raw_io_data = stwo_ml::cairo_serde::serialize_raw_io(input, &proof.execution.output);
+    let raw_io_data = obelyzk::cairo_serde::serialize_raw_io(input, &proof.execution.output);
     let verify_calldata = if use_starknet_gkr_v4 {
         build_verify_model_gkr_v4_calldata(gkr_proof, &circuit, model_id, &raw_io_data)
     } else if use_starknet_gkr_v3 {
@@ -3880,8 +3880,8 @@ fn resolve_wallet_path(path_str: &str) -> PathBuf {
 fn build_pool_config(
     network: &str,
     pool_contract: Option<&str>,
-) -> stwo_ml::privacy::pool_client::PoolClientConfig {
-    use stwo_ml::privacy::pool_client::PoolClientConfig;
+) -> obelyzk::privacy::pool_client::PoolClientConfig {
+    use obelyzk::privacy::pool_client::PoolClientConfig;
 
     let mut config = PoolClientConfig::from_env(network);
     if let Some(addr) = pool_contract {
@@ -3891,7 +3891,7 @@ fn build_pool_config(
 }
 
 fn run_wallet_command(cmd: &WalletCmd) {
-    use stwo_ml::privacy::wallet::Wallet;
+    use obelyzk::privacy::wallet::Wallet;
 
     match cmd.action.as_str() {
         "generate" => {
@@ -4009,10 +4009,10 @@ fn run_wallet_command(cmd: &WalletCmd) {
 }
 
 fn run_deposit_command(cmd: &DepositCmd) {
-    use stwo_ml::privacy::note_store::NoteStore;
-    use stwo_ml::privacy::serde_utils::{batch_proof_to_json, build_batch_proof_output};
-    use stwo_ml::privacy::tx_builder::TxBuilder;
-    use stwo_ml::privacy::wallet::Wallet;
+    use obelyzk::privacy::note_store::NoteStore;
+    use obelyzk::privacy::serde_utils::{batch_proof_to_json, build_batch_proof_output};
+    use obelyzk::privacy::tx_builder::TxBuilder;
+    use obelyzk::privacy::wallet::Wallet;
 
     let wallet_path = resolve_wallet_path(&cmd.wallet);
     let wallet = Wallet::load(&wallet_path, cmd.password.as_deref()).unwrap_or_else(|e| {
@@ -4120,11 +4120,11 @@ fn run_deposit_command(cmd: &DepositCmd) {
 }
 
 fn run_withdraw_command(cmd: &WithdrawCmd) {
-    use stwo_ml::privacy::note_store::NoteStore;
-    use stwo_ml::privacy::relayer::compute_withdrawal_binding_digest;
-    use stwo_ml::privacy::serde_utils::{batch_proof_to_json, build_batch_proof_output};
-    use stwo_ml::privacy::tx_builder::TxBuilder;
-    use stwo_ml::privacy::wallet::Wallet;
+    use obelyzk::privacy::note_store::NoteStore;
+    use obelyzk::privacy::relayer::compute_withdrawal_binding_digest;
+    use obelyzk::privacy::serde_utils::{batch_proof_to_json, build_batch_proof_output};
+    use obelyzk::privacy::tx_builder::TxBuilder;
+    use obelyzk::privacy::wallet::Wallet;
 
     let wallet_path = resolve_wallet_path(&cmd.wallet);
     let wallet = Wallet::load(&wallet_path, cmd.password.as_deref()).unwrap_or_else(|e| {
@@ -4209,8 +4209,8 @@ fn run_withdraw_command(cmd: &WithdrawCmd) {
     // Sync Merkle tree from on-chain pool
     #[cfg(feature = "audit-http")]
     let (path, root) = {
-        use stwo_ml::privacy::pool_client::PoolClient;
-        use stwo_ml::privacy::tree_sync::TreeSync;
+        use obelyzk::privacy::pool_client::PoolClient;
+        use obelyzk::privacy::tree_sync::TreeSync;
 
         let pool_config = build_pool_config(&cmd.priv_network, cmd.pool_contract.as_deref());
         if pool_config.pool_address.is_empty() {
@@ -4243,7 +4243,7 @@ fn run_withdraw_command(cmd: &WithdrawCmd) {
         let root = tree_sync.root();
 
         // Local verification before proving
-        use stwo_ml::crypto::merkle_m31::verify_merkle_proof;
+        use obelyzk::crypto::merkle_m31::verify_merkle_proof;
         if !verify_merkle_proof(&root, &commitment, &path, 20) {
             eprintln!("Error: local Merkle proof verification failed");
             eprintln!("Hint: delete ~/.vm31/tree_cache.json and re-sync");
@@ -4256,7 +4256,7 @@ fn run_withdraw_command(cmd: &WithdrawCmd) {
     // Fallback when audit-http is not available: ephemeral single-note tree
     #[cfg(not(feature = "audit-http"))]
     let (path, root) = {
-        use stwo_ml::crypto::merkle_m31::PoseidonMerkleTreeM31;
+        use obelyzk::crypto::merkle_m31::PoseidonMerkleTreeM31;
         eprintln!("  Warning: no audit-http feature, using ephemeral tree");
         let mut tree = PoseidonMerkleTreeM31::new(20);
         tree.append(commitment);
@@ -4331,10 +4331,10 @@ fn run_withdraw_command(cmd: &WithdrawCmd) {
 }
 
 fn run_transfer_command(cmd: &TransferCmd) {
-    use stwo_ml::privacy::note_store::NoteStore;
-    use stwo_ml::privacy::serde_utils::{batch_proof_to_json, build_batch_proof_output};
-    use stwo_ml::privacy::tx_builder::TxBuilder;
-    use stwo_ml::privacy::wallet::Wallet;
+    use obelyzk::privacy::note_store::NoteStore;
+    use obelyzk::privacy::serde_utils::{batch_proof_to_json, build_batch_proof_output};
+    use obelyzk::privacy::tx_builder::TxBuilder;
+    use obelyzk::privacy::wallet::Wallet;
 
     let wallet_path = resolve_wallet_path(&cmd.wallet);
     let wallet = Wallet::load(&wallet_path, cmd.password.as_deref()).unwrap_or_else(|e| {
@@ -4394,8 +4394,8 @@ fn run_transfer_command(cmd: &TransferCmd) {
     // Sync Merkle tree from on-chain pool
     #[cfg(feature = "audit-http")]
     let (path1, path2, root) = {
-        use stwo_ml::privacy::pool_client::PoolClient;
-        use stwo_ml::privacy::tree_sync::TreeSync;
+        use obelyzk::privacy::pool_client::PoolClient;
+        use obelyzk::privacy::tree_sync::TreeSync;
 
         let pool_config = build_pool_config(&cmd.priv_network, cmd.pool_contract.as_deref());
         if pool_config.pool_address.is_empty() {
@@ -4432,7 +4432,7 @@ fn run_transfer_command(cmd: &TransferCmd) {
         let root = tree_sync.root();
 
         // Local verification before proving
-        use stwo_ml::crypto::merkle_m31::verify_merkle_proof;
+        use obelyzk::crypto::merkle_m31::verify_merkle_proof;
         if !verify_merkle_proof(&root, &note1.commitment(), &p1, 20) {
             eprintln!("Error: local Merkle proof verification failed for note 1");
             eprintln!("Hint: delete ~/.vm31/tree_cache.json and re-sync");
@@ -4450,7 +4450,7 @@ fn run_transfer_command(cmd: &TransferCmd) {
     // Fallback when audit-http is not available: ephemeral 2-note tree
     #[cfg(not(feature = "audit-http"))]
     let (path1, path2, root) = {
-        use stwo_ml::crypto::merkle_m31::PoseidonMerkleTreeM31;
+        use obelyzk::crypto::merkle_m31::PoseidonMerkleTreeM31;
         eprintln!("  Warning: no audit-http feature, using ephemeral tree");
         let mut tree = PoseidonMerkleTreeM31::new(20);
         tree.append(note1.commitment());
@@ -4532,12 +4532,12 @@ fn run_transfer_command(cmd: &TransferCmd) {
 }
 
 fn run_batch_command(cmd: &BatchCmd) {
-    use stwo_ml::privacy::note_store::NoteStore;
-    use stwo_ml::privacy::serde_utils::{
+    use obelyzk::privacy::note_store::NoteStore;
+    use obelyzk::privacy::serde_utils::{
         batch_proof_to_json, build_batch_proof_output, parse_tx_file,
     };
-    use stwo_ml::privacy::tx_builder::TxBuilder;
-    use stwo_ml::privacy::wallet::Wallet;
+    use obelyzk::privacy::tx_builder::TxBuilder;
+    use obelyzk::privacy::wallet::Wallet;
 
     let wallet_path = resolve_wallet_path(&cmd.wallet);
     let wallet = Wallet::load(&wallet_path, cmd.password.as_deref()).unwrap_or_else(|e| {
@@ -4650,7 +4650,7 @@ fn run_batch_command(cmd: &BatchCmd) {
 }
 
 fn run_pool_status_command(cmd: &PoolStatusCmd) {
-    use stwo_ml::privacy::pool_client::{format_pool_status, PoolClientConfig};
+    use obelyzk::privacy::pool_client::{format_pool_status, PoolClientConfig};
 
     let config = PoolClientConfig::from_env(&cmd.priv_network);
     let pool_addr = cmd.pool_contract.as_deref().unwrap_or(&config.pool_address);
@@ -4670,7 +4670,7 @@ fn run_pool_status_command(cmd: &PoolStatusCmd) {
 
     #[cfg(feature = "audit-http")]
     {
-        use stwo_ml::privacy::pool_client::PoolClient;
+        use obelyzk::privacy::pool_client::PoolClient;
 
         let client_config = PoolClientConfig {
             rpc_url: config.rpc_url.clone(),
@@ -4758,8 +4758,8 @@ fn parse_m31_digest_hex(hex: &str) -> Result<[M31; 8], String> {
 }
 
 fn run_scan_command(cmd: &ScanCmd) {
-    use stwo_ml::privacy::note_store::NoteStore;
-    use stwo_ml::privacy::wallet::Wallet;
+    use obelyzk::privacy::note_store::NoteStore;
+    use obelyzk::privacy::wallet::Wallet;
 
     let wallet_path = resolve_wallet_path(&cmd.wallet);
     let wallet = Wallet::load(&wallet_path, cmd.password.as_deref()).unwrap_or_else(|e| {
@@ -4787,8 +4787,8 @@ fn run_scan_command(cmd: &ScanCmd) {
     // Sync tree and update pending note indices
     #[cfg(feature = "audit-http")]
     {
-        use stwo_ml::privacy::pool_client::PoolClient;
-        use stwo_ml::privacy::tree_sync::TreeSync;
+        use obelyzk::privacy::pool_client::PoolClient;
+        use obelyzk::privacy::tree_sync::TreeSync;
 
         let pool_config = build_pool_config(&cmd.priv_network, cmd.pool_contract.as_deref());
         if !pool_config.pool_address.is_empty() {
@@ -4959,8 +4959,8 @@ fn generate_diverse_input(rows: usize, cols: usize, iteration: usize) -> M31Matr
 /// Run the `prove-model capture` subcommand.
 fn run_capture_command(cmd: &CaptureCmd) {
     use std::time::{SystemTime, UNIX_EPOCH};
-    use stwo_ml::audit::capture::{CaptureHook, CaptureJob};
-    use stwo_ml::audit::replay::execute_forward_pass;
+    use obelyzk::audit::capture::{CaptureHook, CaptureJob};
+    use obelyzk::audit::replay::execute_forward_pass;
 
     eprintln!();
     eprintln!("  prove-model capture");
@@ -4987,14 +4987,14 @@ fn run_capture_command(cmd: &CaptureCmd) {
                 .unwrap_or(1)
         }).unwrap_or(1);
         eprintln!("  seq_len={} (from conversation tokens)", seq_len);
-        stwo_ml::compiler::hf_loader::load_hf_model_full(model_dir, cmd.layers, seq_len)
+        obelyzk::compiler::hf_loader::load_hf_model_full(model_dir, cmd.layers, seq_len)
             .unwrap_or_else(|e| {
                 eprintln!("Error loading full attention model: {e}");
                 process::exit(1);
             })
     } else if let Some(ref model_dir) = cmd.model_dir {
         eprintln!("Loading model: {} (HuggingFace)", model_dir.display());
-        stwo_ml::compiler::hf_loader::load_hf_model(model_dir, cmd.layers).unwrap_or_else(|e| {
+        obelyzk::compiler::hf_loader::load_hf_model(model_dir, cmd.layers).unwrap_or_else(|e| {
             eprintln!("Error loading model directory: {e}");
             process::exit(1);
         })
@@ -5097,7 +5097,7 @@ fn run_capture_command(cmd: &CaptureCmd) {
                 all_response_tokens.len(), conv.turns.len(),
             );
 
-            match stwo_ml::compiler::hf_loader::load_embedding_batch(
+            match obelyzk::compiler::hf_loader::load_embedding_batch(
                 model_dir, input_cols, &all_response_tokens,
             ) {
                 Ok(batch_embedding) => {
@@ -5152,7 +5152,7 @@ fn run_capture_command(cmd: &CaptureCmd) {
             let t_turn = Instant::now();
 
             // Extract embedding for this turn's last token
-            let (embedding, _vocab_size) = stwo_ml::compiler::hf_loader::load_embedding_row(
+            let (embedding, _vocab_size) = obelyzk::compiler::hf_loader::load_embedding_row(
                 model_dir, input_cols, turn.last_token_id,
             )
             .unwrap_or_else(|e| {
@@ -5290,7 +5290,7 @@ fn run_capture_command(cmd: &CaptureCmd) {
             );
 
             // 3. Extract single embedding row (zero-copy from mmap, ~40 KB not ~3 GB)
-            let (row, vocab_size) = stwo_ml::compiler::hf_loader::load_embedding_row(
+            let (row, vocab_size) = obelyzk::compiler::hf_loader::load_embedding_row(
                 model_dir, input_cols, last_token_id,
             )
             .unwrap_or_else(|e| {
@@ -5400,10 +5400,10 @@ fn run_capture_command(cmd: &CaptureCmd) {
 
 /// Run the `prove-model audit` subcommand.
 fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
-    use stwo_ml::audit::log::InferenceLog;
-    use stwo_ml::audit::orchestrator::{run_audit, AuditPipelineConfig};
-    use stwo_ml::audit::submit::{explorer_url, SubmitConfig};
-    use stwo_ml::audit::types::{AuditRequest, ModelInfo};
+    use obelyzk::audit::log::InferenceLog;
+    use obelyzk::audit::orchestrator::{run_audit, AuditPipelineConfig};
+    use obelyzk::audit::submit::{explorer_url, SubmitConfig};
+    use obelyzk::audit::types::{AuditRequest, ModelInfo};
 
     eprintln!();
     eprintln!("  prove-model audit");
@@ -5411,8 +5411,8 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
 
     // ── Multi-session aggregation (--sessions) ──────────────────────────
     if let Some(ref sessions_dir) = cmd.sessions {
-        use stwo_ml::audit::aggregator::MultiSessionAuditAggregator;
-        use stwo_ml::audit::digest::digest_to_hex;
+        use obelyzk::audit::aggregator::MultiSessionAuditAggregator;
+        use obelyzk::audit::digest::digest_to_hex;
 
         eprintln!("Multi-session aggregation: {}", sessions_dir.display());
         let mut agg = MultiSessionAuditAggregator::new();
@@ -5504,14 +5504,14 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
         eprintln!("Loading model: {} (full attention)", model_dir.display());
         // Determine seq_len from the inference log entries
         let seq_len = 1; // per-turn proving uses seq_len=1
-        stwo_ml::compiler::hf_loader::load_hf_model_full(model_dir, cmd.layers, seq_len)
+        obelyzk::compiler::hf_loader::load_hf_model_full(model_dir, cmd.layers, seq_len)
             .unwrap_or_else(|e| {
                 eprintln!("Error loading full attention model: {e}");
                 process::exit(1);
             })
     } else if let Some(ref model_dir) = cmd.model_dir {
         eprintln!("Loading model: {} (HuggingFace)", model_dir.display());
-        stwo_ml::compiler::hf_loader::load_hf_model(model_dir, cmd.layers).unwrap_or_else(|e| {
+        obelyzk::compiler::hf_loader::load_hf_model(model_dir, cmd.layers).unwrap_or_else(|e| {
             eprintln!("Error loading model directory: {e}");
             process::exit(1);
         })
@@ -5712,17 +5712,17 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
         };
 
         // Construct encryption backend
-        let encryption_backend: Option<Box<dyn stwo_ml::audit::types::AuditEncryption>> = match cmd
+        let encryption_backend: Option<Box<dyn obelyzk::audit::types::AuditEncryption>> = match cmd
             .encryption
             .as_str()
         {
             "poseidon2" | "poseidon2_m31" => {
-                Some(Box::new(stwo_ml::audit::encryption::Poseidon2M31Encryption))
+                Some(Box::new(obelyzk::audit::encryption::Poseidon2M31Encryption))
             }
             "aes" => {
                 #[cfg(feature = "aes-fallback")]
                 {
-                    Some(Box::new(stwo_ml::audit::encryption::Aes256GcmEncryption))
+                    Some(Box::new(obelyzk::audit::encryption::Aes256GcmEncryption))
                 }
                 #[cfg(not(feature = "aes-fallback"))]
                 {
@@ -5732,21 +5732,21 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
             }
             "noop" => {
                 eprintln!("Warning: --encryption noop is for testing only, NOT production-safe");
-                Some(Box::new(stwo_ml::audit::encryption::NoopEncryption))
+                Some(Box::new(obelyzk::audit::encryption::NoopEncryption))
             }
             _ => None, // "none"
         };
 
         // Construct storage client for private audits
         #[allow(unused_assignments, unused_mut)]
-        let mut storage_client: Option<stwo_ml::audit::storage::ArweaveClient> = None;
+        let mut storage_client: Option<obelyzk::audit::storage::ArweaveClient> = None;
         if cmd.privacy != "public" && encryption_backend.is_some() {
             #[cfg(feature = "audit-http")]
             {
-                let mut client = stwo_ml::audit::storage::ArweaveClient::new(
+                let mut client = obelyzk::audit::storage::ArweaveClient::new(
                     &cmd.arweave_gateway,
                     &cmd.arweave_bundler,
-                    Box::new(stwo_ml::audit::storage::UreqTransport),
+                    Box::new(obelyzk::audit::storage::UreqTransport),
                 );
                 if let Some(ref token) = cmd.irys_token {
                     client = client.with_auth(token);
@@ -6236,7 +6236,7 @@ fn run_retrieve_command(cmd: &RetrieveCmd) {
 
     #[cfg(feature = "audit-http")]
     {
-        use stwo_ml::audit::encryption::fetch_and_decrypt;
+        use obelyzk::audit::encryption::fetch_and_decrypt;
 
         eprintln!();
         eprintln!("  prove-model retrieve");
@@ -6272,17 +6272,17 @@ fn run_retrieve_command(cmd: &RetrieveCmd) {
             .unwrap_or_else(|| privkey.clone()); // Fallback: use privkey as address
 
         // Build encryption backend
-        let encryption: Box<dyn stwo_ml::audit::types::AuditEncryption> = match cmd
+        let encryption: Box<dyn obelyzk::audit::types::AuditEncryption> = match cmd
             .encryption
             .as_str()
         {
             "poseidon2" | "poseidon2_m31" => {
-                Box::new(stwo_ml::audit::encryption::Poseidon2M31Encryption)
+                Box::new(obelyzk::audit::encryption::Poseidon2M31Encryption)
             }
             "aes" => {
                 #[cfg(feature = "aes-fallback")]
                 {
-                    Box::new(stwo_ml::audit::encryption::Aes256GcmEncryption)
+                    Box::new(obelyzk::audit::encryption::Aes256GcmEncryption)
                 }
                 #[cfg(not(feature = "aes-fallback"))]
                 {
@@ -6292,7 +6292,7 @@ fn run_retrieve_command(cmd: &RetrieveCmd) {
             }
             "noop" => {
                 eprintln!("Warning: --encryption noop is for testing only, NOT production-safe");
-                Box::new(stwo_ml::audit::encryption::NoopEncryption)
+                Box::new(obelyzk::audit::encryption::NoopEncryption)
             }
             other => {
                 eprintln!(
@@ -6304,9 +6304,9 @@ fn run_retrieve_command(cmd: &RetrieveCmd) {
         };
 
         // Build storage client (read-only, bundler not used for downloads)
-        let transport: Box<dyn stwo_ml::audit::storage::HttpTransport> =
-            Box::new(stwo_ml::audit::storage::UreqTransport);
-        let storage = stwo_ml::audit::storage::ArweaveClient::new(
+        let transport: Box<dyn obelyzk::audit::storage::HttpTransport> =
+            Box::new(obelyzk::audit::storage::UreqTransport);
+        let storage = obelyzk::audit::storage::ArweaveClient::new(
             &cmd.arweave_gateway,
             "https://node1.irys.xyz",
             transport,
@@ -6420,7 +6420,7 @@ fn format_bytes(bytes: usize) -> String {
 
 /// Print a well-structured audit report to stderr.
 fn print_audit_report(
-    report: &stwo_ml::audit::types::AuditReport,
+    report: &obelyzk::audit::types::AuditReport,
     elapsed: std::time::Duration,
     output: &std::path::Path,
 ) {
@@ -7024,7 +7024,7 @@ impl GpuCommitHasher {
 /// Packed 7:1 (7 M31 values per FieldElement) + parallel Merkle segments.
 /// Caches result with fingerprint for instant validated reuse on subsequent runs.
 fn compute_weight_commitment(
-    weights: &stwo_ml::compiler::graph::GraphWeights,
+    weights: &obelyzk::compiler::graph::GraphWeights,
     model_dir: Option<&std::path::Path>,
 ) -> FieldElement {
     use rayon::prelude::*;
@@ -7469,10 +7469,10 @@ fn compute_scaling_analysis(steps: &[serde_json::Value]) -> (f64, f64) {
 fn run_decode_mode(
     cli: &Cli,
     _prefill_model: &OnnxModel,
-    weight_cache: Option<&stwo_ml::weight_cache::SharedWeightCache>,
+    weight_cache: Option<&obelyzk::weight_cache::SharedWeightCache>,
 ) {
-    use stwo_ml::aggregation::prove_model_pure_gkr_decode_step_incremental;
-    use stwo_ml::kv_state::KVCacheState;
+    use obelyzk::aggregation::prove_model_pure_gkr_decode_step_incremental;
+    use obelyzk::kv_state::KVCacheState;
 
     let model_dir = cli.model_dir.as_ref().expect("--decode requires --model-dir");
     let t_start = Instant::now();
@@ -7594,16 +7594,16 @@ fn run_prefill(
     model: &OnnxModel,
     prefill_len: usize,
 ) -> (
-    stwo_ml::components::attention::ModelKVCache,
-    stwo_ml::aggregation::IncrementalKVCommitment,
+    obelyzk::components::attention::ModelKVCache,
+    obelyzk::aggregation::IncrementalKVCommitment,
 ) {
-    use stwo_ml::aggregation::IncrementalKVCommitment;
-    use stwo_ml::compiler::graph::GraphOp;
-    use stwo_ml::compiler::prove::{apply_layernorm_pub, apply_rmsnorm_pub};
-    use stwo_ml::components::attention::{
+    use obelyzk::aggregation::IncrementalKVCommitment;
+    use obelyzk::compiler::graph::GraphOp;
+    use obelyzk::compiler::prove::{apply_layernorm_pub, apply_rmsnorm_pub};
+    use obelyzk::components::attention::{
         attention_forward_cached, AttentionWeights, ModelKVCache,
     };
-    use stwo_ml::components::matmul::M31Matrix;
+    use obelyzk::components::matmul::M31Matrix;
 
     let d_model = model.input_shape.1;
     let mut kv_cache = ModelKVCache::new();
@@ -7617,7 +7617,7 @@ fn run_prefill(
         match &node.op {
             GraphOp::MatMul { dims: (_m, _k, _n) } => {
                 if let Some(w) = model.weights.get_weight(idx) {
-                    current = stwo_ml::components::matmul::matmul_m31(&current, w);
+                    current = obelyzk::components::matmul::matmul_m31(&current, w);
                 }
             }
             GraphOp::Activation { activation_type, .. } => {

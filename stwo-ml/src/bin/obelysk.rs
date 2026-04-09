@@ -87,7 +87,7 @@ fn main() {
         network: network.clone(),
         model_id: model_id.clone(),
 
-        streaming_steps: stwo_ml::tui::dashboard::default_streaming_steps(),
+        streaming_steps: obelyzk::tui::dashboard::default_streaming_steps(),
 
         policy_name: None,
         policy_commitment: None,
@@ -223,7 +223,7 @@ fn main() {
                                     step.done = false;
                                     step.time = None;
                                 }
-                                s.streaming_steps = stwo_ml::tui::dashboard::default_streaming_steps();
+                                s.streaming_steps = obelyzk::tui::dashboard::default_streaming_steps();
                                 s.messages.push(("system".into(), "Retrying — ready for input".into()));
                             }
                             KeyCode::Char('q') => { s.should_quit = true; }
@@ -243,7 +243,7 @@ fn main() {
                                     step.done = false;
                                     step.time = None;
                                 }
-                                s.streaming_steps = stwo_ml::tui::dashboard::default_streaming_steps();
+                                s.streaming_steps = obelyzk::tui::dashboard::default_streaming_steps();
                                 s.prove_started_at = None;
                                 s.tamper_io = None;
                                 s.tamper_weight = None;
@@ -410,7 +410,7 @@ struct AppState {
 
     pipeline_step: usize,
     pipeline_status: Vec<StepStatus>,   // 3 steps
-    streaming_steps: Vec<stwo_ml::tui::dashboard::StreamingStep>,
+    streaming_steps: Vec<obelyzk::tui::dashboard::StreamingStep>,
 
     // Starknet on-chain config
     starknet_private_key: Option<String>,
@@ -954,7 +954,7 @@ fn run_prove_pipeline(
                     if line.contains("[E2E]") && line.contains(pattern) {
                         current_stream_step = idx;
                         if idx < s.streaming_steps.len() {
-                            s.streaming_steps[idx].status = stwo_ml::tui::dashboard::StepStatus::Submitting;
+                            s.streaming_steps[idx].status = obelyzk::tui::dashboard::StepStatus::Submitting;
                             s.pipeline_status[2].progress = (idx as f64 + 0.3) / 6.0;
                         }
                     }
@@ -971,7 +971,7 @@ fn run_prove_pipeline(
                         let tx_hash = line[tx_start..].trim().to_string();
                         if !tx_hash.is_empty() && current_stream_step < s.streaming_steps.len() {
                             s.streaming_steps[current_stream_step].tx_hash = Some(tx_hash);
-                            s.streaming_steps[current_stream_step].status = stwo_ml::tui::dashboard::StepStatus::Confirmed;
+                            s.streaming_steps[current_stream_step].status = obelyzk::tui::dashboard::StepStatus::Confirmed;
                             s.pipeline_status[2].progress = (current_stream_step as f64 + 1.0) / 6.0;
                             awaiting_tx = false;
                         }
@@ -995,7 +995,7 @@ fn run_prove_pipeline(
                         // If we have a TX hash, it was submitted — keep as Confirmed
                         // (the revert happened on-chain, not in submission)
                         if s.streaming_steps[current_stream_step].tx_hash.is_none() {
-                            s.streaming_steps[current_stream_step].status = stwo_ml::tui::dashboard::StepStatus::Failed;
+                            s.streaming_steps[current_stream_step].status = obelyzk::tui::dashboard::StepStatus::Failed;
                         }
                     }
                     awaiting_tx = false;
@@ -1021,12 +1021,12 @@ fn run_prove_pipeline(
     {
         let mut s = state.lock().unwrap();
         for step in s.streaming_steps.iter_mut() {
-            if step.status == stwo_ml::tui::dashboard::StepStatus::Submitting && step.tx_hash.is_some() {
-                step.status = stwo_ml::tui::dashboard::StepStatus::Confirmed;
+            if step.status == obelyzk::tui::dashboard::StepStatus::Submitting && step.tx_hash.is_some() {
+                step.status = obelyzk::tui::dashboard::StepStatus::Confirmed;
             }
         }
         let confirmed = s.streaming_steps.iter()
-            .filter(|st| st.status == stwo_ml::tui::dashboard::StepStatus::Confirmed)
+            .filter(|st| st.status == obelyzk::tui::dashboard::StepStatus::Confirmed)
             .count();
         if confirmed >= 5 {
             s.verification_count = Some(1);
@@ -1050,7 +1050,7 @@ fn run_prove_pipeline(
 
         // Count confirmed steps
         let confirmed = s.streaming_steps.iter()
-            .filter(|st| st.status == stwo_ml::tui::dashboard::StepStatus::Confirmed)
+            .filter(|st| st.status == obelyzk::tui::dashboard::StepStatus::Confirmed)
             .count();
 
         s.messages.push(("system".into(), "━━━━━━━━━━━━━━━━━━━━━━━━━━━━".into()));
@@ -1086,7 +1086,7 @@ fn render_app(frame: &mut ratatui::Frame, state: &AppState) {
     use ratatui::style::*;
     use ratatui::text::*;
     use ratatui::widgets::*;
-    use stwo_ml::tui::dashboard::{self, DashboardState, PipelineStep};
+    use obelyzk::tui::dashboard::{self, DashboardState, PipelineStep};
 
     // ── Loading / Welcome screen ─────────────────────────────────
     if state.mode == Mode::Loading {
@@ -1386,7 +1386,7 @@ fn render_welcome(frame: &mut ratatui::Frame, state: &AppState) {
 }
 
 #[cfg(feature = "tui")]
-fn render_header_section(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &AppState, _ds: &stwo_ml::tui::dashboard::DashboardState) {
+fn render_header_section(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &AppState, _ds: &obelyzk::tui::dashboard::DashboardState) {
     use ratatui::style::*;
     use ratatui::text::*;
     use ratatui::widgets::*;
@@ -1517,7 +1517,7 @@ fn render_input(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, state: 
 }
 
 #[cfg(feature = "tui")]
-fn render_footer_section(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &AppState, _ds: &stwo_ml::tui::dashboard::DashboardState) {
+fn render_footer_section(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &AppState, _ds: &obelyzk::tui::dashboard::DashboardState) {
     use ratatui::style::*;
     use ratatui::text::*;
     use ratatui::widgets::*;

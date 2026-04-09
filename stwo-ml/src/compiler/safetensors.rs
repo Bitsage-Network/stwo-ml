@@ -635,7 +635,7 @@ mod tests {
         graph.add_node(GraphOp::MatMul { dims: (1, 4, 2) }, vec![], (1, 2));
         graph.add_node(GraphOp::MatMul { dims: (1, 2, 3) }, vec![0], (1, 3));
 
-        let tmp_dir = std::env::temp_dir().join("stwo_ml_shard_test");
+        let tmp_dir = std::env::temp_dir().join("obelyzk_shard_test");
         std::fs::create_dir_all(&tmp_dir).unwrap();
 
         // Shard 0: contains weight.0
@@ -722,7 +722,7 @@ mod tests {
 
     #[test]
     fn test_discover_shards() {
-        let tmp_dir = std::env::temp_dir().join("stwo_ml_discover_test");
+        let tmp_dir = std::env::temp_dir().join("obelyzk_discover_test");
         std::fs::create_dir_all(&tmp_dir).unwrap();
 
         // Create fake shard files

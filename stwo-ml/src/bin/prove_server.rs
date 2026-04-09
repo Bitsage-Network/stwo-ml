@@ -34,17 +34,17 @@ use tower_http::limit::RequestBodyLimitLayer;
 use uuid::Uuid;
 
 use stwo::core::fields::m31::M31;
-use stwo_ml::circuits::batch::BatchPublicInputs;
+use obelyzk::circuits::batch::BatchPublicInputs;
 
-use stwo_ml::compiler::hf_loader::load_hf_model;
-use stwo_ml::compiler::onnx::load_onnx;
-use stwo_ml::components::matmul::M31Matrix;
-use stwo_ml::gadgets::quantize::{quantize_tensor, QuantStrategy};
-use stwo_ml::starknet::{prepare_model_registration, prove_for_starknet_onchain};
-use stwo_ml::tee::detect_tee_capability;
+use obelyzk::compiler::hf_loader::load_hf_model;
+use obelyzk::compiler::onnx::load_onnx;
+use obelyzk::components::matmul::M31Matrix;
+use obelyzk::gadgets::quantize::{quantize_tensor, QuantStrategy};
+use obelyzk::starknet::{prepare_model_registration, prove_for_starknet_onchain};
+use obelyzk::tee::detect_tee_capability;
 
-use stwo_ml::cairo_serde::serialize_proof;
-use stwo_ml::privacy::relayer::{
+use obelyzk::cairo_serde::serialize_proof;
+use obelyzk::privacy::relayer::{
     build_submit_batch_proof_calldata, compute_withdrawal_binding_digest,
     hash_batch_public_inputs_for_cairo, WithdrawalRecipients,
 };
@@ -98,14 +98,14 @@ struct LoadedModel {
     num_layers: usize,
     input_shape: (usize, usize),
     /// Arc-wrapped to avoid O(model_size) clones per prove request.
-    graph: Arc<stwo_ml::compiler::graph::ComputationGraph>,
-    weights: Arc<stwo_ml::compiler::graph::GraphWeights>,
+    graph: Arc<obelyzk::compiler::graph::ComputationGraph>,
+    weights: Arc<obelyzk::compiler::graph::GraphWeights>,
     /// Tokenizer loaded from model directory (if tokenizer.json exists).
     tokenizer: Option<Arc<tokenizers::Tokenizer>>,
     /// Model directory path (for embedding row extraction via mmap).
     model_dir: Option<PathBuf>,
     #[cfg(feature = "server-audit")]
-    capture_hook: Option<Arc<stwo_ml::audit::capture::CaptureHook>>,
+    capture_hook: Option<Arc<obelyzk::audit::capture::CaptureHook>>,
 }
 
 struct PrivacyJob {
@@ -188,9 +188,9 @@ struct ChatSession {
     session_id: String,
     model_id: String,
     /// KV-cache accumulating K/V projections from all prior tokens.
-    kv_cache: stwo_ml::components::attention::ModelKVCache,
+    kv_cache: obelyzk::components::attention::ModelKVCache,
     /// Incremental Merkle commitment over the KV-cache.
-    kv_commitment: stwo_ml::aggregation::IncrementalKVCommitment,
+    kv_commitment: obelyzk::aggregation::IncrementalKVCommitment,
     /// All token IDs seen so far.
     token_history: Vec<u32>,
     /// Timestamp of last activity (for TTL eviction).
@@ -216,9 +216,9 @@ struct AppState {
     ws_sink: proof_stream::WsBroadcastSink,
     validator_url: Option<String>,
     #[cfg(feature = "multi-query")]
-    scheduler: stwo_ml::gpu_scheduler::GpuScheduler,
+    scheduler: obelyzk::gpu_scheduler::GpuScheduler,
     #[cfg(feature = "multi-query")]
-    weight_caches: RwLock<HashMap<String, stwo_ml::weight_cache::SharedWeightCache>>,
+    weight_caches: RwLock<HashMap<String, obelyzk::weight_cache::SharedWeightCache>>,
     #[cfg(feature = "server-audit")]
     audit_jobs: RwLock<HashMap<String, AuditJob>>,
 }
@@ -845,13 +845,13 @@ fn create_capture_hook(
     model_id: &str,
     weight_commitment: &str,
     description: &str,
-) -> Option<Arc<stwo_ml::audit::capture::CaptureHook>> {
+) -> Option<Arc<obelyzk::audit::capture::CaptureHook>> {
     let audit_dir = match std::env::var("AUDIT_LOG_DIR") {
         Ok(d) => d,
         Err(_) => return None,
     };
     let hook_dir = std::path::Path::new(&audit_dir).join(model_id);
-    match stwo_ml::audit::capture::CaptureHook::new(
+    match obelyzk::audit::capture::CaptureHook::new(
         &hook_dir,
         model_id,
         weight_commitment,
@@ -985,7 +985,7 @@ async fn load_model(
     #[cfg(feature = "multi-query")]
     {
         let cache =
-            stwo_ml::weight_cache::shared_cache_for_model(&canonical_path, &model_id);
+            obelyzk::weight_cache::shared_cache_for_model(&canonical_path, &model_id);
         state
             .weight_caches
             .write()
@@ -1053,7 +1053,7 @@ async fn load_hf_model_handler(
     // Use the canonicalized path for weight cache (not raw user input)
     #[cfg(feature = "multi-query")]
     {
-        let cache = stwo_ml::weight_cache::shared_cache_for_model(&path, &model_id);
+        let cache = obelyzk::weight_cache::shared_cache_for_model(&path, &model_id);
         state
             .weight_caches
             .write()
@@ -1177,9 +1177,9 @@ async fn submit_prove(
 
     // Resolve policy from request (defaults to "standard" if not specified).
     let request_policy = match req.policy.as_deref() {
-        None | Some("standard") => stwo_ml::policy::PolicyConfig::standard(),
-        Some("strict") => stwo_ml::policy::PolicyConfig::strict(),
-        Some("relaxed") => stwo_ml::policy::PolicyConfig::relaxed(),
+        None | Some("standard") => obelyzk::policy::PolicyConfig::standard(),
+        Some("strict") => obelyzk::policy::PolicyConfig::strict(),
+        Some("relaxed") => obelyzk::policy::PolicyConfig::relaxed(),
         Some(unknown) => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -1191,7 +1191,7 @@ async fn submit_prove(
             ));
         }
     };
-    let request_policy_name = stwo_ml::policy::preset_name(&request_policy)
+    let request_policy_name = obelyzk::policy::preset_name(&request_policy)
         .unwrap_or("custom")
         .to_string();
     let request_policy_commitment_hex = format!("0x{:x}", request_policy.policy_commitment());
@@ -1237,7 +1237,7 @@ async fn submit_prove(
     // -------------------------------------------------------------------------
     #[cfg(feature = "multi-query")]
     {
-        use stwo_ml::gpu_scheduler::{ProveJobResult as GpuJobResult, ScheduledJob};
+        use obelyzk::gpu_scheduler::{ProveJobResult as GpuJobResult, ScheduledJob};
 
         // Look up weight cache for this model (if available)
         let weight_cache = {
@@ -1257,13 +1257,13 @@ async fn submit_prove(
             prove_fn: Box::new(move |_device_id| {
                 // Install proof-stream sink on the blocking thread
                 #[cfg(feature = "proof-stream")]
-                let _sink_guard = stwo_ml::gkr::prover::set_proof_sink(
+                let _sink_guard = obelyzk::gkr::prover::set_proof_sink(
                     proof_stream::ProofSink::new(ws_clone),
                 );
 
                 let prove_start = Instant::now();
                 let proof_result = if let Some(ref cache) = weight_cache {
-                    stwo_ml::starknet::prove_for_starknet_onchain_cached(
+                    obelyzk::starknet::prove_for_starknet_onchain_cached(
                         &*graph,
                         &input_matrix,
                         &*weights,
@@ -1481,7 +1481,7 @@ async fn submit_prove(
             // live on the same thread that runs the prover).
             #[cfg(feature = "proof-stream")]
             let _sink_guard =
-                stwo_ml::gkr::prover::set_proof_sink(proof_stream::ProofSink::new(ws_clone));
+                obelyzk::gkr::prover::set_proof_sink(proof_stream::ProofSink::new(ws_clone));
             prove_for_starknet_onchain(&*graph, &input_matrix, &*weights)
         })
         .await;
@@ -1584,12 +1584,12 @@ async fn submit_prove(
                     if let Some(model) = models.get(&jid_model) {
                         if let Some(ref hook) = model.capture_hook {
                             // Replay forward pass to get output for audit record
-                            if let Ok(output_m31) = stwo_ml::audit::replay::execute_forward_pass(
+                            if let Ok(output_m31) = obelyzk::audit::replay::execute_forward_pass(
                                 &audit_graph,
                                 &input_matrix_clone,
                                 &audit_weights,
                             ) {
-                                hook.record(stwo_ml::audit::capture::CaptureJob {
+                                hook.record(obelyzk::audit::capture::CaptureJob {
                                     input_tokens: vec![],
                                     output_tokens: vec![],
                                     input_m31: input_matrix_clone,
@@ -1751,7 +1751,7 @@ async fn infer(
             return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse { error: "Prompt produced zero tokens".into() })));
         }
         let last_token_id = *token_ids.last().unwrap();
-        let (row, _vocab_size) = stwo_ml::compiler::hf_loader::load_embedding_row(
+        let (row, _vocab_size) = obelyzk::compiler::hf_loader::load_embedding_row(
             model_dir, in_cols, last_token_id,
         ).map_err(|e| (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1800,7 +1800,7 @@ async fn infer(
         let t_start = Instant::now();
 
         // Full GKR proof (includes forward pass)
-        let proof_result = stwo_ml::aggregation::prove_model_aggregated_onchain_gkr_auto(
+        let proof_result = obelyzk::aggregation::prove_model_aggregated_onchain_gkr_auto(
             &graph,
             &input_matrix,
             &weights,
@@ -1831,7 +1831,7 @@ async fn infer(
                 let gkr_proof = proof.gkr_proof.as_ref();
                 let calldata_felts = if let Some(gkr) = gkr_proof {
                     let mut felts = Vec::new();
-                    stwo_ml::cairo_serde::serialize_gkr_proof_data_only(gkr, &mut felts);
+                    obelyzk::cairo_serde::serialize_gkr_proof_data_only(gkr, &mut felts);
                     felts
                 } else {
                     Vec::new()
@@ -1970,7 +1970,7 @@ async fn chat(
 
         // For decode, embed just the last token (single-token input)
         let last_token_id = *token_ids.last().unwrap();
-        let (input_matrix, _) = stwo_ml::compiler::hf_loader::load_embedding_row(
+        let (input_matrix, _) = obelyzk::compiler::hf_loader::load_embedding_row(
             model_dir, in_cols, last_token_id,
         ).map_err(|e| (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1982,7 +1982,7 @@ async fn chat(
 
         let result = tokio::task::spawn_blocking(move || {
             let t_start = Instant::now();
-            let proof_result = stwo_ml::aggregation::prove_model_pure_gkr_decode_step_incremental(
+            let proof_result = obelyzk::aggregation::prove_model_pure_gkr_decode_step_incremental(
                 &graph,
                 &input_matrix,
                 &weights,
@@ -1999,7 +1999,7 @@ async fn chat(
                     let output_f32: Vec<f32> = output_matrix.data.iter().map(|v| v.0 as f32).collect();
 
                     let (predicted_token_id, predicted_text) =
-                        match stwo_ml::compiler::hf_loader::project_to_logits(&model_dir_clone, output_matrix) {
+                        match obelyzk::compiler::hf_loader::project_to_logits(&model_dir_clone, output_matrix) {
                             Ok((tid, _)) => (Some(tid), tokenizer_clone.decode(&[tid], true).ok()),
                             Err(_) => (None, None),
                         };
@@ -2012,7 +2012,7 @@ async fn chat(
                     let gkr_proof = proof.gkr_proof.as_ref();
                     let calldata_felts = if let Some(gkr) = gkr_proof {
                         let mut felts = Vec::new();
-                        stwo_ml::cairo_serde::serialize_gkr_proof_data_only(gkr, &mut felts);
+                        obelyzk::cairo_serde::serialize_gkr_proof_data_only(gkr, &mut felts);
                         felts
                     } else { Vec::new() };
                     let calldata_size = calldata_felts.len();
@@ -2066,7 +2066,7 @@ async fn chat(
         // ── Prefill path: new conversation ──────────────────────────────
         // Embed the last token for the single-row prefill
         let last_token_id = *token_ids.last().unwrap();
-        let (input_matrix, _) = stwo_ml::compiler::hf_loader::load_embedding_row(
+        let (input_matrix, _) = obelyzk::compiler::hf_loader::load_embedding_row(
             model_dir, in_cols, last_token_id,
         ).map_err(|e| (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2081,8 +2081,8 @@ async fn chat(
             let t_start = Instant::now();
 
             // Create fresh KV-cache and run prefill with caching
-            let mut kv_cache = stwo_ml::components::attention::ModelKVCache::new();
-            let proof_result = stwo_ml::aggregation::prove_model_pure_gkr_prefill_with_cache(
+            let mut kv_cache = obelyzk::components::attention::ModelKVCache::new();
+            let proof_result = obelyzk::aggregation::prove_model_pure_gkr_prefill_with_cache(
                 &graph, &input_matrix, &weights, &mut kv_cache, None, None,
             );
 
@@ -2093,7 +2093,7 @@ async fn chat(
                     let output_f32: Vec<f32> = output_matrix.data.iter().map(|v| v.0 as f32).collect();
 
                     let (predicted_token_id, predicted_text) =
-                        match stwo_ml::compiler::hf_loader::project_to_logits(&model_dir_clone, output_matrix) {
+                        match obelyzk::compiler::hf_loader::project_to_logits(&model_dir_clone, output_matrix) {
                             Ok((tid, _)) => (Some(tid), tokenizer_clone.decode(&[tid], true).ok()),
                             Err(_) => (None, None),
                         };
@@ -2104,13 +2104,13 @@ async fn chat(
 
                     // Build incremental commitment from the populated KV-cache
                     let capacity = (num_tokens + 64).next_power_of_two();
-                    let kv_commitment = stwo_ml::aggregation::IncrementalKVCommitment::from_kv_cache(&kv_cache, capacity);
+                    let kv_commitment = obelyzk::aggregation::IncrementalKVCommitment::from_kv_cache(&kv_cache, capacity);
                     let kv_hex = format!("0x{:x}", kv_commitment.commitment());
 
                     let gkr_proof = proof.gkr_proof.as_ref();
                     let calldata_felts = if let Some(gkr) = gkr_proof {
                         let mut felts = Vec::new();
-                        stwo_ml::cairo_serde::serialize_gkr_proof_data_only(gkr, &mut felts);
+                        obelyzk::cairo_serde::serialize_gkr_proof_data_only(gkr, &mut felts);
                         felts
                     } else { Vec::new() };
                     let calldata_size = calldata_felts.len();
@@ -2327,7 +2327,7 @@ async fn attest(
         .unwrap_or(starknet_ff::FieldElement::from(0x9u64));
 
     let attestation = tokio::task::spawn_blocking(move || {
-        stwo_ml::starknet::prove_full_attestation(&*graph, &input_matrix, &*weights, model_id_fe)
+        obelyzk::starknet::prove_full_attestation(&*graph, &input_matrix, &*weights, model_id_fe)
     })
     .await
     .map_err(|e| (
@@ -2697,8 +2697,8 @@ async fn classify(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ClassifyRequest>,
 ) -> Result<Json<ClassifyResponse>, (StatusCode, Json<ErrorResponse>)> {
-    use stwo_ml::classifier::*;
-    use stwo_ml::policy::PolicyConfig;
+    use obelyzk::classifier::*;
+    use obelyzk::policy::PolicyConfig;
 
     // Generate unique request ID
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -2901,13 +2901,13 @@ async fn submit_privacy_batch(
         let result =
             tokio::task::spawn_blocking(move || {
                 use stwo::core::fields::m31::BaseField;
-                use stwo_ml::circuits::batch::{prove_privacy_batch, PrivacyBatch};
-                use stwo_ml::circuits::deposit::DepositWitness;
-                use stwo_ml::circuits::spend::{InputNoteWitness, OutputNoteWitness, SpendWitness};
-                use stwo_ml::circuits::withdraw::WithdrawWitness;
-                use stwo_ml::crypto::commitment::Note;
-                use stwo_ml::crypto::merkle_m31::MerklePath;
-                use stwo_ml::crypto::poseidon2_m31::RATE;
+                use obelyzk::circuits::batch::{prove_privacy_batch, PrivacyBatch};
+                use obelyzk::circuits::deposit::DepositWitness;
+                use obelyzk::circuits::spend::{InputNoteWitness, OutputNoteWitness, SpendWitness};
+                use obelyzk::circuits::withdraw::WithdrawWitness;
+                use obelyzk::crypto::commitment::Note;
+                use obelyzk::crypto::merkle_m31::MerklePath;
+                use obelyzk::crypto::poseidon2_m31::RATE;
 
                 let m31 = |v: u32| BaseField::from_u32_unchecked(v);
                 let m31_4 = |arr: [u32; 4]| [m31(arr[0]), m31(arr[1]), m31(arr[2]), m31(arr[3])];
@@ -3522,10 +3522,10 @@ async fn submit_audit(
 
         let result = tokio::task::spawn_blocking(move || {
             // Load the inference log
-            let log = stwo_ml::audit::log::InferenceLog::load(&log_dir)
+            let log = obelyzk::audit::log::InferenceLog::load(&log_dir)
                 .map_err(|e| format!("Failed to load audit log: {e}"))?;
 
-            let request = stwo_ml::audit::types::AuditRequest {
+            let request = obelyzk::audit::types::AuditRequest {
                 start_ns: 0,
                 end_ns: u64::MAX,
                 model_id: model_id.clone(),
@@ -3536,7 +3536,7 @@ async fn submit_audit(
                 weight_binding,
             };
 
-            let model_info = stwo_ml::audit::types::ModelInfo {
+            let model_info = obelyzk::audit::types::ModelInfo {
                 model_id: model_id.clone(),
                 name: model_id.clone(),
                 architecture: "transformer".to_string(),
@@ -3545,7 +3545,7 @@ async fn submit_audit(
                 weight_commitment: weight_commitment.clone(),
             };
 
-            let config = stwo_ml::audit::orchestrator::AuditPipelineConfig {
+            let config = obelyzk::audit::orchestrator::AuditPipelineConfig {
                 request,
                 model_info,
                 evaluate_semantics: false,
@@ -3558,7 +3558,7 @@ async fn submit_audit(
             };
 
             let pipeline_result =
-                stwo_ml::audit::orchestrator::run_audit(&log, &graph, &weights, &config, None, None)
+                obelyzk::audit::orchestrator::run_audit(&log, &graph, &weights, &config, None, None)
                     .map_err(|e| format!("Audit pipeline failed: {e}"))?;
 
             serde_json::to_value(&pipeline_result.report)
@@ -3630,7 +3630,7 @@ async fn get_audit_status(
 #[cfg(feature = "multi-query")]
 async fn get_queue_stats(
     State(state): State<Arc<AppState>>,
-) -> Json<stwo_ml::gpu_scheduler::QueueStatsSnapshot> {
+) -> Json<obelyzk::gpu_scheduler::QueueStatsSnapshot> {
     Json(state.scheduler.stats.snapshot())
 }
 
@@ -3791,7 +3791,7 @@ async fn main() {
     // Safety: set_var is called once in main() before tokio spawns threads.
     // Individual STWO_* env vars set by the operator take precedence (we only
     // set vars that aren't already set).
-    let server_default_policy = stwo_ml::policy::PolicyConfig::standard();
+    let server_default_policy = obelyzk::policy::PolicyConfig::standard();
     for (key, val) in [
         ("STWO_SKIP_RMS_SQ_PROOF", if server_default_policy.skip_rms_sq_proof { "1" } else { "0" }),
         ("STWO_ALLOW_MISSING_NORM_PROOF", if server_default_policy.allow_missing_norm_proof { "1" } else { "0" }),
@@ -3808,17 +3808,17 @@ async fn main() {
     }
     eprintln!(
         "  Policy: {}",
-        stwo_ml::policy::summary_line(&server_default_policy),
+        obelyzk::policy::summary_line(&server_default_policy),
     );
 
     // ── Worker mode ────────────────────────────────────────────────
     // If COORDINATOR_URL is set, start in worker mode:
     // register with coordinator, send heartbeats, accept jobs via WebSocket.
-    let worker_config = stwo_ml::worker::WorkerConfig::from_env();
+    let worker_config = obelyzk::worker::WorkerConfig::from_env();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     let worker_handle = if let Some(ref wc) = worker_config {
-        match stwo_ml::worker::start_worker(wc.clone(), shutdown_rx.clone()).await {
+        match obelyzk::worker::start_worker(wc.clone(), shutdown_rx.clone()).await {
             Ok(handle) => {
                 eprintln!("  Worker mode: ACTIVE (id: {})", handle.worker_id);
                 eprintln!("  Coordinator: {}", wc.coordinator_url);
@@ -3859,7 +3859,7 @@ async fn main() {
             })
             .unwrap_or_default();
 
-        stwo_ml::gpu_scheduler::GpuScheduler::new(stwo_ml::gpu_scheduler::GpuSchedulerConfig {
+        obelyzk::gpu_scheduler::GpuScheduler::new(obelyzk::gpu_scheduler::GpuSchedulerConfig {
             max_concurrent_per_gpu: max_per_gpu,
             max_queue_depth: max_queue,
             device_ordinals,
@@ -4096,7 +4096,7 @@ async fn main() {
                 let model_exists = worker_state.models.read().await.contains_key(&job.model_id);
                 if !model_exists {
                     eprintln!("  Worker: model {} not loaded, rejecting job", job.model_id);
-                    stwo_ml::worker::submit_job_result(
+                    obelyzk::worker::submit_job_result(
                         &worker_cfg, &worker_id, &job.job_id,
                         Err(format!("Model {} not loaded on this worker", job.model_id)),
                     ).await;
@@ -4120,7 +4120,7 @@ async fn main() {
                         let model = match models.get(&model_id) {
                             Some(m) => m,
                             None => {
-                                stwo_ml::worker::submit_job_result(
+                                obelyzk::worker::submit_job_result(
                                     &cfg, &wid, &job_id,
                                     Err("Model disappeared during proving".into()),
                                 ).await;
@@ -4146,7 +4146,7 @@ async fn main() {
                         let start = Instant::now();
 
                         // Run proof
-                        match stwo_ml::starknet::prove_for_starknet_onchain(
+                        match obelyzk::starknet::prove_for_starknet_onchain(
                             &graph, &input_matrix, &weights,
                         ) {
                             Ok(proof) => {
@@ -4155,9 +4155,9 @@ async fn main() {
                                 let calldata_size = proof.unified_calldata.len()
                                     + proof.matmul_calldata.iter().map(|c| c.len()).sum::<usize>();
 
-                                stwo_ml::worker::submit_job_result(
+                                obelyzk::worker::submit_job_result(
                                     &cfg, &wid, &job_id,
-                                    Ok(stwo_ml::worker::JobProofResult {
+                                    Ok(obelyzk::worker::JobProofResult {
                                         proof_hash: io_str.clone(),
                                         io_commitment: io_str,
                                         weight_commitment: String::new(),
@@ -4167,7 +4167,7 @@ async fn main() {
                                 ).await;
                             }
                             Err(e) => {
-                                stwo_ml::worker::submit_job_result(
+                                obelyzk::worker::submit_job_result(
                                     &cfg, &wid, &job_id,
                                     Err(format!("Proof failed: {e}")),
                                 ).await;

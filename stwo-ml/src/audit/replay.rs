@@ -213,7 +213,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("stwo_ml_replay_{}", d))
+        std::env::temp_dir().join(format!("obelyzk_replay_{}", d))
     }
 
     fn make_entry_for_replay(

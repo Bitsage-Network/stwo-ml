@@ -1,12 +1,12 @@
 [package]
-name = "stwo-ml"
-version = "0.2.0"
+name = "obelyzk"
+version = "0.3.0"
 edition = "2021"
-description = "ML inference proving circuits built on STWO Circle STARKs — verifiable AI on Starknet"
+description = "obelyzk.rs — Verifiable AI engine built on STWO Circle STARKs. Provable inference for every model."
 license = "Apache-2.0"
-repository = "https://github.com/Bitsage-Network/stwo-ml"
+repository = "https://github.com/Bitsage-Network/obelyzk.rs"
 homepage = "https://obelysk.xyz"
-keywords = ["zkml", "starknet", "zero-knowledge", "machine-learning", "stark"]
+keywords = ["zkml", "starknet", "zero-knowledge", "machine-learning", "verifiable-ai"]
 categories = ["cryptography", "science"]
 rust-version = "1.90"
 
@@ -111,7 +111,7 @@ path = "src/bin/obelysk.rs"
 required-features = ["tui"]
 
 [[bin]]
-name = "obelyzk-vm"
+name = "obelyzk"
 path = "src/bin/obelyzk_vm.rs"
 required-features = ["server"]
 

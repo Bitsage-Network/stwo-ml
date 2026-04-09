@@ -694,7 +694,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("stwo_ml_prover_{}", d))
+        std::env::temp_dir().join(format!("obelyzk_prover_{}", d))
     }
 
     /// Helper: build a simple model, create log entries with correct commitments.

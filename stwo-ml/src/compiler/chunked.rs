@@ -1484,7 +1484,7 @@ mod tests {
         }
         weights.add_weight(2, w2);
 
-        let dir = std::env::temp_dir().join("stwo_ml_chunked_test");
+        let dir = std::env::temp_dir().join("obelyzk_chunked_test");
         let _ = std::fs::remove_dir_all(&dir);
 
         let results = prove_model_chunked(
@@ -1575,7 +1575,7 @@ mod tests {
         }
         weights.add_weight(2, w2);
 
-        let dir = std::env::temp_dir().join("stwo_ml_collect_test");
+        let dir = std::env::temp_dir().join("obelyzk_collect_test");
         let _ = std::fs::remove_dir_all(&dir);
 
         let results = prove_model_chunked(&graph, &input, &weights, 100_000_000, &dir)
@@ -1608,7 +1608,7 @@ mod tests {
         }
         weights.add_weight(0, w);
 
-        let dir = std::env::temp_dir().join("stwo_ml_ckpt_persist_test");
+        let dir = std::env::temp_dir().join("obelyzk_ckpt_persist_test");
         let _ = std::fs::remove_dir_all(&dir);
 
         let _results = prove_model_chunked(&graph, &input, &weights, 100_000_000, &dir)
@@ -1649,7 +1649,7 @@ mod tests {
         }
         weights.add_weight(2, w2);
 
-        let dir = std::env::temp_dir().join("stwo_ml_compose_single_test");
+        let dir = std::env::temp_dir().join("obelyzk_compose_single_test");
         let _ = std::fs::remove_dir_all(&dir);
 
         let chunks = prove_model_chunked(&graph, &input, &weights, 100_000_000, &dir)
@@ -1697,7 +1697,7 @@ mod tests {
         }
         weights.add_weight(1, w1);
 
-        let dir = std::env::temp_dir().join("stwo_ml_compose_matmul_only_test");
+        let dir = std::env::temp_dir().join("obelyzk_compose_matmul_only_test");
         let _ = std::fs::remove_dir_all(&dir);
 
         let chunks = prove_model_chunked(&graph, &input, &weights, 100_000_000, &dir)
@@ -1748,7 +1748,7 @@ mod tests {
         }
         weights.add_weight(0, w0);
 
-        let dir = std::env::temp_dir().join("stwo_ml_compose_residual_test");
+        let dir = std::env::temp_dir().join("obelyzk_compose_residual_test");
         let _ = std::fs::remove_dir_all(&dir);
 
         let chunks = prove_model_chunked(&graph, &input, &weights, 100_000_000, &dir)
@@ -1872,7 +1872,7 @@ mod tests {
     fn test_multi_chunk_collect_proofs() {
         let (graph, input, weights) = build_2_layernorm_graph();
 
-        let dir = std::env::temp_dir().join("stwo_ml_multi_chunk_collect_test");
+        let dir = std::env::temp_dir().join("obelyzk_multi_chunk_collect_test");
         let _ = std::fs::remove_dir_all(&dir);
 
         let chunks = prove_model_chunked(&graph, &input, &weights, 100_000_000, &dir)

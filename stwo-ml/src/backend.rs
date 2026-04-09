@@ -440,7 +440,7 @@ pub fn force_gpu() -> bool {
 ///
 /// # Example
 /// ```ignore
-/// use stwo_ml::backend::with_best_backend;
+/// use obelyzk::backend::with_best_backend;
 ///
 /// let result = with_best_backend(
 ///     || prove_model_simd(graph, input, weights),

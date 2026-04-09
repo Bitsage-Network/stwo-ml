@@ -230,7 +230,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("stwo_ml_capture_{}", d))
+        std::env::temp_dir().join(format!("obelyzk_capture_{}", d))
     }
 
     fn make_m31_matrix(rows: usize, cols: usize, base: u32) -> M31Matrix {
