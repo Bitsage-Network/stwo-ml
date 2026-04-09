@@ -62,6 +62,7 @@ pub mod gkr;
 pub mod gpu;
 pub mod json_serde;
 pub mod policy;
+pub mod providers;
 pub mod vm;
 #[cfg(feature = "binary-proof")]
 pub mod binary_serde;

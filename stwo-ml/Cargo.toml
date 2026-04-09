@@ -110,6 +110,11 @@ name = "obelysk"
 path = "src/bin/obelysk.rs"
 required-features = ["tui"]
 
+[[bin]]
+name = "obelyzk-vm"
+path = "src/bin/obelyzk_vm.rs"
+required-features = ["server"]
+
 [[example]]
 name = "rerun_demo"
 required-features = ["proof-stream-rerun"]
