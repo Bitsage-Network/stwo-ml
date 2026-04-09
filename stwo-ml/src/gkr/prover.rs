@@ -1870,10 +1870,10 @@ pub fn prove_gkr_with_cache(
                 let devices: Vec<proof_stream::GpuSnapshot> = gkr_gpu_info
                     .iter()
                     .map(|(id, name, mem)| proof_stream::GpuSnapshot {
-                        device_id: *id,
+                        device_id: *id as usize,
                         device_name: name.clone(),
                         utilization: (layer_idx + 1) as f32 / layers_total as f32,
-                        free_memory_bytes: Some(*mem),
+                        free_memory_bytes: Some(*mem as usize),
                     })
                     .collect();
                 proof_stream::ProofEvent::GpuStatus {
@@ -3157,10 +3157,10 @@ pub fn prove_gkr_gpu_with_cache(
                 let devices: Vec<proof_stream::GpuSnapshot> = gkr_gpu_info
                     .iter()
                     .map(|(id, name, mem)| proof_stream::GpuSnapshot {
-                        device_id: *id,
+                        device_id: *id as usize,
                         device_name: name.clone(),
                         utilization: (layer_idx + 1) as f32 / layers_total as f32,
-                        free_memory_bytes: Some(*mem),
+                        free_memory_bytes: Some(*mem as usize),
                     })
                     .collect();
                 proof_stream::ProofEvent::GpuStatus {
@@ -4073,10 +4073,10 @@ pub fn prove_gkr_decode_gpu_with_cache(
                 let devices: Vec<proof_stream::GpuSnapshot> = gkr_gpu_info
                     .iter()
                     .map(|(id, name, mem)| proof_stream::GpuSnapshot {
-                        device_id: *id,
+                        device_id: *id as usize,
                         device_name: name.clone(),
                         utilization: (layer_idx + 1) as f32 / layers_total as f32,
-                        free_memory_bytes: Some(*mem),
+                        free_memory_bytes: Some(*mem as usize),
                     })
                     .collect();
                 proof_stream::ProofEvent::GpuStatus {
