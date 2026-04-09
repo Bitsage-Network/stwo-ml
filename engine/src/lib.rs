@@ -60,6 +60,7 @@ pub mod crypto;
 pub mod gadgets;
 pub mod gkr;
 pub mod gpu;
+pub mod gpu_forward;
 pub mod json_serde;
 pub mod policy;
 pub mod providers;

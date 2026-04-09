@@ -4723,6 +4723,23 @@ where
     let has_moe = graph.nodes.iter().any(|n| matches!(n.op, GraphOp::MoE { .. }));
     let mut moe_weights = if has_moe { Some(weights.clone()) } else { None };
 
+    // Pre-upload weights to GPU for the forward pass (stays resident)
+    #[cfg(feature = "cuda-runtime")]
+    let gpu_forward = if crate::backend::gpu_is_available() && std::env::var("OBELYZK_GPU_FORWARD").ok().as_deref() != Some("0") {
+        match crate::gpu_forward::GpuForwardExecutor::new() {
+            Ok(exec) => {
+                match exec.upload_weights(weights) {
+                    Ok(gw) => {
+                        eprintln!("  [gpu-forward] Weights pre-uploaded to GPU ({} matrices)", gw.len());
+                        Some((exec, gw))
+                    }
+                    Err(e) => { eprintln!("  [gpu-forward] Weight upload failed: {e}, falling back to CPU"); None }
+                }
+            }
+            Err(e) => { eprintln!("  [gpu-forward] Init failed: {e}, falling back to CPU"); None }
+        }
+    } else { None };
+
     let topo = graph.topological_order();
     let total_nodes = topo.len();
     eprintln!("Phase 1/3: Forward pass ({} nodes)...", total_nodes);

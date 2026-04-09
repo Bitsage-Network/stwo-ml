@@ -1252,14 +1252,14 @@ pub struct GpuSumcheckExecutor {
 
 /// Forward pass CUDA kernel handles.
 #[cfg(feature = "cuda-runtime")]
-struct ForwardKernels {
-    gemv_fn: CudaFunction,
-    gemm_fn: CudaFunction,
-    add_fn: CudaFunction,
-    mul_fn: CudaFunction,
-    relu_fn: CudaFunction,
-    layernorm_fn: CudaFunction,
-    rmsnorm_fn: CudaFunction,
+pub(crate) struct ForwardKernels {
+    pub(crate) gemv_fn: CudaFunction,
+    pub(crate) gemm_fn: CudaFunction,
+    pub(crate) add_fn: CudaFunction,
+    pub(crate) mul_fn: CudaFunction,
+    pub(crate) relu_fn: CudaFunction,
+    pub(crate) layernorm_fn: CudaFunction,
+    pub(crate) rmsnorm_fn: CudaFunction,
 }
 
 /// MLE restrict CUDA kernel handles.
@@ -1472,7 +1472,7 @@ impl GpuSumcheckExecutor {
     }
 
     /// Get or lazily compile forward pass kernels (GEMV, GEMM, add, mul, relu).
-    fn get_forward_fns(&self) -> Result<ForwardKernels, CudaFftError> {
+    pub(crate) fn get_forward_fns(&self) -> Result<ForwardKernels, CudaFftError> {
         let mut guard = self.forward_fns.lock().unwrap();
         if let Some(ref fns) = *guard {
             return Ok(ForwardKernels {
