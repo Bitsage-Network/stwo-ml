@@ -135,6 +135,8 @@ pub struct WeightCommitmentCache {
     /// (e.g., fine-tuning) that would invalidate cached Merkle roots.
     fingerprint: [u8; 32],
     dirty: bool,
+    /// Path to auto-save to when dirty (set on load from disk).
+    auto_save_path: Option<std::path::PathBuf>,
 }
 
 impl WeightCommitmentCache {
@@ -145,6 +147,24 @@ impl WeightCommitmentCache {
             model_id: model_id.to_string(),
             fingerprint: [0u8; 32],
             dirty: false,
+            auto_save_path: None,
+        }
+    }
+
+    /// Get the auto-save path (if set).
+    pub fn auto_save_path(&self) -> Option<&std::path::Path> {
+        self.auto_save_path.as_deref()
+    }
+
+    /// Auto-save to disk if dirty and path is set.
+    pub fn auto_save(&mut self) {
+        if self.dirty {
+            if let Some(ref path) = self.auto_save_path.clone() {
+                match self.save(path) {
+                    Ok(()) => eprintln!("[weight-cache] Auto-saved to {}", path.display()),
+                    Err(e) => eprintln!("[weight-cache] Auto-save failed: {e}"),
+                }
+            }
         }
     }
 
@@ -162,6 +182,7 @@ impl WeightCommitmentCache {
             model_id: model_id.to_string(),
             fingerprint: compute_weight_fingerprint(weights),
             dirty: false,
+            auto_save_path: None,
         }
     }
 
@@ -499,14 +520,22 @@ impl WeightCommitmentCache {
             model_id,
             fingerprint,
             dirty: false,
+            auto_save_path: Some(path.to_path_buf()),
         })
     }
 
     /// Load from file if it exists, otherwise create empty.
     pub fn load_or_new(path: &Path, model_id: &str) -> Self {
         match Self::load(path) {
-            Ok(cache) if cache.model_id == model_id => cache,
-            _ => Self::new(model_id),
+            Ok(cache) if cache.model_id == model_id => {
+                eprintln!("[weight-cache] Loaded {} entries from {}", cache.entries.len(), path.display());
+                cache
+            }
+            _ => {
+                let mut c = Self::new(model_id);
+                c.auto_save_path = Some(path.to_path_buf());
+                c
+            }
         }
     }
 
@@ -1101,6 +1130,7 @@ impl MmapWeightCache {
             model_id,
             fingerprint,
             dirty: false,
+            auto_save_path: None,
         })
     }
 

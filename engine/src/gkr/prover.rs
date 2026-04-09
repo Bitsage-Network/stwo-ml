@@ -1202,6 +1202,8 @@ fn apply_aggregated_oracle_sumcheck(
                     eprintln!(
                         "  [{log_tag}] weight commitment cache: {inserted} new roots stored",
                     );
+                    // Auto-save to disk so subsequent runs get cache hits
+                    w.auto_save();
                 }
             }
         }
