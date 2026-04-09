@@ -4122,6 +4122,19 @@ pub fn prove_matmul_batch_onchain_gpu(
     let mut assignment = Vec::with_capacity(log_k);
     let mut cur_n_points = k;
 
+    // Check if GPU Poseidon is enabled for the batch path
+    let use_gpu_poseidon_batch = std::env::var("OBELYZK_GPU_POSEIDON").ok().as_deref() == Some("1");
+    let mut gpu_channel: Option<crate::crypto::gpu_poseidon::GpuPoseidonChannel> = None;
+    if use_gpu_poseidon_batch {
+        match crate::crypto::gpu_poseidon::GpuPoseidonChannel::from_cpu(&channel, &gpu_executor.device) {
+            Ok(gc) => {
+                eprintln!("    [gpu-poseidon] GPU Fiat-Shamir enabled for batch sumcheck");
+                gpu_channel = Some(gc);
+            }
+            Err(e) => eprintln!("    [gpu-poseidon] Init failed: {e}, using CPU Poseidon"),
+        }
+    }
+
     for _round in 0..log_k {
         let mid = cur_n_points / 2;
 
@@ -4131,6 +4144,7 @@ pub fn prove_matmul_batch_onchain_gpu(
         let mut combined_s2 = SecureField::zero();
         let mut lambda_power = SecureField::one();
 
+        // Compute round poly per entry (GPU) and accumulate (CPU for lambda weighting)
         for i in 0..num_entries {
             let (s0_u32, s1_u32, s2_u32) = gpu_executor
                 .compute_round_poly(&d_f_a_list[i], &d_f_b_list[i], mid)
@@ -4149,7 +4163,7 @@ pub fn prove_matmul_batch_onchain_gpu(
             lambda_power = lambda_power * lambda;
         }
 
-        // Extract combined round polynomial coefficients
+        // Lagrange interpolation
         let c0 = combined_s0;
         let two = SecureField::from(M31::from(2));
         let c2 = (combined_s2 - two * combined_s1 + combined_s0) * two.inverse();
@@ -4157,29 +4171,59 @@ pub fn prove_matmul_batch_onchain_gpu(
 
         round_polys.push(RoundPoly { c0, c1, c2 });
 
-        // Fiat-Shamir: mix combined polynomial and draw shared challenge
-        channel.mix_poly_coeffs(c0, c1, c2);
-        let r_k = channel.draw_qm31();
-        assignment.push(r_k);
+        // Fiat-Shamir + fold — GPU Poseidon path or CPU path
+        if let Some(ref mut gc) = gpu_channel {
+            // Upload combined coefficients to GPU for GPU Poseidon
+            let c0_u32 = secure_field_to_u32s(c0);
+            let c1_u32 = secure_field_to_u32s(c1);
+            let c2_u32 = secure_field_to_u32s(c2);
 
-        // GPU: fold ALL MLEs with shared challenge
-        // Use mle_fold_device when GPU Poseidon is active (challenge stays on GPU)
-        let challenge_u32 = secure_field_to_u32s(r_k);
+            let d_c0 = gpu_executor.device.htod_sync_copy(&c0_u32)
+                .map_err(|e| MatMulError::SumcheckFailed(format!("upload c0: {e:?}")))?;
+            let d_c1 = gpu_executor.device.htod_sync_copy(&c1_u32)
+                .map_err(|e| MatMulError::SumcheckFailed(format!("upload c1: {e:?}")))?;
+            let d_c2 = gpu_executor.device.htod_sync_copy(&c2_u32)
+                .map_err(|e| MatMulError::SumcheckFailed(format!("upload c2: {e:?}")))?;
 
-        for i in 0..num_entries {
-            let new_d_f_a = gpu_executor
-                .mle_fold(&d_f_a_list[i], cur_n_points, &challenge_u32)
-                .map_err(|e| {
-                    MatMulError::SumcheckFailed(format!("GPU batch fold f_a entry {i}: {e}"))
-                })?;
-            let new_d_f_b = gpu_executor
-                .mle_fold(&d_f_b_list[i], cur_n_points, &challenge_u32)
-                .map_err(|e| {
-                    MatMulError::SumcheckFailed(format!("GPU batch fold f_b entry {i}: {e}"))
-                })?;
+            // GPU Poseidon: mix + draw on device
+            let d_challenge = gc.mix_and_draw_gpu(&d_c0, &d_c1, &d_c2)
+                .map_err(|e| MatMulError::SumcheckFailed(format!("gpu poseidon batch: {e}")))?;
 
-            d_f_a_list[i] = new_d_f_a;
-            d_f_b_list[i] = new_d_f_b;
+            // Also update CPU channel to stay in sync
+            channel.mix_poly_coeffs(c0, c1, c2);
+            let r_k = channel.draw_qm31();
+            assignment.push(r_k);
+
+            // GPU fold with device-resident challenge
+            for i in 0..num_entries {
+                let new_a = gpu_executor.mle_fold_device(&d_f_a_list[i], cur_n_points, &d_challenge)
+                    .map_err(|e| MatMulError::SumcheckFailed(format!("gpu fold batch a {i}: {e}")))?;
+                let new_b = gpu_executor.mle_fold_device(&d_f_b_list[i], cur_n_points, &d_challenge)
+                    .map_err(|e| MatMulError::SumcheckFailed(format!("gpu fold batch b {i}: {e}")))?;
+                d_f_a_list[i] = new_a;
+                d_f_b_list[i] = new_b;
+            }
+        } else {
+            // CPU Poseidon path (default)
+            channel.mix_poly_coeffs(c0, c1, c2);
+            let r_k = channel.draw_qm31();
+            assignment.push(r_k);
+
+            let challenge_u32 = secure_field_to_u32s(r_k);
+            for i in 0..num_entries {
+                let new_d_f_a = gpu_executor
+                    .mle_fold(&d_f_a_list[i], cur_n_points, &challenge_u32)
+                    .map_err(|e| {
+                        MatMulError::SumcheckFailed(format!("GPU batch fold f_a entry {i}: {e}"))
+                    })?;
+                let new_d_f_b = gpu_executor
+                    .mle_fold(&d_f_b_list[i], cur_n_points, &challenge_u32)
+                    .map_err(|e| {
+                        MatMulError::SumcheckFailed(format!("GPU batch fold f_b entry {i}: {e}"))
+                    })?;
+                d_f_a_list[i] = new_d_f_a;
+                d_f_b_list[i] = new_d_f_b;
+            }
         }
 
         cur_n_points = mid;
