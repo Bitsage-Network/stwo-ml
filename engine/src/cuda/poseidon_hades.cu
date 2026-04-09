@@ -541,95 +541,61 @@ extern "C" __global__ void lambda_accumulate_kernel(
     // combined[c] += qm31_mul(lambda_power, entry[c])
     const uint32_t* entries[3] = {entry_s0, entry_s1, entry_s2};
 
+    // M31 inline functions for NVRTC compatibility (no GCC statement expressions)
+    // Defined at device scope above the loop
+    // Uses the existing m31_add/m31_sub/m31_mul from the Poseidon section
+
+    // QM31 multiply helper: result[4] = a[4] * b[4]
+    // QM31 = (a0+a1*i) + (a2+a3*i)*u, i^2=-1, u^2=2+i
+    auto qm31_mul_local = [](uint32_t* out, const uint32_t* a, const uint32_t* b) {
+        #define PM 0x7FFFFFFFu
+        auto mm = [](uint32_t x, uint32_t y) -> uint32_t { return (uint32_t)(((uint64_t)x * (uint64_t)y) % PM); };
+        auto ma = [](uint32_t x, uint32_t y) -> uint32_t { uint32_t s = x+y; return s >= PM ? s-PM : s; };
+        auto ms = [](uint32_t x, uint32_t y) -> uint32_t { return x >= y ? x-y : x+PM-y; };
+
+        uint32_t x0y0_r = ms(mm(a[0],b[0]), mm(a[1],b[1]));
+        uint32_t x0y0_i = ma(mm(a[0],b[1]), mm(a[1],b[0]));
+        uint32_t x1y1_r = ms(mm(a[2],b[2]), mm(a[3],b[3]));
+        uint32_t x1y1_i = ma(mm(a[2],b[3]), mm(a[3],b[2]));
+        uint32_t u2_r = ms(ma(x1y1_r, x1y1_r), x1y1_i);
+        uint32_t u2_i = ma(x1y1_r, ma(x1y1_i, x1y1_i));
+        out[0] = ma(x0y0_r, u2_r);
+        out[1] = ma(x0y0_i, u2_i);
+        uint32_t x0y1_r = ms(mm(a[0],b[2]), mm(a[1],b[3]));
+        uint32_t x0y1_i = ma(mm(a[0],b[3]), mm(a[1],b[2]));
+        uint32_t x1y0_r = ms(mm(a[2],b[0]), mm(a[3],b[1]));
+        uint32_t x1y0_i = ma(mm(a[2],b[1]), mm(a[3],b[0]));
+        out[2] = ma(x0y1_r, x1y0_r);
+        out[3] = ma(x0y1_i, x1y0_i);
+        #undef PM
+    };
+
+    auto qm31_add_local = [](uint32_t* out, const uint32_t* a, const uint32_t* b) {
+        #define PM 0x7FFFFFFFu
+        for (int i = 0; i < 4; i++) { uint32_t s = a[i]+b[i]; out[i] = s >= PM ? s-PM : s; }
+        #undef PM
+    };
+
     for (int c = 0; c < 3; c++) {
         uint32_t e[4];
         for (int i = 0; i < 4; i++) e[i] = entries[c][i];
 
-        // QM31 multiply: result = lp * e
-        // lp = (a0+a1*i) + (a2+a3*i)*u
-        // e  = (b0+b1*i) + (b2+b3*i)*u
-        // result = (a0b0-a1b1 + 2(a2b2-a3b3) + (a2b3+a3b2)) // real real
-        //        + ...
-        // This is complex. Use the standard QM31 formula.
-        // For M31: mul(a,b) = (a*b) mod (2^31-1)
-        #define P 0x7FFFFFFFu
-        #define m31_mul(a,b) ((uint32_t)(((uint64_t)(a) * (uint64_t)(b)) % P))
-        #define m31_add(a,b) ({ uint32_t _s = (a)+(b); _s >= P ? _s-P : _s; })
-        #define m31_sub(a,b) ({ uint32_t _s = (a)>=(b) ? (a)-(b) : (a)+P-(b); _s; })
+        // product = lambda_power * entry
+        uint32_t product[4];
+        qm31_mul_local(product, lp, e);
 
-        // CM31 mul: (a+bi)(c+di) = (ac-bd) + (ad+bc)i
-        // QM31 mul: (x0+x1*u)(y0+y1*u) = (x0y0 + x1y1*u^2) + (x0y1+x1y0)*u
-        // where u^2 = 2+i, so x1y1*u^2 = x1y1*(2+i)
-
-        // x0 = (lp[0], lp[1]) as CM31, x1 = (lp[2], lp[3]) as CM31
-        // y0 = (e[0], e[1]) as CM31, y1 = (e[2], e[3]) as CM31
-
-        // x0*y0
-        uint32_t x0y0_r = m31_sub(m31_mul(lp[0], e[0]), m31_mul(lp[1], e[1]));
-        uint32_t x0y0_i = m31_add(m31_mul(lp[0], e[1]), m31_mul(lp[1], e[0]));
-
-        // x1*y1
-        uint32_t x1y1_r = m31_sub(m31_mul(lp[2], e[2]), m31_mul(lp[3], e[3]));
-        uint32_t x1y1_i = m31_add(m31_mul(lp[2], e[3]), m31_mul(lp[3], e[2]));
-
-        // x1y1 * u^2 = x1y1 * (2+i) = (2*r - i_part) + (r + 2*i_part)*i
-        uint32_t u2_r = m31_sub(m31_add(x1y1_r, x1y1_r), x1y1_i);
-        uint32_t u2_i = m31_add(x1y1_r, m31_add(x1y1_i, x1y1_i));
-
-        // real_part = x0y0 + u2
-        uint32_t rr = m31_add(x0y0_r, u2_r);
-        uint32_t ri = m31_add(x0y0_i, u2_i);
-
-        // x0*y1 + x1*y0
-        uint32_t x0y1_r = m31_sub(m31_mul(lp[0], e[2]), m31_mul(lp[1], e[3]));
-        uint32_t x0y1_i = m31_add(m31_mul(lp[0], e[3]), m31_mul(lp[1], e[2]));
-        uint32_t x1y0_r = m31_sub(m31_mul(lp[2], e[0]), m31_mul(lp[3], e[1]));
-        uint32_t x1y0_i = m31_add(m31_mul(lp[2], e[1]), m31_mul(lp[3], e[0]));
-
-        uint32_t ir = m31_add(x0y1_r, x1y0_r);
-        uint32_t ii = m31_add(x0y1_i, x1y0_i);
-
-        // result QM31 = (rr, ri, ir, ii)
-        // Add to combined
+        // combined += product
         uint32_t off = c * 4;
-        combined_io[off+0] = m31_add(combined_io[off+0], rr);
-        combined_io[off+1] = m31_add(combined_io[off+1], ri);
-        combined_io[off+2] = m31_add(combined_io[off+2], ir);
-        combined_io[off+3] = m31_add(combined_io[off+3], ii);
-
-        #undef P
-        #undef m31_mul
-        #undef m31_add
-        #undef m31_sub
+        uint32_t tmp[4] = {combined_io[off], combined_io[off+1], combined_io[off+2], combined_io[off+3]};
+        qm31_add_local(tmp, tmp, product);
+        for (int i = 0; i < 4; i++) combined_io[off+i] = tmp[i];
     }
 
-    // Update lambda_power *= lambda (same QM31 mul)
-    #define P 0x7FFFFFFFu
-    #define m31_mul(a,b) ((uint32_t)(((uint64_t)(a) * (uint64_t)(b)) % P))
-    #define m31_add(a,b) ({ uint32_t _s = (a)+(b); _s >= P ? _s-P : _s; })
-    #define m31_sub(a,b) ({ uint32_t _s = (a)>=(b) ? (a)-(b) : (a)+P-(b); _s; })
-
+    // Update lambda_power *= lambda
     uint32_t la[4];
     for (int i = 0; i < 4; i++) la[i] = lambda[i];
-
-    uint32_t x0y0_r = m31_sub(m31_mul(lp[0], la[0]), m31_mul(lp[1], la[1]));
-    uint32_t x0y0_i = m31_add(m31_mul(lp[0], la[1]), m31_mul(lp[1], la[0]));
-    uint32_t x1y1_r = m31_sub(m31_mul(lp[2], la[2]), m31_mul(lp[3], la[3]));
-    uint32_t x1y1_i = m31_add(m31_mul(lp[2], la[3]), m31_mul(lp[3], la[2]));
-    uint32_t u2_r = m31_sub(m31_add(x1y1_r, x1y1_r), x1y1_i);
-    uint32_t u2_i = m31_add(x1y1_r, m31_add(x1y1_i, x1y1_i));
-    lambda_power_io[0] = m31_add(x0y0_r, u2_r);
-    lambda_power_io[1] = m31_add(x0y0_i, u2_i);
-    uint32_t x0y1_r = m31_sub(m31_mul(lp[0], la[2]), m31_mul(lp[1], la[3]));
-    uint32_t x0y1_i = m31_add(m31_mul(lp[0], la[3]), m31_mul(lp[1], la[2]));
-    uint32_t x1y0_r = m31_sub(m31_mul(lp[2], la[0]), m31_mul(lp[3], la[1]));
-    uint32_t x1y0_i = m31_add(m31_mul(lp[2], la[1]), m31_mul(lp[3], la[0]));
-    lambda_power_io[2] = m31_add(x0y1_r, x1y0_r);
-    lambda_power_io[3] = m31_add(x0y1_i, x1y0_i);
-
-    #undef P
-    #undef m31_mul
-    #undef m31_add
-    #undef m31_sub
+    uint32_t new_lp[4];
+    qm31_mul_local(new_lp, lp, la);
+    for (int i = 0; i < 4; i++) lambda_power_io[i] = new_lp[i];
 }
 
