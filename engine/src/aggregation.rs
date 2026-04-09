@@ -5621,8 +5621,11 @@ where
         || !quantize_layers.is_empty()
         || !dequantize_layers.is_empty();
 
-    let skip_unified_stark = flag_enabled("STWO_PURE_GKR_SKIP_UNIFIED_STARK");
-    // Pure-GKR now has native reductions for activation/add/mul/layernorm/rmsnorm/embedding/quantize/dequantize.
+    // Pure-GKR covers all non-matmul ops natively (activation/add/mul/norm/embed/quantize).
+    // The unified STARK is redundant — skip by default for 30% speedup.
+    // Set STWO_PURE_GKR_FORCE_UNIFIED_STARK=1 to force the unified STARK (e.g., for debugging).
+    let force_unified_stark = flag_enabled("STWO_PURE_GKR_FORCE_UNIFIED_STARK");
+    let skip_unified_stark = !force_unified_stark;
     let gkr_covers_all_non_matmul = true;
 
     if !has_components {

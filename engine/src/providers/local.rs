@@ -248,9 +248,10 @@ impl LocalProvider {
         // Reshape graph for batch size
         let batch_graph = self.graph.with_seq_len(token_ids.len());
 
-        // Run full proving pipeline with weight cache
-        let proof = crate::aggregation::prove_model_aggregated_onchain_gkr_auto(
+        // Run full proving pipeline with weight cache (skips weight commitment recomputation)
+        let proof = crate::aggregation::prove_model_pure_gkr_auto_with_cache(
             &batch_graph, &input_matrix, &self.weights,
+            self.weight_cache.as_ref(), None,
         ).map_err(|e| LocalProviderError::ProveFailed(format!("{e}")))?;
 
         let prove_time_ms = t_start.elapsed().as_millis() as u64;

@@ -118,8 +118,9 @@ impl ProvingQueue {
                                 ).map_err(|e| format!("{e}"))
                             } else if let Some(ref input) = job.input_matrix {
                                 // Full re-execution + proving
-                                crate::aggregation::prove_model_aggregated_onchain_gkr_auto(
+                                crate::aggregation::prove_model_pure_gkr_auto_with_cache(
                                     &job.graph, input, &job.weights,
+                                    job.weight_cache.as_ref(), None,
                                 ).map_err(|e| format!("{e}"))
                             } else {
                                 Err("No proof, no forward_result, and no input_matrix".into())

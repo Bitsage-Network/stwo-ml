@@ -33,7 +33,7 @@ pub fn execute_and_prove(
             graph, input, weights, kv, None, policy,
         )
     } else {
-        crate::aggregation::prove_model_aggregated_onchain_gkr_auto(graph, input, weights)
+        crate::aggregation::prove_model_pure_gkr_auto_with_cache(graph, input, weights, None, policy)
     };
 
     let proof = proof_result.map_err(|e| ExecutorError::ForwardError(format!("{e}")))?;
