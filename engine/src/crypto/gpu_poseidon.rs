@@ -56,6 +56,15 @@ impl GpuPoseidonChannel {
         let poseidon_fn = device.get_func("poseidon", "poseidon_permute_kernel")
             .ok_or_else(|| GpuPoseidonError::KernelCompile("poseidon_permute_kernel not found".into()))?;
 
+        // Increase GPU thread stack size for deep felt252 arithmetic in Hades
+        // Default is 1KB; Poseidon needs ~16KB for 99 rounds of felt252_mul → felt252_pow7
+        unsafe {
+            cudarc::driver::sys::lib().cuCtxSetLimit(
+                cudarc::driver::sys::CUlimit::CU_LIMIT_STACK_SIZE,
+                32 * 1024, // 32KB per thread
+            );
+        }
+
         // Upload round constants
         let (rc_u32, _n_rounds, _n_per_round) = poseidon_constants::get_round_constants_u32();
         let d_round_constants = device.htod_sync_copy(&rc_u32)
