@@ -264,6 +264,62 @@ class Client:
         )
         return InferResult.from_dict(data)
 
+    # ── Chat (verifiable inference from text) ──────────────────────────
+
+    def chat(
+        self,
+        prompt: str,
+        model: str = "local",
+        max_tokens: int = 1,
+        session_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Verifiable chat inference — send a prompt, get a response with on-chain proof.
+
+        Runs the full pipeline: tokenize → forward pass → GKR proof →
+        recursive STARK → on-chain submission (if STARKNET_PRIVATE_KEY is set
+        on the server).
+
+        Args:
+            prompt: User message text.
+            model: Model name (default: "local" for the loaded model).
+            max_tokens: Maximum tokens to generate (default: 1).
+            session_id: Optional session ID for multi-turn conversations.
+
+        Returns:
+            Dict with keys: text, tx_hash, proof_hash, model_id, io_commitment,
+            calldata_felts, explorer_url, prove_time_secs, trust_model.
+
+        Example:
+            >>> result = client.chat("What is 2+2?")
+            >>> print(result["text"])
+            >>> print(result["tx_hash"])       # Starknet TX hash
+            >>> print(result["explorer_url"])   # Starkscan link
+        """
+        data = self._request(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "stream": False,
+                **({"session_id": session_id} if session_id else {}),
+            },
+        )
+        choice = data.get("choices", [{}])[0]
+        meta = data.get("obelyzk", {})
+        return {
+            "text": choice.get("message", {}).get("content", ""),
+            "tx_hash": meta.get("tx_hash"),
+            "proof_hash": meta.get("proof_hash"),
+            "model_id": meta.get("model_id"),
+            "io_commitment": meta.get("io_commitment"),
+            "calldata_felts": meta.get("calldata_felts"),
+            "explorer_url": meta.get("explorer_url"),
+            "prove_time_secs": meta.get("prove_time_secs"),
+            "trust_model": meta.get("trust_model", "unknown"),
+        }
+
     # ── Verification ─────────────────────────────────────────────────────
 
     def verify(self, proof_hash: str) -> VerifyResult:
