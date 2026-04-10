@@ -113,6 +113,12 @@ fn verify_gkr_inner(
         channel.mix_felt(policy_commitment);
     }
 
+    let _v_trace = std::env::var("STWO_CHANNEL_TRACE").is_ok();
+    if _v_trace {
+        eprintln!("[VERIFIER] ch after seeding+policy: {:?}", channel.digest());
+        eprintln!("[VERIFIER] policy: {:?}, skip={}", policy_commitment, skip_policy);
+    }
+
     // Reconstruct output claim
     let output_padded = pad_matrix_pow2(output);
     let output_mle = matrix_to_mle(&output_padded);
@@ -124,6 +130,11 @@ fn verify_gkr_inner(
     let output_value = evaluate_mle(&output_mle, &r_out);
 
     mix_secure_field(channel, output_value);
+
+    if _v_trace {
+        eprintln!("[VERIFIER] output_value: {:?}", output_value);
+        eprintln!("[VERIFIER] ch after output claim: {:?}", channel.digest());
+    }
 
     let mut current_claim = GKRClaim {
         point: r_out,
@@ -208,6 +219,16 @@ fn verify_gkr_inner(
 
         let layer_proof = &proof.layer_proofs[proof_idx];
         proof_idx += 1;
+
+        if _v_trace {
+            eprintln!(
+                "[VERIFIER] L{} type={:?} ch={:?} claim_val={:?}",
+                layer_idx,
+                std::mem::discriminant(&layer.layer_type),
+                channel.digest(),
+                current_claim.value,
+            );
+        }
 
         current_claim = match (&layer.layer_type, layer_proof) {
             (

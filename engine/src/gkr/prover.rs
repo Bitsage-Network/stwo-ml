@@ -2872,6 +2872,10 @@ pub fn prove_gkr_gpu_with_cache(
 
     mix_secure_field(channel, output_value);
 
+    if trace {
+        eprintln!("[PROVER-GPU] ch after output claim: {:?}", channel.digest());
+    }
+
     let output_claim = GKRClaim {
         point: r_out,
         value: output_value,
@@ -3144,6 +3148,15 @@ pub fn prove_gkr_gpu_with_cache(
 
         layer_proofs.push(proof);
         current_claim = next_claim;
+        if trace {
+            eprintln!(
+                "[PROVER-GPU] L{} type={:?} ch={:?} claim_val={:?}",
+                layer_idx,
+                std::mem::discriminant(&layer.layer_type),
+                channel.digest(),
+                current_claim.value,
+            );
+        }
         #[cfg(feature = "proof-stream")]
         emit_proof_event!(|| proof_stream::ProofEvent::LayerEnd {
             layer_idx,
