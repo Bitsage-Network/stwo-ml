@@ -384,9 +384,9 @@ fn validate_weight_dimensions(
                                 // Fused gate_up: 2× output dimension
                                 || (rows == 2 * *n && cols == *k)
                                 || (rows == *k && cols == 2 * *n)
-                                // Fused QKV: 3× output dimension (or Q+K+V where K/V may differ)
-                                || (rows >= 2 * *n && cols == *k)
-                                || (rows == *k && cols >= 2 * *n);
+                                // Fused QKV: any size > n (3× for MHA, (H+2KV)*head for GQA)
+                                || (rows > *n && cols == *k)
+                                || (rows == *k && cols > *n);
                             if !ok {
                                 mismatches.push(format!(
                                     "{}: shape ({}, {}) does not match expected ({}, {})",
