@@ -96,8 +96,10 @@ async function main() {
     const proofRoot = weightSuperRoot.toLowerCase();
     const chainRoot = registeredWeightRoot.toLowerCase();
 
-    if (chainRoot !== "0x0" && chainRoot !== proofRoot && proofRoot !== "0x0") {
-      console.log("Register:      re-registering (weight_super_root changed: " + chainRoot.slice(0, 12) + "... → " + proofRoot.slice(0, 12) + "...)");
+    const needsRegister = chainRoot === "0x0" || (chainRoot !== proofRoot && proofRoot !== "0x0");
+    if (needsRegister) {
+      const reason = chainRoot === "0x0" ? "not registered" : "weight_super_root changed";
+      console.log("Register:      registering (" + reason + ")");
       const regTx = await account.execute({
         contractAddress: CONTRACT,
         entrypoint: "register_model_recursive",
