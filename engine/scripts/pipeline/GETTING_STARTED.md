@@ -496,51 +496,56 @@ echo "What is 2+2?" | \
 
 ## 11. Interactive TUI Dashboard
 
-ObelyZK includes a live terminal dashboard that shows GPU workers, proving queue, sessions, and on-chain proof status in real time.
+ObelyZK includes a real-time interactive terminal dashboard with 5 modes, animated sparklines, dual-dataset charts, and live proving visualization.
 
-### Run on the H100 (via bitsage shell)
+### Launch
 
 ```bash
+# On the H100 (via bitsage shell):
 bitsage shell h100-prover
-obelyzk dashboard
+dashboard
+
+# Or locally with any model:
+OBELYSK_MODEL_DIR=~/.obelyzk/models/qwen2.5-14b obelyzk dashboard
 ```
 
-### Run locally (any supported model)
+Works on Linux (CUDA GPU) and macOS (CPU). Model auto-downloads if not present.
 
-```bash
-# SmolLM2-135M (fastest, good for testing)
-OBELYSK_MODEL_DIR=~/.obelyzk/models/smollm2-135m obelyzk dashboard
+### 5 Interactive Modes
 
-# Qwen2.5-7B (smaller Qwen, fits consumer GPUs)
-OBELYSK_MODEL_DIR=~/.obelyzk/models/qwen2.5-7b obelyzk dashboard
+| Key | Mode | What it shows |
+|-----|------|---------------|
+| `1` | **Monitor** | 11 panels: Signal Drift chart (throughput + GPU), 3 sparklines (throughput, GPU load, layer time), Dispatch, Pulse gauge, Registers badges, Layer Spotlight timing bars, Live Trace, GPU Memory, Proof Artifact |
+| `2` | **Prove** | GKR progress gauge, STARK compression status, 3 sparklines (MatMul time, Poseidon hash, Sumcheck rounds), Proving Signal chart, Live Proof Trace with timing bars |
+| `3` | **Chat** | Interactive verifiable conversation — type a prompt, hit Enter, watch the proof progress live, get response with TX hash and [verified] badge |
+| `4` | **On-Chain** | Starknet contract info, verification count, verified TX feed with [VERIFIED] badges |
+| `5` | **Model** | Architecture details (hidden_size, heads, ff, vocab), weight commitment + cache status, Poseidon hashing sparkline, GPU detail (VRAM gauge, temp sparkline, power), Sumcheck + Forward pass progress |
 
-# GLM-4-9B
-OBELYSK_MODEL_DIR=~/.obelyzk/models/glm-4-9b obelyzk dashboard
+### Key Bindings
 
-# Any model — auto-downloads if not present
-OBELYSK_MODEL_DIR=~/.obelyzk/models/mistral-7b obelyzk dashboard
-```
+| Key | Action |
+|-----|--------|
+| `1-5` | Switch mode |
+| `t` | Cycle color theme (Neon → Ember → Violet) |
+| `Tab` | Cycle loaded models |
+| `+`/`-` | Adjust tick rate (faster/slower animation) |
+| `q` / `Esc` | Quit (Esc cancels input in Chat mode) |
+| `Enter` | Send message in Chat mode (triggers proving) |
 
-Works on Linux (CUDA GPU) and macOS (CPU/Metal). The dashboard adapts to whatever model is loaded.
+### What makes it live
 
-### What it shows
+- **Animated sparklines**: all 9 history buffers (throughput, GPU util, GPU temp, layer time, matmul time, Poseidon perms, sumcheck rounds, forward pass, STARK) update every tick
+- **During proving**: GPU utilization jumps to 75-90%, temperature rises, new layer events scroll in, progress gauges fill, phase transitions (forward → GKR → STARK)
+- **During idle**: gentle sine-wave patterns keep all sparklines moving
+- **Chat mode**: background API call with pulse animation (◢◣◤◥) during proving, response appears with proof status + full TX hash
 
-```
- ┌─────────────────────────────────────────────────────────────┐
- │  ObelyZK VM   ● Ready   0:42:17   0x1c20...0c7   Sepolia  │
- ├─────────────────────────────────────────────────────────────┤
- │  GPU Workers       │  Queue / Throughput  │  Sessions       │
- │  · H100 (80GB)     │  Queued:    0        │  ses-a1b2 (3)   │
- │    100% util       │  Proving:   1        │  ses-c3d4 (1)   │
- │    78.2°C          │  1.2 tok/s proven    │                 │
- ├─────────────────────────────────────────────────────────────┤
- │  ON-CHAIN   Starknet Sepolia · 7 verified                  │
- │  TX  0x677694b9...fa890   892 felts  46.0s prove  1.2s STARK│
- │  ID  0x05e8dcc9...6eaf   IO 0x0313...b25a                  │
- └─────────────────────────────────────────────────────────────┘
-```
+### 3 Color Themes
 
-The dashboard updates live. Press `q` to exit, `s` for sessions, `g` for GPU details.
+| Theme | Borders | Accents | Press `t` to cycle |
+|-------|---------|---------|---------------------|
+| **Neon** | Cyan | Green + Orange | Default |
+| **Ember** | Orange | Coral + Amber | Warm |
+| **Violet** | Purple | Pink + Sky Blue | Cool |
 
 ### All subcommands
 
@@ -549,7 +554,7 @@ The dashboard updates live. Press `q` to exit, `s` for sessions, `g` for GPU det
 | `obelyzk serve` | Start OpenAI-compatible API server (port 8080) |
 | `obelyzk chat --model local` | Interactive verified chat (stdin/stdout) |
 | `obelyzk bench --tokens 8` | Throughput benchmark (N tokens batched) |
-| `obelyzk dashboard` | Live TUI monitor with on-chain status |
+| `obelyzk dashboard` | Interactive TUI with 5 modes + live animation |
 
 ---
 
