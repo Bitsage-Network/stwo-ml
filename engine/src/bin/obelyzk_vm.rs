@@ -1055,6 +1055,7 @@ async fn run_dashboard() {
                         KeyCode::Char('2') if state.mode != Mode::Chat => state.mode = Mode::Prove,
                         KeyCode::Char('3') if state.mode != Mode::Chat => state.mode = Mode::Chat,
                         KeyCode::Char('4') if state.mode != Mode::Chat => state.mode = Mode::OnChain,
+                        KeyCode::Char('5') if state.mode != Mode::Chat => state.mode = Mode::Model,
 
                         // Theme cycling
                         KeyCode::Char('t') if state.mode != Mode::Chat => {

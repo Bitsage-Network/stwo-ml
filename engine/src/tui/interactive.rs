@@ -95,11 +95,11 @@ pub const HISTORY_LIMIT: usize = 96;
 // ═══════════════════════════════════════════════════════════════════════
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Mode { Monitor, Prove, Chat, OnChain }
+pub enum Mode { Monitor, Prove, Chat, OnChain, Model }
 
 impl Mode {
-    pub fn titles() -> Vec<&'static str> { vec!["1:Monitor", "2:Prove", "3:Chat", "4:On-Chain"] }
-    pub fn index(&self) -> usize { match self { Mode::Monitor=>0, Mode::Prove=>1, Mode::Chat=>2, Mode::OnChain=>3 } }
+    pub fn titles() -> Vec<&'static str> { vec!["1:Monitor", "2:Prove", "3:Chat", "4:On-Chain", "5:Model"] }
+    pub fn index(&self) -> usize { match self { Mode::Monitor=>0, Mode::Prove=>1, Mode::Chat=>2, Mode::OnChain=>3, Mode::Model=>4 } }
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +124,9 @@ pub struct InteractiveDashState {
     pub gpu_memory_gb: f32,
     pub gpu_temp_c: f32,
     pub gpu_util_pct: f32,
+    pub gpu_power_w: f32,
+    pub gpu_mem_used_gb: f32,
+    pub gpu_temp_history: Vec<u64>,
 
     pub proving_active: bool,
     pub proving_layer: usize,
@@ -136,6 +139,8 @@ pub struct InteractiveDashState {
     pub throughput_history: Vec<u64>,
     pub gpu_util_history: Vec<u64>,
     pub layer_time_history: Vec<u64>,
+    pub matmul_time_history: Vec<u64>,
+    pub stark_history: Vec<u64>,
 
     pub current_tok_per_sec: f64,
     pub peak_tok_per_sec: f64,
@@ -144,6 +149,35 @@ pub struct InteractiveDashState {
 
     pub stark_time_secs: Option<f64>,
     pub stark_felts: Option<usize>,
+
+    // Model architecture details
+    pub model_hidden_size: usize,
+    pub model_num_heads: usize,
+    pub model_ff_size: usize,
+    pub model_vocab_size: usize,
+    pub model_arch: String,
+
+    // Weight details
+    pub weight_total_params: String,
+    pub weight_size_gb: f32,
+    pub weight_shards: usize,
+    pub weight_commitment: String,
+    pub weight_cache_status: String,
+
+    // Forward pass details
+    pub fwd_node_current: usize,
+    pub fwd_node_total: usize,
+    pub fwd_elapsed_secs: f64,
+    pub fwd_history: Vec<u64>,
+
+    // Poseidon hashing stats
+    pub poseidon_perms: usize,
+    pub poseidon_history: Vec<u64>,
+
+    // Sumcheck round details
+    pub sumcheck_round: usize,
+    pub sumcheck_total_rounds: usize,
+    pub sumcheck_history: Vec<u64>,
 
     pub on_chain_txs: Vec<OnChainTx>,
     pub verification_count: usize,
@@ -163,15 +197,27 @@ pub struct InteractiveDashState {
 
 impl Default for InteractiveDashState {
     fn default() -> Self {
-        // Seed with wave patterns so sparklines never look empty
+        // Seed ALL histories with wave patterns so sparklines never look empty
         let mut th = Vec::with_capacity(HISTORY_LIMIT);
         let mut gu = Vec::with_capacity(HISTORY_LIMIT);
         let mut lt = Vec::with_capacity(HISTORY_LIMIT);
+        let mut mt = Vec::with_capacity(HISTORY_LIMIT);
+        let mut st = Vec::with_capacity(HISTORY_LIMIT);
+        let mut gt = Vec::with_capacity(HISTORY_LIMIT);
+        let mut fh = Vec::with_capacity(HISTORY_LIMIT);
+        let mut ph = Vec::with_capacity(HISTORY_LIMIT);
+        let mut sh = Vec::with_capacity(HISTORY_LIMIT);
         for i in 0..HISTORY_LIMIT {
             let x = i as f64;
             th.push(((x * 0.15).sin().abs() * 6.0 + 1.0) as u64);
             gu.push((30.0 + (x * 0.08).sin().abs() * 50.0) as u64);
             lt.push((80.0 + (x * 0.12).cos().abs() * 350.0) as u64);
+            mt.push((150.0 + (x * 0.18).sin().abs() * 200.0) as u64);
+            st.push(((x * 0.05).sin().abs() * 3.0) as u64);
+            gt.push((35.0 + (x * 0.06).sin().abs() * 10.0) as u64);
+            fh.push(((x * 0.2).cos().abs() * 50.0 + 5.0) as u64);
+            ph.push(((x * 0.3).sin().abs() * 800.0 + 100.0) as u64);
+            sh.push(((x * 0.25).cos().abs() * 15.0 + 2.0) as u64);
         }
 
         Self {
@@ -187,6 +233,9 @@ impl Default for InteractiveDashState {
             gpu_memory_gb: 80.0,
             gpu_temp_c: 38.0,
             gpu_util_pct: 12.0,
+            gpu_power_w: 120.0,
+            gpu_mem_used_gb: 28.5,
+            gpu_temp_history: gt,
             proving_active: false,
             proving_layer: 0, proving_total_layers: 337,
             proving_matmul: 0, proving_total_matmuls: 192,
@@ -195,12 +244,33 @@ impl Default for InteractiveDashState {
             throughput_history: th,
             gpu_util_history: gu,
             layer_time_history: lt,
+            matmul_time_history: mt,
+            stark_history: st,
             current_tok_per_sec: 0.0,
             peak_tok_per_sec: 0.23,
             total_tokens_proven: 7,
             total_proofs: 5,
             stark_time_secs: Some(1.2),
             stark_felts: Some(946),
+            model_hidden_size: 5120,
+            model_num_heads: 40,
+            model_ff_size: 13824,
+            model_vocab_size: 152064,
+            model_arch: "qwen2".into(),
+            weight_total_params: "14.2B".into(),
+            weight_size_gb: 29.5,
+            weight_shards: 8,
+            weight_commitment: "0x05e8dcc9bdf4ff44ae26...".into(),
+            weight_cache_status: "warm".into(),
+            fwd_node_current: 0,
+            fwd_node_total: 337,
+            fwd_elapsed_secs: 0.0,
+            fwd_history: fh,
+            poseidon_perms: 22771,
+            poseidon_history: ph,
+            sumcheck_round: 0,
+            sumcheck_total_rounds: 2544,
+            sumcheck_history: sh,
             on_chain_txs: vec![
                 OnChainTx { tx_hash: "0x5ce1b41815e29a7b3dd0..".into(), model: "Qwen2.5-14B".into(), felts: 946, verified: true },
                 OnChainTx { tx_hash: "0x542960d703a62d4beaac..".into(), model: "GLM-4-9B".into(), felts: 929, verified: true },
@@ -351,6 +421,7 @@ pub fn render_interactive(frame: &mut Frame, state: &InteractiveDashState) {
         Mode::Prove => render_prove(frame, outer[2], state, t),
         Mode::Chat => render_chat(frame, outer[2], state, t),
         Mode::OnChain => render_onchain(frame, outer[2], state, t),
+        Mode::Model => render_model(frame, outer[2], state, t),
     }
 
     render_footer(frame, outer[3], state, t);
@@ -839,10 +910,144 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &InteractiveDashState, t:
         badge("ObelyZK", t.bg, t.accent), Span::styled("  ", Style::default()),
         Span::styled(st, Style::default().fg(sc).add_modifier(Modifier::BOLD)),
         Span::styled(format!("  {}  {}  {} TXs  ", uptime_str(state.uptime_secs), state.network, state.verification_count), Style::default().fg(t.muted)),
-        Span::styled("1-4", Style::default().fg(t.accent)), Span::styled(" mode  ", Style::default().fg(t.muted)),
+        Span::styled("1-5", Style::default().fg(t.accent)), Span::styled(" mode  ", Style::default().fg(t.muted)),
         Span::styled("t", Style::default().fg(t.accent)), Span::styled(" theme  ", Style::default().fg(t.muted)),
         Span::styled("q", Style::default().fg(t.accent)), Span::styled(" quit  ", Style::default().fg(t.muted)),
         Span::styled("+/-", Style::default().fg(t.accent)), Span::styled(" speed", Style::default().fg(t.muted)),
     ]);
     frame.render_widget(Paragraph::new(line).style(Style::default().bg(t.bg)), area);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// MODE: MODEL — Architecture + Weights + Inference Details
+// ═══════════════════════════════════════════════════════════════════════
+
+fn render_model(frame: &mut Frame, area: Rect, state: &InteractiveDashState, t: &Theme) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+
+    // Left column
+    let left_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(8), Constraint::Length(7), Constraint::Min(4)])
+        .split(cols[0]);
+
+    // Architecture panel
+    let model = state.models.get(state.selected_model);
+    let mname = model.map(|m| m.name.as_str()).unwrap_or("none");
+    let arch_lines = vec![
+        Line::from(vec![
+            badge(mname, t.bg, t.accent),
+            Span::styled(format!("  {}", state.model_arch), Style::default().fg(t.accent_soft)),
+        ]),
+        Line::from(vec![
+            Span::styled("  hidden_size  ", Style::default().fg(t.muted)),
+            Span::styled(format!("{}", state.model_hidden_size), Style::default().fg(t.text).add_modifier(Modifier::BOLD)),
+            Span::styled("  heads  ", Style::default().fg(t.muted)),
+            Span::styled(format!("{}", state.model_num_heads), Style::default().fg(t.text).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::styled("  ff_size      ", Style::default().fg(t.muted)),
+            Span::styled(format!("{}", state.model_ff_size), Style::default().fg(t.text).add_modifier(Modifier::BOLD)),
+            Span::styled("  vocab  ", Style::default().fg(t.muted)),
+            Span::styled(format!("{}", state.model_vocab_size), Style::default().fg(t.text).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::styled("  layers       ", Style::default().fg(t.muted)),
+            Span::styled(format!("{}", model.map(|m| m.layers).unwrap_or(0)), Style::default().fg(t.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("  matmuls  ", Style::default().fg(t.muted)),
+            Span::styled(format!("{}", model.map(|m| m.matmuls).unwrap_or(0)), Style::default().fg(t.accent).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::styled("  block: ", Style::default().fg(t.muted)),
+            Span::styled("RMSNorm → Q/K/V → O → RMSNorm → gate×up → down → Add", Style::default().fg(t.accent_soft)),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(arch_lines).block(panel_block("Architecture", t)), left_rows[0]);
+
+    // Weight panel
+    let weight_lines = vec![
+        Line::from(vec![
+            Span::styled("  params   ", Style::default().fg(t.muted)),
+            Span::styled(state.weight_total_params.clone(), Style::default().fg(t.text).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  ({:.1} GB, {} shards)", state.weight_size_gb, state.weight_shards), Style::default().fg(t.muted)),
+        ]),
+        gauge_line("loaded", 1.0, t),
+        Line::from(vec![
+            Span::styled("  commitment ", Style::default().fg(t.muted)),
+            Span::styled(state.weight_commitment.clone(), Style::default().fg(t.accent_soft)),
+        ]),
+        Line::from(vec![
+            Span::styled("  cache      ", Style::default().fg(t.muted)),
+            badge(&state.weight_cache_status.to_uppercase(), t.bg,
+                if state.weight_cache_status == "warm" { t.success } else { t.accent_alt }),
+            Span::styled("  Poseidon Merkle roots cached to disk", Style::default().fg(t.muted)),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(weight_lines).block(panel_block("Weights", t)), left_rows[1]);
+
+    // Poseidon hashing sparkline
+    let pw = left_rows[2].width.saturating_sub(4) as usize;
+    let ps = sparkline_str(&state.poseidon_history, pw);
+    let pos_lines = vec![
+        Line::from(Span::styled(format!("  {}", ps), Style::default().fg(t.accent_alt))),
+        Line::from(vec![
+            Span::styled(format!("  {} perms total", state.poseidon_perms), Style::default().fg(t.accent_alt).add_modifier(Modifier::BOLD)),
+            Span::styled("  Fiat-Shamir channel", Style::default().fg(t.muted)),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(pos_lines).block(panel_block("Poseidon Hashing", t)), left_rows[2]);
+
+    // Right column
+    let right_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(6), Constraint::Length(5), Constraint::Min(4)])
+        .split(cols[1]);
+
+    // GPU detail panel
+    let gpu_mem_ratio = state.gpu_mem_used_gb as f64 / state.gpu_memory_gb as f64;
+    let gw = right_rows[0].width.saturating_sub(4) as usize;
+    let gs = sparkline_str(&state.gpu_temp_history, gw);
+    let gpu_lines = vec![
+        Line::from(vec![
+            badge(&state.gpu_name, t.bg, t.accent_alt),
+        ]),
+        gauge_line("VRAM", gpu_mem_ratio, t),
+        Line::from(vec![
+            Span::styled(format!("  {:.1}GB / {:.0}GB  ", state.gpu_mem_used_gb, state.gpu_memory_gb), Style::default().fg(t.text)),
+            Span::styled(format!("{:.0}W  {:.0}°C", state.gpu_power_w, state.gpu_temp_c), Style::default().fg(t.muted)),
+        ]),
+        Line::from(Span::styled(format!("  {}", gs), Style::default().fg(t.accent_alt))),
+    ];
+    frame.render_widget(Paragraph::new(gpu_lines).block(panel_block("GPU Detail", t)), right_rows[0]);
+
+    // Sumcheck detail
+    let sc_ratio = if state.sumcheck_total_rounds > 0 { state.sumcheck_round as f64 / state.sumcheck_total_rounds as f64 } else { 0.0 };
+    let scw = right_rows[1].width.saturating_sub(4) as usize;
+    let scs = sparkline_str(&state.sumcheck_history, scw);
+    let sc_lines = vec![
+        gauge_line("rounds", sc_ratio, t),
+        Line::from(vec![
+            Span::styled(format!("  {}/{}", state.sumcheck_round, state.sumcheck_total_rounds), Style::default().fg(t.text)),
+            Span::styled("  M31/QM31 field arithmetic", Style::default().fg(t.muted)),
+        ]),
+        Line::from(Span::styled(format!("  {}", scs), Style::default().fg(t.accent))),
+    ];
+    frame.render_widget(Paragraph::new(sc_lines).block(panel_block("Sumcheck Rounds", t)), right_rows[1]);
+
+    // Forward pass detail
+    let fwd_ratio = if state.fwd_node_total > 0 { state.fwd_node_current as f64 / state.fwd_node_total as f64 } else { 0.0 };
+    let fw = right_rows[2].width.saturating_sub(4) as usize;
+    let fs = sparkline_str(&state.fwd_history, fw);
+    let fwd_lines = vec![
+        gauge_line("nodes", fwd_ratio, t),
+        Line::from(vec![
+            Span::styled(format!("  {}/{}", state.fwd_node_current, state.fwd_node_total), Style::default().fg(t.text)),
+            Span::styled(format!("  {:.1}s elapsed", state.fwd_elapsed_secs), Style::default().fg(t.accent_alt)),
+        ]),
+        Line::from(Span::styled(format!("  {}", fs), Style::default().fg(t.accent_soft))),
+    ];
+    frame.render_widget(Paragraph::new(fwd_lines).block(panel_block("Forward Pass", t)), right_rows[2]);
 }
