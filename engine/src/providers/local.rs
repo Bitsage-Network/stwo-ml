@@ -372,12 +372,21 @@ impl LocalProvider {
                     .map(|f| format!("0x{:064x}", f))
                     .collect();
 
-                let io_commitment_packed = crate::crypto::poseidon_channel::securefield_to_felt(io_commitment);
+                // model_id = hash of weight commitments (stable per model)
+                let model_id = if !gkr_proof.weight_commitments.is_empty() {
+                    let mut parts = Vec::new();
+                    for wc in &gkr_proof.weight_commitments {
+                        parts.push(*wc);
+                    }
+                    starknet_crypto::poseidon_hash_many(&parts)
+                } else {
+                    proof.io_commitment
+                };
 
                 // Build proof artifact for submit_recursive.mjs
                 let artifact = serde_json::json!({
-                    "model_id": format!("0x{:064x}", proof.io_commitment),
-                    "io_commitment": format!("0x{:064x}", io_commitment_packed),
+                    "model_id": format!("0x{:064x}", model_id),
+                    "io_commitment": format!("0x{:064x}", proof.io_commitment),
                     "policy_commitment": format!("0x{:064x}", proof.policy_commitment),
                     "recursive_proof": {
                         "calldata": calldata_hex,
