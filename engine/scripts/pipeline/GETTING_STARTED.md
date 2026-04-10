@@ -48,7 +48,61 @@ rustup default nightly-2025-07-14
 
 ---
 
-## 2. Build
+## 2. Instant Access (no build required)
+
+Three ways to run verifiable inference right now, from fastest to most independent:
+
+### Option A: SSH into the H100 (branded CLI)
+
+```bash
+npm i -g @bitsagecli/cli
+bitsage login --api-key <your-key>
+bitsage shell h100-prover
+```
+
+You land in a branded H100 environment with Qwen2.5-14B + GLM-4-9B loaded. Type `prove` to generate an on-chain proof. The server is already running — no setup needed.
+
+### Option B: Use the Python/TypeScript SDK (no SSH)
+
+```bash
+pip install obelyzk
+
+python3 -c "
+from obelyzk import Client
+c = Client('http://62.169.159.231:8080', timeout=600)
+r = c.chat('What is AI?')
+print(r['text'])
+print(r['tx_hash'])
+print(r['explorer_url'])
+"
+```
+
+TypeScript:
+```bash
+npm install @obelyzk/sdk
+
+node -e "
+import { createStwoProverClient } from '@obelyzk/sdk';
+const p = createStwoProverClient({ baseUrl: 'http://62.169.159.231:8080' });
+const r = await p.chat('What is AI?');
+console.log(r.text, r.txHash, r.explorerUrl);
+"
+```
+
+### Option C: curl (raw API, zero dependencies)
+
+```bash
+curl -s -X POST http://62.169.159.231:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"local","messages":[{"role":"user","content":"What is AI?"}],"max_tokens":1}' \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); m=d.get('obelyzk',{}); print(f'Text: {d[\"choices\"][0][\"message\"][\"content\"]}'); print(f'TX: {m.get(\"tx_hash\")}'); print(f'Explorer: {m.get(\"explorer_url\")}')"
+```
+
+All three paths hit the same proving pipeline: GKR sumcheck → recursive STARK → Starknet verification.
+
+---
+
+## 3. Build from Source (fully independent)
 
 ```bash
 git clone https://github.com/Bitsage-Network/obelyzk.rs.git
@@ -67,7 +121,7 @@ The binary is at `target/release/obelyzk`.
 
 ---
 
-## 3. Supported Models
+## 4. Supported Models
 
 ### Full ZK Proof (open weights — every operation cryptographically proven)
 
