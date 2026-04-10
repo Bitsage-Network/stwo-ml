@@ -233,7 +233,7 @@ impl LocalProvider {
             &self.model_dir, self.hidden_size, last_token_id,
         ).map_err(|e| LocalProviderError::EmbedFailed(format!("{e}")))?;
 
-        // GPU forward pass is enabled — GEMV/GEMM overflow fix applied.
+        // GPU forward pass with exact M31 arithmetic (Barrett reduction per multiply).
 
         let proof = crate::aggregation::prove_model_pure_gkr_auto_with_cache(
             &self.graph, &input_matrix, &self.weights,
