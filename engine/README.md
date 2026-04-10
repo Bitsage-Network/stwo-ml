@@ -11,15 +11,12 @@
 
 ObelyZK proves that a transformer model (LLaMA, Qwen, Phi, SmolLM, Mistral) produced a specific output for a given input. The proof compresses into ~950 felts via recursive STARK and verifies in one Starknet transaction. No trusted setup. No multi-step coordination.
 
-**Live on Starknet Sepolia** — Qwen2.5-14B (14 billion parameters):
+**Live on Starknet Sepolia** — multiple architectures verified on-chain:
 
-| Metric | Value |
-|--------|-------|
-| GKR proof (192 matmuls, 337 layers) | 46s (H100 GPU) |
-| Recursive STARK compression | 1.2s |
-| On-chain calldata | ~950 felts (single TX) |
-| Verification gas | ~117M L2 gas (~$0.03) |
-| Verified TX | [`0x5ce1b4...edfd3`](https://sepolia.starkscan.co/tx/0x5ce1b41815e29a7b3dd03b77187cf32c8c5f0e2607960303174cbea303edfd3) |
+| Model | Params | GKR | STARK | Felts | Verified TX |
+|-------|--------|-----|-------|-------|-------------|
+| Qwen2.5-14B | 14B | 46s | 1.2s | 946 | [`0x5ce1b4...`](https://sepolia.starkscan.co/tx/0x5ce1b41815e29a7b3dd03b77187cf32c8c5f0e2607960303174cbea303edfd3) |
+| GLM-4-9B | 9B | 201s | 1.1s | 929 | [`0x542960...`](https://sepolia.starkscan.co/tx/0x542960d703a62d4beaacf0d9094ea92dc86bf326cd917c533039f4dd1eb4a30) |
 
 > **[Full Getting Started Guide →](scripts/pipeline/GETTING_STARTED.md)**
 

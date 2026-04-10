@@ -16,9 +16,9 @@
 
 ### Verifiable AI Engine Written in Rust
 
-**Provable inference for every model. Qwen2.5-14B proven on-chain in a single TX.**
+**Provable inference for every model. Qwen2.5-14B + GLM-4-9B proven on-chain.**
 
-[Live Proof → `0x5ce1b4...edfd3`](https://sepolia.starkscan.co/tx/0x5ce1b41815e29a7b3dd03b77187cf32c8c5f0e2607960303174cbea303edfd3)
+[Qwen2.5-14B → `0x5ce1b4...`](https://sepolia.starkscan.co/tx/0x5ce1b41815e29a7b3dd03b77187cf32c8c5f0e2607960303174cbea303edfd3) · [GLM-4-9B → `0x542960...`](https://sepolia.starkscan.co/tx/0x542960d703a62d4beaacf0d9094ea92dc86bf326cd917c533039f4dd1eb4a30)
 
 <br/>
 

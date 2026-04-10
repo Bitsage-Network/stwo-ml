@@ -2,7 +2,12 @@
 
 Prove that an ML model ran correctly with a cryptographic proof, verified on Starknet in a single transaction.
 
-**Live proof**: [`0x5ce1b4...edfd3`](https://sepolia.starkscan.co/tx/0x5ce1b41815e29a7b3dd03b77187cf32c8c5f0e2607960303174cbea303edfd3) — Qwen2.5-14B (14 billion parameters), 192 matmul reductions, verified on Sepolia.
+**Live proofs on Starknet Sepolia:**
+
+| Model | Params | TX | Felts | GKR | STARK |
+|-------|--------|-----|-------|-----|-------|
+| **Qwen2.5-14B** | 14B | [`0x5ce1b4...edfd3`](https://sepolia.starkscan.co/tx/0x5ce1b41815e29a7b3dd03b77187cf32c8c5f0e2607960303174cbea303edfd3) | 946 | 46s | 1.2s |
+| **GLM-4-9B** | 9B | [`0x542960...4dd1e`](https://sepolia.starkscan.co/tx/0x542960d703a62d4beaacf0d9094ea92dc86bf326cd917c533039f4dd1eb4a30) | 929 | 201s | 1.1s |
 
 ## Quick Overview
 
@@ -282,7 +287,9 @@ echo "What is 2+2?" | \
 
 ---
 
-## 8. Performance Benchmarks (H100 PCIe, Qwen2.5-14B)
+## 8. Performance Benchmarks (H100 PCIe)
+
+### Qwen2.5-14B (14 billion parameters, 48 layers, 192 matmuls)
 
 | Phase | Time | Notes |
 |-------|------|-------|
@@ -293,6 +300,30 @@ echo "What is 2+2?" | \
 | Recursive STARK | 1.2s | 22,771 Poseidon perms, log_size=15 |
 | On-chain submission | ~15s | Model registration (once) + verify TX |
 | **Total per token (warm)** | **~72s** | Includes on-chain confirmation |
+
+### GLM-4-9B (9 billion parameters, 40 layers, 160 matmuls)
+
+| Phase | Time | Notes |
+|-------|------|-------|
+| Weight loading | ~80s | One-time (10 SafeTensor shards, 18 GB) |
+| Forward pass | ~56s | 160 matmuls, fused QKV auto-split |
+| GKR proof | 201s | 281 layer proofs, 160 matmul reductions |
+| Weight commitments | 0s | Warm cache |
+| Recursive STARK | 1.1s | 18,276 Poseidon perms, log_size=15 |
+| On-chain submission | ~15s | Auto-registration + verify TX |
+| **Total per token (warm)** | **~273s** | GLM uses CPU forward (GPU path coming) |
+
+### MiniMax-M2.5 (estimated — 256-expert MoE, requires 8× H100)
+
+| Phase | Estimated Time | Notes |
+|-------|---------------|-------|
+| Weight loading | ~10 min | 400 GB FP8, 8-way parallel shard loading |
+| Forward pass | ~5s | Only 8/256 experts active per token |
+| GKR proof | ~15s | ~496 matmuls (8 active experts × 62 layers) |
+| Weight commitments (cold) | ~30 min | 15,872 matrices, 8-way parallel |
+| Weight commitments (warm) | 0s | Cached after first run |
+| Recursive STARK | ~2s | Same constant-size compression |
+| **Total per token (warm)** | **~22s** | Requires 640 GB HBM3 (8× H100) |
 
 ---
 
@@ -353,15 +384,51 @@ echo "What is 2+2?" | \
 
 ## 11. Verified Proofs on Sepolia
 
-| TX | Model | Felts | Block |
-|----|-------|-------|-------|
-| [`0x38a156d...`](https://sepolia.starkscan.co/tx/0x38a156d972cdc111f40bca7dedf056f42031088daf434d3849a1352da713317) | Qwen2.5-14B | 1,007 | 8592348 |
-| [`0x67a7b92...`](https://sepolia.starkscan.co/tx/0x67a7b9259d874aa40d593ac55fa47f3c4db6836f20893db718334d56ac0f0d9) | Qwen2.5-14B | 927 | 8593213 |
-| [`0x5ce1b41...`](https://sepolia.starkscan.co/tx/0x5ce1b41815e29a7b3dd03b77187cf32c8c5f0e2607960303174cbea303edfd3) | Qwen2.5-14B | 946 | — |
+| TX | Model | Params | Felts | GKR | STARK |
+|----|-------|--------|-------|-----|-------|
+| [`0x5ce1b41...`](https://sepolia.starkscan.co/tx/0x5ce1b41815e29a7b3dd03b77187cf32c8c5f0e2607960303174cbea303edfd3) | Qwen2.5-14B | 14B | 946 | 46s | 1.2s |
+| [`0x542960d...`](https://sepolia.starkscan.co/tx/0x542960d703a62d4beaacf0d9094ea92dc86bf326cd917c533039f4dd1eb4a30) | GLM-4-9B | 9B | 929 | 201s | 1.1s |
+| [`0x16c9fa1...`](https://sepolia.starkscan.co/tx/0x16c9fa1a9da0a388125e4d27e11b8eff6dd663f911b38e0f799d12e4cf15feb) | GLM-4-9B | 9B | 970 | — | — |
+| [`0x67a7b92...`](https://sepolia.starkscan.co/tx/0x67a7b9259d874aa40d593ac55fa47f3c4db6836f20893db718334d56ac0f0d9) | Qwen2.5-14B | 14B | 927 | — | — |
+| [`0x38a156d...`](https://sepolia.starkscan.co/tx/0x38a156d972cdc111f40bca7dedf056f42031088daf434d3849a1352da713317) | Qwen2.5-14B | 14B | 1,007 | — | — |
+
+Two different model architectures (Qwen2 + ChatGLM), both verified on-chain in single transactions.
 
 ---
 
 ## 12. Troubleshooting
+
+### Model download script
+
+Use the interactive download script for any supported model:
+
+```bash
+./scripts/download_model.sh           # show all models
+./scripts/download_model.sh glm-4-9b  # download GLM-4
+./scripts/download_model.sh qwen2.5-14b
+```
+
+Or models auto-download when you point `OBELYSK_MODEL_DIR` at a model name:
+```bash
+# Auto-downloads THUDM/glm-4-9b if not present
+OBELYSK_MODEL_DIR=~/.obelyzk/models/glm-4-9b obelyzk chat --model local
+```
+
+### GLM-4 tokenizer
+
+GLM-4 uses a tiktoken-based tokenizer that needs conversion. If you see `tokenizer.json not found`:
+
+```bash
+pip install transformers tiktoken
+python3 -c "
+from transformers import AutoTokenizer
+tok = AutoTokenizer.from_pretrained('path/to/glm-4-9b', trust_remote_code=True)
+import json
+vocab = {tok.decode([i]): i for i in range(tok.vocab_size)}
+with open('path/to/glm-4-9b/tokenizer.json', 'w') as f:
+    json.dump({'version':'1.0','model':{'type':'BPE','vocab':vocab,'merges':[]}}, f)
+"
+```
 
 ### "CUDA not detected"
 
@@ -400,7 +467,60 @@ export RUST_MIN_STACK=16777216  # 16 MB stack
 
 ---
 
-## 13. Links
+## 13. SDKs
+
+### Rust (crates.io)
+
+```bash
+cargo add obelyzk  # v0.4.0
+```
+
+```rust
+use obelyzk::providers::local::LocalProvider;
+
+let provider = LocalProvider::load(Path::new("path/to/model"), None)?;
+let (text, ids, proof_meta) = provider.generate_with_proof("What is AI?", 1, |_, _, _| {})?;
+println!("TX: {:?}", proof_meta.tx_hash);
+println!("Explorer: {:?}", proof_meta.explorer_url);
+```
+
+### TypeScript (npm)
+
+```bash
+npm install @obelyzk/sdk  # v1.6.0
+```
+
+```typescript
+import { createStwoProverClient } from "@obelyzk/sdk";
+
+const prover = createStwoProverClient({ baseUrl: "http://localhost:9090" });
+const result = await prover.chat("What is AI?", { model: "local" });
+console.log(result.text);         // model output
+console.log(result.txHash);       // Starknet TX hash
+console.log(result.explorerUrl);  // Starkscan link
+console.log(result.calldataFelts); // ~950
+```
+
+### Python (PyPI)
+
+```bash
+pip install obelyzk  # v0.4.0
+```
+
+```python
+from obelyzk import Client
+
+client = Client("http://localhost:9090")
+result = client.chat("What is AI?")
+print(result["text"])           # model output
+print(result["tx_hash"])        # Starknet TX hash
+print(result["explorer_url"])   # Starkscan link
+print(result["calldata_felts"]) # ~950
+```
+
+---
+
+## 14. Links
 
 | Resource | URL |
 |----------|-----|
@@ -409,3 +529,4 @@ export RUST_MIN_STACK=16777216  # 16 MB stack
 | crates.io | https://crates.io/crates/obelyzk |
 | npm SDK | https://www.npmjs.com/package/@obelyzk/sdk |
 | PyPI SDK | https://pypi.org/project/obelyzk |
+| Download models | `./scripts/download_model.sh` |
