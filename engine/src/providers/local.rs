@@ -234,9 +234,10 @@ impl LocalProvider {
         ).map_err(|e| LocalProviderError::EmbedFailed(format!("{e}")))?;
 
         // Configure for on-chain proving path.
-        // Skip RMS² Part 0 (redundant with Part 1 linear sumcheck).
-        std::env::set_var("STWO_SKIP_RMS_SQ_PROOF", "1");
-        std::env::set_var("STWO_ALLOW_MISSING_NORM_PROOF", "1");
+        // Disable GPU forward pass — the GPU GEMV kernel has a reduction bug
+        // for large matrices (5120+) that produces slightly wrong intermediates,
+        // causing sumcheck claim mismatches. GPU sumcheck reductions are fine.
+        std::env::set_var("OBELYZK_GPU_FORWARD", "0");
 
         let proof = crate::aggregation::prove_model_pure_gkr_auto_with_cache(
             &self.graph, &input_matrix, &self.weights,
