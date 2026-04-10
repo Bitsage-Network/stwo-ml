@@ -85,6 +85,12 @@ pub trait IRecursiveVerifier<TContractState> {
         self: @TContractState, model_id: felt252,
     ) -> felt252;
 
+    /// Get full details of the last verification for a model.
+    /// Returns (io_commitment, proof_hash, timestamp, proof_felts, n_layers, trace_log_size, verification_count).
+    fn get_last_verification(
+        self: @TContractState, model_id: felt252,
+    ) -> (felt252, felt252, u64, u32, u32, u32, u64);
+
     /// Propose a contract class upgrade (owner only, subject to timelock).
     fn propose_upgrade(ref self: TContractState, new_class_hash: starknet::ClassHash);
 
@@ -128,6 +134,15 @@ pub mod RecursiveVerifierContract {
         /// Verification count per model.
         recursive_count: Map<felt252, u64>,
 
+        /// Last proof details per model (queryable on-chain).
+        /// model_id → (io_commitment, proof_hash, timestamp, proof_felts)
+        last_io: Map<felt252, felt252>,
+        last_proof_hash: Map<felt252, felt252>,
+        last_verified_at: Map<felt252, u64>,
+        last_proof_felts: Map<felt252, u32>,
+        last_n_layers: Map<felt252, u32>,
+        last_trace_log_size: Map<felt252, u32>,
+
         /// Pending upgrade class hash (0 = no pending upgrade).
         pending_upgrade: starknet::ClassHash,
 
@@ -164,7 +179,26 @@ pub mod RecursiveVerifierContract {
         pub model_id: felt252,
         #[key]
         pub proof_hash: felt252,
+        /// Poseidon hash of packed inference IO (input + output).
         pub io_commitment: felt252,
+        /// Poseidon hash of the model's circuit descriptor (architecture fingerprint).
+        pub circuit_hash: felt252,
+        /// Poseidon Merkle root binding all weight matrices.
+        pub weight_super_root: felt252,
+        /// Poseidon hash of the policy config used during proving.
+        pub policy_commitment: felt252,
+        /// Number of transformer layers in the model (e.g., 48 for Qwen2.5-14B).
+        pub n_layers: u32,
+        /// STARK trace log_size (log₂ of execution trace rows).
+        pub trace_log_size: u32,
+        /// Number of calldata felts in the STARK proof.
+        pub proof_felts: u32,
+        /// Verification sequence number for this model.
+        pub verification_count: u64,
+        /// Block timestamp of verification.
+        pub verified_at: u64,
+        /// Submitter address.
+        pub submitter: ContractAddress,
     }
 
     #[derive(Drop, starknet::Event)]
@@ -250,6 +284,7 @@ pub mod RecursiveVerifierContract {
             //   [15]     log_size: u32
             //   [16..)   CommitmentSchemeProof (Serde-compatible)
 
+            let stark_proof_data_len: u32 = stark_proof_data.len();
             let mut proof_span = stark_proof_data.span();
             assert!(proof_span.len() >= 20, "Proof too short");
 
@@ -271,8 +306,9 @@ pub mod RecursiveVerifierContract {
             let wr2: felt252 = *proof_span.pop_front().unwrap();
             let wr3: felt252 = *proof_span.pop_front().unwrap();
 
-            // Skip n_layers and verified (2 felts)
-            let _ = proof_span.pop_front().unwrap(); // n_layers
+            // Parse n_layers and verified
+            let n_layers_felt: felt252 = *proof_span.pop_front().unwrap();
+            let n_layers: u32 = n_layers_felt.try_into().unwrap_or(0);
             let _ = proof_span.pop_front().unwrap(); // verified
 
             let final_digest: felt252 = *proof_span.pop_front().unwrap();
@@ -355,16 +391,32 @@ pub mod RecursiveVerifierContract {
                 air, ref channel, stark_proof, commitment_scheme, 0, composition_commitment,
             );
 
-            // 6. Record verification
+            // 6. Record verification + rich on-chain state
             self.recursive_verified.write(proof_hash, true);
             let count = self.recursive_count.read(model_id);
             self.recursive_count.write(model_id, count + 1);
+            let block_ts = starknet::get_block_timestamp();
+            self.last_io.write(model_id, io_commitment);
+            self.last_proof_hash.write(model_id, proof_hash);
+            self.last_verified_at.write(model_id, block_ts);
+            self.last_proof_felts.write(model_id, stark_proof_data_len);
+            self.last_n_layers.write(model_id, n_layers);
+            self.last_trace_log_size.write(model_id, log_size);
 
-            // 7. Emit event
+            // 7. Emit rich verification event — full provenance in one TX
             self.emit(RecursiveProofVerified {
                 model_id,
                 proof_hash,
                 io_commitment,
+                circuit_hash: circuit_hash_packed,
+                weight_super_root: weight_root_packed,
+                policy_commitment: model.policy_commitment,
+                n_layers,
+                trace_log_size: log_size,
+                proof_felts: stark_proof_data_len,
+                verification_count: count + 1,
+                verified_at: block_ts,
+                submitter: get_caller_address(),
             });
 
             true
@@ -392,6 +444,20 @@ pub mod RecursiveVerifierContract {
             self: @ContractState, model_id: felt252,
         ) -> felt252 {
             self.recursive_models.read(model_id).policy_commitment
+        }
+
+        fn get_last_verification(
+            self: @ContractState, model_id: felt252,
+        ) -> (felt252, felt252, u64, u32, u32, u32, u64) {
+            (
+                self.last_io.read(model_id),
+                self.last_proof_hash.read(model_id),
+                self.last_verified_at.read(model_id),
+                self.last_proof_felts.read(model_id),
+                self.last_n_layers.read(model_id),
+                self.last_trace_log_size.read(model_id),
+                self.recursive_count.read(model_id),
+            )
         }
 
         fn propose_upgrade(ref self: ContractState, new_class_hash: starknet::ClassHash) {
