@@ -1,6 +1,6 @@
 [package]
 name = "obelyzk"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "obelyzk.rs — Verifiable AI engine built on STWO Circle STARKs. Provable inference for every model."
 license = "Apache-2.0"
@@ -38,8 +38,8 @@ tui = ["dep:ratatui", "dep:crossterm", "serde", "dep:serde_json", "dep:ureq"]
 metal = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
 [dependencies]
-stwo = { package = "stwo-gpu", path = "../stwo-gpu/crates/stwo", features = ["prover"] }
-stwo-constraint-framework = { package = "stwo-gpu-constraint-framework", path = "../stwo-gpu/crates/constraint-framework", features = ["prover"] }
+stwo = { package = "stwo-gpu", version = "2.0.0", path = "../stwo-gpu/crates/stwo", features = ["prover"] }
+stwo-constraint-framework = { package = "stwo-gpu-constraint-framework", version = "2.0.0", path = "../stwo-gpu/crates/constraint-framework", features = ["prover"] }
 tracing = "0.1"
 thiserror = "2"
 itertools = "0.12"
@@ -69,7 +69,7 @@ tokio-tungstenite = { version = "0.24", features = ["native-tls"], optional = tr
 futures-util = { version = "0.3", optional = true }
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 tokenizers = { version = "0.20", optional = true, default-features = false, features = ["onig"] }
-proof-stream = { path = "../proof-stream", optional = true }
+proof-stream = { version = "0.1.0", path = "../proof-stream", optional = true }
 wgpu = { version = "24", optional = true }
 pollster = { version = "0.4", optional = true }
 bytemuck = { version = "1.14", features = ["derive"], optional = true }
