@@ -394,6 +394,16 @@ echo "What is 2+2?" | \
 
 Two different model architectures (Qwen2 + ChatGLM), both verified on-chain in single transactions.
 
+### SDK-submitted proofs
+
+| SDK | TX | Felts |
+|-----|-----|-------|
+| Python (`pip install obelyzk`) | [`0x677694b...`](https://sepolia.starkscan.co/tx/0x677694b934d9bd6d8d2f984acb26b7aff8204d162e2bd929c729fee060fa890) | 892 |
+| TypeScript (`npm install @obelyzk/sdk`) | [`0x534424...`](https://sepolia.starkscan.co/tx/0x53442404ace74ca5391f90214ff5d4695c7ca4eefc5ea053a28464bceeecf42) | 1,007 |
+| curl (raw API) | [`0x4d868f...`](https://sepolia.starkscan.co/tx/0x4d868fe123f821af0b09c506f7307056ac23afe53f3d02a6d44ea6089f4b790) | 1,007 |
+
+All SDKs call `/v1/chat/completions` on the `obelyzk serve` instance. The server runs the full pipeline (GKR → STARK → on-chain) and returns `tx_hash` + `explorer_url` in the response.
+
 ---
 
 ## 12. Troubleshooting
