@@ -62,10 +62,39 @@ The binary is at `target/release/obelyzk`.
 
 ---
 
-## 3. Download a Model
+## 3. Supported Models
 
-### SmolLM2-135M (small, fast — good for testing)
+### Full ZK Proof (open weights — every operation cryptographically proven)
 
+| Model | Params | Architecture | Status | Download |
+|-------|--------|-------------|--------|----------|
+| **Qwen2.5-14B** | 14B | Qwen2 (GQA) | Verified on-chain | `huggingface-cli download Qwen/Qwen2.5-14B` |
+| **Qwen2.5-7B** | 7B | Qwen2 (GQA) | Supported | `huggingface-cli download Qwen/Qwen2.5-7B` |
+| **LLaMA-3.1-8B** | 8B | LLaMA (GQA) | Supported | `huggingface-cli download meta-llama/Llama-3.1-8B` |
+| **Mistral-7B** | 7B | Mistral (GQA+SWA) | Supported | `huggingface-cli download mistralai/Mistral-7B-v0.3` |
+| **Mixtral-8x7B** | 47B | MoE (8 experts) | Supported | `huggingface-cli download mistralai/Mixtral-8x7B-v0.1` |
+| **Phi-3-mini** | 3.8B | Phi (fused QKV) | Supported | `huggingface-cli download microsoft/Phi-3-mini-4k-instruct` |
+| **GLM-4-9B** | 9B | ChatGLM (fused QKV+GQA) | Supported (v0.4.0+) | `huggingface-cli download THUDM/glm-4-9b` |
+| **SmolLM2-135M** | 135M | SmolLM | Supported | See below |
+| **Gemma-2B** | 2B | Gemma | Supported | `huggingface-cli download google/gemma-2b` |
+| **MiniMax-M2.5** | 256B MoE | 256 experts, sigmoid | Config supported, needs FP8 dequant | — |
+| **Kimi-K2.5** | 1T MoE | MLA + 384 experts | Config supported, needs MLA attention | — |
+
+Any HuggingFace SafeTensors transformer with standard Q/K/V/O + SwiGLU FFN is auto-detected.
+GGUF format (Q4_K, Q8_0, F16, BF16) is also supported.
+
+### TLS Attestation (closed APIs — certificate-verified commitments)
+
+| Provider | Models | Status |
+|----------|--------|--------|
+| Anthropic | Claude 3.5/4 | Supported |
+| OpenAI | GPT-4o, o1, o3 | Supported |
+| MiniMax API | MiniMax-M2.5 | Planned |
+| Moonshot API | Kimi-K2.5 | Planned |
+
+### Download a Model
+
+**SmolLM2-135M** (small, fast — good for testing):
 ```bash
 mkdir -p ~/.obelyzk/models/smollm2-135m && cd $_
 for f in config.json model.safetensors tokenizer.json tokenizer_config.json; do
@@ -73,14 +102,18 @@ for f in config.json model.safetensors tokenizer.json tokenizer_config.json; do
 done
 ```
 
-### Qwen2.5-14B (production — 14 billion parameters)
-
+**Qwen2.5-14B** (production — 14B params, verified on Starknet):
 ```bash
 pip install huggingface_hub
 huggingface-cli download Qwen/Qwen2.5-14B --local-dir ~/.obelyzk/models/qwen2.5-14b
 ```
 
-> Qwen2.5-14B is ~30 GB. Weight loading takes ~125s on first run (one-time).
+**GLM-4-9B** (ChatGLM — fused QKV attention):
+```bash
+huggingface-cli download THUDM/glm-4-9b --local-dir ~/.obelyzk/models/glm-4-9b
+```
+
+> Large models (7B+) are ~15-30 GB. Weight loading takes ~125s on first run (cached after).
 
 ---
 
