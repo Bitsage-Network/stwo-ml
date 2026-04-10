@@ -686,14 +686,17 @@ fn render_chat(frame: &mut Frame, area: Rect, state: &InteractiveDashState, t: &
             let sc = match st.as_str() { "verified" => t.success, "proving" => t.accent_alt, _ => t.danger };
             spans.push(Span::styled(format!("  [{}]", st), Style::default().fg(sc)));
             if st == "proving" {
-                spans.push(Span::styled(format!(" {}", pulse(state.tick)), Style::default().fg(t.accent_alt)));
+                spans.push(Span::styled(format!(" {} {:.0}s", pulse(state.tick), state.proving_elapsed_secs), Style::default().fg(t.accent_alt)));
             }
         }
+        let mut lines = vec![Line::from(spans)];
         if let Some(ref tx) = m.tx_hash {
-            let short = if tx.len() > 18 { &tx[..18] } else { tx.as_str() };
-            spans.push(Span::styled(format!("  TX:{}", short), Style::default().fg(t.accent_soft)));
+            lines.push(Line::from(vec![
+                Span::styled("         TX: ", Style::default().fg(t.muted)),
+                Span::styled(tx.clone(), Style::default().fg(t.accent_soft)),
+            ]));
         }
-        ListItem::new(Line::from(spans))
+        ListItem::new(lines)
     }).collect();
 
     let empty_msg = if state.chat_messages.is_empty() {

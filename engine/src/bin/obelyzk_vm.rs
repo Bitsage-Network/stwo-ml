@@ -1000,7 +1000,18 @@ async fn run_dashboard() {
                 if let Some(felts) = meta["calldata_felts"].as_u64() {
                     state.stark_felts = Some(felts as usize);
                 }
-                state.stark_time_secs = Some(1.2);
+                if let Some(rt) = meta["prove_time_secs"].as_f64() {
+                    state.stark_time_secs = Some(rt);
+                } else {
+                    state.stark_time_secs = Some(state.proving_elapsed_secs);
+                }
+                // Update peak throughput
+                if state.proving_elapsed_secs > 0.0 {
+                    state.current_tok_per_sec = 1.0 / state.proving_elapsed_secs;
+                    if state.current_tok_per_sec > state.peak_tok_per_sec {
+                        state.peak_tok_per_sec = state.current_tok_per_sec;
+                    }
+                }
 
                 // Add on-chain TX
                 if let Some(ref tx) = tx_hash {
