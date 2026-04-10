@@ -4786,11 +4786,17 @@ where
             if let Some(inp) = node_outputs.get(&first_input) {
                 current = inp.clone();
             }
-            // Also update GPU tensor if we have one cached
+            // Sync GPU tensor: use cached GPU output if available,
+            // otherwise re-upload current (after CPU-only ops like RMSNorm/Add).
             #[cfg(feature = "cuda-runtime")]
-            if gpu_forward.is_some() {
+            if let Some((ref exec, _)) = gpu_forward {
                 if let Some(gt) = gpu_node_outputs.remove(&first_input) {
                     gpu_current = Some(gt);
+                } else if gpu_current.is_some() {
+                    // Previous node ran on CPU — re-upload current to keep GPU in sync
+                    if let Ok(gt) = exec.upload(&current) {
+                        gpu_current = Some(gt);
+                    }
                 }
             }
         }
