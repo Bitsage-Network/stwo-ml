@@ -176,7 +176,7 @@ huggingface-cli download THUDM/glm-4-9b --local-dir ~/.obelyzk/models/glm-4-9b
 
 ---
 
-## 4. Prove a Single Inference
+## 5. Prove a Single Inference
 
 ### One command — prove + recursive STARK + on-chain submission
 
@@ -224,7 +224,7 @@ node submit_recursive.mjs /tmp/obelyzk_recursive_prefill.json
 
 ---
 
-## 5. What's in the Proof
+## 6. What's in the Proof
 
 Each on-chain transaction contains these **named, decoded fields** visible in any block explorer:
 
@@ -250,7 +250,7 @@ The contract performs **full cryptographic STARK verification** on-chain:
 
 ---
 
-## 6. Verify a Proof Independently
+## 7. Verify a Proof Independently
 
 ### On the block explorer
 
@@ -323,7 +323,7 @@ echo "What is 2+2?" | \
 
 ---
 
-## 7. Contract Reference
+## 8. Contract Reference
 
 **Verifier contract**: [`0x1c208a5fe731c0d03b098b524f274c537587ea1d43d903838cc4a2bf90c40c7`](https://sepolia.starkscan.co/contract/0x1c208a5fe731c0d03b098b524f274c537587ea1d43d903838cc4a2bf90c40c7)
 
@@ -341,7 +341,7 @@ echo "What is 2+2?" | \
 
 ---
 
-## 8. Performance Benchmarks (H100 PCIe)
+## 9. Performance Benchmarks (H100 PCIe)
 
 ### Qwen2.5-14B (14 billion parameters, 48 layers, 192 matmuls)
 
@@ -381,7 +381,7 @@ echo "What is 2+2?" | \
 
 ---
 
-## 9. Architecture
+## 10. Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -421,7 +421,66 @@ echo "What is 2+2?" | \
 
 ---
 
-## 10. Environment Variables
+## 11. Interactive TUI Dashboard
+
+ObelyZK includes a live terminal dashboard that shows GPU workers, proving queue, sessions, and on-chain proof status in real time.
+
+### Run on the H100 (via bitsage shell)
+
+```bash
+bitsage shell h100-prover
+obelyzk dashboard
+```
+
+### Run locally (any supported model)
+
+```bash
+# SmolLM2-135M (fastest, good for testing)
+OBELYSK_MODEL_DIR=~/.obelyzk/models/smollm2-135m obelyzk dashboard
+
+# Qwen2.5-7B (smaller Qwen, fits consumer GPUs)
+OBELYSK_MODEL_DIR=~/.obelyzk/models/qwen2.5-7b obelyzk dashboard
+
+# GLM-4-9B
+OBELYSK_MODEL_DIR=~/.obelyzk/models/glm-4-9b obelyzk dashboard
+
+# Any model — auto-downloads if not present
+OBELYSK_MODEL_DIR=~/.obelyzk/models/mistral-7b obelyzk dashboard
+```
+
+Works on Linux (CUDA GPU) and macOS (CPU/Metal). The dashboard adapts to whatever model is loaded.
+
+### What it shows
+
+```
+ ┌─────────────────────────────────────────────────────────────┐
+ │  ObelyZK VM   ● Ready   0:42:17   0x1c20...0c7   Sepolia  │
+ ├─────────────────────────────────────────────────────────────┤
+ │  GPU Workers       │  Queue / Throughput  │  Sessions       │
+ │  · H100 (80GB)     │  Queued:    0        │  ses-a1b2 (3)   │
+ │    100% util       │  Proving:   1        │  ses-c3d4 (1)   │
+ │    78.2°C          │  1.2 tok/s proven    │                 │
+ ├─────────────────────────────────────────────────────────────┤
+ │  ON-CHAIN   Starknet Sepolia · 7 verified                  │
+ │  TX  0x677694b9...fa890   892 felts  46.0s prove  1.2s STARK│
+ │  ID  0x05e8dcc9...6eaf   IO 0x0313...b25a                  │
+ └─────────────────────────────────────────────────────────────┘
+```
+
+The dashboard updates live. Press `q` to exit, `s` for sessions, `g` for GPU details.
+
+### All subcommands
+
+| Command | Description |
+|---------|-------------|
+| `obelyzk serve` | Start OpenAI-compatible API server (port 8080) |
+| `obelyzk chat --model local` | Interactive verified chat (stdin/stdout) |
+| `obelyzk bench --tokens 8` | Throughput benchmark (N tokens batched) |
+| `obelyzk dashboard` | Live TUI monitor with on-chain status |
+
+---
+
+## 12. Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -436,7 +495,7 @@ echo "What is 2+2?" | \
 
 ---
 
-## 11. Verified Proofs on Sepolia
+## 13. Verified Proofs on Sepolia
 
 | TX | Model | Params | Felts | GKR | STARK |
 |----|-------|--------|-------|-----|-------|
@@ -460,7 +519,7 @@ All SDKs call `/v1/chat/completions` on the `obelyzk serve` instance. The server
 
 ---
 
-## 12. Troubleshooting
+## 14. Troubleshooting
 
 ### Model download script
 
@@ -531,7 +590,7 @@ export RUST_MIN_STACK=16777216  # 16 MB stack
 
 ---
 
-## 13. SDKs
+## 15. SDKs
 
 ### Rust (crates.io)
 
@@ -584,7 +643,7 @@ print(result["calldata_felts"]) # ~950
 
 ---
 
-## 14. Links
+## 16. Links
 
 | Resource | URL |
 |----------|-----|
