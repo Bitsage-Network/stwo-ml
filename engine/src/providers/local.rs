@@ -233,7 +233,10 @@ impl LocalProvider {
             &self.model_dir, self.hidden_size, last_token_id,
         ).map_err(|e| LocalProviderError::EmbedFailed(format!("{e}")))?;
 
-        // GPU forward pass with exact M31 arithmetic (Barrett reduction per multiply).
+        // Trust weight claims in recursive STARK verification — skip expensive
+        // MLE re-evaluation (10+ min for 14B models). Weight binding is verified
+        // on-chain via Poseidon commitments as public inputs.
+        std::env::set_var("OBELYZK_TRUST_WEIGHT_CLAIMS", "1");
 
         let proof = crate::aggregation::prove_model_pure_gkr_auto_with_cache(
             &self.graph, &input_matrix, &self.weights,

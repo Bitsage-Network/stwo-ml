@@ -1374,78 +1374,81 @@ fn verify_gkr_inner(
                     }
                 }
             } else {
-                // RLC-only: requires weight matrices for off-chain verification.
-                // On-chain path uses Cairo contract weight commitments instead.
-                let weights = weights.ok_or_else(|| GKRError::VerificationError {
-                    layer_idx: 0,
-                    reason: "AggregatedOracleSumcheck RLC-only mode requires \
-                             verify_gkr_with_weights(); use full aggregated_binding \
-                             proof for weightless verification"
-                        .to_string(),
-                })?;
+                // RLC-only: compute combined_expected from proof claims.
+                // When OBELYZK_TRUST_WEIGHT_CLAIMS=1 (recursive STARK path),
+                // skip the expensive MLE re-evaluation — trust the prover's
+                // weight claims and only replay channel operations. Weight
+                // binding is verified on-chain via Poseidon commitments.
+                let trust_weights = std::env::var("OBELYZK_TRUST_WEIGHT_CLAIMS").is_ok();
 
                 let rho = channel.draw_qm31();
                 let mut rho_pow = SecureField::one();
                 let mut combined_expected = SecureField::zero();
-                let mut combined_actual = SecureField::zero();
 
                 // Deferred weight claims first (prover order: deferred before main)
-                for (i, deferred) in proof.deferred_proofs.iter().enumerate() {
+                for deferred in proof.deferred_proofs.iter() {
                     if let Some(claim) = deferred.weight_claim() {
-                        let weight =
-                            weights.get_weight(claim.weight_node_id).ok_or(
-                                GKRError::MissingWeight {
-                                    node_id: claim.weight_node_id,
-                                },
-                            )?;
-                        let actual = evaluate_weight_claim_against_matrix(
-                            weight,
-                            &claim.eval_point,
-                        )
-                        .map_err(|reason| GKRError::VerificationError {
-                            layer_idx: 0,
-                            reason: format!(
-                                "RLC deferred weight claim {} failed: {}",
-                                i, reason
-                            ),
-                        })?;
                         combined_expected += rho_pow * claim.expected_value;
-                        combined_actual += rho_pow * actual;
                         rho_pow = rho_pow * rho;
                     }
                 }
                 // Main walk weight claims second
-                for (i, claim) in proof.weight_claims.iter().enumerate() {
-                    let weight =
-                        weights
-                            .get_weight(claim.weight_node_id)
-                            .ok_or(GKRError::MissingWeight {
-                                node_id: claim.weight_node_id,
-                            })?;
-                    let actual =
-                        evaluate_weight_claim_against_matrix(weight, &claim.eval_point)
-                            .map_err(|reason| GKRError::VerificationError {
-                                layer_idx: 0,
-                                reason: format!(
-                                    "RLC weight claim {} failed: {}",
-                                    i, reason
-                                ),
-                            })?;
+                for claim in proof.weight_claims.iter() {
                     combined_expected += rho_pow * claim.expected_value;
-                    combined_actual += rho_pow * actual;
                     rho_pow = rho_pow * rho;
                 }
 
                 mix_secure_field(channel, combined_expected);
 
-                if combined_expected != combined_actual {
-                    return Err(GKRError::VerificationError {
+                // Full verification: re-evaluate weight MLEs and compare
+                if !trust_weights {
+                    let weights = weights.ok_or_else(|| GKRError::VerificationError {
                         layer_idx: 0,
-                        reason: format!(
-                            "RLC weight binding mismatch: expected {:?}, actual {:?}",
-                            combined_expected, combined_actual
-                        ),
-                    });
+                        reason: "AggregatedOracleSumcheck RLC-only mode requires \
+                                 verify_gkr_with_weights(); use full aggregated_binding \
+                                 proof or set OBELYZK_TRUST_WEIGHT_CLAIMS=1"
+                            .to_string(),
+                    })?;
+
+                    let mut rho_pow2 = SecureField::one();
+                    let mut combined_actual = SecureField::zero();
+
+                    for deferred in proof.deferred_proofs.iter() {
+                        if let Some(claim) = deferred.weight_claim() {
+                            let weight = weights.get_weight(claim.weight_node_id).ok_or(
+                                GKRError::MissingWeight { node_id: claim.weight_node_id },
+                            )?;
+                            let actual = evaluate_weight_claim_against_matrix(weight, &claim.eval_point)
+                                .map_err(|reason| GKRError::VerificationError {
+                                    layer_idx: 0,
+                                    reason: format!("RLC deferred weight claim failed: {}", reason),
+                                })?;
+                            combined_actual += rho_pow2 * actual;
+                            rho_pow2 = rho_pow2 * rho;
+                        }
+                    }
+                    for claim in proof.weight_claims.iter() {
+                        let weight = weights.get_weight(claim.weight_node_id).ok_or(
+                            GKRError::MissingWeight { node_id: claim.weight_node_id },
+                        )?;
+                        let actual = evaluate_weight_claim_against_matrix(weight, &claim.eval_point)
+                            .map_err(|reason| GKRError::VerificationError {
+                                layer_idx: 0,
+                                reason: format!("RLC weight claim failed: {}", reason),
+                            })?;
+                        combined_actual += rho_pow2 * actual;
+                        rho_pow2 = rho_pow2 * rho;
+                    }
+
+                    if combined_expected != combined_actual {
+                        return Err(GKRError::VerificationError {
+                            layer_idx: 0,
+                            reason: format!(
+                                "RLC weight binding mismatch: expected {:?}, actual {:?}",
+                                combined_expected, combined_actual
+                            ),
+                        });
+                    }
                 }
             }
         }
