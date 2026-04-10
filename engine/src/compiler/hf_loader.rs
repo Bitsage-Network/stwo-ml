@@ -461,16 +461,25 @@ impl HfConfig {
             num_attention_heads: get_u64("num_attention_heads")
                 .ok_or_else(|| OnnxError::ParseError("missing num_attention_heads".into()))?
                 as usize,
+            // GLM uses multi_query_group_num instead of num_key_value_heads
             num_key_value_heads: get_u64("num_key_value_heads")
+                .or_else(|| get_u64("multi_query_group_num"))
                 .unwrap_or(get_u64("num_attention_heads").unwrap_or(1))
                 as usize,
+            // GLM uses ffn_hidden_size instead of intermediate_size
             intermediate_size: get_u64("intermediate_size")
-                .ok_or_else(|| OnnxError::ParseError("missing intermediate_size".into()))?
+                .or_else(|| get_u64("ffn_hidden_size"))
+                .ok_or_else(|| OnnxError::ParseError("missing intermediate_size/ffn_hidden_size".into()))?
                 as usize,
+            // GLM uses num_layers instead of num_hidden_layers
             num_hidden_layers: get_u64("num_hidden_layers")
-                .ok_or_else(|| OnnxError::ParseError("missing num_hidden_layers".into()))?
+                .or_else(|| get_u64("num_layers"))
+                .ok_or_else(|| OnnxError::ParseError("missing num_hidden_layers/num_layers".into()))?
                 as usize,
-            vocab_size: get_u64("vocab_size").unwrap_or(32000) as usize,
+            // GLM uses padded_vocab_size instead of vocab_size
+            vocab_size: get_u64("vocab_size")
+                .or_else(|| get_u64("padded_vocab_size"))
+                .unwrap_or(32000) as usize,
             hidden_act: get_str("hidden_act")
                 .or_else(|| get_str("hidden_activation"))
                 .unwrap_or("silu")
@@ -842,6 +851,8 @@ pub(crate) fn build_weight_name_map(
             format!("model.layers.{layer_idx}.self_attn.qkv_proj.weight"),
             // GPT-2 fused QKV
             format!("h.{layer_idx}.attn.c_attn.weight"),
+            // GLM-4 fused QKV
+            format!("transformer.encoder.layers.{layer_idx}.self_attention.query_key_value.weight"),
         ];
         for name in &q_candidates {
             if tensor_set.contains(name.as_str()) {
@@ -857,6 +868,8 @@ pub(crate) fn build_weight_name_map(
             format!("transformer.h.{layer_idx}.attn.o_proj.weight"),
             // GPT-2
             format!("h.{layer_idx}.attn.c_proj.weight"),
+            // GLM-4
+            format!("transformer.encoder.layers.{layer_idx}.self_attention.dense.weight"),
         ];
         for name in &o_candidates {
             if tensor_set.contains(name.as_str()) {
@@ -871,6 +884,8 @@ pub(crate) fn build_weight_name_map(
             format!("model.layers.{layer_idx}.mlp.gate_proj.weight"),
             format!("model.layers.{layer_idx}.feed_forward.w1.weight"),
             format!("transformer.h.{layer_idx}.mlp.gate_proj.weight"),
+            // GLM-4 gate_proj (part of fused dense_h_to_4h)
+            format!("transformer.encoder.layers.{layer_idx}.mlp.dense_h_to_4h.weight"),
         ];
         let mut found_gate = false;
         for name in &gate_candidates {
@@ -885,6 +900,8 @@ pub(crate) fn build_weight_name_map(
         if !found_gate {
             let fused_candidates = [
                 format!("model.layers.{layer_idx}.mlp.gate_up_proj.weight"),
+                // GLM-4 fused gate+up
+                format!("transformer.encoder.layers.{layer_idx}.mlp.dense_h_to_4h.weight"),
             ];
             for name in &fused_candidates {
                 if tensor_set.contains(name.as_str()) {
@@ -937,6 +954,8 @@ pub(crate) fn build_weight_name_map(
             format!("transformer.h.{layer_idx}.mlp.down_proj.weight"),
             // GPT-2
             format!("h.{layer_idx}.mlp.c_proj.weight"),
+            // GLM-4
+            format!("transformer.encoder.layers.{layer_idx}.mlp.dense_4h_to_h.weight"),
         ];
         for name in &down_candidates {
             if tensor_set.contains(name.as_str()) {
@@ -952,6 +971,8 @@ pub(crate) fn build_weight_name_map(
             format!("model.layers.{layer_idx}.input_layernorm.weight"),
             format!("model.layers.{layer_idx}.ln1.weight"),
             format!("transformer.h.{layer_idx}.ln_1.weight"),
+            // GLM-4
+            format!("transformer.encoder.layers.{layer_idx}.input_layernorm.weight"),
         ];
         for name in &pre_norm_candidates {
             if tensor_set.contains(name.as_str()) {
@@ -967,6 +988,8 @@ pub(crate) fn build_weight_name_map(
             format!("model.layers.{layer_idx}.post_attention_layernorm.weight"),
             format!("model.layers.{layer_idx}.ln2.weight"),
             format!("transformer.h.{layer_idx}.ln_2.weight"),
+            // GLM-4
+            format!("transformer.encoder.layers.{layer_idx}.post_attention_layernorm.weight"),
         ];
         for name in &post_norm_candidates {
             if tensor_set.contains(name.as_str()) {
@@ -982,6 +1005,8 @@ pub(crate) fn build_weight_name_map(
         "model.norm.weight".to_string(),
         "transformer.ln_f.weight".to_string(),
         "model.final_layernorm.weight".to_string(),
+        // GLM-4
+        "transformer.encoder.final_layernorm.weight".to_string(),
     ];
     for name in &final_norm_candidates {
         if tensor_set.contains(name.as_str()) {
@@ -1172,12 +1197,17 @@ fn load_weights_from_shards(
         if shape.len() == 2 {
             let tensor_rows = shape[0];
             let tensor_cols = shape[1];
-            // Check if this is a fused QKV: tensor has 3× the expected output dimension
-            // (Phi-3 qkv_proj [3*d, d] or GPT-2 c_attn [d, 3*d])
-            // Extract just the Q portion (first third)
-            if (tensor_rows == 3 * *n && tensor_cols == *k) || (tensor_cols == 3 * *n && tensor_rows == *k)
+            // Check if this is a fused QKV: tensor has more rows than expected
+            // Handles: Phi-3 [3d, d], GPT-2 [d, 3d], GLM-4 [(H+2*KV)*head, d]
+            // Extract just the Q portion (first n rows or columns)
+            let is_fused_qkv = (tensor_rows == 3 * *n && tensor_cols == *k)
+                || (tensor_cols == 3 * *n && tensor_rows == *k)
                 || (tensor_rows >= 2 * *n && tensor_rows != 2 * *n && tensor_cols == *k && tensor_rows % *n == 0)
-                || (tensor_cols >= 2 * *n && tensor_cols != 2 * *n && tensor_rows == *k && tensor_cols % *n == 0) {
+                || (tensor_cols >= 2 * *n && tensor_cols != 2 * *n && tensor_rows == *k && tensor_cols % *n == 0)
+                // GLM-4 GQA fused QKV: (num_heads + 2*num_kv_heads) * head_dim rows
+                // tensor_rows > n but tensor_rows < 2*n (e.g., 4608 > 4096 but < 8192)
+                || (tensor_rows > *n && tensor_rows < 2 * *n && tensor_cols == *k);
+            if is_fused_qkv {
                 let is_col_fused = tensor_cols > tensor_rows;
                 let multiplier = if is_col_fused { tensor_cols / *n } else { tensor_rows / *n };
 
@@ -2048,6 +2078,8 @@ const EMBED_CANDIDATES: &[&str] = &[
     "model.embed_tokens.weight",
     "transformer.wte.weight",
     "transformer.word_embeddings.weight",
+    // GLM-4
+    "transformer.embedding.word_embeddings.weight",
 ];
 
 /// Extract a single embedding row for a token ID from a HuggingFace model.
@@ -2227,6 +2259,8 @@ pub fn load_embedding_batch(
 const LM_HEAD_CANDIDATES: &[&str] = &[
     "lm_head.weight",
     "output.weight",
+    // GLM-4
+    "transformer.output_layer.weight",
 ];
 
 /// Project a hidden-state M31Matrix through lm_head (or tied embedding weights)
