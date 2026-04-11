@@ -265,6 +265,8 @@ pub fn prove_recursive_with_policy(
 
     let mut commitment_scheme =
         CommitmentSchemeProver::<SimdBackend, Poseidon252MerkleChannel>::new(config, &twiddles);
+    // Store polynomial coefficients for OODS evaluation during proving.
+    commitment_scheme.set_store_polynomials_coefficients();
 
     let chain_domain = CanonicCoset::new(chain_log_size).circle_domain();
     let hades_domain = CanonicCoset::new(hades_log_size).circle_domain();
@@ -287,7 +289,8 @@ pub fn prove_recursive_with_policy(
         eprintln!("  [Recursive] Channel after preprocessed commit: {:?}", channel.digest());
     }
 
-    // Tree 1: Execution traces
+    // Tree 1: All execution traces (chain + Hades in same tree, mixed sizes)
+    // STWO's tree builder supports mixed-size columns within one commit.
     {
         let mut tree_builder = commitment_scheme.tree_builder();
 
@@ -304,7 +307,7 @@ pub fn prove_recursive_with_policy(
             convert_evaluations::<SimdBackend, SimdBackend, M31>(chain_evals),
         );
 
-        // Hades columns: only included when Hades AIR is enabled
+        // Hades columns: 590 columns at hades_log_size (in same tree)
         if hades_enabled {
             let hades_evals: Vec<CircleEvaluation<SimdBackend, M31, _>> = hades_trace
                 .trace
@@ -320,8 +323,7 @@ pub fn prove_recursive_with_policy(
         }
 
         tree_builder.commit(channel);
-        eprintln!(
-            "  [Recursive] Channel after trace commit: {:?} (chain: {} cols @ log{}{})",
+        eprintln!("  [Recursive] Channel after trace commit: {:?} (chain: {} cols @ log{}{})",
             channel.digest(),
             trace_data.execution_trace.len(), chain_log_size,
             if hades_enabled { format!(", hades: {} cols @ log{}", hades_trace.trace.len(), hades_log_size) }
