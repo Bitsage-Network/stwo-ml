@@ -139,20 +139,23 @@ pub const N_PARTIAL_ROUNDS: usize = 83;
 /// Total rounds per Hades permutation: 4 full + 83 partial + 4 full = 91.
 pub const N_ROUNDS: usize = N_FULL_ROUNDS_HALF + N_PARTIAL_ROUNDS + N_FULL_ROUNDS_HALF; // 91
 
+/// Columns per multiplication witness: 27 carries + 28 k_limbs = 55.
+pub const MUL_WITNESS_COLS: usize = 27 + LIMBS_28; // 55
+
 /// Trace columns per Hades round row.
 ///
 /// Breakdown:
-///   state_before:     3 × 28 = 84
-///   sbox_input:       3 × 28 = 84   (state_before + round_constant)
-///   cube_result:      3 × 28 = 84
-///   cube_sq_aux:      3 × 28 = 84
-///   mul_carries+k:    6 × 28 = 168  (6 multiplications: 3 elements × 2 muls each)
-///   mds_result:       3 × 28 = 84
-///   mds_carries+k:    3 × 28 = 84
-///   is_full_round:    1
-///   is_real:          1
-///   Total: 674
-pub const N_HADES_TRACE_COLUMNS: usize = 674;
+///   state_before:        3 × 28 = 84
+///   sbox_input:          3 × 28 = 84   (state_before + round_constant)
+///   cube_result:         3 × 28 = 84   (sbox_output)
+///   cube_sq_aux:         3 × 28 = 84   (x² intermediate)
+///   mul_witness:         6 × 55 = 330  (6 muls: 27 carries + 28 k_limbs each)
+///   mds_result:          3 × 28 = 84
+///   mds_carries+k_val:   3 × 28 = 84   (MDS uses small k, single value ok)
+///   is_full_round:       1
+///   is_real:             1
+///   Total: 836
+pub const N_HADES_TRACE_COLUMNS: usize = 836;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Felt252 in 9-bit limbs
@@ -268,12 +271,12 @@ pub fn verify_mul_252_constraint<E: EvalAtRow>(
     a: &[E::F; LIMBS_28],
     b: &[E::F; LIMBS_28],
     c: &[E::F; LIMBS_28],
-    k: &E::F,
+    k_limbs: &[E::F; LIMBS_28],
     carries: &[E::F; 27],
     eval: &mut E,
     p_limbs: &[u32; LIMBS_28],
     is_active: &E::F,
-    range_check: Option<&RangeCheck20>,
+    _range_check: Option<&RangeCheck20>,
 ) {
     let base = E::F::from(M31::from(512)); // 2^9
     let zero = E::F::from(M31::from(0));
@@ -288,18 +291,24 @@ pub fn verify_mul_252_constraint<E: EvalAtRow>(
             }
         }
 
-        // Expected: conv = c[j] + k * p[j] + carry_out * 512 - carry_in
-        let p_j = E::F::from(M31::from(p_limbs[j]));
+        // k*P at position j = Σ k_limbs[l] * p_limbs[j-l]
+        let mut kp_j = zero.clone();
+        for l in 0..=j {
+            if l < LIMBS_28 && (j - l) < LIMBS_28 {
+                kp_j = kp_j + k_limbs[l].clone() * E::F::from(M31::from(p_limbs[j - l]));
+            }
+        }
+
         let carry_in = if j == 0 { zero.clone() } else { carries[j - 1].clone() };
         let carry_out = if j < 27 { carries[j].clone() } else { zero.clone() };
 
         let rhs = c[j].clone()
-            + k.clone() * p_j
+            + kp_j
             + carry_out.clone() * base.clone()
             - carry_in;
 
         // Constraint: is_active * (conv - rhs) = 0
-        // Degree 3 (a[i]*b[j-i] is degree 2, times selector = degree 3).
+        // Degree 3: (a[i]*b[j-i]) * is_active, or (k_limbs[l]*p) * is_active.
         eval.add_constraint(is_active.clone() * (conv - rhs));
     }
 }
@@ -315,9 +324,9 @@ pub fn cube_252_constraint<E: EvalAtRow>(
     x: &[E::F; LIMBS_28],
     x_sq: &[E::F; LIMBS_28],
     x_cubed: &[E::F; LIMBS_28],
-    k_sq: &E::F,
+    k_sq_limbs: &[E::F; LIMBS_28],
     carries_sq: &[E::F; 27],
-    k_cube: &E::F,
+    k_cube_limbs: &[E::F; LIMBS_28],
     carries_cube: &[E::F; 27],
     eval: &mut E,
     p_limbs: &[u32; LIMBS_28],
@@ -325,10 +334,10 @@ pub fn cube_252_constraint<E: EvalAtRow>(
     range_check: Option<&RangeCheck20>,
 ) {
     // x * x = x_sq (mod P)
-    verify_mul_252_constraint::<E>(x, x, x_sq, k_sq, carries_sq, eval, p_limbs, is_active, range_check);
+    verify_mul_252_constraint::<E>(x, x, x_sq, k_sq_limbs, carries_sq, eval, p_limbs, is_active, range_check);
 
     // x_sq * x = x_cubed (mod P)
-    verify_mul_252_constraint::<E>(x_sq, x, x_cubed, k_cube, carries_cube, eval, p_limbs, is_active, range_check);
+    verify_mul_252_constraint::<E>(x_sq, x, x_cubed, k_cube_limbs, carries_cube, eval, p_limbs, is_active, range_check);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -681,16 +690,17 @@ impl FrameworkEval for HadesVerifierEval {
             }
         }
 
-        // Multiplication witness: carries + k for 6 multiplications
-        // (3 elements × 2 muls per cube = 6 total)
+        // Multiplication witness: 27 carries + 28 k_limbs per multiplication (6 total)
         let mut mul_carries: [[[E::F; 27]; 2]; 3] = std::array::from_fn(|_| std::array::from_fn(|_| std::array::from_fn(|_| zero_f())));
-        let mut mul_k: [[E::F; 2]; 3] = std::array::from_fn(|_| std::array::from_fn(|_| zero_f()));
+        let mut mul_k_limbs: [[[[E::F; LIMBS_28]; 1]; 2]; 3] = std::array::from_fn(|_| std::array::from_fn(|_| std::array::from_fn(|_| std::array::from_fn(|_| zero_f()))));
         for elem in 0..3 {
             for mul_idx in 0..2 {
                 for j in 0..27 {
                     mul_carries[elem][mul_idx][j] = eval.next_trace_mask();
                 }
-                mul_k[elem][mul_idx] = eval.next_trace_mask();
+                for j in 0..LIMBS_28 {
+                    mul_k_limbs[elem][mul_idx][0][j] = eval.next_trace_mask();
+                }
             }
         }
 
@@ -752,14 +762,13 @@ impl FrameworkEval for HadesVerifierEval {
         let rc_ref = self.range_check.as_ref();
         for elem in 0..3 {
             if elem < 2 {
-                // Elements 0,1: cubed only in full rounds
                 cube_252_constraint::<E>(
                     &sbox_input[elem],
                     &cube_sq[elem],
                     &cube_result[elem],
-                    &mul_k[elem][0],
+                    &mul_k_limbs[elem][0][0],
                     &mul_carries[elem][0],
-                    &mul_k[elem][1],
+                    &mul_k_limbs[elem][1][0],
                     &mul_carries[elem][1],
                     &mut eval,
                     &p_limbs,
@@ -767,14 +776,13 @@ impl FrameworkEval for HadesVerifierEval {
                     rc_ref,
                 );
             } else {
-                // Element 2: cubed in ALL rounds
                 cube_252_constraint::<E>(
                     &sbox_input[2],
                     &cube_sq[2],
                     &cube_result[2],
-                    &mul_k[2][0],
+                    &mul_k_limbs[2][0][0],
                     &mul_carries[2][0],
-                    &mul_k[2][1],
+                    &mul_k_limbs[2][1][0],
                     &mul_carries[2][1],
                     &mut eval,
                     &p_limbs,
@@ -796,10 +804,8 @@ impl FrameworkEval for HadesVerifierEval {
             }
         }
 
-        // ── MDS constraint (temporarily disabled for debugging) ─────
-        // TODO: re-enable once S-box constraints verified
-        let _mds_disabled = true;
-        if false { mds_constraint::<E>(
+        // ── MDS constraint ───────────────────────────────────────────
+        mds_constraint::<E>(
             &cube_result[0],
             &cube_result[1],
             &cube_result[2],
@@ -816,7 +822,7 @@ impl FrameworkEval for HadesVerifierEval {
             &p_limbs,
             &is_real,
             rc_ref,
-        ); }
+        );
 
         eval
     }
@@ -959,9 +965,7 @@ pub fn build_hades_trace(
             }
             col += 3 * LIMBS_28; // 252
 
-            // Multiplication carries + k: 6 × 28 = 168
-            // For partial rounds, elements 0,1 pass through (not cubed).
-            // Only compute carries when the cube constraint is active.
+            // Multiplication witness: 6 × 55 = 330 (27 carries + 28 k_limbs each)
             for elem in 0..3 {
                 let should_compute = is_full || elem == 2;
                 for mul_idx in 0..2 {
@@ -971,14 +975,15 @@ pub fn build_hades_trace(
                         } else {
                             (&round.sbox_sq[elem], &round.sbox_input[elem], &round.sbox_output[elem])
                         };
-                        let (carries, k) = compute_mul_witness(a_fe, b_fe, c_fe);
+                        let (carries, k_limbs) = compute_mul_witness(a_fe, b_fe, c_fe);
                         for j in 0..27 {
                             trace[col + j][row] = i64_to_m31(carries[j]);
                         }
-                        trace[col + 27][row] = i64_to_m31(k);
+                        for j in 0..LIMBS_28 {
+                            trace[col + 27 + j][row] = i64_to_m31(k_limbs[j]);
+                        }
                     }
-                    // else: leave as zero (constraint gated by is_full_round)
-                    col += 28;
+                    col += MUL_WITNESS_COLS; // 55
                 }
             }
             // col now at 252 + 168 = 420
@@ -1181,11 +1186,12 @@ fn mds_mix(state: &[FieldElement; 3]) -> [FieldElement; 3] {
 /// Returns `(carries[27], k)` where:
 ///   conv[j] = Σ a_limb[i] * b_limb[j-i]
 ///   conv[j] = c_limb[j] + k * p_limb[j] + carry[j] * 512 - carry[j-1]
+/// Returns (carries[27], k_limbs[28]) for the multiplication witness.
 fn compute_mul_witness(
     a: &FieldElement,
     b: &FieldElement,
     c: &FieldElement,
-) -> ([i64; 27], i64) {
+) -> ([i64; 27], [i64; LIMBS_28]) {
     let a_limbs = felt252_to_9bit_limbs(a);
     let b_limbs = felt252_to_9bit_limbs(b);
     let c_limbs = felt252_to_9bit_limbs(c);
@@ -1210,41 +1216,58 @@ fn compute_mul_witness(
         if diff_limbs[j] < 0 { diff_limbs[j] += 512; carry = remainder / 512 - 1; }
         else { carry = remainder / 512; }
     }
+    diff_limbs[55] = carry; // store any remaining carry
+    #[cfg(test)]
+    eprintln!("diff_limbs[54]={}, diff_limbs[55]={}", diff_limbs[54], diff_limbs[55]);
 
-    // Step 2: diff_limbs now represents k*P in base 512.
-    // Divide by P to get k. Since P's highest nonzero limb is p[27]=256,
-    // start from the highest diff limb and long-divide.
-    // k has at most 28 limbs (k < P).
-    let mut k_limbs = [0i64; LIMBS_28];
-    let mut rem = [0i64; 56];
-    rem.copy_from_slice(&diff_limbs);
-
-    // Long division: rem / P = k, working from highest limb down.
-    // P in limbs: p[0]=1, p[21]=136, p[27]=256, rest=0.
-    for i in (0..LIMBS_28).rev() {
-        // The quotient digit at position i:
-        // rem[i + 27] / p[27] = rem[i + 27] / 256
-        if i + 27 < 56 {
-            let q = rem[i + 27] / 256;
-            k_limbs[i] = q;
-            // Subtract q * P shifted by i positions
-            rem[i] -= q * 1; // p[0]=1
-            if i + 21 < 56 { rem[i + 21] -= q * 136; } // p[21]=136
-            if i + 27 < 56 { rem[i + 27] -= q * 256; } // p[27]=256
-            // Propagate borrows
-            for j in i..55 {
-                if rem[j] < 0 {
-                    let borrow = (-rem[j] + 511) / 512;
-                    rem[j] += borrow * 512;
-                    rem[j + 1] -= borrow;
+    // Step 2: convert diff_limbs to bytes and divide by P using byte-level arithmetic.
+    // diff_limbs is the unreduced product minus c, in base 512, up to 55 limbs.
+    // Convert to little-endian bytes.
+    let mut diff_bytes = [0u8; 64];
+    {
+        let mut bit_pos = 0usize;
+        for j in 0..56 {
+            let val = diff_limbs[j].max(0) as u64;
+            for b in 0..9 {
+                if (val >> b) & 1 == 1 {
+                    let byte_idx = (bit_pos + b) / 8;
+                    let bit_idx = (bit_pos + b) % 8;
+                    if byte_idx < 64 { diff_bytes[byte_idx] |= 1 << bit_idx; }
                 }
             }
+            bit_pos += 9;
         }
     }
 
-    // Step 3: compute carry chain with the found k
-    // k as a single value (reconstruct from limbs)
-    // For the carry chain, we need k*p[j] for each j.
+    // P in little-endian bytes
+    let p_le: [u8; 32] = [
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08,
+    ];
+
+    // Divide diff_bytes (64 bytes) by p_le (32 bytes) → k_bytes (32 bytes)
+    let k_bytes = bigint_div_le(&diff_bytes, &p_le);
+
+    // Convert k_bytes to 9-bit limbs
+    let mut k_limbs = [0i64; LIMBS_28];
+    {
+        let mut bit_pos = 0usize;
+        for limb in k_limbs.iter_mut() {
+            let mut acc = 0i64;
+            for b in 0..9 {
+                let byte_idx = (bit_pos + b) / 8;
+                let bit_idx = (bit_pos + b) % 8;
+                if byte_idx < 32 {
+                    acc |= (((k_bytes[byte_idx] >> bit_idx) & 1) as i64) << b;
+                }
+            }
+            *limb = acc;
+            bit_pos += 9;
+        }
+    }
+
     // Step 3: compute carry chain using k_limbs convolved with p_limbs.
     // The AIR constraint uses a SINGLE k value, not k_limbs.
     // But the carry chain equation is:
@@ -1278,17 +1301,7 @@ fn compute_mul_witness(
         carry_val = new_carry;
     }
 
-    // Return k as a single value (for the AIR constraint's k*p[j] term).
-    // The AIR expects a SINGLE k, but we computed k_limbs.
-    // For the constraint, k is used as: k * p_limbs[j] (scalar × limb).
-    // This works if k fits in a single M31 value (< 2^31).
-    // Since k < P < 2^252, we need k_limbs in the constraint too.
-    //
-    // WORKAROUND: the carries absorb the k*P term entirely.
-    // Set k=0 in the AIR constraint and let the carries handle everything.
-    // The constraint becomes: conv = c + carry*512 - carry_prev
-    // This is valid because the carries encode the full correction.
-    (carries, 0)
+    (carries, k_limbs)
 }
 
 /// Compute MDS witness carries for one output element.
@@ -1357,6 +1370,73 @@ fn compute_mds_witness(
 // ═══════════════════════════════════════════════════════════════════════
 // Big integer helpers for witness computation
 // ═══════════════════════════════════════════════════════════════════════
+
+/// Divide a big integer (numerator, LE bytes) by a divisor (LE bytes).
+/// Returns quotient as 32 LE bytes. Uses schoolbook bit-level long division.
+fn bigint_div_le(numerator: &[u8; 64], divisor: &[u8; 32]) -> [u8; 32] {
+    // Convert to big-endian for easier MSB-first division
+    let mut num_be = *numerator;
+    num_be.reverse();
+    let mut div_be = [0u8; 64]; // Pad divisor to 64 bytes
+    div_be[32..64].copy_from_slice(divisor);
+    div_be[32..64].reverse();
+
+    // Bit-level long division: process one bit at a time from MSB
+    let mut quotient = [0u8; 64];
+    let mut remainder = [0u8; 64];
+
+    for bit in 0..(64 * 8) {
+        // Shift remainder left by 1 bit
+        let mut carry = 0u8;
+        for j in (0..64).rev() {
+            let new_carry = remainder[j] >> 7;
+            remainder[j] = (remainder[j] << 1) | carry;
+            carry = new_carry;
+        }
+        // Bring down next bit from numerator
+        let byte_idx = bit / 8;
+        let bit_idx = 7 - (bit % 8);
+        remainder[63] |= (num_be[byte_idx] >> bit_idx) & 1;
+
+        // If remainder >= divisor, subtract and set quotient bit
+        if bigint_ge(&remainder, &div_be) {
+            bigint_sub_inplace(&mut remainder, &div_be);
+            let q_byte = bit / 8;
+            let q_bit = 7 - (bit % 8);
+            quotient[q_byte] |= 1 << q_bit;
+        }
+    }
+
+    // Convert quotient to LE, take low 32 bytes
+    quotient.reverse();
+    let mut result = [0u8; 32];
+    result.copy_from_slice(&quotient[..32]);
+    result
+}
+
+/// Compare two big-endian byte arrays: a >= b
+fn bigint_ge(a: &[u8; 64], b: &[u8; 64]) -> bool {
+    for i in 0..64 {
+        if a[i] > b[i] { return true; }
+        if a[i] < b[i] { return false; }
+    }
+    true // equal
+}
+
+/// Subtract b from a in-place (big-endian). Assumes a >= b.
+fn bigint_sub_inplace(a: &mut [u8; 64], b: &[u8; 64]) {
+    let mut borrow = 0i16;
+    for i in (0..64).rev() {
+        let diff = a[i] as i16 - b[i] as i16 - borrow;
+        if diff < 0 {
+            a[i] = (diff + 256) as u8;
+            borrow = 1;
+        } else {
+            a[i] = diff as u8;
+            borrow = 0;
+        }
+    }
+}
 
 /// Simple 512-bit unsigned integer for witness computation.
 /// Only used during trace generation, not in constraints.
@@ -1516,7 +1596,7 @@ mod tests {
         let c_limbs = felt252_to_9bit_limbs(&c);
         let p_limbs = stark_prime_9bit_limbs();
 
-        let (carries, k) = compute_mul_witness(&a, &b, &c);
+        let (carries, k_limbs_val) = compute_mul_witness(&a, &b, &c);
 
         // Check each limb constraint in M31 arithmetic
         let base = M31::from(512u32);
@@ -1527,15 +1607,19 @@ mod tests {
                     conv = conv + a_limbs[i] * b_limbs[j - i];
                 }
             }
+            // k*P at position j = Σ k_limbs[l] * p_limbs[j-l]
+            let mut kp_j = M31::from(0u32);
+            for l in 0..=j {
+                if l < LIMBS_28 && (j - l) < LIMBS_28 {
+                    kp_j = kp_j + i64_to_m31(k_limbs_val[l]) * M31::from(p_limbs[j - l]);
+                }
+            }
             let carry_in = if j == 0 { M31::from(0u32) } else { i64_to_m31(carries[j-1]) };
             let carry_out = if j < 27 { i64_to_m31(carries[j]) } else { M31::from(0u32) };
-            let p_j = M31::from(p_limbs[j]);
-            let k_m31 = i64_to_m31(k);
 
-            let rhs = c_limbs[j] + k_m31 * p_j + carry_out * base - carry_in;
+            let rhs = c_limbs[j] + kp_j + carry_out * base - carry_in;
             assert_eq!(conv, rhs,
-                "Mul constraint fails at limb {j}: conv={:?}, rhs={:?}, k={k}, carry_in={:?}, carry_out={:?}",
-                conv.0, rhs.0, carry_in.0, carry_out.0);
+                "Mul constraint fails at limb {j}: conv={}, rhs={}", conv.0, rhs.0);
         }
     }
 
@@ -1554,7 +1638,7 @@ mod tests {
         // Check cube for element 0: sbox_input[0]^2 = sbox_sq[0]
         let a = &round.sbox_input[0];
         let c = &round.sbox_sq[0];
-        let (carries, k) = compute_mul_witness(a, a, c);
+        let (carries, k_limbs_val) = compute_mul_witness(a, a, c);
 
         let a_limbs = felt252_to_9bit_limbs(a);
         let c_limbs = felt252_to_9bit_limbs(c);
@@ -1567,17 +1651,71 @@ mod tests {
                     conv = conv + a_limbs[i] * a_limbs[j - i];
                 }
             }
+            let mut kp_j = M31::from(0u32);
+            for l in 0..=j {
+                if l < LIMBS_28 && (j - l) < LIMBS_28 {
+                    kp_j = kp_j + i64_to_m31(k_limbs_val[l]) * M31::from(p_limbs[j - l]);
+                }
+            }
             let carry_in = if j == 0 { M31::from(0u32) } else { i64_to_m31(carries[j-1]) };
             let carry_out = if j < 27 { i64_to_m31(carries[j]) } else { M31::from(0u32) };
-            let p_j = M31::from(p_limbs[j]);
-            let k_m31 = i64_to_m31(k);
 
-            // k=0 approach: k*P is absorbed into carries
-            let rhs = c_limbs[j] + k_m31 * p_j + carry_out * base - carry_in;
+            let rhs = c_limbs[j] + kp_j + carry_out * base - carry_in;
             assert_eq!(conv, rhs,
-                "S-box constraint fails at limb {j}: conv={}, rhs={}, k={k}, carry_in={}, carry_out={}", conv.0, rhs.0, carry_in.0, carry_out.0);
+                "S-box constraint fails at limb {j}: conv={}, rhs={}", conv.0, rhs.0);
         }
         eprintln!("Hades round 0 S-box constraint verified in M31 ✓");
+    }
+
+    #[test]
+    fn test_bigint_div_le_known_case() {
+        // k = (sbox_input^2 - sq) / P for a known Hades round
+        // k = 0x551ea9567d342910398cb38360e087859468eee334bc275b8ff92f073911d4e (Python)
+        let k_expected_hex = "0x551ea9567d342910398cb38360e087859468eee334bc275b8ff92f073911d4e";
+        let k_expected = FieldElement::from_hex_be(k_expected_hex).unwrap();
+
+        // sbox_input = 1 + first_round_constant
+        let rc0 = FieldElement::from_dec_str(
+            "2950795762459345168613727575620414179244544320470208355568817838579231751791"
+        ).unwrap();
+        let sbox_input = FieldElement::ONE + rc0;
+        let sq = sbox_input * sbox_input;
+
+        let (carries, k_limbs) = compute_mul_witness(&sbox_input, &sbox_input, &sq);
+
+        // Reconstruct k from k_limbs and verify
+        let k_reconstructed = limbs_9bit_to_felt252(&k_limbs.map(|v| M31::from_u32_unchecked(v.max(0) as u32)));
+        eprintln!("k expected:      {:?}", k_expected);
+        eprintln!("k reconstructed: {:?}", k_reconstructed);
+        // The felt252 comparison checks the low 252 bits
+        assert_eq!(k_reconstructed, k_expected, "k_limbs don't reconstruct to expected k");
+
+        // Also verify the carry chain
+        let a_limbs = felt252_to_9bit_limbs(&sbox_input);
+        let c_limbs = felt252_to_9bit_limbs(&sq);
+        let p_limbs = stark_prime_9bit_limbs();
+        let base = M31::from(512u32);
+
+        for j in 0..LIMBS_28 {
+            let mut conv = M31::from(0u32);
+            for i in 0..=j {
+                if i < LIMBS_28 && (j - i) < LIMBS_28 {
+                    conv = conv + a_limbs[i] * a_limbs[j - i];
+                }
+            }
+            let mut kp_j = M31::from(0u32);
+            for l in 0..=j {
+                if l < LIMBS_28 && (j - l) < LIMBS_28 {
+                    kp_j = kp_j + i64_to_m31(k_limbs[l]) * M31::from(p_limbs[j - l]);
+                }
+            }
+            let carry_in = if j == 0 { M31::from(0u32) } else { i64_to_m31(carries[j-1]) };
+            let carry_out = if j < 27 { i64_to_m31(carries[j]) } else { M31::from(0u32) };
+
+            let rhs = c_limbs[j] + kp_j + carry_out * base - carry_in;
+            assert_eq!(conv, rhs, "Constraint fails at limb {j}");
+        }
+        eprintln!("Hades round S-box with k_limbs: all 28 limb constraints hold ✓");
     }
 
     #[test]
