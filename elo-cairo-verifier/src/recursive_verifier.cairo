@@ -357,12 +357,32 @@ pub mod RecursiveVerifierContract {
                 + wr3;
             assert(circuit_hash_packed == model.circuit_hash, 'Circuit hash mismatch');
             assert(weight_root_packed == model.weight_super_root, 'Weight binding mismatch');
-            // The io_commitment, n_layers, and other metadata are cryptographically
-            // bound to the proof via the Fiat-Shamir channel (mixed below).
-            // A proof generated with different values will fail STARK verification.
-            // Additionally, validate the caller-supplied n_layers matches the proof:
+
+            // Cross-check ALL caller parameters against the proof body.
+            // This prevents the relabeling attack: same proof body, different
+            // caller metadata. Every value emitted in the event MUST match
+            // what's cryptographically bound inside the proof.
+
+            // io_commitment: pack proof body's QM31 → felt252, compare with caller
+            let io_packed = io0 * 0x80000000 * 0x80000000 * 0x80000000
+                + io1 * 0x80000000 * 0x80000000
+                + io2 * 0x80000000
+                + io3;
+            assert(io_commitment == io_packed, 'io_commitment mismatch (proof)');
+
+            // n_layers: compare caller param with proof body
             let proof_n_layers_u32: u32 = proof_n_layers.try_into().unwrap();
             assert(n_layers == proof_n_layers_u32, 'n_layers mismatch (param/proof)');
+
+            // policy_commitment: check against registered model
+            assert(
+                policy_commitment == model.policy_commitment
+                    || model.policy_commitment == 0,
+                'Policy mismatch'
+            );
+
+            // trace_log_size: must match proof body
+            assert(trace_log_size == proof_log_size, 'trace_log_size mismatch');
 
             // Build RecursiveAir from public inputs.
             // Initial digest is always zero (fresh Poseidon channel).
