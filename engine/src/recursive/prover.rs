@@ -95,7 +95,27 @@ pub fn prove_recursive(
     io_commitment: QM31,
     gkr_prove_time_secs: f64,
 ) -> Result<RecursiveProof, RecursiveError> {
-    prove_recursive_with_policy(circuit, gkr_proof, output, weights, weight_super_root, io_commitment, gkr_prove_time_secs, None)
+    // Reconstruct the felt252 from the QM31 (lossy — only low 124 bits).
+    // Callers with the original felt252 should use prove_recursive_with_policy directly.
+    let io_felt252 = crate::crypto::poseidon_channel::securefield_to_felt(io_commitment);
+    prove_recursive_with_io(circuit, gkr_proof, output, weights, weight_super_root, io_commitment, io_felt252, gkr_prove_time_secs, None)
+}
+
+/// Prove with the original felt252 io_commitment preserved for on-chain cross-check.
+pub fn prove_recursive_with_io(
+    circuit: &LayeredCircuit,
+    gkr_proof: &GKRProof,
+    output: &M31Matrix,
+    weights: &GraphWeights,
+    weight_super_root: QM31,
+    io_commitment: QM31,
+    io_commitment_felt252: starknet_ff::FieldElement,
+    gkr_prove_time_secs: f64,
+    policy: Option<&crate::policy::PolicyConfig>,
+) -> Result<RecursiveProof, RecursiveError> {
+    let mut proof = prove_recursive_with_policy(circuit, gkr_proof, output, weights, weight_super_root, io_commitment, gkr_prove_time_secs, policy)?;
+    proof.io_commitment_felt252 = io_commitment_felt252;
+    Ok(proof)
 }
 
 /// Generate a recursive STARK proof with explicit policy binding.
@@ -305,9 +325,13 @@ pub fn prove_recursive_with_policy(
         estimate_proof_size(&stark_proof),
     );
 
+    let io_felt252 = crate::crypto::poseidon_channel::securefield_to_felt(
+        witness.public_inputs.io_commitment,
+    );
     Ok(RecursiveProof {
         stark_proof: stark_proof,
         public_inputs: witness.public_inputs,
+        io_commitment_felt252: io_felt252,
         final_digest: final_digest_felt,
         log_size,
         metadata: RecursiveProofMetadata {

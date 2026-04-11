@@ -156,6 +156,12 @@ pub struct RecursiveProof {
     /// Public inputs committed in the circuit.
     pub public_inputs: RecursivePublicInputs,
 
+    /// Full felt252 IO commitment (Poseidon hash of packed IO).
+    /// The QM31 `public_inputs.io_commitment` only carries the low 124 bits
+    /// (lossy conversion via `felt_to_securefield`). This field preserves
+    /// the full 252-bit value for on-chain cross-checking.
+    pub io_commitment_felt252: FieldElement,
+
     /// Final channel digest from the GKR verifier (for boundary constraint).
     pub final_digest: FieldElement,
 

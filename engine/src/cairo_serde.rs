@@ -3611,6 +3611,11 @@ mod recursive_serde {
         serialize_u32(proof.public_inputs.n_layers, &mut output);
         serialize_u32(if proof.public_inputs.verified { 1 } else { 0 }, &mut output);
 
+        // Full felt252 IO commitment for on-chain cross-checking.
+        // The QM31 io_commitment above only carries the low 124 bits (lossy).
+        // This field preserves the full 252-bit Poseidon hash.
+        output.push(proof.io_commitment_felt252);
+
         // Final digest (felt252)
         output.push(proof.final_digest);
 

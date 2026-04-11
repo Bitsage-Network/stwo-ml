@@ -325,9 +325,10 @@ pub mod RecursiveVerifierContract {
             //   [8..12)  weight_super_root: QM31 (4 felts)
             //   [12]     n_layers: u32
             //   [13]     verified: u32 (bool)
-            //   [14]     final_digest: felt252
-            //   [15]     log_size: u32
-            //   [16..)   CommitmentSchemeProof (Serde-compatible)
+            //   [14]     io_commitment_felt252: felt252 (full 252-bit hash)
+            //   [15]     final_digest: felt252
+            //   [16]     log_size: u32
+            //   [17..)   CommitmentSchemeProof (Serde-compatible)
 
             let stark_proof_data_len: u32 = stark_proof_data.len();
             let mut proof_span = stark_proof_data.span();
@@ -355,6 +356,9 @@ pub mod RecursiveVerifierContract {
             let proof_n_layers: felt252 = *proof_span.pop_front().unwrap();
             let _ = proof_span.pop_front().unwrap(); // verified
 
+            // Full felt252 IO commitment (preserves all 252 bits)
+            let proof_io_commitment_felt252: felt252 = *proof_span.pop_front().unwrap();
+
             let final_digest: felt252 = *proof_span.pop_front().unwrap();
             let proof_log_size: u32 = (*proof_span.pop_front().unwrap()).try_into().unwrap();
 
@@ -376,12 +380,10 @@ pub mod RecursiveVerifierContract {
             // caller metadata. Every value emitted in the event MUST match
             // what's cryptographically bound inside the proof.
 
-            // io_commitment: pack proof body's QM31 → felt252, compare with caller
-            let io_packed = io0 * 0x80000000 * 0x80000000 * 0x80000000
-                + io1 * 0x80000000 * 0x80000000
-                + io2 * 0x80000000
-                + io3;
-            assert(io_commitment == io_packed, 'io_commitment mismatch (proof)');
+            // io_commitment: full 252-bit felt252 from proof body, compare with caller.
+            // The QM31 io_commitment only carries 124 bits (lossy conversion via
+            // felt_to_securefield). The felt252 field preserves the full hash.
+            assert(io_commitment == proof_io_commitment_felt252, 'io_commitment mismatch (proof)');
 
             // n_layers: compare caller param with proof body
             let proof_n_layers_u32: u32 = proof_n_layers.try_into().unwrap();
