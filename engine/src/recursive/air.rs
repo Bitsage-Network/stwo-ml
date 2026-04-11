@@ -158,8 +158,9 @@ impl FrameworkEval for RecursiveVerifierEval {
     }
 
     fn max_constraint_log_degree_bound(&self) -> u32 {
-        // All constraints are degree ≤ 2 (products with is_first/is_last selectors).
-        self.log_n_rows + 1
+        // Degree ≤ 2, but use +2 to match Hades component's degree bound
+        // (avoids mixed-degree OODS evaluation issues).
+        self.log_n_rows + 2
     }
 
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {

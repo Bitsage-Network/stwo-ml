@@ -139,8 +139,9 @@ pub const N_PARTIAL_ROUNDS: usize = 83;
 /// Total rounds per Hades permutation: 4 full + 83 partial + 4 full = 91.
 pub const N_ROUNDS: usize = N_FULL_ROUNDS_HALF + N_PARTIAL_ROUNDS + N_FULL_ROUNDS_HALF; // 91
 
-/// Columns per multiplication witness: 27 carries + 28 k_limbs = 55.
-pub const MUL_WITNESS_COLS: usize = 27 + LIMBS_28; // 55
+/// Columns per multiplication witness: 54 carries + 28 k_limbs = 82.
+/// (55-limb product needs 54 inter-limb carries.)
+pub const MUL_WITNESS_COLS: usize = 54 + LIMBS_28; // 82
 
 /// Trace columns per Hades round row.
 ///
@@ -149,13 +150,13 @@ pub const MUL_WITNESS_COLS: usize = 27 + LIMBS_28; // 55
 ///   sbox_input:          3 × 28 = 84   (state_before + round_constant)
 ///   cube_result:         3 × 28 = 84   (sbox_output)
 ///   cube_sq_aux:         3 × 28 = 84   (x² intermediate)
-///   mul_witness:         6 × 55 = 330  (6 muls: 27 carries + 28 k_limbs each)
+///   mul_witness:         6 × 82 = 492  (6 muls: 54 carries + 28 k_limbs each)
 ///   mds_result:          3 × 28 = 84
 ///   mds_carries+k_val:   3 × 28 = 84   (MDS uses small k, single value ok)
 ///   is_full_round:       1
 ///   is_real:             1
-///   Total: 836
-pub const N_HADES_TRACE_COLUMNS: usize = 836;
+///   Total: 998
+pub const N_HADES_TRACE_COLUMNS: usize = 998;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Felt252 in 9-bit limbs
@@ -324,8 +325,8 @@ pub fn verify_mul_252_constraint<E: EvalAtRow>(
     a: &[E::F; LIMBS_28],
     b: &[E::F; LIMBS_28],
     c: &[E::F; LIMBS_28],
-    k_limbs: &[E::F; LIMBS_28], // k_limbs[0] = k scalar, rest unused
-    carries: &[E::F; 27],
+    k_limbs: &[E::F; LIMBS_28],
+    carries: &[E::F; 54], // 55 limbs → 54 inter-limb carries
     eval: &mut E,
     _p_limbs: &[u32; LIMBS_28],
     is_active: &E::F,
@@ -336,26 +337,27 @@ pub fn verify_mul_252_constraint<E: EvalAtRow>(
     let c136 = E::F::from(M31::from(136u32)); // 17*8
     let c256 = E::F::from(M31::from(256u32)); // 2^8
 
-    // Step 1: compute 55-limb convolution of (a*b - c) then reduce mod P to 28 limbs
-    let mut conv_full: [E::F; 55] = std::array::from_fn(|_| zero.clone());
+    // Check all 55 limb positions of: conv[j] - c[j] - kp[j] + carry_in = carry_out * 512
+    // conv[j] = Σ a[i]*b[j-i], kp[j] = Σ k_limbs[l]*p[j-l]
+    // Both convolutions span 0..54 (product of two 28-limb numbers).
     for j in 0..55 {
+        let mut conv = zero.clone();
         for i in 0..=j {
             if i < LIMBS_28 && (j - i) < LIMBS_28 {
-                conv_full[j] = conv_full[j].clone() + a[i].clone() * b[j - i].clone();
+                conv = conv + a[i].clone() * b[j - i].clone();
             }
         }
-        if j < LIMBS_28 { conv_full[j] = conv_full[j].clone() - c[j].clone(); }
-    }
-    let conv_mod = reduce_conv_mod_p::<E>(&conv_full);
-
-    // Step 2: conv_mod[j] - k*p[j] = carry[j]*512 - carry[j-1]
-    // k is k_limbs[0] (small scalar from conv_mod residual)
-    let k_val = k_limbs[0].clone();
-    for j in 0..LIMBS_28 {
+        let c_j = if j < LIMBS_28 { c[j].clone() } else { zero.clone() };
+        let mut kp_j = zero.clone();
+        for l in 0..=j {
+            if l < LIMBS_28 && (j - l) < LIMBS_28 {
+                kp_j = kp_j + k_limbs[l].clone() * E::F::from(M31::from(_p_limbs[j - l]));
+            }
+        }
         let carry_in = if j == 0 { zero.clone() } else { carries[j - 1].clone() };
-        let carry_out = if j < 27 { carries[j].clone() } else { zero.clone() };
-        let p_j = E::F::from(M31::from(_p_limbs[j]));
-        let lhs = conv_mod[j].clone() - k_val.clone() * p_j + carry_in;
+        let carry_out = if j < 54 { carries[j].clone() } else { zero.clone() };
+
+        let lhs = conv - c_j - kp_j + carry_in;
         let rhs = carry_out * base.clone();
         eval.add_constraint(is_active.clone() * (lhs - rhs));
     }
@@ -373,9 +375,9 @@ pub fn cube_252_constraint<E: EvalAtRow>(
     x_sq: &[E::F; LIMBS_28],
     x_cubed: &[E::F; LIMBS_28],
     k_sq_limbs: &[E::F; LIMBS_28],
-    carries_sq: &[E::F; 27],
+    carries_sq: &[E::F; 54],
     k_cube_limbs: &[E::F; LIMBS_28],
-    carries_cube: &[E::F; 27],
+    carries_cube: &[E::F; 54],
     eval: &mut E,
     p_limbs: &[u32; LIMBS_28],
     is_active: &E::F,
@@ -738,12 +740,12 @@ impl FrameworkEval for HadesVerifierEval {
             }
         }
 
-        // Multiplication witness: 27 carries + 28 k_limbs per multiplication (6 total)
-        let mut mul_carries: [[[E::F; 27]; 2]; 3] = std::array::from_fn(|_| std::array::from_fn(|_| std::array::from_fn(|_| zero_f())));
+        // Multiplication witness: 54 carries + 28 k_limbs per multiplication (6 total)
+        let mut mul_carries: [[[E::F; 54]; 2]; 3] = std::array::from_fn(|_| std::array::from_fn(|_| std::array::from_fn(|_| zero_f())));
         let mut mul_k_limbs: [[[[E::F; LIMBS_28]; 1]; 2]; 3] = std::array::from_fn(|_| std::array::from_fn(|_| std::array::from_fn(|_| std::array::from_fn(|_| zero_f()))));
         for elem in 0..3 {
             for mul_idx in 0..2 {
-                for j in 0..27 {
+                for j in 0..54 {
                     mul_carries[elem][mul_idx][j] = eval.next_trace_mask();
                 }
                 for j in 0..LIMBS_28 {
@@ -808,6 +810,8 @@ impl FrameworkEval for HadesVerifierEval {
         // sbox_input is now in the trace (state_before + round_constant).
         // Verify: cube_sq = sbox_input², cube_result = cube_sq * sbox_input.
         let rc_ref = self.range_check.as_ref();
+
+        // ── S-box constraints ────────────────────────────────────────
         for elem in 0..3 {
             if elem < 2 {
                 cube_252_constraint::<E>(
@@ -840,8 +844,7 @@ impl FrameworkEval for HadesVerifierEval {
             }
         }
 
-        // Partial-round passthrough: for elements 0,1 in partial rounds,
-        // cube_result should equal sbox_input (identity, no cubing)
+        // Partial-round passthrough: for elements 0,1 in partial rounds
         let is_partial = is_real.clone() * (E::F::from(M31::from(1u32)) - is_full_round.clone());
         for elem in 0..2 {
             for j in 0..LIMBS_28 {
@@ -1023,12 +1026,12 @@ pub fn build_hades_trace(
                         } else {
                             (&round.sbox_sq[elem], &round.sbox_input[elem], &round.sbox_output[elem])
                         };
-                        let (carries, k_limbs) = compute_mul_witness(a_fe, b_fe, c_fe);
-                        for j in 0..27 {
+                        let (carries, k_lmbs) = compute_mul_witness(a_fe, b_fe, c_fe);
+                        for j in 0..54 {
                             trace[col + j][row] = i64_to_m31(carries[j]);
                         }
                         for j in 0..LIMBS_28 {
-                            trace[col + 27 + j][row] = i64_to_m31(k_limbs[j]);
+                            trace[col + 54 + j][row] = i64_to_m31(k_lmbs[j]);
                         }
                     }
                     col += MUL_WITNESS_COLS; // 55
@@ -1234,13 +1237,13 @@ fn mds_mix(state: &[FieldElement; 3]) -> [FieldElement; 3] {
 /// Returns `(carries[27], k)` where:
 ///   conv[j] = Σ a_limb[i] * b_limb[j-i]
 ///   conv[j] = c_limb[j] + k * p_limb[j] + carry[j] * 512 - carry[j-1]
-/// Returns (carries[27], k_limbs[28]) for the multiplication witness.
-/// Computes k via bigint division, then derives carries using k_limbs convolution.
+/// Returns (carries[54], k_limbs[28]) for the multiplication witness.
+/// Computes k via bigint division, then derives carries over all 55 limbs.
 fn compute_mul_witness(
     a: &FieldElement,
     b: &FieldElement,
     c: &FieldElement,
-) -> ([i64; 27], [i64; LIMBS_28]) {
+) -> ([i64; 54], [i64; LIMBS_28]) {
     let a_limbs = felt252_to_9bit_limbs(a);
     let b_limbs = felt252_to_9bit_limbs(b);
     let c_limbs = felt252_to_9bit_limbs(c);
@@ -1287,72 +1290,32 @@ fn compute_mul_witness(
         }
     }
 
-    // Step 3: compute conv_mod in M31 arithmetic (where k*P ≡ 0),
-    // then derive carries from the M31-reduced values.
-    // This matches what the AIR constraint does (reduce_conv_mod_p in E::F).
-    let mut conv_full_m31 = [0i64; 55];
+    // Step 3: compute carries over all 55 limb positions.
+    // conv[j] - c[j] - kp[j] + carry_in = carry_out * 512
+    let mut carries = [0i64; 54];
+    let mut carry2: i64 = 0;
     for j in 0..55 {
-        let mut v: i64 = 0;
+        let mut conv: i64 = 0;
         for i in 0..=j {
             if i < LIMBS_28 && (j - i) < LIMBS_28 {
-                v += (a_limbs[i].0 as i64) * (b_limbs[j - i].0 as i64);
+                conv += (a_limbs[i].0 as i64) * (b_limbs[j - i].0 as i64);
             }
         }
-        if j < LIMBS_28 { v -= c_limbs[j].0 as i64; }
-        conv_full_m31[j] = v;
-    }
-
-    // Reduce mod P in M31 arithmetic (matching the AIR's reduce_conv_mod_p).
-    // In M31, the result is exactly 0 since a*b ≡ c (mod P) ≡ 0 (mod M31_P).
-    // Convert each conv_full value to M31, then reduce.
-    let p_m31 = 2147483647u32; // M31::P = 2^31 - 1
-    let conv_m31: Vec<M31> = (0..55).map(|j| {
-        let v = conv_full_m31[j];
-        i64_to_m31(v)
-    }).collect();
-
-    let c272_m31 = M31::from(272u32);
-    let mut reduced_m31 = [M31::from(0u32); LIMBS_28];
-    for j in 0..LIMBS_28 { reduced_m31[j] = conv_m31[j]; }
-    let mut pend: Vec<(usize, M31)> = (28..55).map(|k| (k, conv_m31[k])).collect();
-    for _ in 0..5 {
-        let cur = std::mem::take(&mut pend);
-        if cur.is_empty() { break; }
-        for (k, val) in cur {
-            let pl = k - 28; let pm = k - 7;
-            if pl < LIMBS_28 { reduced_m31[pl] = reduced_m31[pl] - val; }
-            else { pend.push((pl, val)); }
-            if pm < LIMBS_28 { reduced_m31[pm] = reduced_m31[pm] - c272_m31 * val; }
-            else { pend.push((pm, c272_m31 * val)); }
+        let c_j = if j < LIMBS_28 { c_limbs[j].0 as i64 } else { 0 };
+        let mut kp: i64 = 0;
+        for l in 0..=j {
+            if l < LIMBS_28 && (j - l) < LIMBS_28 {
+                kp += k_limbs[l] * (p_limbs[j - l] as i64);
+            }
         }
+        let total = conv - c_j - kp + carry2;
+        let nc = if total >= 0 { total / 512 } else { (total - 511) / 512 };
+        if j < 54 { carries[j] = nc; }
+        carry2 = nc;
     }
+    debug_assert_eq!(carry2, 0, "55-limb carry chain failed: final carry = {carry2}");
 
-    // The reduced values in M31 should be ≡ 0 (mod P) which in M31 means
-    // they are exactly 0 (since M31 IS Z/P_M31 and our reduction is correct).
-    // Extract carries: conv_mod[j] = carry[j]*512 - carry[j-1]
-    // Convert M31 back to signed integer in [-(P-1)/2, (P-1)/2] for carry computation.
-    let base_m31 = M31::from(512u32);
-    let mut carries = [0i64; 27];
-    let mut carry_m31 = M31::from(0u32);
-    for j in 0..LIMBS_28 {
-        // conv_mod[j] + carry_in = carry_out * 512
-        let total = reduced_m31[j] + carry_m31;
-        // carry_out = total / 512 in M31: total * 512^(-1) mod P_M31
-        // Since 512^(-1) mod (2^31-1) exists, this gives the unique carry.
-        // But we need carries as BOUNDED integers, not arbitrary M31 values.
-        // Convert total.0 to signed: if > P/2, subtract P
-        let total_signed = if total.0 > p_m31 / 2 { total.0 as i64 - p_m31 as i64 } else { total.0 as i64 };
-        let nc = if total_signed >= 0 { total_signed / 512 } else { (total_signed - 511) / 512 };
-        if j < 27 { carries[j] = nc; }
-        // Recompute carry_m31 for next iteration
-        carry_m31 = M31::from(0u32) + i64_to_m31(nc); // carry as M31
-        // Verify: total == carry_out * 512 in M31
-        debug_assert_eq!(total, carry_m31 * base_m31,
-            "M31 carry chain broken at limb {j}: total={}, carry*512={}", total.0, (carry_m31 * base_m31).0);
-    }
-
-    // k = 0 for conv_mod approach (reduction absorbed k*P entirely)
-    (carries, [0i64; LIMBS_28])
+    (carries, k_limbs)
 }
 
 /// Compute MDS witness carries for one output element.
@@ -1769,13 +1732,14 @@ mod tests {
         let p_limbs = stark_prime_9bit_limbs();
         let base = M31::from(512u32);
 
-        for j in 0..LIMBS_28 {
+        for j in 0..55 {
             let mut conv = M31::from(0u32);
             for i in 0..=j {
                 if i < LIMBS_28 && (j - i) < LIMBS_28 {
                     conv = conv + a_limbs[i] * a_limbs[j - i];
                 }
             }
+            let c_j = if j < LIMBS_28 { c_limbs[j] } else { M31::from(0u32) };
             let mut kp_j = M31::from(0u32);
             for l in 0..=j {
                 if l < LIMBS_28 && (j - l) < LIMBS_28 {
@@ -1783,12 +1747,13 @@ mod tests {
                 }
             }
             let carry_in = if j == 0 { M31::from(0u32) } else { i64_to_m31(carries[j-1]) };
-            let carry_out = if j < 27 { i64_to_m31(carries[j]) } else { M31::from(0u32) };
+            let carry_out = if j < 54 { i64_to_m31(carries[j]) } else { M31::from(0u32) };
 
-            let rhs = c_limbs[j] + kp_j + carry_out * base - carry_in;
-            assert_eq!(conv, rhs, "Constraint fails at limb {j}");
+            let lhs = conv - c_j - kp_j + carry_in;
+            let rhs = carry_out * base;
+            assert_eq!(lhs, rhs, "Constraint fails at limb {j}: lhs={}, rhs={}", lhs.0, rhs.0);
         }
-        eprintln!("Hades round S-box with k_limbs: all 28 limb constraints hold ✓");
+        eprintln!("Hades round S-box with k_limbs: all 55 limb constraints hold ✓");
     }
 
     #[test]
