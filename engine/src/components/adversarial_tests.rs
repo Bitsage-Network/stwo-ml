@@ -358,4 +358,155 @@ mod tests {
         assert_ne!(silu_result, gelu_result,
             "SOUNDNESS BUG: different activations produce same output! Attack: activation function swap");
     }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Recursive STARK: metadata relabeling (Omar Espejel review)
+    // These tests require the `cli` feature (which enables `mod recursive`).
+    // Run with: cargo test --lib --all-features -- adversarial_recursive
+    // ═══════════════════════════════════════════════════════════════
+
+    /// Helper: produce a valid recursive proof for adversarial testing.
+    fn adversarial_recursive_proof() -> crate::recursive::types::RecursiveProof {
+        use stwo::core::fields::cm31::CM31;
+
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(2);
+        let graph = builder.build();
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        let mut weights = GraphWeights::new();
+        let mut w = M31Matrix::new(4, 2);
+        for i in 0..4 { for j in 0..2 { w.set(i, j, M31::from((i * 2 + j + 1) as u32)); } }
+        weights.add_weight(0, w);
+
+        let proof = crate::aggregation::prove_model_pure_gkr(&graph, &input, &weights).unwrap();
+        let gkr = proof.gkr_proof.as_ref().unwrap();
+        let circuit = crate::gkr::LayeredCircuit::from_graph(&graph).unwrap();
+        let zero = QM31(CM31(M31::from(0), M31::from(0)), CM31(M31::from(0), M31::from(0)));
+        crate::recursive::prove_recursive(
+            &circuit, gkr, &proof.execution.output, &weights, zero, zero, 0.0,
+        ).expect("recursive proving should succeed")
+    }
+
+    #[test]
+    fn test_adversarial_recursive_tampered_io_commitment() {
+        use stwo::core::fields::cm31::CM31;
+        let rp = adversarial_recursive_proof();
+
+        // Valid metadata passes
+        let ok = crate::recursive::verify_recursive(
+            &rp.stark_proof, &rp.public_inputs, rp.log_size, rp.final_digest,
+        );
+        assert!(ok.is_ok(), "valid proof must verify: {:?}", ok.err());
+
+        // Tampered io_commitment → channel diverges → FRI fails
+        let tampered = crate::recursive::RecursivePublicInputs {
+            io_commitment: QM31(CM31(M31::from(999), M31::from(888)), CM31(M31::from(777), M31::from(666))),
+            ..rp.public_inputs
+        };
+        let err = crate::recursive::verify_recursive(
+            &rp.stark_proof, &tampered, rp.log_size, rp.final_digest,
+        );
+        assert!(err.is_err(), "SOUNDNESS BUG: tampered io_commitment was accepted!");
+        eprintln!("[adversarial] io_commitment relabeling blocked ✓");
+    }
+
+    #[test]
+    fn test_adversarial_recursive_tampered_n_layers() {
+        let rp = adversarial_recursive_proof();
+        let tampered = crate::recursive::RecursivePublicInputs {
+            n_layers: rp.public_inputs.n_layers + 100,
+            ..rp.public_inputs
+        };
+        let err = crate::recursive::verify_recursive(
+            &rp.stark_proof, &tampered, rp.log_size, rp.final_digest,
+        );
+        assert!(err.is_err(), "SOUNDNESS BUG: tampered n_layers was accepted!");
+        eprintln!("[adversarial] n_layers relabeling blocked ✓");
+    }
+
+    #[test]
+    fn test_adversarial_recursive_tampered_weight_root() {
+        use stwo::core::fields::cm31::CM31;
+        let rp = adversarial_recursive_proof();
+        let tampered = crate::recursive::RecursivePublicInputs {
+            weight_super_root: QM31(CM31(M31::from(42), M31::from(0)), CM31(M31::from(0), M31::from(0))),
+            ..rp.public_inputs
+        };
+        let err = crate::recursive::verify_recursive(
+            &rp.stark_proof, &tampered, rp.log_size, rp.final_digest,
+        );
+        assert!(err.is_err(), "SOUNDNESS BUG: tampered weight_super_root was accepted!");
+        eprintln!("[adversarial] weight_super_root relabeling blocked ✓");
+    }
+
+    #[test]
+    fn test_adversarial_recursive_omar_full_relabeling() {
+        // Reproduce Omar's exact test: change ALL metadata while keeping proof body.
+        use stwo::core::fields::cm31::CM31;
+        let rp = adversarial_recursive_proof();
+        let tampered = crate::recursive::RecursivePublicInputs {
+            circuit_hash: QM31(CM31(M31::from(1), M31::from(2)), CM31(M31::from(3), M31::from(4))),
+            io_commitment: QM31(CM31(M31::from(5), M31::from(6)), CM31(M31::from(7), M31::from(8))),
+            weight_super_root: QM31(CM31(M31::from(9), M31::from(10)), CM31(M31::from(11), M31::from(12))),
+            n_layers: 337,
+            verified: true,
+        };
+        let err = crate::recursive::verify_recursive(
+            &rp.stark_proof, &tampered, rp.log_size, rp.final_digest,
+        );
+        assert!(err.is_err(), "SOUNDNESS BUG: Omar's full relabeling attack was accepted!");
+
+        // Original still works
+        let ok = crate::recursive::verify_recursive(
+            &rp.stark_proof, &rp.public_inputs, rp.log_size, rp.final_digest,
+        );
+        assert!(ok.is_ok(), "original metadata must still verify");
+        eprintln!("[adversarial] Omar's full relabeling scenario: blocked ✓");
+    }
+
+    #[test]
+    fn test_adversarial_recursive_hades_witness_tampering() {
+        // Omar's Finding 2: verify Hades permutation integrity in witness.
+        use stwo::core::fields::cm31::CM31;
+        use crate::recursive::types::WitnessOp;
+
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(2);
+        let graph = builder.build();
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        let mut weights = GraphWeights::new();
+        let mut w = M31Matrix::new(4, 2);
+        for i in 0..4 { for j in 0..2 { w.set(i, j, M31::from((i * 2 + j + 1) as u32)); } }
+        weights.add_weight(0, w);
+
+        let proof = crate::aggregation::prove_model_pure_gkr(&graph, &input, &weights).unwrap();
+        let gkr = proof.gkr_proof.as_ref().unwrap();
+        let circuit = crate::gkr::LayeredCircuit::from_graph(&graph).unwrap();
+        let zero = QM31(CM31(M31::from(0), M31::from(0)), CM31(M31::from(0), M31::from(0)));
+
+        let mut witness = crate::recursive::generate_witness(
+            &circuit, gkr, &proof.execution.output, Some(&weights), zero, zero,
+        ).unwrap();
+
+        // Honest witness passes
+        let n = crate::recursive::verify_hades_perms_offline(&witness).unwrap();
+        assert!(n > 0, "should verify at least one Hades perm");
+
+        // Tamper a HadesPerm output
+        let mut tampered = false;
+        for op in witness.ops.iter_mut() {
+            if let WitnessOp::HadesPerm { output, .. } = op {
+                output[0] = starknet_ff::FieldElement::from(12345u64);
+                tampered = true;
+                break;
+            }
+        }
+        assert!(tampered, "should have found a HadesPerm to tamper");
+
+        let err = crate::recursive::verify_hades_perms_offline(&witness);
+        assert!(err.is_err(), "SOUNDNESS BUG: tampered Hades permutation was accepted!");
+        eprintln!("[adversarial] Hades witness tampering detected ✓");
+    }
 }

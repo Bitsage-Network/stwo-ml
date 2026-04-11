@@ -73,7 +73,6 @@ pub mod kv_state;
 pub mod economics;
 pub mod receipt;
 pub mod starknet;
-#[cfg(feature = "cli")]
 pub mod recursive;
 pub mod tee;
 pub mod weight_cache;

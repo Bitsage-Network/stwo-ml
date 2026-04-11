@@ -418,7 +418,9 @@ fn test_poseidon_hash_many_matches_reference() {
 
 #[test]
 fn test_mix_felts_poseidon252_matches_js() {
-    use stwo::core::channel::poseidon252::Poseidon252Channel;
+    use stwo::core::vcs_lifted::poseidon252_merkle::Poseidon252MerkleChannel;
+    use stwo::core::channel::MerkleChannel;
+    type Poseidon252Channel = <Poseidon252MerkleChannel as MerkleChannel>::C;
     use stwo::core::channel::Channel;
     use stwo::core::fields::m31::M31;
     use stwo::core::fields::qm31::SecureField;

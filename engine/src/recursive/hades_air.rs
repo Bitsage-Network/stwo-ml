@@ -114,7 +114,7 @@
 //! in the chain AIR must appear in the Hades verification table.
 
 use starknet_ff::FieldElement;
-use stwo::core::fields::m31::{BaseField as M31, M31};
+use stwo::core::fields::m31::BaseField as M31;
 use stwo_constraint_framework::{
     preprocessed_columns::PreProcessedColumnId, EvalAtRow, FrameworkComponent, FrameworkEval,
     RelationEntry, Relation,
@@ -347,8 +347,10 @@ pub fn mds_constraint<E: EvalAtRow>(
     let base = E::F::from(M31::from(512)); // 2^9
     let zero = E::F::from(M31::from(0));
     let three = E::F::from(M31::from(3));
-    let neg_one = E::F::from(M31::from(M31::P - 1)); // -1 in M31
-    let neg_two = E::F::from(M31::from(M31::P - 2)); // -2 in M31
+    // -1 mod (2^31 - 1) = 2^31 - 2 = 2147483646
+    let neg_one = E::F::from(M31::from(2147483646u32));
+    // -2 mod (2^31 - 1) = 2^31 - 3 = 2147483645
+    let neg_two = E::F::from(M31::from(2147483645u32));
 
     let carry_shift = E::F::from(M31::from(524288)); // 2^19
 
@@ -420,7 +422,7 @@ pub fn hades_round_constants() -> Vec<[FieldElement; 3]> {
     //
     // Rather than extracting them from the opaque implementation, we use a
     // known-answer approach: run Hades step-by-step and record intermediates.
-    extract_round_constants()
+    load_raw_round_constants()
 }
 
 /// Load the 91 × 3 raw round constants from the Starknet Poseidon specification.
@@ -639,21 +641,22 @@ impl FrameworkEval for HadesVerifierEval {
         //   [588]       is_full_round
         //   [589]       is_real
 
-        let mut state_before = [[E::F::from(M31::from(0)); LIMBS_28]; 3];
+        let zero_f = || E::F::from(M31::from(0u32));
+        let mut state_before: [[E::F; LIMBS_28]; 3] = std::array::from_fn(|_| std::array::from_fn(|_| zero_f()));
         for elem in 0..3 {
             for j in 0..LIMBS_28 {
                 state_before[elem][j] = eval.next_trace_mask();
             }
         }
 
-        let mut cube_result = [[E::F::from(M31::from(0)); LIMBS_28]; 3];
+        let mut cube_result: [[E::F; LIMBS_28]; 3] = std::array::from_fn(|_| std::array::from_fn(|_| zero_f()));
         for elem in 0..3 {
             for j in 0..LIMBS_28 {
                 cube_result[elem][j] = eval.next_trace_mask();
             }
         }
 
-        let mut cube_sq = [[E::F::from(M31::from(0)); LIMBS_28]; 3];
+        let mut cube_sq: [[E::F; LIMBS_28]; 3] = std::array::from_fn(|_| std::array::from_fn(|_| zero_f()));
         for elem in 0..3 {
             for j in 0..LIMBS_28 {
                 cube_sq[elem][j] = eval.next_trace_mask();
@@ -662,8 +665,8 @@ impl FrameworkEval for HadesVerifierEval {
 
         // Multiplication witness: carries + k for 6 multiplications
         // (3 elements × 2 muls per cube = 6 total)
-        let mut mul_carries = [[[E::F::from(M31::from(0)); 27]; 2]; 3];
-        let mut mul_k = [[E::F::from(M31::from(0)); 2]; 3];
+        let mut mul_carries: [[[E::F; 27]; 2]; 3] = std::array::from_fn(|_| std::array::from_fn(|_| std::array::from_fn(|_| zero_f())));
+        let mut mul_k: [[E::F; 2]; 3] = std::array::from_fn(|_| std::array::from_fn(|_| zero_f()));
         for elem in 0..3 {
             for mul_idx in 0..2 {
                 for j in 0..27 {
@@ -674,7 +677,7 @@ impl FrameworkEval for HadesVerifierEval {
         }
 
         // MDS result columns
-        let mut mds_result = [[E::F::from(M31::from(0)); LIMBS_28]; 3];
+        let mut mds_result: [[E::F; LIMBS_28]; 3] = std::array::from_fn(|_| std::array::from_fn(|_| zero_f()));
         for elem in 0..3 {
             for j in 0..LIMBS_28 {
                 mds_result[elem][j] = eval.next_trace_mask();
@@ -682,8 +685,8 @@ impl FrameworkEval for HadesVerifierEval {
         }
 
         // MDS carries + k
-        let mut mds_carries = [[E::F::from(M31::from(0)); 27]; 3];
-        let mut mds_k = [E::F::from(M31::from(0)); 3];
+        let mut mds_carries: [[E::F; 27]; 3] = std::array::from_fn(|_| std::array::from_fn(|_| zero_f()));
+        let mut mds_k: [E::F; 3] = std::array::from_fn(|_| zero_f());
         for elem in 0..3 {
             for j in 0..27 {
                 mds_carries[elem][j] = eval.next_trace_mask();
@@ -695,8 +698,8 @@ impl FrameworkEval for HadesVerifierEval {
         let is_real = eval.next_trace_mask();
 
         // ── Preprocessed selectors ───────────────────────────────────
-        let is_first_round = eval.next_interaction_mask(0, [0])[0];
-        let is_last_round = eval.next_interaction_mask(0, [0])[0];
+        let [is_first_round] = eval.next_interaction_mask(0, [0]);
+        let [is_last_round] = eval.next_interaction_mask(0, [0]);
 
         // ── Stark prime limbs ────────────────────────────────────────
         let p_limbs = stark_prime_9bit_limbs();
@@ -861,7 +864,7 @@ impl FrameworkEval for RangeCheck20TableEval {
 
         // Contribute NEGATIVE LogUp: this table PROVIDES the range values.
         // multiplicity[i] / (z + alpha * i) with negative sign.
-        let neg_mult = E::EF::from(M31::from(0)) - E::EF::from(multiplicity.clone());
+        let neg_mult = E::EF::from(E::F::from(M31::from(0u32))) - E::EF::from(multiplicity.clone());
         eval.add_to_relation(RelationEntry::new(
             &self.range_check,
             neg_mult,
