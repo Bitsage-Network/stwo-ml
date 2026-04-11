@@ -1,7 +1,18 @@
 /// Cairo AIR implementation for the Recursive STARK verifier.
 ///
 /// Verifies that a chain of Poseidon channel operations was executed correctly.
-/// The trace has 28 columns per row (9+9+9+1) and 3 preprocessed selector columns.
+///
+/// Expanded trace layout (64 columns per row):
+///   [0..9)    digest_before     (input state[0])
+///   [9..18)   input_value       (input state[1])
+///   [18..27)  input_capacity    (input state[2])
+///   [27..36)  digest_after      (output state[0])
+///   [36..45)  output_value      (output state[1])
+///   [45..54)  output_capacity   (output state[2])
+///   [54..63)  shifted_next_before (next row's digest_before)
+///   [63]      op_type
+///
+/// Plus 3 preprocessed selector columns: is_first, is_last, is_chain.
 ///
 /// Constraints (all degree ≤ 2):
 ///   - Boundary (first row): digest_before[j] == initial_digest_limbs[j]  (9 constraints)
@@ -19,8 +30,12 @@ use stwo_verifier_core::{TreeSpan, ColumnSpan};
 /// Number of M31 limbs per felt252 (9 × 31 = 279 bits ≥ 252).
 pub const LIMBS_PER_FELT: u32 = 9;
 
-/// Total trace columns: digest_before(9) + digest_after(9) + shifted_next(9) + op_type(1) = 28.
-const TRACE_COLS: u32 = 28;
+/// Total trace columns (expanded):
+///   input_state(27) + output_state(27) + shifted_next(9) + op_type(1) = 64.
+const TRACE_COLS: u32 = 64;
+
+/// Columns per full Hades state (3 felt252 × 9 limbs).
+const COLS_PER_STATE: u32 = 27;
 
 /// Number of preprocessed selector columns: is_first, is_last, is_chain.
 const PREPROCESS_COLS: u32 = 3;
@@ -64,11 +79,15 @@ impl RecursiveAirImpl of Air<RecursiveAir> {
         let is_last = extract_single_val(preprocessed_vals, 1);
         let is_chain = extract_single_val(preprocessed_vals, 2);
 
-        // Extract trace columns
+        // Extract trace columns (expanded layout):
         // Columns 0-8: digest_before (9 limbs)
-        // Columns 9-17: digest_after (9 limbs)
-        // Columns 18-26: shifted_next_before (9 limbs)
-        // Column 27: op_type (unused in constraints)
+        // Columns 9-17: input_value (9 limbs)
+        // Columns 18-26: input_capacity (9 limbs)
+        // Columns 27-35: digest_after (9 limbs)
+        // Columns 36-44: output_value (9 limbs)
+        // Columns 45-53: output_capacity (9 limbs)
+        // Columns 54-62: shifted_next_before (9 limbs)
+        // Column 63: op_type (unused in constraints)
 
         // Compute the vanishing polynomial inverse at the OOD point.
         // The denominator uses CanonicCoset::new(max_log_degree_bound) where
@@ -91,21 +110,23 @@ impl RecursiveAirImpl of Air<RecursiveAir> {
         };
 
         // ── Boundary: last row's digest_after = final_digest (9 constraints) ──
+        // digest_after is at columns [27..36) in the expanded layout
         j = 0;
         loop {
             if j >= LIMBS_PER_FELT { break; }
-            let digest_after_j = extract_single_val(trace_vals, LIMBS_PER_FELT + j);
+            let digest_after_j = extract_single_val(trace_vals, COLS_PER_STATE + j);
             let final_j = *self.final_digest_limbs.at(j);
             quotients.append(domain_vanishing_eval_inv * is_last * (digest_after_j - final_j));
             j += 1;
         };
 
         // ── Chain: digest_after[row] == shifted_next_before[row] (9 constraints) ──
+        // digest_after at [27..36), shifted_next_before at [54..63)
         j = 0;
         loop {
             if j >= LIMBS_PER_FELT { break; }
-            let digest_after_j = extract_single_val(trace_vals, LIMBS_PER_FELT + j);
-            let shifted_next_j = extract_single_val(trace_vals, 2 * LIMBS_PER_FELT + j);
+            let digest_after_j = extract_single_val(trace_vals, COLS_PER_STATE + j);
+            let shifted_next_j = extract_single_val(trace_vals, 2 * COLS_PER_STATE + j);
             quotients.append(domain_vanishing_eval_inv * is_chain * (digest_after_j - shifted_next_j));
             j += 1;
         };

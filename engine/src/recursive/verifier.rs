@@ -5,7 +5,7 @@
 
 use num_traits::Zero;
 use stwo::core::air::Component;
-use stwo::core::channel::MerkleChannel;
+use stwo::core::channel::{Channel, MerkleChannel};
 use stwo::core::fields::m31::M31;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::pcs::{CommitmentSchemeVerifier, PcsConfig};
@@ -40,6 +40,7 @@ pub fn verify_recursive(
         log_n_rows: log_size,
         initial_digest_limbs: zero_limbs,
         final_digest_limbs: super::air::felt252_to_limbs(&final_digest),
+        hades_lookup: None, // LogUp disabled until multi-component STARK is wired
     };
 
     // Build dummy component to get trace_log_degree_bounds
@@ -50,6 +51,21 @@ pub fn verify_recursive(
 
     // Set up channel and commitment scheme verifier
     let channel = &mut <Poseidon252MerkleChannel as MerkleChannel>::C::default();
+
+    // Mix PcsConfig into channel (must match prover's individual mix_u64 calls)
+    channel.mix_u64(pcs_config.pow_bits as u64);
+    channel.mix_u64(pcs_config.fri_config.log_blowup_factor as u64);
+    channel.mix_u64(pcs_config.fri_config.n_queries as u64);
+    channel.mix_u64(pcs_config.fri_config.log_last_layer_degree_bound as u64);
+
+    // Mix public inputs into channel (must match prover's binding)
+    channel.mix_felts(&[
+        public_inputs.circuit_hash,
+        public_inputs.io_commitment,
+        public_inputs.weight_super_root,
+    ]);
+    channel.mix_u64(public_inputs.n_layers as u64);
+
     let mut commitment_scheme = CommitmentSchemeVerifier::<Poseidon252MerkleChannel>::new(pcs_config);
 
     // Replay commitments (Tree 0 = preprocessed, Tree 1 = execution)

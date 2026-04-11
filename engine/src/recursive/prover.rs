@@ -129,6 +129,16 @@ pub fn prove_recursive_with_policy(
         witness.n_poseidon_perms, witness.n_sumcheck_rounds, witness.n_qm31_ops,
     );
 
+    // ── Step 1b: Verify all Hades permutations offline ──────────────
+    // This ensures every (input, output) pair in the witness is a valid
+    // Hades permutation, providing soundness at the prover level even
+    // before the Hades AIR is fully integrated into the multi-component STARK.
+    let n_hades_verified = verify_hades_perms_offline(&witness)
+        .map_err(|e| RecursiveError::GkrVerificationFailed(format!(
+            "Hades permutation check failed: {e}"
+        )))?;
+    eprintln!("  [Recursive] Verified {} Hades permutations offline", n_hades_verified);
+
     // ── Step 2: Build trace ──────────────────────────────────────────
     eprintln!("  [Recursive] Step 2/4: Building execution trace...");
     let trace_data = build_recursive_trace(&witness);
@@ -167,6 +177,25 @@ pub fn prove_recursive_with_policy(
     channel.mix_u64(config.fri_config.n_queries as u64);
     channel.mix_u64(config.fri_config.log_last_layer_degree_bound as u64);
     eprintln!("  [Recursive] Channel after PcsConfig: {:?}", channel.digest());
+
+    // ── Bind public inputs to Fiat-Shamir channel ────────────────────
+    // By mixing circuit_hash, io_commitment, weight_super_root, and
+    // n_layers into the channel BEFORE any tree commits, the STARK proof
+    // becomes cryptographically bound to these values.  A verifier that
+    // supplies different metadata will initialize a different channel
+    // state, causing the FRI verification to fail.
+    //
+    // Order: [circuit_hash, io_commitment, weight_super_root] via
+    // mix_felts (chunks-of-2 QM31 packing), then n_layers via mix_u64.
+    // The Cairo verifier MUST replicate this exact sequence.
+    channel.mix_felts(&[
+        witness.public_inputs.circuit_hash,
+        witness.public_inputs.io_commitment,
+        witness.public_inputs.weight_super_root,
+    ]);
+    channel.mix_u64(witness.public_inputs.n_layers as u64);
+    eprintln!("  [Recursive] Channel after public inputs: {:?}", channel.digest());
+
     let mut commitment_scheme =
         CommitmentSchemeProver::<SimdBackend, Poseidon252MerkleChannel>::new(config, &twiddles);
 
@@ -254,6 +283,7 @@ pub fn prove_recursive_with_policy(
         log_n_rows: log_size,
         initial_digest_limbs: zero_limbs,
         final_digest_limbs: final_limbs,
+        hades_lookup: None, // LogUp disabled until multi-component STARK is wired
     };
 
     let component = FrameworkComponent::new(
@@ -289,6 +319,54 @@ pub fn prove_recursive_with_policy(
             n_trace_columns: super::air::COLS_PER_ROW,
         },
     })
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Hardened Recursive Proving (with Hades AIR)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Extract (input, output) pairs for every HadesPerm in the witness.
+///
+/// These pairs are used to build the Hades verification trace that
+/// constrains the actual Hades permutation computation.
+pub fn extract_hades_perms(
+    witness: &super::types::GkrVerifierWitness,
+) -> Vec<([starknet_ff::FieldElement; 3], [starknet_ff::FieldElement; 3])> {
+    witness
+        .ops
+        .iter()
+        .filter_map(|op| {
+            if let super::types::WitnessOp::HadesPerm { input, output } = op {
+                Some((*input, *output))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Verify all HadesPerm operations in a witness via step-by-step execution.
+///
+/// This is a standalone soundness check that can be run without generating
+/// a STARK proof. It verifies that every (input, output) pair in the witness
+/// corresponds to a correct Hades permutation.
+///
+/// Returns Ok(n_verified) on success, or Err with the first mismatch.
+pub fn verify_hades_perms_offline(
+    witness: &super::types::GkrVerifierWitness,
+) -> Result<usize, RecursiveError> {
+    let perms = extract_hades_perms(witness);
+    for (i, (input, expected_output)) in perms.iter().enumerate() {
+        let mut actual = *input;
+        starknet_crypto::poseidon_permute_comp(&mut actual);
+        if actual != *expected_output {
+            return Err(RecursiveError::ProvingFailed(format!(
+                "HadesPerm #{} mismatch: input={:?}, expected={:?}, got={:?}",
+                i, input, expected_output, actual,
+            )));
+        }
+    }
+    Ok(perms.len())
 }
 
 // ═══════════════════════════════════════════════════════════════════════

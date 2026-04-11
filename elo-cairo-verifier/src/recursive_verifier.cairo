@@ -130,8 +130,8 @@ pub mod RecursiveVerifierContract {
     use starknet::storage::{Map, StorageMapReadAccess, StorageMapWriteAccess, StoragePointerReadAccess, StoragePointerWriteAccess};
     use starknet::{get_caller_address, ContractAddress};
     use core::poseidon::poseidon_hash_span;
-    use stwo_verifier_core::fields::qm31::{QM31, QM31Zero};
-    use stwo_verifier_core::fields::m31::M31;
+    use stwo_verifier_core::fields::qm31::{QM31, QM31Zero, QM31Trait};
+    use stwo_verifier_core::fields::m31::{M31, m31};
     use stwo_verifier_core::pcs::verifier::CommitmentSchemeVerifierImpl;
     use stwo_verifier_core::pcs::PcsConfigTrait;
     use stwo_verifier_core::channel::ChannelTrait;
@@ -339,7 +339,7 @@ pub mod RecursiveVerifierContract {
             let wr3: felt252 = *proof_span.pop_front().unwrap();
 
             // Parse n_layers and verified from proof body
-            let _proof_n_layers: felt252 = *proof_span.pop_front().unwrap();
+            let proof_n_layers: felt252 = *proof_span.pop_front().unwrap();
             let _ = proof_span.pop_front().unwrap(); // verified
 
             let final_digest: felt252 = *proof_span.pop_front().unwrap();
@@ -357,10 +357,12 @@ pub mod RecursiveVerifierContract {
                 + wr3;
             assert(circuit_hash_packed == model.circuit_hash, 'Circuit hash mismatch');
             assert(weight_root_packed == model.weight_super_root, 'Weight binding mismatch');
-            // NOTE: io_commitment parameter is a Poseidon hash (felt252), while the header
-            // contains QM31 limbs. These are different encodings and cannot be directly
-            // compared. The STARK proof internally binds io_commitment through the
-            // Fiat-Shamir channel, so a proof with wrong IO will fail STARK verification.
+            // The io_commitment, n_layers, and other metadata are cryptographically
+            // bound to the proof via the Fiat-Shamir channel (mixed below).
+            // A proof generated with different values will fail STARK verification.
+            // Additionally, validate the caller-supplied n_layers matches the proof:
+            let proof_n_layers_u32: u32 = proof_n_layers.try_into().unwrap();
+            assert(n_layers == proof_n_layers_u32, 'n_layers mismatch (param/proof)');
 
             // Build RecursiveAir from public inputs.
             // Initial digest is always zero (fresh Poseidon channel).
@@ -403,10 +405,39 @@ pub mod RecursiveVerifierContract {
             loop { if i >= 3 { break; } preprocessed_sizes.append(proof_log_size); i += 1; };
             let mut trace_sizes: Array<u32> = array![];
             i = 0;
-            loop { if i >= 28 { break; } trace_sizes.append(proof_log_size); i += 1; };
+            // Expanded trace: 64 columns (was 28)
+            loop { if i >= 64 { break; } trace_sizes.append(proof_log_size); i += 1; };
 
             let mut channel = Default::default();
             pcs_config.mix_into(ref channel);
+
+            // ── Bind public inputs to Fiat-Shamir channel ────────────
+            // Reconstruct QM31 values from the M31 limbs parsed from the
+            // proof header, then mix into the channel in the same order
+            // as the Rust prover: [circuit_hash, io_commitment,
+            // weight_super_root] via mix_felts, then n_layers via mix_u64.
+            //
+            // This makes the STARK proof cryptographically bound to these
+            // values.  Submitting different metadata causes channel
+            // divergence → FRI verification failure.
+            let z = m31(0);
+            let circuit_hash_qm31 = QM31Trait::from_fixed_array([
+                felt252_to_m31(ch0), felt252_to_m31(ch1),
+                felt252_to_m31(ch2), felt252_to_m31(ch3),
+            ]);
+            let io_commitment_qm31 = QM31Trait::from_fixed_array([
+                felt252_to_m31(io0), felt252_to_m31(io1),
+                felt252_to_m31(io2), felt252_to_m31(io3),
+            ]);
+            let weight_root_qm31 = QM31Trait::from_fixed_array([
+                felt252_to_m31(wr0), felt252_to_m31(wr1),
+                felt252_to_m31(wr2), felt252_to_m31(wr3),
+            ]);
+            channel.mix_felts(
+                array![circuit_hash_qm31, io_commitment_qm31, weight_root_qm31].span()
+            );
+            let proof_n_layers_u64: u64 = proof_n_layers.try_into().unwrap();
+            channel.mix_u64(proof_n_layers_u64);
 
             let mut commitment_scheme = stwo_verifier_core::pcs::verifier::CommitmentSchemeVerifierImpl::new();
             commitment_scheme.commit(preprocessed_commitment, preprocessed_sizes.span(), ref channel, log_blowup);
@@ -544,6 +575,13 @@ pub mod RecursiveVerifierContract {
         fn get_pending_upgrade(self: @ContractState) -> (starknet::ClassHash, u64) {
             (self.pending_upgrade.read(), self.upgrade_proposed_at.read())
         }
+    }
+
+    /// Convert a felt252 that holds an M31 value (0..2^31-1) to M31.
+    /// Used to reconstruct QM31 from proof header limbs.
+    fn felt252_to_m31(value: felt252) -> M31 {
+        let v_u32: u32 = value.try_into().unwrap();
+        m31(v_u32)
     }
 
     /// Extract the i-th 28-bit M31 limb from a felt252.

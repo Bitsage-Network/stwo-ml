@@ -38,7 +38,15 @@ use starknet_ff::FieldElement;
 use stwo::core::fields::m31::BaseField as M31;
 use stwo_constraint_framework::{
     preprocessed_columns::PreProcessedColumnId, EvalAtRow, FrameworkComponent, FrameworkEval,
+    RelationEntry, Relation,
 };
+
+// ── LogUp relation: binds chain AIR ↔ Hades AIR ─────────────────────
+// Key: (digest_before[9], input_value[9], input_capacity[9],
+//        digest_after[9], output_value[9], output_capacity[9]) = 54 M31 columns.
+// Chain AIR contributes +1 multiplicity (consumer).
+// Hades AIR contributes -1 multiplicity (provider).
+stwo_constraint_framework::relation!(HadesPermRelation, 54);
 
 /// Number of M31 limbs to represent one felt252.
 /// 9 * 31 = 279 bits ≥ 252 bits.
@@ -53,9 +61,19 @@ pub const COLS_SHIFTED_DIGEST: usize = LIMBS_PER_FELT; // 9
 /// Columns for one digest: 9 M31 limbs.
 pub const COLS_PER_DIGEST: usize = LIMBS_PER_FELT; // 9
 
-/// Total columns per row: digest_before + digest_after + shifted_next_before + op_type.
-/// Chain-based layout: each row = one channel operation.
-pub const COLS_PER_ROW: usize = COLS_PER_DIGEST + COLS_PER_DIGEST + COLS_PER_DIGEST + 1; // 28
+/// Columns for the full Hades state that are NOT the digest (value + capacity = 2 × 9 = 18).
+pub const COLS_EXTRA_STATE: usize = 2 * LIMBS_PER_FELT; // 18
+
+/// Total columns per row (expanded):
+///   digest_before[9] + input_value[9] + input_capacity[9]
+/// + digest_after[9]  + output_value[9] + output_capacity[9]
+/// + shifted_next_before[9] + op_type[1] = 64
+pub const COLS_PER_ROW: usize =
+    COLS_PER_STATE   // input full state: 27
+    + COLS_PER_STATE // output full state: 27
+    + COLS_PER_DIGEST // shifted_next_before: 9
+    + 1;             // op_type
+    // Total: 27 + 27 + 9 + 1 = 64
 
 // ═══════════════════════════════════════════════════════════════════════
 // Felt252 ↔ M31 limb decomposition
@@ -128,6 +146,10 @@ pub struct RecursiveVerifierEval {
 
     /// Expected final digest after all verifier operations (decomposed into limbs).
     pub final_digest_limbs: [M31; LIMBS_PER_FELT],
+
+    /// LogUp lookup elements for the Hades permutation relation.
+    /// When `None`, LogUp is disabled (backward-compatible mode).
+    pub hades_lookup: Option<HadesPermRelation>,
 }
 
 impl FrameworkEval for RecursiveVerifierEval {
@@ -153,12 +175,20 @@ impl FrameworkEval for RecursiveVerifierEval {
         });
 
         // ── Read execution trace columns ─────────────────────────────
-        // digest_before: 9 M31 limbs (the channel digest at the start of this op)
+        // Full input state: digest_before[9] + input_value[9] + input_capacity[9]
         let digest_before: [E::F; LIMBS_PER_FELT] =
             std::array::from_fn(|_| eval.next_trace_mask());
+        let input_value: [E::F; LIMBS_PER_FELT] =
+            std::array::from_fn(|_| eval.next_trace_mask());
+        let input_capacity: [E::F; LIMBS_PER_FELT] =
+            std::array::from_fn(|_| eval.next_trace_mask());
 
-        // digest_after: 9 M31 limbs (the channel digest after this op completes)
+        // Full output state: digest_after[9] + output_value[9] + output_capacity[9]
         let digest_after: [E::F; LIMBS_PER_FELT] =
+            std::array::from_fn(|_| eval.next_trace_mask());
+        let output_value: [E::F; LIMBS_PER_FELT] =
+            std::array::from_fn(|_| eval.next_trace_mask());
+        let output_capacity: [E::F; LIMBS_PER_FELT] =
             std::array::from_fn(|_| eval.next_trace_mask());
 
         // shifted_next_before: 9 M31 limbs (digest_before of the NEXT row)
@@ -192,6 +222,29 @@ impl FrameworkEval for RecursiveVerifierEval {
             );
         }
 
+        // ── LogUp: Hades permutation binding ─────────────────────────
+        // Each row contributes a +1 lookup into the HadesPermRelation.
+        // The Hades AIR must provide matching -1 entries, proving that
+        // every (input_state, output_state) was correctly computed.
+        if let Some(ref hades_rel) = self.hades_lookup {
+            // Build the 54-column key: [input_state[27], output_state[27]]
+            let mut key_values: Vec<E::F> = Vec::with_capacity(54);
+            for v in &digest_before { key_values.push(v.clone()); }
+            for v in &input_value { key_values.push(v.clone()); }
+            for v in &input_capacity { key_values.push(v.clone()); }
+            for v in &digest_after { key_values.push(v.clone()); }
+            for v in &output_value { key_values.push(v.clone()); }
+            for v in &output_capacity { key_values.push(v.clone()); }
+
+            eval.add_to_relation(RelationEntry::new(
+                hades_rel,
+                E::EF::one(), // +1 multiplicity: consumer
+                &key_values,
+            ));
+
+            eval.finalize_logup();
+        }
+
         eval
     }
 }
@@ -206,27 +259,60 @@ pub type RecursiveVerifierComponent = FrameworkComponent<RecursiveVerifierEval>;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::{Col, Column};
 
+/// A single chain trace row with full Hades input/output states.
+struct ChainRow {
+    full_input: [FieldElement; 3],
+    full_output: [FieldElement; 3],
+}
+
 /// Build the execution trace from real Hades permutation states.
 ///
 /// Each row stores the actual felt252 Hades input/output from the GKR
 /// verifier's Fiat-Shamir transcript, decomposed into M31 limbs.
+///
+/// Expanded layout (64 columns):
+///   [0..9)    digest_before     (input state[0])
+///   [9..18)   input_value       (input state[1])
+///   [18..27)  input_capacity    (input state[2])
+///   [27..36)  digest_after      (output state[0])
+///   [36..45)  output_value      (output state[1])
+///   [45..54)  output_capacity   (output state[2])
+///   [54..63)  shifted_next_before (next row's digest_before)
+///   [63]      op_type
 pub fn build_recursive_trace(
     witness: &super::types::GkrVerifierWitness,
 ) -> RecursiveTraceData {
     use super::types::WitnessOp;
 
-    // Collect all ChannelOp entries — these are the chain units.
-    // Each ChannelOp records (digest_before, digest_after) for one channel operation.
-    let channel_ops: Vec<(FieldElement, FieldElement)> = witness
-        .ops
-        .iter()
-        .filter_map(|op| match op {
-            WitnessOp::ChannelOp { digest_before, digest_after } => Some((*digest_before, *digest_after)),
-            _ => None,
-        })
-        .collect();
+    // Pair each ChannelOp with its preceding HadesPerm to get full states.
+    // The witness records: HadesPerm { input, output } then ChannelOp { digest_before, digest_after }.
+    // We walk the ops and pair them.
+    let mut rows: Vec<ChainRow> = Vec::new();
+    let mut pending_hades: Option<([FieldElement; 3], [FieldElement; 3])> = None;
 
-    let n_ops = channel_ops.len();
+    for op in &witness.ops {
+        match op {
+            WitnessOp::HadesPerm { input, output } => {
+                pending_hades = Some((*input, *output));
+            }
+            WitnessOp::ChannelOp { digest_before, digest_after } => {
+                let (full_input, full_output) = if let Some((inp, out)) = pending_hades.take() {
+                    // Verify consistency: HadesPerm input[0] == digest_before
+                    debug_assert_eq!(inp[0], *digest_before);
+                    debug_assert_eq!(out[0], *digest_after);
+                    (inp, out)
+                } else {
+                    // No HadesPerm for this ChannelOp — use digest + zeros
+                    ([*digest_before, FieldElement::ZERO, FieldElement::ZERO],
+                     [*digest_after, FieldElement::ZERO, FieldElement::ZERO])
+                };
+                rows.push(ChainRow { full_input, full_output });
+            }
+            _ => {} // Skip non-chain ops
+        }
+    }
+
+    let n_ops = rows.len();
     let n_real_rows = n_ops;
     let n_for_sizing = witness.n_poseidon_perms.max(n_ops);
 
@@ -237,44 +323,42 @@ pub fn build_recursive_trace(
     };
     let n_padded_rows = 1usize << log_size;
 
-    // Build trace columns
+    // Build trace columns (expanded: 64 columns)
     let mut execution_trace: Vec<Vec<M31>> = Vec::with_capacity(COLS_PER_ROW);
     for _ in 0..COLS_PER_ROW {
         execution_trace.push(vec![M31::from_u32_unchecked(0); n_padded_rows]);
     }
 
-    // Zero limbs for padding
     let zero_limbs = felt252_to_limbs(&FieldElement::ZERO);
 
-    // Populate trace from ChannelOp data
-    for row in 0..n_padded_rows {
-        let (before_limbs, after_limbs, op_type) = if row < n_ops {
-            let (before, after) = channel_ops[row];
-            (felt252_to_limbs(&before), felt252_to_limbs(&after), 0u32)
+    // Populate trace
+    for row_idx in 0..n_padded_rows {
+        let (input_limbs, output_limbs) = if row_idx < n_ops {
+            let r = &rows[row_idx];
+            (hades_state_to_limbs(&r.full_input), hades_state_to_limbs(&r.full_output))
         } else {
-            // Padding rows: digest stays zero
-            (zero_limbs, zero_limbs, 0u32)
+            ([M31::from_u32_unchecked(0); COLS_PER_STATE],
+             [M31::from_u32_unchecked(0); COLS_PER_STATE])
         };
 
-        // Write digest_before (9 columns)
-        for j in 0..LIMBS_PER_FELT {
-            execution_trace[j][row] = before_limbs[j];
+        // Write full input state (27 columns: digest_before + input_value + input_capacity)
+        for j in 0..COLS_PER_STATE {
+            execution_trace[j][row_idx] = input_limbs[j];
         }
-        // Write digest_after (9 columns)
-        for j in 0..LIMBS_PER_FELT {
-            execution_trace[LIMBS_PER_FELT + j][row] = after_limbs[j];
+        // Write full output state (27 columns: digest_after + output_value + output_capacity)
+        for j in 0..COLS_PER_STATE {
+            execution_trace[COLS_PER_STATE + j][row_idx] = output_limbs[j];
         }
-        // shifted_next_before populated in second pass
-        // Write op_type
-        execution_trace[3 * LIMBS_PER_FELT][row] = M31::from_u32_unchecked(op_type);
+        // op_type
+        execution_trace[2 * COLS_PER_STATE + LIMBS_PER_FELT][row_idx] = M31::from_u32_unchecked(0);
     }
 
     // Second pass: shifted_next_before[row_i] = digest_before[row_{i+1}]
-    let shifted_start = 2 * LIMBS_PER_FELT;
-    for row in 0..n_padded_rows {
-        if row + 1 < n_padded_rows {
+    let shifted_start = 2 * COLS_PER_STATE; // after input + output states
+    for row_idx in 0..n_padded_rows {
+        if row_idx + 1 < n_padded_rows {
             for j in 0..LIMBS_PER_FELT {
-                execution_trace[shifted_start + j][row] = execution_trace[j][row + 1];
+                execution_trace[shifted_start + j][row_idx] = execution_trace[j][row_idx + 1];
             }
         }
     }
@@ -341,8 +425,9 @@ mod tests {
     fn test_cols_per_row() {
         assert_eq!(LIMBS_PER_FELT, 9);
         assert_eq!(COLS_PER_DIGEST, 9);
-        // 9 (digest_before) + 9 (digest_after) + 9 (shifted_next_before) + 1 (op_type) = 28
-        assert_eq!(COLS_PER_ROW, 28);
+        assert_eq!(COLS_PER_STATE, 27);
+        // Expanded: 27 (input) + 27 (output) + 9 (shifted) + 1 (op_type) = 64
+        assert_eq!(COLS_PER_ROW, 64);
     }
 
     #[test]
@@ -491,6 +576,7 @@ mod tests {
             log_n_rows: 14,
             initial_digest_limbs: [M31::from_u32_unchecked(0); LIMBS_PER_FELT],
             final_digest_limbs: [M31::from_u32_unchecked(42); LIMBS_PER_FELT],
+            hades_lookup: None,
         };
         assert_eq!(eval.log_size(), 14);
         assert_eq!(eval.max_constraint_log_degree_bound(), 15);

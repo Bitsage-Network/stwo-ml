@@ -72,4 +72,8 @@ mod tests {
             "hades([x, y, 2])[0] must equal poseidon_hash(x, y)"
         );
     }
+
+    // Hades step-by-step execution tests are in recursive::hades_air::tests.
+    // They can't be called from here due to conditional compilation of the
+    // recursive module's test dependencies.
 }
