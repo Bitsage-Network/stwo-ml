@@ -451,6 +451,13 @@ pub mod RecursiveVerifierContract {
 
             let pcs_config = csp.config;
             let log_blowup = pcs_config.fri_config.log_blowup_factor;
+
+            // Enforce minimum proof security level.
+            // Without this, an attacker could submit a proof with 1-bit security.
+            // Minimum: pow_bits ≥ 10, log_blowup ≥ 1, n_queries ≥ 3 (≥ 13 bits total)
+            assert(pcs_config.pow_bits >= 10, 'pow_bits too low');
+            assert(log_blowup >= 1, 'log_blowup too low');
+            assert(pcs_config.fri_config.n_queries >= 3, 'n_queries too low');
             let commitments_span = csp.commitments;
 
             let preprocessed_commitment: stwo_verifier_core::Hash = *commitments_span.at(0);
