@@ -456,7 +456,7 @@ pub fn prove_recursive_with_policy(
     // witness only partially records the chain (Pass 2 covers core layers).
     let zero_limbs = super::air::felt252_to_limbs(&starknet_ff::FieldElement::ZERO);
 
-    // Find the last ChannelOp's digest_after
+    // Find the last ChannelOp's digest_after — this is the chain trace's final digest.
     let last_channel_op = witness.ops.iter().rev().find_map(|op| {
         if let super::types::WitnessOp::ChannelOp { digest_after, .. } = op {
             Some(*digest_after)
@@ -465,13 +465,10 @@ pub fn prove_recursive_with_policy(
         }
     });
 
-    let pass2_final = last_channel_op.unwrap_or(starknet_ff::FieldElement::ZERO);
+    let final_digest_felt =
+        last_channel_op.unwrap_or(starknet_ff::FieldElement::ZERO);
 
-    // The chain AIR uses Pass 2's last digest for the boundary constraint
-    // (since the chain trace is built from Pass 2's recorded ops).
-    let final_digest_felt = pass2_final;
-
-    if pass2_final != witness.final_digest {
+    if final_digest_felt != witness.final_digest {
         recursive_log!(
             "  [Recursive] NOTE: Pass 2 final digest differs from Pass 1 \
              ({} recorded ops vs {} total Poseidon calls). \

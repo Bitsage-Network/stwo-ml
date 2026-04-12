@@ -74,22 +74,27 @@ pub const COLS_EXTRA_STATE: usize = 2 * LIMBS_PER_FELT; // 18
 ///   digest_before[9] + input_value[9] + input_capacity[9]
 /// + digest_after[9]  + output_value[9] + output_capacity[9]
 /// + shifted_next_before[9] + op_type[1]
-/// + is_active[1] + is_active_next[1] + is_active_prev[1]
-/// + active_count[1] + active_count_next[1] = 69
+/// + addition_digest[9]    (intermediate addition between consecutive HadesPerms)
+/// + is_active[1] + is_active_next[1] + active_count[1] + active_count_next[1]
+/// + is_chain_gate[1] + is_boundary_gate[1] + is_active_prev[1] = 80
 ///
-/// SECURITY: The last 7 columns are execution-trace selectors with UNCONDITIONAL
-/// constraints. This prevents the all-zeros-selector attack where a malicious prover
-/// sets preprocessed selectors to zero, making all constraints trivially satisfied.
-/// The amortized accumulator (active_count) uses the identity:
-///   active_count[i+1] = active_count[i] + is_active[i] - n_real_rows * N_inv
-/// which evaluates to n_real_rows * N_inv ≠ 0 on an all-zeros trace.
+/// Each row = one Hades permutation (not one ChannelOp). Multi-Hades ChannelOps
+/// (mix_poly_coeffs: 2 Hades calls) produce 2 rows. The addition_digest column
+/// holds the intermediate value added to element 0 between consecutive perms
+/// within the same ChannelOp.
+///
+/// Chain constraint: is_chain_gate * (digest_after + addition_digest - shifted_next_before) = 0
+///
+/// SECURITY: Execution-trace selectors with UNCONDITIONAL amortized accumulator
+/// constraint block the all-zeros-selector attack.
 pub const COLS_PER_ROW: usize = COLS_PER_STATE   // input full state: 27
     + COLS_PER_STATE // output full state: 27
     + COLS_PER_DIGEST // shifted_next_before: 9
     + 1  // op_type
-    + 7; // [64] is_active, [65] is_active_next, [66] active_count,
-         // [67] active_count_next, [68] is_chain_gate, [69] is_boundary_gate,
-         // [70] is_active_prev
+    + COLS_PER_DIGEST // addition_digest: 9 (intermediate additions between Hades calls)
+    + 7; // [73] is_active, [74] is_active_next, [75] active_count,
+         // [76] active_count_next, [77] is_chain_gate, [78] is_boundary_gate,
+         // [79] is_active_prev
          // Total: 27 + 27 + 9 + 1 = 64
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -222,6 +227,11 @@ impl FrameworkEval for RecursiveVerifierEval {
         // op_type: 0 = mix, 1 = draw, 2 = mix_poly_coeffs
         let _op_type = eval.next_trace_mask();
 
+        // addition_digest: intermediate value added to digest between consecutive
+        // Hades permutations within the same ChannelOp (e.g., felt2 in mix_poly_coeffs).
+        // Zero for single-perm ops.
+        let addition_digest: [E::F; LIMBS_PER_FELT] = std::array::from_fn(|_| eval.next_trace_mask());
+
         // ── Execution-trace selectors ────────────────────────────────
         // Read but used only for the amortized accumulator (unconditional constraint).
         let is_active = eval.next_trace_mask();
@@ -276,11 +286,14 @@ impl FrameworkEval for RecursiveVerifierEval {
             );
         }
 
-        // C5: Chain — consecutive active rows have chained digests [degree 2]
+        // C5: Chain — consecutive Hades perms have chained digests [degree 2]
+        // For single-perm ops: addition_digest = 0, so digest_after == shifted_next
+        // For multi-perm ops: digest_after + addition == shifted_next (= next perm's input[0])
         for j in 0..LIMBS_PER_FELT {
             eval.add_constraint(
                 _is_chain.clone()
-                    * (digest_after[j].clone() - shifted_next_before[j].clone()),
+                    * (digest_after[j].clone() + addition_digest[j].clone()
+                        - shifted_next_before[j].clone()),
             );
         }
 
@@ -322,10 +335,14 @@ pub type RecursiveVerifierComponent = FrameworkComponent<RecursiveVerifierEval>;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::{Col, Column};
 
-/// A single chain trace row with full Hades input/output states.
+/// A single chain trace row — one Hades permutation.
 struct ChainRow {
     full_input: [FieldElement; 3],
     full_output: [FieldElement; 3],
+    /// Value added to output[0] before the NEXT perm's input[0].
+    /// Zero for most rows. Non-zero for intermediate perms within
+    /// multi-Hades ChannelOps (e.g., felt2 in mix_poly_coeffs).
+    addition_digest: FieldElement,
 }
 
 /// Build the execution trace from real Hades permutation states.
@@ -342,27 +359,26 @@ struct ChainRow {
 ///   [45..54)  output_capacity   (output state[2])
 ///   [54..63)  shifted_next_before (next row's digest_before)
 ///   [63]      op_type
-///   [64]      is_active         (1 for real rows, 0 for padding)
-///   [65]      is_active_next    (shifted: is_active[i+1])
-///   [66]      active_count      (amortized accumulator)
-///   [67]      active_count_next (shifted: active_count[i+1])
-///   [68]      is_chain_gate     (precomputed: is_active * is_active_next)
-///   [69]      is_boundary_gate  (precomputed: is_active * (1 - is_active_next))
-///   [70]      is_active_prev    (shifted: is_active[i-1])
+///   [64..73)  addition_digest   (intermediate addition between consecutive HadesPerms)
+///   [73]      is_active         (1 for real rows, 0 for padding)
+///   [74]      is_active_next    (shifted: is_active[i+1])
+///   [75]      active_count      (amortized accumulator)
+///   [76]      active_count_next (shifted: active_count[i+1])
+///   [77]      is_chain_gate     (precomputed: is_active * is_active_next)
+///   [78]      is_boundary_gate  (precomputed: is_active * (1 - is_active_next))
+///   [79]      is_active_prev    (shifted: is_active[i-1])
 pub fn build_recursive_trace(witness: &super::types::GkrVerifierWitness) -> RecursiveTraceData {
     use super::types::WitnessOp;
 
     // Build one row per ChannelOp (digest transition).
-    // Each row represents one atomic channel state change (digest_before → digest_after).
-    // Some ChannelOps involve multiple Hades permutations (e.g., mix_poly_coeffs
-    // does 2 Hades calls per ChannelOp). The chain constraint only links the
-    // NET digest transitions, not individual permutations.
+    // Each row represents one atomic channel state change.
+    // Multi-Hades ChannelOps (mix_poly_coeffs: 2 Hades calls) produce ONE row
+    // with the NET digest transition.
     //
-    // NOTE: LogUp binding to the Hades AIR requires matching at the individual
-    // permutation level, which means refactoring the chain to HadesPerm-level
-    // rows. This is deferred to Phase 6 — the current defenses (amortized
-    // accumulator, seed_digest, n_poseidon_perms, offline Hades verification)
-    // provide strong security without LogUp.
+    // LogUp binding requires per-permutation matching, which needs a trace
+    // architecture redesign with carry-chain addition columns. The current
+    // defenses (amortized accumulator, seed_digest, n_poseidon_perms, offline
+    // Hades verification) provide strong security without LogUp.
     let mut rows: Vec<ChainRow> = Vec::new();
     let mut pending_hades: Option<([FieldElement; 3], [FieldElement; 3])> = None;
 
@@ -393,6 +409,7 @@ pub fn build_recursive_trace(witness: &super::types::GkrVerifierWitness) -> Recu
                 rows.push(ChainRow {
                     full_input,
                     full_output,
+                    addition_digest: FieldElement::ZERO, // ChannelOp level: no intermediate additions
                 });
             }
             _ => {}
@@ -452,6 +469,15 @@ pub fn build_recursive_trace(witness: &super::types::GkrVerifierWitness) -> Recu
         }
         // op_type
         execution_trace[2 * COLS_PER_STATE + LIMBS_PER_FELT][row_idx] = M31::from_u32_unchecked(0);
+
+        // addition_digest: 9 limbs (value added to output[0] before next input[0])
+        let addition_col_start = 2 * COLS_PER_STATE + LIMBS_PER_FELT + 1;
+        if row_idx < n_ops {
+            let add_limbs = felt252_to_limbs(&rows[row_idx].addition_digest);
+            for j in 0..LIMBS_PER_FELT {
+                execution_trace[addition_col_start + j][row_idx] = add_limbs[j];
+            }
+        }
     }
 
     // Second pass: shifted_next_before[row_i] = digest_before[row_{(i+1) mod N}]
@@ -464,10 +490,10 @@ pub fn build_recursive_trace(witness: &super::types::GkrVerifierWitness) -> Recu
         }
     }
 
-    // ── Execution-trace selectors (columns 64..70) ──────────────────
+    // ── Execution-trace selectors (columns 73..79) ──────────────────
     // These replace preprocessed is_last/is_chain with unconditional
     // constraints that prevent the all-zeros-selector attack.
-    let col_is_active = 2 * COLS_PER_STATE + LIMBS_PER_FELT + 1; // column 64
+    let col_is_active = 2 * COLS_PER_STATE + LIMBS_PER_FELT + 1 + LIMBS_PER_FELT; // column 73
     let col_is_active_next = col_is_active + 1;     // 65
     let col_active_count = col_is_active + 2;       // 66
     let col_active_count_next = col_is_active + 3;  // 67
@@ -581,8 +607,8 @@ mod tests {
         assert_eq!(LIMBS_PER_FELT, 9);
         assert_eq!(COLS_PER_DIGEST, 9);
         assert_eq!(COLS_PER_STATE, 27);
-        // Expanded: 27 (input) + 27 (output) + 9 (shifted) + 1 (op_type) + 7 (selectors) = 71
-        assert_eq!(COLS_PER_ROW, 71);
+        // Expanded: 27 (input) + 27 (output) + 9 (shifted) + 1 (op_type) + 9 (addition) + 7 (selectors) = 80
+        assert_eq!(COLS_PER_ROW, 80);
     }
 
     #[test]
