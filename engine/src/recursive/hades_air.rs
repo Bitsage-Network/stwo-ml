@@ -158,8 +158,20 @@ pub const MUL_WITNESS_COLS: usize = 54 + LIMBS_28; // 82
 ///   is_full_round:       1
 ///   is_real:             1
 ///   is_chain_round:      1             (1 on real rows except last in each 91-block)
-///   Total: 1173
-pub const N_HADES_TRACE_COLUMNS: usize = 1173;
+///   is_first_round:      1             (1 on first round of each 91-block)
+///   is_last_round:       1             (1 on last round of each 91-block)
+///   input_digest_28bit:  9             (repacked 28-bit limbs of input digest, last round only)
+///   output_digest_28bit: 9             (repacked 28-bit limbs of output digest, last round only)
+///   split_lo_in:         8             (lo split witnesses for input repack)
+///   split_hi_in:         8             (hi split witnesses for input repack)
+///   split_lo_out:        8             (lo split witnesses for output repack)
+///   split_hi_out:        8             (hi split witnesses for output repack)
+///   Total: 1225
+///
+/// The repack columns enable LogUp binding: the chain AIR's 28-bit digest
+/// limbs match the Hades AIR's repacked 28-bit limbs, proving every
+/// permutation in the chain was actually verified by the Hades AIR.
+pub const N_HADES_TRACE_COLUMNS: usize = 1225;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Felt252 in 9-bit limbs
@@ -218,6 +230,73 @@ pub fn limbs_9bit_to_felt252(limbs: &[M31; LIMBS_28]) -> FieldElement {
     // Convert to big-endian for FieldElement
     bytes.reverse();
     FieldElement::from_bytes_be(&bytes).unwrap_or(FieldElement::ZERO)
+}
+
+/// Repack 28 nine-bit limbs into 9 twenty-eight-bit limbs for LogUp key matching.
+///
+/// Returns (repacked_28bit[9], split_lo[8], split_hi[8]).
+/// Each 28-bit boundary that falls inside a 9-bit limb requires a split:
+///   a[j] = lo + hi × 2^lo_bits
+/// The lo part goes to the current 28-bit limb, hi goes to the next.
+///
+/// Split boundaries (from packing formula computation):
+///   b[0→1]: a[3], lo=1 bit, hi=8 bits
+///   b[1→2]: a[6], lo=2 bits, hi=7 bits
+///   b[2→3]: a[9], lo=3 bits, hi=6 bits
+///   b[3→4]: a[12], lo=4 bits, hi=5 bits
+///   b[4→5]: a[15], lo=5 bits, hi=4 bits
+///   b[5→6]: a[18], lo=6 bits, hi=3 bits
+///   b[6→7]: a[21], lo=7 bits, hi=2 bits
+///   b[7→8]: a[24], lo=8 bits, hi=1 bit
+pub fn repack_9bit_to_28bit(a: &[M31; LIMBS_28]) -> ([M31; 9], [M31; 8], [M31; 8]) {
+    // Split limb indices and bit counts
+    const SPLIT_LIMBS: [usize; 8] = [3, 6, 9, 12, 15, 18, 21, 24];
+    const LO_BITS: [u32; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+
+    let mut split_lo = [M31::from_u32_unchecked(0); 8];
+    let mut split_hi = [M31::from_u32_unchecked(0); 8];
+
+    for s in 0..8 {
+        let val = a[SPLIT_LIMBS[s]].0;
+        let lo_mask = (1u32 << LO_BITS[s]) - 1;
+        split_lo[s] = M31::from_u32_unchecked(val & lo_mask);
+        split_hi[s] = M31::from_u32_unchecked(val >> LO_BITS[s]);
+    }
+
+    // Build 28-bit limbs using the packing formulas
+    let mut b = [M31::from_u32_unchecked(0); 9];
+
+    // b[0] = a[0] + a[1]×2^9 + a[2]×2^18 + lo(a[3])×2^27
+    b[0] = M31::from_u32_unchecked(
+        a[0].0 + a[1].0 * (1 << 9) + a[2].0 * (1 << 18) + split_lo[0].0 * (1 << 27),
+    );
+
+    // b[k] for k=1..8: hi(a[prev_split])×1 + a[j1]×shift1 + a[j2]×shift2 + lo(a[next_split])×shift3
+    // Pattern: each 28-bit chunk contains hi of previous split, 2 full 9-bit limbs, lo of next split
+    for k in 1..8 {
+        let hi_prev = split_hi[k - 1].0;
+        let hi_bits_prev = 9 - LO_BITS[k - 1]; // bits remaining from previous split
+        let j_base = SPLIT_LIMBS[k - 1] + 1; // first full limb after previous split
+        let lo_next = split_lo[k].0;
+        let lo_bits_next = LO_BITS[k];
+        let shift_a1 = hi_bits_prev;
+        let shift_a2 = hi_bits_prev + 9;
+        let shift_lo = 28 - lo_bits_next;
+
+        b[k] = M31::from_u32_unchecked(
+            hi_prev
+                + a[j_base].0 * (1u32 << shift_a1)
+                + a[j_base + 1].0 * (1u32 << shift_a2)
+                + lo_next * (1u32 << shift_lo),
+        );
+    }
+
+    // b[8] = hi(a[24]) + a[25]×2^1 + a[26]×2^10 + a[27]×2^19
+    b[8] = M31::from_u32_unchecked(
+        split_hi[7].0 + a[25].0 * (1 << 1) + a[26].0 * (1 << 10) + a[27].0 * (1 << 19),
+    );
+
+    (b, split_lo, split_hi)
 }
 
 /// Compute the 9-bit limbs of the Stark prime P = 2^251 + 17 * 2^192 + 1.
@@ -1116,6 +1195,9 @@ pub struct HadesVerifierEval {
     /// LogUp lookup elements for carry range checks.
     /// When `None`, range checks are disabled (not sound, for testing only).
     pub range_check: Option<RangeCheck20>,
+    /// LogUp lookup elements for Hades permutation binding (chain ↔ Hades).
+    /// When `Some`, contributes -1 per verified permutation on last-round rows.
+    pub hades_logup: Option<super::air::HadesPermRelation>,
 }
 
 impl FrameworkEval for HadesVerifierEval {
@@ -1233,10 +1315,17 @@ impl FrameworkEval for HadesVerifierEval {
         let is_real = eval.next_trace_mask();
         let is_chain_round = eval.next_trace_mask(); // 1 on non-last rounds in each block
 
-        // Note: is_first_round and is_last_round are not needed for the
-        // current constraint set (all constraints gated by is_real/is_full_round).
-        // When LogUp boundary contributions are added, these will be needed
-        // as additional trace columns, not preprocessed.
+        // LogUp boundary selectors
+        let is_first_round = eval.next_trace_mask(); // 1 on first round of each 91-block
+        let is_last_round = eval.next_trace_mask();  // 1 on last round of each 91-block
+
+        // Repacked 28-bit limbs (populated on is_last_round rows only)
+        let input_digest_28bit: [E::F; 9] = std::array::from_fn(|_| eval.next_trace_mask());
+        let output_digest_28bit: [E::F; 9] = std::array::from_fn(|_| eval.next_trace_mask());
+        let split_lo_in: [E::F; 8] = std::array::from_fn(|_| eval.next_trace_mask());
+        let split_hi_in: [E::F; 8] = std::array::from_fn(|_| eval.next_trace_mask());
+        let split_lo_out: [E::F; 8] = std::array::from_fn(|_| eval.next_trace_mask());
+        let split_hi_out: [E::F; 8] = std::array::from_fn(|_| eval.next_trace_mask());
 
         // ── Stark prime limbs ────────────────────────────────────────
         let p_limbs = stark_prime_9bit_limbs();
@@ -1326,6 +1415,145 @@ impl FrameworkEval for HadesVerifierEval {
                         * (mds_result[elem][j].clone() - shifted_next_state[elem][j].clone()),
                 );
             }
+        }
+
+        // ── Boolean constraints for new selectors ────────────────────
+        eval.add_constraint(
+            is_first_round.clone() * (is_first_round.clone() - one.clone()),
+        );
+        eval.add_constraint(
+            is_last_round.clone() * (is_last_round.clone() - one.clone()),
+        );
+
+        // ── Repack verification (gated by is_last_round) ────────────
+        // On last-round rows, verify that the 28-bit repacked limbs match
+        // the 9-bit state_before[0] (input digest) and mds_result[0] (output digest).
+        //
+        // Split constraint: a[split_j] = lo + hi × 2^lo_bits
+        // Packing constraint: b[k] = hi_prev + a[j1]×shift1 + a[j2]×shift2 + lo_next×shift3
+        {
+            let split_limbs: [usize; 8] = [3, 6, 9, 12, 15, 18, 21, 24];
+            let lo_bits: [u32; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+
+            // Input digest: verify split consistency
+            for s in 0..8 {
+                let two_pow_lo = E::F::from(M31::from(1u32 << lo_bits[s]));
+                eval.add_constraint(
+                    is_last_round.clone()
+                        * (state_before[0][split_limbs[s]].clone()
+                            - split_lo_in[s].clone()
+                            - split_hi_in[s].clone() * two_pow_lo),
+                );
+            }
+
+            // Output digest: verify split consistency
+            for s in 0..8 {
+                let two_pow_lo = E::F::from(M31::from(1u32 << lo_bits[s]));
+                eval.add_constraint(
+                    is_last_round.clone()
+                        * (mds_result[0][split_limbs[s]].clone()
+                            - split_lo_out[s].clone()
+                            - split_hi_out[s].clone() * two_pow_lo),
+                );
+            }
+
+            // Input digest: verify packing b[0]
+            // b[0] = a[0] + a[1]×2^9 + a[2]×2^18 + lo(a[3])×2^27
+            {
+                let expected_b0 = state_before[0][0].clone()
+                    + state_before[0][1].clone() * E::F::from(M31::from(1u32 << 9))
+                    + state_before[0][2].clone() * E::F::from(M31::from(1u32 << 18))
+                    + split_lo_in[0].clone() * E::F::from(M31::from(1u32 << 27));
+                eval.add_constraint(
+                    is_last_round.clone() * (input_digest_28bit[0].clone() - expected_b0),
+                );
+            }
+
+            // Input digest: verify packing b[1..8]
+            for k in 1..8usize {
+                let hi_bits_prev = 9 - lo_bits[k - 1];
+                let j_base = split_limbs[k - 1] + 1;
+                let shift_lo = 28 - lo_bits[k];
+                let expected = split_hi_in[k - 1].clone()
+                    + state_before[0][j_base].clone()
+                        * E::F::from(M31::from(1u32 << hi_bits_prev))
+                    + state_before[0][j_base + 1].clone()
+                        * E::F::from(M31::from(1u32 << (hi_bits_prev + 9)))
+                    + split_lo_in[k].clone() * E::F::from(M31::from(1u32 << shift_lo));
+                eval.add_constraint(
+                    is_last_round.clone() * (input_digest_28bit[k].clone() - expected),
+                );
+            }
+
+            // Input digest: verify packing b[8]
+            // b[8] = hi(a[24]) + a[25]×2^1 + a[26]×2^10 + a[27]×2^19
+            {
+                let expected_b8 = split_hi_in[7].clone()
+                    + state_before[0][25].clone() * E::F::from(M31::from(1u32 << 1))
+                    + state_before[0][26].clone() * E::F::from(M31::from(1u32 << 10))
+                    + state_before[0][27].clone() * E::F::from(M31::from(1u32 << 19));
+                eval.add_constraint(
+                    is_last_round.clone() * (input_digest_28bit[8].clone() - expected_b8),
+                );
+            }
+
+            // Output digest: same packing verification
+            {
+                let expected_b0 = mds_result[0][0].clone()
+                    + mds_result[0][1].clone() * E::F::from(M31::from(1u32 << 9))
+                    + mds_result[0][2].clone() * E::F::from(M31::from(1u32 << 18))
+                    + split_lo_out[0].clone() * E::F::from(M31::from(1u32 << 27));
+                eval.add_constraint(
+                    is_last_round.clone() * (output_digest_28bit[0].clone() - expected_b0),
+                );
+            }
+            for k in 1..8usize {
+                let hi_bits_prev = 9 - lo_bits[k - 1];
+                let j_base = split_limbs[k - 1] + 1;
+                let shift_lo = 28 - lo_bits[k];
+                let expected = split_hi_out[k - 1].clone()
+                    + mds_result[0][j_base].clone()
+                        * E::F::from(M31::from(1u32 << hi_bits_prev))
+                    + mds_result[0][j_base + 1].clone()
+                        * E::F::from(M31::from(1u32 << (hi_bits_prev + 9)))
+                    + split_lo_out[k].clone() * E::F::from(M31::from(1u32 << shift_lo));
+                eval.add_constraint(
+                    is_last_round.clone() * (output_digest_28bit[k].clone() - expected),
+                );
+            }
+            {
+                let expected_b8 = split_hi_out[7].clone()
+                    + mds_result[0][25].clone() * E::F::from(M31::from(1u32 << 1))
+                    + mds_result[0][26].clone() * E::F::from(M31::from(1u32 << 10))
+                    + mds_result[0][27].clone() * E::F::from(M31::from(1u32 << 19));
+                eval.add_constraint(
+                    is_last_round.clone() * (output_digest_28bit[8].clone() - expected_b8),
+                );
+            }
+        }
+
+        // ── LogUp: Hades permutation provider (-1 per verified perm) ─
+        // On is_last_round rows, contribute -1 to HadesPermRelation(18)
+        // using the repacked 28-bit digest limbs.
+        // Key: (input_digest_28bit[9], output_digest_28bit[9])
+        if let Some(ref hades_rel) = self.hades_logup {
+            let mut key_values: Vec<E::F> = Vec::with_capacity(18);
+            for v in &input_digest_28bit {
+                key_values.push(v.clone());
+            }
+            for v in &output_digest_28bit {
+                key_values.push(v.clone());
+            }
+
+            // -1 multiplicity on last-round rows, 0 elsewhere
+            let neg_one = E::F::from(M31::from(0u32)) - E::F::from(M31::from(1u32));
+            eval.add_to_relation(RelationEntry::new(
+                hades_rel,
+                E::EF::from(is_last_round.clone() * neg_one),
+                &key_values,
+            ));
+
+            eval.finalize_logup();
         }
 
         eval
@@ -1536,7 +1764,48 @@ pub fn build_hades_trace(hades_perms: &[([FieldElement; 3], [FieldElement; 3])])
 
             // is_chain_round: 1 on all rows except the last in each 91-block
             let is_last_in_block = round_idx == N_ROUNDS - 1;
+            let is_first_in_block = round_idx == 0;
             trace[col][row] = M31::from_u32_unchecked(if !is_last_in_block { 1 } else { 0 });
+            col += 1;
+
+            // is_first_round
+            trace[col][row] = M31::from_u32_unchecked(if is_first_in_block { 1 } else { 0 });
+            col += 1;
+
+            // is_last_round
+            trace[col][row] = M31::from_u32_unchecked(if is_last_in_block { 1 } else { 0 });
+            col += 1;
+
+            // LogUp repack columns: only populated on last-round rows
+            if is_last_in_block {
+                // Input digest: state_before of the FIRST round in this block
+                let input_digest_9bit = felt252_to_9bit_limbs(&input[0]);
+                let (input_28bit, in_lo, in_hi) = repack_9bit_to_28bit(&input_digest_9bit);
+
+                // Output digest: mds_result[0] of this (last) round
+                let output_digest_9bit = felt252_to_9bit_limbs(&round.mds_output[0]);
+                let (output_28bit, out_lo, out_hi) = repack_9bit_to_28bit(&output_digest_9bit);
+
+                // input_digest_28bit[9]
+                for j in 0..9 { trace[col + j][row] = input_28bit[j]; }
+                col += 9;
+                // output_digest_28bit[9]
+                for j in 0..9 { trace[col + j][row] = output_28bit[j]; }
+                col += 9;
+                // split_lo_in[8]
+                for j in 0..8 { trace[col + j][row] = in_lo[j]; }
+                col += 8;
+                // split_hi_in[8]
+                for j in 0..8 { trace[col + j][row] = in_hi[j]; }
+                col += 8;
+                // split_lo_out[8]
+                for j in 0..8 { trace[col + j][row] = out_lo[j]; }
+                col += 8;
+                // split_hi_out[8]
+                for j in 0..8 { trace[col + j][row] = out_hi[j]; }
+                // col += 8;
+            }
+            // Non-last-round rows: repack columns remain zero (initialized above)
         }
 
         // Second pass: populate shifted_next_state_before
@@ -2209,6 +2478,46 @@ fn u512_to_9bit_limbs(val: &U512) -> Vec<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_repack_9bit_to_28bit() {
+        // Verify repack produces the same 28-bit limbs as direct decomposition
+        let values = [
+            FieldElement::ZERO,
+            FieldElement::ONE,
+            FieldElement::from(0xDEADBEEFu64),
+            FieldElement::from(u64::MAX),
+            FieldElement::from(0x123456789ABCDEF0_u64),
+        ];
+
+        for val in &values {
+            let limbs_9 = felt252_to_9bit_limbs(val);
+            let limbs_28 = crate::recursive::air::felt252_to_limbs(val);
+            let (repacked, split_lo, split_hi) = repack_9bit_to_28bit(&limbs_9);
+
+            for k in 0..9 {
+                assert_eq!(
+                    repacked[k], limbs_28[k],
+                    "repack mismatch for {:?} at limb {k}: got {:?}, expected {:?}",
+                    val, repacked[k], limbs_28[k]
+                );
+            }
+
+            // Verify split consistency: lo + hi × 2^lo_bits = a[split_limb]
+            let split_limbs: [usize; 8] = [3, 6, 9, 12, 15, 18, 21, 24];
+            let lo_bits: [u32; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+            for s in 0..8 {
+                let expected = limbs_9[split_limbs[s]].0;
+                let actual = split_lo[s].0 + split_hi[s].0 * (1u32 << lo_bits[s]);
+                assert_eq!(
+                    actual, expected,
+                    "split mismatch for {:?} at split {s}: lo={}, hi={}, expected={}",
+                    val, split_lo[s].0, split_hi[s].0, expected
+                );
+            }
+        }
+        eprintln!("[test] repack 9-bit→28-bit verified for {} values", values.len());
+    }
 
     #[test]
     fn test_felt252_9bit_roundtrip() {

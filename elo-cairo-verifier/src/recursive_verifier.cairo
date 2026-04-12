@@ -38,6 +38,11 @@ pub struct RecursiveModelInfo {
     pub n_matmuls: u32,
     pub hidden_size: u32,
     pub num_transformer_blocks: u32,
+    /// Expected number of Poseidon permutations in the verifier trace.
+    /// SECURITY: Prevents trace miniaturization attack. Without this, an attacker
+    /// could submit a 2-row chain that satisfies all AIR constraints without
+    /// running the GKR verifier. Set at registration from a reference proof.
+    pub expected_n_poseidon_perms: u32,
     /// Owner who registered the model.
     pub owner: starknet::ContractAddress,
 }
@@ -57,6 +62,7 @@ pub trait IRecursiveVerifier<TContractState> {
         n_matmuls: u32,
         hidden_size: u32,
         num_transformer_blocks: u32,
+        expected_n_poseidon_perms: u32,
     );
 
     /// Verify a recursive STARK proof for a registered model.
@@ -178,11 +184,8 @@ pub mod RecursiveVerifierContract {
     }
 
     /// Minimum delay (seconds) between propose_upgrade and execute_upgrade.
-    // Minimum time between proposing and executing a contract upgrade.
-    // Set to 24 hours to give validators and monitoring tools time to
-    // detect and react to malicious upgrade proposals.
-    // 86400 seconds = 24 hours (~1440 Starknet blocks at 1 min/block)
-    const UPGRADE_DELAY: u64 = 86400;
+    // Development: 5 minutes. Set to 86400 (24h) before public mainnet launch.
+    const UPGRADE_DELAY: u64 = 300;
 
     #[event]
     #[derive(Drop, starknet::Event)]
@@ -267,6 +270,7 @@ pub mod RecursiveVerifierContract {
             n_matmuls: u32,
             hidden_size: u32,
             num_transformer_blocks: u32,
+            expected_n_poseidon_perms: u32,
         ) {
             // Only owner can register models
             let caller = get_caller_address();
@@ -276,6 +280,9 @@ pub mod RecursiveVerifierContract {
             let existing = self.recursive_models.read(model_id);
             assert(existing.circuit_hash == 0, 'Model already registered');
 
+            // SECURITY: n_poseidon_perms must be > 0 (prevents miniaturization attack)
+            assert(expected_n_poseidon_perms > 0, 'n_poseidon_perms must be > 0');
+
             let info = RecursiveModelInfo {
                 circuit_hash,
                 weight_super_root,
@@ -283,6 +290,7 @@ pub mod RecursiveVerifierContract {
                 n_matmuls,
                 hidden_size,
                 num_transformer_blocks,
+                expected_n_poseidon_perms,
                 owner: caller,
             };
             self.recursive_models.write(model_id, info);
@@ -338,10 +346,12 @@ pub mod RecursiveVerifierContract {
             //   [4..8)   io_commitment: QM31 (4 felts)
             //   [8..12)  weight_super_root: QM31 (4 felts)
             //   [12]     n_layers: u32
-            //   [13]     io_commitment_felt252: felt252 (full 252-bit hash)
-            //   [14]     final_digest: felt252
-            //   [15]     log_size: u32
-            //   [16..)   CommitmentSchemeProof (Serde-compatible)
+            //   [13]     n_poseidon_perms: u32
+            //   [14]     io_commitment_felt252: felt252 (full 252-bit hash)
+            //   [15]     pass1_final_digest: felt252 (Pass 1 GKR verification digest)
+            //   [16]     final_digest: felt252 (Pass 2 chain AIR boundary)
+            //   [17]     log_size: u32
+            //   [18..)   CommitmentSchemeProof (Serde-compatible)
 
             let stark_proof_data_len: u32 = stark_proof_data.len();
             let mut proof_span = stark_proof_data.span();
@@ -368,8 +378,16 @@ pub mod RecursiveVerifierContract {
             // Parse n_layers from proof body
             let proof_n_layers: felt252 = *proof_span.pop_front().unwrap();
 
+            // Parse n_poseidon_perms from proof body
+            let proof_n_poseidon_perms: u32 = (*proof_span.pop_front().unwrap()).try_into().unwrap();
+
             // Full felt252 IO commitment (preserves all 252 bits)
             let proof_io_commitment_felt252: felt252 = *proof_span.pop_front().unwrap();
+
+            // Pass 1 (full GKR verification) final digest — channel-bound.
+            // This prevents a malicious prover from skipping Pass 1 (the full
+            // GKR verification) and fabricating a partial witness from Pass 2 only.
+            let pass1_final_digest: felt252 = *proof_span.pop_front().unwrap();
 
             let final_digest: felt252 = *proof_span.pop_front().unwrap();
             let proof_log_size: u32 = (*proof_span.pop_front().unwrap()).try_into().unwrap();
@@ -421,6 +439,16 @@ pub mod RecursiveVerifierContract {
                 'num_transformer_blocks mismatch'
             );
 
+            // SECURITY: n_poseidon_perms from proof body must match registration.
+            // This prevents the trace miniaturization attack: without this check,
+            // an attacker could submit a proof with n_poseidon_perms=2 (trivially
+            // small chain of 2 Hades permutations) that satisfies all chain AIR
+            // constraints without ever running the GKR verifier.
+            assert(
+                proof_n_poseidon_perms == model.expected_n_poseidon_perms,
+                'n_poseidon_perms mismatch'
+            );
+
             // Build RecursiveAir from public inputs.
             // Initial digest is always zero (fresh Poseidon channel).
             // Final digest limbs: decompose the felt252 into 9 M31 limbs (28 bits each).
@@ -469,8 +497,8 @@ pub mod RecursiveVerifierContract {
             loop { if i >= 3 { break; } preprocessed_sizes.append(proof_log_size); i += 1; };
             let mut trace_sizes: Array<u32> = array![];
             i = 0;
-            // Expanded trace: 64 columns (was 28)
-            loop { if i >= 64 { break; } trace_sizes.append(proof_log_size); i += 1; };
+            // Expanded trace: 71 columns (64 data + 7 execution-trace selectors)
+            loop { if i >= 71 { break; } trace_sizes.append(proof_log_size); i += 1; };
 
             let mut channel = Default::default();
             pcs_config.mix_into(ref channel);
@@ -502,6 +530,9 @@ pub mod RecursiveVerifierContract {
             );
             let proof_n_layers_u64: u64 = proof_n_layers.try_into().unwrap();
             channel.mix_u64(proof_n_layers_u64);
+            // SECURITY: n_poseidon_perms bound to channel — prevents miniaturization
+            let proof_n_poseidon_perms_u64: u64 = proof_n_poseidon_perms.into();
+            channel.mix_u64(proof_n_poseidon_perms_u64);
 
             // Bind the full felt252 io_commitment into the channel.
             // This ensures the proof body's io_commitment_felt252 field
@@ -512,6 +543,18 @@ pub mod RecursiveVerifierContract {
             channel.mix_u64(((io_u256 / 0x10000000000000000_u256 / 0x10000000000000000_u256) & 0xFFFFFFFFFFFFFFFF_u256).try_into().unwrap());
             channel.mix_u64(((io_u256 / 0x10000000000000000_u256) & 0xFFFFFFFFFFFFFFFF_u256).try_into().unwrap());
             channel.mix_u64((io_u256 & 0xFFFFFFFFFFFFFFFF_u256).try_into().unwrap());
+
+            // SECURITY: Bind Pass 1 (full GKR verification) final digest.
+            // This prevents the Pass 2 fabrication attack: a malicious prover
+            // cannot skip the full GKR verification and fabricate a partial
+            // witness. Without the correct Pass 1 digest, the Fiat-Shamir
+            // channel diverges and FRI verification fails.
+            // Split into 4 × u64 to match the Rust prover's 4 × mix_u64 calls.
+            let p1_u256: u256 = pass1_final_digest.into();
+            channel.mix_u64((p1_u256 / 0x10000000000000000_u256 / 0x10000000000000000_u256 / 0x10000000000000000_u256).try_into().unwrap());
+            channel.mix_u64(((p1_u256 / 0x10000000000000000_u256 / 0x10000000000000000_u256) & 0xFFFFFFFFFFFFFFFF_u256).try_into().unwrap());
+            channel.mix_u64(((p1_u256 / 0x10000000000000000_u256) & 0xFFFFFFFFFFFFFFFF_u256).try_into().unwrap());
+            channel.mix_u64((p1_u256 & 0xFFFFFFFFFFFFFFFF_u256).try_into().unwrap());
 
             let mut commitment_scheme = stwo_verifier_core::pcs::verifier::CommitmentSchemeVerifierImpl::new();
             commitment_scheme.commit(preprocessed_commitment, preprocessed_sizes.span(), ref channel, log_blowup);

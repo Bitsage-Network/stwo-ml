@@ -2,7 +2,7 @@
 ///
 /// Verifies that a chain of Poseidon channel operations was executed correctly.
 ///
-/// Expanded trace layout (64 columns per row):
+/// Expanded trace layout (69 columns per row):
 ///   [0..9)    digest_before     (input state[0])
 ///   [9..18)   input_value       (input state[1])
 ///   [18..27)  input_capacity    (input state[2])
@@ -11,13 +11,21 @@
 ///   [45..54)  output_capacity   (output state[2])
 ///   [54..63)  shifted_next_before (next row's digest_before)
 ///   [63]      op_type
+///   [64]      is_active         (1 for real rows, 0 for padding)
+///   [65]      is_active_next    (shifted: is_active[i+1])
+///   [66]      is_active_prev    (shifted: is_active[i-1])
+///   [67]      active_count      (amortized accumulator)
+///   [68]      active_count_next (shifted: active_count[i+1])
 ///
-/// Plus 3 preprocessed selector columns: is_first, is_last, is_chain.
+/// Plus 3 preprocessed selector columns (structural, not used in constraints).
 ///
-/// Constraints (all degree ≤ 2):
-///   - Boundary (first row): digest_before[j] == initial_digest_limbs[j]  (9 constraints)
-///   - Boundary (last row):  digest_after[j]  == final_digest_limbs[j]    (9 constraints)
-///   - Chain (internal rows): digest_after[j]  == shifted_next_before[j]   (9 constraints)
+/// Constraints (degree ≤ 3):
+///   - C1: is_active boolean           [unconditional, degree 2]
+///   - C2: monotone (1-active)*next=0  [unconditional, degree 2]
+///   - C3: amortized accumulator       [unconditional, degree 1 — BLOCKS all-zeros attack]
+///   - C4: initial boundary            [degree 3, gated by is_active * (1-is_active_prev)]
+///   - C5: final boundary              [degree 3, gated by is_active * (1-is_active_next)]
+///   - C6: chain transition            [degree 3, gated by is_active * is_active_next]
 
 use stwo_verifier_core::fields::qm31::{QM31, QM31Zero, QM31One, QM31Trait};
 use stwo_verifier_core::fields::m31::M31;
@@ -31,8 +39,10 @@ use stwo_verifier_core::{TreeSpan, ColumnSpan};
 pub const LIMBS_PER_FELT: u32 = 9;
 
 /// Total trace columns (expanded):
-///   input_state(27) + output_state(27) + shifted_next(9) + op_type(1) = 64.
-const TRACE_COLS: u32 = 64;
+///   input_state(27) + output_state(27) + shifted_next(9) + op_type(1)
+///   + is_active(1) + is_active_next(1) + active_count(1) + active_count_next(1)
+///   + is_chain_gate(1) + is_boundary_gate(1) + is_active_prev(1) = 71.
+const TRACE_COLS: u32 = 71;
 
 /// Columns per full Hades state (3 felt252 × 9 limbs).
 const COLS_PER_STATE: u32 = 27;

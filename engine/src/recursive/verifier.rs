@@ -31,6 +31,8 @@ use super::types::RecursivePublicInputs;
 pub fn verify_recursive(
     stark_proof: &stwo::core::proof::StarkProof<Poseidon252MerkleHasher>,
     public_inputs: &RecursivePublicInputs,
+    pass1_final_digest: starknet_ff::FieldElement,
+    n_real_rows: u32,
     log_size: u32,
     final_digest: starknet_ff::FieldElement,
 ) -> Result<(), RecursiveError> {
@@ -56,6 +58,7 @@ pub fn verify_recursive(
     let zero_limbs = super::air::felt252_to_limbs(&starknet_ff::FieldElement::ZERO);
     let eval = RecursiveVerifierEval {
         log_n_rows: log_size,
+        n_real_rows,
         initial_digest_limbs: zero_limbs,
         final_digest_limbs: super::air::felt252_to_limbs(&final_digest),
         hades_lookup: None, // LogUp disabled until multi-component STARK is wired
@@ -83,12 +86,27 @@ pub fn verify_recursive(
         public_inputs.weight_super_root,
     ]);
     channel.mix_u64(public_inputs.n_layers as u64);
+    channel.mix_u64(public_inputs.n_poseidon_perms as u64);
+    channel.mix_felts(&[public_inputs.seed_digest]);
 
     // Also bind the felt252 io_commitment (4 × u64, matching prover)
     {
         let io_felt =
             crate::crypto::poseidon_channel::securefield_to_felt(public_inputs.io_commitment);
         let bytes = io_felt.to_bytes_be();
+        let u0 = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
+        let u1 = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
+        let u2 = u64::from_be_bytes(bytes[16..24].try_into().unwrap());
+        let u3 = u64::from_be_bytes(bytes[24..32].try_into().unwrap());
+        channel.mix_u64(u0);
+        channel.mix_u64(u1);
+        channel.mix_u64(u2);
+        channel.mix_u64(u3);
+    }
+
+    // Bind Pass 1 (full GKR verification) digest — must match prover
+    {
+        let bytes = pass1_final_digest.to_bytes_be();
         let u0 = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
         let u1 = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
         let u2 = u64::from_be_bytes(bytes[16..24].try_into().unwrap());
@@ -205,6 +223,8 @@ mod tests {
         let verify_result = verify_recursive(
             &recursive_proof.stark_proof,
             &recursive_proof.public_inputs,
+            recursive_proof.pass1_final_digest,
+            recursive_proof.n_real_rows,
             recursive_proof.log_size,
             recursive_proof.final_digest,
         );
@@ -216,7 +236,7 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // Adversarial tests — reproduce Omar Espejel's review findings
+    // Adversarial tests — metadata relabeling + proof integrity
     // ═══════════════════════════════════════════════════════════════
 
     /// Helper: produce a valid recursive proof for adversarial testing.
@@ -263,15 +283,16 @@ mod tests {
 
     #[test]
     fn test_adversarial_tampered_io_commitment_rejected() {
-        // Omar's Finding 1: same proof body, different io_commitment.
-        // Before fix (commit c3071846): starknet_call returned success (0x1).
-        // After fix (commit 618fcc79): Fiat-Shamir channel diverges → FRI fails.
+        // Relabeling attack: same proof body, different io_commitment.
+        // Fiat-Shamir channel binding causes FRI divergence → rejection.
         let rp = adversarial_proof();
 
         // Valid proof passes
         let ok = verify_recursive(
             &rp.stark_proof,
             &rp.public_inputs,
+            rp.pass1_final_digest,
+            rp.n_real_rows,
             rp.log_size,
             rp.final_digest,
         );
@@ -285,7 +306,7 @@ mod tests {
             ),
             ..rp.public_inputs
         };
-        let err = verify_recursive(&rp.stark_proof, &tampered, rp.log_size, rp.final_digest);
+        let err = verify_recursive(&rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest);
         assert!(
             err.is_err(),
             "SECURITY: tampered io_commitment MUST be rejected"
@@ -295,14 +316,14 @@ mod tests {
 
     #[test]
     fn test_adversarial_tampered_n_layers_rejected() {
-        // Omar specifically changed n_layers in his test.
+        // n_layers tampering: different layer count with same proof body.
         let rp = adversarial_proof();
 
         let tampered = RecursivePublicInputs {
             n_layers: rp.public_inputs.n_layers + 100,
             ..rp.public_inputs
         };
-        let err = verify_recursive(&rp.stark_proof, &tampered, rp.log_size, rp.final_digest);
+        let err = verify_recursive(&rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest);
         assert!(err.is_err(), "SECURITY: tampered n_layers MUST be rejected");
         eprintln!("[adversarial] n_layers tampering rejected ✓");
     }
@@ -318,7 +339,7 @@ mod tests {
             ),
             ..rp.public_inputs
         };
-        let err = verify_recursive(&rp.stark_proof, &tampered, rp.log_size, rp.final_digest);
+        let err = verify_recursive(&rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest);
         assert!(
             err.is_err(),
             "SECURITY: tampered weight_super_root MUST be rejected"
@@ -337,7 +358,7 @@ mod tests {
             ),
             ..rp.public_inputs
         };
-        let err = verify_recursive(&rp.stark_proof, &tampered, rp.log_size, rp.final_digest);
+        let err = verify_recursive(&rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest);
         assert!(
             err.is_err(),
             "SECURITY: tampered circuit_hash MUST be rejected"
@@ -346,8 +367,8 @@ mod tests {
     }
 
     #[test]
-    fn test_adversarial_omar_full_scenario() {
-        // Reproduce Omar's exact test: change ALL metadata fields
+    fn test_adversarial_full_metadata_relabeling() {
+        // Full relabeling attack: change ALL metadata fields
         // while keeping the proof body unchanged.
         let rp = adversarial_proof();
 
@@ -365,8 +386,10 @@ mod tests {
                 CM31(M31::from(11), M31::from(12)),
             ),
             n_layers: 337,
+            n_poseidon_perms: 9999,
+            seed_digest: QM31::default(),
         };
-        let err = verify_recursive(&rp.stark_proof, &tampered, rp.log_size, rp.final_digest);
+        let err = verify_recursive(&rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest);
         assert!(
             err.is_err(),
             "SECURITY: fully tampered metadata MUST be rejected"
@@ -376,6 +399,8 @@ mod tests {
         let ok = verify_recursive(
             &rp.stark_proof,
             &rp.public_inputs,
+            rp.pass1_final_digest,
+            rp.n_real_rows,
             rp.log_size,
             rp.final_digest,
         );
@@ -383,12 +408,48 @@ mod tests {
             ok.is_ok(),
             "original metadata must still verify after adversarial test"
         );
-        eprintln!("[adversarial] Omar's full relabeling scenario: blocked ✓");
+        eprintln!("[adversarial] full metadata relabeling blocked ✓");
+    }
+
+    #[test]
+    fn test_adversarial_trace_miniaturization_rejected() {
+        // VULNERABILITY: Trace miniaturization attack.
+        // An attacker claims a different n_poseidon_perms to make the trace
+        // trivially small. Without the n_poseidon_perms channel binding, this
+        // would produce a valid STARK proof without running the GKR verifier.
+        let rp = adversarial_proof();
+
+        // Tampered: claim only 2 Poseidon perms (trivially small chain)
+        let tampered = RecursivePublicInputs {
+            n_poseidon_perms: 2,
+            ..rp.public_inputs
+        };
+        let err = verify_recursive(
+            &rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest,
+        );
+        assert!(
+            err.is_err(),
+            "SECURITY: miniaturized n_poseidon_perms MUST be rejected"
+        );
+
+        // Also test inflated count
+        let tampered = RecursivePublicInputs {
+            n_poseidon_perms: rp.public_inputs.n_poseidon_perms + 1000,
+            ..rp.public_inputs
+        };
+        let err = verify_recursive(
+            &rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest,
+        );
+        assert!(
+            err.is_err(),
+            "SECURITY: inflated n_poseidon_perms MUST be rejected"
+        );
+        eprintln!("[adversarial] trace miniaturization attack blocked ✓");
     }
 
     #[test]
     fn test_adversarial_hades_tampered_witness_detected() {
-        // Omar's Finding 2: verify Hades permutation integrity.
+        // Hades permutation integrity: tampered witness must be rejected.
         use crate::recursive::types::WitnessOp;
 
         let mut builder = GraphBuilder::new((1, 4));

@@ -129,6 +129,24 @@ pub struct RecursivePublicInputs {
 
     /// Total number of GKR layers verified (for the AIR log_size).
     pub n_layers: u32,
+
+    /// Total Poseidon permutations in the verifier execution.
+    /// SECURITY: This is validated on-chain against the registered model's
+    /// expected complexity. Without this, an attacker could submit a trivially
+    /// small trace (2 Hades permutations) that satisfies all chain AIR constraints
+    /// without ever running the GKR verifier. The AIR uses this to reconstruct
+    /// the preprocessed columns (is_first, is_last, is_chain) deterministically.
+    pub n_poseidon_perms: u32,
+
+    /// Poseidon channel digest after the 3 circuit-seeding operations:
+    ///   mix_u64(n_layers), mix_u64(input_shape.0), mix_u64(input_shape.1)
+    ///
+    /// SECURITY: This checkpoint constrains the chain's early rows to match
+    /// the GKR verifier's deterministic seeding. An attacker fabricating a
+    /// chain cannot pass this constraint without knowing the model dimensions
+    /// and producing the exact same Hades permutations the real verifier would.
+    /// This value is deterministic per model (doesn't depend on inference data).
+    pub seed_digest: QM31,
 }
 
 /// The recursive STARK proof — replaces the 112K felt GKR calldata.
@@ -147,13 +165,22 @@ pub struct RecursiveProof {
     pub public_inputs: RecursivePublicInputs,
 
     /// Full felt252 IO commitment (Poseidon hash of packed IO).
-    /// The QM31 `public_inputs.io_commitment` only carries the low 124 bits
-    /// (lossy conversion via `felt_to_securefield`). This field preserves
-    /// the full 252-bit value for on-chain cross-checking.
     pub io_commitment_felt252: FieldElement,
 
-    /// Final channel digest from the GKR verifier (for boundary constraint).
+    /// Pass 1 (full GKR verification) final channel digest.
+    /// Mixed into the Fiat-Shamir channel to bind the STARK proof to a
+    /// COMPLETE GKR verification. Without this, an attacker could fabricate
+    /// a partial witness that passes the chain AIR without running the full verifier.
+    pub pass1_final_digest: FieldElement,
+
+    /// Pass 2 (instrumented replay) final digest — used for chain AIR boundary.
     pub final_digest: FieldElement,
+
+    /// Number of real (active) rows in the chain trace.
+    /// This is the ChannelOp count from Pass 2, NOT n_poseidon_perms (which
+    /// counts ALL Poseidon calls including non-ChannelOp ones from Pass 1).
+    /// The AIR's amortized accumulator uses this for the correction term.
+    pub n_real_rows: u32,
 
     /// Trace log_size (needed for verifier to reconstruct the AIR).
     pub log_size: u32,

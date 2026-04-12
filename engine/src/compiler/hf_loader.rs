@@ -2435,6 +2435,8 @@ mod tests {
             d_ff: 16,
             activation: ActivationType::GELU,
             norm_type: crate::compiler::onnx::NormType::LayerNorm,
+            num_experts: 0,
+            num_experts_per_tok: 0,
         };
 
         let (graph, moe_infos) = build_hf_transformer_graph(&config, 2);

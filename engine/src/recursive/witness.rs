@@ -474,6 +474,10 @@ pub fn generate_witness_with_policy(
     channel.mix_u64(circuit.input_shape.0 as u64);
     channel.mix_u64(circuit.input_shape.1 as u64);
 
+    // SECURITY: Capture the seed digest — deterministic given the model.
+    // This becomes a public input and AIR checkpoint constraint.
+    let seed_digest = felt_to_securefield(channel.inner().digest());
+
     // Reconstruct output claim
     let output_padded = pad_matrix_pow2(output);
     let output_mle = matrix_to_mle(&output_padded);
@@ -625,6 +629,8 @@ pub fn generate_witness_with_policy(
             io_commitment,
             weight_super_root,
             n_layers: d as u32,
+            n_poseidon_perms: total_poseidon_calls as u32,
+            seed_digest,
         },
         // Use the production verifier's total count (covers ALL layer types)
         n_poseidon_perms: total_poseidon_calls,

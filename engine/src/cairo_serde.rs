@@ -3609,13 +3609,16 @@ mod recursive_serde {
         serialize_qm31(proof.public_inputs.io_commitment, &mut output);
         serialize_qm31(proof.public_inputs.weight_super_root, &mut output);
         serialize_u32(proof.public_inputs.n_layers, &mut output);
+        serialize_u32(proof.public_inputs.n_poseidon_perms, &mut output);
+        serialize_qm31(proof.public_inputs.seed_digest, &mut output);
 
         // Full felt252 IO commitment for on-chain cross-checking.
-        // The QM31 io_commitment above only carries the low 124 bits (lossy).
-        // This field preserves the full 252-bit Poseidon hash.
         output.push(proof.io_commitment_felt252);
 
-        // Final digest (felt252)
+        // Pass 1 (full GKR verification) final digest — channel-bound.
+        output.push(proof.pass1_final_digest);
+
+        // Pass 2 (chain AIR boundary) final digest.
         output.push(proof.final_digest);
 
         // Trace log_size (needed by verifier to reconstruct the AIR)

@@ -360,7 +360,7 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // Recursive STARK: metadata relabeling (Omar Espejel review)
+    // Recursive STARK: metadata relabeling attacks
     // These tests require the `cli` feature (which enables `mod recursive`).
     // Run with: cargo test --lib --all-features -- adversarial_recursive
     // ═══════════════════════════════════════════════════════════════
@@ -397,7 +397,7 @@ mod tests {
 
         // Valid metadata passes
         let ok = crate::recursive::verify_recursive(
-            &rp.stark_proof, &rp.public_inputs, rp.log_size, rp.final_digest,
+            &rp.stark_proof, &rp.public_inputs, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest,
         );
         assert!(ok.is_ok(), "valid proof must verify: {:?}", ok.err());
 
@@ -407,7 +407,7 @@ mod tests {
             ..rp.public_inputs
         };
         let err = crate::recursive::verify_recursive(
-            &rp.stark_proof, &tampered, rp.log_size, rp.final_digest,
+            &rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest,
         );
         assert!(err.is_err(), "SOUNDNESS BUG: tampered io_commitment was accepted!");
         eprintln!("[adversarial] io_commitment relabeling blocked ✓");
@@ -421,7 +421,7 @@ mod tests {
             ..rp.public_inputs
         };
         let err = crate::recursive::verify_recursive(
-            &rp.stark_proof, &tampered, rp.log_size, rp.final_digest,
+            &rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest,
         );
         assert!(err.is_err(), "SOUNDNESS BUG: tampered n_layers was accepted!");
         eprintln!("[adversarial] n_layers relabeling blocked ✓");
@@ -436,15 +436,15 @@ mod tests {
             ..rp.public_inputs
         };
         let err = crate::recursive::verify_recursive(
-            &rp.stark_proof, &tampered, rp.log_size, rp.final_digest,
+            &rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest,
         );
         assert!(err.is_err(), "SOUNDNESS BUG: tampered weight_super_root was accepted!");
         eprintln!("[adversarial] weight_super_root relabeling blocked ✓");
     }
 
     #[test]
-    fn test_adversarial_recursive_omar_full_relabeling() {
-        // Reproduce Omar's exact test: change ALL metadata while keeping proof body.
+    fn test_adversarial_recursive_full_metadata_relabeling() {
+        // Full relabeling attack: change ALL metadata while keeping proof body.
         use stwo::core::fields::cm31::CM31;
         let rp = adversarial_recursive_proof();
         let tampered = crate::recursive::RecursivePublicInputs {
@@ -452,23 +452,25 @@ mod tests {
             io_commitment: QM31(CM31(M31::from(5), M31::from(6)), CM31(M31::from(7), M31::from(8))),
             weight_super_root: QM31(CM31(M31::from(9), M31::from(10)), CM31(M31::from(11), M31::from(12))),
             n_layers: 337,
+            n_poseidon_perms: 9999,
+            seed_digest: QM31::default(),
         };
         let err = crate::recursive::verify_recursive(
-            &rp.stark_proof, &tampered, rp.log_size, rp.final_digest,
+            &rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest,
         );
-        assert!(err.is_err(), "SOUNDNESS BUG: Omar's full relabeling attack was accepted!");
+        assert!(err.is_err(), "SOUNDNESS BUG: full relabeling attack was accepted!");
 
         // Original still works
         let ok = crate::recursive::verify_recursive(
-            &rp.stark_proof, &rp.public_inputs, rp.log_size, rp.final_digest,
+            &rp.stark_proof, &rp.public_inputs, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest,
         );
         assert!(ok.is_ok(), "original metadata must still verify");
-        eprintln!("[adversarial] Omar's full relabeling scenario: blocked ✓");
+        eprintln!("[adversarial] full metadata relabeling blocked ✓");
     }
 
     #[test]
     fn test_adversarial_recursive_hades_witness_tampering() {
-        // Omar's Finding 2: verify Hades permutation integrity in witness.
+        // Hades permutation integrity: tampered witness must be rejected.
         use stwo::core::fields::cm31::CM31;
         use crate::recursive::types::WitnessOp;
 

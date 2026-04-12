@@ -276,6 +276,10 @@ pub fn prove_recursive_with_policy(
         witness.public_inputs.weight_super_root,
     ]);
     channel.mix_u64(witness.public_inputs.n_layers as u64);
+    // SECURITY: n_poseidon_perms prevents trace miniaturization attack.
+    channel.mix_u64(witness.public_inputs.n_poseidon_perms as u64);
+    // SECURITY: seed_digest checkpoint — binds chain content to model dimensions.
+    channel.mix_felts(&[witness.public_inputs.seed_digest]);
 
     // Also bind the full felt252 io_commitment into the channel.
     // The QM31 io_commitment above is lossy (124 bits). This mixes the
@@ -295,8 +299,27 @@ pub fn prove_recursive_with_policy(
         channel.mix_u64(u2);
         channel.mix_u64(u3);
     }
+    // SECURITY: Bind the Pass 1 (full GKR verification) final digest into
+    // the Fiat-Shamir channel. This prevents a malicious prover from skipping
+    // Pass 1 — without the correct Pass 1 digest, the channel diverges and
+    // the STARK proof fails FRI verification.
+    //
+    // An attacker who fabricates a partial witness (Pass 2 only) cannot produce
+    // the correct Pass 1 digest because it depends on ALL layer verifications
+    // (Activation, LayerNorm, etc.) that Pass 2 doesn't replay.
+    {
+        let bytes = witness.final_digest.to_bytes_be();
+        let u0 = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
+        let u1 = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
+        let u2 = u64::from_be_bytes(bytes[16..24].try_into().unwrap());
+        let u3 = u64::from_be_bytes(bytes[24..32].try_into().unwrap());
+        channel.mix_u64(u0);
+        channel.mix_u64(u1);
+        channel.mix_u64(u2);
+        channel.mix_u64(u3);
+    }
     recursive_log!(
-        "  [Recursive] Channel after public inputs: {:?}",
+        "  [Recursive] Channel after public inputs + Pass 1 digest: {:?}",
         channel.digest()
     );
 
@@ -310,6 +333,7 @@ pub fn prove_recursive_with_policy(
     };
     // Max degree must cover the largest component's constraint degree.
     // Chain: +1 (degree 2), Hades: +2 (degree 3 from a*b*is_active).
+    // +1 for degree-2 constraints (helper columns keep all constraints degree ≤ 2)
     let max_degree_bound = unified_log_size + 1;
     let twiddles = SimdBackend::precompute_twiddles(
         CanonicCoset::new(max_degree_bound + config.fri_config.log_blowup_factor)
@@ -357,7 +381,7 @@ pub fn prove_recursive_with_policy(
     {
         let mut tree_builder = commitment_scheme.tree_builder();
 
-        // Chain columns: 64 columns, padded to unified_log_size if needed
+        // Chain columns: 69 columns (64 data + 5 selectors), padded to unified_log_size
         let chain_evals: Vec<CircleEvaluation<SimdBackend, M31, _>> = trace_data
             .execution_trace
             .iter()
@@ -441,13 +465,13 @@ pub fn prove_recursive_with_policy(
         }
     });
 
-    let final_digest_felt = last_channel_op.unwrap_or(starknet_ff::FieldElement::ZERO);
+    let pass2_final = last_channel_op.unwrap_or(starknet_ff::FieldElement::ZERO);
 
-    // Pass 2 (instrumented) may reach a different final digest than Pass 1 (production)
-    // if Pass 2 only replays a subset of layers (e.g., MatMul/Add/Mul but not Activation).
-    // The chain AIR proves consistency of the INSTRUMENTED transcript, not the full one.
-    // Pass 1 validates the full proof; the chain proves the cryptographic core.
-    if final_digest_felt != witness.final_digest {
+    // The chain AIR uses Pass 2's last digest for the boundary constraint
+    // (since the chain trace is built from Pass 2's recorded ops).
+    let final_digest_felt = pass2_final;
+
+    if pass2_final != witness.final_digest {
         recursive_log!(
             "  [Recursive] NOTE: Pass 2 final digest differs from Pass 1 \
              ({} recorded ops vs {} total Poseidon calls). \
@@ -486,6 +510,7 @@ pub fn prove_recursive_with_policy(
     // Component 1: Chain AIR (digest chain + boundary constraints)
     let chain_eval = RecursiveVerifierEval {
         log_n_rows: unified_log_size,
+        n_real_rows: trace_data.n_real_rows as u32,
         initial_digest_limbs: zero_limbs,
         final_digest_limbs: final_limbs,
         hades_lookup: None, // LogUp for Hades binding (TODO: draw from channel)
@@ -497,6 +522,7 @@ pub fn prove_recursive_with_policy(
         log_n_rows: unified_log_size,
         round_constants_limbs: Vec::new(),
         range_check: None,
+        hades_logup: None, // TODO: draw from channel when multi-component LogUp is wired
     };
 
     let stark_proof = if hades_enabled {
@@ -536,7 +562,9 @@ pub fn prove_recursive_with_policy(
         stark_proof: stark_proof,
         public_inputs: witness.public_inputs,
         io_commitment_felt252: io_felt252,
+        pass1_final_digest: witness.final_digest,
         final_digest: final_digest_felt,
+        n_real_rows: trace_data.n_real_rows as u32,
         log_size: chain_log_size,
         metadata: RecursiveProofMetadata {
             recursive_prove_time_secs: recursive_prove_time,

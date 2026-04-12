@@ -600,6 +600,8 @@ mod tests {
             verification_calldata: None,
             weight_binding_mode: None,
             tee_attestation_hash: None,
+            policy_name: None,
+            policy_commitment: None,
         }
     }
 
