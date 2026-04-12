@@ -1338,6 +1338,7 @@ fn compute_mds_witness(
     sbox_output: &[FieldElement; 3],
     mds_output: &FieldElement,
 ) -> ([i64; 29], i64) {
+    println!("compute_mds_witness called for elem_idx={elem_idx}");
     // MDS coefficients per output element:
     // out[0] = 3*a + b + c
     // out[1] = a - b + c
@@ -1366,34 +1367,81 @@ fn compute_mds_witness(
         _ => unreachable!(),
     };
 
-    // MDS: out = coeffs[0]*a + coeffs[1]*b + coeffs[2]*c (mod P)
-    // Try k = -2, -1, 0, 1, 2 until carry chain resolves.
-    for k_candidate in -10i64..=10 {
+    // Compute carries directly from the raw limb equation:
+    // coeffs·inputs[j] - out[j] - k*p[j] + carry_in = carry_out * 512
+    // Try k = -5..5 (covers all cases for |coeffs| ≤ 3).
+    let p_arr = stark_prime_9bit_limbs();
+    // Compute k via byte-level division: k = diff / P.
+    // diff = coeffs·inputs - output. Build as bytes and divide.
+    let mut diff_limbs30 = [0i64; 30];
+    for j in 0..LIMBS_28 {
+        diff_limbs30[j] = coeffs[0] * (a_limbs[j].0 as i64)
+            + coeffs[1] * (b_limbs[j].0 as i64)
+            + coeffs[2] * (c_limbs[j].0 as i64)
+            - (out_limbs[j].0 as i64);
+    }
+    // Normalize to [0, 512)
+    for j in 0..29 {
+        while diff_limbs30[j] < 0 { diff_limbs30[j] += 512; diff_limbs30[j+1] -= 1; }
+        while diff_limbs30[j] >= 512 { diff_limbs30[j] -= 512; diff_limbs30[j+1] += 1; }
+    }
+    // Determine sign and handle negative diff
+    let is_negative = diff_limbs30[29] < 0;
+    if is_negative {
+        // Negate: diff = -diff
+        for j in 0..30 { diff_limbs30[j] = -diff_limbs30[j]; }
+        // Re-normalize
+        for j in 0..29 {
+            while diff_limbs30[j] < 0 { diff_limbs30[j] += 512; diff_limbs30[j+1] -= 1; }
+            while diff_limbs30[j] >= 512 { diff_limbs30[j] -= 512; diff_limbs30[j+1] += 1; }
+        }
+    }
+    // Convert to bytes for bigint division
+    let mut diff_bytes = [0u8; 64];
+    {
+        let mut bp = 0usize;
+        for j in 0..30 {
+            let v = diff_limbs30[j].max(0) as u64;
+            for b in 0..9 { if (v >> b) & 1 == 1 { let bi=(bp+b)/8; let bt=(bp+b)%8; if bi<64 { diff_bytes[bi]|=1<<bt; } } }
+            bp += 9;
+        }
+    }
+    let p_le: [u8; 32] = [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0x11,0,0,0,0,0,0,0x08];
+    let k_bytes = bigint_div_le(&diff_bytes, &p_le);
+    let k_from_div = k_bytes[0] as i64;
+    let k_from_div = if is_negative { -k_from_div } else { k_from_div };
+
+    // Use the computed k
+    let mut best_k = k_from_div;
+    let mut best_carries = [0i64; 29];
+    let mut best_max_carry = i64::MAX;
+
+    for k_candidate in [k_from_div] {
         let mut carries = [0i64; 29];
         let mut carry: i64 = 0;
-
         for j in 0..30 {
             let a_j = if j < LIMBS_28 { a_limbs[j].0 as i64 } else { 0 };
             let b_j = if j < LIMBS_28 { b_limbs[j].0 as i64 } else { 0 };
             let c_j = if j < LIMBS_28 { c_limbs[j].0 as i64 } else { 0 };
             let out_j = if j < LIMBS_28 { out_limbs[j].0 as i64 } else { 0 };
-            let p_j = if j < LIMBS_28 { p_limbs[j] as i64 } else { 0 };
+            let p_j = if j < LIMBS_28 { p_arr[j] as i64 } else { 0 };
 
-            let lhs = coeffs[0] * a_j + coeffs[1] * b_j + coeffs[2] * c_j;
-            let rhs_fixed = out_j + k_candidate * p_j;
-            let remainder = lhs - rhs_fixed + carry;
-            let nc = if remainder >= 0 { remainder / 512 } else { (remainder - 511) / 512 };
+            let total = coeffs[0]*a_j + coeffs[1]*b_j + coeffs[2]*c_j - out_j - k_candidate*p_j + carry;
+            let nc = if total >= 0 { total / 512 } else { (total - 511) / 512 };
             if j < 29 { carries[j] = nc; }
             carry = nc;
         }
-
         if carry == 0 {
-            return (carries, k_candidate);
+            let max_c = carries.iter().map(|c| c.abs()).max().unwrap_or(0);
+            println!("  k={k_candidate}: max_carry={max_c}");
+            if max_c < best_max_carry {
+                best_max_carry = max_c;
+                best_carries = carries;
+                best_k = k_candidate;
+            }
         }
     }
-
-    // Fallback
-    ([0i64; 29], 0)
+    (best_carries, best_k)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1748,6 +1796,48 @@ mod tests {
             assert_eq!(lhs, rhs, "Constraint fails at limb {j}: lhs={}, rhs={}", lhs.0, rhs.0);
         }
         eprintln!("Hades round S-box with k_limbs: all 55 limb constraints hold ✓");
+    }
+
+    #[test]
+    fn test_mds_witness_constraint_m31() {
+        let input = [
+            FieldElement::from(1u64),
+            FieldElement::from(2u64),
+            FieldElement::from(3u64),
+        ];
+        let rounds = execute_hades_rounds(&input);
+        let round = &rounds[0];
+        let p_limbs = stark_prime_9bit_limbs();
+        let base = M31::from(512u32);
+
+        // Test MDS row 0: out[0] = 3*a + b + c
+        let a_limbs = felt252_to_9bit_limbs(&round.post_sbox[0]);
+        let b_limbs = felt252_to_9bit_limbs(&round.post_sbox[1]);
+        let c_limbs = felt252_to_9bit_limbs(&round.post_sbox[2]);
+        let out_limbs = felt252_to_9bit_limbs(&round.mds_output[0]);
+        let coeffs: [i64; 3] = [3, 1, 1];
+
+        let (carries, k) = compute_mds_witness(0, &round.post_sbox, &round.mds_output[0]);
+        let k_m31 = i64_to_m31(k);
+
+        for j in 0..30 {
+            let a_j = if j < LIMBS_28 { a_limbs[j] } else { M31::from(0u32) };
+            let b_j = if j < LIMBS_28 { b_limbs[j] } else { M31::from(0u32) };
+            let c_j = if j < LIMBS_28 { c_limbs[j] } else { M31::from(0u32) };
+            let out_j = if j < LIMBS_28 { out_limbs[j] } else { M31::from(0u32) };
+            let p_j = if j < LIMBS_28 { M31::from(p_limbs[j]) } else { M31::from(0u32) };
+
+            let lhs = M31::from(coeffs[0] as u32) * a_j
+                + i64_to_m31(coeffs[1]) * b_j
+                + i64_to_m31(coeffs[2]) * c_j;
+            let carry_in = if j == 0 { M31::from(0u32) } else { i64_to_m31(carries[j-1]) };
+            let carry_out = if j < 29 { i64_to_m31(carries[j]) } else { M31::from(0u32) };
+
+            let rhs = out_j + k_m31 * p_j + carry_out * base - carry_in;
+            assert_eq!(lhs, rhs,
+                "MDS row 0 fails at j={}: lhs={}, rhs={}, k={}", j, lhs.0, rhs.0, k);
+        }
+        eprintln!("MDS row 0 constraint verified ✓");
     }
 
     #[test]
