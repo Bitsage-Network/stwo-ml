@@ -35,6 +35,7 @@ pub fn verify_recursive(
     n_real_rows: u32,
     log_size: u32,
     final_digest: starknet_ff::FieldElement,
+    logup_claimed_sum: SecureField,
 ) -> Result<(), RecursiveError> {
     // PcsConfig must match what the prover used. The Cairo verifier reads
     // it from the proof body. For Rust pre-flight, match the prover's config.
@@ -130,7 +131,7 @@ pub fn verify_recursive(
     commitment_scheme.commit(stark_proof.commitments[0], &bounds[0], channel);
     commitment_scheme.commit(stark_proof.commitments[1], &bounds[1], channel);
 
-    // Build real component for verification
+    // Build component for verification (LogUp disabled in verifier for now)
     let mut allocator = TraceLocationAllocator::default();
     let component = FrameworkComponent::new(&mut allocator, eval, SecureField::zero());
 
@@ -227,6 +228,7 @@ mod tests {
             recursive_proof.n_real_rows,
             recursive_proof.log_size,
             recursive_proof.final_digest,
+            recursive_proof.logup_claimed_sum,
         );
         assert!(
             verify_result.is_ok(),
@@ -295,6 +297,7 @@ mod tests {
             rp.n_real_rows,
             rp.log_size,
             rp.final_digest,
+            rp.logup_claimed_sum,
         );
         assert!(ok.is_ok(), "valid proof must verify");
 
@@ -306,7 +309,7 @@ mod tests {
             ),
             ..rp.public_inputs
         };
-        let err = verify_recursive(&rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest);
+        let err = verify_recursive(&rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest, rp.logup_claimed_sum);
         assert!(
             err.is_err(),
             "SECURITY: tampered io_commitment MUST be rejected"
@@ -323,7 +326,7 @@ mod tests {
             n_layers: rp.public_inputs.n_layers + 100,
             ..rp.public_inputs
         };
-        let err = verify_recursive(&rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest);
+        let err = verify_recursive(&rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest, rp.logup_claimed_sum);
         assert!(err.is_err(), "SECURITY: tampered n_layers MUST be rejected");
         eprintln!("[adversarial] n_layers tampering rejected ✓");
     }
@@ -339,7 +342,7 @@ mod tests {
             ),
             ..rp.public_inputs
         };
-        let err = verify_recursive(&rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest);
+        let err = verify_recursive(&rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest, rp.logup_claimed_sum);
         assert!(
             err.is_err(),
             "SECURITY: tampered weight_super_root MUST be rejected"
@@ -358,7 +361,7 @@ mod tests {
             ),
             ..rp.public_inputs
         };
-        let err = verify_recursive(&rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest);
+        let err = verify_recursive(&rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest, rp.logup_claimed_sum);
         assert!(
             err.is_err(),
             "SECURITY: tampered circuit_hash MUST be rejected"
@@ -389,7 +392,7 @@ mod tests {
             n_poseidon_perms: 9999,
             seed_digest: QM31::default(),
         };
-        let err = verify_recursive(&rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest);
+        let err = verify_recursive(&rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest, rp.logup_claimed_sum);
         assert!(
             err.is_err(),
             "SECURITY: fully tampered metadata MUST be rejected"
@@ -403,6 +406,7 @@ mod tests {
             rp.n_real_rows,
             rp.log_size,
             rp.final_digest,
+            rp.logup_claimed_sum,
         );
         assert!(
             ok.is_ok(),
@@ -425,7 +429,7 @@ mod tests {
             ..rp.public_inputs
         };
         let err = verify_recursive(
-            &rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest,
+            &rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest, rp.logup_claimed_sum,
         );
         assert!(
             err.is_err(),
@@ -438,7 +442,7 @@ mod tests {
             ..rp.public_inputs
         };
         let err = verify_recursive(
-            &rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest,
+            &rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest, rp.logup_claimed_sum,
         );
         assert!(
             err.is_err(),

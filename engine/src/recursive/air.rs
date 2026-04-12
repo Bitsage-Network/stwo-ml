@@ -413,8 +413,6 @@ impl FrameworkEval for RecursiveVerifierEval {
 
             eval.add_to_relation(RelationEntry::new(
                 hades_rel,
-                // +1 on active rows, 0 on padding.
-                // is_active is an execution-trace column (E::F), needs conversion to E::EF.
                 E::EF::from(is_active.clone()),
                 &key_values,
             ));

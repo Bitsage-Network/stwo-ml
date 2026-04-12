@@ -397,7 +397,7 @@ mod tests {
 
         // Valid metadata passes
         let ok = crate::recursive::verify_recursive(
-            &rp.stark_proof, &rp.public_inputs, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest,
+            &rp.stark_proof, &rp.public_inputs, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest, rp.logup_claimed_sum,
         );
         assert!(ok.is_ok(), "valid proof must verify: {:?}", ok.err());
 
@@ -407,7 +407,7 @@ mod tests {
             ..rp.public_inputs
         };
         let err = crate::recursive::verify_recursive(
-            &rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest,
+            &rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest, rp.logup_claimed_sum,
         );
         assert!(err.is_err(), "SOUNDNESS BUG: tampered io_commitment was accepted!");
         eprintln!("[adversarial] io_commitment relabeling blocked ✓");
@@ -421,7 +421,7 @@ mod tests {
             ..rp.public_inputs
         };
         let err = crate::recursive::verify_recursive(
-            &rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest,
+            &rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest, rp.logup_claimed_sum,
         );
         assert!(err.is_err(), "SOUNDNESS BUG: tampered n_layers was accepted!");
         eprintln!("[adversarial] n_layers relabeling blocked ✓");
@@ -436,7 +436,7 @@ mod tests {
             ..rp.public_inputs
         };
         let err = crate::recursive::verify_recursive(
-            &rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest,
+            &rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest, rp.logup_claimed_sum,
         );
         assert!(err.is_err(), "SOUNDNESS BUG: tampered weight_super_root was accepted!");
         eprintln!("[adversarial] weight_super_root relabeling blocked ✓");
@@ -456,13 +456,13 @@ mod tests {
             seed_digest: QM31::default(),
         };
         let err = crate::recursive::verify_recursive(
-            &rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest,
+            &rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest, rp.logup_claimed_sum,
         );
         assert!(err.is_err(), "SOUNDNESS BUG: full relabeling attack was accepted!");
 
         // Original still works
         let ok = crate::recursive::verify_recursive(
-            &rp.stark_proof, &rp.public_inputs, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest,
+            &rp.stark_proof, &rp.public_inputs, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest, rp.logup_claimed_sum,
         );
         assert!(ok.is_ok(), "original metadata must still verify");
         eprintln!("[adversarial] full metadata relabeling blocked ✓");

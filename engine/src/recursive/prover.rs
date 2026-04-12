@@ -437,13 +437,72 @@ pub fn prove_recursive_with_policy(
     // ── Step 3b: LogUp interaction trace (Tree 2) ─────────────────────
     // When enabled, draws LogUp lookup elements from channel and generates
     // the interaction trace binding chain ↔ Hades permutations.
-    // Currently OFF by default — activate with OBELYZK_LOGUP=1.
-    let logup_enabled = hades_enabled
-        && std::env::var("OBELYZK_LOGUP")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+    // Activate with OBELYZK_LOGUP=1.
+    let logup_enabled = std::env::var("OBELYZK_LOGUP")
+        .map(|v| v == "1")
+        .unwrap_or(false);
 
-    let chain_claimed_sum = SecureField::zero(); // TODO: compute from interaction trace when LogUp enabled
+    let (logup_relation, chain_claimed_sum) = if logup_enabled {
+        use num_traits::One;
+        use stwo_constraint_framework::{LogupTraceGenerator, Relation};
+        use stwo::prover::backend::simd::m31::N_LANES;
+        use stwo::prover::backend::simd::qm31::PackedSecureField;
+
+        // Draw shared LogUp random elements from channel
+        let relation = super::air::HadesPermRelation::draw(channel);
+        recursive_log!("  [Recursive] LogUp relation drawn from channel");
+
+        // Generate chain interaction trace (+1 per active HadesPerm row)
+        let mut logup_gen = LogupTraceGenerator::new(unified_log_size);
+        {
+            let mut col = logup_gen.new_col();
+            let n_total = 1usize << unified_log_size;
+            let n_vec_rows = n_total / N_LANES;
+            for vec_row in 0..n_vec_rows {
+                let mut nums = [SecureField::zero(); N_LANES];
+                let mut denoms = [SecureField::one(); N_LANES];
+                for lane in 0..N_LANES {
+                    let row = vec_row * N_LANES + lane;
+                    if row < trace_data.n_real_rows {
+                        nums[lane] = SecureField::one();
+                        // Key: (digest_before[9], digest_after[9])
+                        let key_vals: Vec<M31> = (0..super::air::LIMBS_PER_FELT)
+                            .map(|j| trace_data.execution_trace[j][row])
+                            .chain(
+                                (0..super::air::LIMBS_PER_FELT)
+                                    .map(|j| trace_data.execution_trace[super::air::COLS_PER_STATE + j][row]),
+                            )
+                            .collect();
+                        let denom: SecureField = relation.combine(&key_vals);
+                        denoms[lane] = denom;
+                    }
+                    // Padding rows: nums=0, denoms=1 (neutral fraction 0/1)
+                }
+                col.write_frac(
+                    vec_row,
+                    PackedSecureField::from_array(nums),
+                    PackedSecureField::from_array(denoms),
+                );
+            }
+            col.finalize_col();
+        }
+        let (interaction_trace, claimed_sum) = logup_gen.finalize_last();
+
+        // Commit interaction trace as Tree 2
+        {
+            let mut tree_builder = commitment_scheme.tree_builder();
+            tree_builder.extend_evals(interaction_trace);
+            tree_builder.commit(channel);
+        }
+        recursive_log!(
+            "  [Recursive] LogUp interaction committed (claimed_sum={:?})",
+            claimed_sum
+        );
+
+        (Some(relation), claimed_sum)
+    } else {
+        (None, SecureField::zero())
+    };
 
     recursive_log!(
         "  [Recursive] Channel before prove(): {:?}",
@@ -510,23 +569,27 @@ pub fn prove_recursive_with_policy(
     // Create both AIR components with shared allocator
     let mut allocator = TraceLocationAllocator::default();
 
-    // Component 1: Chain AIR (digest chain + boundary constraints)
+    // Component 1: Chain AIR (digest chain + boundary constraints + LogUp consumer)
     let chain_eval = RecursiveVerifierEval {
         log_n_rows: unified_log_size,
         n_real_rows: trace_data.n_real_rows as u32,
         initial_digest_limbs: zero_limbs,
         final_digest_limbs: final_limbs,
-        hades_lookup: None, // Activated when OBELYZK_LOGUP=1 + interaction trace wired
+        hades_lookup: logup_relation.clone(),
     };
     let chain_component =
         FrameworkComponent::new(&mut allocator, chain_eval, chain_claimed_sum);
 
     // Component 2: Hades AIR (permutation verification)
+    // NOTE: Hades LogUp provider (-1 per verified perm) requires its own
+    // interaction trace generation. For now, only the chain consumer is active.
+    // The Hades provider will be activated when we generate its interaction
+    // trace from the Hades execution trace's is_last_round rows.
     let hades_eval = super::hades_air::HadesVerifierEval {
         log_n_rows: unified_log_size,
         round_constants_limbs: Vec::new(),
         range_check: None,
-        hades_logup: None, // Activated when OBELYZK_LOGUP=1 + interaction trace wired
+        hades_logup: None, // TODO: activate with Hades interaction trace
     };
 
     let stark_proof = if hades_enabled {
@@ -568,6 +631,7 @@ pub fn prove_recursive_with_policy(
         io_commitment_felt252: io_felt252,
         pass1_final_digest: witness.final_digest,
         final_digest: final_digest_felt,
+        logup_claimed_sum: chain_claimed_sum,
         n_real_rows: trace_data.n_real_rows as u32,
         log_size: chain_log_size,
         metadata: RecursiveProofMetadata {

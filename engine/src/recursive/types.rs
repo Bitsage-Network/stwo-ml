@@ -176,6 +176,9 @@ pub struct RecursiveProof {
     /// Pass 2 (instrumented replay) final digest — used for chain AIR boundary.
     pub final_digest: FieldElement,
 
+    /// LogUp claimed sum for the chain component (0 if LogUp disabled).
+    pub logup_claimed_sum: QM31,
+
     /// Number of real (active) rows in the chain trace.
     /// This is the ChannelOp count from Pass 2, NOT n_poseidon_perms (which
     /// counts ALL Poseidon calls including non-ChannelOp ones from Pass 1).
