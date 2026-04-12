@@ -163,10 +163,17 @@ pub fn prove_recursive_with_policy(
         n_hades_verified
     );
 
-    // Hades AIR: enabled via OBELYZK_HADES_AIR=1 (enforces full permutation constraints)
+    // Hades AIR: inline constraints for the Hades permutation.
+    // Default ON in production. Set OBELYZK_HADES_AIR=0 to disable (faster but less sound).
+    // In test builds, default OFF for speed (offline verification still runs).
+    #[cfg(not(test))]
+    let hades_enabled = std::env::var("OBELYZK_HADES_AIR")
+        .map(|v| v != "0")
+        .unwrap_or(true); // ON by default in production
+    #[cfg(test)]
     let hades_enabled = std::env::var("OBELYZK_HADES_AIR")
         .map(|v| v == "1")
-        .unwrap_or(false);
+        .unwrap_or(false); // OFF by default in tests
 
     // ── Step 2: Build traces ─────────────────────────────────────────
     recursive_log!("  [Recursive] Step 2/5: Building chain execution trace...");

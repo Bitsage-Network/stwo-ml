@@ -154,10 +154,12 @@ pub const MUL_WITNESS_COLS: usize = 54 + LIMBS_28; // 82
 ///   post_sbox:           3 × 28 = 84   (actual MDS input: cube for full, passthrough for partial)
 ///   mds_result:          3 × 28 = 84
 ///   mds_carries+k_val:   3 × 30 = 90   (29 carries + 1 k per element)
+///   shifted_next_state:  3 × 28 = 84   (state_before of NEXT row for round chaining)
 ///   is_full_round:       1
 ///   is_real:             1
-///   Total: 1088
-pub const N_HADES_TRACE_COLUMNS: usize = 1088;
+///   is_chain_round:      1             (1 on real rows except last in each 91-block)
+///   Total: 1173
+pub const N_HADES_TRACE_COLUMNS: usize = 1173;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Felt252 in 9-bit limbs
@@ -1219,8 +1221,17 @@ impl FrameworkEval for HadesVerifierEval {
             mds_k[elem] = eval.next_trace_mask();
         }
 
+        // shifted_next_state: state_before of the NEXT row (for round transition)
+        let mut shifted_next_state: [[E::F; LIMBS_28]; 3] = std::array::from_fn(|_| std::array::from_fn(|_| zero_f()));
+        for elem in 0..3 {
+            for j in 0..LIMBS_28 {
+                shifted_next_state[elem][j] = eval.next_trace_mask();
+            }
+        }
+
         let is_full_round = eval.next_trace_mask();
         let is_real = eval.next_trace_mask();
+        let is_chain_round = eval.next_trace_mask(); // 1 on non-last rounds in each block
 
         // Note: is_first_round and is_last_round are not needed for the
         // current constraint set (all constraints gated by is_real/is_full_round).
@@ -1303,6 +1314,19 @@ impl FrameworkEval for HadesVerifierEval {
             &is_real,
             rc_ref,
         );
+
+        // ── Round transition constraint ──────────────────────────────
+        // mds_result[row] == state_before[row+1] (via shifted_next_state)
+        // Active on is_chain_round (all real rows except last in block).
+        // Degree 2: is_chain_round × (mds_result - shifted_next_state).
+        for elem in 0..3 {
+            for j in 0..LIMBS_28 {
+                eval.add_constraint(
+                    is_chain_round.clone()
+                        * (mds_result[elem][j].clone() - shifted_next_state[elem][j].clone()),
+                );
+            }
+        }
 
         eval
     }
@@ -1499,12 +1523,39 @@ pub fn build_hades_trace(hades_perms: &[([FieldElement; 3], [FieldElement; 3])])
             }
             // col now at 504 + 84 = 588
 
+            // shifted_next_state_before: populated in second pass
+            col += 3 * LIMBS_28; // 84 columns reserved
+
             // is_full_round
             trace[col][row] = M31::from_u32_unchecked(if is_full { 1 } else { 0 });
             col += 1;
 
             // is_real
             trace[col][row] = M31::from_u32_unchecked(1);
+            col += 1;
+
+            // is_chain_round: 1 on all rows except the last in each 91-block
+            let is_last_in_block = round_idx == N_ROUNDS - 1;
+            trace[col][row] = M31::from_u32_unchecked(if !is_last_in_block { 1 } else { 0 });
+        }
+
+        // Second pass: populate shifted_next_state_before
+        // For each row i, shifted_next[j] = state_before[i+1][j]
+        let shifted_col_start = 84 + 84 + 84 + 84 + 6 * MUL_WITNESS_COLS + 84 + 84 + 3 * 30; // after mds_carries
+        for (round_idx, round) in rounds.iter().enumerate() {
+            let row = base_row + round_idx;
+            if row >= n_padded || row + 1 >= n_padded { continue; }
+            let next_round_idx = round_idx + 1;
+            if next_round_idx < rounds.len() {
+                let next_round = &rounds[next_round_idx];
+                for elem in 0..3 {
+                    let limbs = felt252_to_9bit_limbs(&next_round.state_before[elem]);
+                    for j in 0..LIMBS_28 {
+                        trace[shifted_col_start + elem * LIMBS_28 + j][row] = limbs[j];
+                    }
+                }
+            }
+            // Last row in block and padding rows: shifted stays zero
         }
 
         // Verify the last round's MDS output matches expected output
