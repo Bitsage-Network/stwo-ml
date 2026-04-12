@@ -121,19 +121,50 @@ pub fn verify_recursive(
     let mut commitment_scheme =
         CommitmentSchemeVerifier::<Poseidon252MerkleChannel>::new(pcs_config);
 
-    // Replay commitments (Tree 0 = preprocessed, Tree 1 = execution)
     if stark_proof.commitments.len() < 2 {
         return Err(RecursiveError::ProvingFailed(format!(
             "expected at least 2 commitments, got {}",
             stark_proof.commitments.len()
         )));
     }
+
+    // Commit Tree 0 (preprocessed) and Tree 1 (execution)
     commitment_scheme.commit(stark_proof.commitments[0], &bounds[0], channel);
     commitment_scheme.commit(stark_proof.commitments[1], &bounds[1], channel);
 
-    // Build component for verification (LogUp disabled in verifier for now)
+    // Detect LogUp: 3+ commitments means Tree 2 (interaction) is present.
+    let logup_active = stark_proof.commitments.len() >= 3
+        && logup_claimed_sum != SecureField::zero();
+
+    let logup_relation = if logup_active {
+        Some(super::air::HadesPermRelation::draw(channel))
+    } else {
+        None
+    };
+
+    // Build evaluator with LogUp if active
+    let eval_final = RecursiveVerifierEval {
+        hades_lookup: logup_relation,
+        ..eval
+    };
+
+    // Build component — bounds now include interaction trace if LogUp active
     let mut allocator = TraceLocationAllocator::default();
-    let component = FrameworkComponent::new(&mut allocator, eval, SecureField::zero());
+    let component = FrameworkComponent::new(
+        &mut allocator,
+        eval_final,
+        if logup_active { logup_claimed_sum } else { SecureField::zero() },
+    );
+    let all_bounds = Component::trace_log_degree_bounds(&component);
+
+    // Commit Tree 2 (interaction) if present, using bounds from the component
+    if logup_active && all_bounds.len() > 2 {
+        commitment_scheme.commit(
+            stark_proof.commitments[2],
+            &all_bounds[2],
+            channel,
+        );
+    }
 
     // Verify
     stwo_verify::<Poseidon252MerkleChannel>(

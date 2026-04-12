@@ -438,9 +438,12 @@ pub fn prove_recursive_with_policy(
     // When enabled, draws LogUp lookup elements from channel and generates
     // the interaction trace binding chain ↔ Hades permutations.
     // Activate with OBELYZK_LOGUP=1.
+    // LogUp cross-component binding: ON by default.
+    // Binds every chain digest transition to a verified Hades permutation.
+    // Set OBELYZK_LOGUP=0 to disable.
     let logup_enabled = std::env::var("OBELYZK_LOGUP")
-        .map(|v| v == "1")
-        .unwrap_or(false);
+        .map(|v| v != "0")
+        .unwrap_or(true);
 
     let (logup_relation, chain_claimed_sum) = if logup_enabled {
         use num_traits::One;
