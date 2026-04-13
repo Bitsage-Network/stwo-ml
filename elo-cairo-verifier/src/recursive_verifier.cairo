@@ -348,12 +348,13 @@ pub mod RecursiveVerifierContract {
             //   [12]     n_layers: u32
             //   [13]     n_poseidon_perms: u32
             //   [14..18) seed_digest: QM31 (4 felts, channel seeding checkpoint)
-            //   [18]     io_commitment_felt252: felt252 (full 252-bit hash)
-            //   [19]     pass1_final_digest: felt252 (Pass 1 GKR verification digest)
-            //   [20]     final_digest: felt252 (Pass 2 chain AIR boundary)
-            //   [21]     log_size: u32
-            //   [22]     n_real_rows: u32 (active HadesPerm rows for accumulator)
-            //   [23..)   CommitmentSchemeProof (Serde-compatible)
+            //   [18]     hades_commitment: felt252 (Level 1 Hades recursive proof binding)
+            //   [19]     io_commitment_felt252: felt252 (full 252-bit hash)
+            //   [20]     pass1_final_digest: felt252 (Pass 1 GKR verification digest)
+            //   [21]     final_digest: felt252 (Pass 2 chain AIR boundary)
+            //   [22]     log_size: u32
+            //   [23]     n_real_rows: u32 (active HadesPerm rows for accumulator)
+            //   [24..)   CommitmentSchemeProof (Serde-compatible)
 
             let stark_proof_data_len: u32 = stark_proof_data.len();
             let mut proof_span = stark_proof_data.span();
@@ -388,6 +389,9 @@ pub mod RecursiveVerifierContract {
             let sd1: felt252 = *proof_span.pop_front().unwrap();
             let sd2: felt252 = *proof_span.pop_front().unwrap();
             let sd3: felt252 = *proof_span.pop_front().unwrap();
+
+            // Level 1 Hades recursive proof commitment (two-level recursion)
+            let hades_commitment: felt252 = *proof_span.pop_front().unwrap();
 
             // Full felt252 IO commitment (preserves all 252 bits)
             let proof_io_commitment_felt252: felt252 = *proof_span.pop_front().unwrap();
@@ -550,6 +554,16 @@ pub mod RecursiveVerifierContract {
                 felt252_to_m31(sd2), felt252_to_m31(sd3),
             ]);
             channel.mix_felts(array![seed_digest_qm31].span());
+
+            // SECURITY: Bind Level 1 Hades recursive proof commitment.
+            // This cryptographically ties the chain STARK to the set of verified
+            // Hades permutations. An attacker cannot substitute different permutations
+            // without changing the commitment, which invalidates the STARK proof.
+            let hc_u256: u256 = hades_commitment.into();
+            channel.mix_u64((hc_u256 / 0x10000000000000000_u256 / 0x10000000000000000_u256 / 0x10000000000000000_u256).try_into().unwrap());
+            channel.mix_u64(((hc_u256 / 0x10000000000000000_u256 / 0x10000000000000000_u256) & 0xFFFFFFFFFFFFFFFF_u256).try_into().unwrap());
+            channel.mix_u64(((hc_u256 / 0x10000000000000000_u256) & 0xFFFFFFFFFFFFFFFF_u256).try_into().unwrap());
+            channel.mix_u64((hc_u256 & 0xFFFFFFFFFFFFFFFF_u256).try_into().unwrap());
 
             // Bind the full felt252 io_commitment into the channel.
             // This ensures the proof body's io_commitment_felt252 field
