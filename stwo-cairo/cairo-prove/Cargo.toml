@@ -16,11 +16,8 @@ edition = "2021"
 
 [features]
 default = []
-# GPU features temporarily disabled — stwo_cairo_prover v1.2.2 upstream does not include
-# prove_cairo_gpu. Will be re-enabled once stwo-gpu is synced with v1.2.2.
-# gpu = ["stwo_cairo_prover/gpu"]
-# cuda-runtime = ["gpu", "stwo_cairo_prover/cuda-runtime"]
-cuda-runtime = []
+gpu = ["stwo-cairo-prover/gpu"]
+cuda-runtime = ["gpu", "stwo-cairo-prover/cuda-runtime"]
 
 [dependencies]
 # Local workspace dependencies (use our custom implementations)

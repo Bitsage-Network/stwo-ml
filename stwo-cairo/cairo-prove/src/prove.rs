@@ -46,26 +46,77 @@ pub fn prover_input_from_runner(runner: &CairoRunner) -> Result<ProverInput> {
 ///
 /// Returns an error if proof generation fails.
 pub fn prove(input: ProverInput, pcs_config: PcsConfig) -> Result<CairoProof<Blake2sMerkleHasher>> {
-    // Currently there are two variants of the preprocessed trace:
-    // - Canonical: Pedersen is included in the program.
-    // - CanonicalWithoutPedersen: Pedersen is not included in the program.
-    // We deduce the variant based on weather the pedersen builtin is included in the program.
-    let preprocessed_trace = match input.public_segment_context[1] {
-        true => PreProcessedTraceVariant::Canonical,
-        false => PreProcessedTraceVariant::CanonicalWithoutPedersen,
-    };
+    // Always use Canonical (with pedersen) to match the default Cairo verifier's
+    // preprocessed trace root. This ensures STARK-in-STARK compatibility.
+    // The pedersen builtin columns are included in the preprocessed trace even if
+    // the program doesn't use pedersen — they just have empty evaluations.
+    let preprocessed_trace = PreProcessedTraceVariant::Canonical;
     prove_inner(input, preprocessed_trace, pcs_config)
 }
 
-/// Prove with GPU backend when cuda-runtime feature is enabled.
+/// Prove with GPU backend. Uses GpuBackend for STARK proving (FFT, FRI, Merkle,
+/// constraints) while keeping witness generation on SimdBackend (CPU).
 ///
-/// NOTE: GPU proving requires our custom stwo-gpu backend. The upstream v1.2.2
-/// prover does not include prove_cairo_gpu. For now, this falls back to CPU.
-/// GPU support will be re-integrated once stwo-gpu is synced with v1.2.2.
-#[cfg(feature = "cuda-runtime")]
+/// Requires the `gpu` feature to be enabled at compile time, which pulls in the
+/// stwo-gpu CUDA runtime.
+#[cfg(feature = "gpu")]
 pub fn prove_gpu(input: ProverInput, pcs_config: PcsConfig) -> Result<CairoProof<Blake2sMerkleHasher>> {
-    log::warn!("GPU proving not yet available with stwo_cairo_prover v1.2.2 — falling back to CPU");
-    prove(input, pcs_config)
+    use std::sync::Arc;
+    use stwo_cairo_prover::stwo::prover::backend::gpu::GpuBackend;
+    use stwo_cairo_prover::stwo::prover::backend::simd::SimdBackend;
+    use stwo_cairo_prover::stwo::prover::backend::BackendForChannel;
+    use stwo_cairo_prover::stwo::prover::pcs::CommitmentTreeProver;
+    use stwo_cairo_prover::stwo::prover::poly::circle::CanonicCoset;
+    use stwo_cairo_prover::stwo::prover::MaybeOwned;
+    use stwo_cairo_prover::prover::{prove_cairo_with_precompute, MAX_CANONICAL_COSET_LOG_SIZE};
+    use stwo_cairo_prover::witness::preprocessed_trace::gen_trace;
+    use stwo_cairo_prover::witness::utils::BaseColumnPool;
+
+    let preprocessed_trace_variant = match input.public_segment_context[1] {
+        true => PreProcessedTraceVariant::Canonical,
+        false => PreProcessedTraceVariant::CanonicalWithoutPedersen,
+    };
+
+    let prover_params = ProverParameters {
+        channel_hash: ChannelHash::Blake2s,
+        channel_salt: 0,
+        pcs_config,
+        preprocessed_trace: preprocessed_trace_variant,
+        store_polynomials_coefficients: false,
+        include_all_preprocessed_columns: false,
+    };
+
+    let max_domain_size = prover_params.pcs_config.lifting_log_size
+        .unwrap_or(MAX_CANONICAL_COSET_LOG_SIZE);
+
+    // Precompute twiddles on GPU
+    let twiddles = GpuBackend::precompute_twiddles(
+        CanonicCoset::new(max_domain_size).circle_domain().half_coset,
+    );
+
+    let preprocessed_trace = Arc::new(prover_params.preprocessed_trace.to_preprocessed_trace());
+    let preprocessed_trace_polys =
+        GpuBackend::interpolate_columns(gen_trace(preprocessed_trace.clone()), &twiddles);
+
+    let base_column_pool = BaseColumnPool::new();
+    let preprocessed_tree = CommitmentTreeProver::<GpuBackend, Blake2sMerkleChannel>::new(
+        preprocessed_trace_polys,
+        prover_params.pcs_config.fri_config.log_blowup_factor,
+        &twiddles,
+        prover_params.store_polynomials_coefficients,
+        prover_params.pcs_config.lifting_log_size,
+        &base_column_pool,
+    );
+
+    prove_cairo_with_precompute::<Blake2sMerkleChannel>(
+        &base_column_pool,
+        &twiddles,
+        preprocessed_trace,
+        MaybeOwned::Owned(preprocessed_tree),
+        input,
+        prover_params,
+    )
+    .map_err(|e| CairoProveError::ProofGeneration(format!("{:?}", e)))
 }
 
 fn prove_inner(
