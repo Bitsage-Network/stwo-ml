@@ -42,7 +42,8 @@ pub use air::{
     COLS_PER_ROW,
 };
 pub use prover::{
-    prove_recursive, prove_recursive_with_policy, verify_hades_perms_offline, RecursiveError,
+    export_hades_pairs_cairo_args, prove_recursive, prove_recursive_with_policy,
+    verify_hades_perms_offline, RecursiveError,
 };
 pub use types::{GkrVerifierWitness, RecursiveProof, RecursivePublicInputs, WitnessOp};
 pub use verifier::verify_recursive;

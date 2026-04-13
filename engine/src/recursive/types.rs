@@ -188,6 +188,11 @@ pub struct RecursiveProof {
     /// Trace log_size (needed for verifier to reconstruct the AIR).
     pub log_size: u32,
 
+    /// Hades permutation pairs for two-level recursion.
+    /// Each pair is (input[3], output[3]) verified by the prover offline.
+    /// Used to generate the Level 1 Hades recursive proof via cairo-prove.
+    pub hades_pairs: Vec<([starknet_ff::FieldElement; 3], [starknet_ff::FieldElement; 3])>,
+
     /// Proof metadata for debugging/display.
     pub metadata: RecursiveProofMetadata,
 }

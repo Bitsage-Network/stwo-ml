@@ -2339,6 +2339,18 @@ fn main() {
                         recursive_proof.metadata.trace_log_size,
                     );
 
+                    // Export Hades pairs for two-level recursion
+                    let hades_args_path = format!("{}.hades_args.json", cli.output.display());
+                    let hades_args = obelyzk::recursive::export_hades_pairs_cairo_args(
+                        &recursive_proof.hades_pairs,
+                    );
+                    std::fs::write(&hades_args_path, &hades_args).ok();
+                    eprintln!(
+                        "  Hades pairs: {} permutations → {}",
+                        recursive_proof.hades_pairs.len(),
+                        hades_args_path,
+                    );
+
                     // Serialize recursive proof into calldata felts for single-TX submission
                     let calldata = obelyzk::cairo_serde::serialize_recursive_proof_calldata(
                         &recursive_proof,

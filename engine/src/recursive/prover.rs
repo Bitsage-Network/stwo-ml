@@ -815,6 +815,7 @@ pub fn prove_recursive_with_policy(
         logup_claimed_sum: chain_claimed_sum,
         n_real_rows: trace_data.n_real_rows as u32,
         log_size: chain_log_size,
+        hades_pairs: hades_perms.clone(),
         metadata: RecursiveProofMetadata {
             recursive_prove_time_secs: recursive_prove_time,
             gkr_prove_time_secs,
@@ -851,6 +852,23 @@ pub fn extract_hades_perms(
             }
         })
         .collect()
+}
+
+/// Export Hades permutation pairs as Cairo arguments JSON.
+///
+/// Format: `["n_pairs", "in0", "in1", "in2", "out0", "out1", "out2", ...]`
+/// Each felt252 is hex-encoded. This file is fed to cairo-prove --arguments-file.
+pub fn export_hades_pairs_cairo_args(
+    pairs: &[([starknet_ff::FieldElement; 3], [starknet_ff::FieldElement; 3])],
+) -> String {
+    let mut args: Vec<String> = Vec::with_capacity(1 + pairs.len() * 6);
+    args.push(format!("\"{}\"", pairs.len()));
+    for (input, output) in pairs {
+        for v in input.iter().chain(output.iter()) {
+            args.push(format!("\"{:#066x}\"", v));
+        }
+    }
+    format!("[{}]", args.join(", "))
 }
 
 /// Verify all HadesPerm operations in a witness via step-by-step execution.

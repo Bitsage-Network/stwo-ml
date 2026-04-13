@@ -1,0 +1,24 @@
+[package]
+name = "hades_recursive_verifier"
+version = "0.1.0"
+edition = "2024_07"
+
+# A standalone Cairo executable that verifies Hades permutation pairs.
+# Compiled with scarb, proven with cairo-prove, verified on-chain.
+#
+# This is Level 1 of the two-level recursive STARK:
+#   Level 1: This program verifies all Hades permutations (proven by cairo-prove)
+#   Level 2: The chain STARK binds to Level 1's proof commitment
+#
+# Usage:
+#   scarb build --profile release
+#   cairo-prove prove target/release/hades_recursive_verifier.executable.json \
+#     hades_proof.json --arguments-file pairs.json --proof-format cairo-serde
+
+[cairo]
+enable-gas = false
+
+[dependencies]
+cairo_execute = "2.12.2"
+
+[[target.executable]]
