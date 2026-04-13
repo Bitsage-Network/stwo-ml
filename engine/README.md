@@ -9,15 +9,15 @@
 [![PyPI](https://img.shields.io/pypi/v/obelyzk)](https://pypi.org/project/obelyzk/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-lightgrey)](LICENSE)
 
-ObelyZK proves that a transformer model (LLaMA, Qwen, Phi, SmolLM, Mistral) produced a specific output for a given input. The proof compresses into ~4800 felts via recursive STARK and verifies in one Starknet transaction. No trusted setup. No multi-step coordination.
+ObelyZK proves that a transformer model (LLaMA, Qwen, Phi, SmolLM, Mistral) produced a specific output for a given input. The proof compresses into ~4,934 felts via two-level recursive STARK and verifies in one Starknet transaction. No trusted setup. No multi-step coordination.
 
-The recursive STARK system provides 120-bit cryptographic security (pow_bits=20 + log_blowup=5 x n_queries=20) through an 89-column chain AIR with 38 constraints, including an amortized accumulator, carry-chain modular addition, and boundary constraints. Eight security layers protect against proof forgery, trace miniaturization, and selector manipulation.
+The recursive STARK system provides 160-bit cryptographic security (pow_bits=20 + log_blowup=5 x n_queries=28 = 20+140 = 160) through a 48-column chain AIR with 38 constraints, including an amortized accumulator, carry-chain modular addition, and boundary constraints. Nine security layers protect against proof forgery, trace miniaturization, and selector manipulation. The two-level recursion architecture uses cairo-prove to verify 145 Hades permutations (Level 1, off-chain) and a chain STARK bound to the Level 1 commitment (Level 2, on-chain). Security exceeds AES-256 target and is quantum-resistant (Grover reduces to 2^80).
 
 **Live on Starknet Sepolia** — multiple architectures verified on-chain:
 
 | Model | Params | GKR | STARK | Felts | Verified TX |
 |-------|--------|-----|-------|-------|-------------|
-| SmolLM2-135M | 135M | 102s | 3.55s | ~4,824 | [`0x055c2b...`](https://sepolia.starkscan.co/tx/0x055c2bf89f43d9b65580862e0b81e6b47842b9dda3b862c134f35b61b0ae620f) |
+| SmolLM2-135M | 135M | 102s | 6.5s | ~4,934 | [`0x021512dd...`](https://sepolia.starkscan.co/tx/0x021512dd991a1c317a1aa93a382bed322af2e63d9fa01b9c5a3b133cf1ceebb8) |
 | Qwen2.5-14B | 14B | 46s | 1.2s | 946 | [`0x5ce1b4...`](https://sepolia.starkscan.co/tx/0x5ce1b41815e29a7b3dd03b77187cf32c8c5f0e2607960303174cbea303edfd3) |
 | GLM-4-9B | 9B | 201s | 1.1s | 929 | [`0x542960...`](https://sepolia.starkscan.co/tx/0x542960d703a62d4beaacf0d9094ea92dc86bf326cd917c533039f4dd1eb4a30) |
 
@@ -104,7 +104,7 @@ obelysk prove --model smollm2-135m --input "Hello world" --on-chain
 ```
 Model:     SmolLM2-135M (30 layers)
 GKR proof: 102.0s
-Recursive: 3.55s (942 felts)
+Recursive: 6.5s (~4,934 felts)
 TX hash:   0x276c6a44...
 Status:    VERIFIED
 ```
@@ -123,7 +123,7 @@ export OBELYZK_API_URL=http://localhost:8080
  +-----------------+     +-----------------+     +------------------+     +------------------+
  |  Model Weights  |     |  M31 Forward    |     |  GKR Sumcheck    |     |  Recursive STARK |
  |  (SafeTensors)  | --> |  Pass Execution | --> |  Prover (GPU)    | --> |  Compression     |
- |  HuggingFace    |     |  Mersenne-31    |     |  per-layer proof |     |  ~942 felts      |
+ |  HuggingFace    |     |  Mersenne-31    |     |  per-layer proof |     |  ~4,934 felts    |
  +-----------------+     +-----------------+     +------------------+     +--------+---------+
                                                                                    |
                                                                                    v
@@ -142,11 +142,11 @@ export OBELYZK_API_URL=http://localhost:8080
 
 **Step 3 -- Prove.** Each operation becomes a GKR sumcheck circuit. Weight commitments are bound via aggregated Poseidon2 Merkle roots through an oracle sumcheck. The prover generates an interactive proof for every layer in the computation graph.
 
-**Step 4 -- Compress.** The GKR proof tree (~46,148 felts for 30 layers) is wrapped in a STWO Circle STARK via an 89-column chain AIR with 38 constraints. The recursive verifier circuit checks the entire GKR proof inside the STARK, producing ~4,824 felts of calldata. The chain AIR includes HadesPerm-level rows with carry-chain modular addition and an amortized accumulator constraint that blocks all-zeros-selector attacks.
+**Step 4 -- Compress.** The GKR proof tree (~46,148 felts for 30 layers) is wrapped in a two-level recursive STARK via a 48-column chain AIR with 38 constraints. Level 1 (off-chain): cairo-prove verifies 145 Hades permutations (~10s, 278K felts). Level 2 (on-chain): the chain STARK binds to the Level 1 commitment (~6.5s, ~4,934 felts). The chain AIR includes HadesPerm-level rows with carry-chain modular addition and an amortized accumulator constraint that blocks all-zeros-selector attacks, plus a hades_commitment binding layer for two-level recursion.
 
 **Step 5 -- Verify.** A Cairo contract on Starknet performs full STARK verification: OODS sampling, Merkle decommitment, FRI layer folding, and proof-of-work validation. One transaction. No trust assumptions. The Cairo verifier at `recursive_air.cairo` implements all 38 constraints matching the Rust AIR exactly.
 
-**Security:** 120-bit cryptographic security via PcsConfig (pow_bits=20, log_blowup=5, n_queries=20, log_last_layer_deg=0). M31 base field with QM31 quartic extension. Poseidon2 Merkle trees commit to weights, IO, and proof data. Eight security layers protect proof integrity (see below).
+**Security:** 160-bit cryptographic security via PcsConfig (pow_bits=20, log_blowup=5, n_queries=28, log_last_layer_deg=0). M31 base field with QM31 quartic extension. Poseidon2 Merkle trees commit to weights, IO, and proof data. Nine security layers protect proof integrity (see below).
 
 ---
 
@@ -156,15 +156,15 @@ Benchmarked on real hardware. All times include full GKR sumcheck + recursive ST
 
 | Model | Layers | Params | GPU | GKR Prove | Recursive | Total | Calldata |
 |---|---|---|---|---|---|---|---|
-| SmolLM2-135M | 1 | 135M | A10G | 3.3s | 0.18s | 3.5s | ~4,824 felts |
-| SmolLM2-135M | 30 | 135M | A10G | 102s | 3.55s | ~106s | ~4,824 felts |
-| Qwen2-0.5B | 1 | 494M | A10G | 3.0s | 0.20s | 3.2s | ~4,824 felts |
-| Qwen3-14B | 40 | 14B | H100 | 103s | 3.6s | ~107s | ~4,824 felts |
+| SmolLM2-135M | 1 | 135M | A10G | 3.3s | 0.18s | 3.5s | ~4,934 felts |
+| SmolLM2-135M | 30 | 135M | A10G | 102s | 3.55s | ~106s | ~4,934 felts |
+| Qwen2-0.5B | 1 | 494M | A10G | 3.0s | 0.20s | 3.2s | ~4,934 felts |
+| Qwen3-14B | 40 | 14B | H100 | 103s | 3.6s | ~107s | ~4,934 felts |
 
 Key observations:
 - Recursive STARK adds 0.18--3.6s depending on model depth
-- Output calldata is ~4,824 felts regardless of model size (compression from GKR)
-- 120-bit security via PcsConfig: pow_bits=20, log_blowup=5, n_queries=20
+- Output calldata is ~4,934 felts regardless of model size (compression from GKR)
+- 160-bit security via PcsConfig: pow_bits=20, log_blowup=5, n_queries=28
 - GPU acceleration uses CUDA for Merkle commits, MLE restriction, and FRI; CPU SIMD for FFT
 
 ---
@@ -183,18 +183,19 @@ Every proof is verified trustlessly on Starknet. The Cairo contract performs com
 
 ### Verified Transactions
 
-The SmolLM2-135M recursive proof was verified on-chain with the new 89-column chain AIR:
+4 verified TXs on Sepolia with the production 48-column chain AIR:
 
-- **TX:** [`0x055c2bf89f43d9b65580862e0b81e6b47842b9dda3b862c134f35b61b0ae620f`](https://sepolia.starkscan.co/tx/0x055c2bf89f43d9b65580862e0b81e6b47842b9dda3b862c134f35b61b0ae620f)
+- **Latest TX:** [`0x021512dd...`](https://sepolia.starkscan.co/tx/0x021512dd991a1c317a1aa93a382bed322af2e63d9fa01b9c5a3b133cf1ceebb8)
 - **Contract:** `0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005`
-- **Calldata:** ~4,824 felts
-- **Security:** 120-bit (pow_bits=20, log_blowup=5, n_queries=20)
-- **AIR:** 89 columns, 38 constraints (chain + Hades components)
+- **Calldata:** ~4,934 felts (under 5,000 Starknet limit)
+- **Security:** 160-bit (pow_bits=20, log_blowup=5, n_queries=28)
+- **AIR:** 48 columns, 38 constraints (chain + Hades components)
+- **Two-level recursion:** Level 1 cairo-prove (145 Hades perms, 10s, off-chain) + Level 2 chain STARK (6.5s, on-chain)
 - **Verification:** OODS + Merkle decommitment + FRI folding + PoW
 
-### Recursive STARK Security Layers (8 total)
+### Recursive STARK Security Layers (9 total)
 
-The recursive verification system is protected by 8 independent security layers:
+The recursive verification system is protected by 9 independent security layers:
 
 1. **Fiat-Shamir channel binding** -- all public inputs mixed before tree commits
 2. **Amortized accumulator** -- unconditional constraint, blocks all-zeros-selector attack
@@ -202,8 +203,9 @@ The recursive verification system is protected by 8 independent security layers:
 4. **seed_digest checkpoint** -- binds chain to model dimensions
 5. **pass1_final_digest binding** -- proves full GKR verification ran
 6. **Carry-chain modular addition** -- HadesPerm-level chain integrity
-7. **LogUp chain-to-Hades binding** -- cross-component verification
-8. **Offline Hades verification** -- prover-side permutation checks
+7. **hades_commitment binding** -- two-level recursion (Level 2 chain STARK binds to Level 1 cairo-prove commitment)
+8. **Boundary constraints** -- initial/final digest enforcement
+9. **160-bit STARK security** -- pow=20, blowup=5, queries=28
 
 ### Verify a Proof Programmatically
 
@@ -500,7 +502,7 @@ stwo-ml/
     gkr/                 # GKR sumcheck prover + verifier
     compiler/            # Model compiler (HF -> GKR circuit)
     gpu/                 # CUDA kernels + GPU sumcheck
-    recursive/           # Recursive STARK wrapper (89-col chain AIR, 38 constraints)
+    recursive/           # Recursive STARK wrapper (48-col chain AIR, 38 constraints)
     starknet.rs          # On-chain calldata builder
     aggregation.rs       # Proof aggregation + weight binding
     tui/                 # Terminal dashboard
@@ -529,7 +531,7 @@ stwo-ml/
 | GKR Protocol | [docs/gkr-protocol.md](docs/gkr-protocol.md) |
 | GPU Acceleration | [docs/gpu-acceleration.md](docs/gpu-acceleration.md) |
 | Transformer Architecture | [docs/transformer-architecture.md](docs/transformer-architecture.md) |
-| Sepolia Explorer | [Starkscan](https://sepolia.starkscan.co/tx/0x055c2bf89f43d9b65580862e0b81e6b47842b9dda3b862c134f35b61b0ae620f) |
+| Sepolia Explorer | [Starkscan](https://sepolia.starkscan.co/tx/0x021512dd991a1c317a1aa93a382bed322af2e63d9fa01b9c5a3b133cf1ceebb8) |
 | npm | [@obelyzk/sdk](https://www.npmjs.com/package/@obelyzk/sdk) |
 | PyPI | [obelyzk](https://pypi.org/project/obelyzk/) |
 

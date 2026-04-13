@@ -645,39 +645,51 @@ All success criteria met. The recursive STARK verifier is **live on Starknet Sep
 
 ## 13. Upgraded Recursive STARK (April 12, 2026)
 
-The recursive STARK system has been upgraded to a hardened 89-column chain AIR with
-38 constraints, replacing the original 28-column/27-constraint design. This upgrade
-provides 120-bit cryptographic security and introduces 8 independent security layers.
+The recursive STARK system has been upgraded to a production 48-column chain AIR with
+38 constraints (41 unused columns removed from the previous 89-column design). This upgrade
+provides 160-bit cryptographic security and introduces 9 independent security layers via
+a two-level recursion architecture.
 
 ### 13.1 New On-Chain Verification
 
 | Field | Value |
 |-------|-------|
 | **Contract** | [`0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005`](https://sepolia.starkscan.co/contract/0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005) |
-| **First verified TX** | [`0x055c2bf89f43d9b65580862e0b81e6b47842b9dda3b862c134f35b61b0ae620f`](https://sepolia.starkscan.co/tx/0x055c2bf89f43d9b65580862e0b81e6b47842b9dda3b862c134f35b61b0ae620f) |
+| **Latest verified TX** | [`0x021512dd...`](https://sepolia.starkscan.co/tx/0x021512dd991a1c317a1aa93a382bed322af2e63d9fa01b9c5a3b133cf1ceebb8) |
+| **Verification count** | 4 on Sepolia |
 | **Model** | SmolLM2-135M |
-| **Calldata** | ~4,824 felts |
-| **Security** | 120-bit (pow_bits=20, log_blowup=5, n_queries=20, log_last_layer_deg=0) |
+| **Calldata** | ~4,934 felts |
+| **Security** | 160-bit (pow_bits=20, log_blowup=5, n_queries=28, log_last_layer_deg=0) |
 
 ### 13.2 Chain AIR Architecture
 
-The upgraded AIR uses two components:
+The production AIR uses two components in a two-level recursion architecture:
 
-- **Chain AIR**: 89 columns, 38 constraints. Includes amortized accumulator
-  (unconditional constraint that blocks the all-zeros-selector attack),
-  carry-chain modular addition for HadesPerm-level chain integrity, and
-  boundary constraints binding the chain to model dimensions.
+- **Chain AIR**: 48 columns (was 89 -- 41 unused columns removed), 38 constraints.
+  Includes amortized accumulator (unconditional constraint that blocks the
+  all-zeros-selector attack), carry-chain modular addition for HadesPerm-level
+  chain integrity, boundary constraints binding the chain to model dimensions,
+  and hades_commitment binding for two-level recursion.
+
+  Column layout (48 columns):
+  [0..9) digest_before, [9..18) digest_after, [18..27) shifted_next_before,
+  [27..36) addition_digest, [36..44) addition_carry, [44] addition_k,
+  [45] is_active, [46] active_count, [47] active_count_next
 
 - **Hades AIR**: 1225 columns. S-box, MDS matrix, and round transition constraints
   for full Poseidon/Hades permutation verification.
 
+**Two-level recursion:**
+- Level 1: cairo-prove verifies 145 Hades permutations (10s, 278K felts, OFF-CHAIN)
+- Level 2: Chain STARK binds to Level 1 commitment (6.5s, ~4,934 felts, ON-CHAIN)
+
 The Cairo verifier at `recursive_air.cairo` implements all 38 constraints matching
 the Rust implementation exactly. Cross-component verification is enforced via
-LogUp chain-to-Hades binding.
+hades_commitment binding (the 7th security layer).
 
-### 13.3 Security Layers (8 total)
+### 13.3 Security Layers (9 total)
 
-The upgraded system is protected by 8 independent security layers:
+The production system is protected by 9 independent security layers:
 
 1. **Fiat-Shamir channel binding**: All public inputs (circuit_hash, weight_super_root,
    io_commitment) are mixed into the channel before tree commits, preventing
@@ -703,23 +715,30 @@ The upgraded system is protected by 8 independent security layers:
    for modular addition, preventing overflow attacks in the Poseidon permutation
    chain.
 
-7. **LogUp chain-to-Hades binding**: Cross-component verification ensures that the
-   chain AIR and Hades AIR reference the same permutation values. An attacker
-   cannot satisfy one component while violating the other.
+7. **hades_commitment binding**: Two-level recursion binding -- the Level 2 chain
+   STARK binds to the Level 1 cairo-prove commitment, ensuring cross-level
+   integrity. An attacker cannot satisfy the chain STARK without a valid Level 1
+   Hades verification.
 
-8. **Offline Hades verification**: The prover performs full Hades permutation checks
-   before generating the STARK proof, catching witness construction errors before
-   they reach the on-chain verifier.
+8. **Boundary constraints**: Initial and final digest values are constrained,
+   enforcing that the chain starts from the correct seed and ends at the expected
+   final state.
+
+9. **160-bit STARK security**: PcsConfig with pow_bits=20, log_blowup=5,
+   n_queries=28 provides 160-bit security (20 + 5x28 = 160). Exceeds AES-256
+   target. Quantum-resistant (Grover reduces to 2^80).
 
 ### 13.4 PcsConfig
 
-The proof uses hardened PCS parameters for 120-bit security:
+The proof uses hardened PCS parameters for 160-bit security:
 
 ```
 pow_bits        = 20    (proof-of-work grinding difficulty)
 log_blowup      = 5     (FRI blowup factor: 2^5 = 32x)
-n_queries       = 20    (FRI query count)
+n_queries       = 28    (FRI query count)
 log_last_layer_deg = 0  (final FRI layer is degree 1)
+
+Security: pow_bits + log_blowup * n_queries = 20 + 5*28 = 160 bits
 ```
 
 ### 13.5 Usage
@@ -736,5 +755,5 @@ Generate a recursive proof with the upgraded system:
 ```
 
 The model must be registered on-chain first via `register_model_recursive` on the
-verifier contract. The proof is ~4,824 felts, verified in a single Starknet
+verifier contract. The proof is ~4,934 felts, verified in a single Starknet
 transaction.

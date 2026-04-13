@@ -68,12 +68,14 @@ The GKR prover uses 5 environment variable "gates" that weaken proof components 
 
 ## Recursive STARK Security (April 12, 2026)
 
-The upgraded recursive STARK (v2) provides additional soundness protection independent
-of the GKR soundness gates above. The v2 system uses an 89-column chain AIR with
-38 constraints and 120-bit cryptographic security (PcsConfig: pow_bits=20, log_blowup=5,
-n_queries=20, log_last_layer_deg=0).
+The production recursive STARK (v2) provides additional soundness protection independent
+of the GKR soundness gates above. The v2 system uses a 48-column chain AIR (was 89 --
+41 unused columns removed) with 38 constraints and 160-bit cryptographic security
+(PcsConfig: pow_bits=20, log_blowup=5, n_queries=28, log_last_layer_deg=0). It uses a
+two-level recursion architecture: Level 1 cairo-prove verifies 145 Hades permutations
+(off-chain), Level 2 chain STARK binds to the Level 1 commitment (on-chain).
 
-The recursive layer is protected by 8 independent security layers:
+The recursive layer is protected by 9 independent security layers:
 
 1. **Fiat-Shamir channel binding** -- prevents transcript manipulation
 2. **Amortized accumulator** -- unconditional constraint, blocks all-zeros-selector
@@ -81,8 +83,9 @@ The recursive layer is protected by 8 independent security layers:
 4. **seed_digest checkpoint** -- binds chain to model dimensions
 5. **pass1_final_digest binding** -- proves full GKR verification ran
 6. **Carry-chain modular addition** -- HadesPerm-level chain integrity
-7. **LogUp chain-to-Hades binding** -- cross-component verification
-8. **Offline Hades verification** -- prover-side permutation checks
+7. **hades_commitment binding** -- two-level recursion
+8. **Boundary constraints** -- initial/final digest
+9. **160-bit STARK security** -- pow=20, blowup=5, queries=28
 
 First verified on Sepolia:
 [`0x055c2bf89f43d9b65580862e0b81e6b47842b9dda3b862c134f35b61b0ae620f`](https://sepolia.starkscan.co/tx/0x055c2bf89f43d9b65580862e0b81e6b47842b9dda3b862c134f35b61b0ae620f)

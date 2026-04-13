@@ -65,13 +65,17 @@ STARK, and verifies it on Starknet via a Cairo smart contract.
 - Inner GKR proof correctly encoded as AIR witness
 - Recursive AIR constraints faithfully reproduce GKR verifier logic
 - STARK soundness (delegates to STWO's `prove()`/`verify()`)
-- Proof compression preserves soundness (~4,824 felts for v2 AIR, 981 felts for v1)
-- 120-bit security via PcsConfig (pow_bits=20, log_blowup=5, n_queries=20)
-- 89-column chain AIR with 38 constraints (v2), including amortized accumulator
+- Proof compression preserves soundness (~4,934 felts for v2 AIR, 981 felts for v1)
+- 160-bit security via PcsConfig (pow_bits=20, log_blowup=5, n_queries=28)
+- 48-column chain AIR with 38 constraints (v2), including amortized accumulator
+  (41 unused columns removed from previous 89-column design)
 - Hades AIR with 1225 columns for Poseidon permutation verification
-- 8 security layers: Fiat-Shamir binding, amortized accumulator, n_poseidon_perms
+- Two-level recursion: Level 1 cairo-prove (145 Hades perms, off-chain) + Level 2
+  chain STARK (on-chain)
+- 9 security layers: Fiat-Shamir binding, amortized accumulator, n_poseidon_perms
   validation, seed_digest checkpoint, pass1_final_digest binding, carry-chain
-  modular addition, LogUp chain-to-Hades binding, offline Hades verification
+  modular addition, hades_commitment binding, boundary constraints, 160-bit STARK
+  security
 
 ### 2.3 Cairo Serialization
 
@@ -304,7 +308,7 @@ cryptographic outputs.
 ### 6.4 End-to-End On-Chain Verification
 
 Three models have been verified end-to-end on Starknet Sepolia:
-- SmolLM2-135M (v2 AIR, 89-col/38-constraint, 120-bit security): recursive STARK,
+- SmolLM2-135M (v2 AIR, 48-col/38-constraint, 160-bit security): recursive STARK,
   single TX ([`0x055c2bf8...`](https://sepolia.starkscan.co/tx/0x055c2bf89f43d9b65580862e0b81e6b47842b9dda3b862c134f35b61b0ae620f))
 - SmolLM2-135M (30 layers, 211 GKR layers): recursive STARK v1, single TX
 - 5-layer MLP: streaming GKR, 14 sequential transactions

@@ -355,18 +355,21 @@ All fixes verified with:
 
 ## Post-Audit: Recursive STARK v2 (April 2026)
 
-After the initial audit, the recursive STARK system was upgraded to a hardened
-89-column chain AIR with 38 constraints, providing 120-bit cryptographic security.
+After the initial audit, the recursive STARK system was upgraded to a production
+48-column chain AIR (was 89 -- 41 unused columns removed) with 38 constraints,
+providing 160-bit cryptographic security via two-level recursion.
 Key security improvements:
 
-- **PcsConfig**: pow_bits=20, log_blowup=5, n_queries=20 (120-bit security)
-- **Chain AIR**: 89 columns, 38 constraints including amortized accumulator
+- **PcsConfig**: pow_bits=20, log_blowup=5, n_queries=28 (160-bit security)
+- **Chain AIR**: 48 columns, 38 constraints including amortized accumulator
 - **Hades AIR**: 1225 columns for full Poseidon permutation verification
-- **8 security layers**: Fiat-Shamir binding, amortized accumulator (blocks
+- **Two-level recursion**: Level 1 cairo-prove (145 Hades perms, off-chain) +
+  Level 2 chain STARK (~4,934 felts, on-chain)
+- **9 security layers**: Fiat-Shamir binding, amortized accumulator (blocks
   all-zeros-selector attack), n_poseidon_perms validation, seed_digest checkpoint,
-  pass1_final_digest binding, carry-chain modular addition, LogUp chain-to-Hades
-  binding, offline Hades verification
-- **Verified on Sepolia**: TX [`0x055c2bf8...ae620f`](https://sepolia.starkscan.co/tx/0x055c2bf89f43d9b65580862e0b81e6b47842b9dda3b862c134f35b61b0ae620f)
+  pass1_final_digest binding, carry-chain modular addition, hades_commitment
+  binding, boundary constraints, 160-bit STARK security
+- **4 verified TXs on Sepolia**: Latest [`0x021512dd...`](https://sepolia.starkscan.co/tx/0x021512dd991a1c317a1aa93a382bed322af2e63d9fa01b9c5a3b133cf1ceebb8)
 - **Contract**: `0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005`
 
 The Cairo verifier at `recursive_air.cairo` implements all 38 constraints matching

@@ -6,11 +6,11 @@ Prove that an ML model ran correctly with a cryptographic proof, verified on Sta
 
 | Model | Params | TX | Felts | Security | GKR | STARK |
 |-------|--------|----|-------|----------|-----|-------|
-| **SmolLM2-135M** (v2 AIR) | 135M | [`0x055c2b...620f`](https://sepolia.starkscan.co/tx/0x055c2bf89f43d9b65580862e0b81e6b47842b9dda3b862c134f35b61b0ae620f) | ~4,824 | 120-bit | 102s | 3.55s |
+| **SmolLM2-135M** (v2 AIR) | 135M | [`0x021512dd...`](https://sepolia.starkscan.co/tx/0x021512dd991a1c317a1aa93a382bed322af2e63d9fa01b9c5a3b133cf1ceebb8) | ~4,934 | 160-bit | 102s | 6.5s |
 | **Qwen2.5-14B** | 14B | [`0x5ce1b4...edfd3`](https://sepolia.starkscan.co/tx/0x5ce1b41815e29a7b3dd03b77187cf32c8c5f0e2607960303174cbea303edfd3) | 946 | Standard | 46s | 1.2s |
 | **GLM-4-9B** | 9B | [`0x542960...4dd1e`](https://sepolia.starkscan.co/tx/0x542960d703a62d4beaacf0d9094ea92dc86bf326cd917c533039f4dd1eb4a30) | 929 | Standard | 201s | 1.1s |
 
-The latest verification uses an upgraded 89-column chain AIR with 38 constraints, including an amortized accumulator and carry-chain modular addition, verified at contract [`0x0121d1...8c005`](https://sepolia.starkscan.co/contract/0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005).
+The latest verification uses an upgraded 48-column chain AIR with 38 constraints, including an amortized accumulator and carry-chain modular addition, verified at contract [`0x0121d1...8c005`](https://sepolia.starkscan.co/contract/0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005).
 
 ## Quick Overview
 
@@ -22,10 +22,10 @@ Input text → Tokenize → Forward pass (GPU) → GKR proof (GPU) → Recursive
 | Component | Description |
 |-----------|-------------|
 | **GKR Sumcheck** | Layer-by-layer interactive proof over M31/QM31 fields (192 matmuls, 337 layers) |
-| **Recursive STARK** | Compresses GKR proof (~46K felts) into ~4,824 felts via 89-column chain AIR (38 constraints) + Hades AIR (1225 columns) |
+| **Recursive STARK** | Two-level recursion: Level 1 cairo-prove verifies 145 Hades perms (off-chain), Level 2 chain STARK (~4,934 felts) via 48-column chain AIR (38 constraints) + Hades AIR (1225 columns) |
 | **On-chain Verifier** | Cairo contract with 38 constraints matching Rust exactly, full FRI + Merkle + PoW verification |
 | **Weight Binding** | Poseidon Merkle roots bind each weight matrix -- swap detection is instant |
-| **Security** | 120-bit cryptographic security (pow_bits=20, log_blowup=5, n_queries=20), 8 independent security layers |
+| **Security** | 160-bit cryptographic security (pow_bits=20, log_blowup=5, n_queries=28), 9 independent security layers |
 
 ---
 
@@ -215,7 +215,7 @@ This runs the full pipeline automatically:
 1. **Tokenize** input text
 2. **Forward pass** through all 48 transformer layers (GPU-accelerated)
 3. **GKR proof** — 192 matmul sumcheck reductions, 337 layer proofs (~46s on H100)
-4. **Recursive STARK** — compress GKR proof (~46K felts) into ~950 felts (~1.2s)
+4. **Recursive STARK** — compress GKR proof (~46K felts) into ~4,934 felts (~1.2s)
 5. **Register model** on Starknet (if not already registered)
 6. **Submit `verify_recursive` TX** — single transaction, full STARK verification on-chain
 7. **Report TX hash** and Starkscan explorer link
@@ -317,11 +317,11 @@ Each on-chain transaction contains these **named, decoded fields** visible in an
 | `num_transformer_blocks` | u32 | 48 | Transformer block count |
 | `policy_commitment` | felt252 | `0x0178ed...6162` | Proving policy hash |
 | `trace_log_size` | u32 | 15 | STARK trace: 2^15 = 32,768 rows |
-| `stark_proof_data` | Array | ~950 felts | FRI + Merkle decommitments |
+| `stark_proof_data` | Array | ~4,934 felts | FRI + Merkle decommitments |
 
 The contract performs **full cryptographic STARK verification** on-chain:
 - AIR boundary constraints (Poseidon digest chain)
-- Merkle tree decommitments (28 trace columns)
+- Merkle tree decommitments (48 trace columns)
 - FRI low-degree proof (polynomial proximity)
 - Proof of work (grinding resistance)
 
@@ -346,7 +346,7 @@ const provider = new RpcProvider({
   nodeUrl: "https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_8/demo",
 });
 
-// v2 contract (upgraded, 89-column chain AIR, 120-bit security)
+// v2 contract (upgraded, 48-column chain AIR, 160-bit security)
 const CONTRACT = "0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005";
 
 // Check if a specific proof was verified
@@ -584,14 +584,14 @@ Works on Linux (CUDA GPU) and macOS (CPU). Model auto-downloads if not present.
 
 | TX | Model | Params | Felts | AIR | Security | GKR | STARK |
 |----|-------|--------|-------|-----|----------|-----|-------|
-| [`0x055c2bf...`](https://sepolia.starkscan.co/tx/0x055c2bf89f43d9b65580862e0b81e6b47842b9dda3b862c134f35b61b0ae620f) | SmolLM2-135M | 135M | ~4,824 | v2 (89-col/38-cst) | 120-bit | 102s | 3.55s |
+| [`0x021512dd...`](https://sepolia.starkscan.co/tx/0x021512dd991a1c317a1aa93a382bed322af2e63d9fa01b9c5a3b133cf1ceebb8) | SmolLM2-135M | 135M | ~4,934 | v2 (48-col/38-cst) | 160-bit | 102s | 6.5s |
 | [`0x5ce1b41...`](https://sepolia.starkscan.co/tx/0x5ce1b41815e29a7b3dd03b77187cf32c8c5f0e2607960303174cbea303edfd3) | Qwen2.5-14B | 14B | 946 | v1 (28-col/27-cst) | Standard | 46s | 1.2s |
 | [`0x542960d...`](https://sepolia.starkscan.co/tx/0x542960d703a62d4beaacf0d9094ea92dc86bf326cd917c533039f4dd1eb4a30) | GLM-4-9B | 9B | 929 | v1 (28-col/27-cst) | Standard | 201s | 1.1s |
 | [`0x16c9fa1...`](https://sepolia.starkscan.co/tx/0x16c9fa1a9da0a388125e4d27e11b8eff6dd663f911b38e0f799d12e4cf15feb) | GLM-4-9B | 9B | 970 | v1 | Standard | -- | -- |
 | [`0x67a7b92...`](https://sepolia.starkscan.co/tx/0x67a7b9259d874aa40d593ac55fa47f3c4db6836f20893db718334d56ac0f0d9) | Qwen2.5-14B | 14B | 927 | v1 | Standard | -- | -- |
 | [`0x38a156d...`](https://sepolia.starkscan.co/tx/0x38a156d972cdc111f40bca7dedf056f42031088daf434d3849a1352da713317) | Qwen2.5-14B | 14B | 1,007 | v1 | Standard | -- | -- |
 
-Three different model architectures (SmolLM + Qwen2 + ChatGLM), verified on-chain in single transactions. The latest verification uses the upgraded v2 AIR with 120-bit security.
+Three different model architectures (SmolLM + Qwen2 + ChatGLM), verified on-chain in single transactions. The latest verification uses the upgraded v2 AIR with 160-bit security.
 
 ### SDK-submitted proofs
 
@@ -707,7 +707,7 @@ const result = await prover.chat("What is AI?", { model: "local" });
 console.log(result.text);         // model output
 console.log(result.txHash);       // Starknet TX hash
 console.log(result.explorerUrl);  // Starkscan link
-console.log(result.calldataFelts); // ~950
+console.log(result.calldataFelts); // ~4934
 ```
 
 ### Python (PyPI)
@@ -724,7 +724,7 @@ result = client.chat("What is AI?")
 print(result["text"])           # model output
 print(result["tx_hash"])        # Starknet TX hash
 print(result["explorer_url"])   # Starkscan link
-print(result["calldata_felts"]) # ~950
+print(result["calldata_felts"]) # ~4934
 ```
 
 ---
