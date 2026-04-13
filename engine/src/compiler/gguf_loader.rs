@@ -317,6 +317,7 @@ fn extract_model_config(metadata: &HashMap<String, GgufValue>) -> Result<HfConfi
         vocab_size,
         hidden_act: "silu".to_string(), // default for llama-family
         max_position_embeddings: if max_pos > 0 { max_pos } else { 4096 },
+        head_dim: if num_heads > 0 { hidden_size / num_heads } else { 64 },
         num_experts: 0,
         num_experts_per_tok: 0,
     })

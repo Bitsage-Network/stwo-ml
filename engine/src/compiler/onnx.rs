@@ -316,6 +316,9 @@ pub struct TransformerConfig {
     pub activation: ActivationType,
     /// Normalization type (LayerNorm or RMSNorm).
     pub norm_type: NormType,
+    /// Per-head dimension. When head_dim != d_model/num_heads (e.g., Qwen3-4B: 128),
+    /// Q projection output is num_heads × head_dim instead of d_model.
+    pub head_dim: usize,
     /// Number of experts for MoE (0 = dense, no MoE).
     pub num_experts: usize,
     /// Number of experts activated per token (top-K). 0 for dense models.
@@ -331,6 +334,7 @@ impl TransformerConfig {
             d_ff: 4 * d_model,
             activation: ActivationType::GELU,
             norm_type: NormType::LayerNorm,
+            head_dim: d_model / num_heads,
             num_experts: 0,
             num_experts_per_tok: 0,
         }

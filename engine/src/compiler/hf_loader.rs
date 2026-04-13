@@ -424,6 +424,10 @@ pub struct HfConfig {
     pub vocab_size: usize,
     pub hidden_act: String,
     pub max_position_embeddings: usize,
+    /// Head dimension. When set explicitly (e.g., Qwen3-4B: head_dim=128),
+    /// Q projection is num_heads * head_dim which may differ from hidden_size.
+    /// If not set, defaults to hidden_size / num_attention_heads.
+    pub head_dim: usize,
     /// Number of experts for MoE models (0 = dense, no MoE).
     pub num_experts: usize,
     /// Number of experts activated per token (top-K).
@@ -486,6 +490,14 @@ impl HfConfig {
                 .to_string(),
             max_position_embeddings: get_u64("max_position_embeddings").unwrap_or(2048)
                 as usize,
+            // Head dimension: explicit in Qwen3-4B (128), defaults to hidden/heads
+            head_dim: get_u64("head_dim")
+                .map(|v| v as usize)
+                .unwrap_or_else(|| {
+                    let hs = get_u64("hidden_size").unwrap_or(1) as usize;
+                    let nh = get_u64("num_attention_heads").unwrap_or(1) as usize;
+                    hs / nh
+                }),
             // MoE: MiniMax uses num_local_experts (256), Mixtral uses num_local_experts (8)
             num_experts: get_u64("num_local_experts")
                 .or_else(|| get_u64("num_experts"))
@@ -522,6 +534,7 @@ impl HfConfig {
             d_ff: self.intermediate_size,
             activation,
             norm_type,
+            head_dim: self.head_dim,
             num_experts: self.num_experts,
             num_experts_per_tok: self.num_experts_per_tok,
         }
@@ -758,6 +771,10 @@ pub(crate) fn build_hf_transformer_graph(config: &TransformerConfig, num_layers:
     use crate::compiler::onnx::NormType;
     let d = config.d_model;
     let d_ff = config.d_ff;
+    // Q projection dim: num_heads × head_dim (may differ from hidden_size, e.g., Qwen3-4B)
+    let q_dim = config.num_heads * config.head_dim;
+    // O projection: maps Q dim back to hidden_size
+    let o_dim = d;
 
     let mut builder = GraphBuilder::new((1, d));
     let mut moe_slot_infos: Vec<(usize, crate::compiler::graph::MoESlotInfo)> = Vec::new();
@@ -768,10 +785,10 @@ pub(crate) fn build_hf_transformer_graph(config: &TransformerConfig, num_layers:
             NormType::LayerNorm => { builder.layer_norm(); }
             NormType::RMSNorm => { builder.rms_norm(); }
         }
-        // Q projection (d → d)
-        builder.linear(d);
-        // O projection (d → d)
-        builder.linear(d);
+        // Q projection (d → q_dim, where q_dim = num_heads × head_dim)
+        builder.linear(q_dim);
+        // O projection (q_dim → d)
+        builder.linear(o_dim);
         // Post-attention norm
         match config.norm_type {
             NormType::LayerNorm => { builder.layer_norm(); }
