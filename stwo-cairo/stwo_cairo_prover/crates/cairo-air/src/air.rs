@@ -330,7 +330,8 @@ pub struct FullSegmentRanges {
     pub mul_mod: SegmentRange,
 }
 
-// The Cairo1 verifier currently requires all the segments to be present.
+// The Cairo1 verifier requires all segments to be present. For standalone programs that
+// don't use all builtins, missing segments are serialized as empty (start_ptr == stop_ptr == 0).
 impl CairoSerialize for PublicSegmentRanges {
     fn serialize(&self, serialized: &mut Vec<starknet_ff::FieldElement>) {
         let Self {
@@ -347,19 +348,20 @@ impl CairoSerialize for PublicSegmentRanges {
             mul_mod,
         } = self;
 
+        let empty = SegmentRange::default();
         CairoSerialize::serialize(
             &FullSegmentRanges {
                 output: *output,
-                pedersen: pedersen.unwrap(),
-                range_check_128: range_check_128.unwrap(),
-                ecdsa: ecdsa.unwrap(),
-                bitwise: bitwise.unwrap(),
-                ec_op: ec_op.unwrap(),
-                keccak: keccak.unwrap(),
-                poseidon: poseidon.unwrap(),
-                range_check_96: range_check_96.unwrap(),
-                add_mod: add_mod.unwrap(),
-                mul_mod: mul_mod.unwrap(),
+                pedersen: pedersen.unwrap_or(empty),
+                range_check_128: range_check_128.unwrap_or(empty),
+                ecdsa: ecdsa.unwrap_or(empty),
+                bitwise: bitwise.unwrap_or(empty),
+                ec_op: ec_op.unwrap_or(empty),
+                keccak: keccak.unwrap_or(empty),
+                poseidon: poseidon.unwrap_or(empty),
+                range_check_96: range_check_96.unwrap_or(empty),
+                add_mod: add_mod.unwrap_or(empty),
+                mul_mod: mul_mod.unwrap_or(empty),
             },
             serialized,
         );
