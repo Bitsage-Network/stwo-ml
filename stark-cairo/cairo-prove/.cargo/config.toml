@@ -1,0 +1,4 @@
+[patch.crates-io]
+
+[patch."file:///Users/vaamx/bitsage-network/libs/stwo/crates/stwo"]
+stwo = { path = "/Users/vaamx/bitsage-network/libs/stwo-gpu/crates/stwo", package = "stwo-gpu" }
