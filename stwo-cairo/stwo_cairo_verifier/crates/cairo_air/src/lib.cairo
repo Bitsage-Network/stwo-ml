@@ -584,6 +584,16 @@ pub struct SegmentRange {
     pub stop_ptr: MemorySmallValue,
 }
 
+/// Returns true if a segment was never allocated (serialized as all-zeros).
+/// Real segments — even empty ones (start_ptr == stop_ptr) — have non-zero addresses
+/// since they are allocated after program/execution segments.
+fn is_absent(segment: @SegmentRange) -> bool {
+    *segment.start_ptr.id == 0
+        && *segment.start_ptr.value == 0
+        && *segment.stop_ptr.id == 0
+        && *segment.stop_ptr.value == 0
+}
+
 #[generate_trait]
 impl SegmentRangeImpl of SegmentRangeTrait {
     fn is_empty(self: @SegmentRange) -> bool {
@@ -618,6 +628,12 @@ impl PublicSegmentRangesImpl of PublicSegmentRangesTrait {
         }
     }
 
+    /// Returns segments that were actually allocated by the VM.
+    ///
+    /// Distinguishes real segments (allocated at non-zero addresses, even if empty) from
+    /// absent segments (serialized as all-zeros by the prover for standalone programs).
+    /// This allows both bootloader proofs (11 segments) and standalone proofs (N segments)
+    /// to verify correctly — n_builtins matches the actual number of allocated segments.
     fn present_segments(self: @PublicSegmentRanges) -> Array<@SegmentRange> {
         let mut segments = array![];
         let PublicSegmentRanges {
@@ -634,17 +650,38 @@ impl PublicSegmentRangesImpl of PublicSegmentRangesTrait {
             mul_mod,
         } = self;
 
+        // Output is always present.
         segments.append(output);
-        segments.append(pedersen);
-        segments.append(range_check_128);
-        segments.append(ecdsa);
-        segments.append(bitwise);
-        segments.append(ec_op);
-        segments.append(keccak);
-        segments.append(poseidon);
-        segments.append(range_check_96);
-        segments.append(add_mod);
-        segments.append(mul_mod);
+        if !is_absent(pedersen) {
+            segments.append(pedersen);
+        }
+        if !is_absent(range_check_128) {
+            segments.append(range_check_128);
+        }
+        if !is_absent(ecdsa) {
+            segments.append(ecdsa);
+        }
+        if !is_absent(bitwise) {
+            segments.append(bitwise);
+        }
+        if !is_absent(ec_op) {
+            segments.append(ec_op);
+        }
+        if !is_absent(keccak) {
+            segments.append(keccak);
+        }
+        if !is_absent(poseidon) {
+            segments.append(poseidon);
+        }
+        if !is_absent(range_check_96) {
+            segments.append(range_check_96);
+        }
+        if !is_absent(add_mod) {
+            segments.append(add_mod);
+        }
+        if !is_absent(mul_mod) {
+            segments.append(mul_mod);
+        }
         segments
     }
 }
