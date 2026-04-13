@@ -2452,6 +2452,7 @@ mod tests {
             d_ff: 16,
             activation: ActivationType::GELU,
             norm_type: crate::compiler::onnx::NormType::LayerNorm,
+            head_dim: 4,
             num_experts: 0,
             num_experts_per_tok: 0,
         };
