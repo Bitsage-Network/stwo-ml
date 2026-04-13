@@ -177,7 +177,7 @@ pub fn prove_recursive_with_policy(
 
     // ── Step 2: Build traces ─────────────────────────────────────────
     recursive_log!("  [Recursive] Step 2/5: Building chain execution trace...");
-    let trace_data = build_recursive_trace(&witness);
+    let mut trace_data = build_recursive_trace(&witness);
 
     // Build Hades verification trace from HadesPerm witness ops
     let hades_perms = extract_hades_perms(&witness);
@@ -381,7 +381,96 @@ pub fn prove_recursive_with_policy(
     {
         let mut tree_builder = commitment_scheme.tree_builder();
 
-        // Chain columns: 69 columns (64 data + 5 selectors), padded to unified_log_size
+        // Recompute accumulator for unified_log_size if chain was built at a smaller size.
+        // The amortized accumulator correction depends on N = 2^log_size. If the chain
+        // trace was built at chain_log_size but we're committing at unified_log_size
+        // (which may be larger due to Hades AIR), the accumulator must be recomputed.
+        if unified_log_size > chain_log_size {
+            let unified_n = 1usize << unified_log_size;
+            let n_real = trace_data.n_real_rows;
+            let col_is_active = 2 * super::air::COLS_PER_STATE + super::air::LIMBS_PER_FELT + 1
+                + super::air::LIMBS_PER_FELT + 8 + 1;
+            let col_ac = col_is_active + 2;
+            let col_ac_next = col_is_active + 3;
+
+            // Pad execution columns to unified size first
+            for col in trace_data.execution_trace.iter_mut() {
+                col.resize(unified_n, M31::from_u32_unchecked(0));
+            }
+
+            // Recompute is_active_next with wrap-around for unified domain
+            let col_ia_next = col_is_active + 1;
+            for i in 0..unified_n {
+                let next = (i + 1) % unified_n;
+                trace_data.execution_trace[col_ia_next][i] = trace_data.execution_trace[col_is_active][next];
+            }
+            // Recompute is_active_prev
+            let col_ia_prev = col_is_active + 6;
+            for i in 0..unified_n {
+                let prev = if i == 0 { unified_n - 1 } else { i - 1 };
+                trace_data.execution_trace[col_ia_prev][i] = trace_data.execution_trace[col_is_active][prev];
+            }
+            // Recompute is_chain_gate and is_boundary_gate
+            let col_cg = col_is_active + 4;
+            let col_bg = col_is_active + 5;
+            for i in 0..unified_n {
+                let a = trace_data.execution_trace[col_is_active][i];
+                let a_next = trace_data.execution_trace[col_ia_next][i];
+                trace_data.execution_trace[col_cg][i] = a * a_next;
+                trace_data.execution_trace[col_bg][i] = a - a * a_next;
+            }
+            // Recompute shifted_next_before with wrap-around for unified domain
+            let shifted_start = 2 * super::air::COLS_PER_STATE;
+            for i in 0..unified_n {
+                let next = (i + 1) % unified_n;
+                for j in 0..super::air::LIMBS_PER_FELT {
+                    trace_data.execution_trace[shifted_start + j][i] =
+                        trace_data.execution_trace[j][next];
+                }
+            }
+
+            // Recompute accumulator with unified N
+            let n_m31 = M31::from(unified_n as u32);
+            let n_inv = n_m31.inverse();
+            let correction = M31::from(n_real as u32) * n_inv;
+
+            trace_data.execution_trace[col_ac][0] = M31::from_u32_unchecked(0);
+            for i in 0..unified_n - 1 {
+                let is_act = trace_data.execution_trace[col_is_active][i];
+                trace_data.execution_trace[col_ac][i + 1] =
+                    trace_data.execution_trace[col_ac][i] + is_act - correction;
+            }
+            for i in 0..unified_n {
+                let next = (i + 1) % unified_n;
+                trace_data.execution_trace[col_ac_next][i] = trace_data.execution_trace[col_ac][next];
+            }
+
+            // Recompute carry chain for unified domain (only chain rows need carries)
+            let addition_col = 2 * super::air::COLS_PER_STATE + super::air::LIMBS_PER_FELT + 1;
+            let carry_col = addition_col + super::air::LIMBS_PER_FELT;
+            let k_col_idx = carry_col + 8;
+            for row_idx in 0..n_real.saturating_sub(1) {
+                let da_limbs: [M31; super::air::LIMBS_PER_FELT] =
+                    std::array::from_fn(|j| trace_data.execution_trace[super::air::COLS_PER_STATE + j][row_idx]);
+                let add_limbs: [M31; super::air::LIMBS_PER_FELT] =
+                    std::array::from_fn(|j| trace_data.execution_trace[addition_col + j][row_idx]);
+                let next_before_limbs: [M31; super::air::LIMBS_PER_FELT] =
+                    std::array::from_fn(|j| trace_data.execution_trace[j][row_idx + 1]);
+                let (carries, k) =
+                    super::air::compute_addition_carry_chain(&da_limbs, &add_limbs, &next_before_limbs);
+                for j in 0..8 {
+                    trace_data.execution_trace[carry_col + j][row_idx] = carries[j];
+                }
+                trace_data.execution_trace[k_col_idx][row_idx] = k;
+            }
+
+            recursive_log!(
+                "  [Recursive] Recomputed selectors/accumulator for unified_log_size={} (was chain_log_size={})",
+                unified_log_size, chain_log_size
+            );
+        }
+
+        // Chain columns: 89 columns, padded to unified_log_size
         let chain_evals: Vec<CircleEvaluation<SimdBackend, M31, _>> = trace_data
             .execution_trace
             .iter()
@@ -594,6 +683,82 @@ pub fn prove_recursive_with_policy(
         range_check: None,
         hades_logup: None, // TODO: activate with Hades interaction trace
     };
+
+    // Verify chain constraints before proving
+    {
+        let n_real = trace_data.n_real_rows;
+        let n_padded = 1usize << unified_log_size;
+        let addition_col = 2 * super::air::COLS_PER_STATE + super::air::LIMBS_PER_FELT + 1;
+        let carry_col = addition_col + super::air::LIMBS_PER_FELT;
+        let k_col_idx = carry_col + 8;
+        let shifted = 2 * super::air::COLS_PER_STATE;
+        let mut chain_failures = 0usize;
+        for i in 0..n_real.saturating_sub(1) {
+            for j in 0..super::air::LIMBS_PER_FELT {
+                let da = trace_data.execution_trace[super::air::COLS_PER_STATE + j][i].0 as i64;
+                let add = trace_data.execution_trace[addition_col + j][i].0 as i64;
+                let carry_in = if j == 0 { 0i64 } else { trace_data.execution_trace[carry_col + j - 1][i].0 as i64 };
+                let snb = trace_data.execution_trace[shifted + j][i].0 as i64;
+                let k = trace_data.execution_trace[k_col_idx][i].0 as i64;
+                let carry_out = if j < 8 { trace_data.execution_trace[carry_col + j][i].0 as i64 } else { 0 };
+                let p_j = super::air::P_LIMBS_28[j] as i64;
+                let residual = da + add + carry_in - snb - k * p_j - carry_out * (1i64 << 28);
+                if residual != 0 {
+                    if chain_failures < 5 {
+                        eprintln!("[chain-check] FAIL row {i} limb {j}: residual={residual} (da={da} add={add} cin={carry_in} snb={snb} k={k} cout={carry_out})");
+                    }
+                    chain_failures += 1;
+                }
+            }
+        }
+        if chain_failures > 0 {
+            eprintln!("[chain-check] {} total constraint failures across {} chain rows", chain_failures, n_real - 1);
+        } else {
+            eprintln!("[chain-check] PASSED: all {} chain rows OK (n_padded={}, n_real={})", n_real - 1, n_padded, n_real);
+        }
+
+        // Check initial boundary: row 0's digest_before should be zero
+        for j in 0..super::air::LIMBS_PER_FELT {
+            let v = trace_data.execution_trace[j][0].0;
+            if v != 0 {
+                eprintln!("[boundary-check] INITIAL FAIL: row 0 limb {j} = {v} (expected 0)");
+            }
+        }
+
+        // Check final boundary: row n_real-1's digest_after should match final_digest
+        if n_real > 0 {
+            let final_limbs_ref = super::air::felt252_to_limbs(&final_digest_felt);
+            for j in 0..super::air::LIMBS_PER_FELT {
+                let da = trace_data.execution_trace[super::air::COLS_PER_STATE + j][n_real - 1];
+                if da != final_limbs_ref[j] {
+                    eprintln!("[boundary-check] FINAL FAIL: row {} limb {j}: got {:?}, expected {:?}", n_real - 1, da, final_limbs_ref[j]);
+                }
+            }
+        }
+
+        // Check accumulator: verify correction term
+        let col_is_active_offset = 2 * super::air::COLS_PER_STATE + super::air::LIMBS_PER_FELT + 1 + super::air::LIMBS_PER_FELT + 8 + 1;
+        let col_ac = col_is_active_offset + 2;
+        let col_ac_next = col_is_active_offset + 3;
+        let n_m31 = M31::from(n_padded as u32);
+        let n_inv_m31 = n_m31.inverse();
+        let correction_m31 = M31::from(n_real as u32) * n_inv_m31;
+        let mut accum_failures = 0;
+        for i in 0..n_padded {
+            let ac = trace_data.execution_trace[col_ac][i];
+            let ac_next = trace_data.execution_trace[col_ac_next][i];
+            let is_act_col = col_is_active_offset;
+            let is_act = trace_data.execution_trace[is_act_col][i];
+            let residual = ac_next - ac - is_act + correction_m31;
+            if residual != M31::from_u32_unchecked(0) {
+                if accum_failures < 3 {
+                    eprintln!("[accum-check] FAIL row {i}: ac={:?} ac_next={:?} is_act={:?} correction={:?} residual={:?}", ac, ac_next, is_act, correction_m31, residual);
+                }
+                accum_failures += 1;
+            }
+        }
+        eprintln!("[accum-check] {} failures out of {} rows", accum_failures, n_padded);
+    }
 
     let stark_proof = if hades_enabled {
         let hades_component =
