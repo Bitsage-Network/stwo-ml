@@ -602,7 +602,7 @@ pub fn prove_recursive_with_policy(
     );
 
     // ── Step 4: Prove ────────────────────────────────────────────────
-    recursive_log!("  [Recursive] Step 4/5: Proving (STARK)...");
+    eprintln!("  [Recursive] Step 4/5: Proving (STARK)...");
 
     // Compute initial/final digest limbs.
     // Initial = zero (fresh channel).
@@ -671,6 +671,14 @@ pub fn prove_recursive_with_policy(
     };
     let chain_component =
         FrameworkComponent::new(&mut allocator, chain_eval, chain_claimed_sum);
+
+    use stwo::core::air::Component;
+    let bounds = Component::trace_log_degree_bounds(&chain_component);
+    eprintln!("  [Recursive] Chain component: {} constraints, {} trees, bounds: {:?}",
+        chain_component.n_constraints(),
+        bounds.len(),
+        bounds.iter().map(|t| t.len()).collect::<Vec<_>>(),
+    );
 
     // Component 2: Hades AIR (permutation verification)
     // NOTE: Hades LogUp provider (-1 per verified perm) requires its own

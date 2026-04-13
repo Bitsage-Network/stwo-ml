@@ -238,6 +238,15 @@ impl RecursiveAirImpl of Air<RecursiveAir> {
         };
 
         acc
+        // let n_quotients = quotients.len();
+        // let mut acc: QM31 = QM31Zero::zero();
+        // let mut idx: u32 = 0;
+        // loop {
+        //     if idx >= n_quotients { break; }
+        //     acc = acc * random_coeff + *quotients.at(idx);
+        //     idx += 1;
+        // };
+        // acc
     }
 }
 
