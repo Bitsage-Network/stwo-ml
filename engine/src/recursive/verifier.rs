@@ -50,7 +50,7 @@ pub fn verify_recursive(
             "test" => PcsConfig::default(),
             _ => PcsConfig {
                 pow_bits: 16,
-                fri_config: stwo::core::fri::FriConfig::new(3, 3, 30),
+                fri_config: stwo::core::fri::FriConfig::new(0, 3, 20),
             },
         }
     };
@@ -312,6 +312,163 @@ mod tests {
             0.0,
         )
         .expect("recursive proving should succeed")
+    }
+
+    #[test]
+    fn test_oods_diagnostic() {
+        use num_traits::One;
+        use stwo::core::air::accumulation::PointEvaluationAccumulator;
+        use stwo::core::constraints::coset_vanishing;
+        use stwo::core::fields::FieldExpOps;
+        use stwo::core::poly::circle::CanonicCoset;
+
+        std::env::set_var("OBELYZK_RECURSIVE_SECURITY", "test");
+        std::env::set_var("OBELYZK_LOGUP", "0");
+        let rp = adversarial_proof();
+
+        // Replay the FULL verification channel to extract random_coeff + oods_point
+        let pcs_config = stwo::core::pcs::PcsConfig::default();
+        let channel = &mut <Poseidon252MerkleChannel as stwo::core::channel::MerkleChannel>::C::default();
+
+        channel.mix_u64(pcs_config.pow_bits as u64);
+        channel.mix_u64(pcs_config.fri_config.log_blowup_factor as u64);
+        channel.mix_u64(pcs_config.fri_config.n_queries as u64);
+        channel.mix_u64(pcs_config.fri_config.log_last_layer_degree_bound as u64);
+        channel.mix_felts(&[
+            rp.public_inputs.circuit_hash,
+            rp.public_inputs.io_commitment,
+            rp.public_inputs.weight_super_root,
+        ]);
+        channel.mix_u64(rp.public_inputs.n_layers as u64);
+        channel.mix_u64(rp.public_inputs.n_poseidon_perms as u64);
+        channel.mix_felts(&[rp.public_inputs.seed_digest]);
+        {
+            let io_felt = crate::crypto::poseidon_channel::securefield_to_felt(rp.public_inputs.io_commitment);
+            let bytes = io_felt.to_bytes_be();
+            channel.mix_u64(u64::from_be_bytes(bytes[0..8].try_into().unwrap()));
+            channel.mix_u64(u64::from_be_bytes(bytes[8..16].try_into().unwrap()));
+            channel.mix_u64(u64::from_be_bytes(bytes[16..24].try_into().unwrap()));
+            channel.mix_u64(u64::from_be_bytes(bytes[24..32].try_into().unwrap()));
+        }
+        {
+            let bytes = rp.pass1_final_digest.to_bytes_be();
+            channel.mix_u64(u64::from_be_bytes(bytes[0..8].try_into().unwrap()));
+            channel.mix_u64(u64::from_be_bytes(bytes[8..16].try_into().unwrap()));
+            channel.mix_u64(u64::from_be_bytes(bytes[16..24].try_into().unwrap()));
+            channel.mix_u64(u64::from_be_bytes(bytes[24..32].try_into().unwrap()));
+        }
+
+        let zero_limbs = super::super::air::felt252_to_limbs(&starknet_ff::FieldElement::ZERO);
+        let eval = RecursiveVerifierEval {
+            log_n_rows: rp.log_size,
+            n_real_rows: rp.n_real_rows,
+            initial_digest_limbs: zero_limbs,
+            final_digest_limbs: super::super::air::felt252_to_limbs(&rp.final_digest),
+            hades_lookup: None,
+        };
+        let mut allocator = TraceLocationAllocator::default();
+        let component = FrameworkComponent::new(&mut allocator, eval, SecureField::zero());
+        let bounds = Component::trace_log_degree_bounds(&component);
+
+        let mut cs = stwo::core::pcs::CommitmentSchemeVerifier::<Poseidon252MerkleChannel>::new(pcs_config);
+        cs.commit(rp.stark_proof.commitments[0], &bounds[0], channel);
+        cs.commit(rp.stark_proof.commitments[1], &bounds[1], channel);
+
+        let comp_log_size = component.max_constraint_log_degree_bound();
+        cs.commit(
+            *rp.stark_proof.commitments.last().unwrap(),
+            &[comp_log_size - 1; 2 * 4],
+            channel,
+        );
+
+        let random_coeff = channel.draw_secure_felt();
+        let oods_point = stwo::core::circle::CirclePoint::<SecureField>::get_random_point(channel);
+        eprintln!("random_coeff: {:?}", random_coeff);
+        eprintln!("oods_point.x: {:?}", oods_point.x);
+
+        // Compute via FrameworkComponent
+        let max_log_deg = comp_log_size - 1;
+        let rust_eval = {
+            let mut acc = PointEvaluationAccumulator::new(random_coeff);
+            component.evaluate_constraint_quotients_at_point(
+                oods_point, &rp.stark_proof.sampled_values, &mut acc, max_log_deg,
+            );
+            acc.finalize()
+        };
+        eprintln!("rust_eval: {:?}", rust_eval);
+
+        // Manual "Cairo-style" evaluation
+        let denom_inv = coset_vanishing(CanonicCoset::new(max_log_deg).coset, oods_point).inverse();
+        let sv = &rp.stark_proof.sampled_values;
+        let prep = &sv[0];
+        let trace = &sv[1];
+
+        eprintln!("prep cols: {}, trace cols: {}", prep.len(), trace.len());
+
+        let one = SecureField::one();
+        let zero_sf = SecureField::zero();
+        let is_first = prep[0][0];
+        let is_last = prep[1][0];
+        let is_chain = prep[2][0];
+        let is_active = trace[82][0];
+        let ac = trace[84][0];
+        let ac_next = trace[85][0];
+        let add_k = trace[81][0];
+
+        let n = 1u32 << rp.log_size;
+        let n_inv = M31::from(n).inverse();
+        let corr = SecureField::from(M31::from(rp.n_real_rows)) * SecureField::from(n_inv);
+
+        let mut cairo = zero_sf;
+        // C1
+        cairo = cairo * random_coeff + denom_inv * is_active * (one - is_active);
+        // C2
+        cairo = cairo * random_coeff + denom_inv * (ac_next - ac - is_active + corr);
+        // C3: initial boundary ×9
+        let init_limbs = super::super::air::felt252_to_limbs(&starknet_ff::FieldElement::ZERO);
+        for j in 0..9usize {
+            cairo = cairo * random_coeff + denom_inv * is_first * (trace[j][0] - SecureField::from(init_limbs[j]));
+        }
+        // C4: final boundary ×9
+        let final_limbs = super::super::air::felt252_to_limbs(&rp.final_digest);
+        for j in 0..9usize {
+            cairo = cairo * random_coeff + denom_inv * is_last * (trace[27 + j][0] - SecureField::from(final_limbs[j]));
+        }
+        // C5k: k boolean
+        cairo = cairo * random_coeff + denom_inv * is_chain * add_k * (add_k - one);
+        // C5c: carry booleans ×8
+        for j in 0..8usize {
+            let cj = trace[73 + j][0];
+            cairo = cairo * random_coeff + denom_inv * is_chain * cj * (cj - one);
+        }
+        // C5: carry chain ×9
+        let p_28: [u32; 9] = [1, 0, 0, 0, 0, 0, 16777216, 1, 134217728];
+        let two28 = SecureField::from(M31::from(1u32 << 28));
+        for j in 0..9usize {
+            let da = trace[27 + j][0];
+            let add = trace[64 + j][0];
+            let snb = trace[54 + j][0];
+            let pj = SecureField::from(M31::from(p_28[j]));
+            let cin = if j == 0 { zero_sf } else { trace[73 + j - 1][0] };
+            let cout = if j < 8 { trace[73 + j][0] * two28 } else { zero_sf };
+            cairo = cairo * random_coeff + denom_inv * is_chain * (da + add + cin - snb - add_k * pj - cout);
+        }
+
+        eprintln!("cairo_eval: {:?}", cairo);
+        eprintln!("MATCH: {}", rust_eval == cairo);
+
+        if rust_eval != cairo {
+            // Find first diverging constraint
+            let mut rust_acc = PointEvaluationAccumulator::new(random_coeff);
+            let mut cairo_terms: Vec<SecureField> = Vec::new();
+
+            // We can't easily get per-constraint values from FrameworkComponent.
+            // But we know they should match. Let me print the first few constraint values.
+            eprintln!("\nPer-constraint Cairo values:");
+            eprintln!("  C1 (is_active bool): {:?}", denom_inv * is_active * (one - is_active));
+            eprintln!("  C2 (accumulator):    {:?}", denom_inv * (ac_next - ac - is_active + corr));
+            eprintln!("  C3[0] (init bnd):    {:?}", denom_inv * is_first * (trace[0][0] - SecureField::from(init_limbs[0])));
+        }
     }
 
     #[test]

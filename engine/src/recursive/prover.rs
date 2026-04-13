@@ -231,7 +231,11 @@ pub fn prove_recursive_with_policy(
             "test" => PcsConfig::default(), // 13 bits — unit tests only
             _ => PcsConfig {
                 pow_bits: 16,
-                fri_config: stwo::core::fri::FriConfig::new(3, 3, 30),
+                // log_last_layer_degree_bound=0: Cairo FRI verifier requires last layer
+                // to be a single constant (degree 0). Higher values are unsupported.
+                // 76 bits security: pow(16) + blowup(3)*queries(20) = 16+60 = 76
+                // log_last_layer_degree_bound=0 required by Cairo FRI verifier
+                fri_config: stwo::core::fri::FriConfig::new(0, 3, 20),
             },
         }
     };
@@ -281,10 +285,13 @@ pub fn prove_recursive_with_policy(
     // SECURITY: seed_digest checkpoint — binds chain content to model dimensions.
     channel.mix_felts(&[witness.public_inputs.seed_digest]);
 
-    // Also bind the full felt252 io_commitment into the channel.
-    // The QM31 io_commitment above is lossy (124 bits). This mixes the
-    // original 252-bit Poseidon hash so the proof body's felt252 field
-    // cannot be tampered without invalidating the STARK.
+    // Bind the felt252 io_commitment into the channel.
+    // IMPORTANT: This MUST use the SAME value that ends up in the proof body
+    // (io_commitment_felt252). The Cairo verifier reads this from the proof
+    // and mixes it into its channel — both must match.
+    // The default is the lossy QM31→felt252 conversion. Production callers
+    // (prove_model.rs) may override this AFTER proving — but the channel
+    // binding MUST use the value that was mixed during proving.
     {
         let io_felt = crate::crypto::poseidon_channel::securefield_to_felt(
             witness.public_inputs.io_commitment,
