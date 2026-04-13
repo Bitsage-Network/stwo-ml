@@ -2328,7 +2328,10 @@ fn main() {
                 prove_elapsed.as_secs_f64(),
                 Some(&resolved_policy),
             ) {
-                Ok(recursive_proof) => {
+                Ok(mut recursive_proof) => {
+                    // Override with the ORIGINAL Poseidon hash (not the lossy QM31→felt252).
+                    // This ensures the on-chain io_commitment check passes.
+                    recursive_proof.io_commitment_felt252 = recursive_io;
                     eprintln!(
                         "  Recursive STARK: {:.2}s, {} Poseidon perms, log_size={}",
                         recursive_proof.metadata.recursive_prove_time_secs,
