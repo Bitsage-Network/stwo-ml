@@ -218,7 +218,7 @@ impl PolyOps for GpuBackend {
         twiddles: &TwiddleTree<Self>,
     ) -> CircleEvaluation<Self, BaseField, BitReversedOrder> {
         // SAFETY: evaluate_into writes all values via FFT before they are read.
-        let buffer = unsafe { Col::<Self, BaseField>::uninitialized(domain.size()) };
+        let buffer = Col::<Self, BaseField>::zeros(domain.size());
         Self::evaluate_into(poly, domain, twiddles, buffer)
     }
 
@@ -367,7 +367,7 @@ fn evaluate_polynomials_simd_fallback(
         .collect();
 
     let simd_results =
-        SimdBackend::evaluate_polynomials(simd_polys, log_blowup_factor, simd_twiddles, false);
+        SimdBackend::evaluate_polynomials(simd_polys, log_blowup_factor, simd_twiddles, false, &Default::default());
 
     simd_results
         .into_iter()
@@ -591,16 +591,13 @@ fn eval_at_point_by_folding_gpu(
 ) -> SecureField {
     let log_size = evals.domain.log_size();
     let mut folding_alphas = get_folding_alphas(point, log_size as usize);
-    let mut layer_evaluation =
-        LineEvaluation::<GpuBackend>::new_zero(LineDomain::new(Coset::half_odds(log_size - 1)));
 
     let secure_evals = SecureEvaluation::<GpuBackend, BitReversedOrder>::new(
         evals.domain,
         SecureColumnByCoords::from_base_field_col(&evals.values),
     );
 
-    GpuBackend::fold_circle_into_line(
-        &mut layer_evaluation,
+    let mut layer_evaluation = GpuBackend::fold_circle_into_line(
         &secure_evals,
         folding_alphas.pop().expect("missing first folding alpha"),
         twiddles,
@@ -611,6 +608,7 @@ fn eval_at_point_by_folding_gpu(
             &layer_evaluation,
             folding_alphas.pop().expect("missing folding alpha"),
             twiddles,
+            1, // fold_step
         );
     }
     GpuBackend::resolve_pending_line_evaluation(&mut layer_evaluation);
