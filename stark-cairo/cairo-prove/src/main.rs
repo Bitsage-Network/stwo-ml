@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use cairo_air::utils::{ProofFormat, serialize_proof_to_file};
 use cairo_air::verifier::verify_cairo;
-use cairo_air::{CairoProof, PreProcessedTraceVariant};
+use cairo_air::{CairoProof, CairoProofForRustVerifier};
 use cairo_lang_runner::Arg;
 use cairo_prove::args::{Cli, Commands, ProgramArguments};
 use cairo_prove::error::{CairoProveError, Result};
@@ -42,13 +42,18 @@ fn execute_and_prove(
 }
 
 fn secure_pcs_config() -> PcsConfig {
+    // 96 bits of security: pow(26) + blowup(1) * queries(70) = 96 bits.
+    // Blowup=1 minimizes prover memory/time (critical for STARK-in-STARK Level 2).
+    // This matches the upstream default configuration.
     PcsConfig {
         pow_bits: 26,
         fri_config: FriConfig {
             log_last_layer_degree_bound: 0,
             log_blowup_factor: 1,
             n_queries: 70,
+            fold_step: 1,
         },
+        lifting_log_size: None,
     }
 }
 
@@ -73,7 +78,7 @@ fn handle_prove(
     Ok(())
 }
 
-fn handle_verify(proof: &Path, with_pedersen: bool) -> Result<()> {
+fn handle_verify(proof: &Path, _with_pedersen: bool) -> Result<()> {
     info!("Verifying proof from: {:?}", proof);
 
     let proof_path = proof
@@ -83,14 +88,10 @@ fn handle_verify(proof: &Path, with_pedersen: bool) -> Result<()> {
         })?;
 
     let proof_str = std::fs::read_to_string(proof_path)?;
-    let cairo_proof = serde_json::from_str(&proof_str)?;
+    let cairo_proof: CairoProofForRustVerifier<Blake2sMerkleHasher> =
+        serde_json::from_str(&proof_str)?;
 
-    let preprocessed_trace = match with_pedersen {
-        true => PreProcessedTraceVariant::Canonical,
-        false => PreProcessedTraceVariant::CanonicalWithoutPedersen,
-    };
-
-    verify_cairo::<Blake2sMerkleChannel>(cairo_proof, preprocessed_trace)
+    verify_cairo::<Blake2sMerkleChannel>(cairo_proof)
         .map_err(|e| CairoProveError::Verification(format!("{:?}", e)))?;
 
     info!("Verification successful");
@@ -238,8 +239,8 @@ mod tests {
         let args = vec![Arg::Value(Felt252::from(BigInt::from(100)))];
         let proof = execute_and_prove(target_path, args, PcsConfig::default())
             .expect("Proof generation failed");
-        let preprocessed_trace = PreProcessedTraceVariant::CanonicalWithoutPedersen;
-        let result = verify_cairo::<Blake2sMerkleChannel>(proof, preprocessed_trace);
+        let proof_for_verifier: CairoProofForRustVerifier<Blake2sMerkleHasher> = proof.into();
+        let result = verify_cairo::<Blake2sMerkleChannel>(proof_for_verifier);
         assert!(result.is_ok());
     }
 }

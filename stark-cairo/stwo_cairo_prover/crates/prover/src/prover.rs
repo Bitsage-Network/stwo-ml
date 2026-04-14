@@ -1,31 +1,42 @@
 use std::fs::read_to_string;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
-use cairo_air::air::{lookup_sum, CairoComponents, CairoInteractionElements};
+use cairo_air::cairo_components::CairoComponents;
+use cairo_air::claims::lookup_sum;
+use cairo_air::relations::CommonLookupElements;
 use cairo_air::utils::{serialize_proof_to_file, ProofFormat};
-use cairo_air::verifier::{verify_cairo, INTERACTION_POW_BITS};
-use cairo_air::{CairoProof, PreProcessedTraceVariant};
+use cairo_air::verifier::{verify_cairo_ex, INTERACTION_POW_BITS};
+use cairo_air::CairoProof;
 use num_traits::Zero;
 use serde::{Deserialize, Serialize};
 use stwo::core::channel::{Channel, MerkleChannel};
+use stwo::core::circle::M31_CIRCLE_LOG_ORDER;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::fri::FriConfig;
 use stwo::core::pcs::PcsConfig;
 use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::proof_of_work::GrindOps;
-use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
+use stwo::core::utils::MaybeOwned;
+use stwo::core::vcs_lifted::blake2_merkle::{Blake2sM31MerkleChannel, Blake2sMerkleChannel};
+use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::BackendForChannel;
+use stwo::prover::mempool::BaseColumnPool;
 use stwo::prover::poly::circle::PolyOps;
-use stwo::prover::{prove, CommitmentSchemeProver, ProvingError};
+use stwo::prover::poly::twiddles::TwiddleTree;
+use stwo::prover::{prove_ex, CommitmentSchemeProver, CommitmentTreeProver, ProvingError};
 use stwo_cairo_adapter::ProverInput;
+use stwo_cairo_common::preprocessed_columns::preprocessed_trace::{
+    PreProcessedTrace, PreProcessedTraceVariant,
+};
+use stwo_cairo_serialize::CairoSerialize;
 use tracing::{event, span, Level};
 
-use crate::witness::cairo::CairoClaimGenerator;
-#[cfg(feature = "cuda-runtime")]
-use crate::witness::utils::TreeBuilder as _;
+use crate::utils::cairo_provers;
+use crate::witness::cairo::create_cairo_claim_generator;
+use crate::witness::preprocessed_trace::gen_trace;
 use crate::witness::utils::witness_trace_cells;
 
 mod json {
@@ -35,7 +46,30 @@ mod json {
     pub use sonic_rs::from_str;
 }
 
-pub(crate) const LOG_MAX_ROWS: u32 = 26;
+pub(crate) const MAX_CANONICAL_COSET_LOG_SIZE: u32 = M31_CIRCLE_LOG_ORDER - 1;
+
+fn prove_verify_serialize<MC: MerkleChannel>(
+    input: ProverInput,
+    verify: bool,
+    proof_path: &Path,
+    proof_format: ProofFormat,
+    proof_params: ProverParameters,
+) -> Result<()>
+where
+    SimdBackend: BackendForChannel<MC>,
+    MC::H: MerkleHasherLifted + Serialize,
+    <MC::H as MerkleHasherLifted>::Hash: CairoSerialize,
+{
+    let cairo_proof = prove_cairo::<MC>(input, proof_params)?;
+    if verify {
+        verify_cairo_ex::<MC>(
+            cairo_proof.clone().into(),
+            proof_params.include_all_preprocessed_columns,
+        )?;
+    }
+    serialize_proof_to_file(&cairo_proof, proof_path, proof_format)?;
+    Ok(())
+}
 
 pub fn prove_cairo<MC: MerkleChannel>(
     input: ProverInput,
@@ -44,60 +78,112 @@ pub fn prove_cairo<MC: MerkleChannel>(
 where
     SimdBackend: BackendForChannel<MC>,
 {
+    let max_domain_size = if let Some(lifting_log_size) = prover_params.pcs_config.lifting_log_size
+    {
+        lifting_log_size
+    } else {
+        // TODO(ilya): Deduces the max domain size from 'input'.
+        MAX_CANONICAL_COSET_LOG_SIZE
+    };
+    let span = span!(Level::INFO, "Precompute Twiddles").entered();
+    let twiddles = SimdBackend::precompute_twiddles(
+        CanonicCoset::new(max_domain_size)
+            .circle_domain()
+            .half_coset,
+    );
+    span.exit();
+
+    let span = span!(Level::INFO, "Write preprocessed trace").entered();
+    let preprocessed_trace = Arc::new(prover_params.preprocessed_trace.to_preprocessed_trace());
+    span.exit();
+
+    let span = span!(Level::INFO, "Compute preprocessed trace commitment").entered();
+    let preprocessed_trace_polys =
+        SimdBackend::interpolate_columns(gen_trace(preprocessed_trace.clone()), &twiddles);
+
+    let base_column_pool = BaseColumnPool::new();
+    let preprocessed_tree = CommitmentTreeProver::<SimdBackend, MC>::new(
+        preprocessed_trace_polys,
+        prover_params.pcs_config.fri_config.log_blowup_factor,
+        &twiddles,
+        prover_params.store_polynomials_coefficients,
+        prover_params.pcs_config.lifting_log_size,
+        &base_column_pool,
+    );
+    span.exit();
+
+    prove_cairo_with_precompute::<MC>(
+        &base_column_pool,
+        &twiddles,
+        preprocessed_trace,
+        MaybeOwned::Owned(preprocessed_tree),
+        input,
+        prover_params,
+    )
+}
+
+pub fn prove_cairo_with_precompute<'a, MC: MerkleChannel>(
+    base_column_pool: &BaseColumnPool<SimdBackend>,
+    twiddles: &TwiddleTree<SimdBackend>,
+    preprocessed_trace: Arc<PreProcessedTrace>,
+    preprocessed_tree: MaybeOwned<'a, CommitmentTreeProver<SimdBackend, MC>>,
+    input: ProverInput,
+    prover_params: ProverParameters,
+) -> Result<CairoProof<MC::H>, ProvingError>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
     let _span = span!(Level::INFO, "prove_cairo").entered();
-    // Composition polynomial domain log size is LOG_MAX_ROWS + 1, double it
-    // because we compute on a half-coset, and account for blowup factor.
     let ProverParameters {
         channel_hash: _,
         channel_salt,
         pcs_config,
-        preprocessed_trace,
+        preprocessed_trace: preprocessed_trace_variant,
         store_polynomials_coefficients,
+        include_all_preprocessed_columns,
     } = prover_params;
-    let twiddles = SimdBackend::precompute_twiddles(
-        CanonicCoset::new(LOG_MAX_ROWS + pcs_config.fri_config.log_blowup_factor + 2)
-            .circle_domain()
-            .half_coset,
-    );
 
     // Setup protocol.
     let channel = &mut MC::C::default();
-    if let Some(salt) = channel_salt {
-        channel.mix_u64(salt);
-    }
+
+    // Mix channel salt. Note that we first reduce it modulo `M31::P`, then cast it as QM31.
+    channel.mix_felts(&[channel_salt.into()]);
     pcs_config.mix_into(channel);
-    let mut commitment_scheme =
-        CommitmentSchemeProver::<SimdBackend, MC>::new(pcs_config, &twiddles);
+    let mut commitment_scheme = CommitmentSchemeProver::<SimdBackend, MC>::with_memory_pool(
+        pcs_config,
+        twiddles,
+        base_column_pool,
+    );
     if store_polynomials_coefficients {
         commitment_scheme.set_store_polynomials_coefficients();
     }
-    // Preprocessed trace.
-    let preprocessed_trace = Arc::new(preprocessed_trace.to_preprocessed_trace());
-    let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(preprocessed_trace.gen_trace());
-    tree_builder.commit(channel);
+
+    // Add the preprocessed trace commitment that was computed earlier to the commitment scheme.
+    commitment_scheme.commit_tree(preprocessed_tree, channel);
 
     // Run Cairo.
-    let cairo_claim_generator = CairoClaimGenerator::new(input, preprocessed_trace.clone());
-    // Base trace.
-    let mut tree_builder = commitment_scheme.tree_builder();
-    let span = span!(Level::INFO, "Base trace").entered();
-    let (claim, interaction_generator) = cairo_claim_generator.write_trace(&mut tree_builder);
-    span.exit();
+    let cairo_claim_generator = create_cairo_claim_generator(input, preprocessed_trace.clone());
 
-    claim.mix_into(channel);
+    // Base trace.
+    let span = span!(Level::INFO, "Write base trace").entered();
+    let (trace_evals, claim, interaction_generator) = cairo_claim_generator.write_trace();
+    span.exit();
+    claim.mix_into::<MC>(channel);
+    let span = span!(Level::INFO, "Compute base trace commitment").entered();
+    let mut tree_builder = commitment_scheme.tree_builder();
+    tree_builder.extend_evals(trace_evals);
     tree_builder.commit(channel);
+    span.exit();
 
     // Draw interaction elements.
     let interaction_pow = SimdBackend::grind(channel, INTERACTION_POW_BITS);
     channel.mix_u64(interaction_pow);
-    let interaction_elements = CairoInteractionElements::draw(channel);
+    let interaction_elements = CommonLookupElements::draw(channel);
 
     // Interaction trace.
-    let span = span!(Level::INFO, "Interaction trace").entered();
-    let mut tree_builder = commitment_scheme.tree_builder();
-    let interaction_claim =
-        interaction_generator.write_interaction_trace(&mut tree_builder, &interaction_elements);
+    let span = span!(Level::INFO, "Write interaction trace").entered();
+    let (interaction_trace_evals, interaction_claim) =
+        interaction_generator.write_interaction_trace(&interaction_elements);
     span.exit();
 
     tracing::info!(
@@ -109,9 +195,13 @@ where
         lookup_sum(&claim, &interaction_elements, &interaction_claim),
         SecureField::zero()
     );
-
     interaction_claim.mix_into(channel);
+
+    let span = span!(Level::INFO, "Compute interaction trace commitment").entered();
+    let mut tree_builder = commitment_scheme.tree_builder();
+    tree_builder.extend_evals(interaction_trace_evals);
     tree_builder.commit(channel);
+    span.exit();
 
     // Component provers.
     let component_builder = CairoComponents::new(
@@ -133,11 +223,16 @@ where
         tracing::info!("Relations summary: {:?}", summary);
     }
 
-    let components = component_builder.provers();
+    let components = cairo_provers(&component_builder);
 
     // Prove stark.
     let span = span!(Level::INFO, "Prove STARKs").entered();
-    let proof = prove::<SimdBackend, _>(&components, channel, commitment_scheme)?;
+    let proof = prove_ex::<SimdBackend, _>(
+        &components,
+        channel,
+        commitment_scheme,
+        include_all_preprocessed_columns,
+    )?;
     span.exit();
 
     event!(name: "component_info", Level::DEBUG, "Components: {}", component_builder);
@@ -146,121 +241,9 @@ where
         claim,
         interaction_pow,
         interaction_claim,
-        stark_proof: proof,
+        extended_stark_proof: proof,
         channel_salt,
-    })
-}
-
-/// GPU-accelerated variant of [`prove_cairo`].
-///
-/// Keeps witness generation on `SimdBackend` (CPU), then bridges to `GpuBackend` via
-/// zero-copy transmute for all STARK proving operations (FFT, FRI, Merkle, constraints).
-///
-/// The bridge exploits the fact that `GpuBackend` and `SimdBackend` use identical column
-/// types (`Vec<PackedM31>`). See [`crate::gpu_bridge::SimdToGpuTreeBuilder`].
-#[cfg(feature = "cuda-runtime")]
-pub fn prove_cairo_gpu<MC: MerkleChannel>(
-    input: ProverInput,
-    prover_params: ProverParameters,
-) -> Result<CairoProof<MC::H>, ProvingError>
-where
-    stwo::prover::backend::gpu::GpuBackend: BackendForChannel<MC>,
-{
-    use stwo::prover::backend::gpu::GpuBackend;
-    use crate::gpu_bridge::SimdToGpuTreeBuilder;
-
-    let _span = span!(Level::INFO, "prove_cairo_gpu").entered();
-
-    let ProverParameters {
-        channel_hash: _,
-        channel_salt,
-        pcs_config,
-        preprocessed_trace,
-        store_polynomials_coefficients,
-    } = prover_params;
-
-    // 1. GpuBackend twiddle precomputation.
-    let twiddles = GpuBackend::precompute_twiddles(
-        CanonicCoset::new(LOG_MAX_ROWS + pcs_config.fri_config.log_blowup_factor + 2)
-            .circle_domain()
-            .half_coset,
-    );
-
-    // 2. Setup protocol with GpuBackend commitment scheme.
-    let channel = &mut MC::C::default();
-    if let Some(salt) = channel_salt {
-        channel.mix_u64(salt);
-    }
-    pcs_config.mix_into(channel);
-    let mut commitment_scheme =
-        CommitmentSchemeProver::<GpuBackend, MC>::new(pcs_config, &twiddles);
-    if store_polynomials_coefficients {
-        commitment_scheme.set_store_polynomials_coefficients();
-    }
-
-    // 3. Preprocessed trace — SimdBackend evals bridged to GpuBackend.
-    let preprocessed_trace = Arc::new(preprocessed_trace.to_preprocessed_trace());
-    let mut gpu_tree = SimdToGpuTreeBuilder::new(commitment_scheme.tree_builder());
-    gpu_tree.extend_evals(preprocessed_trace.gen_trace());
-    gpu_tree.commit(channel);
-
-    // 4. Base trace — witness generation on CPU (SimdBackend), commitment on GPU.
-    let cairo_claim_generator = CairoClaimGenerator::new(input, preprocessed_trace.clone());
-    let mut gpu_tree = SimdToGpuTreeBuilder::new(commitment_scheme.tree_builder());
-    let span = span!(Level::INFO, "Base trace").entered();
-    let (claim, interaction_generator) = cairo_claim_generator.write_trace(&mut gpu_tree);
-    span.exit();
-
-    claim.mix_into(channel);
-    gpu_tree.commit(channel);
-
-    // 5. Draw interaction elements.
-    let interaction_pow = GpuBackend::grind(channel, INTERACTION_POW_BITS);
-    channel.mix_u64(interaction_pow);
-    let interaction_elements = CairoInteractionElements::draw(channel);
-
-    // 6. Interaction trace — same SimdToGpu bridge.
-    let span = span!(Level::INFO, "Interaction trace").entered();
-    let mut gpu_tree = SimdToGpuTreeBuilder::new(commitment_scheme.tree_builder());
-    let interaction_claim =
-        interaction_generator.write_interaction_trace(&mut gpu_tree, &interaction_elements);
-    span.exit();
-
-    tracing::info!(
-        "Witness trace cells: {:?}",
-        witness_trace_cells(&claim, &preprocessed_trace)
-    );
-    debug_assert_eq!(
-        lookup_sum(&claim, &interaction_elements, &interaction_claim),
-        SecureField::zero()
-    );
-
-    interaction_claim.mix_into(channel);
-    gpu_tree.commit(channel);
-
-    // 7. Component provers — GPU variants.
-    let component_builder = CairoComponents::new(
-        &claim,
-        &interaction_elements,
-        &interaction_claim,
-        &preprocessed_trace.ids(),
-    );
-
-    let components = component_builder.provers_gpu();
-
-    // 8. STARK proving — ALL on GpuBackend (FFT, FRI, Merkle, constraints).
-    let span = span!(Level::INFO, "Prove STARKs (GPU)").entered();
-    let proof = prove::<GpuBackend, _>(&components, channel, commitment_scheme)?;
-    span.exit();
-
-    event!(name: "component_info", Level::DEBUG, "Components: {}", component_builder);
-
-    Ok(CairoProof {
-        claim,
-        interaction_pow,
-        interaction_claim,
-        stark_proof: proof,
-        channel_salt,
+        preprocessed_trace_variant,
     })
 }
 
@@ -270,11 +253,11 @@ where
 pub struct ProverParameters {
     /// Channel hash function.
     pub channel_hash: ChannelHash,
-    /// Optional salt for the channel initialization. If `None`, no salt is used.
+    /// Salt for the channel initialization.
     /// Note that the salt is only used to allow recomputation of the proof with other draws
     /// of the randomness, in case of failure due to unprovable draws (e.g. a zero in the
     /// denominator).
-    pub channel_salt: Option<u64>,
+    pub channel_salt: u32,
     /// Parameters of the commitment scheme.
     pub pcs_config: PcsConfig,
     /// Preprocessed trace.
@@ -282,6 +265,9 @@ pub struct ProverParameters {
     /// Whether or not to store the polynomials coefficients. Affects runtime-memory usage
     /// trade-off. Default is `false`.
     pub store_polynomials_coefficients: bool,
+    /// Whether to include samples for every preprocessed column in the proof. Default is `false`.
+    /// If `false`, the proof only includes samples for columns used by at least one component.
+    pub include_all_preprocessed_columns: bool,
 }
 
 /// The hash function used for commitments, for the prover-verifier channel,
@@ -291,6 +277,8 @@ pub struct ProverParameters {
 pub enum ChannelHash {
     /// Default variant, the fastest option.
     Blake2s,
+    /// A variant for Blake2s where modulo M31 is applied to every 32bits in the output.
+    Blake2sM31,
     /// A variant for recursive proof verification.
     /// Note that using `Poseidon252` results in a significant decrease in proving speed compared
     /// to `Blake2s` (because of the large field emulation)
@@ -314,7 +302,7 @@ pub fn create_and_serialize_proof(
         // The formula is `security_bits = pow_bits + log_blowup_factor * n_queries`.
         ProverParameters {
             channel_hash: ChannelHash::Blake2s,
-            channel_salt: None,
+            channel_salt: 0,
             pcs_config: PcsConfig {
                 // Stay within 500ms on M3.
                 pow_bits: 26,
@@ -326,20 +314,34 @@ pub fn create_and_serialize_proof(
                     // The more FRI queries, the larger the proof.
                     // Proving time is not affected much by increasing this value.
                     n_queries: 70,
+                    fold_step: 1,
                 },
+                lifting_log_size: None,
             },
             preprocessed_trace: PreProcessedTraceVariant::Canonical,
             store_polynomials_coefficients: false,
+            include_all_preprocessed_columns: false,
         }
     };
 
     match proof_params.channel_hash {
         ChannelHash::Blake2s => {
-            let proof = prove_cairo::<Blake2sMerkleChannel>(input, proof_params)?;
-            serialize_proof_to_file(&proof, &proof_path, proof_format)?;
-            if verify {
-                verify_cairo::<Blake2sMerkleChannel>(proof, proof_params.preprocessed_trace)?;
-            }
+            prove_verify_serialize::<Blake2sMerkleChannel>(
+                input,
+                verify,
+                &proof_path,
+                proof_format,
+                proof_params,
+            )?;
+        }
+        ChannelHash::Blake2sM31 => {
+            prove_verify_serialize::<Blake2sM31MerkleChannel>(
+                input,
+                verify,
+                &proof_path,
+                proof_format,
+                proof_params,
+            )?;
         }
         #[cfg(any(target_arch = "wasm32", target_arch = "wasm64"))]
         ChannelHash::Poseidon252 => {
@@ -348,11 +350,13 @@ pub fn create_and_serialize_proof(
         #[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
         ChannelHash::Poseidon252 => {
             use stwo::core::vcs_lifted::poseidon252_merkle::Poseidon252MerkleChannel;
-            let proof = prove_cairo::<Poseidon252MerkleChannel>(input, proof_params)?;
-            serialize_proof_to_file(&proof, &proof_path, proof_format)?;
-            if verify {
-                verify_cairo::<Poseidon252MerkleChannel>(proof, proof_params.preprocessed_trace)?;
-            }
+            prove_verify_serialize::<Poseidon252MerkleChannel>(
+                input,
+                verify,
+                &proof_path,
+                proof_format,
+                proof_params,
+            )?;
         }
     };
 
@@ -363,17 +367,42 @@ pub fn create_and_serialize_proof(
 pub mod tests {
     use std::sync::Arc;
 
-    use dev_utils::utils::get_compiled_cairo_program_path;
-    use stwo_cairo_common::preprocessed_columns::preprocessed_trace::testing_preprocessed_tree;
-    use stwo_cairo_utils::vm_utils::{run_and_adapt, ProgramType};
+    use cairo_vm::types::layout_name::LayoutName;
+    use stwo_cairo_common::preprocessed_columns::preprocessed_trace::{
+        testing_preprocessed_tree, PreProcessedTrace,
+    };
+    use stwo_cairo_dev_utils::utils::get_compiled_cairo_program_path;
+    use stwo_cairo_dev_utils::vm_utils::{run_and_adapt, ProgramType};
 
     use crate::debug_tools::assert_constraints::assert_cairo_constraints;
+
     #[test]
     fn test_all_cairo_constraints() {
         let compiled_program =
             get_compiled_cairo_program_path("test_prove_verify_all_opcode_components");
-        let input = run_and_adapt(&compiled_program, ProgramType::Json, None).unwrap();
-        let pp_tree = Arc::new(testing_preprocessed_tree(20));
+        let input = run_and_adapt(
+            &compiled_program,
+            ProgramType::Json,
+            LayoutName::all_cairo_stwo,
+            None,
+        )
+        .unwrap();
+        let pp_tree = Arc::new(testing_preprocessed_tree(24));
+        assert_cairo_constraints(input, pp_tree);
+    }
+
+    #[test]
+    fn test_all_cairo_constraints_small_ppt() {
+        let compiled_program =
+            get_compiled_cairo_program_path("test_prove_verify_all_opcode_components");
+        let input = run_and_adapt(
+            &compiled_program,
+            ProgramType::Json,
+            LayoutName::all_cairo_stwo,
+            None,
+        )
+        .unwrap();
+        let pp_tree = Arc::new(PreProcessedTrace::canonical_small());
         assert_cairo_constraints(input, pp_tree);
     }
 
@@ -383,13 +412,13 @@ pub mod tests {
         use std::io::Write;
         use std::process::Command;
 
-        use cairo_air::PreProcessedTraceVariant;
-        use dev_utils::utils::get_proof_file_path;
         use stwo::core::fri::FriConfig;
         use stwo::core::pcs::PcsConfig;
         use stwo::core::vcs_lifted::poseidon252_merkle::Poseidon252MerkleChannel;
+        use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
+        use stwo_cairo_dev_utils::utils::get_proof_file_path;
+        use stwo_cairo_dev_utils::vm_utils::{run_and_adapt, ProgramType};
         use stwo_cairo_serialize::CairoSerialize;
-        use stwo_cairo_utils::vm_utils::{run_and_adapt, ProgramType};
         use tempfile::NamedTempFile;
         use test_log::test;
 
@@ -399,20 +428,27 @@ pub mod tests {
         #[test]
         fn test_poseidon_e2e_prove_cairo_verify_ret_opcode_components() {
             let compiled_program = get_compiled_cairo_program_path("test_prove_verify_ret_opcode");
-            let input = run_and_adapt(&compiled_program, ProgramType::Json, None).unwrap();
+            let input = run_and_adapt(
+                &compiled_program,
+                ProgramType::Json,
+                LayoutName::all_cairo_stwo,
+                None,
+            )
+            .unwrap();
             let prover_params = ProverParameters {
                 channel_hash: ChannelHash::Poseidon252,
                 pcs_config: PcsConfig {
                     pow_bits: 20,
-                    fri_config: FriConfig::new(0, 1, 90),
+                    fri_config: FriConfig::new(0, 1, 90, 1),
+                    lifting_log_size: None,
                 },
                 preprocessed_trace: PreProcessedTraceVariant::CanonicalWithoutPedersen,
-                channel_salt: Some(42),
+                channel_salt: 42,
                 store_polynomials_coefficients: false,
+                include_all_preprocessed_columns: false,
             };
             let cairo_proof =
                 prove_cairo::<Poseidon252MerkleChannel>(input, prover_params).unwrap();
-
             let mut proof_file = NamedTempFile::new().unwrap();
             let mut serialized: Vec<starknet_ff::FieldElement> = Vec::new();
             CairoSerialize::serialize(&cairo_proof, &mut serialized);
@@ -466,12 +502,13 @@ pub mod tests {
         use std::process::Command;
 
         use cairo_air::verifier::verify_cairo;
-        use dev_utils::utils::{get_compiled_cairo_program_path, get_proof_file_path};
+        use cairo_air::CairoProofForRustVerifier;
         use itertools::Itertools;
         use stwo::core::fri::FriConfig;
         use stwo::core::pcs::PcsConfig;
         use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
         use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTrace;
+        use stwo_cairo_dev_utils::utils::{get_compiled_cairo_program_path, get_proof_file_path};
         use stwo_cairo_serialize::CairoSerialize;
         use tempfile::NamedTempFile;
         use test_log::test;
@@ -487,18 +524,30 @@ pub mod tests {
         fn test_cairo_constraints() {
             let compiled_program =
                 get_compiled_cairo_program_path("test_prove_verify_all_opcode_components");
-            let input = run_and_adapt(&compiled_program, ProgramType::Json, None).unwrap();
+            let input = run_and_adapt(
+                &compiled_program,
+                ProgramType::Json,
+                LayoutName::all_cairo_stwo,
+                None,
+            )
+            .unwrap();
             assert_cairo_constraints(
                 input,
                 Arc::new(PreProcessedTrace::canonical_without_pedersen()),
             );
         }
 
-        #[test]
+        #[test_log::test]
         fn test_prove_verify_all_opcode_components() {
             let compiled_program =
                 get_compiled_cairo_program_path("test_prove_verify_all_opcode_components");
-            let input = run_and_adapt(&compiled_program, ProgramType::Json, None).unwrap();
+            let input = run_and_adapt(
+                &compiled_program,
+                ProgramType::Json,
+                LayoutName::all_cairo_stwo,
+                None,
+            )
+            .unwrap();
             for (opcode, n_instances) in &input.state_transitions.casm_states_by_opcode.counts() {
                 assert!(
                     *n_instances > 0,
@@ -509,31 +558,38 @@ pub mod tests {
                 channel_hash: ChannelHash::Blake2s,
                 pcs_config: PcsConfig::default(),
                 preprocessed_trace: PreProcessedTraceVariant::CanonicalWithoutPedersen,
-                channel_salt: None,
-                store_polynomials_coefficients: false,
+                channel_salt: 0,
+                store_polynomials_coefficients: true,
+                include_all_preprocessed_columns: false,
             };
             let cairo_proof = prove_cairo::<Blake2sMerkleChannel>(input, prover_params).unwrap();
-            verify_cairo::<Blake2sMerkleChannel>(cairo_proof, prover_params.preprocessed_trace)
-                .unwrap();
+            verify_cairo::<Blake2sMerkleChannel>(cairo_proof.into()).unwrap();
         }
 
         #[test]
         fn test_e2e_prove_cairo_verify_all_opcode_components() {
             let compiled_program =
                 get_compiled_cairo_program_path("test_prove_verify_all_opcode_components");
-            let input = run_and_adapt(&compiled_program, ProgramType::Json, None).unwrap();
+            let input = run_and_adapt(
+                &compiled_program,
+                ProgramType::Json,
+                LayoutName::all_cairo_stwo,
+                None,
+            )
+            .unwrap();
             let prover_params = ProverParameters {
                 channel_hash: ChannelHash::Blake2s,
                 pcs_config: PcsConfig {
                     pow_bits: 26,
-                    fri_config: FriConfig::new(0, 1, 70),
+                    fri_config: FriConfig::new(0, 1, 70, 1),
+                    lifting_log_size: None,
                 },
                 preprocessed_trace: PreProcessedTraceVariant::Canonical,
-                channel_salt: None,
+                channel_salt: 0,
                 store_polynomials_coefficients: false,
+                include_all_preprocessed_columns: false,
             };
             let cairo_proof = prove_cairo::<Blake2sMerkleChannel>(input, prover_params).unwrap();
-
             let mut proof_file = NamedTempFile::new().unwrap();
             let mut serialized: Vec<starknet_ff::FieldElement> = Vec::new();
             CairoSerialize::serialize(&cairo_proof, &mut serialized);
@@ -583,19 +639,26 @@ pub mod tests {
         fn test_e2e_prove_cairo_verify_all_builtins() {
             let compiled_program =
                 get_compiled_cairo_program_path("test_prove_verify_all_builtins");
-            let input = run_and_adapt(&compiled_program, ProgramType::Json, None).unwrap();
+            let input = run_and_adapt(
+                &compiled_program,
+                ProgramType::Json,
+                LayoutName::all_cairo_stwo,
+                None,
+            )
+            .unwrap();
             let prover_params = ProverParameters {
                 channel_hash: ChannelHash::Blake2s,
                 pcs_config: PcsConfig {
                     pow_bits: 26,
-                    fri_config: FriConfig::new(0, 1, 70),
+                    fri_config: FriConfig::new(0, 1, 70, 1),
+                    lifting_log_size: None,
                 },
                 preprocessed_trace: PreProcessedTraceVariant::Canonical,
-                channel_salt: None,
+                channel_salt: 0,
                 store_polynomials_coefficients: false,
+                include_all_preprocessed_columns: false,
             };
             let cairo_proof = prove_cairo::<Blake2sMerkleChannel>(input, prover_params).unwrap();
-
             let mut proof_file = NamedTempFile::new().unwrap();
             let mut serialized: Vec<starknet_ff::FieldElement> = Vec::new();
             CairoSerialize::serialize(&cairo_proof, &mut serialized);
@@ -626,20 +689,28 @@ pub mod tests {
 
         fn test_proof_stability(path: &str, n_proofs_to_compare: usize) {
             let compiled_program = get_compiled_cairo_program_path(path);
-            let input = run_and_adapt(&compiled_program, ProgramType::Json, None).unwrap();
+            let input = run_and_adapt(
+                &compiled_program,
+                ProgramType::Json,
+                LayoutName::all_cairo_stwo,
+                None,
+            )
+            .unwrap();
             let prover_params = ProverParameters {
                 channel_hash: ChannelHash::Blake2s,
                 pcs_config: PcsConfig::default(),
                 preprocessed_trace: PreProcessedTraceVariant::Canonical,
-                channel_salt: None,
+                channel_salt: 0,
                 store_polynomials_coefficients: false,
+                include_all_preprocessed_columns: false,
             };
             let proofs = (0..n_proofs_to_compare)
                 .map(|_| {
-                    sonic_rs::to_string(
-                        &prove_cairo::<Blake2sMerkleChannel>(input.clone(), prover_params).unwrap(),
-                    )
-                    .unwrap()
+                    let proof: CairoProofForRustVerifier<_> =
+                        prove_cairo::<Blake2sMerkleChannel>(input.clone(), prover_params)
+                            .unwrap()
+                            .into();
+                    sonic_rs::to_string(&proof).unwrap()
                 })
                 .collect_vec();
 
@@ -658,9 +729,10 @@ pub mod tests {
 
         /// These tests' inputs were generated using cairo-vm with 50 instances of each builtin.
         pub mod builtin_tests {
+            use cairo_vm::types::layout_name::LayoutName;
             use stwo::core::pcs::PcsConfig;
             use stwo_cairo_common::preprocessed_columns::preprocessed_trace::testing_preprocessed_tree;
-            use stwo_cairo_utils::vm_utils::{run_and_adapt, ProgramType};
+            use stwo_cairo_dev_utils::vm_utils::{run_and_adapt, ProgramType};
             use test_log::test;
 
             use super::*;
@@ -685,26 +757,62 @@ pub mod tests {
             fn test_prove_verify_all_builtins() {
                 let compiled_program =
                     get_compiled_cairo_program_path("test_prove_verify_all_builtins");
-                let input = run_and_adapt(&compiled_program, ProgramType::Json, None).unwrap();
+                let input = run_and_adapt(
+                    &compiled_program,
+                    ProgramType::Json,
+                    LayoutName::all_cairo_stwo,
+                    None,
+                )
+                .unwrap();
                 assert_all_builtins_in_input(&input);
                 let prover_params = ProverParameters {
                     channel_hash: ChannelHash::Blake2s,
                     pcs_config: PcsConfig::default(),
                     preprocessed_trace: PreProcessedTraceVariant::Canonical,
-                    channel_salt: None,
+                    channel_salt: 0,
                     store_polynomials_coefficients: false,
+                    include_all_preprocessed_columns: false,
                 };
                 let cairo_proof =
                     prove_cairo::<Blake2sMerkleChannel>(input, prover_params).unwrap();
-                verify_cairo::<Blake2sMerkleChannel>(cairo_proof, prover_params.preprocessed_trace)
-                    .unwrap();
+                verify_cairo::<Blake2sMerkleChannel>(cairo_proof.into()).unwrap();
+            }
+
+            #[test]
+            fn test_prove_verify_pedersen_canonical_small() {
+                let compiled_program =
+                    get_compiled_cairo_program_path("test_prove_verify_pedersen_builtin");
+                let input = run_and_adapt(
+                    &compiled_program,
+                    ProgramType::Json,
+                    LayoutName::stwo_no_ecop,
+                    None,
+                )
+                .unwrap();
+                let prover_params = ProverParameters {
+                    channel_hash: ChannelHash::Blake2s,
+                    pcs_config: PcsConfig::default(),
+                    preprocessed_trace: PreProcessedTraceVariant::CanonicalSmall,
+                    channel_salt: 0,
+                    store_polynomials_coefficients: false,
+                    include_all_preprocessed_columns: false,
+                };
+                let cairo_proof =
+                    prove_cairo::<Blake2sMerkleChannel>(input, prover_params).unwrap();
+                verify_cairo::<Blake2sMerkleChannel>(cairo_proof.into()).unwrap();
             }
 
             #[test]
             fn test_add_mod_builtin_constraints() {
                 let compiled_program =
                     get_compiled_cairo_program_path("test_prove_verify_add_mod_builtin");
-                let input = run_and_adapt(&compiled_program, ProgramType::Json, None).unwrap();
+                let input = run_and_adapt(
+                    &compiled_program,
+                    ProgramType::Json,
+                    LayoutName::all_cairo_stwo,
+                    None,
+                )
+                .unwrap();
                 assert_cairo_constraints(
                     input,
                     Arc::new(PreProcessedTrace::canonical_without_pedersen()),
@@ -715,7 +823,13 @@ pub mod tests {
             fn test_bitwise_builtin_constraints() {
                 let compiled_program =
                     get_compiled_cairo_program_path("test_prove_verify_bitwise_builtin");
-                let input = run_and_adapt(&compiled_program, ProgramType::Json, None).unwrap();
+                let input = run_and_adapt(
+                    &compiled_program,
+                    ProgramType::Json,
+                    LayoutName::all_cairo_stwo,
+                    None,
+                )
+                .unwrap();
                 assert_cairo_constraints(input, Arc::new(testing_preprocessed_tree(20)));
             }
 
@@ -723,7 +837,13 @@ pub mod tests {
             fn test_mul_mod_builtin_constraints() {
                 let compiled_program =
                     get_compiled_cairo_program_path("test_prove_verify_mul_mod_builtin");
-                let input = run_and_adapt(&compiled_program, ProgramType::Json, None).unwrap();
+                let input = run_and_adapt(
+                    &compiled_program,
+                    ProgramType::Json,
+                    LayoutName::all_cairo_stwo,
+                    None,
+                )
+                .unwrap();
                 assert_cairo_constraints(input, Arc::new(testing_preprocessed_tree(20)));
             }
 
@@ -731,15 +851,41 @@ pub mod tests {
             fn test_pedersen_builtin_constraints() {
                 let compiled_program =
                     get_compiled_cairo_program_path("test_prove_verify_pedersen_builtin");
-                let input = run_and_adapt(&compiled_program, ProgramType::Json, None).unwrap();
+                let input = run_and_adapt(
+                    &compiled_program,
+                    ProgramType::Json,
+                    LayoutName::all_cairo_stwo,
+                    None,
+                )
+                .unwrap();
                 assert_cairo_constraints(input, Arc::new(PreProcessedTrace::canonical()));
+            }
+
+            #[test]
+            fn test_pedersen_narrow_windows_builtin_constraints() {
+                let compiled_program =
+                    get_compiled_cairo_program_path("test_prove_verify_pedersen_builtin");
+                let input = run_and_adapt(
+                    &compiled_program,
+                    ProgramType::Json,
+                    LayoutName::all_cairo_stwo,
+                    None,
+                )
+                .unwrap();
+                assert_cairo_constraints(input, Arc::new(PreProcessedTrace::canonical_small()));
             }
 
             #[test]
             fn test_poseidon_builtin_constraints() {
                 let compiled_program =
                     get_compiled_cairo_program_path("test_prove_verify_poseidon_builtin");
-                let input = run_and_adapt(&compiled_program, ProgramType::Json, None).unwrap();
+                let input = run_and_adapt(
+                    &compiled_program,
+                    ProgramType::Json,
+                    LayoutName::all_cairo_stwo,
+                    None,
+                )
+                .unwrap();
                 assert_cairo_constraints(input, Arc::new(testing_preprocessed_tree(20)));
             }
 
@@ -748,7 +894,13 @@ pub mod tests {
                 let compiled_program = get_compiled_cairo_program_path(
                     "test_prove_verify_range_check_bits_96_builtin",
                 );
-                let input = run_and_adapt(&compiled_program, ProgramType::Json, None).unwrap();
+                let input = run_and_adapt(
+                    &compiled_program,
+                    ProgramType::Json,
+                    LayoutName::all_cairo_stwo,
+                    None,
+                )
+                .unwrap();
                 assert_cairo_constraints(input, Arc::new(testing_preprocessed_tree(20)));
             }
 
@@ -757,7 +909,13 @@ pub mod tests {
                 let compiled_program = get_compiled_cairo_program_path(
                     "test_prove_verify_range_check_bits_128_builtin",
                 );
-                let input = run_and_adapt(&compiled_program, ProgramType::Json, None).unwrap();
+                let input = run_and_adapt(
+                    &compiled_program,
+                    ProgramType::Json,
+                    LayoutName::all_cairo_stwo,
+                    None,
+                )
+                .unwrap();
                 assert_cairo_constraints(input, Arc::new(testing_preprocessed_tree(20)));
             }
 
@@ -767,19 +925,25 @@ pub mod tests {
                     channel_hash: ChannelHash::Blake2s,
                     pcs_config: PcsConfig::default(),
                     preprocessed_trace: PreProcessedTraceVariant::Canonical,
-                    channel_salt: None,
+                    channel_salt: 0,
                     store_polynomials_coefficients: false,
+                    include_all_preprocessed_columns: false,
                 };
 
                 // Run poseidon builtin with 15 different instances.
                 let compiled_program_a =
                     get_compiled_cairo_program_path("test_prove_verify_poseidon_builtin");
-                let input_a = run_and_adapt(&compiled_program_a, ProgramType::Json, None).unwrap();
+                let input_a = run_and_adapt(
+                    &compiled_program_a,
+                    ProgramType::Json,
+                    LayoutName::all_cairo_stwo,
+                    None,
+                )
+                .unwrap();
                 let proof_a = prove_cairo::<Blake2sMerkleChannel>(input_a, prover_params).unwrap();
                 let poseidon_builtin_size_a = 2u32.pow(
                     proof_a
                         .claim
-                        .builtins
                         .poseidon_builtin
                         .expect("Poseidon builtin is not present in the claim")
                         .log_size,
@@ -788,21 +952,24 @@ pub mod tests {
 
                 let poseidon_aggregator_log_size_a = proof_a
                     .claim
-                    .poseidon_context
-                    .claim
-                    .expect("Poseidon context is not present in the claim")
                     .poseidon_aggregator
+                    .expect("Poseidon context is not present in the claim")
                     .log_size;
 
                 // Run poseidon builtin with 15 different instances, each one 30 times.
                 let compiled_program_b =
                     get_compiled_cairo_program_path("test_poseidon_aggregator");
-                let input_b = run_and_adapt(&compiled_program_b, ProgramType::Json, None).unwrap();
+                let input_b = run_and_adapt(
+                    &compiled_program_b,
+                    ProgramType::Json,
+                    LayoutName::all_cairo_stwo,
+                    None,
+                )
+                .unwrap();
                 let proof_b = prove_cairo::<Blake2sMerkleChannel>(input_b, prover_params).unwrap();
                 let poseidon_builtin_size_b = 2u32.pow(
                     proof_b
                         .claim
-                        .builtins
                         .poseidon_builtin
                         .expect("Poseidon builtin is not present in the claim")
                         .log_size,
@@ -811,10 +978,8 @@ pub mod tests {
 
                 let poseidon_aggregator_log_size_b = proof_b
                     .claim
-                    .poseidon_context
-                    .claim
-                    .expect("Poseidon context is not present in the claim")
                     .poseidon_aggregator
+                    .expect("Poseidon context is not present in the claim")
                     .log_size;
 
                 assert_eq!(
@@ -830,19 +995,25 @@ pub mod tests {
                     channel_hash: ChannelHash::Blake2s,
                     pcs_config: PcsConfig::default(),
                     preprocessed_trace: PreProcessedTraceVariant::Canonical,
-                    channel_salt: None,
+                    channel_salt: 0,
                     store_polynomials_coefficients: false,
+                    include_all_preprocessed_columns: false,
                 };
 
                 // Run pedersen builtin with 15 different instances.
                 let compiled_program_a =
                     get_compiled_cairo_program_path("test_prove_verify_pedersen_builtin");
-                let input_a = run_and_adapt(&compiled_program_a, ProgramType::Json, None).unwrap();
+                let input_a = run_and_adapt(
+                    &compiled_program_a,
+                    ProgramType::Json,
+                    LayoutName::all_cairo_stwo,
+                    None,
+                )
+                .unwrap();
                 let proof_a = prove_cairo::<Blake2sMerkleChannel>(input_a, prover_params).unwrap();
                 let pedersen_builtin_size_a = 2u32.pow(
                     proof_a
                         .claim
-                        .builtins
                         .pedersen_builtin
                         .expect("Pedersen builtin is not present in the claim")
                         .log_size,
@@ -851,21 +1022,24 @@ pub mod tests {
 
                 let pedersen_aggregator_log_size_a = proof_a
                     .claim
-                    .pedersen_context
-                    .claim
+                    .pedersen_aggregator_window_bits_18
                     .expect("Pedersen context is not present in the claim")
-                    .pedersen_aggregator
                     .log_size;
 
                 // Run pedersen builtin with 15 different instances, each one 30 times.
                 let compiled_program_b =
                     get_compiled_cairo_program_path("test_pedersen_aggregator");
-                let input_b = run_and_adapt(&compiled_program_b, ProgramType::Json, None).unwrap();
+                let input_b = run_and_adapt(
+                    &compiled_program_b,
+                    ProgramType::Json,
+                    LayoutName::all_cairo_stwo,
+                    None,
+                )
+                .unwrap();
                 let proof_b = prove_cairo::<Blake2sMerkleChannel>(input_b, prover_params).unwrap();
                 let pedersen_builtin_size_b = 2u32.pow(
                     proof_b
                         .claim
-                        .builtins
                         .pedersen_builtin
                         .expect("Pedersen builtin is not present in the claim")
                         .log_size,
@@ -874,10 +1048,8 @@ pub mod tests {
 
                 let pedersen_aggregator_log_size_b = proof_b
                     .claim
-                    .pedersen_context
-                    .claim
+                    .pedersen_aggregator_window_bits_18
                     .expect("Pedersen context is not present in the claim")
-                    .pedersen_aggregator
                     .log_size;
 
                 assert_eq!(

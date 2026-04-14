@@ -7,24 +7,24 @@ use stwo::core::channel::{Channel, MerkleChannel};
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::pcs::CommitmentSchemeVerifier;
-use stwo::core::verifier::{verify, VerificationError};
-use stwo_cairo_common::builtins::{
-    ADD_MOD_MEMORY_CELLS, BITWISE_MEMORY_CELLS, MUL_MOD_MEMORY_CELLS, PEDERSEN_MEMORY_CELLS,
-    POSEIDON_MEMORY_CELLS, RANGE_CHECK_MEMORY_CELLS,
-};
+use stwo::core::verifier::{verify_ex, VerificationError};
+use stwo_cairo_common::builtins::*;
 use stwo_cairo_common::memory::{LARGE_MEMORY_VALUE_ID_BASE, LOG_MEMORY_ADDRESS_BOUND};
 use stwo_cairo_common::prover_types::cpu::{CasmState, PRIME};
 use stwo_constraint_framework::PREPROCESSED_TRACE_IDX;
 use thiserror::Error;
 use tracing::{span, Level};
 
-use crate::air::{
-    lookup_sum, CairoClaim, CairoComponents, CairoInteractionElements, MemorySection, PublicData,
-    PublicMemory, PublicSegmentRanges, SegmentRange,
-};
-use crate::builtins_air::BuiltinsClaim;
+use crate::air::{MemorySection, PublicData, PublicMemory, PublicSegmentRanges, SegmentRange};
+use crate::cairo_components::CairoComponents;
+use crate::claims::{lookup_sum, CairoClaim};
 use crate::components::memory_address_to_id::MEMORY_ADDRESS_TO_ID_SPLIT;
-use crate::{CairoProof, PreProcessedTraceVariant};
+use crate::components::{
+    add_mod_builtin, bitwise_builtin, ec_op_builtin, mul_mod_builtin, pedersen_builtin,
+    pedersen_builtin_narrow_windows, poseidon_builtin, range_check96_builtin, range_check_builtin,
+};
+use crate::relations::CommonLookupElements;
+use crate::CairoProofForRustVerifier;
 
 fn verify_claim(claim: &CairoClaim) {
     let PublicData {
@@ -49,7 +49,18 @@ fn verify_claim(claim: &CairoClaim) {
             },
     } = &claim.public_data;
 
-    verify_builtins(&claim.builtins, public_segments);
+    verify_builtins(
+        &claim.add_mod_builtin,
+        &claim.bitwise_builtin,
+        &claim.mul_mod_builtin,
+        &claim.pedersen_builtin,
+        &claim.pedersen_builtin_narrow_windows,
+        &claim.poseidon_builtin,
+        &claim.range_check96_builtin,
+        &claim.range_check_builtin,
+        &claim.ec_op_builtin,
+        public_segments,
+    );
 
     verify_program(program, public_segments);
 
@@ -71,7 +82,9 @@ fn verify_claim(claim: &CairoClaim) {
     // Large value IDs reside in [LARGE_MEMORY_VALUE_ID_BASE..P).
     // Check that IDs in (ID -> Value) do not overflow P.
     let largest_id = claim
-        .memory_id_to_value
+        .memory_id_to_big
+        .as_ref()
+        .unwrap()
         .big_log_sizes
         .iter()
         .map(|log_size| 1 << log_size)
@@ -111,7 +124,19 @@ struct BuiltinClaim {
     log_size: u32,
 }
 
-fn verify_builtins(builtins_claim: &BuiltinsClaim, segment_ranges: &PublicSegmentRanges) {
+#[allow(clippy::too_many_arguments)]
+fn verify_builtins(
+    add_mod_builtin_claim: &Option<add_mod_builtin::Claim>,
+    bitwise_builtin_claim: &Option<bitwise_builtin::Claim>,
+    mul_mod_builtin_claim: &Option<mul_mod_builtin::Claim>,
+    pedersen_builtin_claim: &Option<pedersen_builtin::Claim>,
+    pedersen_builtin_narrow_windows_claim: &Option<pedersen_builtin_narrow_windows::Claim>,
+    poseidon_builtin_claim: &Option<poseidon_builtin::Claim>,
+    range_check_96_builtin_claim: &Option<range_check96_builtin::Claim>,
+    range_check_128_builtin_claim: &Option<range_check_builtin::Claim>,
+    ec_op_builtin_claim: &Option<ec_op_builtin::Claim>,
+    segment_ranges: &PublicSegmentRanges,
+) {
     let PublicSegmentRanges {
         output,
         pedersen,
@@ -138,12 +163,6 @@ fn verify_builtins(builtins_claim: &BuiltinsClaim, segment_ranges: &PublicSegmen
             "Keccak segment is not empty"
         );
     }
-    if let Some(ec_op) = ec_op {
-        assert_eq!(
-            ec_op.start_ptr.value, ec_op.stop_ptr.value,
-            "EC_OP segment is not empty"
-        );
-    }
 
     // Output builtin.
     assert!(output.stop_ptr.value < 1 << 31);
@@ -154,14 +173,14 @@ fn verify_builtins(builtins_claim: &BuiltinsClaim, segment_ranges: &PublicSegmen
         ($name:ident) => {
             paste! {
                 check_builtin(
-                    builtins_claim.[<$name _builtin>]
+                    (*[<$name _builtin_claim>])
                         .map(|claim| BuiltinClaim {
                             segment_start: claim.[<$name _builtin_segment_start>],
                             log_size: claim.log_size,
                         }),
                     $name,
                     stringify!($name),
-                    [<$name:upper _MEMORY_CELLS>]
+                    [<$name:upper _BUILTIN_MEMORY_CELLS>]
                 );
             }
         };
@@ -169,32 +188,52 @@ fn verify_builtins(builtins_claim: &BuiltinsClaim, segment_ranges: &PublicSegmen
 
     // All other supported builtins.
     check_builtin(
-        builtins_claim
-            .range_check_128_builtin
-            .map(|claim| BuiltinClaim {
-                segment_start: claim.range_check_builtin_segment_start,
-                log_size: claim.log_size,
-            }),
+        (*range_check_128_builtin_claim).map(|claim| BuiltinClaim {
+            segment_start: claim.range_check_builtin_segment_start,
+            log_size: claim.log_size,
+        }),
         range_check_128,
         "range_check_128",
-        RANGE_CHECK_MEMORY_CELLS,
+        RANGE_CHECK_BUILTIN_MEMORY_CELLS,
     );
     check_builtin(
-        builtins_claim
-            .range_check_96_builtin
-            .map(|claim| BuiltinClaim {
-                segment_start: claim.range_check96_builtin_segment_start,
-                log_size: claim.log_size,
-            }),
+        (*range_check_96_builtin_claim).map(|claim| BuiltinClaim {
+            segment_start: claim.range_check96_builtin_segment_start,
+            log_size: claim.log_size,
+        }),
         range_check_96,
         "range_check_96",
-        RANGE_CHECK_MEMORY_CELLS,
+        RANGE_CHECK_96_BUILTIN_MEMORY_CELLS,
     );
+    assert!(
+        !(pedersen_builtin_claim.is_some() && pedersen_builtin_narrow_windows_claim.is_some()),
+        "Both pedersen_builtin_claim and pedersen_builtin_narrow_windows_claim builtins cannot be used together");
+    if let Some(claim) = pedersen_builtin_claim {
+        check_builtin(
+            Some(BuiltinClaim {
+                segment_start: claim.pedersen_builtin_segment_start,
+                log_size: claim.log_size,
+            }),
+            pedersen,
+            "pedersen",
+            PEDERSEN_BUILTIN_MEMORY_CELLS,
+        );
+    } else {
+        check_builtin(
+            pedersen_builtin_narrow_windows_claim.map(|claim| BuiltinClaim {
+                segment_start: claim.pedersen_builtin_segment_start,
+                log_size: claim.log_size,
+            }),
+            pedersen,
+            "pedersen",
+            PEDERSEN_BUILTIN_NARROW_WINDOWS_MEMORY_CELLS,
+        );
+    };
     check_builtin_generic!(bitwise);
     check_builtin_generic!(add_mod);
     check_builtin_generic!(mul_mod);
-    check_builtin_generic!(pedersen);
     check_builtin_generic!(poseidon);
+    check_builtin_generic!(ec_op);
 }
 
 fn verify_program(program: &MemorySection, public_segments: &PublicSegmentRanges) {
@@ -270,41 +309,52 @@ fn check_builtin(
 pub const INTERACTION_POW_BITS: u32 = 24;
 
 pub fn verify_cairo<MC: MerkleChannel>(
-    CairoProof {
+    proof: CairoProofForRustVerifier<MC::H>,
+) -> Result<(), CairoVerificationError> {
+    verify_cairo_ex::<MC>(proof, false)
+}
+
+pub fn verify_cairo_ex<MC: MerkleChannel>(
+    CairoProofForRustVerifier {
         claim,
         interaction_pow,
         interaction_claim,
         stark_proof,
         channel_salt,
-    }: CairoProof<MC::H>,
-    preprocessed_trace: PreProcessedTraceVariant,
+        preprocessed_trace_variant,
+    }: CairoProofForRustVerifier<MC::H>,
+    include_all_preprocessed_columns: bool,
 ) -> Result<(), CairoVerificationError> {
     let _span = span!(Level::INFO, "verify_cairo").entered();
 
     // Auxiliary verifications.
     // Assert that ADDRESS->ID component does not overflow.
     assert!(
-        (1 << claim.memory_address_to_id.log_size) * MEMORY_ADDRESS_TO_ID_SPLIT
+        (1 << claim.memory_address_to_id.as_ref().unwrap().log_size) * MEMORY_ADDRESS_TO_ID_SPLIT
             <= (1 << LOG_MEMORY_ADDRESS_BOUND)
     );
 
     verify_claim(&claim);
 
     let channel = &mut MC::C::default();
-    if let Some(salt) = channel_salt {
-        channel.mix_u64(salt);
-    }
+    channel.mix_felts(&[channel_salt.into()]);
+
     let pcs_config = stark_proof.config;
     pcs_config.mix_into(channel);
     let commitment_scheme_verifier = &mut CommitmentSchemeVerifier::<MC>::new(pcs_config);
 
     let mut log_sizes = claim.log_sizes();
-    log_sizes[PREPROCESSED_TRACE_IDX] = preprocessed_trace.to_preprocessed_trace().log_sizes();
+    log_sizes.insert(
+        PREPROCESSED_TRACE_IDX,
+        preprocessed_trace_variant
+            .to_preprocessed_trace()
+            .log_sizes(),
+    );
 
     // Preproccessed trace.
     commitment_scheme_verifier.commit(stark_proof.commitments[0], &log_sizes[0], channel);
 
-    claim.mix_into(channel);
+    claim.mix_into::<MC>(channel);
     commitment_scheme_verifier.commit(stark_proof.commitments[1], &log_sizes[1], channel);
 
     // Proof of work.
@@ -312,7 +362,7 @@ pub fn verify_cairo<MC: MerkleChannel>(
         return Err(CairoVerificationError::ProofOfWork);
     }
     channel.mix_u64(interaction_pow);
-    let interaction_elements = CairoInteractionElements::draw(channel);
+    let interaction_elements = CommonLookupElements::draw(channel);
 
     // Verify lookup argument.
     if lookup_sum(&claim, &interaction_elements, &interaction_claim) != SecureField::zero() {
@@ -325,16 +375,17 @@ pub fn verify_cairo<MC: MerkleChannel>(
         &claim,
         &interaction_elements,
         &interaction_claim,
-        &preprocessed_trace.to_preprocessed_trace().ids(),
+        &preprocessed_trace_variant.to_preprocessed_trace().ids(),
     );
     let components = component_generator.components();
 
     // Verify stark.
-    verify(
+    verify_ex(
         &components,
         channel,
         commitment_scheme_verifier,
         stark_proof,
+        include_all_preprocessed_columns,
     )
     .map_err(CairoVerificationError::Stark)
 }

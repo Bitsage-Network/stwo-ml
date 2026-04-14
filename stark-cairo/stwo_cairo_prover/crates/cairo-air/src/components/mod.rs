@@ -13,6 +13,7 @@ pub mod blake_round_sigma;
 pub mod call_opcode_abs;
 pub mod call_opcode_rel_imm;
 pub mod cube_252;
+pub mod ec_op_builtin;
 pub mod generic_opcode;
 pub mod jnz_opcode_non_taken;
 pub mod jnz_opcode_taken;
@@ -22,58 +23,47 @@ pub mod jump_opcode_rel;
 pub mod jump_opcode_rel_imm;
 pub mod memory_address_to_id;
 pub mod memory_id_to_big;
+pub mod memory_id_to_small;
 pub mod mul_mod_builtin;
 pub mod mul_opcode;
 pub mod mul_opcode_small;
-pub mod partial_ec_mul;
-pub mod pedersen_aggregator;
+pub mod partial_ec_mul_generic;
+pub mod partial_ec_mul_window_bits_18;
+pub mod partial_ec_mul_window_bits_9;
+pub mod pedersen_aggregator_window_bits_18;
+pub mod pedersen_aggregator_window_bits_9;
 pub mod pedersen_builtin;
-pub mod pedersen_points_table;
+pub mod pedersen_builtin_narrow_windows;
+pub mod pedersen_points_table_window_bits_18;
+pub mod pedersen_points_table_window_bits_9;
 pub mod poseidon_3_partial_rounds_chain;
 pub mod poseidon_aggregator;
 pub mod poseidon_builtin;
 pub mod poseidon_full_round_chain;
 pub mod poseidon_round_keys;
 pub mod qm_31_add_mul_opcode;
+pub mod range_check96_builtin;
 pub mod range_check_11;
 pub mod range_check_12;
 pub mod range_check_18;
-pub mod range_check_18_b;
 pub mod range_check_20;
-pub mod range_check_20_b;
-pub mod range_check_20_c;
-pub mod range_check_20_d;
-pub mod range_check_20_e;
-pub mod range_check_20_f;
-pub mod range_check_20_g;
-pub mod range_check_20_h;
 pub mod range_check_252_width_27;
 pub mod range_check_3_3_3_3_3;
 pub mod range_check_3_6_6_3;
 pub mod range_check_4_3;
 pub mod range_check_4_4;
 pub mod range_check_4_4_4_4;
-pub mod range_check_5_4;
 pub mod range_check_6;
 pub mod range_check_7_2_5;
 pub mod range_check_8;
 pub mod range_check_9_9;
-pub mod range_check_9_9_b;
-pub mod range_check_9_9_c;
-pub mod range_check_9_9_d;
-pub mod range_check_9_9_e;
-pub mod range_check_9_9_f;
-pub mod range_check_9_9_g;
-pub mod range_check_9_9_h;
-pub mod range_check_builtin_bits_128;
-pub mod range_check_builtin_bits_96;
+pub mod range_check_builtin;
 pub mod ret_opcode;
 pub mod triple_xor_32;
 pub mod verify_bitwise_xor_12;
 pub mod verify_bitwise_xor_4;
 pub mod verify_bitwise_xor_7;
 pub mod verify_bitwise_xor_8;
-pub mod verify_bitwise_xor_8_b;
 pub mod verify_bitwise_xor_9;
 pub mod verify_instruction;
 
@@ -94,12 +84,5 @@ pub(crate) fn indented_component_display<E: FrameworkEval>(
     component_display
         .lines()
         .map(|line| format!("\t{line}"))
-        .join("\n")
-}
-
-pub(crate) fn display_components<E: FrameworkEval>(components: &[FrameworkComponent<E>]) -> String {
-    components
-        .iter()
-        .map(|component| indented_component_display(component))
         .join("\n")
 }

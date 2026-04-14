@@ -33,12 +33,7 @@ pub const RELATION_USES_PER_ROW: [RelationUse; 6] = [
 
 pub struct Eval {
     pub claim: Claim,
-    pub poseidon_round_keys_lookup_elements: relations::PoseidonRoundKeys,
-    pub cube_252_lookup_elements: relations::Cube252,
-    pub range_check_4_4_4_4_lookup_elements: relations::RangeCheck_4_4_4_4,
-    pub range_check_4_4_lookup_elements: relations::RangeCheck_4_4,
-    pub range_check_252_width_27_lookup_elements: relations::RangeCheck252Width27,
-    pub poseidon_3_partial_rounds_chain_lookup_elements: relations::Poseidon3PartialRoundsChain,
+    pub common_lookup_elements: relations::CommonLookupElements,
 }
 
 #[derive(Copy, Clone, Serialize, Deserialize, CairoSerialize, CairoDeserialize)]
@@ -49,22 +44,13 @@ impl Claim {
     pub fn log_sizes(&self) -> TreeVec<Vec<u32>> {
         let trace_log_sizes = vec![self.log_size; N_TRACE_COLUMNS];
         let interaction_log_sizes = vec![self.log_size; SECURE_EXTENSION_DEGREE * 9];
-        TreeVec::new(vec![vec![], trace_log_sizes, interaction_log_sizes])
-    }
-
-    pub fn mix_into(&self, channel: &mut impl Channel) {
-        channel.mix_u64(self.log_size as u64);
+        TreeVec::new(vec![trace_log_sizes, interaction_log_sizes])
     }
 }
 
 #[derive(Copy, Clone, Serialize, Deserialize, CairoSerialize, CairoDeserialize)]
 pub struct InteractionClaim {
     pub claimed_sum: SecureField,
-}
-impl InteractionClaim {
-    pub fn mix_into(&self, channel: &mut impl Channel) {
-        channel.mix_felts(&[self.claimed_sum]);
-    }
 }
 
 pub type Component = FrameworkComponent<Eval>;
@@ -83,6 +69,8 @@ impl FrameworkEval for Eval {
     #[allow(non_snake_case)]
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
         let M31_1 = E::F::from(M31::from(1));
+        let M31_1024310512 = E::F::from(M31::from(1024310512));
+        let M31_1343313504 = E::F::from(M31::from(1343313504));
         let input_limb_0_col0 = eval.next_trace_mask();
         let input_limb_1_col1 = eval.next_trace_mask();
         let input_limb_2_col2 = eval.next_trace_mask();
@@ -251,14 +239,13 @@ impl FrameworkEval for Eval {
         let combination_limb_8_col165 = eval.next_trace_mask();
         let combination_limb_9_col166 = eval.next_trace_mask();
         let p_coef_col167 = eval.next_trace_mask();
-        let enabler = eval.next_trace_mask();
-
-        eval.add_constraint(enabler.clone() * enabler.clone() - enabler.clone());
+        let enabler_col168 = eval.next_trace_mask();
 
         eval.add_to_relation(RelationEntry::new(
-            &self.poseidon_round_keys_lookup_elements,
-            E::EF::one(),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
             &[
+                M31_1024310512.clone(),
                 input_limb_1_col1.clone(),
                 poseidon_round_keys_output_limb_0_col42.clone(),
                 poseidon_round_keys_output_limb_1_col43.clone(),
@@ -378,10 +365,7 @@ impl FrameworkEval for Eval {
             combination_limb_8_col101.clone(),
             combination_limb_9_col102.clone(),
             p_coef_col103.clone(),
-            &self.cube_252_lookup_elements,
-            &self.range_check_4_4_4_4_lookup_elements,
-            &self.range_check_4_4_lookup_elements,
-            &self.range_check_252_width_27_lookup_elements,
+            &self.common_lookup_elements,
             &mut eval,
         );
         PoseidonPartialRound::evaluate(
@@ -469,10 +453,7 @@ impl FrameworkEval for Eval {
             combination_limb_8_col133.clone(),
             combination_limb_9_col134.clone(),
             p_coef_col135.clone(),
-            &self.cube_252_lookup_elements,
-            &self.range_check_4_4_4_4_lookup_elements,
-            &self.range_check_4_4_lookup_elements,
-            &self.range_check_252_width_27_lookup_elements,
+            &self.common_lookup_elements,
             &mut eval,
         );
         PoseidonPartialRound::evaluate(
@@ -560,16 +541,18 @@ impl FrameworkEval for Eval {
             combination_limb_8_col165.clone(),
             combination_limb_9_col166.clone(),
             p_coef_col167.clone(),
-            &self.cube_252_lookup_elements,
-            &self.range_check_4_4_4_4_lookup_elements,
-            &self.range_check_4_4_lookup_elements,
-            &self.range_check_252_width_27_lookup_elements,
+            &self.common_lookup_elements,
             &mut eval,
         );
+        // Enabler is a bit.
+        eval.add_constraint(
+            ((enabler_col168.clone() * enabler_col168.clone()) - enabler_col168.clone()),
+        );
         eval.add_to_relation(RelationEntry::new(
-            &self.poseidon_3_partial_rounds_chain_lookup_elements,
-            E::EF::from(enabler.clone()),
+            &self.common_lookup_elements,
+            E::EF::from(enabler_col168.clone()),
             &[
+                M31_1343313504.clone(),
                 input_limb_0_col0.clone(),
                 input_limb_1_col1.clone(),
                 input_limb_2_col2.clone(),
@@ -616,9 +599,10 @@ impl FrameworkEval for Eval {
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.poseidon_3_partial_rounds_chain_lookup_elements,
-            -E::EF::from(enabler.clone()),
+            &self.common_lookup_elements,
+            -E::EF::from(enabler_col168.clone()),
             &[
+                M31_1343313504.clone(),
                 input_limb_0_col0.clone(),
                 (input_limb_1_col1.clone() + M31_1.clone()),
                 cube_252_output_limb_0_col104.clone(),
@@ -685,13 +669,7 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(0);
         let eval = Eval {
             claim: Claim { log_size: 4 },
-            poseidon_round_keys_lookup_elements: relations::PoseidonRoundKeys::dummy(),
-            cube_252_lookup_elements: relations::Cube252::dummy(),
-            range_check_4_4_4_4_lookup_elements: relations::RangeCheck_4_4_4_4::dummy(),
-            range_check_4_4_lookup_elements: relations::RangeCheck_4_4::dummy(),
-            range_check_252_width_27_lookup_elements: relations::RangeCheck252Width27::dummy(),
-            poseidon_3_partial_rounds_chain_lookup_elements:
-                relations::Poseidon3PartialRoundsChain::dummy(),
+            common_lookup_elements: relations::CommonLookupElements::dummy(),
         };
         let expr_eval = eval.evaluate(ExprEvaluator::new());
         let assignment = expr_eval.random_assignment();
@@ -701,6 +679,6 @@ mod tests {
             sum += c.assign(&assignment) * rng.gen::<QM31>();
         }
 
-        assert_eq!(sum, POSEIDON_3_PARTIAL_ROUNDS_CHAIN);
+        POSEIDON_3_PARTIAL_ROUNDS_CHAIN.assert_debug_eq(&sum);
     }
 }

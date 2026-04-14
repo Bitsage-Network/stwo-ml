@@ -1,0 +1,221 @@
+// This file was created by the AIR team.
+
+#![allow(unused_parens)]
+use cairo_air::components::pedersen_builtin_narrow_windows::{
+    Claim, InteractionClaim, N_TRACE_COLUMNS,
+};
+
+use crate::witness::components::{memory_address_to_id, pedersen_aggregator_window_bits_9};
+use crate::witness::prelude::*;
+
+#[derive(Default)]
+pub struct ClaimGenerator {
+    pub log_size: u32,
+    pub pedersen_builtin_segment_start: u32,
+}
+
+impl ClaimGenerator {
+    pub fn new(log_size: u32, pedersen_builtin_segment_start: u32) -> Self {
+        assert!(log_size >= LOG_N_LANES);
+        Self {
+            log_size,
+            pedersen_builtin_segment_start,
+        }
+    }
+
+    pub fn write_trace(
+        self,
+        memory_address_to_id_state: &memory_address_to_id::ClaimGenerator,
+        pedersen_aggregator_window_bits_9_state: &pedersen_aggregator_window_bits_9::ClaimGenerator,
+    ) -> (
+        ComponentTrace<N_TRACE_COLUMNS>,
+        Claim,
+        InteractionClaimGenerator,
+    ) {
+        let log_size = self.log_size;
+
+        let (trace, lookup_data, sub_component_inputs) = write_trace_simd(
+            log_size,
+            self.pedersen_builtin_segment_start,
+            memory_address_to_id_state,
+            pedersen_aggregator_window_bits_9_state,
+        );
+        for inputs in sub_component_inputs.memory_address_to_id {
+            memory_address_to_id_state.add_packed_inputs(&inputs, 0);
+        }
+        for inputs in sub_component_inputs.pedersen_aggregator_window_bits_9 {
+            pedersen_aggregator_window_bits_9_state.add_packed_inputs(&inputs, 0);
+        }
+
+        (
+            trace,
+            Claim {
+                log_size,
+                pedersen_builtin_segment_start: self.pedersen_builtin_segment_start,
+            },
+            InteractionClaimGenerator {
+                log_size,
+                lookup_data,
+            },
+        )
+    }
+}
+
+#[derive(Uninitialized, IterMut, ParIterMut)]
+struct SubComponentInputs {
+    memory_address_to_id: [Vec<memory_address_to_id::PackedInputType>; 3],
+    pedersen_aggregator_window_bits_9: [Vec<pedersen_aggregator_window_bits_9::PackedInputType>; 1],
+}
+
+#[allow(clippy::useless_conversion)]
+#[allow(unused_variables)]
+#[allow(clippy::double_parens)]
+#[allow(non_snake_case)]
+fn write_trace_simd(
+    log_size: u32,
+    pedersen_builtin_segment_start: u32,
+    memory_address_to_id_state: &memory_address_to_id::ClaimGenerator,
+    pedersen_aggregator_window_bits_9_state: &pedersen_aggregator_window_bits_9::ClaimGenerator,
+) -> (
+    ComponentTrace<N_TRACE_COLUMNS>,
+    LookupData,
+    SubComponentInputs,
+) {
+    let log_n_packed_rows = log_size - LOG_N_LANES;
+    let (mut trace, mut lookup_data, mut sub_component_inputs) = unsafe {
+        (
+            ComponentTrace::<N_TRACE_COLUMNS>::uninitialized(log_size),
+            LookupData::uninitialized(log_n_packed_rows),
+            SubComponentInputs::uninitialized(log_n_packed_rows),
+        )
+    };
+
+    let M31_1 = PackedM31::broadcast(M31::from(1));
+    let M31_1444891767 = PackedM31::broadcast(M31::from(1444891767));
+    let M31_194336987 = PackedM31::broadcast(M31::from(194336987));
+    let M31_2 = PackedM31::broadcast(M31::from(2));
+    let M31_3 = PackedM31::broadcast(M31::from(3));
+    let seq = Seq::new(log_size);
+
+    (
+        trace.par_iter_mut(),
+        lookup_data.par_iter_mut(),
+        sub_component_inputs.par_iter_mut(),
+    )
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(row_index, (row, lookup_data, sub_component_inputs))| {
+            let seq = seq.packed_at(row_index);
+            let instance_addr_tmp_adb38_0 = (((seq) * (M31_3))
+                + (PackedM31::broadcast(M31::from(pedersen_builtin_segment_start))));
+
+            // Read Id.
+
+            let memory_address_to_id_value_tmp_adb38_1 =
+                memory_address_to_id_state.deduce_output(instance_addr_tmp_adb38_0);
+            let input_state_0_id_col0 = memory_address_to_id_value_tmp_adb38_1;
+            *row[0] = input_state_0_id_col0;
+            *sub_component_inputs.memory_address_to_id[0] = instance_addr_tmp_adb38_0;
+            *lookup_data.memory_address_to_id_0 = [
+                M31_1444891767,
+                instance_addr_tmp_adb38_0,
+                input_state_0_id_col0,
+            ];
+
+            // Read Id.
+
+            let memory_address_to_id_value_tmp_adb38_3 =
+                memory_address_to_id_state.deduce_output(((instance_addr_tmp_adb38_0) + (M31_1)));
+            let input_state_1_id_col1 = memory_address_to_id_value_tmp_adb38_3;
+            *row[1] = input_state_1_id_col1;
+            *sub_component_inputs.memory_address_to_id[1] = ((instance_addr_tmp_adb38_0) + (M31_1));
+            *lookup_data.memory_address_to_id_1 = [
+                M31_1444891767,
+                ((instance_addr_tmp_adb38_0) + (M31_1)),
+                input_state_1_id_col1,
+            ];
+
+            // Read Id.
+
+            let memory_address_to_id_value_tmp_adb38_5 =
+                memory_address_to_id_state.deduce_output(((instance_addr_tmp_adb38_0) + (M31_2)));
+            let output_state_id_col2 = memory_address_to_id_value_tmp_adb38_5;
+            *row[2] = output_state_id_col2;
+            *sub_component_inputs.memory_address_to_id[2] = ((instance_addr_tmp_adb38_0) + (M31_2));
+            *lookup_data.memory_address_to_id_2 = [
+                M31_1444891767,
+                ((instance_addr_tmp_adb38_0) + (M31_2)),
+                output_state_id_col2,
+            ];
+
+            *sub_component_inputs.pedersen_aggregator_window_bits_9[0] = (
+                [input_state_0_id_col0, input_state_1_id_col1],
+                output_state_id_col2,
+            );
+            *lookup_data.pedersen_aggregator_window_bits_9_0 = [
+                M31_194336987,
+                input_state_0_id_col0,
+                input_state_1_id_col1,
+                output_state_id_col2,
+            ];
+        });
+
+    (trace, lookup_data, sub_component_inputs)
+}
+
+#[derive(Uninitialized, IterMut, ParIterMut)]
+struct LookupData {
+    memory_address_to_id_0: Vec<[PackedM31; 3]>,
+    memory_address_to_id_1: Vec<[PackedM31; 3]>,
+    memory_address_to_id_2: Vec<[PackedM31; 3]>,
+    pedersen_aggregator_window_bits_9_0: Vec<[PackedM31; 4]>,
+}
+
+pub struct InteractionClaimGenerator {
+    log_size: u32,
+    lookup_data: LookupData,
+}
+impl InteractionClaimGenerator {
+    pub fn write_interaction_trace(
+        self,
+        common_lookup_elements: &relations::CommonLookupElements,
+    ) -> (
+        Vec<CircleEvaluation<SimdBackend, M31, BitReversedOrder>>,
+        InteractionClaim,
+    ) {
+        let mut logup_gen = unsafe { LogupTraceGenerator::uninitialized(self.log_size) };
+
+        // Sum logup terms in pairs.
+        let mut col_gen = logup_gen.new_col();
+        (
+            col_gen.par_iter_mut(),
+            &self.lookup_data.memory_address_to_id_0,
+            &self.lookup_data.memory_address_to_id_1,
+        )
+            .into_par_iter()
+            .for_each(|(writer, values0, values1)| {
+                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
+                writer.write_frac(denom0 + denom1, denom0 * denom1);
+            });
+        col_gen.finalize_col();
+
+        let mut col_gen = logup_gen.new_col();
+        (
+            col_gen.par_iter_mut(),
+            &self.lookup_data.memory_address_to_id_2,
+            &self.lookup_data.pedersen_aggregator_window_bits_9_0,
+        )
+            .into_par_iter()
+            .for_each(|(writer, values0, values1)| {
+                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
+                writer.write_frac(denom0 + denom1, denom0 * denom1);
+            });
+        col_gen.finalize_col();
+
+        let (trace, claimed_sum) = logup_gen.finalize_last();
+
+        (trace, InteractionClaim { claimed_sum })
+    }
+}

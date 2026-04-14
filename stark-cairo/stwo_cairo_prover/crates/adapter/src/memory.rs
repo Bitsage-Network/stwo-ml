@@ -5,9 +5,8 @@ use std::ops::{Deref, DerefMut};
 use bytemuck::{Pod, Zeroable};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use stwo_cairo_common::memory::{
-    LARGE_MEMORY_VALUE_ID_BASE, N_BITS_PER_FELT, N_M31_IN_SMALL_FELT252,
-};
+use stwo_cairo_common::memory::{LARGE_MEMORY_VALUE_ID_BASE, N_M31_IN_SMALL_FELT252};
+use stwo_cairo_common::prover_types::cpu::FELT252_BITS_PER_WORD;
 use tracing::{span, Level};
 
 /// P is 2^251 + 17 * 2^192 - 1.
@@ -58,7 +57,7 @@ pub struct MemoryConfig {
 }
 impl MemoryConfig {
     pub fn new(small_max: u128, log_small_value_capacity: u32) -> MemoryConfig {
-        assert!(small_max < 1 << (N_M31_IN_SMALL_FELT252 * N_BITS_PER_FELT));
+        assert!(small_max < 1 << (N_M31_IN_SMALL_FELT252 * FELT252_BITS_PER_WORD));
         MemoryConfig {
             small_max,
             log_small_value_capacity,
@@ -84,27 +83,11 @@ pub struct Memory {
     pub small_values: Vec<u128>,
 }
 impl Memory {
-    /// Gets a memory value at the given address.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the memory cell is empty. Use [`try_get`] for a non-panicking version.
     pub fn get(&self, addr: u32) -> MemoryValue {
         match self.address_to_id[addr as usize].decode() {
             MemoryValueId::Small(id) => MemoryValue::Small(self.small_values[id as usize]),
             MemoryValueId::F252(id) => MemoryValue::F252(self.f252_values[id as usize]),
             MemoryValueId::Empty => panic!("Accessing empty memory cell"),
-        }
-    }
-
-    /// Gets a memory value at the given address, returning an error if the cell is empty.
-    ///
-    /// This is the non-panicking version of [`get`].
-    pub fn try_get(&self, addr: u32) -> crate::error::Result<MemoryValue> {
-        match self.address_to_id[addr as usize].try_decode()? {
-            MemoryValueId::Small(id) => Ok(MemoryValue::Small(self.small_values[id as usize])),
-            MemoryValueId::F252(id) => Ok(MemoryValue::F252(self.f252_values[id as usize])),
-            MemoryValueId::Empty => Err(crate::error::AdapterError::EmptyMemoryCell { address: addr }),
         }
     }
 
@@ -220,12 +203,6 @@ impl MemoryBuilder {
         }
     }
 
-    /// Asserts that a memory segment is empty.
-    ///
-    /// # Panics
-    ///
-    /// Panics if any address in the segment contains a value.
-    /// Use [`verify_segment_is_empty`] for a non-panicking version.
     pub fn assert_segment_is_empty(&self, start_addr: u32, segment_length: u32) {
         let len = self.address_to_id.len();
         let start = start_addr as usize;
@@ -241,30 +218,6 @@ impl MemoryBuilder {
                 self.address_to_id[start + non_empty]
             );
         }
-    }
-
-    /// Verifies that a memory segment is empty, returning an error if not.
-    ///
-    /// This is the non-panicking version of [`assert_segment_is_empty`].
-    pub fn verify_segment_is_empty(
-        &self,
-        start_addr: u32,
-        segment_length: u32,
-    ) -> crate::error::Result<()> {
-        let len = self.address_to_id.len();
-        let start = start_addr as usize;
-        let end = std::cmp::min(len, (start_addr + segment_length) as usize);
-
-        if let Some(non_empty) = self.address_to_id[start..end]
-            .iter()
-            .position(|&id| id != EncodedMemoryValueId::default())
-        {
-            return Err(crate::error::AdapterError::SegmentNotEmpty {
-                address: (start + non_empty) as u32,
-                value_id: self.address_to_id[start + non_empty].0,
-            });
-        }
-        Ok(())
     }
 
     pub fn build(self) -> (Memory, Vec<(u32, u128)>) {
@@ -297,11 +250,6 @@ impl EncodedMemoryValueId {
             MemoryValueId::Empty => EncodedMemoryValueId(DEFAULT_ID),
         }
     }
-    /// Decodes the memory value ID.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the tag is invalid. Use [`try_decode`] for a non-panicking version.
     pub fn decode(&self) -> MemoryValueId {
         if self.0 == DEFAULT_ID {
             return MemoryValueId::Empty;
@@ -312,22 +260,6 @@ impl EncodedMemoryValueId {
             0 => MemoryValueId::Small(val),
             1 => MemoryValueId::F252(val),
             _ => panic!("Invalid tag"),
-        }
-    }
-
-    /// Decodes the memory value ID, returning an error if the tag is invalid.
-    ///
-    /// This is the non-panicking version of [`decode`].
-    pub fn try_decode(&self) -> crate::error::Result<MemoryValueId> {
-        if self.0 == DEFAULT_ID {
-            return Ok(MemoryValueId::Empty);
-        }
-        let tag = self.0 >> 30;
-        let val = self.0 & 0x3FFF_FFFF;
-        match tag {
-            0 => Ok(MemoryValueId::Small(val)),
-            1 => Ok(MemoryValueId::F252(val)),
-            _ => Err(crate::error::AdapterError::InvalidTag { tag }),
         }
     }
 }

@@ -23,10 +23,13 @@ impl ClaimGenerator {
 
     pub fn write_trace(
         self,
-        tree_builder: &mut impl TreeBuilder<SimdBackend>,
         memory_address_to_id_state: &memory_address_to_id::ClaimGenerator,
         memory_id_to_big_state: &memory_id_to_big::ClaimGenerator,
-    ) -> (Claim, InteractionClaimGenerator) {
+    ) -> (
+        ComponentTrace<N_TRACE_COLUMNS>,
+        Claim,
+        InteractionClaimGenerator,
+    ) {
         let log_size = self.log_size;
 
         let (trace, lookup_data, sub_component_inputs) = write_trace_simd(
@@ -35,21 +38,15 @@ impl ClaimGenerator {
             memory_address_to_id_state,
             memory_id_to_big_state,
         );
-        sub_component_inputs
-            .memory_address_to_id
-            .iter()
-            .for_each(|inputs| {
-                memory_address_to_id_state.add_packed_inputs(inputs);
-            });
-        sub_component_inputs
-            .memory_id_to_big
-            .iter()
-            .for_each(|inputs| {
-                memory_id_to_big_state.add_packed_inputs(inputs);
-            });
-        tree_builder.extend_evals(trace.to_evals());
+        for inputs in sub_component_inputs.memory_address_to_id {
+            memory_address_to_id_state.add_packed_inputs(&inputs, 0);
+        }
+        for inputs in sub_component_inputs.memory_id_to_big {
+            memory_id_to_big_state.add_packed_inputs(&inputs, 0);
+        }
 
         (
+            trace,
             Claim {
                 log_size,
                 add_mod_builtin_segment_start: self.add_mod_builtin_segment_start,
@@ -98,7 +95,9 @@ fn write_trace_simd(
     let M31_128 = PackedM31::broadcast(M31::from(128));
     let M31_134217728 = PackedM31::broadcast(M31::from(134217728));
     let M31_136 = PackedM31::broadcast(M31::from(136));
+    let M31_1444891767 = PackedM31::broadcast(M31::from(1444891767));
     let M31_16 = PackedM31::broadcast(M31::from(16));
+    let M31_1662111297 = PackedM31::broadcast(M31::from(1662111297));
     let M31_2 = PackedM31::broadcast(M31::from(2));
     let M31_256 = PackedM31::broadcast(M31::from(256));
     let M31_262144 = PackedM31::broadcast(M31::from(262144));
@@ -149,7 +148,8 @@ fn write_trace_simd(
             let p0_id_col1 = memory_address_to_id_value_tmp_c1b19_4;
             *row[1] = p0_id_col1;
             *sub_component_inputs.memory_address_to_id[0] = instance_addr_tmp_c1b19_2;
-            *lookup_data.memory_address_to_id_0 = [instance_addr_tmp_c1b19_2, p0_id_col1];
+            *lookup_data.memory_address_to_id_0 =
+                [M31_1444891767, instance_addr_tmp_c1b19_2, p0_id_col1];
 
             // Read Positive Known Id Num Bits 99.
 
@@ -179,6 +179,7 @@ fn write_trace_simd(
             *row[12] = p0_limb_10_col12;
             *sub_component_inputs.memory_id_to_big[0] = p0_id_col1;
             *lookup_data.memory_id_to_big_0 = [
+                M31_1662111297,
                 p0_id_col1,
                 p0_limb_0_col2,
                 p0_limb_1_col3,
@@ -255,8 +256,11 @@ fn write_trace_simd(
             let p1_id_col13 = memory_address_to_id_value_tmp_c1b19_9;
             *row[13] = p1_id_col13;
             *sub_component_inputs.memory_address_to_id[1] = ((instance_addr_tmp_c1b19_2) + (M31_1));
-            *lookup_data.memory_address_to_id_1 =
-                [((instance_addr_tmp_c1b19_2) + (M31_1)), p1_id_col13];
+            *lookup_data.memory_address_to_id_1 = [
+                M31_1444891767,
+                ((instance_addr_tmp_c1b19_2) + (M31_1)),
+                p1_id_col13,
+            ];
 
             // Read Positive Known Id Num Bits 99.
 
@@ -286,6 +290,7 @@ fn write_trace_simd(
             *row[24] = p1_limb_10_col24;
             *sub_component_inputs.memory_id_to_big[1] = p1_id_col13;
             *lookup_data.memory_id_to_big_1 = [
+                M31_1662111297,
                 p1_id_col13,
                 p1_limb_0_col14,
                 p1_limb_1_col15,
@@ -362,8 +367,11 @@ fn write_trace_simd(
             let p2_id_col25 = memory_address_to_id_value_tmp_c1b19_14;
             *row[25] = p2_id_col25;
             *sub_component_inputs.memory_address_to_id[2] = ((instance_addr_tmp_c1b19_2) + (M31_2));
-            *lookup_data.memory_address_to_id_2 =
-                [((instance_addr_tmp_c1b19_2) + (M31_2)), p2_id_col25];
+            *lookup_data.memory_address_to_id_2 = [
+                M31_1444891767,
+                ((instance_addr_tmp_c1b19_2) + (M31_2)),
+                p2_id_col25,
+            ];
 
             // Read Positive Known Id Num Bits 99.
 
@@ -393,6 +401,7 @@ fn write_trace_simd(
             *row[36] = p2_limb_10_col36;
             *sub_component_inputs.memory_id_to_big[2] = p2_id_col25;
             *lookup_data.memory_id_to_big_2 = [
+                M31_1662111297,
                 p2_id_col25,
                 p2_limb_0_col26,
                 p2_limb_1_col27,
@@ -469,8 +478,11 @@ fn write_trace_simd(
             let p3_id_col37 = memory_address_to_id_value_tmp_c1b19_19;
             *row[37] = p3_id_col37;
             *sub_component_inputs.memory_address_to_id[3] = ((instance_addr_tmp_c1b19_2) + (M31_3));
-            *lookup_data.memory_address_to_id_3 =
-                [((instance_addr_tmp_c1b19_2) + (M31_3)), p3_id_col37];
+            *lookup_data.memory_address_to_id_3 = [
+                M31_1444891767,
+                ((instance_addr_tmp_c1b19_2) + (M31_3)),
+                p3_id_col37,
+            ];
 
             // Read Positive Known Id Num Bits 99.
 
@@ -500,6 +512,7 @@ fn write_trace_simd(
             *row[48] = p3_limb_10_col48;
             *sub_component_inputs.memory_id_to_big[3] = p3_id_col37;
             *lookup_data.memory_id_to_big_3 = [
+                M31_1662111297,
                 p3_id_col37,
                 p3_limb_0_col38,
                 p3_limb_1_col39,
@@ -576,8 +589,11 @@ fn write_trace_simd(
             let values_ptr_id_col49 = memory_address_to_id_value_tmp_c1b19_24;
             *row[49] = values_ptr_id_col49;
             *sub_component_inputs.memory_address_to_id[4] = ((instance_addr_tmp_c1b19_2) + (M31_4));
-            *lookup_data.memory_address_to_id_4 =
-                [((instance_addr_tmp_c1b19_2) + (M31_4)), values_ptr_id_col49];
+            *lookup_data.memory_address_to_id_4 = [
+                M31_1444891767,
+                ((instance_addr_tmp_c1b19_2) + (M31_4)),
+                values_ptr_id_col49,
+            ];
 
             // Read Positive Known Id Num Bits 29.
 
@@ -603,6 +619,7 @@ fn write_trace_simd(
 
             *sub_component_inputs.memory_id_to_big[4] = values_ptr_id_col49;
             *lookup_data.memory_id_to_big_4 = [
+                M31_1662111297,
                 values_ptr_id_col49,
                 values_ptr_limb_0_col50,
                 values_ptr_limb_1_col51,
@@ -680,6 +697,7 @@ fn write_trace_simd(
             *row[55] = offsets_ptr_id_col55;
             *sub_component_inputs.memory_address_to_id[5] = ((instance_addr_tmp_c1b19_2) + (M31_5));
             *lookup_data.memory_address_to_id_5 = [
+                M31_1444891767,
                 ((instance_addr_tmp_c1b19_2) + (M31_5)),
                 offsets_ptr_id_col55,
             ];
@@ -708,6 +726,7 @@ fn write_trace_simd(
 
             *sub_component_inputs.memory_id_to_big[5] = offsets_ptr_id_col55;
             *lookup_data.memory_id_to_big_5 = [
+                M31_1662111297,
                 offsets_ptr_id_col55,
                 offsets_ptr_limb_0_col56,
                 offsets_ptr_limb_1_col57,
@@ -786,6 +805,7 @@ fn write_trace_simd(
             *sub_component_inputs.memory_address_to_id[6] =
                 ((prev_instance_addr_tmp_c1b19_3) + (M31_5));
             *lookup_data.memory_address_to_id_6 = [
+                M31_1444891767,
                 ((prev_instance_addr_tmp_c1b19_3) + (M31_5)),
                 offsets_ptr_prev_id_col61,
             ];
@@ -815,6 +835,7 @@ fn write_trace_simd(
 
             *sub_component_inputs.memory_id_to_big[6] = offsets_ptr_prev_id_col61;
             *lookup_data.memory_id_to_big_6 = [
+                M31_1662111297,
                 offsets_ptr_prev_id_col61,
                 offsets_ptr_prev_limb_0_col62,
                 offsets_ptr_prev_limb_1_col63,
@@ -891,8 +912,11 @@ fn write_trace_simd(
             let n_id_col67 = memory_address_to_id_value_tmp_c1b19_45;
             *row[67] = n_id_col67;
             *sub_component_inputs.memory_address_to_id[7] = ((instance_addr_tmp_c1b19_2) + (M31_6));
-            *lookup_data.memory_address_to_id_7 =
-                [((instance_addr_tmp_c1b19_2) + (M31_6)), n_id_col67];
+            *lookup_data.memory_address_to_id_7 = [
+                M31_1444891767,
+                ((instance_addr_tmp_c1b19_2) + (M31_6)),
+                n_id_col67,
+            ];
 
             // Read Positive Known Id Num Bits 29.
 
@@ -918,6 +942,7 @@ fn write_trace_simd(
 
             *sub_component_inputs.memory_id_to_big[7] = n_id_col67;
             *lookup_data.memory_id_to_big_7 = [
+                M31_1662111297,
                 n_id_col67,
                 n_limb_0_col68,
                 n_limb_1_col69,
@@ -996,6 +1021,7 @@ fn write_trace_simd(
             *sub_component_inputs.memory_address_to_id[8] =
                 ((prev_instance_addr_tmp_c1b19_3) + (M31_6));
             *lookup_data.memory_address_to_id_8 = [
+                M31_1444891767,
                 ((prev_instance_addr_tmp_c1b19_3) + (M31_6)),
                 n_prev_id_col73,
             ];
@@ -1024,6 +1050,7 @@ fn write_trace_simd(
 
             *sub_component_inputs.memory_id_to_big[8] = n_prev_id_col73;
             *lookup_data.memory_id_to_big_8 = [
+                M31_1662111297,
                 n_prev_id_col73,
                 n_prev_limb_0_col74,
                 n_prev_limb_1_col75,
@@ -1107,6 +1134,7 @@ fn write_trace_simd(
             *sub_component_inputs.memory_address_to_id[9] =
                 ((prev_instance_addr_tmp_c1b19_3) + (M31_4));
             *lookup_data.memory_address_to_id_9 = [
+                M31_1444891767,
                 ((prev_instance_addr_tmp_c1b19_3) + (M31_4)),
                 values_ptr_prev_id_col79,
             ];
@@ -1120,8 +1148,11 @@ fn write_trace_simd(
             let p_prev0_id_col80 = memory_address_to_id_value_tmp_c1b19_64;
             *row[80] = p_prev0_id_col80;
             *sub_component_inputs.memory_address_to_id[10] = prev_instance_addr_tmp_c1b19_3;
-            *lookup_data.memory_address_to_id_10 =
-                [prev_instance_addr_tmp_c1b19_3, p_prev0_id_col80];
+            *lookup_data.memory_address_to_id_10 = [
+                M31_1444891767,
+                prev_instance_addr_tmp_c1b19_3,
+                p_prev0_id_col80,
+            ];
 
             // Mem Cond Verify Equal Known Id.
 
@@ -1134,6 +1165,7 @@ fn write_trace_simd(
             *sub_component_inputs.memory_address_to_id[11] =
                 ((prev_instance_addr_tmp_c1b19_3) + (M31_1));
             *lookup_data.memory_address_to_id_11 = [
+                M31_1444891767,
                 ((prev_instance_addr_tmp_c1b19_3) + (M31_1)),
                 p_prev1_id_col81,
             ];
@@ -1149,6 +1181,7 @@ fn write_trace_simd(
             *sub_component_inputs.memory_address_to_id[12] =
                 ((prev_instance_addr_tmp_c1b19_3) + (M31_2));
             *lookup_data.memory_address_to_id_12 = [
+                M31_1444891767,
                 ((prev_instance_addr_tmp_c1b19_3) + (M31_2)),
                 p_prev2_id_col82,
             ];
@@ -1164,6 +1197,7 @@ fn write_trace_simd(
             *sub_component_inputs.memory_address_to_id[13] =
                 ((prev_instance_addr_tmp_c1b19_3) + (M31_3));
             *lookup_data.memory_address_to_id_13 = [
+                M31_1444891767,
                 ((prev_instance_addr_tmp_c1b19_3) + (M31_3)),
                 p_prev3_id_col83,
             ];
@@ -1177,7 +1211,8 @@ fn write_trace_simd(
             let offsets_a_id_col84 = memory_address_to_id_value_tmp_c1b19_72;
             *row[84] = offsets_a_id_col84;
             *sub_component_inputs.memory_address_to_id[14] = offsets_ptr_tmp_c1b19_60;
-            *lookup_data.memory_address_to_id_14 = [offsets_ptr_tmp_c1b19_60, offsets_a_id_col84];
+            *lookup_data.memory_address_to_id_14 =
+                [M31_1444891767, offsets_ptr_tmp_c1b19_60, offsets_a_id_col84];
 
             let memory_id_to_big_value_tmp_c1b19_74 =
                 memory_id_to_big_state.deduce_output(offsets_a_id_col84);
@@ -1192,7 +1227,14 @@ fn write_trace_simd(
                     & (msb_tmp_c1b19_75));
             let mid_limbs_set_col86 = mid_limbs_set_tmp_c1b19_76.as_m31();
             *row[86] = mid_limbs_set_col86;
-            let decode_small_sign_output_tmp_c1b19_77 = [msb_col85, mid_limbs_set_col86];
+            let decode_small_sign_output_tmp_c1b19_77 = [
+                msb_col85,
+                mid_limbs_set_col86,
+                ((mid_limbs_set_col86) * (M31_508)),
+                ((mid_limbs_set_col86) * (M31_511)),
+                (((msb_col85) * (M31_136)) - (mid_limbs_set_col86)),
+                ((msb_col85) * (M31_256)),
+            ];
 
             let offsets_a_limb_0_col87 = memory_id_to_big_value_tmp_c1b19_74.get_m31(0);
             *row[87] = offsets_a_limb_0_col87;
@@ -1215,35 +1257,36 @@ fn write_trace_simd(
 
             *sub_component_inputs.memory_id_to_big[9] = offsets_a_id_col84;
             *lookup_data.memory_id_to_big_9 = [
+                M31_1662111297,
                 offsets_a_id_col84,
                 offsets_a_limb_0_col87,
                 offsets_a_limb_1_col88,
                 offsets_a_limb_2_col89,
-                ((remainder_bits_col90) + ((mid_limbs_set_col86) * (M31_508))),
-                ((mid_limbs_set_col86) * (M31_511)),
-                ((mid_limbs_set_col86) * (M31_511)),
-                ((mid_limbs_set_col86) * (M31_511)),
-                ((mid_limbs_set_col86) * (M31_511)),
-                ((mid_limbs_set_col86) * (M31_511)),
-                ((mid_limbs_set_col86) * (M31_511)),
-                ((mid_limbs_set_col86) * (M31_511)),
-                ((mid_limbs_set_col86) * (M31_511)),
-                ((mid_limbs_set_col86) * (M31_511)),
-                ((mid_limbs_set_col86) * (M31_511)),
-                ((mid_limbs_set_col86) * (M31_511)),
-                ((mid_limbs_set_col86) * (M31_511)),
-                ((mid_limbs_set_col86) * (M31_511)),
-                ((mid_limbs_set_col86) * (M31_511)),
-                ((mid_limbs_set_col86) * (M31_511)),
-                ((mid_limbs_set_col86) * (M31_511)),
-                ((mid_limbs_set_col86) * (M31_511)),
-                (((M31_136) * (msb_col85)) - (mid_limbs_set_col86)),
+                ((remainder_bits_col90) + (decode_small_sign_output_tmp_c1b19_77[2])),
+                decode_small_sign_output_tmp_c1b19_77[3],
+                decode_small_sign_output_tmp_c1b19_77[3],
+                decode_small_sign_output_tmp_c1b19_77[3],
+                decode_small_sign_output_tmp_c1b19_77[3],
+                decode_small_sign_output_tmp_c1b19_77[3],
+                decode_small_sign_output_tmp_c1b19_77[3],
+                decode_small_sign_output_tmp_c1b19_77[3],
+                decode_small_sign_output_tmp_c1b19_77[3],
+                decode_small_sign_output_tmp_c1b19_77[3],
+                decode_small_sign_output_tmp_c1b19_77[3],
+                decode_small_sign_output_tmp_c1b19_77[3],
+                decode_small_sign_output_tmp_c1b19_77[3],
+                decode_small_sign_output_tmp_c1b19_77[3],
+                decode_small_sign_output_tmp_c1b19_77[3],
+                decode_small_sign_output_tmp_c1b19_77[3],
+                decode_small_sign_output_tmp_c1b19_77[3],
+                decode_small_sign_output_tmp_c1b19_77[3],
+                decode_small_sign_output_tmp_c1b19_77[4],
                 M31_0,
                 M31_0,
                 M31_0,
                 M31_0,
                 M31_0,
-                ((msb_col85) * (M31_256)),
+                decode_small_sign_output_tmp_c1b19_77[5],
             ];
             let read_small_output_tmp_c1b19_81 = (
                 ((((((offsets_a_limb_0_col87) + ((offsets_a_limb_1_col88) * (M31_512)))
@@ -1263,8 +1306,11 @@ fn write_trace_simd(
             let offsets_b_id_col92 = memory_address_to_id_value_tmp_c1b19_82;
             *row[92] = offsets_b_id_col92;
             *sub_component_inputs.memory_address_to_id[15] = ((offsets_ptr_tmp_c1b19_60) + (M31_1));
-            *lookup_data.memory_address_to_id_15 =
-                [((offsets_ptr_tmp_c1b19_60) + (M31_1)), offsets_b_id_col92];
+            *lookup_data.memory_address_to_id_15 = [
+                M31_1444891767,
+                ((offsets_ptr_tmp_c1b19_60) + (M31_1)),
+                offsets_b_id_col92,
+            ];
 
             let memory_id_to_big_value_tmp_c1b19_84 =
                 memory_id_to_big_state.deduce_output(offsets_b_id_col92);
@@ -1279,7 +1325,14 @@ fn write_trace_simd(
                     & (msb_tmp_c1b19_85));
             let mid_limbs_set_col94 = mid_limbs_set_tmp_c1b19_86.as_m31();
             *row[94] = mid_limbs_set_col94;
-            let decode_small_sign_output_tmp_c1b19_87 = [msb_col93, mid_limbs_set_col94];
+            let decode_small_sign_output_tmp_c1b19_87 = [
+                msb_col93,
+                mid_limbs_set_col94,
+                ((mid_limbs_set_col94) * (M31_508)),
+                ((mid_limbs_set_col94) * (M31_511)),
+                (((msb_col93) * (M31_136)) - (mid_limbs_set_col94)),
+                ((msb_col93) * (M31_256)),
+            ];
 
             let offsets_b_limb_0_col95 = memory_id_to_big_value_tmp_c1b19_84.get_m31(0);
             *row[95] = offsets_b_limb_0_col95;
@@ -1302,35 +1355,36 @@ fn write_trace_simd(
 
             *sub_component_inputs.memory_id_to_big[10] = offsets_b_id_col92;
             *lookup_data.memory_id_to_big_10 = [
+                M31_1662111297,
                 offsets_b_id_col92,
                 offsets_b_limb_0_col95,
                 offsets_b_limb_1_col96,
                 offsets_b_limb_2_col97,
-                ((remainder_bits_col98) + ((mid_limbs_set_col94) * (M31_508))),
-                ((mid_limbs_set_col94) * (M31_511)),
-                ((mid_limbs_set_col94) * (M31_511)),
-                ((mid_limbs_set_col94) * (M31_511)),
-                ((mid_limbs_set_col94) * (M31_511)),
-                ((mid_limbs_set_col94) * (M31_511)),
-                ((mid_limbs_set_col94) * (M31_511)),
-                ((mid_limbs_set_col94) * (M31_511)),
-                ((mid_limbs_set_col94) * (M31_511)),
-                ((mid_limbs_set_col94) * (M31_511)),
-                ((mid_limbs_set_col94) * (M31_511)),
-                ((mid_limbs_set_col94) * (M31_511)),
-                ((mid_limbs_set_col94) * (M31_511)),
-                ((mid_limbs_set_col94) * (M31_511)),
-                ((mid_limbs_set_col94) * (M31_511)),
-                ((mid_limbs_set_col94) * (M31_511)),
-                ((mid_limbs_set_col94) * (M31_511)),
-                ((mid_limbs_set_col94) * (M31_511)),
-                (((M31_136) * (msb_col93)) - (mid_limbs_set_col94)),
+                ((remainder_bits_col98) + (decode_small_sign_output_tmp_c1b19_87[2])),
+                decode_small_sign_output_tmp_c1b19_87[3],
+                decode_small_sign_output_tmp_c1b19_87[3],
+                decode_small_sign_output_tmp_c1b19_87[3],
+                decode_small_sign_output_tmp_c1b19_87[3],
+                decode_small_sign_output_tmp_c1b19_87[3],
+                decode_small_sign_output_tmp_c1b19_87[3],
+                decode_small_sign_output_tmp_c1b19_87[3],
+                decode_small_sign_output_tmp_c1b19_87[3],
+                decode_small_sign_output_tmp_c1b19_87[3],
+                decode_small_sign_output_tmp_c1b19_87[3],
+                decode_small_sign_output_tmp_c1b19_87[3],
+                decode_small_sign_output_tmp_c1b19_87[3],
+                decode_small_sign_output_tmp_c1b19_87[3],
+                decode_small_sign_output_tmp_c1b19_87[3],
+                decode_small_sign_output_tmp_c1b19_87[3],
+                decode_small_sign_output_tmp_c1b19_87[3],
+                decode_small_sign_output_tmp_c1b19_87[3],
+                decode_small_sign_output_tmp_c1b19_87[4],
                 M31_0,
                 M31_0,
                 M31_0,
                 M31_0,
                 M31_0,
-                ((msb_col93) * (M31_256)),
+                decode_small_sign_output_tmp_c1b19_87[5],
             ];
             let read_small_output_tmp_c1b19_91 = (
                 ((((((offsets_b_limb_0_col95) + ((offsets_b_limb_1_col96) * (M31_512)))
@@ -1350,8 +1404,11 @@ fn write_trace_simd(
             let offsets_c_id_col100 = memory_address_to_id_value_tmp_c1b19_92;
             *row[100] = offsets_c_id_col100;
             *sub_component_inputs.memory_address_to_id[16] = ((offsets_ptr_tmp_c1b19_60) + (M31_2));
-            *lookup_data.memory_address_to_id_16 =
-                [((offsets_ptr_tmp_c1b19_60) + (M31_2)), offsets_c_id_col100];
+            *lookup_data.memory_address_to_id_16 = [
+                M31_1444891767,
+                ((offsets_ptr_tmp_c1b19_60) + (M31_2)),
+                offsets_c_id_col100,
+            ];
 
             let memory_id_to_big_value_tmp_c1b19_94 =
                 memory_id_to_big_state.deduce_output(offsets_c_id_col100);
@@ -1366,7 +1423,14 @@ fn write_trace_simd(
                     & (msb_tmp_c1b19_95));
             let mid_limbs_set_col102 = mid_limbs_set_tmp_c1b19_96.as_m31();
             *row[102] = mid_limbs_set_col102;
-            let decode_small_sign_output_tmp_c1b19_97 = [msb_col101, mid_limbs_set_col102];
+            let decode_small_sign_output_tmp_c1b19_97 = [
+                msb_col101,
+                mid_limbs_set_col102,
+                ((mid_limbs_set_col102) * (M31_508)),
+                ((mid_limbs_set_col102) * (M31_511)),
+                (((msb_col101) * (M31_136)) - (mid_limbs_set_col102)),
+                ((msb_col101) * (M31_256)),
+            ];
 
             let offsets_c_limb_0_col103 = memory_id_to_big_value_tmp_c1b19_94.get_m31(0);
             *row[103] = offsets_c_limb_0_col103;
@@ -1389,35 +1453,36 @@ fn write_trace_simd(
 
             *sub_component_inputs.memory_id_to_big[11] = offsets_c_id_col100;
             *lookup_data.memory_id_to_big_11 = [
+                M31_1662111297,
                 offsets_c_id_col100,
                 offsets_c_limb_0_col103,
                 offsets_c_limb_1_col104,
                 offsets_c_limb_2_col105,
-                ((remainder_bits_col106) + ((mid_limbs_set_col102) * (M31_508))),
-                ((mid_limbs_set_col102) * (M31_511)),
-                ((mid_limbs_set_col102) * (M31_511)),
-                ((mid_limbs_set_col102) * (M31_511)),
-                ((mid_limbs_set_col102) * (M31_511)),
-                ((mid_limbs_set_col102) * (M31_511)),
-                ((mid_limbs_set_col102) * (M31_511)),
-                ((mid_limbs_set_col102) * (M31_511)),
-                ((mid_limbs_set_col102) * (M31_511)),
-                ((mid_limbs_set_col102) * (M31_511)),
-                ((mid_limbs_set_col102) * (M31_511)),
-                ((mid_limbs_set_col102) * (M31_511)),
-                ((mid_limbs_set_col102) * (M31_511)),
-                ((mid_limbs_set_col102) * (M31_511)),
-                ((mid_limbs_set_col102) * (M31_511)),
-                ((mid_limbs_set_col102) * (M31_511)),
-                ((mid_limbs_set_col102) * (M31_511)),
-                ((mid_limbs_set_col102) * (M31_511)),
-                (((M31_136) * (msb_col101)) - (mid_limbs_set_col102)),
+                ((remainder_bits_col106) + (decode_small_sign_output_tmp_c1b19_97[2])),
+                decode_small_sign_output_tmp_c1b19_97[3],
+                decode_small_sign_output_tmp_c1b19_97[3],
+                decode_small_sign_output_tmp_c1b19_97[3],
+                decode_small_sign_output_tmp_c1b19_97[3],
+                decode_small_sign_output_tmp_c1b19_97[3],
+                decode_small_sign_output_tmp_c1b19_97[3],
+                decode_small_sign_output_tmp_c1b19_97[3],
+                decode_small_sign_output_tmp_c1b19_97[3],
+                decode_small_sign_output_tmp_c1b19_97[3],
+                decode_small_sign_output_tmp_c1b19_97[3],
+                decode_small_sign_output_tmp_c1b19_97[3],
+                decode_small_sign_output_tmp_c1b19_97[3],
+                decode_small_sign_output_tmp_c1b19_97[3],
+                decode_small_sign_output_tmp_c1b19_97[3],
+                decode_small_sign_output_tmp_c1b19_97[3],
+                decode_small_sign_output_tmp_c1b19_97[3],
+                decode_small_sign_output_tmp_c1b19_97[3],
+                decode_small_sign_output_tmp_c1b19_97[4],
                 M31_0,
                 M31_0,
                 M31_0,
                 M31_0,
                 M31_0,
-                ((msb_col101) * (M31_256)),
+                decode_small_sign_output_tmp_c1b19_97[5],
             ];
             let read_small_output_tmp_c1b19_101 = (
                 ((((((offsets_c_limb_0_col103) + ((offsets_c_limb_1_col104) * (M31_512)))
@@ -1444,6 +1509,7 @@ fn write_trace_simd(
             *sub_component_inputs.memory_address_to_id[17] =
                 ((values_ptr_tmp_c1b19_102) + (read_small_output_tmp_c1b19_81.0));
             *lookup_data.memory_address_to_id_17 = [
+                M31_1444891767,
                 ((values_ptr_tmp_c1b19_102) + (read_small_output_tmp_c1b19_81.0)),
                 a0_id_col108,
             ];
@@ -1476,6 +1542,7 @@ fn write_trace_simd(
             *row[119] = a0_limb_10_col119;
             *sub_component_inputs.memory_id_to_big[12] = a0_id_col108;
             *lookup_data.memory_id_to_big_12 = [
+                M31_1662111297,
                 a0_id_col108,
                 a0_limb_0_col109,
                 a0_limb_1_col110,
@@ -1556,6 +1623,7 @@ fn write_trace_simd(
             *sub_component_inputs.memory_address_to_id[18] =
                 (((values_ptr_tmp_c1b19_102) + (read_small_output_tmp_c1b19_81.0)) + (M31_1));
             *lookup_data.memory_address_to_id_18 = [
+                M31_1444891767,
                 (((values_ptr_tmp_c1b19_102) + (read_small_output_tmp_c1b19_81.0)) + (M31_1)),
                 a1_id_col120,
             ];
@@ -1588,6 +1656,7 @@ fn write_trace_simd(
             *row[131] = a1_limb_10_col131;
             *sub_component_inputs.memory_id_to_big[13] = a1_id_col120;
             *lookup_data.memory_id_to_big_13 = [
+                M31_1662111297,
                 a1_id_col120,
                 a1_limb_0_col121,
                 a1_limb_1_col122,
@@ -1668,6 +1737,7 @@ fn write_trace_simd(
             *sub_component_inputs.memory_address_to_id[19] =
                 (((values_ptr_tmp_c1b19_102) + (read_small_output_tmp_c1b19_81.0)) + (M31_2));
             *lookup_data.memory_address_to_id_19 = [
+                M31_1444891767,
                 (((values_ptr_tmp_c1b19_102) + (read_small_output_tmp_c1b19_81.0)) + (M31_2)),
                 a2_id_col132,
             ];
@@ -1700,6 +1770,7 @@ fn write_trace_simd(
             *row[143] = a2_limb_10_col143;
             *sub_component_inputs.memory_id_to_big[14] = a2_id_col132;
             *lookup_data.memory_id_to_big_14 = [
+                M31_1662111297,
                 a2_id_col132,
                 a2_limb_0_col133,
                 a2_limb_1_col134,
@@ -1780,6 +1851,7 @@ fn write_trace_simd(
             *sub_component_inputs.memory_address_to_id[20] =
                 (((values_ptr_tmp_c1b19_102) + (read_small_output_tmp_c1b19_81.0)) + (M31_3));
             *lookup_data.memory_address_to_id_20 = [
+                M31_1444891767,
                 (((values_ptr_tmp_c1b19_102) + (read_small_output_tmp_c1b19_81.0)) + (M31_3)),
                 a3_id_col144,
             ];
@@ -1812,6 +1884,7 @@ fn write_trace_simd(
             *row[155] = a3_limb_10_col155;
             *sub_component_inputs.memory_id_to_big[15] = a3_id_col144;
             *lookup_data.memory_id_to_big_15 = [
+                M31_1662111297,
                 a3_id_col144,
                 a3_limb_0_col145,
                 a3_limb_1_col146,
@@ -1890,6 +1963,7 @@ fn write_trace_simd(
             *sub_component_inputs.memory_address_to_id[21] =
                 ((values_ptr_tmp_c1b19_102) + (read_small_output_tmp_c1b19_91.0));
             *lookup_data.memory_address_to_id_21 = [
+                M31_1444891767,
                 ((values_ptr_tmp_c1b19_102) + (read_small_output_tmp_c1b19_91.0)),
                 b0_id_col156,
             ];
@@ -1922,6 +1996,7 @@ fn write_trace_simd(
             *row[167] = b0_limb_10_col167;
             *sub_component_inputs.memory_id_to_big[16] = b0_id_col156;
             *lookup_data.memory_id_to_big_16 = [
+                M31_1662111297,
                 b0_id_col156,
                 b0_limb_0_col157,
                 b0_limb_1_col158,
@@ -2002,6 +2077,7 @@ fn write_trace_simd(
             *sub_component_inputs.memory_address_to_id[22] =
                 (((values_ptr_tmp_c1b19_102) + (read_small_output_tmp_c1b19_91.0)) + (M31_1));
             *lookup_data.memory_address_to_id_22 = [
+                M31_1444891767,
                 (((values_ptr_tmp_c1b19_102) + (read_small_output_tmp_c1b19_91.0)) + (M31_1)),
                 b1_id_col168,
             ];
@@ -2034,6 +2110,7 @@ fn write_trace_simd(
             *row[179] = b1_limb_10_col179;
             *sub_component_inputs.memory_id_to_big[17] = b1_id_col168;
             *lookup_data.memory_id_to_big_17 = [
+                M31_1662111297,
                 b1_id_col168,
                 b1_limb_0_col169,
                 b1_limb_1_col170,
@@ -2114,6 +2191,7 @@ fn write_trace_simd(
             *sub_component_inputs.memory_address_to_id[23] =
                 (((values_ptr_tmp_c1b19_102) + (read_small_output_tmp_c1b19_91.0)) + (M31_2));
             *lookup_data.memory_address_to_id_23 = [
+                M31_1444891767,
                 (((values_ptr_tmp_c1b19_102) + (read_small_output_tmp_c1b19_91.0)) + (M31_2)),
                 b2_id_col180,
             ];
@@ -2146,6 +2224,7 @@ fn write_trace_simd(
             *row[191] = b2_limb_10_col191;
             *sub_component_inputs.memory_id_to_big[18] = b2_id_col180;
             *lookup_data.memory_id_to_big_18 = [
+                M31_1662111297,
                 b2_id_col180,
                 b2_limb_0_col181,
                 b2_limb_1_col182,
@@ -2226,6 +2305,7 @@ fn write_trace_simd(
             *sub_component_inputs.memory_address_to_id[24] =
                 (((values_ptr_tmp_c1b19_102) + (read_small_output_tmp_c1b19_91.0)) + (M31_3));
             *lookup_data.memory_address_to_id_24 = [
+                M31_1444891767,
                 (((values_ptr_tmp_c1b19_102) + (read_small_output_tmp_c1b19_91.0)) + (M31_3)),
                 b3_id_col192,
             ];
@@ -2258,6 +2338,7 @@ fn write_trace_simd(
             *row[203] = b3_limb_10_col203;
             *sub_component_inputs.memory_id_to_big[19] = b3_id_col192;
             *lookup_data.memory_id_to_big_19 = [
+                M31_1662111297,
                 b3_id_col192,
                 b3_limb_0_col193,
                 b3_limb_1_col194,
@@ -2336,6 +2417,7 @@ fn write_trace_simd(
             *sub_component_inputs.memory_address_to_id[25] =
                 ((values_ptr_tmp_c1b19_102) + (read_small_output_tmp_c1b19_101.0));
             *lookup_data.memory_address_to_id_25 = [
+                M31_1444891767,
                 ((values_ptr_tmp_c1b19_102) + (read_small_output_tmp_c1b19_101.0)),
                 c0_id_col204,
             ];
@@ -2368,6 +2450,7 @@ fn write_trace_simd(
             *row[215] = c0_limb_10_col215;
             *sub_component_inputs.memory_id_to_big[20] = c0_id_col204;
             *lookup_data.memory_id_to_big_20 = [
+                M31_1662111297,
                 c0_id_col204,
                 c0_limb_0_col205,
                 c0_limb_1_col206,
@@ -2448,6 +2531,7 @@ fn write_trace_simd(
             *sub_component_inputs.memory_address_to_id[26] =
                 (((values_ptr_tmp_c1b19_102) + (read_small_output_tmp_c1b19_101.0)) + (M31_1));
             *lookup_data.memory_address_to_id_26 = [
+                M31_1444891767,
                 (((values_ptr_tmp_c1b19_102) + (read_small_output_tmp_c1b19_101.0)) + (M31_1)),
                 c1_id_col216,
             ];
@@ -2480,6 +2564,7 @@ fn write_trace_simd(
             *row[227] = c1_limb_10_col227;
             *sub_component_inputs.memory_id_to_big[21] = c1_id_col216;
             *lookup_data.memory_id_to_big_21 = [
+                M31_1662111297,
                 c1_id_col216,
                 c1_limb_0_col217,
                 c1_limb_1_col218,
@@ -2560,6 +2645,7 @@ fn write_trace_simd(
             *sub_component_inputs.memory_address_to_id[27] =
                 (((values_ptr_tmp_c1b19_102) + (read_small_output_tmp_c1b19_101.0)) + (M31_2));
             *lookup_data.memory_address_to_id_27 = [
+                M31_1444891767,
                 (((values_ptr_tmp_c1b19_102) + (read_small_output_tmp_c1b19_101.0)) + (M31_2)),
                 c2_id_col228,
             ];
@@ -2592,6 +2678,7 @@ fn write_trace_simd(
             *row[239] = c2_limb_10_col239;
             *sub_component_inputs.memory_id_to_big[22] = c2_id_col228;
             *lookup_data.memory_id_to_big_22 = [
+                M31_1662111297,
                 c2_id_col228,
                 c2_limb_0_col229,
                 c2_limb_1_col230,
@@ -2672,6 +2759,7 @@ fn write_trace_simd(
             *sub_component_inputs.memory_address_to_id[28] =
                 (((values_ptr_tmp_c1b19_102) + (read_small_output_tmp_c1b19_101.0)) + (M31_3));
             *lookup_data.memory_address_to_id_28 = [
+                M31_1444891767,
                 (((values_ptr_tmp_c1b19_102) + (read_small_output_tmp_c1b19_101.0)) + (M31_3)),
                 c3_id_col240,
             ];
@@ -2704,6 +2792,7 @@ fn write_trace_simd(
             *row[251] = c3_limb_10_col251;
             *sub_component_inputs.memory_id_to_big[23] = c3_id_col240;
             *lookup_data.memory_id_to_big_23 = [
+                M31_1662111297,
                 c3_id_col240,
                 c3_limb_0_col241,
                 c3_limb_1_col242,
@@ -2979,59 +3068,59 @@ fn write_trace_simd(
 
 #[derive(Uninitialized, IterMut, ParIterMut)]
 struct LookupData {
-    memory_address_to_id_0: Vec<[PackedM31; 2]>,
-    memory_address_to_id_1: Vec<[PackedM31; 2]>,
-    memory_address_to_id_2: Vec<[PackedM31; 2]>,
-    memory_address_to_id_3: Vec<[PackedM31; 2]>,
-    memory_address_to_id_4: Vec<[PackedM31; 2]>,
-    memory_address_to_id_5: Vec<[PackedM31; 2]>,
-    memory_address_to_id_6: Vec<[PackedM31; 2]>,
-    memory_address_to_id_7: Vec<[PackedM31; 2]>,
-    memory_address_to_id_8: Vec<[PackedM31; 2]>,
-    memory_address_to_id_9: Vec<[PackedM31; 2]>,
-    memory_address_to_id_10: Vec<[PackedM31; 2]>,
-    memory_address_to_id_11: Vec<[PackedM31; 2]>,
-    memory_address_to_id_12: Vec<[PackedM31; 2]>,
-    memory_address_to_id_13: Vec<[PackedM31; 2]>,
-    memory_address_to_id_14: Vec<[PackedM31; 2]>,
-    memory_address_to_id_15: Vec<[PackedM31; 2]>,
-    memory_address_to_id_16: Vec<[PackedM31; 2]>,
-    memory_address_to_id_17: Vec<[PackedM31; 2]>,
-    memory_address_to_id_18: Vec<[PackedM31; 2]>,
-    memory_address_to_id_19: Vec<[PackedM31; 2]>,
-    memory_address_to_id_20: Vec<[PackedM31; 2]>,
-    memory_address_to_id_21: Vec<[PackedM31; 2]>,
-    memory_address_to_id_22: Vec<[PackedM31; 2]>,
-    memory_address_to_id_23: Vec<[PackedM31; 2]>,
-    memory_address_to_id_24: Vec<[PackedM31; 2]>,
-    memory_address_to_id_25: Vec<[PackedM31; 2]>,
-    memory_address_to_id_26: Vec<[PackedM31; 2]>,
-    memory_address_to_id_27: Vec<[PackedM31; 2]>,
-    memory_address_to_id_28: Vec<[PackedM31; 2]>,
-    memory_id_to_big_0: Vec<[PackedM31; 29]>,
-    memory_id_to_big_1: Vec<[PackedM31; 29]>,
-    memory_id_to_big_2: Vec<[PackedM31; 29]>,
-    memory_id_to_big_3: Vec<[PackedM31; 29]>,
-    memory_id_to_big_4: Vec<[PackedM31; 29]>,
-    memory_id_to_big_5: Vec<[PackedM31; 29]>,
-    memory_id_to_big_6: Vec<[PackedM31; 29]>,
-    memory_id_to_big_7: Vec<[PackedM31; 29]>,
-    memory_id_to_big_8: Vec<[PackedM31; 29]>,
-    memory_id_to_big_9: Vec<[PackedM31; 29]>,
-    memory_id_to_big_10: Vec<[PackedM31; 29]>,
-    memory_id_to_big_11: Vec<[PackedM31; 29]>,
-    memory_id_to_big_12: Vec<[PackedM31; 29]>,
-    memory_id_to_big_13: Vec<[PackedM31; 29]>,
-    memory_id_to_big_14: Vec<[PackedM31; 29]>,
-    memory_id_to_big_15: Vec<[PackedM31; 29]>,
-    memory_id_to_big_16: Vec<[PackedM31; 29]>,
-    memory_id_to_big_17: Vec<[PackedM31; 29]>,
-    memory_id_to_big_18: Vec<[PackedM31; 29]>,
-    memory_id_to_big_19: Vec<[PackedM31; 29]>,
-    memory_id_to_big_20: Vec<[PackedM31; 29]>,
-    memory_id_to_big_21: Vec<[PackedM31; 29]>,
-    memory_id_to_big_22: Vec<[PackedM31; 29]>,
-    memory_id_to_big_23: Vec<[PackedM31; 29]>,
+    memory_address_to_id_0: Vec<[PackedM31; 3]>,
+    memory_address_to_id_1: Vec<[PackedM31; 3]>,
+    memory_address_to_id_2: Vec<[PackedM31; 3]>,
+    memory_address_to_id_3: Vec<[PackedM31; 3]>,
+    memory_address_to_id_4: Vec<[PackedM31; 3]>,
+    memory_address_to_id_5: Vec<[PackedM31; 3]>,
+    memory_address_to_id_6: Vec<[PackedM31; 3]>,
+    memory_address_to_id_7: Vec<[PackedM31; 3]>,
+    memory_address_to_id_8: Vec<[PackedM31; 3]>,
+    memory_address_to_id_9: Vec<[PackedM31; 3]>,
+    memory_address_to_id_10: Vec<[PackedM31; 3]>,
+    memory_address_to_id_11: Vec<[PackedM31; 3]>,
+    memory_address_to_id_12: Vec<[PackedM31; 3]>,
+    memory_address_to_id_13: Vec<[PackedM31; 3]>,
+    memory_address_to_id_14: Vec<[PackedM31; 3]>,
+    memory_address_to_id_15: Vec<[PackedM31; 3]>,
+    memory_address_to_id_16: Vec<[PackedM31; 3]>,
+    memory_address_to_id_17: Vec<[PackedM31; 3]>,
+    memory_address_to_id_18: Vec<[PackedM31; 3]>,
+    memory_address_to_id_19: Vec<[PackedM31; 3]>,
+    memory_address_to_id_20: Vec<[PackedM31; 3]>,
+    memory_address_to_id_21: Vec<[PackedM31; 3]>,
+    memory_address_to_id_22: Vec<[PackedM31; 3]>,
+    memory_address_to_id_23: Vec<[PackedM31; 3]>,
+    memory_address_to_id_24: Vec<[PackedM31; 3]>,
+    memory_address_to_id_25: Vec<[PackedM31; 3]>,
+    memory_address_to_id_26: Vec<[PackedM31; 3]>,
+    memory_address_to_id_27: Vec<[PackedM31; 3]>,
+    memory_address_to_id_28: Vec<[PackedM31; 3]>,
+    memory_id_to_big_0: Vec<[PackedM31; 30]>,
+    memory_id_to_big_1: Vec<[PackedM31; 30]>,
+    memory_id_to_big_2: Vec<[PackedM31; 30]>,
+    memory_id_to_big_3: Vec<[PackedM31; 30]>,
+    memory_id_to_big_4: Vec<[PackedM31; 30]>,
+    memory_id_to_big_5: Vec<[PackedM31; 30]>,
+    memory_id_to_big_6: Vec<[PackedM31; 30]>,
+    memory_id_to_big_7: Vec<[PackedM31; 30]>,
+    memory_id_to_big_8: Vec<[PackedM31; 30]>,
+    memory_id_to_big_9: Vec<[PackedM31; 30]>,
+    memory_id_to_big_10: Vec<[PackedM31; 30]>,
+    memory_id_to_big_11: Vec<[PackedM31; 30]>,
+    memory_id_to_big_12: Vec<[PackedM31; 30]>,
+    memory_id_to_big_13: Vec<[PackedM31; 30]>,
+    memory_id_to_big_14: Vec<[PackedM31; 30]>,
+    memory_id_to_big_15: Vec<[PackedM31; 30]>,
+    memory_id_to_big_16: Vec<[PackedM31; 30]>,
+    memory_id_to_big_17: Vec<[PackedM31; 30]>,
+    memory_id_to_big_18: Vec<[PackedM31; 30]>,
+    memory_id_to_big_19: Vec<[PackedM31; 30]>,
+    memory_id_to_big_20: Vec<[PackedM31; 30]>,
+    memory_id_to_big_21: Vec<[PackedM31; 30]>,
+    memory_id_to_big_22: Vec<[PackedM31; 30]>,
+    memory_id_to_big_23: Vec<[PackedM31; 30]>,
 }
 
 pub struct InteractionClaimGenerator {
@@ -3041,11 +3130,12 @@ pub struct InteractionClaimGenerator {
 impl InteractionClaimGenerator {
     pub fn write_interaction_trace(
         self,
-        tree_builder: &mut impl TreeBuilder<SimdBackend>,
-        memory_address_to_id: &relations::MemoryAddressToId,
-        memory_id_to_big: &relations::MemoryIdToBig,
-    ) -> InteractionClaim {
-        let mut logup_gen = LogupTraceGenerator::new(self.log_size);
+        common_lookup_elements: &relations::CommonLookupElements,
+    ) -> (
+        Vec<CircleEvaluation<SimdBackend, M31, BitReversedOrder>>,
+        InteractionClaim,
+    ) {
+        let mut logup_gen = unsafe { LogupTraceGenerator::uninitialized(self.log_size) };
 
         // Sum logup terms in pairs.
         let mut col_gen = logup_gen.new_col();
@@ -3056,8 +3146,8 @@ impl InteractionClaimGenerator {
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1)| {
-                let denom0: PackedQM31 = memory_address_to_id.combine(values0);
-                let denom1: PackedQM31 = memory_id_to_big.combine(values1);
+                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
                 writer.write_frac(denom0 + denom1, denom0 * denom1);
             });
         col_gen.finalize_col();
@@ -3070,8 +3160,8 @@ impl InteractionClaimGenerator {
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1)| {
-                let denom0: PackedQM31 = memory_address_to_id.combine(values0);
-                let denom1: PackedQM31 = memory_id_to_big.combine(values1);
+                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
                 writer.write_frac(denom0 + denom1, denom0 * denom1);
             });
         col_gen.finalize_col();
@@ -3084,8 +3174,8 @@ impl InteractionClaimGenerator {
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1)| {
-                let denom0: PackedQM31 = memory_address_to_id.combine(values0);
-                let denom1: PackedQM31 = memory_id_to_big.combine(values1);
+                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
                 writer.write_frac(denom0 + denom1, denom0 * denom1);
             });
         col_gen.finalize_col();
@@ -3098,8 +3188,8 @@ impl InteractionClaimGenerator {
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1)| {
-                let denom0: PackedQM31 = memory_address_to_id.combine(values0);
-                let denom1: PackedQM31 = memory_id_to_big.combine(values1);
+                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
                 writer.write_frac(denom0 + denom1, denom0 * denom1);
             });
         col_gen.finalize_col();
@@ -3112,8 +3202,8 @@ impl InteractionClaimGenerator {
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1)| {
-                let denom0: PackedQM31 = memory_address_to_id.combine(values0);
-                let denom1: PackedQM31 = memory_id_to_big.combine(values1);
+                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
                 writer.write_frac(denom0 + denom1, denom0 * denom1);
             });
         col_gen.finalize_col();
@@ -3126,8 +3216,8 @@ impl InteractionClaimGenerator {
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1)| {
-                let denom0: PackedQM31 = memory_address_to_id.combine(values0);
-                let denom1: PackedQM31 = memory_id_to_big.combine(values1);
+                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
                 writer.write_frac(denom0 + denom1, denom0 * denom1);
             });
         col_gen.finalize_col();
@@ -3140,8 +3230,8 @@ impl InteractionClaimGenerator {
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1)| {
-                let denom0: PackedQM31 = memory_address_to_id.combine(values0);
-                let denom1: PackedQM31 = memory_id_to_big.combine(values1);
+                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
                 writer.write_frac(denom0 + denom1, denom0 * denom1);
             });
         col_gen.finalize_col();
@@ -3154,8 +3244,8 @@ impl InteractionClaimGenerator {
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1)| {
-                let denom0: PackedQM31 = memory_address_to_id.combine(values0);
-                let denom1: PackedQM31 = memory_id_to_big.combine(values1);
+                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
                 writer.write_frac(denom0 + denom1, denom0 * denom1);
             });
         col_gen.finalize_col();
@@ -3168,8 +3258,8 @@ impl InteractionClaimGenerator {
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1)| {
-                let denom0: PackedQM31 = memory_address_to_id.combine(values0);
-                let denom1: PackedQM31 = memory_id_to_big.combine(values1);
+                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
                 writer.write_frac(denom0 + denom1, denom0 * denom1);
             });
         col_gen.finalize_col();
@@ -3182,8 +3272,8 @@ impl InteractionClaimGenerator {
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1)| {
-                let denom0: PackedQM31 = memory_address_to_id.combine(values0);
-                let denom1: PackedQM31 = memory_address_to_id.combine(values1);
+                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
                 writer.write_frac(denom0 + denom1, denom0 * denom1);
             });
         col_gen.finalize_col();
@@ -3196,8 +3286,8 @@ impl InteractionClaimGenerator {
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1)| {
-                let denom0: PackedQM31 = memory_address_to_id.combine(values0);
-                let denom1: PackedQM31 = memory_address_to_id.combine(values1);
+                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
                 writer.write_frac(denom0 + denom1, denom0 * denom1);
             });
         col_gen.finalize_col();
@@ -3210,8 +3300,8 @@ impl InteractionClaimGenerator {
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1)| {
-                let denom0: PackedQM31 = memory_address_to_id.combine(values0);
-                let denom1: PackedQM31 = memory_address_to_id.combine(values1);
+                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
                 writer.write_frac(denom0 + denom1, denom0 * denom1);
             });
         col_gen.finalize_col();
@@ -3224,8 +3314,8 @@ impl InteractionClaimGenerator {
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1)| {
-                let denom0: PackedQM31 = memory_id_to_big.combine(values0);
-                let denom1: PackedQM31 = memory_address_to_id.combine(values1);
+                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
                 writer.write_frac(denom0 + denom1, denom0 * denom1);
             });
         col_gen.finalize_col();
@@ -3238,8 +3328,8 @@ impl InteractionClaimGenerator {
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1)| {
-                let denom0: PackedQM31 = memory_id_to_big.combine(values0);
-                let denom1: PackedQM31 = memory_address_to_id.combine(values1);
+                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
                 writer.write_frac(denom0 + denom1, denom0 * denom1);
             });
         col_gen.finalize_col();
@@ -3252,8 +3342,8 @@ impl InteractionClaimGenerator {
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1)| {
-                let denom0: PackedQM31 = memory_id_to_big.combine(values0);
-                let denom1: PackedQM31 = memory_address_to_id.combine(values1);
+                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
                 writer.write_frac(denom0 + denom1, denom0 * denom1);
             });
         col_gen.finalize_col();
@@ -3266,8 +3356,8 @@ impl InteractionClaimGenerator {
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1)| {
-                let denom0: PackedQM31 = memory_id_to_big.combine(values0);
-                let denom1: PackedQM31 = memory_address_to_id.combine(values1);
+                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
                 writer.write_frac(denom0 + denom1, denom0 * denom1);
             });
         col_gen.finalize_col();
@@ -3280,8 +3370,8 @@ impl InteractionClaimGenerator {
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1)| {
-                let denom0: PackedQM31 = memory_id_to_big.combine(values0);
-                let denom1: PackedQM31 = memory_address_to_id.combine(values1);
+                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
                 writer.write_frac(denom0 + denom1, denom0 * denom1);
             });
         col_gen.finalize_col();
@@ -3294,8 +3384,8 @@ impl InteractionClaimGenerator {
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1)| {
-                let denom0: PackedQM31 = memory_id_to_big.combine(values0);
-                let denom1: PackedQM31 = memory_address_to_id.combine(values1);
+                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
                 writer.write_frac(denom0 + denom1, denom0 * denom1);
             });
         col_gen.finalize_col();
@@ -3308,8 +3398,8 @@ impl InteractionClaimGenerator {
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1)| {
-                let denom0: PackedQM31 = memory_id_to_big.combine(values0);
-                let denom1: PackedQM31 = memory_address_to_id.combine(values1);
+                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
                 writer.write_frac(denom0 + denom1, denom0 * denom1);
             });
         col_gen.finalize_col();
@@ -3322,8 +3412,8 @@ impl InteractionClaimGenerator {
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1)| {
-                let denom0: PackedQM31 = memory_id_to_big.combine(values0);
-                let denom1: PackedQM31 = memory_address_to_id.combine(values1);
+                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
                 writer.write_frac(denom0 + denom1, denom0 * denom1);
             });
         col_gen.finalize_col();
@@ -3336,8 +3426,8 @@ impl InteractionClaimGenerator {
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1)| {
-                let denom0: PackedQM31 = memory_id_to_big.combine(values0);
-                let denom1: PackedQM31 = memory_address_to_id.combine(values1);
+                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
                 writer.write_frac(denom0 + denom1, denom0 * denom1);
             });
         col_gen.finalize_col();
@@ -3350,8 +3440,8 @@ impl InteractionClaimGenerator {
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1)| {
-                let denom0: PackedQM31 = memory_id_to_big.combine(values0);
-                let denom1: PackedQM31 = memory_address_to_id.combine(values1);
+                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
                 writer.write_frac(denom0 + denom1, denom0 * denom1);
             });
         col_gen.finalize_col();
@@ -3364,8 +3454,8 @@ impl InteractionClaimGenerator {
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1)| {
-                let denom0: PackedQM31 = memory_id_to_big.combine(values0);
-                let denom1: PackedQM31 = memory_address_to_id.combine(values1);
+                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
                 writer.write_frac(denom0 + denom1, denom0 * denom1);
             });
         col_gen.finalize_col();
@@ -3378,8 +3468,8 @@ impl InteractionClaimGenerator {
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1)| {
-                let denom0: PackedQM31 = memory_id_to_big.combine(values0);
-                let denom1: PackedQM31 = memory_address_to_id.combine(values1);
+                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
                 writer.write_frac(denom0 + denom1, denom0 * denom1);
             });
         col_gen.finalize_col();
@@ -3392,8 +3482,8 @@ impl InteractionClaimGenerator {
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1)| {
-                let denom0: PackedQM31 = memory_id_to_big.combine(values0);
-                let denom1: PackedQM31 = memory_address_to_id.combine(values1);
+                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
                 writer.write_frac(denom0 + denom1, denom0 * denom1);
             });
         col_gen.finalize_col();
@@ -3406,8 +3496,8 @@ impl InteractionClaimGenerator {
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1)| {
-                let denom0: PackedQM31 = memory_id_to_big.combine(values0);
-                let denom1: PackedQM31 = memory_address_to_id.combine(values1);
+                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
                 writer.write_frac(denom0 + denom1, denom0 * denom1);
             });
         col_gen.finalize_col();
@@ -3420,14 +3510,13 @@ impl InteractionClaimGenerator {
         )
             .into_par_iter()
             .for_each(|(writer, values)| {
-                let denom = memory_id_to_big.combine(values);
+                let denom = common_lookup_elements.combine(values);
                 writer.write_frac(PackedQM31::one(), denom);
             });
         col_gen.finalize_col();
 
         let (trace, claimed_sum) = logup_gen.finalize_last();
-        tree_builder.extend_evals(trace);
 
-        InteractionClaim { claimed_sum }
+        (trace, InteractionClaim { claimed_sum })
     }
 }

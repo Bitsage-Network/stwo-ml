@@ -27,10 +27,7 @@ pub const RELATION_USES_PER_ROW: [RelationUse; 4] = [
 
 pub struct Eval {
     pub claim: Claim,
-    pub cube_252_lookup_elements: relations::Cube252,
-    pub poseidon_round_keys_lookup_elements: relations::PoseidonRoundKeys,
-    pub range_check_3_3_3_3_3_lookup_elements: relations::RangeCheck_3_3_3_3_3,
-    pub poseidon_full_round_chain_lookup_elements: relations::PoseidonFullRoundChain,
+    pub common_lookup_elements: relations::CommonLookupElements,
 }
 
 #[derive(Copy, Clone, Serialize, Deserialize, CairoSerialize, CairoDeserialize)]
@@ -41,22 +38,13 @@ impl Claim {
     pub fn log_sizes(&self) -> TreeVec<Vec<u32>> {
         let trace_log_sizes = vec![self.log_size; N_TRACE_COLUMNS];
         let interaction_log_sizes = vec![self.log_size; SECURE_EXTENSION_DEGREE * 6];
-        TreeVec::new(vec![vec![], trace_log_sizes, interaction_log_sizes])
-    }
-
-    pub fn mix_into(&self, channel: &mut impl Channel) {
-        channel.mix_u64(self.log_size as u64);
+        TreeVec::new(vec![trace_log_sizes, interaction_log_sizes])
     }
 }
 
 #[derive(Copy, Clone, Serialize, Deserialize, CairoSerialize, CairoDeserialize)]
 pub struct InteractionClaim {
     pub claimed_sum: SecureField,
-}
-impl InteractionClaim {
-    pub fn mix_into(&self, channel: &mut impl Channel) {
-        channel.mix_felts(&[self.claimed_sum]);
-    }
 }
 
 pub type Component = FrameworkComponent<Eval>;
@@ -75,6 +63,9 @@ impl FrameworkEval for Eval {
     #[allow(non_snake_case)]
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
         let M31_1 = E::F::from(M31::from(1));
+        let M31_1024310512 = E::F::from(M31::from(1024310512));
+        let M31_1480369132 = E::F::from(M31::from(1480369132));
+        let M31_1987997202 = E::F::from(M31::from(1987997202));
         let input_limb_0_col0 = eval.next_trace_mask();
         let input_limb_1_col1 = eval.next_trace_mask();
         let input_limb_2_col2 = eval.next_trace_mask();
@@ -200,14 +191,13 @@ impl FrameworkEval for Eval {
         let combination_limb_8_col122 = eval.next_trace_mask();
         let combination_limb_9_col123 = eval.next_trace_mask();
         let p_coef_col124 = eval.next_trace_mask();
-        let enabler = eval.next_trace_mask();
-
-        eval.add_constraint(enabler.clone() * enabler.clone() - enabler.clone());
+        let enabler_col125 = eval.next_trace_mask();
 
         eval.add_to_relation(RelationEntry::new(
-            &self.cube_252_lookup_elements,
-            E::EF::one(),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
             &[
+                M31_1987997202.clone(),
                 input_limb_2_col2.clone(),
                 input_limb_3_col3.clone(),
                 input_limb_4_col4.clone(),
@@ -232,9 +222,10 @@ impl FrameworkEval for Eval {
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.cube_252_lookup_elements,
-            E::EF::one(),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
             &[
+                M31_1987997202.clone(),
                 input_limb_12_col12.clone(),
                 input_limb_13_col13.clone(),
                 input_limb_14_col14.clone(),
@@ -259,9 +250,10 @@ impl FrameworkEval for Eval {
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.cube_252_lookup_elements,
-            E::EF::one(),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
             &[
+                M31_1987997202.clone(),
                 input_limb_22_col22.clone(),
                 input_limb_23_col23.clone(),
                 input_limb_24_col24.clone(),
@@ -286,9 +278,10 @@ impl FrameworkEval for Eval {
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.poseidon_round_keys_lookup_elements,
-            E::EF::one(),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
             &[
+                M31_1024310512.clone(),
                 input_limb_1_col1.clone(),
                 poseidon_round_keys_output_limb_0_col62.clone(),
                 poseidon_round_keys_output_limb_1_col63.clone(),
@@ -377,7 +370,7 @@ impl FrameworkEval for Eval {
             combination_limb_8_col100.clone(),
             combination_limb_9_col101.clone(),
             p_coef_col102.clone(),
-            &self.range_check_3_3_3_3_3_lookup_elements,
+            &self.common_lookup_elements,
             &mut eval,
         );
         LinearCombinationN4Coefs1M111::evaluate(
@@ -434,7 +427,7 @@ impl FrameworkEval for Eval {
             combination_limb_8_col111.clone(),
             combination_limb_9_col112.clone(),
             p_coef_col113.clone(),
-            &self.range_check_3_3_3_3_3_lookup_elements,
+            &self.common_lookup_elements,
             &mut eval,
         );
         LinearCombinationN4Coefs11M21::evaluate(
@@ -491,13 +484,18 @@ impl FrameworkEval for Eval {
             combination_limb_8_col122.clone(),
             combination_limb_9_col123.clone(),
             p_coef_col124.clone(),
-            &self.range_check_3_3_3_3_3_lookup_elements,
+            &self.common_lookup_elements,
             &mut eval,
         );
+        // Enabler is a bit.
+        eval.add_constraint(
+            ((enabler_col125.clone() * enabler_col125.clone()) - enabler_col125.clone()),
+        );
         eval.add_to_relation(RelationEntry::new(
-            &self.poseidon_full_round_chain_lookup_elements,
-            E::EF::from(enabler.clone()),
+            &self.common_lookup_elements,
+            E::EF::from(enabler_col125.clone()),
             &[
+                M31_1480369132.clone(),
                 input_limb_0_col0.clone(),
                 input_limb_1_col1.clone(),
                 input_limb_2_col2.clone(),
@@ -534,9 +532,10 @@ impl FrameworkEval for Eval {
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.poseidon_full_round_chain_lookup_elements,
-            -E::EF::from(enabler.clone()),
+            &self.common_lookup_elements,
+            -E::EF::from(enabler_col125.clone()),
             &[
+                M31_1480369132.clone(),
                 input_limb_0_col0.clone(),
                 (input_limb_1_col1.clone() + M31_1.clone()),
                 combination_limb_0_col92.clone(),
@@ -593,10 +592,7 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(0);
         let eval = Eval {
             claim: Claim { log_size: 4 },
-            cube_252_lookup_elements: relations::Cube252::dummy(),
-            poseidon_round_keys_lookup_elements: relations::PoseidonRoundKeys::dummy(),
-            range_check_3_3_3_3_3_lookup_elements: relations::RangeCheck_3_3_3_3_3::dummy(),
-            poseidon_full_round_chain_lookup_elements: relations::PoseidonFullRoundChain::dummy(),
+            common_lookup_elements: relations::CommonLookupElements::dummy(),
         };
         let expr_eval = eval.evaluate(ExprEvaluator::new());
         let assignment = expr_eval.random_assignment();
@@ -606,6 +602,6 @@ mod tests {
             sum += c.assign(&assignment) * rng.gen::<QM31>();
         }
 
-        assert_eq!(sum, POSEIDON_FULL_ROUND_CHAIN);
+        POSEIDON_FULL_ROUND_CHAIN.assert_debug_eq(&sum);
     }
 }

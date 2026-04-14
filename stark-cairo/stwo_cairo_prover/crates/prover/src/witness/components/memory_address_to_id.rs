@@ -1,12 +1,13 @@
 use std::iter::zip;
 use std::ops::Index;
 use std::simd::Simd;
+use std::sync::Arc;
 
 use cairo_air::components::memory_address_to_id::{
     Claim, InteractionClaim, MEMORY_ADDRESS_TO_ID_SPLIT, N_ID_AND_MULT_COLUMNS_PER_CHUNK,
     N_TRACE_COLUMNS,
 };
-use cairo_air::relations;
+use cairo_air::relations::{self, MEMORY_ADDRESS_TO_ID_RELATION_ID};
 use itertools::{izip, Itertools};
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use stwo::core::fields::m31::{BaseField, M31};
@@ -21,7 +22,7 @@ use stwo_cairo_adapter::memory::Memory;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::{PreProcessedColumn, Seq};
 use stwo_constraint_framework::{LogupTraceGenerator, Relation};
 
-use crate::witness::utils::{AtomicMultiplicityColumn, TreeBuilder};
+use crate::witness::utils::AtomicMultiplicityColumn;
 
 pub type InputType = M31;
 pub type PackedInputType = PackedM31;
@@ -68,7 +69,7 @@ pub struct ClaimGenerator {
     multiplicities: AtomicMultiplicityColumn,
 }
 impl ClaimGenerator {
-    pub fn new(memory: &Memory) -> Self {
+    pub fn new(memory: Arc<Memory>) -> Self {
         // Note that while `memory.address_to_id` starts from address 0, the memory component can
         // only yield addresses starting from 1.
         let address_to_raw_id = AddressToId::new(
@@ -100,8 +101,8 @@ impl ClaimGenerator {
         }
     }
 
-    pub fn add_packed_inputs(&self, inputs: &[PackedInputType]) {
-        inputs.into_par_iter().for_each(|input| {
+    pub fn add_packed_inputs(&self, inputs: &[PackedInputType], _relation_index: usize) {
+        inputs.iter().for_each(|input| {
             self.add_packed_m31(input);
         });
     }
@@ -120,8 +121,11 @@ impl ClaimGenerator {
 
     pub fn write_trace(
         mut self,
-        tree_builder: &mut impl TreeBuilder<SimdBackend>,
-    ) -> (Claim, InteractionClaimGenerator) {
+    ) -> (
+        Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
+        Claim,
+        InteractionClaimGenerator,
+    ) {
         let size = std::cmp::max(
             (self
                 .address_to_raw_id
@@ -166,9 +170,9 @@ impl ClaimGenerator {
                 CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(domain, eval)
             })
             .collect_vec();
-        tree_builder.extend_evals(trace);
 
         (
+            trace,
             Claim { log_size },
             InteractionClaimGenerator {
                 ids,
@@ -185,13 +189,15 @@ pub struct InteractionClaimGenerator {
 impl InteractionClaimGenerator {
     pub fn write_interaction_trace(
         self,
-        tree_builder: &mut impl TreeBuilder<SimdBackend>,
-        lookup_elements: &relations::MemoryAddressToId,
-    ) -> InteractionClaim {
+        common_lookup_elements: &relations::CommonLookupElements,
+    ) -> (
+        Vec<CircleEvaluation<SimdBackend, M31, BitReversedOrder>>,
+        InteractionClaim,
+    ) {
         let packed_size = self.ids[0].len();
         let log_size = packed_size.ilog2() + LOG_N_LANES;
         let n_rows = 1 << log_size;
-        let mut logup_gen = LogupTraceGenerator::new(log_size);
+        let mut logup_gen = unsafe { LogupTraceGenerator::uninitialized(log_size) };
 
         for (i, ((ids0, mults0), (ids1, mults1))) in
             izip!(&self.ids, &self.multiplicities).tuples().enumerate()
@@ -204,22 +210,31 @@ impl InteractionClaimGenerator {
                     let addr = Seq::new(log_size).packed_at(vec_row) + PackedM31::broadcast(M31(1));
                     let addr0 = addr + PackedM31::broadcast(M31(((i * 2) * n_rows) as u32));
                     let addr1 = addr + PackedM31::broadcast(M31(((i * 2 + 1) * n_rows) as u32));
-                    let p0: PackedQM31 = lookup_elements.combine(&[addr0, id0]);
-                    let p1: PackedQM31 = lookup_elements.combine(&[addr1, id1]);
+                    let p0: PackedQM31 = common_lookup_elements.combine(&[
+                        MEMORY_ADDRESS_TO_ID_RELATION_ID.into(),
+                        addr0,
+                        id0,
+                    ]);
+                    let p1: PackedQM31 = common_lookup_elements.combine(&[
+                        MEMORY_ADDRESS_TO_ID_RELATION_ID.into(),
+                        addr1,
+                        id1,
+                    ]);
                     writer.write_frac(p0 * (-mult1) + p1 * (-mult0), p1 * p0);
                 });
             col_gen.finalize_col();
         }
 
         let (trace, claimed_sum) = logup_gen.finalize_last();
-        tree_builder.extend_evals(trace);
 
-        InteractionClaim { claimed_sum }
+        (trace, InteractionClaim { claimed_sum })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use itertools::Itertools;
     use stwo::core::fields::m31::{BaseField, M31};
     use stwo_cairo_adapter::memory::{MemoryBuilder, MemoryConfig, MemoryEntry};
@@ -237,7 +252,7 @@ mod tests {
             }),
         )
         .build();
-        let memory_address_to_id_gen = memory_address_to_id::ClaimGenerator::new(&memory);
+        let memory_address_to_id_gen = memory_address_to_id::ClaimGenerator::new(Arc::new(memory));
         let address_usages = [1, 1, 2, 2, 2, 3]
             .into_iter()
             .map(BaseField::from)

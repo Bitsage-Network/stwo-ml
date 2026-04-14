@@ -1,9 +1,11 @@
 use std::array::from_fn;
 use std::simd::u32x16;
+use std::sync::Arc;
 
+use stwo::prover::backend::simd::m31::N_LANES;
 use stwo_cairo_adapter::memory::Memory;
 use stwo_cairo_common::preprocessed_columns::blake::{BLAKE_SIGMA, N_BLAKE_SIGMA_COLS};
-use stwo_cairo_common::prover_types::simd::{PackedUInt32, N_LANES};
+use stwo_cairo_common::prover_types::simd::PackedUInt32;
 
 use crate::stwo::prover::backend::simd::m31::PackedM31;
 
@@ -82,11 +84,11 @@ impl PackedBlakeRoundSigma {
 }
 
 pub struct BlakeRound {
-    memory: Memory,
+    memory: Arc<Memory>,
 }
 
 impl BlakeRound {
-    pub fn new(memory: Memory) -> Self {
+    pub fn new(memory: Arc<Memory>) -> Self {
         Self { memory }
     }
     pub fn deduce_output(
@@ -279,7 +281,9 @@ mod tests {
         let expected: [PackedUInt32; 16] =
             from_fn(|i| PackedUInt32::from_simd(u32x16::from_slice(&[exp0[i], exp1[i]].repeat(8))));
 
-        let blake_round = BlakeRound { memory };
+        let blake_round = BlakeRound {
+            memory: Arc::new(memory),
+        };
         let actual = blake_round.deduce_output(chains, rounds, (state, message_pointer));
 
         let (actual_chain, actual_round, (actual_state, actual_message_pointer)) = actual;

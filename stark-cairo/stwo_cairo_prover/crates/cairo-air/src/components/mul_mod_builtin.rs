@@ -31,11 +31,7 @@ pub const RELATION_USES_PER_ROW: [RelationUse; 5] = [
 
 pub struct Eval {
     pub claim: Claim,
-    pub memory_address_to_id_lookup_elements: relations::MemoryAddressToId,
-    pub memory_id_to_big_lookup_elements: relations::MemoryIdToBig,
-    pub range_check_12_lookup_elements: relations::RangeCheck_12,
-    pub range_check_3_6_6_3_lookup_elements: relations::RangeCheck_3_6_6_3,
-    pub range_check_18_lookup_elements: relations::RangeCheck_18,
+    pub common_lookup_elements: relations::CommonLookupElements,
 }
 
 #[derive(Copy, Clone, Serialize, Deserialize, CairoSerialize, CairoDeserialize)]
@@ -47,23 +43,13 @@ impl Claim {
     pub fn log_sizes(&self) -> TreeVec<Vec<u32>> {
         let trace_log_sizes = vec![self.log_size; N_TRACE_COLUMNS];
         let interaction_log_sizes = vec![self.log_size; SECURE_EXTENSION_DEGREE * 94];
-        TreeVec::new(vec![vec![], trace_log_sizes, interaction_log_sizes])
-    }
-
-    pub fn mix_into(&self, channel: &mut impl Channel) {
-        channel.mix_u64(self.log_size as u64);
-        channel.mix_u64(self.mul_mod_builtin_segment_start as u64);
+        TreeVec::new(vec![trace_log_sizes, interaction_log_sizes])
     }
 }
 
 #[derive(Copy, Clone, Serialize, Deserialize, CairoSerialize, CairoDeserialize)]
 pub struct InteractionClaim {
     pub claimed_sum: SecureField,
-}
-impl InteractionClaim {
-    pub fn mix_into(&self, channel: &mut impl Channel) {
-        channel.mix_felts(&[self.claimed_sum]);
-    }
 }
 
 pub type Component = FrameworkComponent<Eval>;
@@ -82,8 +68,11 @@ impl FrameworkEval for Eval {
     #[allow(non_snake_case)]
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
         let M31_0 = E::F::from(M31::from(0));
+        let M31_1 = E::F::from(M31::from(1));
+        let M31_1109051422 = E::F::from(M31::from(1109051422));
         let M31_131072 = E::F::from(M31::from(131072));
         let M31_524288 = E::F::from(M31::from(524288));
+        let M31_941275232 = E::F::from(M31::from(941275232));
         let seq = eval.get_preprocessed_column(Seq::new(self.log_size()).id());
         let is_instance_0_col0 = eval.next_trace_mask();
         let p0_id_col1 = eval.next_trace_mask();
@@ -769,200 +758,295 @@ impl FrameworkEval for Eval {
             c3_limb_8_col249.clone(),
             c3_limb_9_col250.clone(),
             c3_limb_10_col251.clone(),
-            &self.memory_address_to_id_lookup_elements,
-            &self.memory_id_to_big_lookup_elements,
+            &self.common_lookup_elements,
             &mut eval,
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_12_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&ab_minus_c_div_p_limb_0_col252),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_941275232.clone(),
+                ab_minus_c_div_p_limb_0_col252.clone(),
+            ],
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_12_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&ab_minus_c_div_p_limb_1_col253),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_941275232.clone(),
+                ab_minus_c_div_p_limb_1_col253.clone(),
+            ],
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_12_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&ab_minus_c_div_p_limb_2_col254),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_941275232.clone(),
+                ab_minus_c_div_p_limb_2_col254.clone(),
+            ],
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_12_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&ab_minus_c_div_p_limb_3_col255),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_941275232.clone(),
+                ab_minus_c_div_p_limb_3_col255.clone(),
+            ],
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_12_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&ab_minus_c_div_p_limb_4_col256),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_941275232.clone(),
+                ab_minus_c_div_p_limb_4_col256.clone(),
+            ],
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_12_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&ab_minus_c_div_p_limb_5_col257),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_941275232.clone(),
+                ab_minus_c_div_p_limb_5_col257.clone(),
+            ],
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_12_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&ab_minus_c_div_p_limb_6_col258),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_941275232.clone(),
+                ab_minus_c_div_p_limb_6_col258.clone(),
+            ],
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_12_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&ab_minus_c_div_p_limb_7_col259),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_941275232.clone(),
+                ab_minus_c_div_p_limb_7_col259.clone(),
+            ],
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_12_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&ab_minus_c_div_p_limb_8_col260),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_941275232.clone(),
+                ab_minus_c_div_p_limb_8_col260.clone(),
+            ],
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_12_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&ab_minus_c_div_p_limb_9_col261),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_941275232.clone(),
+                ab_minus_c_div_p_limb_9_col261.clone(),
+            ],
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_12_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&ab_minus_c_div_p_limb_10_col262),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_941275232.clone(),
+                ab_minus_c_div_p_limb_10_col262.clone(),
+            ],
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_12_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&ab_minus_c_div_p_limb_11_col263),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_941275232.clone(),
+                ab_minus_c_div_p_limb_11_col263.clone(),
+            ],
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_12_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&ab_minus_c_div_p_limb_12_col264),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_941275232.clone(),
+                ab_minus_c_div_p_limb_12_col264.clone(),
+            ],
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_12_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&ab_minus_c_div_p_limb_13_col265),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_941275232.clone(),
+                ab_minus_c_div_p_limb_13_col265.clone(),
+            ],
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_12_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&ab_minus_c_div_p_limb_14_col266),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_941275232.clone(),
+                ab_minus_c_div_p_limb_14_col266.clone(),
+            ],
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_12_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&ab_minus_c_div_p_limb_15_col267),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_941275232.clone(),
+                ab_minus_c_div_p_limb_15_col267.clone(),
+            ],
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_12_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&ab_minus_c_div_p_limb_16_col268),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_941275232.clone(),
+                ab_minus_c_div_p_limb_16_col268.clone(),
+            ],
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_12_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&ab_minus_c_div_p_limb_17_col269),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_941275232.clone(),
+                ab_minus_c_div_p_limb_17_col269.clone(),
+            ],
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_12_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&ab_minus_c_div_p_limb_18_col270),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_941275232.clone(),
+                ab_minus_c_div_p_limb_18_col270.clone(),
+            ],
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_12_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&ab_minus_c_div_p_limb_19_col271),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_941275232.clone(),
+                ab_minus_c_div_p_limb_19_col271.clone(),
+            ],
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_12_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&ab_minus_c_div_p_limb_20_col272),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_941275232.clone(),
+                ab_minus_c_div_p_limb_20_col272.clone(),
+            ],
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_12_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&ab_minus_c_div_p_limb_21_col273),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_941275232.clone(),
+                ab_minus_c_div_p_limb_21_col273.clone(),
+            ],
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_12_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&ab_minus_c_div_p_limb_22_col274),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_941275232.clone(),
+                ab_minus_c_div_p_limb_22_col274.clone(),
+            ],
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_12_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&ab_minus_c_div_p_limb_23_col275),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_941275232.clone(),
+                ab_minus_c_div_p_limb_23_col275.clone(),
+            ],
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_12_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&ab_minus_c_div_p_limb_24_col276),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_941275232.clone(),
+                ab_minus_c_div_p_limb_24_col276.clone(),
+            ],
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_12_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&ab_minus_c_div_p_limb_25_col277),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_941275232.clone(),
+                ab_minus_c_div_p_limb_25_col277.clone(),
+            ],
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_12_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&ab_minus_c_div_p_limb_26_col278),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_941275232.clone(),
+                ab_minus_c_div_p_limb_26_col278.clone(),
+            ],
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_12_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&ab_minus_c_div_p_limb_27_col279),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_941275232.clone(),
+                ab_minus_c_div_p_limb_27_col279.clone(),
+            ],
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_12_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&ab_minus_c_div_p_limb_28_col280),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_941275232.clone(),
+                ab_minus_c_div_p_limb_28_col280.clone(),
+            ],
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_12_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&ab_minus_c_div_p_limb_29_col281),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_941275232.clone(),
+                ab_minus_c_div_p_limb_29_col281.clone(),
+            ],
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_12_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&ab_minus_c_div_p_limb_30_col282),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_941275232.clone(),
+                ab_minus_c_div_p_limb_30_col282.clone(),
+            ],
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_12_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&ab_minus_c_div_p_limb_31_col283),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_941275232.clone(),
+                ab_minus_c_div_p_limb_31_col283.clone(),
+            ],
         ));
 
         #[allow(clippy::unused_unit)]
@@ -1003,7 +1087,7 @@ impl FrameworkEval for Eval {
                 limb5b_1_col291.clone(),
                 limb6b_1_col292.clone(),
                 limb9b_1_col293.clone(),
-                &self.range_check_3_6_6_3_lookup_elements,
+                &self.common_lookup_elements,
                 &mut eval,
             );
         #[allow(clippy::unused_unit)]
@@ -1044,7 +1128,7 @@ impl FrameworkEval for Eval {
                 limb5b_1_col301.clone(),
                 limb6b_1_col302.clone(),
                 limb9b_1_col303.clone(),
-                &self.range_check_3_6_6_3_lookup_elements,
+                &self.common_lookup_elements,
                 &mut eval,
             );
         #[allow(clippy::unused_unit)]
@@ -1085,7 +1169,7 @@ impl FrameworkEval for Eval {
                 limb5b_1_col311.clone(),
                 limb6b_1_col312.clone(),
                 limb9b_1_col313.clone(),
-                &self.range_check_3_6_6_3_lookup_elements,
+                &self.common_lookup_elements,
                 &mut eval,
             );
         #[allow(clippy::unused_unit)]
@@ -1126,7 +1210,7 @@ impl FrameworkEval for Eval {
                 limb5b_1_col321.clone(),
                 limb6b_1_col322.clone(),
                 limb9b_1_col323.clone(),
-                &self.range_check_3_6_6_3_lookup_elements,
+                &self.common_lookup_elements,
                 &mut eval,
             );
         #[allow(clippy::unused_unit)]
@@ -1167,7 +1251,7 @@ impl FrameworkEval for Eval {
                 limb5b_1_col331.clone(),
                 limb6b_1_col332.clone(),
                 limb9b_1_col333.clone(),
-                &self.range_check_3_6_6_3_lookup_elements,
+                &self.common_lookup_elements,
                 &mut eval,
             );
         #[allow(clippy::unused_unit)]
@@ -1208,7 +1292,7 @@ impl FrameworkEval for Eval {
                 limb5b_1_col341.clone(),
                 limb6b_1_col342.clone(),
                 limb9b_1_col343.clone(),
-                &self.range_check_3_6_6_3_lookup_elements,
+                &self.common_lookup_elements,
                 &mut eval,
             );
         #[allow(clippy::unused_unit)]
@@ -1249,7 +1333,7 @@ impl FrameworkEval for Eval {
                 limb5b_1_col351.clone(),
                 limb6b_1_col352.clone(),
                 limb9b_1_col353.clone(),
-                &self.range_check_3_6_6_3_lookup_elements,
+                &self.common_lookup_elements,
                 &mut eval,
             );
         #[allow(clippy::unused_unit)]
@@ -1290,7 +1374,7 @@ impl FrameworkEval for Eval {
                 limb5b_1_col361.clone(),
                 limb6b_1_col362.clone(),
                 limb9b_1_col363.clone(),
-                &self.range_check_3_6_6_3_lookup_elements,
+                &self.common_lookup_elements,
                 &mut eval,
             );
         #[allow(clippy::unused_unit)]
@@ -1363,6 +1447,7 @@ impl FrameworkEval for Eval {
                     mod_words_to_12_bit_array_output_tmp_cf8b4_290_limb_14.clone(),
                     mod_words_to_12_bit_array_output_tmp_cf8b4_290_limb_15.clone(),
                 ],
+                &self.common_lookup_elements,
                 &mut eval,
             );
         #[allow(clippy::unused_unit)]
@@ -1435,6 +1520,7 @@ impl FrameworkEval for Eval {
                     mod_words_to_12_bit_array_output_tmp_cf8b4_206_limb_14.clone(),
                     mod_words_to_12_bit_array_output_tmp_cf8b4_206_limb_15.clone(),
                 ],
+                &self.common_lookup_elements,
                 &mut eval,
             );
         // carry_0.
@@ -1447,9 +1533,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_0_col364.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_0_col364.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_1.
@@ -1462,9 +1551,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_1_col365.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_1_col365.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_2.
@@ -1477,9 +1569,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_2_col366.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_2_col366.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_3.
@@ -1492,9 +1587,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_3_col367.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_3_col367.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_4.
@@ -1507,9 +1605,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_4_col368.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_4_col368.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_5.
@@ -1522,9 +1623,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_5_col369.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_5_col369.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_6.
@@ -1537,9 +1641,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_6_col370.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_6_col370.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_7.
@@ -1552,9 +1659,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_7_col371.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_7_col371.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_8.
@@ -1567,9 +1677,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_8_col372.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_8_col372.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_9.
@@ -1582,9 +1695,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_9_col373.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_9_col373.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_10.
@@ -1597,9 +1713,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_10_col374.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_10_col374.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_11.
@@ -1612,9 +1731,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_11_col375.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_11_col375.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_12.
@@ -1627,9 +1749,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_12_col376.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_12_col376.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_13.
@@ -1642,9 +1767,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_13_col377.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_13_col377.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_14.
@@ -1657,9 +1785,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_14_col378.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_14_col378.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_15.
@@ -1672,9 +1803,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_15_col379.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_15_col379.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_16.
@@ -1687,9 +1821,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_16_col380.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_16_col380.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_17.
@@ -1702,9 +1839,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_17_col381.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_17_col381.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_18.
@@ -1717,9 +1857,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_18_col382.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_18_col382.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_19.
@@ -1732,9 +1875,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_19_col383.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_19_col383.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_20.
@@ -1747,9 +1893,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_20_col384.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_20_col384.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_21.
@@ -1762,9 +1911,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_21_col385.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_21_col385.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_22.
@@ -1777,9 +1929,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_22_col386.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_22_col386.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_23.
@@ -1792,9 +1947,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_23_col387.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_23_col387.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_24.
@@ -1807,9 +1965,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_24_col388.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_24_col388.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_25.
@@ -1822,9 +1983,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_25_col389.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_25_col389.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_26.
@@ -1837,9 +2001,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_26_col390.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_26_col390.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_27.
@@ -1852,9 +2019,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_27_col391.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_27_col391.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_28.
@@ -1867,9 +2037,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_28_col392.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_28_col392.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_29.
@@ -1882,9 +2055,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_29_col393.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_29_col393.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_30.
@@ -1897,9 +2073,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_30_col394.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_30_col394.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_31.
@@ -1912,9 +2091,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_31_col395.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_31_col395.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_32.
@@ -1926,9 +2108,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_32_col396.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_32_col396.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_33.
@@ -1940,9 +2125,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_33_col397.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_33_col397.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_34.
@@ -1954,9 +2142,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_34_col398.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_34_col398.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_35.
@@ -1968,9 +2159,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_35_col399.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_35_col399.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_36.
@@ -1982,9 +2176,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_36_col400.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_36_col400.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_37.
@@ -1996,9 +2193,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_37_col401.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_37_col401.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_38.
@@ -2010,9 +2210,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_38_col402.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_38_col402.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_39.
@@ -2024,9 +2227,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_39_col403.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_39_col403.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_40.
@@ -2038,9 +2244,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_40_col404.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_40_col404.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_41.
@@ -2052,9 +2261,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_41_col405.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_41_col405.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_42.
@@ -2066,9 +2278,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_42_col406.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_42_col406.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_43.
@@ -2080,9 +2295,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_43_col407.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_43_col407.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_44.
@@ -2094,9 +2312,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_44_col408.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_44_col408.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_45.
@@ -2108,9 +2329,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_45_col409.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_45_col409.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_46.
@@ -2122,9 +2346,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_46_col410.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_46_col410.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_47.
@@ -2136,9 +2363,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_47_col411.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_47_col411.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_48.
@@ -2150,9 +2380,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_48_col412.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_48_col412.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_49.
@@ -2164,9 +2397,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_49_col413.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_49_col413.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_50.
@@ -2178,9 +2414,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_50_col414.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_50_col414.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_51.
@@ -2192,9 +2431,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_51_col415.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_51_col415.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_52.
@@ -2206,9 +2448,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_52_col416.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_52_col416.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_53.
@@ -2220,9 +2465,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_53_col417.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_53_col417.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_54.
@@ -2234,9 +2482,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_54_col418.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_54_col418.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_55.
@@ -2248,9 +2499,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_55_col419.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_55_col419.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_56.
@@ -2262,9 +2516,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_56_col420.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_56_col420.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_57.
@@ -2276,9 +2533,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_57_col421.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_57_col421.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_58.
@@ -2290,9 +2550,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_58_col422.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_58_col422.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_59.
@@ -2304,9 +2567,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_59_col423.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_59_col423.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_60.
@@ -2318,9 +2584,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_60_col424.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_60_col424.clone() + M31_131072.clone()),
+            ],
         ));
 
         // carry_61.
@@ -2332,9 +2601,12 @@ impl FrameworkEval for Eval {
                     * M31_524288.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.range_check_18_lookup_elements,
-            E::EF::one(),
-            std::slice::from_ref(&(carry_61_col425.clone() + M31_131072.clone())),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
+            &[
+                M31_1109051422.clone(),
+                (carry_61_col425.clone() + M31_131072.clone()),
+            ],
         ));
 
         // final limb constraint.
@@ -2367,11 +2639,7 @@ mod tests {
                 log_size: 4,
                 mul_mod_builtin_segment_start: rng.gen::<u32>(),
             },
-            memory_address_to_id_lookup_elements: relations::MemoryAddressToId::dummy(),
-            memory_id_to_big_lookup_elements: relations::MemoryIdToBig::dummy(),
-            range_check_12_lookup_elements: relations::RangeCheck_12::dummy(),
-            range_check_3_6_6_3_lookup_elements: relations::RangeCheck_3_6_6_3::dummy(),
-            range_check_18_lookup_elements: relations::RangeCheck_18::dummy(),
+            common_lookup_elements: relations::CommonLookupElements::dummy(),
         };
         let expr_eval = eval.evaluate(ExprEvaluator::new());
         let assignment = expr_eval.random_assignment();
@@ -2381,6 +2649,6 @@ mod tests {
             sum += c.assign(&assignment) * rng.gen::<QM31>();
         }
 
-        assert_eq!(sum, MUL_MOD_BUILTIN);
+        MUL_MOD_BUILTIN.assert_debug_eq(&sum);
     }
 }

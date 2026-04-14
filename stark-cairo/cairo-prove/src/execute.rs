@@ -42,9 +42,10 @@ pub fn execute(executable: Executable, args: Vec<Arg>) -> Result<CairoRunner> {
         relocate_mem: true,
         layout: LayoutName::all_cairo_stwo,
         secure_run: None,
-        allow_missing_builtins: None,
+        allow_missing_builtins: Some(true),
         dynamic_layout_params: None,
         disable_trace_padding: true,
+        fill_holes: true,
         proof_mode: true,
         ..Default::default()
     };

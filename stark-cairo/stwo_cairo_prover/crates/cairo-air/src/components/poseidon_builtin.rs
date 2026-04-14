@@ -17,8 +17,7 @@ pub const RELATION_USES_PER_ROW: [RelationUse; 2] = [
 
 pub struct Eval {
     pub claim: Claim,
-    pub memory_address_to_id_lookup_elements: relations::MemoryAddressToId,
-    pub poseidon_aggregator_lookup_elements: relations::PoseidonAggregator,
+    pub common_lookup_elements: relations::CommonLookupElements,
 }
 
 #[derive(Copy, Clone, Serialize, Deserialize, CairoSerialize, CairoDeserialize)]
@@ -30,23 +29,13 @@ impl Claim {
     pub fn log_sizes(&self) -> TreeVec<Vec<u32>> {
         let trace_log_sizes = vec![self.log_size; N_TRACE_COLUMNS];
         let interaction_log_sizes = vec![self.log_size; SECURE_EXTENSION_DEGREE * 4];
-        TreeVec::new(vec![vec![], trace_log_sizes, interaction_log_sizes])
-    }
-
-    pub fn mix_into(&self, channel: &mut impl Channel) {
-        channel.mix_u64(self.log_size as u64);
-        channel.mix_u64(self.poseidon_builtin_segment_start as u64);
+        TreeVec::new(vec![trace_log_sizes, interaction_log_sizes])
     }
 }
 
 #[derive(Copy, Clone, Serialize, Deserialize, CairoSerialize, CairoDeserialize)]
 pub struct InteractionClaim {
     pub claimed_sum: SecureField,
-}
-impl InteractionClaim {
-    pub fn mix_into(&self, channel: &mut impl Channel) {
-        channel.mix_felts(&[self.claimed_sum]);
-    }
 }
 
 pub type Component = FrameworkComponent<Eval>;
@@ -65,6 +54,7 @@ impl FrameworkEval for Eval {
     #[allow(non_snake_case)]
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
         let M31_1 = E::F::from(M31::from(1));
+        let M31_1551892206 = E::F::from(M31::from(1551892206));
         let M31_2 = E::F::from(M31::from(2));
         let M31_3 = E::F::from(M31::from(3));
         let M31_4 = E::F::from(M31::from(4));
@@ -85,43 +75,44 @@ impl FrameworkEval for Eval {
         ReadId::evaluate(
             [instance_addr_tmp_51986_0.clone()],
             input_state_0_id_col0.clone(),
-            &self.memory_address_to_id_lookup_elements,
+            &self.common_lookup_elements,
             &mut eval,
         );
         ReadId::evaluate(
             [(instance_addr_tmp_51986_0.clone() + M31_1.clone())],
             input_state_1_id_col1.clone(),
-            &self.memory_address_to_id_lookup_elements,
+            &self.common_lookup_elements,
             &mut eval,
         );
         ReadId::evaluate(
             [(instance_addr_tmp_51986_0.clone() + M31_2.clone())],
             input_state_2_id_col2.clone(),
-            &self.memory_address_to_id_lookup_elements,
+            &self.common_lookup_elements,
             &mut eval,
         );
         ReadId::evaluate(
             [(instance_addr_tmp_51986_0.clone() + M31_3.clone())],
             output_state_0_id_col3.clone(),
-            &self.memory_address_to_id_lookup_elements,
+            &self.common_lookup_elements,
             &mut eval,
         );
         ReadId::evaluate(
             [(instance_addr_tmp_51986_0.clone() + M31_4.clone())],
             output_state_1_id_col4.clone(),
-            &self.memory_address_to_id_lookup_elements,
+            &self.common_lookup_elements,
             &mut eval,
         );
         ReadId::evaluate(
             [(instance_addr_tmp_51986_0.clone() + M31_5.clone())],
             output_state_2_id_col5.clone(),
-            &self.memory_address_to_id_lookup_elements,
+            &self.common_lookup_elements,
             &mut eval,
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.poseidon_aggregator_lookup_elements,
-            E::EF::one(),
+            &self.common_lookup_elements,
+            E::EF::from(M31_1.clone()),
             &[
+                M31_1551892206.clone(),
                 input_state_0_id_col0.clone(),
                 input_state_1_id_col1.clone(),
                 input_state_2_id_col2.clone(),
@@ -155,8 +146,7 @@ mod tests {
                 log_size: 4,
                 poseidon_builtin_segment_start: rng.gen::<u32>(),
             },
-            memory_address_to_id_lookup_elements: relations::MemoryAddressToId::dummy(),
-            poseidon_aggregator_lookup_elements: relations::PoseidonAggregator::dummy(),
+            common_lookup_elements: relations::CommonLookupElements::dummy(),
         };
         let expr_eval = eval.evaluate(ExprEvaluator::new());
         let assignment = expr_eval.random_assignment();
@@ -166,6 +156,6 @@ mod tests {
             sum += c.assign(&assignment) * rng.gen::<QM31>();
         }
 
-        assert_eq!(sum, POSEIDON_BUILTIN);
+        POSEIDON_BUILTIN.assert_debug_eq(&sum);
     }
 }

@@ -37,13 +37,7 @@ pub const RELATION_USES_PER_ROW: [RelationUse; 6] = [
 
 pub struct Eval {
     pub claim: Claim,
-    pub verify_bitwise_xor_8_lookup_elements: relations::VerifyBitwiseXor_8,
-    pub verify_bitwise_xor_8_b_lookup_elements: relations::VerifyBitwiseXor_8_B,
-    pub verify_bitwise_xor_12_lookup_elements: relations::VerifyBitwiseXor_12,
-    pub verify_bitwise_xor_4_lookup_elements: relations::VerifyBitwiseXor_4,
-    pub verify_bitwise_xor_7_lookup_elements: relations::VerifyBitwiseXor_7,
-    pub verify_bitwise_xor_9_lookup_elements: relations::VerifyBitwiseXor_9,
-    pub blake_g_lookup_elements: relations::BlakeG,
+    pub common_lookup_elements: relations::CommonLookupElements,
 }
 
 #[derive(Copy, Clone, Serialize, Deserialize, CairoSerialize, CairoDeserialize)]
@@ -54,22 +48,13 @@ impl Claim {
     pub fn log_sizes(&self) -> TreeVec<Vec<u32>> {
         let trace_log_sizes = vec![self.log_size; N_TRACE_COLUMNS];
         let interaction_log_sizes = vec![self.log_size; SECURE_EXTENSION_DEGREE * 9];
-        TreeVec::new(vec![vec![], trace_log_sizes, interaction_log_sizes])
-    }
-
-    pub fn mix_into(&self, channel: &mut impl Channel) {
-        channel.mix_u64(self.log_size as u64);
+        TreeVec::new(vec![trace_log_sizes, interaction_log_sizes])
     }
 }
 
 #[derive(Copy, Clone, Serialize, Deserialize, CairoSerialize, CairoDeserialize)]
 pub struct InteractionClaim {
     pub claimed_sum: SecureField,
-}
-impl InteractionClaim {
-    pub fn mix_into(&self, channel: &mut impl Channel) {
-        channel.mix_felts(&[self.claimed_sum]);
-    }
 }
 
 pub type Component = FrameworkComponent<Eval>;
@@ -88,6 +73,7 @@ impl FrameworkEval for Eval {
     #[allow(non_snake_case)]
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
         let M31_0 = E::F::from(M31::from(0));
+        let M31_1139985212 = E::F::from(M31::from(1139985212));
         let input_limb_0_col0 = eval.next_trace_mask();
         let input_limb_1_col1 = eval.next_trace_mask();
         let input_limb_2_col2 = eval.next_trace_mask();
@@ -140,9 +126,7 @@ impl FrameworkEval for Eval {
         let xor_col49 = eval.next_trace_mask();
         let xor_col50 = eval.next_trace_mask();
         let xor_col51 = eval.next_trace_mask();
-        let enabler = eval.next_trace_mask();
-
-        eval.add_constraint(enabler.clone() * enabler.clone() - enabler.clone());
+        let enabler_col52 = eval.next_trace_mask();
 
         TripleSum32::evaluate(
             [
@@ -155,6 +139,7 @@ impl FrameworkEval for Eval {
             ],
             triple_sum32_res_limb_0_col12.clone(),
             triple_sum32_res_limb_1_col13.clone(),
+            &self.common_lookup_elements,
             &mut eval,
         );
         #[allow(clippy::unused_unit)]
@@ -175,8 +160,7 @@ impl FrameworkEval for Eval {
                 xor_col19.clone(),
                 xor_col20.clone(),
                 xor_col21.clone(),
-                &self.verify_bitwise_xor_8_lookup_elements,
-                &self.verify_bitwise_xor_8_b_lookup_elements,
+                &self.common_lookup_elements,
                 &mut eval,
             );
         TripleSum32::evaluate(
@@ -190,6 +174,7 @@ impl FrameworkEval for Eval {
             ],
             triple_sum32_res_limb_0_col22.clone(),
             triple_sum32_res_limb_1_col23.clone(),
+            &self.common_lookup_elements,
             &mut eval,
         );
         #[allow(clippy::unused_unit)]
@@ -210,8 +195,7 @@ impl FrameworkEval for Eval {
                 xor_col29.clone(),
                 xor_col30.clone(),
                 xor_col31.clone(),
-                &self.verify_bitwise_xor_12_lookup_elements,
-                &self.verify_bitwise_xor_4_lookup_elements,
+                &self.common_lookup_elements,
                 &mut eval,
             );
         TripleSum32::evaluate(
@@ -225,6 +209,7 @@ impl FrameworkEval for Eval {
             ],
             triple_sum32_res_limb_0_col32.clone(),
             triple_sum32_res_limb_1_col33.clone(),
+            &self.common_lookup_elements,
             &mut eval,
         );
         #[allow(clippy::unused_unit)]
@@ -245,8 +230,7 @@ impl FrameworkEval for Eval {
                 xor_col39.clone(),
                 xor_col40.clone(),
                 xor_col41.clone(),
-                &self.verify_bitwise_xor_8_lookup_elements,
-                &self.verify_bitwise_xor_8_b_lookup_elements,
+                &self.common_lookup_elements,
                 &mut eval,
             );
         TripleSum32::evaluate(
@@ -260,6 +244,7 @@ impl FrameworkEval for Eval {
             ],
             triple_sum32_res_limb_0_col42.clone(),
             triple_sum32_res_limb_1_col43.clone(),
+            &self.common_lookup_elements,
             &mut eval,
         );
         #[allow(clippy::unused_unit)]
@@ -280,14 +265,18 @@ impl FrameworkEval for Eval {
                 xor_col49.clone(),
                 xor_col50.clone(),
                 xor_col51.clone(),
-                &self.verify_bitwise_xor_7_lookup_elements,
-                &self.verify_bitwise_xor_9_lookup_elements,
+                &self.common_lookup_elements,
                 &mut eval,
             );
+        // Enabler is a bit.
+        eval.add_constraint(
+            ((enabler_col52.clone() * enabler_col52.clone()) - enabler_col52.clone()),
+        );
         eval.add_to_relation(RelationEntry::new(
-            &self.blake_g_lookup_elements,
-            -E::EF::from(enabler.clone()),
+            &self.common_lookup_elements,
+            -E::EF::from(enabler_col52.clone()),
             &[
+                M31_1139985212.clone(),
                 input_limb_0_col0.clone(),
                 input_limb_1_col1.clone(),
                 input_limb_2_col2.clone(),
@@ -332,13 +321,7 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(0);
         let eval = Eval {
             claim: Claim { log_size: 4 },
-            verify_bitwise_xor_8_lookup_elements: relations::VerifyBitwiseXor_8::dummy(),
-            verify_bitwise_xor_8_b_lookup_elements: relations::VerifyBitwiseXor_8_B::dummy(),
-            verify_bitwise_xor_12_lookup_elements: relations::VerifyBitwiseXor_12::dummy(),
-            verify_bitwise_xor_4_lookup_elements: relations::VerifyBitwiseXor_4::dummy(),
-            verify_bitwise_xor_7_lookup_elements: relations::VerifyBitwiseXor_7::dummy(),
-            verify_bitwise_xor_9_lookup_elements: relations::VerifyBitwiseXor_9::dummy(),
-            blake_g_lookup_elements: relations::BlakeG::dummy(),
+            common_lookup_elements: relations::CommonLookupElements::dummy(),
         };
         let expr_eval = eval.evaluate(ExprEvaluator::new());
         let assignment = expr_eval.random_assignment();
@@ -348,6 +331,6 @@ mod tests {
             sum += c.assign(&assignment) * rng.gen::<QM31>();
         }
 
-        assert_eq!(sum, BLAKE_G);
+        BLAKE_G.assert_debug_eq(&sum);
     }
 }

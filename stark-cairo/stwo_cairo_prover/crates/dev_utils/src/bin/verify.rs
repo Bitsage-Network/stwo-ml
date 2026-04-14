@@ -2,10 +2,14 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use cairo_air::verifier::verify_cairo;
-use cairo_air::{CairoProof, PreProcessedTraceVariant};
+use cairo_air::CairoProofForRustVerifier;
 use clap::Parser;
-use stwo::core::vcs_lifted::blake2_merkle::{Blake2sMerkleChannel, Blake2sMerkleHasher};
-use stwo::core::vcs_lifted::poseidon252_merkle::{Poseidon252MerkleChannel, Poseidon252MerkleHasher};
+use stwo::core::vcs_lifted::blake2_merkle::{
+    Blake2sM31MerkleChannel, Blake2sM31MerkleHasher, Blake2sMerkleChannel, Blake2sMerkleHasher,
+};
+use stwo::core::vcs_lifted::poseidon252_merkle::{
+    Poseidon252MerkleChannel, Poseidon252MerkleHasher,
+};
 use stwo_cairo_prover::prover::ChannelHash;
 use tracing::{span, Level};
 use tracing_subscriber::fmt::format::FmtSpan;
@@ -23,45 +27,37 @@ struct Args {
     #[arg(long = "proof_path")]
     proof_path: PathBuf,
 
-    /// Hash variant to use for verification (blake2s or poseidon252)
+    /// Hash variant to use for verification (blake2s, blake2s_m31, or poseidon252)
     #[arg(long = "channel_hash", default_value = "blake2s")]
     channel_hash: String,
-
-    /// Preprocessed trace variant (canonical or no_pedersen)
-    #[arg(long = "pp_trace", default_value = "canonical")]
-    pp_trace: String,
 }
 
 fn parse_channel_hash(hash_str: &str) -> Result<ChannelHash> {
     match hash_str.to_lowercase().as_str() {
         "blake2s" => Ok(ChannelHash::Blake2s),
+        "blake2s_m31" => Ok(ChannelHash::Blake2sM31),
         "poseidon252" => Ok(ChannelHash::Poseidon252),
-        _ => anyhow::bail!("Invalid channel hash: {hash_str}. Must be 'blake2s' or 'poseidon252'"),
-    }
-}
-
-fn parse_preprocessed_trace(preprocessed_trace: &str) -> PreProcessedTraceVariant {
-    match preprocessed_trace {
-        "canonical" => PreProcessedTraceVariant::Canonical,
-        "no_pedersen" => PreProcessedTraceVariant::CanonicalWithoutPedersen,
-        _ => panic!(
-            "Invalid preprocessed trace: {preprocessed_trace}, must be 'canonical' or 'no_pedersen'"
+        _ => anyhow::bail!(
+            "Invalid channel hash: {hash_str}. Must be 'blake2s', 'blake2s_m31', or 'poseidon252'"
         ),
     }
 }
 
-fn verify_blake2s_proof(proof: String, preprocessed_trace: PreProcessedTraceVariant) -> Result<()> {
-    let proof: CairoProof<Blake2sMerkleHasher> = sonic_rs::from_str(&proof)?;
-    verify_cairo::<Blake2sMerkleChannel>(proof, preprocessed_trace)?;
+fn verify_blake2s_proof(proof: String) -> Result<()> {
+    let proof: CairoProofForRustVerifier<Blake2sMerkleHasher> = sonic_rs::from_str(&proof)?;
+    verify_cairo::<Blake2sMerkleChannel>(proof)?;
     Ok(())
 }
 
-fn verify_poseidon252_proof(
-    proof: String,
-    preprocessed_trace: PreProcessedTraceVariant,
-) -> Result<()> {
-    let proof: CairoProof<Poseidon252MerkleHasher> = sonic_rs::from_str(&proof)?;
-    verify_cairo::<Poseidon252MerkleChannel>(proof, preprocessed_trace)?;
+fn verify_blake2s_m31_proof(proof: String) -> Result<()> {
+    let proof: CairoProofForRustVerifier<Blake2sM31MerkleHasher> = sonic_rs::from_str(&proof)?;
+    verify_cairo::<Blake2sM31MerkleChannel>(proof)?;
+    Ok(())
+}
+
+fn verify_poseidon252_proof(proof: String) -> Result<()> {
+    let proof: CairoProofForRustVerifier<Poseidon252MerkleHasher> = sonic_rs::from_str(&proof)?;
+    verify_cairo::<Poseidon252MerkleChannel>(proof)?;
     Ok(())
 }
 
@@ -77,11 +73,11 @@ fn main() -> Result<()> {
 
     let proof = std::fs::read_to_string(&args.proof_path)?;
     let channel = parse_channel_hash(&args.channel_hash)?;
-    let preprocessed_trace = parse_preprocessed_trace(&args.pp_trace);
 
     let result = match channel {
-        ChannelHash::Blake2s => verify_blake2s_proof(proof, preprocessed_trace),
-        ChannelHash::Poseidon252 => verify_poseidon252_proof(proof, preprocessed_trace),
+        ChannelHash::Blake2s => verify_blake2s_proof(proof),
+        ChannelHash::Blake2sM31 => verify_blake2s_m31_proof(proof),
+        ChannelHash::Poseidon252 => verify_poseidon252_proof(proof),
     };
     match result {
         Ok(_) => log::info!("✅ Proof verified successfully!"),

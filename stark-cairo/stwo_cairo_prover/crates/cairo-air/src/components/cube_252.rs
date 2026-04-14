@@ -74,23 +74,7 @@ pub const RELATION_USES_PER_ROW: [RelationUse; 16] = [
 
 pub struct Eval {
     pub claim: Claim,
-    pub range_check_9_9_lookup_elements: relations::RangeCheck_9_9,
-    pub range_check_9_9_b_lookup_elements: relations::RangeCheck_9_9_B,
-    pub range_check_9_9_c_lookup_elements: relations::RangeCheck_9_9_C,
-    pub range_check_9_9_d_lookup_elements: relations::RangeCheck_9_9_D,
-    pub range_check_9_9_e_lookup_elements: relations::RangeCheck_9_9_E,
-    pub range_check_9_9_f_lookup_elements: relations::RangeCheck_9_9_F,
-    pub range_check_9_9_g_lookup_elements: relations::RangeCheck_9_9_G,
-    pub range_check_9_9_h_lookup_elements: relations::RangeCheck_9_9_H,
-    pub range_check_20_lookup_elements: relations::RangeCheck_20,
-    pub range_check_20_b_lookup_elements: relations::RangeCheck_20_B,
-    pub range_check_20_c_lookup_elements: relations::RangeCheck_20_C,
-    pub range_check_20_d_lookup_elements: relations::RangeCheck_20_D,
-    pub range_check_20_e_lookup_elements: relations::RangeCheck_20_E,
-    pub range_check_20_f_lookup_elements: relations::RangeCheck_20_F,
-    pub range_check_20_g_lookup_elements: relations::RangeCheck_20_G,
-    pub range_check_20_h_lookup_elements: relations::RangeCheck_20_H,
-    pub cube_252_lookup_elements: relations::Cube252,
+    pub common_lookup_elements: relations::CommonLookupElements,
 }
 
 #[derive(Copy, Clone, Serialize, Deserialize, CairoSerialize, CairoDeserialize)]
@@ -101,22 +85,13 @@ impl Claim {
     pub fn log_sizes(&self) -> TreeVec<Vec<u32>> {
         let trace_log_sizes = vec![self.log_size; N_TRACE_COLUMNS];
         let interaction_log_sizes = vec![self.log_size; SECURE_EXTENSION_DEGREE * 50];
-        TreeVec::new(vec![vec![], trace_log_sizes, interaction_log_sizes])
-    }
-
-    pub fn mix_into(&self, channel: &mut impl Channel) {
-        channel.mix_u64(self.log_size as u64);
+        TreeVec::new(vec![trace_log_sizes, interaction_log_sizes])
     }
 }
 
 #[derive(Copy, Clone, Serialize, Deserialize, CairoSerialize, CairoDeserialize)]
 pub struct InteractionClaim {
     pub claimed_sum: SecureField,
-}
-impl InteractionClaim {
-    pub fn mix_into(&self, channel: &mut impl Channel) {
-        channel.mix_felts(&[self.claimed_sum]);
-    }
 }
 
 pub type Component = FrameworkComponent<Eval>;
@@ -134,6 +109,7 @@ impl FrameworkEval for Eval {
     #[allow(clippy::double_parens)]
     #[allow(non_snake_case)]
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
+        let M31_1987997202 = E::F::from(M31::from(1987997202));
         let M31_262144 = E::F::from(M31::from(262144));
         let M31_512 = E::F::from(M31::from(512));
         let input_limb_0_col0 = eval.next_trace_mask();
@@ -276,9 +252,7 @@ impl FrameworkEval for Eval {
         let carry_24_col137 = eval.next_trace_mask();
         let carry_25_col138 = eval.next_trace_mask();
         let carry_26_col139 = eval.next_trace_mask();
-        let enabler = eval.next_trace_mask();
-
-        eval.add_constraint(enabler.clone() * enabler.clone() - enabler.clone());
+        let enabler_col140 = eval.next_trace_mask();
 
         #[allow(clippy::unused_unit)]
         #[allow(unused_variables)]
@@ -314,14 +288,7 @@ impl FrameworkEval for Eval {
                 unpacked_limb_22_col25.clone(),
                 unpacked_limb_24_col26.clone(),
                 unpacked_limb_25_col27.clone(),
-                &self.range_check_9_9_lookup_elements,
-                &self.range_check_9_9_b_lookup_elements,
-                &self.range_check_9_9_c_lookup_elements,
-                &self.range_check_9_9_d_lookup_elements,
-                &self.range_check_9_9_e_lookup_elements,
-                &self.range_check_9_9_f_lookup_elements,
-                &self.range_check_9_9_g_lookup_elements,
-                &self.range_check_9_9_h_lookup_elements,
+                &self.common_lookup_elements,
                 &mut eval,
             );
         Mul252::evaluate(
@@ -439,22 +406,7 @@ impl FrameworkEval for Eval {
             carry_24_col81.clone(),
             carry_25_col82.clone(),
             carry_26_col83.clone(),
-            &self.range_check_9_9_lookup_elements,
-            &self.range_check_9_9_b_lookup_elements,
-            &self.range_check_9_9_c_lookup_elements,
-            &self.range_check_9_9_d_lookup_elements,
-            &self.range_check_9_9_e_lookup_elements,
-            &self.range_check_9_9_f_lookup_elements,
-            &self.range_check_9_9_g_lookup_elements,
-            &self.range_check_9_9_h_lookup_elements,
-            &self.range_check_20_lookup_elements,
-            &self.range_check_20_b_lookup_elements,
-            &self.range_check_20_c_lookup_elements,
-            &self.range_check_20_d_lookup_elements,
-            &self.range_check_20_e_lookup_elements,
-            &self.range_check_20_f_lookup_elements,
-            &self.range_check_20_g_lookup_elements,
-            &self.range_check_20_h_lookup_elements,
+            &self.common_lookup_elements,
             &mut eval,
         );
         Mul252::evaluate(
@@ -572,28 +524,18 @@ impl FrameworkEval for Eval {
             carry_24_col137.clone(),
             carry_25_col138.clone(),
             carry_26_col139.clone(),
-            &self.range_check_9_9_lookup_elements,
-            &self.range_check_9_9_b_lookup_elements,
-            &self.range_check_9_9_c_lookup_elements,
-            &self.range_check_9_9_d_lookup_elements,
-            &self.range_check_9_9_e_lookup_elements,
-            &self.range_check_9_9_f_lookup_elements,
-            &self.range_check_9_9_g_lookup_elements,
-            &self.range_check_9_9_h_lookup_elements,
-            &self.range_check_20_lookup_elements,
-            &self.range_check_20_b_lookup_elements,
-            &self.range_check_20_c_lookup_elements,
-            &self.range_check_20_d_lookup_elements,
-            &self.range_check_20_e_lookup_elements,
-            &self.range_check_20_f_lookup_elements,
-            &self.range_check_20_g_lookup_elements,
-            &self.range_check_20_h_lookup_elements,
+            &self.common_lookup_elements,
             &mut eval,
         );
+        // Enabler is a bit.
+        eval.add_constraint(
+            ((enabler_col140.clone() * enabler_col140.clone()) - enabler_col140.clone()),
+        );
         eval.add_to_relation(RelationEntry::new(
-            &self.cube_252_lookup_elements,
-            -E::EF::from(enabler.clone()),
+            &self.common_lookup_elements,
+            -E::EF::from(enabler_col140.clone()),
             &[
+                M31_1987997202.clone(),
                 input_limb_0_col0.clone(),
                 input_limb_1_col1.clone(),
                 input_limb_2_col2.clone(),
@@ -653,23 +595,7 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(0);
         let eval = Eval {
             claim: Claim { log_size: 4 },
-            range_check_9_9_lookup_elements: relations::RangeCheck_9_9::dummy(),
-            range_check_9_9_b_lookup_elements: relations::RangeCheck_9_9_B::dummy(),
-            range_check_9_9_c_lookup_elements: relations::RangeCheck_9_9_C::dummy(),
-            range_check_9_9_d_lookup_elements: relations::RangeCheck_9_9_D::dummy(),
-            range_check_9_9_e_lookup_elements: relations::RangeCheck_9_9_E::dummy(),
-            range_check_9_9_f_lookup_elements: relations::RangeCheck_9_9_F::dummy(),
-            range_check_9_9_g_lookup_elements: relations::RangeCheck_9_9_G::dummy(),
-            range_check_9_9_h_lookup_elements: relations::RangeCheck_9_9_H::dummy(),
-            range_check_20_lookup_elements: relations::RangeCheck_20::dummy(),
-            range_check_20_b_lookup_elements: relations::RangeCheck_20_B::dummy(),
-            range_check_20_c_lookup_elements: relations::RangeCheck_20_C::dummy(),
-            range_check_20_d_lookup_elements: relations::RangeCheck_20_D::dummy(),
-            range_check_20_e_lookup_elements: relations::RangeCheck_20_E::dummy(),
-            range_check_20_f_lookup_elements: relations::RangeCheck_20_F::dummy(),
-            range_check_20_g_lookup_elements: relations::RangeCheck_20_G::dummy(),
-            range_check_20_h_lookup_elements: relations::RangeCheck_20_H::dummy(),
-            cube_252_lookup_elements: relations::Cube252::dummy(),
+            common_lookup_elements: relations::CommonLookupElements::dummy(),
         };
         let expr_eval = eval.evaluate(ExprEvaluator::new());
         let assignment = expr_eval.random_assignment();
@@ -679,6 +605,6 @@ mod tests {
             sum += c.assign(&assignment) * rng.gen::<QM31>();
         }
 
-        assert_eq!(sum, CUBE_252);
+        CUBE_252.assert_debug_eq(&sum);
     }
 }

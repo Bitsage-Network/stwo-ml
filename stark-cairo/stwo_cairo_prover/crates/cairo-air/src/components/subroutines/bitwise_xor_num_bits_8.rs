@@ -15,13 +15,17 @@ impl BitwiseXorNumBits8 {
     pub fn evaluate<E: EvalAtRow>(
         [bitwise_xor_num_bits_8_input_limb_0, bitwise_xor_num_bits_8_input_limb_1]: [E::F; 2],
         xor_col0: E::F,
-        verify_bitwise_xor_8_lookup_elements: &relations::VerifyBitwiseXor_8,
+        common_lookup_elements: &relations::CommonLookupElements,
         eval: &mut E,
     ) -> [E::F; 0] {
+        let M31_1 = E::F::from(M31::from(1));
+        let M31_112558620 = E::F::from(M31::from(112558620));
+
         eval.add_to_relation(RelationEntry::new(
-            verify_bitwise_xor_8_lookup_elements,
-            E::EF::one(),
+            common_lookup_elements,
+            E::EF::from(M31_1.clone()),
             &[
+                M31_112558620.clone(),
                 bitwise_xor_num_bits_8_input_limb_0.clone(),
                 bitwise_xor_num_bits_8_input_limb_1.clone(),
                 xor_col0.clone(),

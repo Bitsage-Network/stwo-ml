@@ -8,7 +8,7 @@ pub const RELATION_USES_PER_ROW: [RelationUse; 0] = [];
 
 pub struct Eval {
     pub claim: Claim,
-    pub blake_round_sigma_lookup_elements: relations::BlakeRoundSigma,
+    pub common_lookup_elements: relations::CommonLookupElements,
 }
 
 #[derive(Copy, Clone, Serialize, Deserialize, CairoSerialize, CairoDeserialize)]
@@ -17,20 +17,13 @@ impl Claim {
     pub fn log_sizes(&self) -> TreeVec<Vec<u32>> {
         let trace_log_sizes = vec![LOG_SIZE; N_TRACE_COLUMNS];
         let interaction_log_sizes = vec![LOG_SIZE; SECURE_EXTENSION_DEGREE];
-        TreeVec::new(vec![vec![], trace_log_sizes, interaction_log_sizes])
+        TreeVec::new(vec![trace_log_sizes, interaction_log_sizes])
     }
-
-    pub fn mix_into(&self, _channel: &mut impl Channel) {}
 }
 
 #[derive(Copy, Clone, Serialize, Deserialize, CairoSerialize, CairoDeserialize)]
 pub struct InteractionClaim {
     pub claimed_sum: SecureField,
-}
-impl InteractionClaim {
-    pub fn mix_into(&self, channel: &mut impl Channel) {
-        channel.mix_felts(&[self.claimed_sum]);
-    }
 }
 
 pub type Component = FrameworkComponent<Eval>;
@@ -48,6 +41,7 @@ impl FrameworkEval for Eval {
     #[allow(clippy::double_parens)]
     #[allow(non_snake_case)]
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
+        let M31_1805967942 = E::F::from(M31::from(1805967942));
         let seq_4 = eval.get_preprocessed_column(PreProcessedColumnId {
             id: "seq_4".to_owned(),
         });
@@ -99,12 +93,13 @@ impl FrameworkEval for Eval {
         let blake_sigma_15 = eval.get_preprocessed_column(PreProcessedColumnId {
             id: "blake_sigma_15".to_owned(),
         });
-        let multiplicity = eval.next_trace_mask();
+        let multiplicity_0_col0 = eval.next_trace_mask();
 
         eval.add_to_relation(RelationEntry::new(
-            &self.blake_round_sigma_lookup_elements,
-            -E::EF::from(multiplicity),
+            &self.common_lookup_elements,
+            -E::EF::from(multiplicity_0_col0.clone()),
             &[
+                M31_1805967942.clone(),
                 seq_4.clone(),
                 blake_sigma_0.clone(),
                 blake_sigma_1.clone(),
@@ -146,7 +141,7 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(0);
         let eval = Eval {
             claim: Claim {},
-            blake_round_sigma_lookup_elements: relations::BlakeRoundSigma::dummy(),
+            common_lookup_elements: relations::CommonLookupElements::dummy(),
         };
         let expr_eval = eval.evaluate(ExprEvaluator::new());
         let assignment = expr_eval.random_assignment();
@@ -156,6 +151,6 @@ mod tests {
             sum += c.assign(&assignment) * rng.gen::<QM31>();
         }
 
-        assert_eq!(sum, BLAKE_ROUND_SIGMA);
+        BLAKE_ROUND_SIGMA.assert_debug_eq(&sum);
     }
 }

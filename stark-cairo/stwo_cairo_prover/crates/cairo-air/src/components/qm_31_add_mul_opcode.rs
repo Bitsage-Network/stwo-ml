@@ -30,11 +30,7 @@ pub const RELATION_USES_PER_ROW: [RelationUse; 5] = [
 
 pub struct Eval {
     pub claim: Claim,
-    pub verify_instruction_lookup_elements: relations::VerifyInstruction,
-    pub memory_address_to_id_lookup_elements: relations::MemoryAddressToId,
-    pub memory_id_to_big_lookup_elements: relations::MemoryIdToBig,
-    pub range_check_4_4_4_4_lookup_elements: relations::RangeCheck_4_4_4_4,
-    pub opcodes_lookup_elements: relations::Opcodes,
+    pub common_lookup_elements: relations::CommonLookupElements,
 }
 
 #[derive(Copy, Clone, Serialize, Deserialize, CairoSerialize, CairoDeserialize)]
@@ -45,22 +41,13 @@ impl Claim {
     pub fn log_sizes(&self) -> TreeVec<Vec<u32>> {
         let trace_log_sizes = vec![self.log_size; N_TRACE_COLUMNS];
         let interaction_log_sizes = vec![self.log_size; SECURE_EXTENSION_DEGREE * 6];
-        TreeVec::new(vec![vec![], trace_log_sizes, interaction_log_sizes])
-    }
-
-    pub fn mix_into(&self, channel: &mut impl Channel) {
-        channel.mix_u64(self.log_size as u64);
+        TreeVec::new(vec![trace_log_sizes, interaction_log_sizes])
     }
 }
 
 #[derive(Copy, Clone, Serialize, Deserialize, CairoSerialize, CairoDeserialize)]
 pub struct InteractionClaim {
     pub claimed_sum: SecureField,
-}
-impl InteractionClaim {
-    pub fn mix_into(&self, channel: &mut impl Channel) {
-        channel.mix_felts(&[self.claimed_sum]);
-    }
 }
 
 pub type Component = FrameworkComponent<Eval>;
@@ -80,6 +67,7 @@ impl FrameworkEval for Eval {
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
         let M31_1 = E::F::from(M31::from(1));
         let M31_2 = E::F::from(M31::from(2));
+        let M31_428564188 = E::F::from(M31::from(428564188));
         let input_pc_col0 = eval.next_trace_mask();
         let input_ap_col1 = eval.next_trace_mask();
         let input_fp_col2 = eval.next_trace_mask();
@@ -152,9 +140,7 @@ impl FrameworkEval for Eval {
         let op1_limb_15_col69 = eval.next_trace_mask();
         let op1_delta_ab_inv_col70 = eval.next_trace_mask();
         let op1_delta_cd_inv_col71 = eval.next_trace_mask();
-        let enabler = eval.next_trace_mask();
-
-        eval.add_constraint(enabler.clone() * enabler.clone() - enabler.clone());
+        let enabler_col72 = eval.next_trace_mask();
 
         #[allow(clippy::unused_unit)]
         #[allow(unused_variables)]
@@ -170,7 +156,7 @@ impl FrameworkEval for Eval {
                 op1_base_fp_col9.clone(),
                 res_add_col10.clone(),
                 ap_update_add_1_col11.clone(),
-                &self.verify_instruction_lookup_elements,
+                &self.common_lookup_elements,
                 &mut eval,
             );
         // Either flag op1_imm is off or offset2 is equal to 1.
@@ -223,9 +209,7 @@ impl FrameworkEval for Eval {
                 dst_limb_15_col31.clone(),
                 dst_delta_ab_inv_col32.clone(),
                 dst_delta_cd_inv_col33.clone(),
-                &self.memory_address_to_id_lookup_elements,
-                &self.memory_id_to_big_lookup_elements,
-                &self.range_check_4_4_4_4_lookup_elements,
+                &self.common_lookup_elements,
                 &mut eval,
             );
         #[allow(clippy::unused_unit)]
@@ -253,9 +237,7 @@ impl FrameworkEval for Eval {
                 op0_limb_15_col50.clone(),
                 op0_delta_ab_inv_col51.clone(),
                 op0_delta_cd_inv_col52.clone(),
-                &self.memory_address_to_id_lookup_elements,
-                &self.memory_id_to_big_lookup_elements,
-                &self.range_check_4_4_4_4_lookup_elements,
+                &self.common_lookup_elements,
                 &mut eval,
             );
         #[allow(clippy::unused_unit)]
@@ -283,9 +265,7 @@ impl FrameworkEval for Eval {
                 op1_limb_15_col69.clone(),
                 op1_delta_ab_inv_col70.clone(),
                 op1_delta_cd_inv_col71.clone(),
-                &self.memory_address_to_id_lookup_elements,
-                &self.memory_id_to_big_lookup_elements,
-                &self.range_check_4_4_4_4_lookup_elements,
+                &self.common_lookup_elements,
                 &mut eval,
             );
         // dst equals (op0 * op1)*flag_res_mul + (op0 + op1)*(1-flag_res_mul).
@@ -362,10 +342,15 @@ impl FrameworkEval for Eval {
                     + qm_31_read_reduced_output_tmp_fa85a_30_limb_3.clone())
                     * res_add_col10.clone())),
         );
+        // Enabler is a bit.
+        eval.add_constraint(
+            ((enabler_col72.clone() * enabler_col72.clone()) - enabler_col72.clone()),
+        );
         eval.add_to_relation(RelationEntry::new(
-            &self.opcodes_lookup_elements,
-            E::EF::from(enabler.clone()),
+            &self.common_lookup_elements,
+            E::EF::from(enabler_col72.clone()),
             &[
+                M31_428564188.clone(),
                 input_pc_col0.clone(),
                 input_ap_col1.clone(),
                 input_fp_col2.clone(),
@@ -373,9 +358,10 @@ impl FrameworkEval for Eval {
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.opcodes_lookup_elements,
-            -E::EF::from(enabler.clone()),
+            &self.common_lookup_elements,
+            -E::EF::from(enabler_col72.clone()),
             &[
+                M31_428564188.clone(),
                 ((input_pc_col0.clone() + M31_1.clone()) + op1_imm_col8.clone()),
                 (input_ap_col1.clone() + ap_update_add_1_col11.clone()),
                 input_fp_col2.clone(),
@@ -403,11 +389,7 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(0);
         let eval = Eval {
             claim: Claim { log_size: 4 },
-            verify_instruction_lookup_elements: relations::VerifyInstruction::dummy(),
-            memory_address_to_id_lookup_elements: relations::MemoryAddressToId::dummy(),
-            memory_id_to_big_lookup_elements: relations::MemoryIdToBig::dummy(),
-            range_check_4_4_4_4_lookup_elements: relations::RangeCheck_4_4_4_4::dummy(),
-            opcodes_lookup_elements: relations::Opcodes::dummy(),
+            common_lookup_elements: relations::CommonLookupElements::dummy(),
         };
         let expr_eval = eval.evaluate(ExprEvaluator::new());
         let assignment = expr_eval.random_assignment();
@@ -417,6 +399,6 @@ mod tests {
             sum += c.assign(&assignment) * rng.gen::<QM31>();
         }
 
-        assert_eq!(sum, QM_31_ADD_MUL_OPCODE);
+        QM_31_ADD_MUL_OPCODE.assert_debug_eq(&sum);
     }
 }

@@ -9,45 +9,42 @@ pub type InputType = [M31; 1];
 pub type PackedInputType = [PackedM31; 1];
 
 pub struct ClaimGenerator {
-    pub mults: AtomicMultiplicityColumn,
-    input_to_row: HashMap<[M31; 1], usize>,
+    pub mults: [AtomicMultiplicityColumn; 1],
     preprocessed_trace: Arc<PreProcessedTrace>,
 }
 
 impl ClaimGenerator {
     pub fn new(preprocessed_trace: Arc<PreProcessedTrace>) -> Self {
-        let column_ids = [PreProcessedColumnId {
-            id: "seq_6".to_owned(),
-        }];
+        let mults = from_fn(|_| AtomicMultiplicityColumn::new(1 << LOG_SIZE));
         Self {
-            mults: AtomicMultiplicityColumn::new(1 << LOG_SIZE),
-            input_to_row: make_input_to_row(&preprocessed_trace, column_ids),
+            mults,
             preprocessed_trace,
         }
     }
 
     pub fn write_trace(
         self,
-        tree_builder: &mut impl TreeBuilder<SimdBackend>,
-    ) -> (Claim, InteractionClaimGenerator) {
-        let mults = self.mults.into_simd_vec();
+    ) -> (
+        ComponentTrace<N_TRACE_COLUMNS>,
+        Claim,
+        InteractionClaimGenerator,
+    ) {
+        let mults = self
+            .mults
+            .into_iter()
+            .map(|v| v.into_simd_vec())
+            .collect::<Vec<_>>();
 
         let (trace, lookup_data) = write_trace_simd(&self.preprocessed_trace, mults);
-        tree_builder.extend_evals(trace.to_evals());
 
-        (Claim {}, InteractionClaimGenerator { lookup_data })
+        (trace, Claim {}, InteractionClaimGenerator { lookup_data })
     }
 
-    pub fn add_input(&self, input: &InputType) {
-        self.mults
-            .increase_at((*self.input_to_row.get(input).unwrap()).try_into().unwrap());
-    }
-
-    pub fn add_packed_inputs(&self, packed_inputs: &[PackedInputType]) {
+    pub fn add_packed_inputs(&self, packed_inputs: &[PackedInputType], relation_index: usize) {
         packed_inputs.into_par_iter().for_each(|packed_input| {
-            packed_input.unpack().into_par_iter().for_each(|input| {
-                self.add_input(&input);
-            });
+            for [idx] in packed_input.unpack() {
+                self.mults[relation_index].increase_at(idx.0);
+            }
         });
     }
 }
@@ -58,7 +55,7 @@ impl ClaimGenerator {
 #[allow(non_snake_case)]
 fn write_trace_simd(
     preprocessed_trace: &PreProcessedTrace,
-    mults: Vec<PackedM31>,
+    mults: Vec<Vec<PackedM31>>,
 ) -> (ComponentTrace<N_TRACE_COLUMNS>, LookupData) {
     let log_n_packed_rows = LOG_SIZE - LOG_N_LANES;
     let (mut trace, mut lookup_data) = unsafe {
@@ -68,6 +65,7 @@ fn write_trace_simd(
         )
     };
 
+    let M31_1185356339 = PackedM31::broadcast(M31::from(1185356339));
     let seq_6 = preprocessed_trace.get_column(&PreProcessedColumnId {
         id: "seq_6".to_owned(),
     });
@@ -77,10 +75,11 @@ fn write_trace_simd(
         .enumerate()
         .for_each(|(row_index, (row, lookup_data))| {
             let seq_6 = seq_6.packed_at(row_index);
-            *lookup_data.range_check_6_0 = [seq_6];
-            let mult_at_row = *mults.get(row_index).unwrap_or(&PackedM31::zero());
+            *lookup_data.range_check_6_0 = [M31_1185356339, seq_6];
+            let mult = &mults[0];
+            let mult_at_row = *mult.get(row_index).unwrap_or(&PackedM31::zero());
             *row[0] = mult_at_row;
-            *lookup_data.mults = mult_at_row;
+            *lookup_data.mults_0 = mult_at_row;
         });
 
     (trace, lookup_data)
@@ -88,8 +87,8 @@ fn write_trace_simd(
 
 #[derive(Uninitialized, IterMut, ParIterMut)]
 struct LookupData {
-    range_check_6_0: Vec<[PackedM31; 1]>,
-    mults: Vec<PackedM31>,
+    range_check_6_0: Vec<[PackedM31; 2]>,
+    mults_0: Vec<PackedM31>,
 }
 
 pub struct InteractionClaimGenerator {
@@ -98,28 +97,29 @@ pub struct InteractionClaimGenerator {
 impl InteractionClaimGenerator {
     pub fn write_interaction_trace(
         self,
-        tree_builder: &mut impl TreeBuilder<SimdBackend>,
-        range_check_6: &relations::RangeCheck_6,
-    ) -> InteractionClaim {
-        let mut logup_gen = LogupTraceGenerator::new(LOG_SIZE);
+        common_lookup_elements: &relations::CommonLookupElements,
+    ) -> (
+        Vec<CircleEvaluation<SimdBackend, M31, BitReversedOrder>>,
+        InteractionClaim,
+    ) {
+        let mut logup_gen = unsafe { LogupTraceGenerator::uninitialized(LOG_SIZE) };
 
         // Sum last logup term.
         let mut col_gen = logup_gen.new_col();
         (
             col_gen.par_iter_mut(),
             &self.lookup_data.range_check_6_0,
-            self.lookup_data.mults,
+            self.lookup_data.mults_0,
         )
             .into_par_iter()
-            .for_each(|(writer, values, mults)| {
-                let denom = range_check_6.combine(values);
-                writer.write_frac(-PackedQM31::one() * mults, denom);
+            .for_each(|(writer, values, mults_0)| {
+                let denom = common_lookup_elements.combine(values);
+                writer.write_frac(-PackedQM31::one() * mults_0, denom);
             });
         col_gen.finalize_col();
 
         let (trace, claimed_sum) = logup_gen.finalize_last();
-        tree_builder.extend_evals(trace);
 
-        InteractionClaim { claimed_sum }
+        (trace, InteractionClaim { claimed_sum })
     }
 }

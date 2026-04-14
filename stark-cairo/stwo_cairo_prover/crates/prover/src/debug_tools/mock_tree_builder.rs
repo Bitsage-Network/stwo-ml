@@ -44,7 +44,7 @@ pub struct MockTreeBuilder<'a> {
 impl MockTreeBuilder<'_> {
     pub fn extend_evals<B: Backend>(
         &mut self,
-        columns: impl IntoIterator<Item = CircleEvaluation<B, M31, BitReversedOrder>>,
+        columns: Vec<CircleEvaluation<B, M31, BitReversedOrder>>,
     ) {
         self.evals
             .extend(columns.into_iter().map(|s| s.to_cpu()).collect_vec());
@@ -58,7 +58,7 @@ impl MockTreeBuilder<'_> {
 impl<B: Backend> TreeBuilder<B> for MockTreeBuilder<'_> {
     fn extend_evals(
         &mut self,
-        columns: impl IntoIterator<Item = CircleEvaluation<B, M31, BitReversedOrder>>,
+        columns: Vec<CircleEvaluation<B, M31, BitReversedOrder>>,
     ) -> TreeSubspan {
         let col_start = self.evals.len();
         let tree_index = self.tree_index;
@@ -84,7 +84,7 @@ mod tests {
     use stwo_cairo_common::prover_types::simd::PackedUInt32;
 
     use super::MockCommitmentScheme;
-    use crate::witness::components::{triple_xor_32, verify_bitwise_xor_8, verify_bitwise_xor_8_b};
+    use crate::witness::components::{triple_xor_32, verify_bitwise_xor_8};
 
     #[test]
     fn test_mock_commitment_scheme() {
@@ -95,13 +95,9 @@ mod tests {
         let preprocessed_trace = Arc::new(PreProcessedTrace::canonical());
         let veirfy_bitwise_xor_8_trace_gen =
             &verify_bitwise_xor_8::ClaimGenerator::new(Arc::clone(&preprocessed_trace));
-        let veirfy_bitwise_xor_8_b_trace_gen =
-            &verify_bitwise_xor_8_b::ClaimGenerator::new(Arc::clone(&preprocessed_trace));
         let mut triple_xor_32_trace_gen = triple_xor_32::ClaimGenerator::new();
-        triple_xor_32_trace_gen.add_packed_inputs(&[input]);
-        let triple_xor_relation = relations::TripleXor32::dummy();
-        let verify_bitwise_xor_8_relation = relations::VerifyBitwiseXor_8::dummy();
-        let verify_bitwise_xor_8_b_relation = relations::VerifyBitwiseXor_8_B::dummy();
+        triple_xor_32_trace_gen.add_packed_inputs(&[input], 0);
+        let common_lookup_elements = relations::CommonLookupElements::dummy();
 
         let mut mock_commitment_scheme = MockCommitmentScheme::default();
 
@@ -110,21 +106,15 @@ mod tests {
         let mut mock_tree_builder = mock_commitment_scheme.tree_builder();
 
         // Base trace.
-        let (_, interaction_gen) = triple_xor_32_trace_gen.write_trace(
-            &mut mock_tree_builder,
-            veirfy_bitwise_xor_8_trace_gen,
-            veirfy_bitwise_xor_8_b_trace_gen,
-        );
+        let (trace, _, interaction_gen) =
+            triple_xor_32_trace_gen.write_trace(veirfy_bitwise_xor_8_trace_gen);
+        mock_tree_builder.extend_evals(trace.to_evals());
         mock_tree_builder.finalize_interaction();
         let mut mock_tree_builder = mock_commitment_scheme.tree_builder();
 
         // Interaction trace.
-        interaction_gen.write_interaction_trace(
-            &mut mock_tree_builder,
-            &verify_bitwise_xor_8_relation,
-            &verify_bitwise_xor_8_b_relation,
-            &triple_xor_relation,
-        );
+        let (trace, _) = interaction_gen.write_interaction_trace(&common_lookup_elements);
+        mock_tree_builder.extend_evals(trace);
         mock_tree_builder.finalize_interaction();
         let trace = mock_commitment_scheme.trace_domain_evaluations();
 

@@ -1,23 +1,22 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use cairo_air::air::CairoClaim;
-use cairo_air::PreProcessedTraceVariant;
+use bytemuck::Zeroable;
+use cairo_air::claims::CairoClaim;
 use itertools::Itertools;
 use num_traits::{One, Zero};
 use stwo::core::channel::MerkleChannel;
 use stwo::core::fields::m31::M31;
 use stwo::core::pcs::{TreeSubspan, TreeVec};
-use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
-use stwo::core::vcs_lifted::MerkleHasherLifted;
-use stwo::prover::backend::simd::column::BaseColumn;
+use stwo::core::vcs_lifted::blake2_merkle::{Blake2sM31MerkleChannel, Blake2sMerkleChannel};
 use stwo::prover::backend::simd::conversion::Pack;
-use stwo::prover::backend::simd::m31::{PackedM31, N_LANES};
+use stwo::prover::backend::simd::m31::{PackedBaseField, PackedM31, LOG_N_LANES, N_LANES};
 use stwo::prover::backend::{Backend, BackendForChannel};
 use stwo::prover::poly::circle::CircleEvaluation;
 use stwo::prover::poly::BitReversedOrder;
-use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTrace;
-use stwo_cairo_common::prover_types::simd::LOG_N_LANES;
+use stwo_cairo_common::preprocessed_columns::preprocessed_trace::{
+    PreProcessedTrace, PreProcessedTraceVariant,
+};
 use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 use stwo_constraint_framework::PREPROCESSED_TRACE_IDX;
 
@@ -33,33 +32,31 @@ pub fn pack_values<T: Pack>(values: &[T]) -> Vec<T::SimdType> {
 /// A column of multiplicities for lookup arguments. Allows increasing the multiplicity at a given
 /// index. This version uses atomic operations to increase the multiplicity, and is `Send`.
 pub struct AtomicMultiplicityColumn {
-    data: Vec<AtomicU32>,
+    data: Vec<PackedM31>,
 }
 impl AtomicMultiplicityColumn {
     /// Creates a new `AtomicMultiplicityColumn` with the given size. The elements are initialized
     /// to 0.
     pub fn new(size: usize) -> Self {
         Self {
-            data: (0..size as u32).map(|_| AtomicU32::new(0)).collect(),
+            data: vec![PackedBaseField::zeroed(); size.div_ceil(N_LANES)],
         }
     }
 
+    /// Atomically increments the multiplicity address by 1.
+    ///
+    /// # Safety
+    /// Caller must ensure `address` is in bounds for the column (no bounds check is performed).
     pub fn increase_at(&self, address: u32) {
-        self.data[address as usize].fetch_add(1, Ordering::Relaxed);
+        let ptr = unsafe { (self.data.as_ptr() as *mut u32).add(address as usize) };
+        unsafe { AtomicU32::from_ptr(ptr).fetch_add(1, Ordering::Relaxed) };
     }
 
     /// Returns the internal data as a Vec<PackedM31>. The last element of the vector is padded with
     /// zeros if needed. This function performs a copy on the inner data, If atomics are not
     /// necessary, use [`MultiplicityColumn`] instead.
     pub fn into_simd_vec(self) -> Vec<PackedM31> {
-        // Safe because the data is aligned to the size of PackedM31 and the size of the data is a
-        // multiple of N_LANES.
-        BaseColumn::from_iter(
-            self.data
-                .into_iter()
-                .map(|a| M31(a.load(Ordering::Relaxed))),
-        )
-        .data
+        self.data
     }
 }
 
@@ -97,7 +94,7 @@ impl Enabler {
 pub trait TreeBuilder<B: Backend> {
     fn extend_evals(
         &mut self,
-        columns: impl IntoIterator<Item = CircleEvaluation<B, M31, BitReversedOrder>>,
+        columns: Vec<CircleEvaluation<B, M31, BitReversedOrder>>,
     ) -> TreeSubspan;
 }
 
@@ -106,9 +103,9 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> TreeBuilder<B>
 {
     fn extend_evals(
         &mut self,
-        columns: impl IntoIterator<Item = CircleEvaluation<B, M31, BitReversedOrder>>,
+        columns: Vec<CircleEvaluation<B, M31, BitReversedOrder>>,
     ) -> TreeSubspan {
-        self.extend_evals(columns.into_iter().collect())
+        self.extend_evals(columns)
     }
 }
 
@@ -127,21 +124,9 @@ fn tree_trace_cells(tree_log_sizes: TreeVec<Vec<u32>>) -> Vec<u64> {
 /// Preprocess trace is determined by the `pp_trace` parameter (and not by the claim).
 pub fn witness_trace_cells(claim: &CairoClaim, pp_trace: &PreProcessedTrace) -> Vec<u64> {
     let mut log_sizes = claim.log_sizes();
-    log_sizes[PREPROCESSED_TRACE_IDX] = pp_trace.log_sizes();
+    log_sizes.insert(PREPROCESSED_TRACE_IDX, pp_trace.log_sizes());
 
     tree_trace_cells(log_sizes)
-}
-
-fn get_preprocessed_roots<MC: MerkleChannel>(
-    max_log_blowup_factor: u32,
-    preprocessed_trace: PreProcessedTraceVariant,
-) -> Vec<<MC::H as MerkleHasherLifted>::Hash>
-where
-    stwo::prover::backend::simd::SimdBackend: BackendForChannel<MC>,
-{
-    (1..=max_log_blowup_factor)
-        .map(|i| generate_preprocessed_commitment_root::<MC>(i, preprocessed_trace))
-        .collect_vec()
 }
 
 /// Exports the preprocessed roots for both Blake2s and Poseidon252 channels.
@@ -150,12 +135,13 @@ where
 pub fn export_preprocessed_roots() {
     let max_log_blowup_factor = 2;
 
-    // Blake2s roots.
-    let blake_roots = get_preprocessed_roots::<Blake2sMerkleChannel>(
-        max_log_blowup_factor,
-        PreProcessedTraceVariant::Canonical,
-    );
-    blake_roots.iter().enumerate().for_each(|(i, root)| {
+    // Blake2s roots
+    for log_blowup_factor in 1..=max_log_blowup_factor {
+        let root = generate_preprocessed_commitment_root::<Blake2sMerkleChannel>(
+            log_blowup_factor,
+            PreProcessedTraceVariant::Canonical,
+            None,
+        );
         let root_bytes = root.0;
         let u32s_hex = root_bytes
             .array_chunks::<4>()
@@ -163,27 +149,46 @@ pub fn export_preprocessed_roots() {
             .collect_vec()
             .join(", ");
 
-        println!("log_blowup_factor: {}, blake root: [{}]", i + 1, u32s_hex);
-    });
+        println!("log_blowup_factor: {log_blowup_factor}, blake root: [{u32s_hex}]");
+    }
 
     // Poseidon252 roots.
     #[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
     {
         use stwo::core::vcs_lifted::poseidon252_merkle::Poseidon252MerkleChannel;
         // Poseidon252 roots.
-        get_preprocessed_roots::<Poseidon252MerkleChannel>(
-            max_log_blowup_factor,
-            PreProcessedTraceVariant::CanonicalWithoutPedersen,
-        )
-        .into_iter()
-        .enumerate()
-        .for_each(|(i, root)| {
-            println!(
-                "log_blowup_factor: {}, poseidon root: [{:#010x}]",
-                i + 1,
-                root
+        for log_blowup_factor in 1..=max_log_blowup_factor {
+            let root = generate_preprocessed_commitment_root::<Poseidon252MerkleChannel>(
+                log_blowup_factor,
+                PreProcessedTraceVariant::CanonicalWithoutPedersen,
+                None,
             );
-        });
+            println!("log_blowup_factor: {log_blowup_factor}, poseidon root: [{root:#010x}]");
+        }
+    }
+}
+
+/// Exports the preprocessed roots for the circuit cairo verifier.
+/// Note: This function is very slow and is intended for generating the preprocessed roots when
+/// needed.
+pub fn export_circuit_cairo_verifier_preprocessed_roots() {
+    let max_log_blowup_factor = 3;
+
+    for log_blowup_factor in 1..=max_log_blowup_factor {
+        let root = generate_preprocessed_commitment_root::<Blake2sM31MerkleChannel>(
+            log_blowup_factor,
+            PreProcessedTraceVariant::CanonicalSmall,
+            Some(20 + log_blowup_factor),
+        );
+
+        let root_bytes = root.0;
+        let u32s = root_bytes
+            .array_chunks::<4>()
+            .map(|&bytes| format!("{:}", u32::from_le_bytes(bytes)))
+            .collect_vec()
+            .join(", ");
+
+        println!("log_blowup_factor: {log_blowup_factor}, blake root: [{u32s}]");
     }
 }
 

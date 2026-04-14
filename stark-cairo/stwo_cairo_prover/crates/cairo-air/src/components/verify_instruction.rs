@@ -26,11 +26,7 @@ pub const RELATION_USES_PER_ROW: [RelationUse; 4] = [
 
 pub struct Eval {
     pub claim: Claim,
-    pub range_check_7_2_5_lookup_elements: relations::RangeCheck_7_2_5,
-    pub range_check_4_3_lookup_elements: relations::RangeCheck_4_3,
-    pub memory_address_to_id_lookup_elements: relations::MemoryAddressToId,
-    pub memory_id_to_big_lookup_elements: relations::MemoryIdToBig,
-    pub verify_instruction_lookup_elements: relations::VerifyInstruction,
+    pub common_lookup_elements: relations::CommonLookupElements,
 }
 
 #[derive(Copy, Clone, Serialize, Deserialize, CairoSerialize, CairoDeserialize)]
@@ -41,22 +37,13 @@ impl Claim {
     pub fn log_sizes(&self) -> TreeVec<Vec<u32>> {
         let trace_log_sizes = vec![self.log_size; N_TRACE_COLUMNS];
         let interaction_log_sizes = vec![self.log_size; SECURE_EXTENSION_DEGREE * 3];
-        TreeVec::new(vec![vec![], trace_log_sizes, interaction_log_sizes])
-    }
-
-    pub fn mix_into(&self, channel: &mut impl Channel) {
-        channel.mix_u64(self.log_size as u64);
+        TreeVec::new(vec![trace_log_sizes, interaction_log_sizes])
     }
 }
 
 #[derive(Copy, Clone, Serialize, Deserialize, CairoSerialize, CairoDeserialize)]
 pub struct InteractionClaim {
     pub claimed_sum: SecureField,
-}
-impl InteractionClaim {
-    pub fn mix_into(&self, channel: &mut impl Channel) {
-        channel.mix_felts(&[self.claimed_sum]);
-    }
 }
 
 pub type Component = FrameworkComponent<Eval>;
@@ -75,6 +62,7 @@ impl FrameworkEval for Eval {
     #[allow(non_snake_case)]
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
         let M31_0 = E::F::from(M31::from(0));
+        let M31_1719106205 = E::F::from(M31::from(1719106205));
         let input_pc_col0 = eval.next_trace_mask();
         let input_offset0_col1 = eval.next_trace_mask();
         let input_offset1_col2 = eval.next_trace_mask();
@@ -91,7 +79,7 @@ impl FrameworkEval for Eval {
         let offset2_mid_col13 = eval.next_trace_mask();
         let offset2_high_col14 = eval.next_trace_mask();
         let instruction_id_col15 = eval.next_trace_mask();
-        let multiplicity = eval.next_trace_mask();
+        let multiplicity_0_col16 = eval.next_trace_mask();
 
         #[allow(clippy::unused_unit)]
         #[allow(unused_variables)]
@@ -110,8 +98,7 @@ impl FrameworkEval for Eval {
                 offset2_low_col12.clone(),
                 offset2_mid_col13.clone(),
                 offset2_high_col14.clone(),
-                &self.range_check_7_2_5_lookup_elements,
-                &self.range_check_4_3_lookup_elements,
+                &self.common_lookup_elements,
                 &mut eval,
             );
         MemVerify::evaluate(
@@ -147,14 +134,14 @@ impl FrameworkEval for Eval {
                 M31_0.clone(),
             ],
             instruction_id_col15.clone(),
-            &self.memory_address_to_id_lookup_elements,
-            &self.memory_id_to_big_lookup_elements,
+            &self.common_lookup_elements,
             &mut eval,
         );
         eval.add_to_relation(RelationEntry::new(
-            &self.verify_instruction_lookup_elements,
-            -E::EF::from(multiplicity),
+            &self.common_lookup_elements,
+            -E::EF::from(multiplicity_0_col16.clone()),
             &[
+                M31_1719106205.clone(),
                 input_pc_col0.clone(),
                 input_offset0_col1.clone(),
                 input_offset1_col2.clone(),
@@ -186,11 +173,7 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(0);
         let eval = Eval {
             claim: Claim { log_size: 4 },
-            range_check_7_2_5_lookup_elements: relations::RangeCheck_7_2_5::dummy(),
-            range_check_4_3_lookup_elements: relations::RangeCheck_4_3::dummy(),
-            memory_address_to_id_lookup_elements: relations::MemoryAddressToId::dummy(),
-            memory_id_to_big_lookup_elements: relations::MemoryIdToBig::dummy(),
-            verify_instruction_lookup_elements: relations::VerifyInstruction::dummy(),
+            common_lookup_elements: relations::CommonLookupElements::dummy(),
         };
         let expr_eval = eval.evaluate(ExprEvaluator::new());
         let assignment = expr_eval.random_assignment();
@@ -200,6 +183,6 @@ mod tests {
             sum += c.assign(&assignment) * rng.gen::<QM31>();
         }
 
-        assert_eq!(sum, VERIFY_INSTRUCTION);
+        VERIFY_INSTRUCTION.assert_debug_eq(&sum);
     }
 }

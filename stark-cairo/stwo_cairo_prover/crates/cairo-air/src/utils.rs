@@ -1,3 +1,4 @@
+use std::array;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -6,15 +7,21 @@ use bzip2::read::BzDecoder;
 use bzip2::write::BzEncoder;
 use bzip2::Compression;
 use clap::ValueEnum;
+use itertools::Itertools;
+use num_traits::Zero;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use stwo::core::fields::m31::BaseField;
+use stwo::core::fields::qm31::{SecureField, SECURE_EXTENSION_DEGREE};
+use stwo::core::pcs::TreeVec;
 use stwo::core::vcs::blake2_hash::Blake2sHasher;
 use stwo::core::vcs_lifted::MerkleHasherLifted;
 use stwo_cairo_serialize::{CairoDeserialize, CairoSerialize};
+use stwo_constraint_framework::{INTERACTION_TRACE_IDX, ORIGINAL_TRACE_IDX};
 use tracing::{span, Level};
 
-use crate::air::{MemorySection, PublicMemory};
-use crate::CairoProof;
+use crate::air::{CairoProof, MemorySection, PublicMemory};
+use crate::CairoProofForRustVerifier;
 
 mod json {
     #[cfg(any(target_arch = "wasm32", target_arch = "wasm64"))]
@@ -37,6 +44,43 @@ pub enum ProofFormat {
     /// Binary format.
     /// Additionally compressed to minimize the proof size.
     Binary,
+    /// Extended binary format.
+    ExtendedBinary,
+}
+
+pub fn pack_into_secure_felts<T: Into<BaseField>>(
+    values: impl Iterator<Item = T>,
+) -> Vec<SecureField> {
+    values
+        .chunks(SECURE_EXTENSION_DEGREE)
+        .into_iter()
+        .map(|mut chunk| {
+            SecureField::from_m31_array(array::from_fn(|_| {
+                chunk.next().map(|v| v.into()).unwrap_or(BaseField::zero())
+            }))
+        })
+        .collect_vec()
+}
+
+pub fn binary_serialize_to_file<T: Serialize>(
+    obj: &T,
+    proof_file: &File,
+) -> Result<(), std::io::Error> {
+    let serialized_bytes = bincode::serialize(&obj).map_err(std::io::Error::other)?;
+
+    let mut bz_encoder = BzEncoder::new(proof_file, Compression::best());
+    bz_encoder.write_all(&serialized_bytes)?;
+    bz_encoder.finish()?;
+    Ok(())
+}
+
+pub fn binary_deserialize_from_file<T: DeserializeOwned>(
+    proof_file: &File,
+) -> Result<T, std::io::Error> {
+    let mut bytes = Vec::new();
+    let mut bz_decoder = BzDecoder::new(proof_file);
+    bz_decoder.read_to_end(&mut bytes)?;
+    bincode::deserialize(&bytes).map_err(std::io::Error::other)
 }
 
 /// Serializes Cairo proof given the desired format and writes it to a file.
@@ -54,7 +98,8 @@ where
 
     match proof_format {
         ProofFormat::Json => {
-            proof_file.write_all(json::to_string_pretty(proof)?.as_bytes())?;
+            let proof_for_rust_verifier: CairoProofForRustVerifier<_> = proof.clone().into();
+            proof_file.write_all(json::to_string_pretty(&proof_for_rust_verifier)?.as_bytes())?;
         }
         ProofFormat::CairoSerde => {
             let mut serialized: Vec<starknet_ff::FieldElement> = Vec::new();
@@ -68,11 +113,11 @@ where
             proof_file.write_all(json::to_string_pretty(&hex_strings)?.as_bytes())?;
         }
         ProofFormat::Binary => {
-            let serialized_bytes = bincode::serialize(proof).map_err(std::io::Error::other)?;
-
-            let mut bz_encoder = BzEncoder::new(proof_file, Compression::best());
-            bz_encoder.write_all(&serialized_bytes)?;
-            bz_encoder.finish()?;
+            let proof_for_rust_verifier: CairoProofForRustVerifier<_> = proof.clone().into();
+            binary_serialize_to_file(&proof_for_rust_verifier, &proof_file)?;
+        }
+        ProofFormat::ExtendedBinary => {
+            binary_serialize_to_file(&proof, &proof_file)?;
         }
     }
 
@@ -80,11 +125,11 @@ where
     Ok(())
 }
 
-/// Deserializes Cairo proof from a file given the desired format.
+/// Loads a Cairo proof for the Rust verifier from a file in the specified format.
 pub fn deserialize_proof_from_file<H: MerkleHasherLifted + DeserializeOwned>(
     proof_path: &Path,
     proof_format: ProofFormat,
-) -> Result<CairoProof<H>, std::io::Error>
+) -> Result<CairoProofForRustVerifier<H>, std::io::Error>
 where
     H::Hash: CairoDeserialize,
 {
@@ -94,17 +139,16 @@ where
             json::from_str(&proof_str).map_err(std::io::Error::other)
         }
         ProofFormat::CairoSerde => {
-            let proof_str = std::fs::read_to_string(proof_path)?;
-            let felts: Vec<starknet_ff::FieldElement> =
-                json::from_str(&proof_str).map_err(std::io::Error::other)?;
-            Ok(CairoDeserialize::deserialize(&mut felts.iter()))
+            panic!("Deserialization from a Cairo-serialized proof is not supported.");
         }
         ProofFormat::Binary => {
             let proof_file = File::open(proof_path)?;
-            let mut proof_bytes = Vec::new();
-            let mut bz_decoder = BzDecoder::new(proof_file);
-            bz_decoder.read_to_end(&mut proof_bytes)?;
-            bincode::deserialize(&proof_bytes).map_err(std::io::Error::other)
+            binary_deserialize_from_file(&proof_file)
+        }
+        ProofFormat::ExtendedBinary => {
+            let proof_file = File::open(proof_path)?;
+            let extended_proof: CairoProof<H> = binary_deserialize_from_file(&proof_file)?;
+            Ok(extended_proof.into())
         }
     }
 }
@@ -182,9 +226,63 @@ pub fn encode_felt_in_limbs(felt: [u32; 8]) -> Vec<u32> {
     }
 }
 
+/// A utility function which transforms the order and layout of the queried values of a stwo proof
+/// according to the format expected by the Cairo verifier.
+pub fn sort_and_transpose_queried_values(
+    queried_values: &TreeVec<Vec<Vec<BaseField>>>,
+    trace_and_interaction_trace_log_sizes: Vec<&[u32]>,
+) -> TreeVec<Vec<BaseField>> {
+    debug_assert!(trace_and_interaction_trace_log_sizes.len() == 2);
+
+    let mut new_queried_values_per_tree = vec![];
+    let n_queries = queried_values[0][0].len();
+    // Transpose the preprocessed queried values. The preprocessed columns are already sorted in
+    // ascending order so there is no need to sort the values.
+    let pp_queried_values = &queried_values.first().unwrap();
+    let mut new_queried_values: Vec<BaseField> = vec![];
+    for row_idx in 0..n_queries {
+        new_queried_values.extend(pp_queried_values.iter().map(|vals| vals[row_idx]));
+    }
+    new_queried_values_per_tree.push(new_queried_values);
+
+    // Sort and transpose the queried values of the base trace and interaction trace.
+    for (queried_values, col_sizes) in queried_values[ORIGINAL_TRACE_IDX..=INTERACTION_TRACE_IDX]
+        .iter()
+        .zip_eq(trace_and_interaction_trace_log_sizes.iter())
+    {
+        let mut new_queried_values = vec![];
+        let mut sorted_queries: Vec<_> = queried_values
+            .iter()
+            .zip_eq(col_sizes.iter())
+            .sorted_by_key(|(_, col_size)| *col_size)
+            .map(|(vals, _)| vals.iter())
+            .collect();
+        for _ in 0..n_queries {
+            new_queried_values.extend(
+                sorted_queries
+                    .iter_mut()
+                    .map(|col_iter| *col_iter.next().unwrap()),
+            );
+        }
+        new_queried_values_per_tree.push(new_queried_values)
+    }
+
+    // Transpose the queried values of the composition polynomial commitment. All columns
+    // in the composition commitment are of the same length so there is no need to sort.
+    let composition_queried_values = &queried_values.last().unwrap();
+    let mut new_queried_values: Vec<BaseField> = vec![];
+    for row_idx in 0..n_queries {
+        new_queried_values.extend(composition_queried_values.iter().map(|vals| vals[row_idx]));
+    }
+    new_queried_values_per_tree.push(new_queried_values);
+    TreeVec(new_queried_values_per_tree)
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::utils::{construct_f252, encode_and_hash_memory_section, encode_felt_in_limbs};
+    use stwo::core::fields::m31::M31;
+
+    use super::*;
 
     #[test]
     fn test_encode_felt_in_limbs() {
@@ -242,71 +340,76 @@ mod tests {
         .unwrap();
         assert_eq!(construct_f252(&limbs), expected);
     }
-}
-
-#[cfg(test)]
-#[cfg(feature = "slow-tests")]
-mod slow_tests {
-    use dev_utils::utils::get_proof_file_path;
-    use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasher;
-    use tempfile::NamedTempFile;
-
-    use super::*;
 
     #[test]
-    fn test_serialize_and_deserialize_proof() {
-        let proof_path = get_proof_file_path("test_prove_verify_all_opcode_components");
-        let mut proof = deserialize_proof_from_file::<Blake2sMerkleHasher>(
-            &proof_path,
-            ProofFormat::CairoSerde,
-        )
-        .expect("Failed to deserialize proof (CairoSerde)");
-
-        let temp_json_file = NamedTempFile::new().expect("Failed to create temp file");
-        serialize_proof_to_file::<Blake2sMerkleHasher>(
-            &proof,
-            temp_json_file.path(),
-            ProofFormat::Json,
-        )
-        .expect("Failed to serialize proof (Json)");
-
-        proof = deserialize_proof_from_file::<Blake2sMerkleHasher>(
-            temp_json_file.path(),
-            ProofFormat::Json,
-        )
-        .expect("Failed to deserialize proof (Json)");
-
-        let temp_binary_file = NamedTempFile::new().expect("Failed to create temp file");
-        serialize_proof_to_file::<Blake2sMerkleHasher>(
-            &proof,
-            temp_binary_file.path(),
-            ProofFormat::Binary,
-        )
-        .expect("Failed to serialize proof (Binary)");
-
-        proof = deserialize_proof_from_file::<Blake2sMerkleHasher>(
-            temp_binary_file.path(),
-            ProofFormat::Binary,
-        )
-        .expect("Failed to deserialize proof (Binary)");
-
-        let temp_serde_file = NamedTempFile::new().expect("Failed to create temp file");
-        serialize_proof_to_file::<Blake2sMerkleHasher>(
-            &proof,
-            temp_serde_file.path(),
-            ProofFormat::CairoSerde,
-        )
-        .expect("Failed to serialize proof (CairoSerde)");
-
-        // Verify the final serialized proof matches the original by comparing JSON strings
-        let final_json = std::fs::read_to_string(temp_serde_file.path())
-            .expect("Failed to read final proof file");
-        let original_json =
-            std::fs::read_to_string(&proof_path).expect("Failed to read original proof file");
+    fn test_sort_queried_values() {
+        let trace_and_interaction_trace_log_sizes = [vec![4, 3, 2, 1], vec![4, 1, 3, 2]];
+        let trace_and_interaction_trace_log_sizes: Vec<&[u32]> =
+            trace_and_interaction_trace_log_sizes
+                .iter()
+                .map(|v| v.as_slice())
+                .collect();
+        let unsorted_queried_values = TreeVec(vec![
+            vec![
+                vec![M31::from(1), M31::from(2)],
+                vec![M31::from(3), M31::from(4)],
+                vec![M31::from(5), M31::from(6)],
+            ],
+            vec![
+                vec![M31::from(1), M31::from(2)],
+                vec![M31::from(3), M31::from(4)],
+                vec![M31::from(5), M31::from(6)],
+                vec![M31::from(7), M31::from(8)],
+            ],
+            vec![
+                vec![M31::from(1), M31::from(2)],
+                vec![M31::from(3), M31::from(4)],
+                vec![M31::from(5), M31::from(6)],
+                vec![M31::from(7), M31::from(8)],
+            ],
+            vec![vec![M31::from(1), M31::from(2)]; 8],
+        ]);
+        let sorted_queried_values = TreeVec(vec![
+            vec![
+                M31::from(1),
+                M31::from(3),
+                M31::from(5),
+                M31::from(2),
+                M31::from(4),
+                M31::from(6),
+            ],
+            vec![
+                M31::from(7),
+                M31::from(5),
+                M31::from(3),
+                M31::from(1),
+                M31::from(8),
+                M31::from(6),
+                M31::from(4),
+                M31::from(2),
+            ],
+            vec![
+                M31::from(3),
+                M31::from(7),
+                M31::from(5),
+                M31::from(1),
+                M31::from(4),
+                M31::from(8),
+                M31::from(6),
+                M31::from(2),
+            ],
+            [[M31::from(1); 8], [M31::from(2); 8]].concat(),
+        ]);
 
         assert_eq!(
-            final_json, original_json,
-            "Final serialized proof should match the original proof"
+            sorted_queried_values.0,
+            sort_and_transpose_queried_values(
+                &unsorted_queried_values,
+                trace_and_interaction_trace_log_sizes
+            )
+            .0
         );
     }
+
+    // TODO(Leo): add tests for serializing and deserializing the proof for rust verifier.
 }

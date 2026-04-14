@@ -8,7 +8,7 @@ pub const RELATION_USES_PER_ROW: [RelationUse; 0] = [];
 
 pub struct Eval {
     pub claim: Claim,
-    pub poseidon_round_keys_lookup_elements: relations::PoseidonRoundKeys,
+    pub common_lookup_elements: relations::CommonLookupElements,
 }
 
 #[derive(Copy, Clone, Serialize, Deserialize, CairoSerialize, CairoDeserialize)]
@@ -17,20 +17,13 @@ impl Claim {
     pub fn log_sizes(&self) -> TreeVec<Vec<u32>> {
         let trace_log_sizes = vec![LOG_SIZE; N_TRACE_COLUMNS];
         let interaction_log_sizes = vec![LOG_SIZE; SECURE_EXTENSION_DEGREE];
-        TreeVec::new(vec![vec![], trace_log_sizes, interaction_log_sizes])
+        TreeVec::new(vec![trace_log_sizes, interaction_log_sizes])
     }
-
-    pub fn mix_into(&self, _channel: &mut impl Channel) {}
 }
 
 #[derive(Copy, Clone, Serialize, Deserialize, CairoSerialize, CairoDeserialize)]
 pub struct InteractionClaim {
     pub claimed_sum: SecureField,
-}
-impl InteractionClaim {
-    pub fn mix_into(&self, channel: &mut impl Channel) {
-        channel.mix_felts(&[self.claimed_sum]);
-    }
 }
 
 pub type Component = FrameworkComponent<Eval>;
@@ -48,6 +41,7 @@ impl FrameworkEval for Eval {
     #[allow(clippy::double_parens)]
     #[allow(non_snake_case)]
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
+        let M31_1024310512 = E::F::from(M31::from(1024310512));
         let seq_6 = eval.get_preprocessed_column(PreProcessedColumnId {
             id: "seq_6".to_owned(),
         });
@@ -141,12 +135,13 @@ impl FrameworkEval for Eval {
         let poseidon_round_keys_29 = eval.get_preprocessed_column(PreProcessedColumnId {
             id: "poseidon_round_keys_29".to_owned(),
         });
-        let multiplicity = eval.next_trace_mask();
+        let multiplicity_0_col0 = eval.next_trace_mask();
 
         eval.add_to_relation(RelationEntry::new(
-            &self.poseidon_round_keys_lookup_elements,
-            -E::EF::from(multiplicity),
+            &self.common_lookup_elements,
+            -E::EF::from(multiplicity_0_col0.clone()),
             &[
+                M31_1024310512.clone(),
                 seq_6.clone(),
                 poseidon_round_keys_0.clone(),
                 poseidon_round_keys_1.clone(),
@@ -202,7 +197,7 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(0);
         let eval = Eval {
             claim: Claim {},
-            poseidon_round_keys_lookup_elements: relations::PoseidonRoundKeys::dummy(),
+            common_lookup_elements: relations::CommonLookupElements::dummy(),
         };
         let expr_eval = eval.evaluate(ExprEvaluator::new());
         let assignment = expr_eval.random_assignment();
@@ -212,6 +207,6 @@ mod tests {
             sum += c.assign(&assignment) * rng.gen::<QM31>();
         }
 
-        assert_eq!(sum, POSEIDON_ROUND_KEYS);
+        POSEIDON_ROUND_KEYS.assert_debug_eq(&sum);
     }
 }

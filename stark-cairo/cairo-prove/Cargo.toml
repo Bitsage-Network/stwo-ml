@@ -16,14 +16,15 @@ edition = "2021"
 
 [features]
 default = []
-gpu = ["stwo_cairo_prover/gpu"]
-cuda-runtime = ["gpu", "stwo_cairo_prover/cuda-runtime"]
+gpu = ["stwo-cairo-prover/gpu"]
+cuda-runtime = ["gpu", "stwo-cairo-prover/cuda-runtime"]
 
 [dependencies]
 # Local workspace dependencies (use our custom implementations)
 stwo-cairo-adapter = { path = "../stwo_cairo_prover/crates/adapter" }
-stwo_cairo_prover = { path = "../stwo_cairo_prover/crates/prover" }
+stwo-cairo-prover = { path = "../stwo_cairo_prover/crates/prover" }
 stwo-cairo-serialize = { path = "../stwo_cairo_prover/crates/cairo-serialize" }
+stwo-cairo-common = { path = "../stwo_cairo_prover/crates/common" }
 cairo-air = { path = "../stwo_cairo_prover/crates/cairo-air" }
 
 # Cairo language dependencies
@@ -42,8 +43,8 @@ cairo-lang-utils = "2.14.1-dev.0"
 # cairo-lang-casm = { git = "https://github.com/starkware-libs/cairo.git", rev = "5cc466a" }
 # cairo-lang-utils = { git = "https://github.com/starkware-libs/cairo.git", rev = "5cc466a" }
 
-# Cairo VM - must match workspace version for type compatibility
-cairo-vm = { version = "3.0.1", features = [
+# Cairo VM - must match stwo_cairo_prover workspace version for type compatibility
+cairo-vm = { version = "3.2.0", features = [
     "extensive_hints",
     "mod_builtin",
     "clap",

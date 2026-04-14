@@ -25,14 +25,16 @@ impl LinearCombinationN4Coefs11M21 {
         combination_limb_8_col8: E::F,
         combination_limb_9_col9: E::F,
         p_coef_col10: E::F,
-        range_check_3_3_3_3_3_lookup_elements: &relations::RangeCheck_3_3_3_3_3,
+        common_lookup_elements: &relations::CommonLookupElements,
         eval: &mut E,
     ) -> [E::F; 0] {
+        let M31_1 = E::F::from(M31::from(1));
         let M31_136 = E::F::from(M31::from(136));
         let M31_16 = E::F::from(M31::from(16));
         let M31_2 = E::F::from(M31::from(2));
         let M31_256 = E::F::from(M31::from(256));
         let M31_3 = E::F::from(M31::from(3));
+        let M31_502259093 = E::F::from(M31::from(502259093));
 
         let carry_0_tmp_db9cf_2 = eval.add_intermediate(
             ((((((linear_combination_n_4_coefs_1_1_m2_1_input_limb_0.clone()
@@ -129,9 +131,10 @@ impl LinearCombinationN4Coefs11M21 {
                 - (p_coef_col10.clone() * M31_256.clone())),
         );
         eval.add_to_relation(RelationEntry::new(
-            range_check_3_3_3_3_3_lookup_elements,
-            E::EF::one(),
+            common_lookup_elements,
+            E::EF::from(M31_1.clone()),
             &[
+                M31_502259093.clone(),
                 (p_coef_col10.clone() + M31_3.clone()),
                 (carry_0_tmp_db9cf_2.clone() + M31_3.clone()),
                 (carry_1_tmp_db9cf_3.clone() + M31_3.clone()),
@@ -141,9 +144,10 @@ impl LinearCombinationN4Coefs11M21 {
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            range_check_3_3_3_3_3_lookup_elements,
-            E::EF::one(),
+            common_lookup_elements,
+            E::EF::from(M31_1.clone()),
             &[
+                M31_502259093.clone(),
                 (carry_4_tmp_db9cf_6.clone() + M31_3.clone()),
                 (carry_5_tmp_db9cf_7.clone() + M31_3.clone()),
                 (carry_6_tmp_db9cf_8.clone() + M31_3.clone()),

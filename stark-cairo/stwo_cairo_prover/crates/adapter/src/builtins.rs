@@ -1,22 +1,19 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use cairo_vm::air_public_input::MemorySegmentAddresses as VMMemorySegmentAddresses;
-use cairo_vm::stdlib::collections::HashMap;
 use cairo_vm::types::builtin_name::BuiltinName;
 use cairo_vm::types::relocatable::MaybeRelocatable;
 use serde::{Deserialize, Serialize};
 use stwo_cairo_common::builtins::{
-    ADD_MOD_MEMORY_CELLS, BITWISE_MEMORY_CELLS, ECDSA_MEMORY_CELLS, EC_OP_MEMORY_CELLS,
-    KECCAK_MEMORY_CELLS, MUL_MOD_MEMORY_CELLS, OUTPUT_MEMORY_CELLS, PEDERSEN_MEMORY_CELLS,
-    POSEIDON_MEMORY_CELLS, RANGE_CHECK_MEMORY_CELLS,
+    ADD_MOD_BUILTIN_MEMORY_CELLS, BITWISE_BUILTIN_MEMORY_CELLS, ECDSA_MEMORY_CELLS,
+    EC_OP_BUILTIN_MEMORY_CELLS, KECCAK_MEMORY_CELLS, MUL_MOD_BUILTIN_MEMORY_CELLS,
+    OUTPUT_MEMORY_CELLS, PEDERSEN_BUILTIN_MEMORY_CELLS, POSEIDON_BUILTIN_MEMORY_CELLS,
+    RANGE_CHECK_96_BUILTIN_MEMORY_CELLS, RANGE_CHECK_BUILTIN_MEMORY_CELLS,
 };
-use stwo_cairo_common::prover_types::simd::N_LANES;
 use tracing::{info, span, Level};
 
-use super::memory::MemoryBuilder;
-
 // Minimal builtins instances per segment, chosen to fit SIMD requirements.
-pub const MIN_SEGMENT_SIZE: usize = N_LANES;
+pub const MIN_SEGMENT_SIZE: usize = 16;
 
 /// This is a copy of [`cairo_vm::air_public_input::MemorySegmentAddresses`] struct from cairo_vm.
 #[derive(Debug, Default, Serialize, Deserialize, Clone, Copy, PartialEq)]
@@ -38,14 +35,15 @@ impl From<VMMemorySegmentAddresses> for MemorySegmentAddresses {
 /// This struct holds the builtins used in a Cairo program.
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct BuiltinSegments {
-    pub add_mod: Option<MemorySegmentAddresses>,
-    pub bitwise: Option<MemorySegmentAddresses>,
+    pub add_mod_builtin: Option<MemorySegmentAddresses>,
+    pub bitwise_builtin: Option<MemorySegmentAddresses>,
     pub output: Option<MemorySegmentAddresses>,
-    pub mul_mod: Option<MemorySegmentAddresses>,
-    pub pedersen: Option<MemorySegmentAddresses>,
-    pub poseidon: Option<MemorySegmentAddresses>,
-    pub range_check_bits_96: Option<MemorySegmentAddresses>,
-    pub range_check_bits_128: Option<MemorySegmentAddresses>,
+    pub mul_mod_builtin: Option<MemorySegmentAddresses>,
+    pub pedersen_builtin: Option<MemorySegmentAddresses>,
+    pub poseidon_builtin: Option<MemorySegmentAddresses>,
+    pub range_check96_builtin: Option<MemorySegmentAddresses>,
+    pub range_check_builtin: Option<MemorySegmentAddresses>,
+    pub ec_op_builtin: Option<MemorySegmentAddresses>,
 }
 
 impl BuiltinSegments {
@@ -59,90 +57,67 @@ impl BuiltinSegments {
             );
         };
 
-        insert_builtin(BuiltinName::add_mod, &self.add_mod, ADD_MOD_MEMORY_CELLS);
-        insert_builtin(BuiltinName::bitwise, &self.bitwise, BITWISE_MEMORY_CELLS);
-        insert_builtin(BuiltinName::mul_mod, &self.mul_mod, MUL_MOD_MEMORY_CELLS);
-        insert_builtin(BuiltinName::pedersen, &self.pedersen, PEDERSEN_MEMORY_CELLS);
-        insert_builtin(BuiltinName::poseidon, &self.poseidon, POSEIDON_MEMORY_CELLS);
+        insert_builtin(
+            BuiltinName::add_mod,
+            &self.add_mod_builtin,
+            ADD_MOD_BUILTIN_MEMORY_CELLS,
+        );
+        insert_builtin(
+            BuiltinName::bitwise,
+            &self.bitwise_builtin,
+            BITWISE_BUILTIN_MEMORY_CELLS,
+        );
+        insert_builtin(
+            BuiltinName::mul_mod,
+            &self.mul_mod_builtin,
+            MUL_MOD_BUILTIN_MEMORY_CELLS,
+        );
+        insert_builtin(
+            BuiltinName::pedersen,
+            &self.pedersen_builtin,
+            PEDERSEN_BUILTIN_MEMORY_CELLS,
+        );
+        insert_builtin(
+            BuiltinName::poseidon,
+            &self.poseidon_builtin,
+            POSEIDON_BUILTIN_MEMORY_CELLS,
+        );
         insert_builtin(
             BuiltinName::range_check,
-            &self.range_check_bits_128,
-            RANGE_CHECK_MEMORY_CELLS,
+            &self.range_check_builtin,
+            RANGE_CHECK_BUILTIN_MEMORY_CELLS,
         );
         insert_builtin(
             BuiltinName::range_check96,
-            &self.range_check_bits_96,
-            RANGE_CHECK_MEMORY_CELLS,
+            &self.range_check96_builtin,
+            RANGE_CHECK_96_BUILTIN_MEMORY_CELLS,
+        );
+        insert_builtin(
+            BuiltinName::ec_op,
+            &self.ec_op_builtin,
+            EC_OP_BUILTIN_MEMORY_CELLS,
         );
         insert_builtin(BuiltinName::output, &self.output, OUTPUT_MEMORY_CELLS);
         counts
     }
 
-    /// Pads every builtin segment to the next power of 2, using copies of its last instance.
-    ///
-    /// # Panics
-    /// - if the remainder for the next power of 2 is not empty.
-    // Note: the last instance was already verified as valid by the VM and in the case of add_mod
-    // and mul_mod, security checks have verified that instance has n=1. Thus the padded segment
-    // satisfies all the AIR constraints.
-    // TODO (ohadn): relocate this function if a more appropriate place is found.
-    // TODO (Stav): remove when the new adapter flow is used.
-    pub fn pad_builtin_segments(&mut self, memory: &mut MemoryBuilder) {
-        if let Some(segment) = &self.add_mod {
-            self.add_mod = Some(pad_segment(
-                segment,
-                memory,
-                ADD_MOD_MEMORY_CELLS as u32,
-                Some("add_mod"),
-            ));
-        }
-        if let Some(segment) = &self.bitwise {
-            self.bitwise = Some(pad_segment(
-                segment,
-                memory,
-                BITWISE_MEMORY_CELLS as u32,
-                Some("bitwise"),
-            ));
-        }
-        if let Some(segment) = &self.mul_mod {
-            self.mul_mod = Some(pad_segment(
-                segment,
-                memory,
-                MUL_MOD_MEMORY_CELLS as u32,
-                Some("mul_mod"),
-            ));
-        }
-        if let Some(segment) = &self.pedersen {
-            self.pedersen = Some(pad_segment(
-                segment,
-                memory,
-                PEDERSEN_MEMORY_CELLS as u32,
-                Some("pedersen"),
-            ));
-        }
-        if let Some(segment) = &self.poseidon {
-            self.poseidon = Some(pad_segment(
-                segment,
-                memory,
-                POSEIDON_MEMORY_CELLS as u32,
-                Some("poseidon"),
-            ));
-        }
-        if let Some(segment) = &self.range_check_bits_96 {
-            self.range_check_bits_96 = Some(pad_segment(
-                segment,
-                memory,
-                RANGE_CHECK_MEMORY_CELLS as u32,
-                Some("range_check_96"),
-            ));
-        }
-        if let Some(segment) = &self.range_check_bits_128 {
-            self.range_check_bits_128 = Some(pad_segment(
-                segment,
-                memory,
-                RANGE_CHECK_MEMORY_CELLS as u32,
-                Some("range_check_128"),
-            ));
+    /// Returns the memory segment addresses for the given builtin name.
+    /// These names are not the same as the BuiltinName enum defined by the vm, as they include
+    /// "pedersen_builtin_narrow_windows", which is an alternative implementation for the pedersen
+    /// builtin.
+    pub fn get_segment_by_name(&self, name: &str) -> Option<MemorySegmentAddresses> {
+        match name {
+            "add_mod_builtin" => self.add_mod_builtin,
+            "bitwise_builtin" => self.bitwise_builtin,
+            "output" => self.output,
+            "mul_mod_builtin" => self.mul_mod_builtin,
+            "pedersen_builtin" => self.pedersen_builtin,
+            "pedersen_builtin_narrow_windows" => self.pedersen_builtin,
+            "poseidon_builtin" => self.poseidon_builtin,
+            "range_check96_builtin" => self.range_check96_builtin,
+            "range_check_builtin" => self.range_check_builtin,
+            "ec_op_builtin" => self.ec_op_builtin,
+            _ => panic!("Invalid builtin name: {name}"),
         }
     }
 
@@ -168,16 +143,16 @@ impl BuiltinSegments {
             }
 
             let cells_per_instance = match builtin_name {
-                BuiltinName::add_mod => ADD_MOD_MEMORY_CELLS,
-                BuiltinName::bitwise => BITWISE_MEMORY_CELLS,
-                BuiltinName::ec_op => EC_OP_MEMORY_CELLS,
+                BuiltinName::add_mod => ADD_MOD_BUILTIN_MEMORY_CELLS,
+                BuiltinName::bitwise => BITWISE_BUILTIN_MEMORY_CELLS,
+                BuiltinName::ec_op => EC_OP_BUILTIN_MEMORY_CELLS,
                 BuiltinName::ecdsa => ECDSA_MEMORY_CELLS,
                 BuiltinName::keccak => KECCAK_MEMORY_CELLS,
-                BuiltinName::mul_mod => MUL_MOD_MEMORY_CELLS,
-                BuiltinName::pedersen => PEDERSEN_MEMORY_CELLS,
-                BuiltinName::poseidon => POSEIDON_MEMORY_CELLS,
-                BuiltinName::range_check96 => RANGE_CHECK_MEMORY_CELLS,
-                BuiltinName::range_check => RANGE_CHECK_MEMORY_CELLS,
+                BuiltinName::mul_mod => MUL_MOD_BUILTIN_MEMORY_CELLS,
+                BuiltinName::pedersen => PEDERSEN_BUILTIN_MEMORY_CELLS,
+                BuiltinName::poseidon => POSEIDON_BUILTIN_MEMORY_CELLS,
+                BuiltinName::range_check96 => RANGE_CHECK_96_BUILTIN_MEMORY_CELLS,
+                BuiltinName::range_check => RANGE_CHECK_BUILTIN_MEMORY_CELLS,
                 _ => panic!("Invalid builtin name"),
             };
             assert!(
@@ -223,54 +198,6 @@ const MIN_N_INSTANCES_IN_BUILTIN_SEGMENT: u32 = 16;
 // Assert MIN_N_INSTANCES_IN_BUILTIN_SEGMENT is a power of 2.
 const _: () = assert!(MIN_N_INSTANCES_IN_BUILTIN_SEGMENT.is_power_of_two());
 
-/// Pads the given segment to the next power of 2, and at least MIN_N_INSTANCES_IN_BUILTIN_SEGMENT
-/// (in number of instances).
-// TODO (Stav): remove when the new adapter is used.
-fn pad_segment(
-    MemorySegmentAddresses {
-        begin_addr,
-        stop_ptr,
-    }: &MemorySegmentAddresses,
-    mem: &mut MemoryBuilder,
-    n_cells_per_instance: u32,
-    segment_name: Option<&str>,
-) -> MemorySegmentAddresses {
-    let (begin_addr, stop_ptr) = (*begin_addr as u32, *stop_ptr as u32);
-    let initial_length = stop_ptr - begin_addr;
-    assert!(initial_length > 0);
-    assert!(initial_length.is_multiple_of(n_cells_per_instance));
-    let num_instances = initial_length / n_cells_per_instance;
-    let padded_size = std::cmp::max(
-        MIN_N_INSTANCES_IN_BUILTIN_SEGMENT,
-        num_instances.next_power_of_two(),
-    );
-
-    let segment_name = segment_name.unwrap_or("<unnamed>");
-    log::info!("Padding segment {segment_name} of size {num_instances} to size {padded_size}");
-
-    // Verify that the segment we intend to pad is empty.
-    mem.assert_segment_is_empty(
-        stop_ptr,
-        (padded_size - num_instances) * n_cells_per_instance,
-    );
-
-    let mut instance_to_fill_start = stop_ptr;
-    let last_instance_start = stop_ptr - n_cells_per_instance;
-    for _ in num_instances..padded_size {
-        mem.copy_block(
-            last_instance_start,
-            instance_to_fill_start,
-            n_cells_per_instance,
-        );
-        instance_to_fill_start += n_cells_per_instance;
-    }
-    let stop_ptr = begin_addr + n_cells_per_instance * padded_size;
-    MemorySegmentAddresses {
-        begin_addr: begin_addr as usize,
-        stop_ptr: stop_ptr as usize,
-    }
-}
-
 /// Return the size of a memory segment.
 fn get_memory_segment_size(segment: &MemorySegmentAddresses) -> usize {
     segment.stop_ptr - segment.begin_addr
@@ -278,95 +205,8 @@ fn get_memory_segment_size(segment: &MemorySegmentAddresses) -> usize {
 
 #[cfg(test)]
 mod test_builtin_segments {
-    use test_case::test_case;
-
     use super::*;
-    use crate::builtins::BITWISE_MEMORY_CELLS;
-    use crate::memory::{u128_to_4_limbs, Memory, MemoryBuilder, MemoryConfig, MemoryValue};
-
-    /// Asserts that the values at addresses start_addr1 to start_addr1 + segment_length - 1
-    /// are equal to values at the addresses start_addr2 to start_addr2 + segment_length - 1.
-    pub fn assert_identical_blocks(
-        memory: &Memory,
-        start_addr1: u32,
-        start_addr2: u32,
-        segment_length: u32,
-    ) {
-        for i in 0..segment_length {
-            assert_eq!(memory.get(start_addr1 + i), memory.get(start_addr2 + i));
-        }
-    }
-
-    /// Initializes a memory builder with the given u128 values.
-    /// Places the value instance_example[i] at the address memory_write_start + i.
-    fn initialize_memory(memory_write_start: u32, instance_example: &[u128]) -> MemoryBuilder {
-        let memory_config = MemoryConfig::default();
-        let mut memory_builder = MemoryBuilder::new(memory_config.clone());
-        for (i, &value) in instance_example.iter().enumerate() {
-            let memory_value = if value <= memory_config.small_max {
-                MemoryValue::Small(value)
-            } else {
-                let x = u128_to_4_limbs(value);
-                MemoryValue::F252([x[0], x[1], x[2], x[3], 0, 0, 0, 0])
-            };
-            memory_builder.set(memory_write_start + i as u32, memory_value);
-        }
-        memory_builder
-    }
-
-    #[test_case(71, 128; "71->128")]
-    #[test_case(64, 64; "64->64")]
-    #[test_case(11, 16; "11->16")]
-    #[test_case(16, 16; "16->16")]
-    #[test_case(7, 16; "7->16")]
-    #[test_case(1, 16; "1->16")]
-    fn test_pad_builtin_segments(num_instances: usize, padded_num_instances: usize) {
-        let instance_example = [
-            123456789,
-            4385067362534966725237889432551,
-            50448645,
-            4385067362534966725237911992050,
-            4385067362534966725237962440695,
-        ];
-        let mut builtin_segments = BuiltinSegments::default();
-        let cells_per_instance = BITWISE_MEMORY_CELLS;
-        assert_eq!(cells_per_instance, instance_example.len());
-        let begin_addr = 23581;
-        let stop_ptr = begin_addr + cells_per_instance * num_instances;
-        builtin_segments.bitwise = Some(MemorySegmentAddresses {
-            begin_addr,
-            stop_ptr,
-        });
-        let memory_write_start = (stop_ptr - cells_per_instance) as u32;
-        let mut memory_builder = initialize_memory(memory_write_start, &instance_example);
-
-        builtin_segments.pad_builtin_segments(&mut memory_builder);
-
-        let &MemorySegmentAddresses {
-            begin_addr: new_begin_addr,
-            stop_ptr: new_stop_ptr,
-        } = builtin_segments.bitwise.as_ref().unwrap();
-        assert_eq!(new_begin_addr, begin_addr);
-        let segment_length = new_stop_ptr - new_begin_addr;
-        assert_eq!(segment_length % cells_per_instance, 0);
-        let new_num_instances = segment_length / cells_per_instance;
-        assert_eq!(new_num_instances, padded_num_instances);
-
-        let (memory, ..) = memory_builder.build();
-        assert_eq!(memory.address_to_id.len(), new_stop_ptr);
-
-        let mut instance_to_verify_start = stop_ptr as u32;
-        let last_instance_start = (stop_ptr - cells_per_instance) as u32;
-        for _ in num_instances..new_num_instances {
-            assert_identical_blocks(
-                &memory,
-                last_instance_start,
-                instance_to_verify_start,
-                cells_per_instance as u32,
-            );
-            instance_to_verify_start += cells_per_instance as u32;
-        }
-    }
+    use crate::builtins::BITWISE_BUILTIN_MEMORY_CELLS;
 
     #[test]
     fn test_pad_relocatble_builtin_segments() {
@@ -399,8 +239,8 @@ mod test_builtin_segments {
             &builtin_segments,
         );
 
-        assert!(relocatable_memory[0].len() == 32 * BITWISE_MEMORY_CELLS);
-        assert!(relocatable_memory[1].len() == 16 * EC_OP_MEMORY_CELLS);
+        assert!(relocatable_memory[0].len() == 32 * BITWISE_BUILTIN_MEMORY_CELLS);
+        assert!(relocatable_memory[1].len() == 16 * EC_OP_BUILTIN_MEMORY_CELLS);
         assert!(relocatable_memory[2].len() == 10);
 
         // Check that the values in the extended segment are identical to the original segment.
@@ -423,7 +263,7 @@ mod test_builtin_segments {
     )]
     fn test_builtin_segment_invalid_size() {
         let mul_mod_segment =
-            vec![Some(MaybeRelocatable::Int(7.into())); MUL_MOD_MEMORY_CELLS * 123 + 3];
+            vec![Some(MaybeRelocatable::Int(7.into())); MUL_MOD_BUILTIN_MEMORY_CELLS * 123 + 3];
         let mut relocatable_memory = [mul_mod_segment];
         let builtin_segments = BTreeMap::from([(0, BuiltinName::mul_mod)]);
 

@@ -1,19 +1,13 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
-use cairo_vm::stdlib::collections::HashMap;
 use cairo_vm::types::builtin_name::BuiltinName;
 use cairo_vm::types::relocatable::MaybeRelocatable;
 use cairo_vm::vm::trace::trace_entry::{RelocatedTraceEntry, TraceEntry};
 use stwo_cairo_common::memory::MEMORY_ADDRESS_BOUND;
-use stwo_cairo_common::prover_types::simd::N_LANES;
 use tracing::{span, Level};
 
-use crate::builtins::MemorySegmentAddresses;
-use crate::memory::MemoryEntry;
-use crate::BuiltinSegments;
-
-// Minimal builtins instances per segment, chosen to fit SIMD requirements.
-pub const MIN_SEGMENT_SIZE: usize = N_LANES;
+use super::builtins::{BuiltinSegments, MemorySegmentAddresses};
+use super::memory::MemoryEntry;
 
 #[derive(Debug, Clone)]
 // The relocator is responsible for converting each two-dimensional address
@@ -49,9 +43,12 @@ impl Relocator {
     /// Relocates the given memory segment by segment.
     pub fn relocate_memory(&self, memory: &[Vec<Option<MaybeRelocatable>>]) -> Vec<MemoryEntry> {
         let _span = span!(Level::INFO, "get_relocated_memory").entered();
-        let mut res = vec![];
+
+        // Pre-allocate with exact size to avoid realloc overhead.
+        let total_size: usize = memory.iter().map(|seg| seg.len()).sum();
+        let mut res = Vec::with_capacity(total_size);
+
         for (segment_index, segment) in memory.iter().enumerate() {
-            let mut relocated_segment = vec![];
             for (offset, value) in segment.iter().enumerate() {
                 let address = self.calc_relocated_addr(segment_index, offset) as u64;
                 let value = if let Some(val) = value {
@@ -70,9 +67,8 @@ impl Relocator {
                     // If this cell is None, fill with zero.
                     [0; 8]
                 };
-                relocated_segment.push(MemoryEntry { address, value });
+                res.push(MemoryEntry { address, value });
             }
-            res.extend(relocated_segment);
         }
         assert!(
             res.len() <= MEMORY_ADDRESS_BOUND,
@@ -101,17 +97,16 @@ impl Relocator {
             };
 
             match builtin_name {
-                BuiltinName::range_check => res.range_check_bits_128 = segment,
-                BuiltinName::pedersen => res.pedersen = segment,
-                BuiltinName::bitwise => res.bitwise = segment,
-                BuiltinName::poseidon => res.poseidon = segment,
-                BuiltinName::range_check96 => res.range_check_bits_96 = segment,
-                BuiltinName::add_mod => res.add_mod = segment,
-                BuiltinName::mul_mod => res.mul_mod = segment,
+                BuiltinName::range_check => res.range_check_builtin = segment,
+                BuiltinName::pedersen => res.pedersen_builtin = segment,
+                BuiltinName::bitwise => res.bitwise_builtin = segment,
+                BuiltinName::poseidon => res.poseidon_builtin = segment,
+                BuiltinName::range_check96 => res.range_check96_builtin = segment,
+                BuiltinName::add_mod => res.add_mod_builtin = segment,
+                BuiltinName::mul_mod => res.mul_mod_builtin = segment,
                 BuiltinName::output => res.output = segment,
-                BuiltinName::ecdsa | BuiltinName::keccak | BuiltinName::ec_op => {
-                    panic!("Builtin {builtin_name} is not supported in Stwo")
-                }
+                BuiltinName::ec_op => res.ec_op_builtin = segment,
+                BuiltinName::ecdsa | BuiltinName::keccak => {}
                 // Not builtins.
                 BuiltinName::segment_arena => {}
             };
@@ -122,7 +117,8 @@ impl Relocator {
     // Relocates the trace entries according to the relocation table.
     pub fn relocate_trace(&self, relocatble_trace: &[TraceEntry]) -> Vec<RelocatedTraceEntry> {
         let _span = span!(Level::INFO, "relocate_trace").entered();
-        let mut res = vec![];
+        // Pre-allocate with exact size to avoid realloc overhead.
+        let mut res = Vec::with_capacity(relocatble_trace.len());
         for entry in relocatble_trace {
             res.push(RelocatedTraceEntry {
                 pc: self.relocation_table[entry.pc.segment_index as usize] as usize
@@ -142,7 +138,9 @@ impl Relocator {
         public_addresses: &HashMap<usize, Vec<(usize, usize)>>,
     ) -> Vec<u32> {
         let _span = span!(Level::INFO, "relocate_public_addresses").entered();
-        let mut res = vec![];
+        // Pre-allocate with exact size to avoid realloc overhead.
+        let total_size: usize = public_addresses.values().map(|v| v.len()).sum();
+        let mut res = Vec::with_capacity(total_size);
         for (segment_index, offsets) in public_addresses {
             let base_addr = self.relocation_table[*segment_index];
 
@@ -319,14 +317,14 @@ pub mod relocator_tests {
         let builtin_segments = relocator.relocate_builtin_segments(&builtin_segments);
 
         assert_eq!(
-            builtin_segments.bitwise,
+            builtin_segments.bitwise_builtin,
             Some(MemorySegmentAddresses {
                 begin_addr: 1,
                 stop_ptr: 81
             })
         );
         assert_eq!(
-            builtin_segments.range_check_bits_128,
+            builtin_segments.range_check_builtin,
             Some(MemorySegmentAddresses {
                 begin_addr: 81,
                 stop_ptr: 97

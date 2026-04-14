@@ -73,9 +73,7 @@ where
 {
     fn deserialize<'a>(data: &mut impl Iterator<Item = &'a FieldElement>) -> Self {
         let hash_witness = Vec::<H::Hash>::deserialize(data);
-        MerkleDecommitmentLifted {
-            hash_witness,
-        }
+        MerkleDecommitmentLifted { hash_witness }
     }
 }
 
@@ -136,10 +134,12 @@ impl CairoDeserialize for FriConfig {
         let log_blowup_factor = u32::deserialize(data);
         let log_last_layer_degree_bound = u32::deserialize(data);
         let n_queries = usize::deserialize(data);
+        let fold_step = u32::deserialize(data);
         FriConfig {
             log_blowup_factor,
             log_last_layer_degree_bound,
             n_queries,
+            fold_step,
         }
     }
 }
@@ -148,9 +148,13 @@ impl CairoDeserialize for PcsConfig {
     fn deserialize<'a>(data: &mut impl Iterator<Item = &'a FieldElement>) -> Self {
         let pow_bits = u32::deserialize(data);
         let fri_config = FriConfig::deserialize(data);
+
+        // The cairo1 does not support fixed lifting log size in the PCS config.
+        let lifting_log_size = None;
         PcsConfig {
             pow_bits,
             fri_config,
+            lifting_log_size,
         }
     }
 }
@@ -164,7 +168,7 @@ where
         let commitments = TreeVec(Vec::<H::Hash>::deserialize(data));
         let sampled_values = TreeVec(Vec::<ColumnVec<Vec<SecureField>>>::deserialize(data));
         let decommitments = TreeVec(Vec::<MerkleDecommitmentLifted<H>>::deserialize(data));
-        let queried_values = TreeVec(Vec::<ColumnVec<Vec<BaseField>>>::deserialize(data));
+        let queried_values = TreeVec(Vec::<Vec<Vec<BaseField>>>::deserialize(data));
         let proof_of_work: u64 = u64::deserialize(data);
         let fri_proof = FriProof::deserialize(data);
         CommitmentSchemeProof {
@@ -239,7 +243,8 @@ impl<T0: CairoDeserialize, T1: CairoDeserialize, T2: CairoDeserialize> CairoDese
 impl CairoDeserialize for Blake2sHash {
     fn deserialize<'a>(data: &mut impl Iterator<Item = &'a FieldElement>) -> Self {
         let mut bytes = [0u8; 32];
-        for byte_chunk in bytes.array_chunks_mut() {
+        for byte_chunk in bytes.chunks_exact_mut(4) {
+            let byte_chunk: &mut [u8; 4] = byte_chunk.try_into().unwrap();
             let v: u32 = u32::deserialize(data);
             *byte_chunk = v.to_le_bytes();
         }

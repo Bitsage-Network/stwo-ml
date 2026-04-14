@@ -2,9 +2,10 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use cairo_air::utils::ProofFormat;
+use cairo_vm::types::layout_name::LayoutName;
 use clap::Parser;
+use stwo_cairo_dev_utils::vm_utils::{run_and_adapt, ProgramType};
 use stwo_cairo_prover::prover::create_and_serialize_proof;
-use stwo_cairo_utils::vm_utils::{run_and_adapt, ProgramType};
 use tracing::{span, Level};
 use tracing_subscriber::fmt::format::FmtSpan;
 
@@ -34,7 +35,7 @@ struct Args {
     /// The expected file format is:
     ///     {
     ///         "channel_hash":"blake2s",
-    ///         "channel_salt": 12345
+    ///         "channel_salt": 0
     ///         "pcs_config": {
     ///             "pow_bits": 26,
     ///             "fri_config": {
@@ -46,7 +47,6 @@ struct Args {
     ///         "preprocessed_trace": "canonical_without_pedersen",
     ///     }
     ///
-    /// The `channel_salt` field is optional. If not provided, no salt will be used.
     /// Default parameters are chosen to ensure 96 bits of security.
     proof_params_json: Option<PathBuf>,
     /// The output file path for the proof.
@@ -73,6 +73,7 @@ fn main() -> Result<()> {
     let prover_input = run_and_adapt(
         &args.program,
         args.program_type,
+        LayoutName::all_cairo_stwo,
         args.program_arguments_file.as_ref(),
     )?;
 

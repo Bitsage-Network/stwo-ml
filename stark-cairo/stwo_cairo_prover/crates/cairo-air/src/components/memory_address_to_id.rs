@@ -3,11 +3,15 @@ use stwo::core::channel::Channel;
 use stwo::core::fields::m31::M31;
 use stwo::core::fields::qm31::{SecureField, SECURE_EXTENSION_DEGREE};
 use stwo::core::pcs::TreeVec;
-use stwo_cairo_common::preprocessed_columns::preprocessed_trace::{PreProcessedColumn, Seq};
+use stwo_cairo_common::memory::LOG_MEMORY_ADDRESS_BOUND;
+use stwo_cairo_common::preprocessed_columns::preprocessed_trace::{
+    PreProcessedColumn, Seq, MAX_SEQUENCE_LOG_SIZE,
+};
 use stwo_cairo_serialize::{CairoDeserialize, CairoSerialize};
 use stwo_constraint_framework::{EvalAtRow, FrameworkComponent, FrameworkEval, RelationEntry};
 
-use crate::relations;
+use crate::relations::{self, MEMORY_ADDRESS_TO_ID_RELATION_ID};
+use crate::verifier::RelationUse;
 
 /// Split the (ID , Multiplicity) columns to shorter chunks. This is done to improve the performance
 /// during The merkle commitment and FRI, as this component is usually the tallest in the Cairo AIR.
@@ -22,30 +26,24 @@ use crate::relations;
 /// ID1 = [id3, id4, id5, 0]
 /// ID2 = [id6, id7, id8, 0]
 /// ID3 = [id9, id10, 0, 0]
-pub const MEMORY_ADDRESS_TO_ID_SPLIT: usize = 16;
+pub const MEMORY_ADDRESS_TO_ID_SPLIT: usize =
+    1 << (LOG_MEMORY_ADDRESS_BOUND - MAX_SEQUENCE_LOG_SIZE);
 pub const N_ID_AND_MULT_COLUMNS_PER_CHUNK: usize = 2;
 pub const N_TRACE_COLUMNS: usize = MEMORY_ADDRESS_TO_ID_SPLIT * N_ID_AND_MULT_COLUMNS_PER_CHUNK;
 
+pub const RELATION_USES_PER_ROW: [RelationUse; 0] = [];
 pub type Component = FrameworkComponent<Eval>;
 
 #[derive(Clone)]
 pub struct Eval {
     // The log size of the component after split.
-    pub log_size: u32,
-    pub lookup_elements: relations::MemoryAddressToId,
-}
-impl Eval {
-    pub fn new(claim: Claim, lookup_elements: relations::MemoryAddressToId) -> Self {
-        Self {
-            log_size: claim.log_size,
-            lookup_elements,
-        }
-    }
+    pub claim: Claim,
+    pub common_lookup_elements: relations::CommonLookupElements,
 }
 
 impl FrameworkEval for Eval {
     fn log_size(&self) -> u32 {
-        self.log_size
+        self.claim.log_size
     }
 
     fn max_constraint_log_degree_bound(&self) -> u32 {
@@ -62,9 +60,9 @@ impl FrameworkEval for Eval {
             let address =
                 seq_plus_one.clone() + E::F::from(M31((i * (1 << self.log_size())) as u32));
             eval.add_to_relation(RelationEntry::new(
-                &self.lookup_elements,
+                &self.common_lookup_elements,
                 E::EF::from(-multiplicity),
-                &[address, id],
+                &[E::F::from(MEMORY_ADDRESS_TO_ID_RELATION_ID), address, id],
             ));
         }
 
@@ -73,7 +71,7 @@ impl FrameworkEval for Eval {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, CairoSerialize, CairoDeserialize)]
+#[derive(Copy, Clone, Serialize, Deserialize, CairoSerialize, CairoDeserialize)]
 pub struct Claim {
     pub log_size: u32,
 }
@@ -82,7 +80,7 @@ impl Claim {
         let trace_log_sizes = vec![self.log_size; N_TRACE_COLUMNS];
         let interaction_log_sizes =
             vec![self.log_size; SECURE_EXTENSION_DEGREE * MEMORY_ADDRESS_TO_ID_SPLIT.div_ceil(2)];
-        TreeVec::new(vec![vec![], trace_log_sizes, interaction_log_sizes])
+        TreeVec::new(vec![trace_log_sizes, interaction_log_sizes])
     }
 
     pub fn mix_into(&self, channel: &mut impl Channel) {
@@ -90,7 +88,7 @@ impl Claim {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, CairoSerialize, CairoDeserialize)]
+#[derive(Copy, Clone, Serialize, Deserialize, CairoSerialize, CairoDeserialize)]
 pub struct InteractionClaim {
     pub claimed_sum: SecureField,
 }
@@ -115,8 +113,8 @@ mod tests {
     fn memory_address_to_id_constraints_regression() {
         let mut rng = SmallRng::seed_from_u64(0);
         let eval = Eval {
-            log_size: 4,
-            lookup_elements: relations::MemoryAddressToId::dummy(),
+            claim: Claim { log_size: 4 },
+            common_lookup_elements: relations::CommonLookupElements::dummy(),
         };
 
         let expr_eval = eval.evaluate(ExprEvaluator::new());
@@ -127,6 +125,6 @@ mod tests {
             sum += c.assign(&assignment) * rng.gen::<QM31>();
         }
 
-        assert_eq!(sum, MEMORY_ADDRESS_TO_ID);
+        MEMORY_ADDRESS_TO_ID.assert_debug_eq(&sum);
     }
 }

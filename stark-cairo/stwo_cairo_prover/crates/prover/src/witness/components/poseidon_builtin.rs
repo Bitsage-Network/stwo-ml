@@ -23,10 +23,13 @@ impl ClaimGenerator {
 
     pub fn write_trace(
         self,
-        tree_builder: &mut impl TreeBuilder<SimdBackend>,
         memory_address_to_id_state: &memory_address_to_id::ClaimGenerator,
         poseidon_aggregator_state: &poseidon_aggregator::ClaimGenerator,
-    ) -> (Claim, InteractionClaimGenerator) {
+    ) -> (
+        ComponentTrace<N_TRACE_COLUMNS>,
+        Claim,
+        InteractionClaimGenerator,
+    ) {
         let log_size = self.log_size;
 
         let (trace, lookup_data, sub_component_inputs) = write_trace_simd(
@@ -35,21 +38,15 @@ impl ClaimGenerator {
             memory_address_to_id_state,
             poseidon_aggregator_state,
         );
-        sub_component_inputs
-            .memory_address_to_id
-            .iter()
-            .for_each(|inputs| {
-                memory_address_to_id_state.add_packed_inputs(inputs);
-            });
-        sub_component_inputs
-            .poseidon_aggregator
-            .iter()
-            .for_each(|inputs| {
-                poseidon_aggregator_state.add_packed_inputs(inputs);
-            });
-        tree_builder.extend_evals(trace.to_evals());
+        for inputs in sub_component_inputs.memory_address_to_id {
+            memory_address_to_id_state.add_packed_inputs(&inputs, 0);
+        }
+        for inputs in sub_component_inputs.poseidon_aggregator {
+            poseidon_aggregator_state.add_packed_inputs(&inputs, 0);
+        }
 
         (
+            trace,
             Claim {
                 log_size,
                 poseidon_builtin_segment_start: self.poseidon_builtin_segment_start,
@@ -92,6 +89,8 @@ fn write_trace_simd(
     };
 
     let M31_1 = PackedM31::broadcast(M31::from(1));
+    let M31_1444891767 = PackedM31::broadcast(M31::from(1444891767));
+    let M31_1551892206 = PackedM31::broadcast(M31::from(1551892206));
     let M31_2 = PackedM31::broadcast(M31::from(2));
     let M31_3 = PackedM31::broadcast(M31::from(3));
     let M31_4 = PackedM31::broadcast(M31::from(4));
@@ -118,8 +117,11 @@ fn write_trace_simd(
             let input_state_0_id_col0 = memory_address_to_id_value_tmp_51986_1;
             *row[0] = input_state_0_id_col0;
             *sub_component_inputs.memory_address_to_id[0] = instance_addr_tmp_51986_0;
-            *lookup_data.memory_address_to_id_0 =
-                [instance_addr_tmp_51986_0, input_state_0_id_col0];
+            *lookup_data.memory_address_to_id_0 = [
+                M31_1444891767,
+                instance_addr_tmp_51986_0,
+                input_state_0_id_col0,
+            ];
 
             // Read Id.
 
@@ -129,6 +131,7 @@ fn write_trace_simd(
             *row[1] = input_state_1_id_col1;
             *sub_component_inputs.memory_address_to_id[1] = ((instance_addr_tmp_51986_0) + (M31_1));
             *lookup_data.memory_address_to_id_1 = [
+                M31_1444891767,
                 ((instance_addr_tmp_51986_0) + (M31_1)),
                 input_state_1_id_col1,
             ];
@@ -141,6 +144,7 @@ fn write_trace_simd(
             *row[2] = input_state_2_id_col2;
             *sub_component_inputs.memory_address_to_id[2] = ((instance_addr_tmp_51986_0) + (M31_2));
             *lookup_data.memory_address_to_id_2 = [
+                M31_1444891767,
                 ((instance_addr_tmp_51986_0) + (M31_2)),
                 input_state_2_id_col2,
             ];
@@ -153,6 +157,7 @@ fn write_trace_simd(
             *row[3] = output_state_0_id_col3;
             *sub_component_inputs.memory_address_to_id[3] = ((instance_addr_tmp_51986_0) + (M31_3));
             *lookup_data.memory_address_to_id_3 = [
+                M31_1444891767,
                 ((instance_addr_tmp_51986_0) + (M31_3)),
                 output_state_0_id_col3,
             ];
@@ -165,6 +170,7 @@ fn write_trace_simd(
             *row[4] = output_state_1_id_col4;
             *sub_component_inputs.memory_address_to_id[4] = ((instance_addr_tmp_51986_0) + (M31_4));
             *lookup_data.memory_address_to_id_4 = [
+                M31_1444891767,
                 ((instance_addr_tmp_51986_0) + (M31_4)),
                 output_state_1_id_col4,
             ];
@@ -177,6 +183,7 @@ fn write_trace_simd(
             *row[5] = output_state_2_id_col5;
             *sub_component_inputs.memory_address_to_id[5] = ((instance_addr_tmp_51986_0) + (M31_5));
             *lookup_data.memory_address_to_id_5 = [
+                M31_1444891767,
                 ((instance_addr_tmp_51986_0) + (M31_5)),
                 output_state_2_id_col5,
             ];
@@ -194,6 +201,7 @@ fn write_trace_simd(
                 ],
             );
             *lookup_data.poseidon_aggregator_0 = [
+                M31_1551892206,
                 input_state_0_id_col0,
                 input_state_1_id_col1,
                 input_state_2_id_col2,
@@ -208,13 +216,13 @@ fn write_trace_simd(
 
 #[derive(Uninitialized, IterMut, ParIterMut)]
 struct LookupData {
-    memory_address_to_id_0: Vec<[PackedM31; 2]>,
-    memory_address_to_id_1: Vec<[PackedM31; 2]>,
-    memory_address_to_id_2: Vec<[PackedM31; 2]>,
-    memory_address_to_id_3: Vec<[PackedM31; 2]>,
-    memory_address_to_id_4: Vec<[PackedM31; 2]>,
-    memory_address_to_id_5: Vec<[PackedM31; 2]>,
-    poseidon_aggregator_0: Vec<[PackedM31; 6]>,
+    memory_address_to_id_0: Vec<[PackedM31; 3]>,
+    memory_address_to_id_1: Vec<[PackedM31; 3]>,
+    memory_address_to_id_2: Vec<[PackedM31; 3]>,
+    memory_address_to_id_3: Vec<[PackedM31; 3]>,
+    memory_address_to_id_4: Vec<[PackedM31; 3]>,
+    memory_address_to_id_5: Vec<[PackedM31; 3]>,
+    poseidon_aggregator_0: Vec<[PackedM31; 7]>,
 }
 
 pub struct InteractionClaimGenerator {
@@ -224,11 +232,12 @@ pub struct InteractionClaimGenerator {
 impl InteractionClaimGenerator {
     pub fn write_interaction_trace(
         self,
-        tree_builder: &mut impl TreeBuilder<SimdBackend>,
-        memory_address_to_id: &relations::MemoryAddressToId,
-        poseidon_aggregator: &relations::PoseidonAggregator,
-    ) -> InteractionClaim {
-        let mut logup_gen = LogupTraceGenerator::new(self.log_size);
+        common_lookup_elements: &relations::CommonLookupElements,
+    ) -> (
+        Vec<CircleEvaluation<SimdBackend, M31, BitReversedOrder>>,
+        InteractionClaim,
+    ) {
+        let mut logup_gen = unsafe { LogupTraceGenerator::uninitialized(self.log_size) };
 
         // Sum logup terms in pairs.
         let mut col_gen = logup_gen.new_col();
@@ -239,8 +248,8 @@ impl InteractionClaimGenerator {
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1)| {
-                let denom0: PackedQM31 = memory_address_to_id.combine(values0);
-                let denom1: PackedQM31 = memory_address_to_id.combine(values1);
+                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
                 writer.write_frac(denom0 + denom1, denom0 * denom1);
             });
         col_gen.finalize_col();
@@ -253,8 +262,8 @@ impl InteractionClaimGenerator {
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1)| {
-                let denom0: PackedQM31 = memory_address_to_id.combine(values0);
-                let denom1: PackedQM31 = memory_address_to_id.combine(values1);
+                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
                 writer.write_frac(denom0 + denom1, denom0 * denom1);
             });
         col_gen.finalize_col();
@@ -267,8 +276,8 @@ impl InteractionClaimGenerator {
         )
             .into_par_iter()
             .for_each(|(writer, values0, values1)| {
-                let denom0: PackedQM31 = memory_address_to_id.combine(values0);
-                let denom1: PackedQM31 = memory_address_to_id.combine(values1);
+                let denom0: PackedQM31 = common_lookup_elements.combine(values0);
+                let denom1: PackedQM31 = common_lookup_elements.combine(values1);
                 writer.write_frac(denom0 + denom1, denom0 * denom1);
             });
         col_gen.finalize_col();
@@ -281,14 +290,13 @@ impl InteractionClaimGenerator {
         )
             .into_par_iter()
             .for_each(|(writer, values)| {
-                let denom = poseidon_aggregator.combine(values);
+                let denom = common_lookup_elements.combine(values);
                 writer.write_frac(PackedQM31::one(), denom);
             });
         col_gen.finalize_col();
 
         let (trace, claimed_sum) = logup_gen.finalize_last();
-        tree_builder.extend_evals(trace);
 
-        InteractionClaim { claimed_sum }
+        (trace, InteractionClaim { claimed_sum })
     }
 }

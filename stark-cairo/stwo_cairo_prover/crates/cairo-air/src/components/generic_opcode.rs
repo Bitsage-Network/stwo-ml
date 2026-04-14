@@ -6,7 +6,7 @@ use crate::components::subroutines::eval_operands::EvalOperands;
 use crate::components::subroutines::handle_opcodes::HandleOpcodes;
 use crate::components::subroutines::update_registers::UpdateRegisters;
 
-pub const N_TRACE_COLUMNS: usize = 244;
+pub const N_TRACE_COLUMNS: usize = 243;
 pub const RELATION_USES_PER_ROW: [RelationUse; 22] = [
     RelationUse {
         relation_id: "MemoryAddressToId",
@@ -100,28 +100,7 @@ pub const RELATION_USES_PER_ROW: [RelationUse; 22] = [
 
 pub struct Eval {
     pub claim: Claim,
-    pub verify_instruction_lookup_elements: relations::VerifyInstruction,
-    pub memory_address_to_id_lookup_elements: relations::MemoryAddressToId,
-    pub memory_id_to_big_lookup_elements: relations::MemoryIdToBig,
-    pub range_check_9_9_lookup_elements: relations::RangeCheck_9_9,
-    pub range_check_9_9_b_lookup_elements: relations::RangeCheck_9_9_B,
-    pub range_check_9_9_c_lookup_elements: relations::RangeCheck_9_9_C,
-    pub range_check_9_9_d_lookup_elements: relations::RangeCheck_9_9_D,
-    pub range_check_9_9_e_lookup_elements: relations::RangeCheck_9_9_E,
-    pub range_check_9_9_f_lookup_elements: relations::RangeCheck_9_9_F,
-    pub range_check_9_9_g_lookup_elements: relations::RangeCheck_9_9_G,
-    pub range_check_9_9_h_lookup_elements: relations::RangeCheck_9_9_H,
-    pub range_check_20_lookup_elements: relations::RangeCheck_20,
-    pub range_check_20_b_lookup_elements: relations::RangeCheck_20_B,
-    pub range_check_20_c_lookup_elements: relations::RangeCheck_20_C,
-    pub range_check_20_d_lookup_elements: relations::RangeCheck_20_D,
-    pub range_check_20_e_lookup_elements: relations::RangeCheck_20_E,
-    pub range_check_20_f_lookup_elements: relations::RangeCheck_20_F,
-    pub range_check_20_g_lookup_elements: relations::RangeCheck_20_G,
-    pub range_check_20_h_lookup_elements: relations::RangeCheck_20_H,
-    pub range_check_18_lookup_elements: relations::RangeCheck_18,
-    pub range_check_11_lookup_elements: relations::RangeCheck_11,
-    pub opcodes_lookup_elements: relations::Opcodes,
+    pub common_lookup_elements: relations::CommonLookupElements,
 }
 
 #[derive(Copy, Clone, Serialize, Deserialize, CairoSerialize, CairoDeserialize)]
@@ -132,22 +111,13 @@ impl Claim {
     pub fn log_sizes(&self) -> TreeVec<Vec<u32>> {
         let trace_log_sizes = vec![self.log_size; N_TRACE_COLUMNS];
         let interaction_log_sizes = vec![self.log_size; SECURE_EXTENSION_DEGREE * 34];
-        TreeVec::new(vec![vec![], trace_log_sizes, interaction_log_sizes])
-    }
-
-    pub fn mix_into(&self, channel: &mut impl Channel) {
-        channel.mix_u64(self.log_size as u64);
+        TreeVec::new(vec![trace_log_sizes, interaction_log_sizes])
     }
 }
 
 #[derive(Copy, Clone, Serialize, Deserialize, CairoSerialize, CairoDeserialize)]
 pub struct InteractionClaim {
     pub claimed_sum: SecureField,
-}
-impl InteractionClaim {
-    pub fn mix_into(&self, channel: &mut impl Channel) {
-        channel.mix_felts(&[self.claimed_sum]);
-    }
 }
 
 pub type Component = FrameworkComponent<Eval>;
@@ -165,6 +135,7 @@ impl FrameworkEval for Eval {
     #[allow(clippy::double_parens)]
     #[allow(non_snake_case)]
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
+        let M31_428564188 = E::F::from(M31::from(428564188));
         let input_pc_col0 = eval.next_trace_mask();
         let input_ap_col1 = eval.next_trace_mask();
         let input_fp_col2 = eval.next_trace_mask();
@@ -393,24 +364,21 @@ impl FrameworkEval for Eval {
         let partial_limb_msb_col225 = eval.next_trace_mask();
         let partial_limb_msb_col226 = eval.next_trace_mask();
         let partial_limb_msb_col227 = eval.next_trace_mask();
-        let partial_limb_msb_col228 = eval.next_trace_mask();
-        let msb_col229 = eval.next_trace_mask();
-        let mid_limbs_set_col230 = eval.next_trace_mask();
-        let partial_limb_msb_col231 = eval.next_trace_mask();
-        let dst_sum_squares_inv_col232 = eval.next_trace_mask();
-        let dst_sum_inv_col233 = eval.next_trace_mask();
-        let op1_as_rel_imm_cond_col234 = eval.next_trace_mask();
-        let msb_col235 = eval.next_trace_mask();
-        let mid_limbs_set_col236 = eval.next_trace_mask();
-        let partial_limb_msb_col237 = eval.next_trace_mask();
-        let next_pc_jnz_col238 = eval.next_trace_mask();
-        let next_pc_col239 = eval.next_trace_mask();
-        let next_ap_col240 = eval.next_trace_mask();
-        let range_check_ap_bot11bits_col241 = eval.next_trace_mask();
-        let next_fp_col242 = eval.next_trace_mask();
-        let enabler = eval.next_trace_mask();
-
-        eval.add_constraint(enabler.clone() * enabler.clone() - enabler.clone());
+        let msb_col228 = eval.next_trace_mask();
+        let mid_limbs_set_col229 = eval.next_trace_mask();
+        let partial_limb_msb_col230 = eval.next_trace_mask();
+        let dst_sum_squares_inv_col231 = eval.next_trace_mask();
+        let dst_sum_inv_col232 = eval.next_trace_mask();
+        let op1_as_rel_imm_cond_col233 = eval.next_trace_mask();
+        let msb_col234 = eval.next_trace_mask();
+        let mid_limbs_set_col235 = eval.next_trace_mask();
+        let partial_limb_msb_col236 = eval.next_trace_mask();
+        let next_pc_jnz_col237 = eval.next_trace_mask();
+        let next_pc_col238 = eval.next_trace_mask();
+        let next_ap_col239 = eval.next_trace_mask();
+        let range_check_29_bot11bits_col240 = eval.next_trace_mask();
+        let next_fp_col241 = eval.next_trace_mask();
+        let enabler_col242 = eval.next_trace_mask();
 
         #[allow(clippy::unused_unit)]
         #[allow(unused_variables)]
@@ -435,7 +403,7 @@ impl FrameworkEval for Eval {
                 opcode_call_col18.clone(),
                 opcode_ret_col19.clone(),
                 opcode_assert_eq_col20.clone(),
-                &self.verify_instruction_lookup_elements,
+                &self.common_lookup_elements,
                 &mut eval,
             );
         EvalOperands::evaluate(
@@ -661,24 +629,7 @@ impl FrameworkEval for Eval {
             res_limb_25_col222.clone(),
             res_limb_26_col223.clone(),
             res_limb_27_col224.clone(),
-            &self.memory_address_to_id_lookup_elements,
-            &self.memory_id_to_big_lookup_elements,
-            &self.range_check_9_9_lookup_elements,
-            &self.range_check_9_9_b_lookup_elements,
-            &self.range_check_9_9_c_lookup_elements,
-            &self.range_check_9_9_d_lookup_elements,
-            &self.range_check_9_9_e_lookup_elements,
-            &self.range_check_9_9_f_lookup_elements,
-            &self.range_check_9_9_g_lookup_elements,
-            &self.range_check_9_9_h_lookup_elements,
-            &self.range_check_20_lookup_elements,
-            &self.range_check_20_b_lookup_elements,
-            &self.range_check_20_c_lookup_elements,
-            &self.range_check_20_d_lookup_elements,
-            &self.range_check_20_e_lookup_elements,
-            &self.range_check_20_f_lookup_elements,
-            &self.range_check_20_g_lookup_elements,
-            &self.range_check_20_h_lookup_elements,
+            &self.common_lookup_elements,
             &mut eval,
         );
         HandleOpcodes::evaluate(
@@ -784,6 +735,7 @@ impl FrameworkEval for Eval {
             ],
             partial_limb_msb_col225.clone(),
             partial_limb_msb_col226.clone(),
+            &self.common_lookup_elements,
             &mut eval,
         );
         UpdateRegisters::evaluate(
@@ -887,29 +839,32 @@ impl FrameworkEval for Eval {
                 res_limb_27_col224.clone(),
             ],
             partial_limb_msb_col227.clone(),
-            partial_limb_msb_col228.clone(),
-            msb_col229.clone(),
-            mid_limbs_set_col230.clone(),
-            partial_limb_msb_col231.clone(),
-            dst_sum_squares_inv_col232.clone(),
-            dst_sum_inv_col233.clone(),
-            op1_as_rel_imm_cond_col234.clone(),
-            msb_col235.clone(),
-            mid_limbs_set_col236.clone(),
-            partial_limb_msb_col237.clone(),
-            next_pc_jnz_col238.clone(),
-            next_pc_col239.clone(),
-            next_ap_col240.clone(),
-            range_check_ap_bot11bits_col241.clone(),
-            next_fp_col242.clone(),
-            &self.range_check_18_lookup_elements,
-            &self.range_check_11_lookup_elements,
+            msb_col228.clone(),
+            mid_limbs_set_col229.clone(),
+            partial_limb_msb_col230.clone(),
+            dst_sum_squares_inv_col231.clone(),
+            dst_sum_inv_col232.clone(),
+            op1_as_rel_imm_cond_col233.clone(),
+            msb_col234.clone(),
+            mid_limbs_set_col235.clone(),
+            partial_limb_msb_col236.clone(),
+            next_pc_jnz_col237.clone(),
+            next_pc_col238.clone(),
+            next_ap_col239.clone(),
+            range_check_29_bot11bits_col240.clone(),
+            next_fp_col241.clone(),
+            &self.common_lookup_elements,
             &mut eval,
         );
+        // Enabler is a bit.
+        eval.add_constraint(
+            ((enabler_col242.clone() * enabler_col242.clone()) - enabler_col242.clone()),
+        );
         eval.add_to_relation(RelationEntry::new(
-            &self.opcodes_lookup_elements,
-            E::EF::from(enabler.clone()),
+            &self.common_lookup_elements,
+            E::EF::from(enabler_col242.clone()),
             &[
+                M31_428564188.clone(),
                 input_pc_col0.clone(),
                 input_ap_col1.clone(),
                 input_fp_col2.clone(),
@@ -917,12 +872,13 @@ impl FrameworkEval for Eval {
         ));
 
         eval.add_to_relation(RelationEntry::new(
-            &self.opcodes_lookup_elements,
-            -E::EF::from(enabler.clone()),
+            &self.common_lookup_elements,
+            -E::EF::from(enabler_col242.clone()),
             &[
-                next_pc_col239.clone(),
-                next_ap_col240.clone(),
-                next_fp_col242.clone(),
+                M31_428564188.clone(),
+                next_pc_col238.clone(),
+                next_ap_col239.clone(),
+                next_fp_col241.clone(),
             ],
         ));
 
@@ -947,28 +903,7 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(0);
         let eval = Eval {
             claim: Claim { log_size: 4 },
-            verify_instruction_lookup_elements: relations::VerifyInstruction::dummy(),
-            memory_address_to_id_lookup_elements: relations::MemoryAddressToId::dummy(),
-            memory_id_to_big_lookup_elements: relations::MemoryIdToBig::dummy(),
-            range_check_9_9_lookup_elements: relations::RangeCheck_9_9::dummy(),
-            range_check_9_9_b_lookup_elements: relations::RangeCheck_9_9_B::dummy(),
-            range_check_9_9_c_lookup_elements: relations::RangeCheck_9_9_C::dummy(),
-            range_check_9_9_d_lookup_elements: relations::RangeCheck_9_9_D::dummy(),
-            range_check_9_9_e_lookup_elements: relations::RangeCheck_9_9_E::dummy(),
-            range_check_9_9_f_lookup_elements: relations::RangeCheck_9_9_F::dummy(),
-            range_check_9_9_g_lookup_elements: relations::RangeCheck_9_9_G::dummy(),
-            range_check_9_9_h_lookup_elements: relations::RangeCheck_9_9_H::dummy(),
-            range_check_20_lookup_elements: relations::RangeCheck_20::dummy(),
-            range_check_20_b_lookup_elements: relations::RangeCheck_20_B::dummy(),
-            range_check_20_c_lookup_elements: relations::RangeCheck_20_C::dummy(),
-            range_check_20_d_lookup_elements: relations::RangeCheck_20_D::dummy(),
-            range_check_20_e_lookup_elements: relations::RangeCheck_20_E::dummy(),
-            range_check_20_f_lookup_elements: relations::RangeCheck_20_F::dummy(),
-            range_check_20_g_lookup_elements: relations::RangeCheck_20_G::dummy(),
-            range_check_20_h_lookup_elements: relations::RangeCheck_20_H::dummy(),
-            range_check_18_lookup_elements: relations::RangeCheck_18::dummy(),
-            range_check_11_lookup_elements: relations::RangeCheck_11::dummy(),
-            opcodes_lookup_elements: relations::Opcodes::dummy(),
+            common_lookup_elements: relations::CommonLookupElements::dummy(),
         };
         let expr_eval = eval.evaluate(ExprEvaluator::new());
         let assignment = expr_eval.random_assignment();
@@ -978,6 +913,6 @@ mod tests {
             sum += c.assign(&assignment) * rng.gen::<QM31>();
         }
 
-        assert_eq!(sum, GENERIC_OPCODE);
+        GENERIC_OPCODE.assert_debug_eq(&sum);
     }
 }

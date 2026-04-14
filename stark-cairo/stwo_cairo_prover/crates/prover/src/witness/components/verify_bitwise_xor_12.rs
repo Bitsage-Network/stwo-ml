@@ -5,7 +5,8 @@ use std::simd::u32x16;
 use cairo_air::components::verify_bitwise_xor_12::{
     Claim, InteractionClaim, EXPAND_BITS, LIMB_BITS, LOG_SIZE, N_MULT_COLUMNS,
 };
-use itertools::Itertools;
+use cairo_air::relations::VERIFY_BITWISE_XOR_12_RELATION_ID;
+use itertools::{chain, Itertools};
 
 use crate::witness::prelude::*;
 
@@ -17,7 +18,7 @@ pub struct ClaimGenerator {
 }
 impl ClaimGenerator {
     #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
+    pub fn new(_preprocessed_trace: Arc<PreProcessedTrace>) -> Self {
         Self {
             mults: std::array::from_fn(|_| AtomicMultiplicityColumn::new(1 << LOG_SIZE)),
         }
@@ -25,8 +26,11 @@ impl ClaimGenerator {
 
     pub fn write_trace(
         self,
-        tree_builder: &mut impl TreeBuilder<SimdBackend>,
-    ) -> (Claim, InteractionClaimGenerator) {
+    ) -> (
+        Vec<CircleEvaluation<SimdBackend, M31, BitReversedOrder>>,
+        Claim,
+        InteractionClaimGenerator,
+    ) {
         let mults = self.mults.map(AtomicMultiplicityColumn::into_simd_vec);
 
         let domain = CanonicCoset::new(LOG_SIZE).circle_domain();
@@ -38,23 +42,18 @@ impl ClaimGenerator {
             .collect_vec();
         let lookup_data = LookupData { mults };
 
-        tree_builder.extend_evals(trace);
-
-        (Claim {}, InteractionClaimGenerator { lookup_data })
+        (trace, Claim {}, InteractionClaimGenerator { lookup_data })
     }
 
-    pub fn add_input(&self, [M31(a), M31(b), ..]: &InputType) {
-        let [[al, ah], [bl, bh]] = [*a, *b].map(|x| [x & ((1 << LIMB_BITS) - 1), x >> LIMB_BITS]);
-        let column_index = (ah << EXPAND_BITS) + bh;
-        let row_index = (al << LIMB_BITS) + bl;
-        self.mults[column_index as usize].increase_at(row_index);
-    }
-
-    pub fn add_packed_inputs(&self, packed_inputs: &[PackedInputType]) {
+    pub fn add_packed_inputs(&self, packed_inputs: &[PackedInputType], _relation_index: usize) {
         packed_inputs.into_par_iter().for_each(|packed_input| {
-            packed_input.unpack().into_iter().for_each(|input| {
-                self.add_input(&input);
-            });
+            for [M31(a), M31(b), ..] in packed_input.unpack() {
+                let [[al, ah], [bl, bh]] =
+                    [a, b].map(|x| [x & ((1 << LIMB_BITS) - 1), x >> LIMB_BITS]);
+                let column_index = (ah << EXPAND_BITS) + bh;
+                let row_index = (al << LIMB_BITS) + bl;
+                self.mults[column_index as usize].increase_at(row_index);
+            }
         });
     }
 }
@@ -70,10 +69,12 @@ pub struct InteractionClaimGenerator {
 impl InteractionClaimGenerator {
     pub fn write_interaction_trace(
         self,
-        tree_builder: &mut impl TreeBuilder<SimdBackend>,
-        verify_bitwise_xor_12: &relations::VerifyBitwiseXor_12,
-    ) -> InteractionClaim {
-        let mut logup_gen = LogupTraceGenerator::new(LOG_SIZE);
+        common_lookup_elements: &relations::CommonLookupElements,
+    ) -> (
+        Vec<CircleEvaluation<SimdBackend, M31, BitReversedOrder>>,
+        InteractionClaim,
+    ) {
+        let mut logup_gen = unsafe { LogupTraceGenerator::uninitialized(LOG_SIZE) };
 
         // [0, 1, 2, ..., N_LANES - 1].
         let zero_to_n_lanes = u32x16::from_array(std::array::from_fn(|i| i as u32));
@@ -125,16 +126,19 @@ impl InteractionClaimGenerator {
                         )
                     };
 
-                    let p0: PackedQM31 = verify_bitwise_xor_12.combine(&v0);
-                    let p1: PackedQM31 = verify_bitwise_xor_12.combine(&v1);
+                    let p0: PackedQM31 = common_lookup_elements.combine(
+                        &chain!([VERIFY_BITWISE_XOR_12_RELATION_ID.into()], v0).collect_vec(),
+                    );
+                    let p1: PackedQM31 = common_lookup_elements.combine(
+                        &chain!([VERIFY_BITWISE_XOR_12_RELATION_ID.into()], v1).collect_vec(),
+                    );
                     writer.write_frac(p0 * (-mults1) + p1 * (-mults0), p1 * p0);
                 });
             col_gen.finalize_col();
         }
 
         let (trace, claimed_sum) = logup_gen.finalize_last();
-        tree_builder.extend_evals(trace);
 
-        InteractionClaim { claimed_sum }
+        (trace, InteractionClaim { claimed_sum })
     }
 }

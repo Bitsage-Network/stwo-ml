@@ -52,9 +52,7 @@ where
     H::Hash: CairoSerialize,
 {
     fn serialize(&self, output: &mut Vec<FieldElement>) {
-        let Self {
-            hash_witness,
-        } = self;
+        let Self { hash_witness } = self;
         hash_witness.serialize(output);
     }
 }
@@ -110,10 +108,12 @@ impl CairoSerialize for FriConfig {
             log_blowup_factor,
             log_last_layer_degree_bound,
             n_queries,
+            fold_step,
         } = self;
         log_blowup_factor.serialize(output);
         log_last_layer_degree_bound.serialize(output);
         n_queries.serialize(output);
+        fold_step.serialize(output);
     }
 }
 
@@ -122,6 +122,7 @@ impl CairoSerialize for PcsConfig {
         let Self {
             pow_bits,
             fri_config,
+            lifting_log_size: _,
         } = self;
         pow_bits.serialize(output);
         fri_config.serialize(output);
@@ -212,8 +213,9 @@ impl<T0: CairoSerialize, T1: CairoSerialize, T2: CairoSerialize> CairoSerialize 
 
 impl CairoSerialize for Blake2sHash {
     fn serialize(&self, output: &mut Vec<FieldElement>) {
-        for byte_chunk in self.0.array_chunks() {
-            let v = u32::from_le_bytes(*byte_chunk);
+        for byte_chunk in self.0.chunks_exact(4) {
+            let bytes: [u8; 4] = byte_chunk.try_into().unwrap();
+            let v = u32::from_le_bytes(bytes);
             CairoSerialize::serialize(&v, output);
         }
     }
