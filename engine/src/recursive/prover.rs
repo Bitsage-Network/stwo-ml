@@ -233,7 +233,8 @@ pub fn prove_recursive_with_policy(
                 pow_bits: 20,
                 // 160 bits: pow(20) + blowup(5)*queries(28) = 20+140 = 160
                 // log_last_layer_degree_bound=0 required by Cairo FRI verifier
-                fri_config: stwo::core::fri::FriConfig::new(0, 5, 28),
+                fri_config: stwo::core::fri::FriConfig::new(0, 5, 28, 1),
+                lifting_log_size: None,
             },
         }
     };

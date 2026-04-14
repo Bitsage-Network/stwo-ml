@@ -50,7 +50,8 @@ pub fn verify_recursive(
             "test" => PcsConfig::default(),
             _ => PcsConfig {
                 pow_bits: 20,
-                fri_config: stwo::core::fri::FriConfig::new(0, 5, 28),
+                fri_config: stwo::core::fri::FriConfig::new(0, 5, 28, 1),
+                lifting_log_size: None,
             },
         }
     };
