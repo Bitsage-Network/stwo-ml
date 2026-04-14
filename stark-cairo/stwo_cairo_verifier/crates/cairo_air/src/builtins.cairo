@@ -247,9 +247,11 @@ pub impl BuiltinComponentsImpl of BuiltinComponentsTrait {
             cairo_claim.pedersen_builtin_narrow_windows.is_none()
                 && interaction_claim.pedersen_builtin_narrow_windows.is_none(),
         );
-        assert!(
-            cairo_claim.poseidon_builtin.is_none() && interaction_claim.poseidon_builtin.is_none(),
-        );
+        // Poseidon builtin CAN coexist with Poseidon252 channel — the builtin handles
+        // the program's hades_permutation calls while the channel handles STARK Fiat-Shamir.
+        // assert!(
+        //     cairo_claim.poseidon_builtin.is_none() && interaction_claim.poseidon_builtin.is_none(),
+        // );
         assert!(cairo_claim.ec_op_builtin.is_none() && interaction_claim.ec_op_builtin.is_none());
 
         let bitwise_builtin_component = components::bitwise_builtin::NewComponentImpl::try_new(

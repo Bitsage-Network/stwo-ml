@@ -27,6 +27,11 @@ pub enum Commands {
         /// - cairo_serde: Array of field elements serialized as hex strings, ex. `["0x1", "0x2"]`
         #[arg(long, value_enum, default_value_t = ProofFormat::Json)]
         proof_format: ProofFormat,
+        /// Use Poseidon252 Merkle channel instead of Blake2s.
+        /// Slower proving but the Cairo verifier is ~60% smaller,
+        /// enabling on-chain recursive verification (~19K felts = 4 TXs).
+        #[arg(long, default_value = "false")]
+        poseidon: bool,
         /// Program arguments
         #[command(flatten)]
         program_arguments: ProgramArguments,
@@ -61,6 +66,9 @@ pub enum Commands {
         /// Use GPU backend for STARK proving (requires cuda-runtime feature).
         #[arg(long, default_value = "false")]
         gpu: bool,
+        /// Use Poseidon252 Merkle channel for on-chain recursive verification.
+        #[arg(long, default_value = "false")]
+        poseidon: bool,
     },
 }
 

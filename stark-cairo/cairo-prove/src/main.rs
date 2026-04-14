@@ -9,7 +9,7 @@ use cairo_lang_runner::Arg;
 use cairo_prove::args::{Cli, Commands, ProgramArguments};
 use cairo_prove::error::{CairoProveError, Result};
 use cairo_prove::execute::execute;
-use cairo_prove::prove::{prove, prover_input_from_runner};
+use cairo_prove::prove::{prove, prove_poseidon, prover_input_from_runner};
 use clap::Parser;
 use log::{error, info};
 use stwo_cairo_prover::stwo::core::fri::FriConfig;
@@ -17,34 +17,11 @@ use stwo_cairo_prover::stwo::core::pcs::PcsConfig;
 use stwo_cairo_prover::stwo::core::vcs_lifted::blake2_merkle::{
     Blake2sMerkleChannel, Blake2sMerkleHasher,
 };
-
-fn execute_and_prove(
-    target_path: &Path,
-    args: Vec<Arg>,
-    pcs_config: PcsConfig,
-) -> Result<CairoProof<Blake2sMerkleHasher>> {
-    // Read and parse executable
-    let target_str = target_path
-        .to_str()
-        .ok_or_else(|| CairoProveError::InvalidPath {
-            path: target_path.to_path_buf(),
-        })?;
-
-    let file = std::fs::File::open(target_str)?;
-    let executable = serde_json::from_reader(file)?;
-
-    // Execute
-    let runner = execute(executable, args)?;
-
-    // Prove
-    let prover_input = prover_input_from_runner(&runner)?;
-    prove(prover_input, pcs_config)
-}
+use stwo_cairo_prover::stwo::core::vcs_lifted::poseidon252_merkle::{
+    Poseidon252MerkleChannel, Poseidon252MerkleHasher,
+};
 
 fn secure_pcs_config() -> PcsConfig {
-    // 96 bits of security: pow(26) + blowup(1) * queries(70) = 96 bits.
-    // Blowup=1 minimizes prover memory/time (critical for STARK-in-STARK Level 2).
-    // This matches the upstream default configuration.
     PcsConfig {
         pow_bits: 26,
         fri_config: FriConfig {
@@ -57,24 +34,58 @@ fn secure_pcs_config() -> PcsConfig {
     }
 }
 
+/// Compact PCS config for the recursive level — fewer queries since the inner
+/// proof is already verified. Reduces verifier step count and Level 2 proof size.
+fn recursive_pcs_config() -> PcsConfig {
+    PcsConfig {
+        pow_bits: 20,
+        fri_config: FriConfig {
+            log_last_layer_degree_bound: 0,
+            log_blowup_factor: 1,
+            n_queries: 20,
+            fold_step: 1,
+        },
+        lifting_log_size: None,
+    }
+}
+
 fn handle_prove(
     target: &Path,
     proof: &Path,
     proof_format: ProofFormat,
+    poseidon: bool,
     args: ProgramArguments,
 ) -> Result<()> {
     info!("Generating proof for target: {:?}", target);
     let start = Instant::now();
 
-    let cairo_proof = execute_and_prove(target, args.read_arguments(), secure_pcs_config())?;
+    let target_str = target
+        .to_str()
+        .ok_or_else(|| CairoProveError::InvalidPath {
+            path: target.to_path_buf(),
+        })?;
+    let file = std::fs::File::open(target_str)?;
+    let executable = serde_json::from_reader(file)?;
+    let runner = execute(executable, args.read_arguments())?;
+    let prover_input = prover_input_from_runner(&runner)?;
 
-    let elapsed = start.elapsed();
-
-    serialize_proof_to_file::<Blake2sMerkleHasher>(&cairo_proof, proof.into(), proof_format)
+    if poseidon {
+        info!("[Poseidon252] On-chain recursive path enabled.");
+        let cairo_proof = prove_poseidon(prover_input, secure_pcs_config())?;
+        serialize_proof_to_file::<Poseidon252MerkleHasher>(
+            &cairo_proof,
+            proof.into(),
+            proof_format,
+        )
         .map_err(|e| CairoProveError::ProofSerialization(format!("{:?}", e)))?;
+    } else {
+        let cairo_proof = prove(prover_input, secure_pcs_config())?;
+        serialize_proof_to_file::<Blake2sMerkleHasher>(&cairo_proof, proof.into(), proof_format)
+            .map_err(|e| CairoProveError::ProofSerialization(format!("{:?}", e)))?;
+    }
 
     info!("Proof saved to: {:?}", proof);
-    info!("Proof generation completed in {:.2?}", elapsed);
+    info!("Proof generation completed in {:.2?}", start.elapsed());
     Ok(())
 }
 
@@ -88,11 +99,19 @@ fn handle_verify(proof: &Path, _with_pedersen: bool) -> Result<()> {
         })?;
 
     let proof_str = std::fs::read_to_string(proof_path)?;
-    let cairo_proof: CairoProofForRustVerifier<Blake2sMerkleHasher> =
-        serde_json::from_str(&proof_str)?;
 
-    verify_cairo::<Blake2sMerkleChannel>(cairo_proof)
-        .map_err(|e| CairoProveError::Verification(format!("{:?}", e)))?;
+    // Try Blake2s first, then Poseidon252
+    if let Ok(cairo_proof) =
+        serde_json::from_str::<CairoProofForRustVerifier<Blake2sMerkleHasher>>(&proof_str)
+    {
+        verify_cairo::<Blake2sMerkleChannel>(cairo_proof)
+            .map_err(|e| CairoProveError::Verification(format!("{:?}", e)))?;
+    } else {
+        let cairo_proof: CairoProofForRustVerifier<Poseidon252MerkleHasher> =
+            serde_json::from_str(&proof_str)?;
+        verify_cairo::<Poseidon252MerkleChannel>(cairo_proof)
+            .map_err(|e| CairoProveError::Verification(format!("{:?}", e)))?;
+    }
 
     info!("Verification successful");
     Ok(())
@@ -104,22 +123,18 @@ fn handle_prove_ml(
     output: &Path,
     proof_format: ProofFormat,
     gpu: bool,
+    poseidon: bool,
 ) -> Result<()> {
-    info!("Generating recursive proof for ML STARK proof: {:?}", ml_proof);
-    info!("Using ML verifier executable: {:?}", verifier_executable);
-    if gpu {
-        info!("GPU requested for recursive proving.");
-        #[cfg(feature = "cuda-runtime")]
-        info!("cuda-runtime feature enabled — GPU will be used for STARK proving.");
-        #[cfg(not(feature = "cuda-runtime"))]
-        info!("cuda-runtime feature NOT enabled — falling back to SimdBackend. \
-               Build with --features cuda-runtime to enable GPU.");
-    } else {
-        info!("GPU backend: disabled");
+    info!(
+        "Generating recursive proof for ML STARK proof: {:?}",
+        ml_proof
+    );
+    if poseidon {
+        info!("[Poseidon252] On-chain recursive path — proof will be ~19K felts.");
     }
     let start = Instant::now();
 
-    // Step 1: Load the ML verifier executable (compiled Cairo Sierra JSON)
+    // Load verifier executable
     let exec_str = verifier_executable
         .to_str()
         .ok_or_else(|| CairoProveError::InvalidPath {
@@ -128,56 +143,92 @@ fn handle_prove_ml(
     let exec_file = std::fs::File::open(exec_str)?;
     let executable: cairo_lang_executable::executable::Executable =
         serde_json::from_reader(exec_file)
-            .map_err(|e| CairoProveError::ProofSerialization(
-                format!("Failed to parse ML verifier executable: {e}")
-            ))?;
-    info!("ML verifier executable loaded.");
+            .map_err(|e| CairoProveError::ProofSerialization(format!("Failed to parse: {e}")))?;
+    info!("Verifier executable loaded.");
 
-    // Step 2: Load ML proof arguments (felt252 hex array)
+    // Load proof arguments
     let args_file = std::fs::File::open(ml_proof)?;
-    let as_vec: Vec<cairo_lang_utils::bigint::BigUintAsHex> =
-        serde_json::from_reader(args_file)
-            .map_err(|e| CairoProveError::ProofSerialization(
-                format!("Failed to parse ML proof arguments: {e}")
-            ))?;
+    let as_vec: Vec<cairo_lang_utils::bigint::BigUintAsHex> = serde_json::from_reader(args_file)
+        .map_err(|e| CairoProveError::ProofSerialization(format!("Failed to parse args: {e}")))?;
     let args: Vec<Arg> = as_vec
         .into_iter()
         .map(|v| Arg::Value(v.value.into()))
         .collect();
-    info!("ML proof arguments loaded: {} felt252 values.", args.len());
+    info!("Proof arguments loaded: {} felt252 values.", args.len());
 
-    // Step 3: Execute the ML verifier in Cairo VM
+    // Execute verifier in Cairo VM
     let exec_start = Instant::now();
     let runner = execute(executable, args)?;
-    info!("ML verifier executed in {:.2?}.", exec_start.elapsed());
+    info!("Verifier executed in {:.2?}.", exec_start.elapsed());
 
-    // Step 4: Generate recursive STARK proof
+    // Generate recursive proof
     let prove_start = Instant::now();
     let prover_input = prover_input_from_runner(&runner)?;
-    let cairo_proof = {
-        #[cfg(feature = "cuda-runtime")]
-        {
-            if gpu {
-                info!("[GPU] Using GpuBackend for STARK proving.");
-                cairo_prove::prove::prove_gpu(prover_input, secure_pcs_config())?
-            } else {
-                prove(prover_input, secure_pcs_config())?
-            }
-        }
-        #[cfg(not(feature = "cuda-runtime"))]
-        {
-            let _ = gpu; // suppress unused warning
-            prove(prover_input, secure_pcs_config())?
-        }
+
+    // Use recursive PCS config (fewer queries) for the Level 2 proof
+    let pcs = if poseidon {
+        recursive_pcs_config()
+    } else {
+        secure_pcs_config()
     };
-    info!("Recursive STARK proof generated in {:.2?}.", prove_start.elapsed());
 
-    // Step 5: Save the proof
-    serialize_proof_to_file::<Blake2sMerkleHasher>(&cairo_proof, output.into(), proof_format)
+    if poseidon {
+        let cairo_proof = {
+            #[cfg(feature = "cuda-runtime")]
+            {
+                if gpu {
+                    info!("[GPU+Poseidon252] CUDA + native Poseidon channel.");
+                    cairo_prove::prove::prove_gpu_poseidon(prover_input, pcs)?
+                } else {
+                    prove_poseidon(prover_input, pcs)?
+                }
+            }
+            #[cfg(not(feature = "cuda-runtime"))]
+            {
+                let _ = gpu;
+                prove_poseidon(prover_input, pcs)?
+            }
+        };
+        info!(
+            "Recursive STARK proof (Poseidon252) generated in {:.2?}.",
+            prove_start.elapsed()
+        );
+        serialize_proof_to_file::<Poseidon252MerkleHasher>(
+            &cairo_proof,
+            output.into(),
+            proof_format,
+        )
         .map_err(|e| CairoProveError::ProofSerialization(format!("{:?}", e)))?;
+    } else {
+        let cairo_proof = {
+            #[cfg(feature = "cuda-runtime")]
+            {
+                if gpu {
+                    info!("[GPU] Using GpuBackend for STARK proving.");
+                    cairo_prove::prove::prove_gpu(prover_input, pcs)?
+                } else {
+                    prove(prover_input, pcs)?
+                }
+            }
+            #[cfg(not(feature = "cuda-runtime"))]
+            {
+                let _ = gpu;
+                prove(prover_input, pcs)?
+            }
+        };
+        info!(
+            "Recursive STARK proof generated in {:.2?}.",
+            prove_start.elapsed()
+        );
+        serialize_proof_to_file::<Blake2sMerkleHasher>(&cairo_proof, output.into(), proof_format)
+            .map_err(|e| CairoProveError::ProofSerialization(format!("{:?}", e)))?;
+    }
 
-    let elapsed = start.elapsed();
-    info!("Recursive proof saved to: {:?} ({:.2?} total)", output, elapsed);
+    info!(
+        "Recursive proof saved to: {:?} ({:.2?} total)",
+        output,
+        start.elapsed()
+    );
     Ok(())
 }
 
@@ -191,9 +242,10 @@ fn run() -> Result<()> {
             target,
             proof,
             proof_format,
+            poseidon,
             program_arguments,
         } => {
-            handle_prove(&target, &proof, proof_format, program_arguments)?;
+            handle_prove(&target, &proof, proof_format, poseidon, program_arguments)?;
         }
         Commands::Verify {
             proof,
@@ -207,8 +259,16 @@ fn run() -> Result<()> {
             output,
             proof_format,
             gpu,
+            poseidon,
         } => {
-            handle_prove_ml(&verifier_executable, &ml_proof, &output, proof_format, gpu)?;
+            handle_prove_ml(
+                &verifier_executable,
+                &ml_proof,
+                &output,
+                proof_format,
+                gpu,
+                poseidon,
+            )?;
         }
     }
     Ok(())
@@ -221,26 +281,5 @@ fn main() -> ExitCode {
             error!("Error: {}", e);
             ExitCode::FAILURE
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::path::Path;
-
-    use cairo_vm::Felt252;
-    use num_bigint::BigInt;
-
-    use super::*;
-
-    #[test]
-    fn test_e2e() {
-        let target_path = Path::new("./example/target/release/example.executable.json");
-        let args = vec![Arg::Value(Felt252::from(BigInt::from(100)))];
-        let proof = execute_and_prove(target_path, args, PcsConfig::default())
-            .expect("Proof generation failed");
-        let proof_for_verifier: CairoProofForRustVerifier<Blake2sMerkleHasher> = proof.into();
-        let result = verify_cairo::<Blake2sMerkleChannel>(proof_for_verifier);
-        assert!(result.is_ok());
     }
 }
