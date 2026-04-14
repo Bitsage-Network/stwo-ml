@@ -185,7 +185,7 @@ pub fn wrap_executable(executable: &Executable) -> Result<(Program, Box<dyn cair
 
     // --- PROLOGUE ---
     // [0]: add_ap_immediate instruction
-    bytecode.push(Felt252::from(0x7fff7fff_u64) | (Felt252::from(0x4078001_u64) << 64));
+    bytecode.push(Felt252::from(0x40780017fff7fff_u64));
     // [1]: immediate = 11
     bytecode.push(Felt252::from(N_ALL_BUILTINS as u64));
 
