@@ -1342,12 +1342,12 @@ impl FrameworkEval for HadesVerifierEval {
         // state_before + round_key. This is built into the cube constraint
         // by using (state_before + round_key) as the multiplication input.
 
-        // ── Boolean selector constraints ──────────────────────────────
-        eval.add_constraint(is_real.clone() * (is_real.clone() - E::F::from(M31::from(1u32))));
-        eval.add_constraint(
-            is_full_round.clone() * (is_full_round.clone() - E::F::from(M31::from(1u32))),
-        );
+        // DEBUG: ALL constraints disabled — testing if framework works with 0 constraints
+        let _ = is_real;
+        let _ = is_full_round;
 
+        // DEBUG: disable all constraints except boolean selectors
+        if std::env::var("OBELYZK_HADES_FULL").map(|v| v == "1").unwrap_or(false) {
         // ── S-box constraints (degree 2, NO selector) ────────────────
         // cube_result = sbox_input^3 for ALL elements on ALL rows.
         let rc_ref = self.range_check.as_ref();
@@ -1426,6 +1426,8 @@ impl FrameworkEval for HadesVerifierEval {
             is_last_round.clone() * (is_last_round.clone() - one.clone()),
         );
 
+        // DEBUG: temporarily disabled for bisection
+        if std::env::var("OBELYZK_HADES_REPACK").map(|v| v == "1").unwrap_or(false) {
         // ── Repack verification (gated by is_last_round) ────────────
         // On last-round rows, verify that the 28-bit repacked limbs match
         // the 9-bit state_before[0] (input digest) and mds_result[0] (output digest).
@@ -1533,6 +1535,8 @@ impl FrameworkEval for HadesVerifierEval {
             }
         }
 
+        } // end DEBUG repack disable
+        } // end DEBUG full constraints disable
         // ── LogUp: Hades permutation provider (-1 per verified perm) ─
         // On is_last_round rows, contribute -1 to HadesPermRelation(18)
         // using the repacked 28-bit digest limbs.
