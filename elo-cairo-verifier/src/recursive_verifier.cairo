@@ -502,6 +502,8 @@ pub mod RecursiveVerifierContract {
             assert(pcs_config.fri_config.n_queries >= 3, 'n_queries too low');
             let commitments_span = csp.commitments;
 
+            // 3 trees: preprocessed (0), trace (1), composition (2)
+            // No interaction tree (LogUp disabled for chain-only proof)
             let preprocessed_commitment: stwo_verifier_core::Hash = *commitments_span.at(0);
             let trace_commitment: stwo_verifier_core::Hash = *commitments_span.at(1);
             let composition_commitment: stwo_verifier_core::Hash = *commitments_span.at(2);
@@ -600,6 +602,7 @@ pub mod RecursiveVerifierContract {
             // v1.2.2 signature: verify(proof, air, composition_log_degree_bound,
             //   composition_commitment, commitment_scheme, ref channel, min_security_bits)
             let composition_log_degree_bound = proof_log_size + 1;
+
             stwo_verifier_core::verifier::verify(
                 stark_proof, air, composition_log_degree_bound,
                 composition_commitment, commitment_scheme, ref channel, 0,

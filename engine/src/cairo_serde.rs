@@ -175,6 +175,7 @@ fn serialize_fri_config(config: &FriConfig, output: &mut Vec<FieldElement>) {
     serialize_u32(config.log_blowup_factor, output);
     serialize_u32(config.log_last_layer_degree_bound, output);
     serialize_usize(config.n_queries, output);
+    serialize_u32(config.fold_step, output);
 }
 
 fn serialize_pcs_config(config: &PcsConfig, output: &mut Vec<FieldElement>) {
@@ -3510,8 +3511,8 @@ mod recursive_serde {
             |h, o| serialize_poseidon252_hash(h, o),
             output,
         );
-        // column_witness: Span<M31> — empty (same as Blake2s path)
-        serialize_u32(0, output);
+        // NOTE: Cairo's MerkleDecommitment only has hash_witness (no column_witness).
+        // Do NOT serialize column_witness — it would shift all subsequent fields.
     }
 
     /// Serialize a FRI layer proof for Poseidon252.

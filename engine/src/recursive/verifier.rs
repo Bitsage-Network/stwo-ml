@@ -76,11 +76,8 @@ pub fn verify_recursive(
     // Set up channel and commitment scheme verifier
     let channel = &mut <Poseidon252MerkleChannel as MerkleChannel>::C::default();
 
-    // Mix PcsConfig into channel (must match prover's individual mix_u64 calls)
-    channel.mix_u64(pcs_config.pow_bits as u64);
-    channel.mix_u64(pcs_config.fri_config.log_blowup_factor as u64);
-    channel.mix_u64(pcs_config.fri_config.n_queries as u64);
-    channel.mix_u64(pcs_config.fri_config.log_last_layer_degree_bound as u64);
+    // Mix PcsConfig into channel (must match prover's config.mix_into() call)
+    pcs_config.mix_into(channel);
 
     // Mix public inputs into channel (must match prover's binding)
     channel.mix_felts(&[
