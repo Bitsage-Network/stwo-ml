@@ -194,6 +194,34 @@ mod tests {
     use stwo::core::fields::qm31::QM31;
 
     #[test]
+    fn test_poseidon_channel_config_mixing() {
+        use stwo::core::channel::Channel;
+        // Verify that config.mix_into() produces a DIFFERENT digest than manual mix_u64 calls.
+        // The Cairo contract uses mix_into(), so the prover must too.
+        let config = PcsConfig {
+            pow_bits: 20,
+            fri_config: stwo::core::fri::FriConfig::new(0, 5, 28, 1),
+            lifting_log_size: None,
+        };
+
+        let ch1 = &mut <Poseidon252MerkleChannel as MerkleChannel>::C::default();
+        config.mix_into(ch1);
+
+        let ch2 = &mut <Poseidon252MerkleChannel as MerkleChannel>::C::default();
+        ch2.mix_u64(20);
+        ch2.mix_u64(5);
+        ch2.mix_u64(28);
+        ch2.mix_u64(0);
+
+        eprintln!("config.mix_into digest: {:?}", ch1.digest());
+        eprintln!("manual mix_u64 digest:  {:?}", ch2.digest());
+        assert_ne!(
+            ch1.digest(), ch2.digest(),
+            "mix_into and manual mix_u64 MUST produce different digests"
+        );
+    }
+
+    #[test]
     fn test_verify_recursive_roundtrip() {
         std::env::set_var("OBELYZK_RECURSIVE_SECURITY", "test");
         // Full roundtrip: prove GKR → prove recursive → verify recursive.
