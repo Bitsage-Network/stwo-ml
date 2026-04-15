@@ -247,29 +247,30 @@ pub type ColumnsIndicesByLogDegreeBound = LogDegreeBoundSpan<Span<usize>>;
 pub fn group_columns_by_degree_bound(
     log_degree_bound_by_column: ColumnSpan<u32>,
 ) -> ColumnsIndicesByLogDegreeBound {
-    let mut column_by_degree_bound: Felt252Dict<Nullable<Array<u32>>> = Default::default();
-    let mut col_index = 0_usize;
-    for column_log_degree_bound in log_degree_bound_by_column {
-        let (column_by_degree_bound_entry, value) = column_by_degree_bound
-            .entry((*column_log_degree_bound).into());
-        let mut column_indices = match match_nullable(value) {
-            FromNullableResult::Null => array![],
-            FromNullableResult::NotNull(value) => value.unbox(),
-        };
-        column_indices.append(col_index);
-        column_by_degree_bound = column_by_degree_bound_entry
-            .finalize(NullableTrait::new(column_indices));
-        col_index += 1;
-    }
-
-    let mut res = array![];
-    for (column_degree_bound, _, column_indices) in column_by_degree_bound.squash().into_entries() {
-        /// Add empty spans for missing degree bounds.
-        while res.len().into() != column_degree_bound {
-            res.append(array![].span());
+    // Find max degree bound to size the result array.
+    let mut max_bound: u32 = 0;
+    for bound in log_degree_bound_by_column {
+        if *bound > max_bound {
+            max_bound = *bound;
         }
-        res.append(column_indices.deref().span());
-    }
+    };
+
+    // Build result: for each degree bound 0..=max_bound, collect column indices.
+    // Uses O(max_bound × n_columns) but both are small.
+    let mut res: Array<Span<u32>> = array![];
+    let mut degree: u32 = 0;
+    while degree <= max_bound {
+        let mut indices: Array<u32> = array![];
+        let mut col_index: u32 = 0;
+        for bound in log_degree_bound_by_column {
+            if *bound == degree {
+                indices.append(col_index);
+            }
+            col_index += 1;
+        };
+        res.append(indices.span());
+        degree += 1;
+    };
     res.span()
 }
 

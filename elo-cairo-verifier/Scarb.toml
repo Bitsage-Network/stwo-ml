@@ -29,7 +29,7 @@ cairo_test = "2.12.2"
 
 [[target.starknet-contract]]
 casm = true
-allowed-libfuncs-list.name = "experimental"
+allowed-libfuncs-list.name = "all"
 
 [tool.snforge]
 name = "elo_cairo_verifier"

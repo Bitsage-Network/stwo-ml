@@ -113,12 +113,17 @@ pub struct PreprocessedMaskValues {
     /// Maps a preprocessed column index to a nullable value with the value of the column at the out
     /// of domain point and a boolean indicating if the value was used in a constraint.
     pub values: Felt252Dict<Nullable<(QM31, bool)>>,
+    /// Total number of non-empty preprocessed columns inserted.
+    pub total_columns: u32,
+    /// Number of columns that have been accessed via get_and_mark_used.
+    pub used_count: u32,
 }
 
 #[generate_trait]
 pub impl PreprocessedMaskValuesImpl of PreprocessedMaskValuesTrait {
     fn new(mut preprocessed_mask_values: ColumnSpan<Span<QM31>>) -> PreprocessedMaskValues {
         let mut values: Felt252Dict<Nullable<(QM31, bool)>> = Default::default();
+        let mut non_empty_count: u32 = 0;
 
         let mut idx = 0;
         for column_mask_values in preprocessed_mask_values.into_iter() {
@@ -127,6 +132,7 @@ pub impl PreprocessedMaskValuesImpl of PreprocessedMaskValuesTrait {
             if let Some(boxed_mask_value) = desnapped.try_into() {
                 let [mask_value]: [QM31; 1] = (*boxed_mask_value).unbox();
                 values.insert(idx, NullableTrait::new((mask_value, false)));
+                non_empty_count += 1;
             } else {
                 // Preprocessed columns should have at most one mask item.
                 assert!(desnapped.is_empty());
@@ -134,7 +140,7 @@ pub impl PreprocessedMaskValuesImpl of PreprocessedMaskValuesTrait {
             idx += 1;
         }
 
-        PreprocessedMaskValues { values }
+        PreprocessedMaskValues { values, total_columns: non_empty_count, used_count: 0 }
     }
 
     fn get_and_mark_used(ref self: PreprocessedMaskValues, idx: PreprocessedColumnIdx) -> QM31 {
@@ -144,6 +150,7 @@ pub impl PreprocessedMaskValuesImpl of PreprocessedMaskValuesTrait {
         let used_value = if used {
             nullable_value
         } else {
+            self.used_count += 1;
             NullableTrait::new((value, true))
         };
         self.values = entry.finalize(used_value);
@@ -155,10 +162,9 @@ pub impl PreprocessedMaskValuesImpl of PreprocessedMaskValuesTrait {
     /// Validates that all the preprocessed_mask_values that were sent in the proof were used by at
     /// least one component.
     fn validate_usage(self: PreprocessedMaskValues) {
-        for (_, _, nullable_value) in self.values.squash().into_entries() {
-            let (_value, used) = nullable_value.deref();
-            assert!(used);
-        }
+        assert!(self.used_count == self.total_columns, "Not all preprocessed values used");
+        // Drop the dict without calling into_entries().
+        let _squashed = self.values.squash();
     }
 }
 
