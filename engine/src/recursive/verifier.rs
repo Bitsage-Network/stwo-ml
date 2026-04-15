@@ -64,6 +64,7 @@ pub fn verify_recursive(
         initial_digest_limbs: zero_limbs,
         final_digest_limbs: super::air::felt252_to_limbs(&final_digest),
         hades_lookup: None, // LogUp disabled until multi-component STARK is wired
+        hades_enabled: false,
     };
 
     // Build dummy component to get trace_log_degree_bounds
@@ -374,6 +375,7 @@ mod tests {
             initial_digest_limbs: zero_limbs,
             final_digest_limbs: super::super::air::felt252_to_limbs(&rp.final_digest),
             hades_lookup: None,
+            hades_enabled: false,
         };
         let mut allocator = TraceLocationAllocator::default();
         let component = FrameworkComponent::new(&mut allocator, eval, SecureField::zero());

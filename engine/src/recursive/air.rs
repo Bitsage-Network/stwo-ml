@@ -40,6 +40,8 @@ use stwo_constraint_framework::{
     Relation, RelationEntry,
 };
 
+use super::hades_air::{cube_252_constraint, mds_constraint, stark_prime_9bit_limbs, LIMBS_28};
+
 // ── LogUp relation: binds chain AIR ↔ Hades AIR ─────────────────────
 // Key: (digest_before[9], digest_after[9]) = 18 M31 columns (28-bit limbs).
 // This binds the chain's digest transitions to verified Hades permutations.
@@ -230,6 +232,11 @@ pub struct RecursiveVerifierEval {
     /// LogUp lookup elements for the Hades permutation relation.
     /// When `None`, LogUp is disabled (backward-compatible mode).
     pub hades_lookup: Option<HadesPermRelation>,
+
+    /// When true, the Hades AIR columns (1225 columns) follow the 48 chain
+    /// columns in the committed trace and their constraints are evaluated
+    /// inline. This merges chain + Hades into a single component.
+    pub hades_enabled: bool,
 }
 
 impl FrameworkEval for RecursiveVerifierEval {
@@ -378,6 +385,216 @@ impl FrameworkEval for RecursiveVerifierEval {
                             - addition_k.clone() * p_j
                             - carry_out_term),
                 );
+            }
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        // HADES AIR (merged inline when enabled)
+        // ══════════════════════════════════════════════════════════════
+        //
+        // When hades_enabled is true, we read the 1225 Hades trace columns
+        // that follow the 48 chain columns in the committed trace and
+        // evaluate the core Hades constraints (boolean selectors, S-box/cube,
+        // post-sbox interpolation, MDS, round transition).
+        //
+        // The Hades trace has its OWN is_real selector (independent of the
+        // chain's is_active) because the two have different numbers of real
+        // rows: chain has ~13 rows, Hades has ~1183 (13 perms * 91 rounds).
+
+        if self.hades_enabled {
+            let h_zero_f = || E::F::from(M31::from(0u32));
+
+            // ── Hades column reads (1225 columns) ────────────────────
+            // state_before: 3 x 28 limbs
+            let mut h_state_before: [[E::F; LIMBS_28]; 3] =
+                std::array::from_fn(|_| std::array::from_fn(|_| h_zero_f()));
+            for elem in 0..3 {
+                for j in 0..LIMBS_28 {
+                    h_state_before[elem][j] = eval.next_trace_mask();
+                }
+            }
+
+            // sbox_input: 3 x 28 limbs
+            let mut h_sbox_input: [[E::F; LIMBS_28]; 3] =
+                std::array::from_fn(|_| std::array::from_fn(|_| h_zero_f()));
+            for elem in 0..3 {
+                for j in 0..LIMBS_28 {
+                    h_sbox_input[elem][j] = eval.next_trace_mask();
+                }
+            }
+
+            // cube_result: 3 x 28 limbs
+            let mut h_cube_result: [[E::F; LIMBS_28]; 3] =
+                std::array::from_fn(|_| std::array::from_fn(|_| h_zero_f()));
+            for elem in 0..3 {
+                for j in 0..LIMBS_28 {
+                    h_cube_result[elem][j] = eval.next_trace_mask();
+                }
+            }
+
+            // cube_sq: 3 x 28 limbs (x^2 intermediate)
+            let mut h_cube_sq: [[E::F; LIMBS_28]; 3] =
+                std::array::from_fn(|_| std::array::from_fn(|_| h_zero_f()));
+            for elem in 0..3 {
+                for j in 0..LIMBS_28 {
+                    h_cube_sq[elem][j] = eval.next_trace_mask();
+                }
+            }
+
+            // Multiplication witness: 54 carries + 28 k_limbs per mul (6 total)
+            let mut h_mul_carries: [[[E::F; 54]; 2]; 3] =
+                std::array::from_fn(|_| std::array::from_fn(|_| std::array::from_fn(|_| h_zero_f())));
+            let mut h_mul_k_limbs: [[[[E::F; LIMBS_28]; 1]; 2]; 3] = std::array::from_fn(|_| {
+                std::array::from_fn(|_| std::array::from_fn(|_| std::array::from_fn(|_| h_zero_f())))
+            });
+            for elem in 0..3 {
+                for mul_idx in 0..2 {
+                    for j in 0..54 {
+                        h_mul_carries[elem][mul_idx][j] = eval.next_trace_mask();
+                    }
+                    for j in 0..LIMBS_28 {
+                        h_mul_k_limbs[elem][mul_idx][0][j] = eval.next_trace_mask();
+                    }
+                }
+            }
+
+            // post_sbox: 3 x 28 limbs (MDS input)
+            let mut h_post_sbox: [[E::F; LIMBS_28]; 3] =
+                std::array::from_fn(|_| std::array::from_fn(|_| h_zero_f()));
+            for elem in 0..3 {
+                for j in 0..LIMBS_28 {
+                    h_post_sbox[elem][j] = eval.next_trace_mask();
+                }
+            }
+
+            // mds_result: 3 x 28 limbs
+            let mut h_mds_result: [[E::F; LIMBS_28]; 3] =
+                std::array::from_fn(|_| std::array::from_fn(|_| h_zero_f()));
+            for elem in 0..3 {
+                for j in 0..LIMBS_28 {
+                    h_mds_result[elem][j] = eval.next_trace_mask();
+                }
+            }
+
+            // MDS carries (29) + k (1) per element
+            let mut h_mds_carries: [[E::F; 29]; 3] =
+                std::array::from_fn(|_| std::array::from_fn(|_| h_zero_f()));
+            let mut h_mds_k: [E::F; 3] = std::array::from_fn(|_| h_zero_f());
+            for elem in 0..3 {
+                for j in 0..29 {
+                    h_mds_carries[elem][j] = eval.next_trace_mask();
+                }
+                h_mds_k[elem] = eval.next_trace_mask();
+            }
+
+            // shifted_next_state: state_before of the NEXT row (round transition)
+            let mut h_shifted_next_state: [[E::F; LIMBS_28]; 3] =
+                std::array::from_fn(|_| std::array::from_fn(|_| h_zero_f()));
+            for elem in 0..3 {
+                for j in 0..LIMBS_28 {
+                    h_shifted_next_state[elem][j] = eval.next_trace_mask();
+                }
+            }
+
+            // Selectors
+            let h_is_full_round = eval.next_trace_mask();
+            let h_is_real = eval.next_trace_mask();
+            let h_is_chain_round = eval.next_trace_mask();
+
+            // Boundary selectors (read but not used for repack/LogUp)
+            let _h_is_first_round = eval.next_trace_mask();
+            let _h_is_last_round = eval.next_trace_mask();
+
+            // Repack columns (read to consume, not constrained in this mode)
+            let _h_input_digest_28bit: [E::F; 9] = std::array::from_fn(|_| eval.next_trace_mask());
+            let _h_output_digest_28bit: [E::F; 9] = std::array::from_fn(|_| eval.next_trace_mask());
+            let _h_split_lo_in: [E::F; 8] = std::array::from_fn(|_| eval.next_trace_mask());
+            let _h_split_hi_in: [E::F; 8] = std::array::from_fn(|_| eval.next_trace_mask());
+            let _h_split_lo_out: [E::F; 8] = std::array::from_fn(|_| eval.next_trace_mask());
+            let _h_split_hi_out: [E::F; 8] = std::array::from_fn(|_| eval.next_trace_mask());
+
+            // ── Hades constraints ────────────────────────────────────
+
+            let h_p_limbs = stark_prime_9bit_limbs();
+            let h_one = E::F::from(M31::from(1u32));
+
+            // Boolean selector constraints
+            eval.add_constraint(
+                h_is_real.clone() * (h_is_real.clone() - h_one.clone()),
+            );
+            eval.add_constraint(
+                h_is_full_round.clone() * (h_is_full_round.clone() - h_one.clone()),
+            );
+
+            // S-box constraints: cube_result = sbox_input^3
+            // No selector gating — padding rows are all-zero so constraints
+            // hold trivially (0^3 = 0).
+            let h_rc_ref: Option<&super::hades_air::RangeCheck20> = None;
+            for elem in 0..3 {
+                cube_252_constraint::<E>(
+                    &h_sbox_input[elem],
+                    &h_cube_sq[elem],
+                    &h_cube_result[elem],
+                    &h_mul_k_limbs[elem][0][0],
+                    &h_mul_carries[elem][0],
+                    &h_mul_k_limbs[elem][1][0],
+                    &h_mul_carries[elem][1],
+                    &mut eval,
+                    &h_p_limbs,
+                    &h_one,
+                    h_rc_ref,
+                );
+            }
+
+            // Post-sbox linking:
+            // Element 2: always cubed -> post_sbox[2] = cube_result[2]
+            for j in 0..LIMBS_28 {
+                eval.add_constraint(
+                    h_post_sbox[2][j].clone() - h_cube_result[2][j].clone(),
+                );
+            }
+            // Elements 0,1: interpolate between cube and passthrough
+            // post_sbox[e] = is_full_round * cube_result[e] + (1 - is_full_round) * sbox_input[e]
+            for elem in 0..2 {
+                for j in 0..LIMBS_28 {
+                    let expected = h_is_full_round.clone() * h_cube_result[elem][j].clone()
+                        + (h_one.clone() - h_is_full_round.clone()) * h_sbox_input[elem][j].clone();
+                    eval.add_constraint(
+                        h_post_sbox[elem][j].clone() - expected,
+                    );
+                }
+            }
+
+            // MDS constraint
+            mds_constraint::<E>(
+                &h_post_sbox[0],
+                &h_post_sbox[1],
+                &h_post_sbox[2],
+                &h_mds_result[0],
+                &h_mds_result[1],
+                &h_mds_result[2],
+                &h_mds_carries[0],
+                &h_mds_carries[1],
+                &h_mds_carries[2],
+                &h_mds_k[0],
+                &h_mds_k[1],
+                &h_mds_k[2],
+                &mut eval,
+                &h_p_limbs,
+                &h_is_real,
+                h_rc_ref,
+            );
+
+            // Round transition: mds_result[row] == state_before[row+1]
+            // Active on is_chain_round (all real rows except last in block).
+            for elem in 0..3 {
+                for j in 0..LIMBS_28 {
+                    eval.add_constraint(
+                        h_is_chain_round.clone()
+                            * (h_mds_result[elem][j].clone()
+                                - h_shifted_next_state[elem][j].clone()),
+                    );
+                }
             }
         }
 
@@ -917,6 +1134,7 @@ mod tests {
             initial_digest_limbs: [M31::from_u32_unchecked(0); LIMBS_PER_FELT],
             final_digest_limbs: [M31::from_u32_unchecked(42); LIMBS_PER_FELT],
             hades_lookup: None,
+            hades_enabled: false,
         };
         assert_eq!(eval.log_size(), 14);
         assert_eq!(eval.max_constraint_log_degree_bound(), 15); // +1 for degree-2 constraints

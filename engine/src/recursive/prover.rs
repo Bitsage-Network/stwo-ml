@@ -662,6 +662,7 @@ pub fn prove_recursive_with_policy(
         initial_digest_limbs: zero_limbs,
         final_digest_limbs: final_limbs,
         hades_lookup: logup_relation.clone(),
+        hades_enabled, // unified component: chain + Hades in one evaluate()
     };
     let chain_component =
         FrameworkComponent::new(&mut allocator, chain_eval, chain_claimed_sum);
@@ -859,25 +860,15 @@ pub fn prove_recursive_with_policy(
         eprintln!("[accum-check] {} failures out of {} rows", accum_failures, n_padded);
     }
 
-    let stark_proof = if hades_enabled {
-        let hades_component =
-            FrameworkComponent::new(&mut allocator, hades_eval, SecureField::zero());
-        recursive_log!("  [Recursive] Proving with chain + Hades components");
-        prove::<SimdBackend, Poseidon252MerkleChannel>(
-            &[&chain_component, &hades_component],
-            channel,
-            commitment_scheme,
-        )
-        .map_err(|e| RecursiveError::ProvingFailed(format!("{e:?}")))?
-    } else {
-        recursive_log!("  [Recursive] Proving with chain component only (Hades offline-verified)");
-        prove::<SimdBackend, Poseidon252MerkleChannel>(
-            &[&chain_component],
-            channel,
-            commitment_scheme,
-        )
-        .map_err(|e| RecursiveError::ProvingFailed(format!("{e:?}")))?
-    };
+    // Unified single-component proving: chain + Hades in one evaluate()
+    // (multi-component proving had a framework bug with 1225-column components)
+    recursive_log!("  [Recursive] Proving unified component (hades_enabled={})", hades_enabled);
+    let stark_proof = prove::<SimdBackend, Poseidon252MerkleChannel>(
+        &[&chain_component],
+        channel,
+        commitment_scheme,
+    )
+    .map_err(|e| RecursiveError::ProvingFailed(format!("{e:?}")))?;
 
     let recursive_prove_time = t_start.elapsed().as_secs_f64();
     recursive_log!(
