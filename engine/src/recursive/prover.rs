@@ -751,6 +751,31 @@ pub fn prove_recursive_with_policy(
         eprintln!("  [HADES DIAG] trace cols: {}, expected: {}", hades_trace.trace.len(), super::hades_air::N_HADES_TRACE_COLUMNS);
         eprintln!("  [HADES DIAG] hades_log_size: {}, unified: {}, rows: {}/{}",
             hades_log_size, unified_log_size, n_hades_real, n_hades_padded);
+
+        // Check cube constraint on row 0: cube_result[2] = sbox_input[2]³
+        // sbox_input starts at col 84, element 2 at col 84+56..84+84
+        // cube_result starts at col 168, element 2 at col 168+56..168+84
+        if n_hades_real > 0 {
+            let row = 0;
+            let sbox_in_2: Vec<u32> = (0..28).map(|j| hades_trace.trace[84 + 56 + j][row].0).collect();
+            let cube_out_2: Vec<u32> = (0..28).map(|j| hades_trace.trace[168 + 56 + j][row].0).collect();
+
+            // Reconstruct felt252 from 9-bit limbs
+            let sbox_felt = super::hades_air::limbs_9bit_to_felt252(
+                &sbox_in_2.iter().map(|v| M31::from_u32_unchecked(*v)).collect::<Vec<_>>().try_into().unwrap()
+            );
+            let cube_felt = super::hades_air::limbs_9bit_to_felt252(
+                &cube_out_2.iter().map(|v| M31::from_u32_unchecked(*v)).collect::<Vec<_>>().try_into().unwrap()
+            );
+            let expected_cube = sbox_felt * sbox_felt * sbox_felt;
+            eprintln!("  [HADES DIAG] Row 0 cube check: sbox_in[2]³ == cube_out[2]? {}",
+                expected_cube == cube_felt);
+            if expected_cube != cube_felt {
+                eprintln!("    sbox_in[2]  = {:?}", sbox_felt);
+                eprintln!("    cube_out[2] = {:?}", cube_felt);
+                eprintln!("    expected    = {:?}", expected_cube);
+            }
+        }
     }
 
     // Verify chain constraints before proving (slim 48-column offsets)
