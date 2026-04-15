@@ -360,8 +360,8 @@ pub fn prove_recursive_with_policy(
     eprintln!("  [SIZES] chain_log={}, hades_log={}, unified={}", chain_log_size, hades_log_size, unified_log_size);
     // Max degree must cover the largest component's constraint degree.
     // Chain: +1 (degree 2), Hades: +2 (degree 3 from a*b*is_active).
-    // +1 for degree-2 constraints (helper columns keep all constraints degree ≤ 2)
-    let max_degree_bound = unified_log_size + 2;
+    // Must match max(component.max_constraint_log_degree_bound()) = log_n + 1
+    let max_degree_bound = unified_log_size + 1;
     let twiddles = SimdBackend::precompute_twiddles(
         CanonicCoset::new(max_degree_bound + config.fri_config.log_blowup_factor)
             .circle_domain()
@@ -498,45 +498,22 @@ pub fn prove_recursive_with_policy(
             chain_evals,
         ));
 
-        tree_builder.commit(channel);
-        recursive_log!(
-            "  [Recursive] Channel after trace commit: {:?} (chain: {} cols @ log{}{})",
-            channel.digest(),
-            trace_data.execution_trace.len(),
-            chain_log_size,
-            if hades_enabled {
-                format!(
-                    ", hades: {} cols @ log{}",
-                    hades_trace.trace.len(),
-                    hades_log_size
-                )
-            } else {
-                String::new()
-            },
-        );
-    }
+        // Hades columns in same tree as chain
+        if hades_enabled {
+            let hades_evals: Vec<CircleEvaluation<SimdBackend, M31, _>> = hades_trace
+                .trace
+                .iter()
+                .map(|col| {
+                    let simd_col = simd_column_from_vec(col);
+                    CircleEvaluation::new(hades_domain, simd_col)
+                })
+                .collect();
+            tree_builder.extend_evals(convert_evaluations::<SimdBackend, SimdBackend, M31>(
+                hades_evals,
+            ));
+        }
 
-    // Tree 2: Hades execution trace (separate tree for independent domain)
-    if hades_enabled {
-        let mut tree_builder = commitment_scheme.tree_builder();
-        let hades_evals: Vec<CircleEvaluation<SimdBackend, M31, _>> = hades_trace
-            .trace
-            .iter()
-            .map(|col| {
-                let simd_col = simd_column_from_vec(col);
-                CircleEvaluation::new(hades_domain, simd_col)
-            })
-            .collect();
-        tree_builder.extend_evals(convert_evaluations::<SimdBackend, SimdBackend, M31>(
-            hades_evals,
-        ));
         tree_builder.commit(channel);
-        recursive_log!(
-            "  [Recursive] Channel after Hades trace commit: {:?} ({} cols @ log{})",
-            channel.digest(),
-            hades_trace.trace.len(),
-            hades_log_size,
-        );
     }
 
     // ── Step 3c: LogUp interaction trace ─────────────────────────────

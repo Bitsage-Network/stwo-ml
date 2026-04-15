@@ -125,18 +125,27 @@ pub fn prove_ex<B: BackendForChannel<MC>, MC: MerkleChannel>(
 
     // Evaluate composition polynomial at OODS point and check that it matches the trace OODS
     // values. This is a sanity check.
-    if proof
+    let lhs = proof
         .extract_composition_oods_eval(oods_point, max_log_degree_bound)
-        .unwrap()
-        != component_provers
-            .components()
-            .eval_composition_polynomial_at_point(
-                oods_point,
-                &proof.sampled_values,
-                random_coeff,
-                max_log_degree_bound,
-            )
-    {
+        .unwrap();
+    let rhs = component_provers
+        .components()
+        .eval_composition_polynomial_at_point(
+            oods_point,
+            &proof.sampled_values,
+            random_coeff,
+            max_log_degree_bound,
+        );
+    if lhs != rhs {
+        eprintln!("[STWO DEBUG] ConstraintsNotSatisfied:");
+        eprintln!("  LHS (composition eval): {:?}", lhs);
+        eprintln!("  RHS (constraint eval):  {:?}", rhs);
+        eprintln!("  max_log_degree_bound: {}", max_log_degree_bound);
+        eprintln!("  n_components: {}", component_provers.components.len());
+        eprintln!("  sampled_values trees: {}", proof.sampled_values.len());
+        for (i, tree) in proof.sampled_values.iter().enumerate() {
+            eprintln!("    tree[{}]: {} columns", i, tree.len());
+        }
         return Err(ProvingError::ConstraintsNotSatisfied);
     }
 
