@@ -106,16 +106,16 @@ impl RecursiveAirImpl of Air<RecursiveAir> {
         let active_count_next = extract_single_val(trace_vals, 47);
         let addition_k = extract_single_val(trace_vals, 44);
 
-        // Vanishing polynomial inverse
-        let constraint_domain = CanonicCosetImpl::new(*self.log_n_rows);
-        let domain_vanishing_eval_inv = constraint_domain.eval_vanishing(point).inverse();
+        // NOTE: Do NOT divide by vanishing polynomial here.
+        // verify() multiplies the result by denominator_inv (vanishing^{-1}) externally.
+        // Dividing here would double-apply the inverse.
 
         let mut quotients: Array<QM31> = array![];
 
         // ═══════════════════════════════════════════════════════════
         // C1: is_active boolean [unconditional]
         // ═══════════════════════════════════════════════════════════
-        quotients.append(domain_vanishing_eval_inv * is_active * (one - is_active));
+        quotients.append(is_active * (one - is_active));
 
         // ═══════════════════════════════════════════════════════════
         // C2: amortized accumulator [unconditional — BLOCKS all-zeros]
@@ -128,8 +128,7 @@ impl RecursiveAirImpl of Air<RecursiveAir> {
         let correction_m31: M31 = m31(*self.n_real_rows) * n_inv_m31;
         let correction: QM31 = m31_to_qm31(correction_m31);
         quotients.append(
-            domain_vanishing_eval_inv
-                * (active_count_next - active_count - is_active + correction)
+            (active_count_next - active_count - is_active + correction)
         );
 
         // ═══════════════════════════════════════════════════════════
@@ -140,7 +139,7 @@ impl RecursiveAirImpl of Air<RecursiveAir> {
             if j >= LIMBS_PER_FELT { break; }
             let db = extract_single_val(trace_vals, j);
             let init = *self.initial_digest_limbs.at(j);
-            quotients.append(domain_vanishing_eval_inv * is_first * (db - init));
+            quotients.append(is_first * (db - init));
             j += 1;
         };
 
@@ -152,7 +151,7 @@ impl RecursiveAirImpl of Air<RecursiveAir> {
             if j >= LIMBS_PER_FELT { break; }
             let da = extract_single_val(trace_vals, 9 + j); // digest_after
             let fin = *self.final_digest_limbs.at(j);
-            quotients.append(domain_vanishing_eval_inv * is_last * (da - fin));
+            quotients.append(is_last * (da - fin));
             j += 1;
         };
 
@@ -160,7 +159,7 @@ impl RecursiveAirImpl of Air<RecursiveAir> {
         // C5k: k boolean — is_chain × k × (k - 1)
         // ═══════════════════════════════════════════════════════════
         quotients.append(
-            domain_vanishing_eval_inv * is_chain * addition_k * (addition_k - one)
+            is_chain * addition_k * (addition_k - one)
         );
 
         // ═══════════════════════════════════════════════════════════
@@ -171,7 +170,7 @@ impl RecursiveAirImpl of Air<RecursiveAir> {
             if j >= 8 { break; }
             let carry_j = extract_single_val(trace_vals, 36 + j); // addition_carry
             quotients.append(
-                domain_vanishing_eval_inv * is_chain * carry_j * (carry_j - one)
+                is_chain * carry_j * (carry_j - one)
             );
             j += 1;
         };
@@ -204,8 +203,7 @@ impl RecursiveAirImpl of Air<RecursiveAir> {
             };
 
             quotients.append(
-                domain_vanishing_eval_inv
-                    * is_chain
+                is_chain
                     * (da + add + carry_in - snb - addition_k * p_j - carry_out_term)
             );
             j += 1;
