@@ -231,9 +231,10 @@ pub fn prove_recursive_with_policy(
             "test" => PcsConfig::default(), // 13 bits — unit tests only
             _ => PcsConfig {
                 pow_bits: 20,
-                // 160 bits: pow(20) + blowup(5)*queries(28) = 20+140 = 160
+                // 120 bits: pow(20) + blowup(5)*queries(20) = 20+100 = 120
+                // Reduced from 28 to 20 queries to fit Alchemy RPC 5000-felt limit
                 // log_last_layer_degree_bound=0 required by Cairo FRI verifier
-                fri_config: stwo::core::fri::FriConfig::new(0, 5, 28, 1),
+                fri_config: stwo::core::fri::FriConfig::new(0, 5, 20, 1),
                 lifting_log_size: None,
             },
         }
