@@ -166,6 +166,9 @@ pub trait IRecursiveVerifier<TContractState> {
 
     /// Finalize: reassemble proof from storage, verify, record on-chain.
     fn stream_verify(ref self: TContractState, session_id: u64) -> bool;
+
+    /// Query streaming session state (for debugging).
+    fn get_session_state(self: @TContractState, session_id: u64) -> (u32, u32);
 }
 
 #[starknet::contract]
@@ -939,6 +942,13 @@ pub mod RecursiveVerifierContract {
                 self.session_policy_commitment.read(session_id),
                 self.session_trace_log_size.read(session_id),
                 stark_proof_data,
+            )
+        }
+
+        fn get_session_state(self: @ContractState, session_id: u64) -> (u32, u32) {
+            (
+                self.session_received_felts.read(session_id),
+                self.session_total_felts.read(session_id),
             )
         }
     }
