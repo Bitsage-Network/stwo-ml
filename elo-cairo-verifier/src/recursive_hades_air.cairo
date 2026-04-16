@@ -16,7 +16,7 @@
 ///   - Sum = 0 proves all chain entries have valid Hades permutations
 
 use stwo_verifier_core::fields::qm31::{QM31, QM31Zero, QM31One};
-// use stwo_verifier_core::fields::m31::M31;
+use crate::recursive_air::extract_single_val;
 
 /// Number of 9-bit limbs per felt252.
 pub const LIMBS_28: u32 = 28;
@@ -246,7 +246,6 @@ pub fn evaluate_hades_constraints_array(
     trace_vals: stwo_verifier_core::ColumnSpan<Span<QM31>>,
     col_offset: u32,
 ) -> Array<QM31> {
-    use crate::recursive_air::extract_single_val;
     let p_limbs = stark_prime_limbs();
 
     let mut pos: u32 = col_offset;
@@ -403,78 +402,89 @@ pub fn evaluate_hades_constraints_array(
     quotients.append(is_full_round * (is_full_round - one));
 
     // S-box cube constraints: 3 elements × 56 constraints = 168
+    let sbox_s = @sbox_input;
+    let csq_s = @cube_sq;
+    let cres_s = @cube_result;
+    let mk_s = @mul_k;
+    let mc_s = @mul_carries;
     elem = 0;
     loop {
         if elem >= 3 { break; }
+        let si_span: Span<QM31> = sbox_s.at(elem).span();
+        let sq_span: Span<QM31> = csq_s.at(elem).span();
+        let cr_span: Span<QM31> = cres_s.at(elem).span();
+        let k_sq_val: QM31 = *mk_s.at(elem).at(0);
+        let k_cu_val: QM31 = *mk_s.at(elem).at(1);
+        let carries_sq: Span<QM31> = mc_s.at(elem).at(0).span();
+        let carries_cu: Span<QM31> = mc_s.at(elem).at(1).span();
         let q = cube_252_at_point(
-            sbox_input.at(elem).span(),
-            cube_sq.at(elem).span(),
-            cube_result.at(elem).span(),
-            *mul_k.at(elem * 2),         // k for x²
-            mul_carries.at(elem).at(0).span(),  // carries for x²
-            *mul_k.at(elem * 2 + 1),     // k for x³
-            mul_carries.at(elem).at(1).span(),  // carries for x³
-            p_limbs.span(),
-            is_real,
+            si_span, sq_span, cr_span,
+            k_sq_val, carries_sq,
+            k_cu_val, carries_cu,
+            p_limbs.span(), is_real,
         );
+        let q_span = q.span();
         let mut i: u32 = 0;
-        loop { if i >= q.len() { break; } quotients.append(*q.at(i)); i += 1; };
+        loop { if i >= q_span.len() { break; } quotients.append(*q_span[i]); i += 1; };
         elem += 1;
     };
 
     // Post-sbox linking: element 2 always cubed (28 constraints)
+    let ps_s = @post_sbox;
+    let ps2: Span<QM31> = ps_s.at(2).span();
+    let cr2: Span<QM31> = cres_s.at(2).span();
     let mut j: u32 = 0;
     loop {
         if j >= 28 { break; }
-        quotients.append(*post_sbox.at(2).at(j) - *cube_result.at(2).at(j));
+        quotients.append(*ps2[j] - *cr2[j]);
         j += 1;
     };
 
     // Post-sbox interpolation: elements 0,1 (56 constraints)
+    let si_s = @sbox_input;
     elem = 0;
     loop {
         if elem >= 2 { break; }
+        let ps_e: Span<QM31> = ps_s.at(elem).span();
+        let cr_e: Span<QM31> = cres_s.at(elem).span();
+        let si_e: Span<QM31> = si_s.at(elem).span();
         j = 0;
         loop {
             if j >= 28 { break; }
-            let expected = is_full_round * *cube_result.at(elem).at(j)
-                + (one - is_full_round) * *sbox_input.at(elem).at(j);
-            quotients.append(*post_sbox.at(elem).at(j) - expected);
+            let expected = is_full_round * *cr_e[j]
+                + (one - is_full_round) * *si_e[j];
+            quotients.append(*ps_e[j] - expected);
             j += 1;
         };
         elem += 1;
     };
 
     // MDS constraints (84 constraints)
+    let mr_s = @mds_result;
+    let mcar_s = @mds_carries;
+    let mk_s2 = @mds_k;
     let mds_q = mds_at_point(
-        post_sbox.at(0).span(),
-        post_sbox.at(1).span(),
-        post_sbox.at(2).span(),
-        mds_result.at(0).span(),
-        mds_result.at(1).span(),
-        mds_result.at(2).span(),
-        mds_carries.at(0).span(),
-        mds_carries.at(1).span(),
-        mds_carries.at(2).span(),
-        *mds_k.at(0),
-        *mds_k.at(1),
-        *mds_k.at(2),
-        p_limbs.span(),
-        is_real,
+        ps_s.at(0).span(), ps_s.at(1).span(), ps_s.at(2).span(),
+        mr_s.at(0).span(), mr_s.at(1).span(), mr_s.at(2).span(),
+        mcar_s.at(0).span(), mcar_s.at(1).span(), mcar_s.at(2).span(),
+        *mk_s2[0], *mk_s2[1], *mk_s2[2],
+        p_limbs.span(), is_real,
     );
+    let mds_q_span = mds_q.span();
     let mut i: u32 = 0;
-    loop { if i >= mds_q.len() { break; } quotients.append(*mds_q.at(i)); i += 1; };
+    loop { if i >= mds_q_span.len() { break; } quotients.append(*mds_q_span[i]); i += 1; };
 
     // Round transition: mds_result == shifted_next_state (84 constraints)
+    let sn_s = @shifted_next;
     elem = 0;
     loop {
         if elem >= 3 { break; }
+        let mr_e: Span<QM31> = mr_s.at(elem).span();
+        let sn_e: Span<QM31> = sn_s.at(elem).span();
         j = 0;
         loop {
             if j >= 28 { break; }
-            quotients.append(
-                is_chain_round * (*mds_result.at(elem).at(j) - *shifted_next.at(elem).at(j))
-            );
+            quotients.append(is_chain_round * (*mr_e[j] - *sn_e[j]));
             j += 1;
         };
         elem += 1;

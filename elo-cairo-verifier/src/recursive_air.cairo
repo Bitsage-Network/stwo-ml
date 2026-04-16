@@ -29,7 +29,7 @@
 use stwo_verifier_core::fields::qm31::{QM31, QM31Zero, QM31One, QM31Trait};
 use stwo_verifier_core::fields::m31::{M31, m31};
 use stwo_verifier_core::circle::CirclePoint;
-use stwo_verifier_core::poly::circle::{CanonicCosetImpl, CanonicCosetTrait};
+use stwo_verifier_core::poly::circle::CanonicCosetImpl;
 use stwo_verifier_core::fields::Invertible;
 use stwo_verifier_core::verifier::Air;
 use stwo_verifier_core::{TreeSpan, ColumnSpan};
@@ -81,9 +81,9 @@ impl RecursiveAirImpl of Air<RecursiveAir> {
     ) -> QM31 {
         // Chain-only: 3 trees [preprocessed, trace, composition]
         // Hades mode: 4 trees [preprocessed, trace+hades, interaction, composition]
-        let mask_span = *mask_values;
-        let preprocessed_vals: ColumnSpan<Span<QM31>> = *mask_span.at(0);
-        let trace_vals: ColumnSpan<Span<QM31>> = *mask_span.at(1);
+        let _n_trees = mask_values.len();
+        let preprocessed_vals: ColumnSpan<Span<QM31>> = *mask_values[0];
+        let trace_vals: ColumnSpan<Span<QM31>> = *mask_values[1];
 
         // Preprocessed selectors
         let is_first = extract_single_val(preprocessed_vals, 0);
