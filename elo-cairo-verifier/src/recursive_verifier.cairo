@@ -136,39 +136,6 @@ pub trait IRecursiveVerifier<TContractState> {
     /// Get the pending upgrade class hash and proposal timestamp.
     fn get_pending_upgrade(self: @TContractState) -> (starknet::ClassHash, u64);
 
-    // ═══════════════════════════════════════════════════════════════
-    // Streaming verification (for proofs > 5000 felts)
-    // ═══════════════════════════════════════════════════════════════
-
-    /// Open a streaming session for large proof upload.
-    /// Returns a session_id for subsequent chunk uploads.
-    fn stream_open(
-        ref self: TContractState,
-        model_id: felt252,
-        io_commitment: felt252,
-        circuit_hash: felt252,
-        weight_super_root: felt252,
-        n_layers: u32,
-        n_matmuls: u32,
-        hidden_size: u32,
-        num_transformer_blocks: u32,
-        policy_commitment: felt252,
-        trace_log_size: u32,
-        expected_total_felts: u32,
-    ) -> u64;
-
-    /// Upload a chunk of proof data to an open session.
-    fn stream_chunk(
-        ref self: TContractState,
-        session_id: u64,
-        chunk: Array<felt252>,
-    );
-
-    /// Finalize: reassemble proof from storage, verify, record on-chain.
-    fn stream_verify(ref self: TContractState, session_id: u64) -> bool;
-
-    /// Query streaming session state (for debugging).
-    fn get_session_state(self: @TContractState, session_id: u64) -> (u32, u32);
 }
 
 #[starknet::contract]
@@ -215,30 +182,6 @@ pub mod RecursiveVerifierContract {
 
         /// Timestamp when upgrade was proposed.
         upgrade_proposed_at: u64,
-
-        // ── Streaming state ─────────────────────────────────────────
-        /// Next session ID counter.
-        next_session_id: u64,
-        /// Session owner (only they can upload chunks / finalize).
-        session_owner: Map<u64, ContractAddress>,
-        /// Session metadata: model_id, io_commitment, etc.
-        session_model_id: Map<u64, felt252>,
-        session_io_commitment: Map<u64, felt252>,
-        session_circuit_hash: Map<u64, felt252>,
-        session_weight_super_root: Map<u64, felt252>,
-        session_n_layers: Map<u64, u32>,
-        session_n_matmuls: Map<u64, u32>,
-        session_hidden_size: Map<u64, u32>,
-        session_num_transformer_blocks: Map<u64, u32>,
-        session_policy_commitment: Map<u64, felt252>,
-        session_trace_log_size: Map<u64, u32>,
-        /// Expected and received proof data.
-        session_total_felts: Map<u64, u32>,
-        session_received_felts: Map<u64, u32>,
-        /// Proof data storage: (session_id, flat_index) → felt252.
-        session_data: Map<(u64, u32), felt252>,
-        /// Running hash of all uploaded chunks for integrity.
-        session_data_hash: Map<u64, felt252>,
     }
 
     /// Minimum delay (seconds) between propose_upgrade and execute_upgrade.
@@ -253,25 +196,6 @@ pub mod RecursiveVerifierContract {
         UpgradeProposed: UpgradeProposed,
         UpgradeExecuted: UpgradeExecuted,
         UpgradeCancelled: UpgradeCancelled,
-        StreamSessionOpened: StreamSessionOpened,
-        StreamChunkReceived: StreamChunkReceived,
-    }
-
-    #[derive(Drop, starknet::Event)]
-    pub struct StreamSessionOpened {
-        #[key]
-        pub session_id: u64,
-        pub model_id: felt252,
-        pub expected_total_felts: u32,
-        pub owner: ContractAddress,
-    }
-
-    #[derive(Drop, starknet::Event)]
-    pub struct StreamChunkReceived {
-        #[key]
-        pub session_id: u64,
-        pub chunk_size: u32,
-        pub total_received: u32,
     }
 
     #[derive(Drop, starknet::Event)]
@@ -334,7 +258,6 @@ pub mod RecursiveVerifierContract {
     #[constructor]
     fn constructor(ref self: ContractState, owner: ContractAddress) {
         self.owner.write(owner);
-        self.next_session_id.write(1);
     }
 
     #[abi(embed_v0)]
@@ -832,125 +755,6 @@ pub mod RecursiveVerifierContract {
             (self.pending_upgrade.read(), self.upgrade_proposed_at.read())
         }
 
-        // ═══════════════════════════════════════════════════════════
-        // Streaming verification
-        // ═══════════════════════════════════════════════════════════
-
-        fn stream_open(
-            ref self: ContractState,
-            model_id: felt252,
-            io_commitment: felt252,
-            circuit_hash: felt252,
-            weight_super_root: felt252,
-            n_layers: u32,
-            n_matmuls: u32,
-            hidden_size: u32,
-            num_transformer_blocks: u32,
-            policy_commitment: felt252,
-            trace_log_size: u32,
-            expected_total_felts: u32,
-        ) -> u64 {
-            let caller = get_caller_address();
-            let session_id = self.next_session_id.read();
-            self.next_session_id.write(session_id + 1);
-
-            self.session_owner.write(session_id, caller);
-            self.session_model_id.write(session_id, model_id);
-            self.session_io_commitment.write(session_id, io_commitment);
-            self.session_circuit_hash.write(session_id, circuit_hash);
-            self.session_weight_super_root.write(session_id, weight_super_root);
-            self.session_n_layers.write(session_id, n_layers);
-            self.session_n_matmuls.write(session_id, n_matmuls);
-            self.session_hidden_size.write(session_id, hidden_size);
-            self.session_num_transformer_blocks.write(session_id, num_transformer_blocks);
-            self.session_policy_commitment.write(session_id, policy_commitment);
-            self.session_trace_log_size.write(session_id, trace_log_size);
-            self.session_total_felts.write(session_id, expected_total_felts);
-            self.session_received_felts.write(session_id, 0);
-
-            self.emit(StreamSessionOpened {
-                session_id, model_id, expected_total_felts, owner: caller,
-            });
-
-            session_id
-        }
-
-        fn stream_chunk(
-            ref self: ContractState,
-            session_id: u64,
-            chunk: Array<felt252>,
-        ) {
-            // Only session owner can upload
-            assert(
-                get_caller_address() == self.session_owner.read(session_id),
-                'Not session owner'
-            );
-
-            let received = self.session_received_felts.read(session_id);
-            let total = self.session_total_felts.read(session_id);
-            let chunk_len: u32 = chunk.len();
-            assert(received + chunk_len <= total, 'Exceeds expected size');
-
-            // Store chunk data
-            let mut i: u32 = 0;
-            let chunk_span = chunk.span();
-            loop {
-                if i >= chunk_len { break; }
-                self.session_data.write((session_id, received + i), *chunk_span.at(i));
-                i += 1;
-            };
-
-            let new_received = received + chunk_len;
-            self.session_received_felts.write(session_id, new_received);
-
-            self.emit(StreamChunkReceived {
-                session_id, chunk_size: chunk_len, total_received: new_received,
-            });
-        }
-
-        fn stream_verify(ref self: ContractState, session_id: u64) -> bool {
-            // Only session owner can finalize
-            assert(
-                get_caller_address() == self.session_owner.read(session_id),
-                'Not session owner'
-            );
-
-            // All data must be uploaded
-            let total = self.session_total_felts.read(session_id);
-            let received = self.session_received_felts.read(session_id);
-            assert(received == total, 'Incomplete upload');
-
-            // Reassemble proof data from storage
-            let mut stark_proof_data: Array<felt252> = array![];
-            let mut i: u32 = 0;
-            loop {
-                if i >= total { break; }
-                stark_proof_data.append(self.session_data.read((session_id, i)));
-                i += 1;
-            };
-
-            // Delegate to verify_recursive with reassembled data
-            self.verify_recursive(
-                self.session_model_id.read(session_id),
-                self.session_io_commitment.read(session_id),
-                self.session_circuit_hash.read(session_id),
-                self.session_weight_super_root.read(session_id),
-                self.session_n_layers.read(session_id),
-                self.session_n_matmuls.read(session_id),
-                self.session_hidden_size.read(session_id),
-                self.session_num_transformer_blocks.read(session_id),
-                self.session_policy_commitment.read(session_id),
-                self.session_trace_log_size.read(session_id),
-                stark_proof_data,
-            )
-        }
-
-        fn get_session_state(self: @ContractState, session_id: u64) -> (u32, u32) {
-            (
-                self.session_received_felts.read(session_id),
-                self.session_total_felts.read(session_id),
-            )
-        }
     }
 
     /// Convert a felt252 that holds an M31 value (0..2^31-1) to M31.
