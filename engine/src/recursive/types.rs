@@ -154,6 +154,20 @@ pub struct RecursivePublicInputs {
     /// and producing the exact same Hades permutations the real verifier would.
     /// This value is deterministic per model (doesn't depend on inference data).
     pub seed_digest: QM31,
+
+    /// KV-cache commitment — Poseidon hash of this step's *output* KV cache.
+    /// FieldElement::ZERO on prefill / single-pass proofs (no KV cache yet).
+    /// Non-zero on every decode step. The on-chain session contract uses this
+    /// as the next step's required `prev_kv_cache_commitment`, enforcing
+    /// continuity across submissions.
+    pub kv_cache_commitment: FieldElement,
+
+    /// Previous KV-cache commitment — what step *i*'s input cache was hashed to.
+    /// FieldElement::ZERO on prefill (the initial step has no prior cache).
+    /// On decode step *i*, must equal step *i-1*'s `kv_cache_commitment`.
+    /// SECURITY: mixed into Fiat-Shamir; cross-checked on-chain by
+    /// `verify_decode_step` against the session's stored `last_kv_commitment`.
+    pub prev_kv_cache_commitment: FieldElement,
 }
 
 /// The recursive STARK proof — replaces the 112K felt GKR calldata.

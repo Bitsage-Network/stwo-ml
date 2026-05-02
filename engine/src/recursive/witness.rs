@@ -635,6 +635,13 @@ pub fn generate_witness_with_policy(
         super::prover::compute_hades_commitment(&pairs)
     };
 
+    // Pull KV-cache commitments from the GKR proof (set by decode-step prover).
+    // FieldElement::ZERO on prefill / single-pass / non-decode proofs.
+    let kv_cache_commitment = proof.kv_cache_commitment
+        .unwrap_or(starknet_ff::FieldElement::ZERO);
+    let prev_kv_cache_commitment = proof.prev_kv_cache_commitment
+        .unwrap_or(starknet_ff::FieldElement::ZERO);
+
     let witness = GkrVerifierWitness {
         ops: channel.into_ops(),
         public_inputs: RecursivePublicInputs {
@@ -645,6 +652,8 @@ pub fn generate_witness_with_policy(
             n_poseidon_perms: total_poseidon_calls as u32,
             seed_digest,
             hades_commitment,
+            kv_cache_commitment,
+            prev_kv_cache_commitment,
         },
         // Use the production verifier's total count (covers ALL layer types)
         n_poseidon_perms: total_poseidon_calls,

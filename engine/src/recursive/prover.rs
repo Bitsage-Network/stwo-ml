@@ -295,6 +295,26 @@ pub fn prove_recursive_with_policy(
         channel.mix_u64(u3);
     }
 
+    // SECURITY: KV-cache continuity binding. Multi-token autoregressive sessions
+    // require step N's input cache == step N-1's output cache. Mixing both
+    // commitments here makes any tampering with the chain (reorder, skip a
+    // step, swap caches) cause Fiat-Shamir divergence and FRI rejection.
+    // Both are FieldElement::ZERO on prefill / single-pass / non-decode proofs.
+    for fe in [
+        witness.public_inputs.prev_kv_cache_commitment,
+        witness.public_inputs.kv_cache_commitment,
+    ] {
+        let bytes = fe.to_bytes_be();
+        let u0 = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
+        let u1 = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
+        let u2 = u64::from_be_bytes(bytes[16..24].try_into().unwrap());
+        let u3 = u64::from_be_bytes(bytes[24..32].try_into().unwrap());
+        channel.mix_u64(u0);
+        channel.mix_u64(u1);
+        channel.mix_u64(u2);
+        channel.mix_u64(u3);
+    }
+
     // Bind the felt252 io_commitment into the channel.
     // IMPORTANT: This MUST use the SAME value that ends up in the proof body
     // (io_commitment_felt252). The Cairo verifier reads this from the proof

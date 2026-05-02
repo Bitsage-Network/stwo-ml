@@ -43,8 +43,32 @@ pub struct RecursiveModelInfo {
     /// could submit a 2-row chain that satisfies all AIR constraints without
     /// running the GKR verifier. Set at registration from a reference proof.
     pub expected_n_poseidon_perms: u32,
+    /// keccak256 of off-chain cairo-prove Hades Level 1 proof; 0 = not yet attached.
+    /// Phase A is auditable hash only — off-chain auditors fetch the Level 1
+    /// proof and verify it matches. No on-chain enforcement at verify time.
+    pub level1_proof_hash: felt252,
     /// Owner who registered the model.
     pub owner: starknet::ContractAddress,
+}
+
+/// Per-session state for streaming/decoding workloads (KV-cache continuity).
+///
+/// Each `verify_decode_step` call advances `step_count` by 1 and rolls
+/// `last_kv_commitment` forward via the proof body's KV-cache fields.
+#[derive(Drop, Copy, Serde, starknet::Store)]
+pub struct DecodeSession {
+    /// Model bound to this session (from start_decode_session).
+    pub model_id: felt252,
+    /// Block timestamp of session start.
+    pub started_at: u64,
+    /// Number of accepted steps so far. Next step MUST equal this value.
+    pub step_count: u32,
+    /// Rolling KV-cache commitment. 0 at start; updated to proof[25] each step.
+    pub last_kv_commitment: felt252,
+    /// True after finalize_decode_session — no more steps accepted.
+    pub finalized: bool,
+    /// Address that opened the session (sole finalizer).
+    pub initiator: starknet::ContractAddress,
 }
 
 #[starknet::interface]
@@ -63,6 +87,7 @@ pub trait IRecursiveVerifier<TContractState> {
         hidden_size: u32,
         num_transformer_blocks: u32,
         expected_n_poseidon_perms: u32,
+        level1_proof_hash: felt252,
     );
 
     /// Verify a recursive STARK proof for a registered model.
@@ -118,11 +143,63 @@ pub trait IRecursiveVerifier<TContractState> {
         self: @TContractState, model_id: felt252,
     ) -> felt252;
 
+    /// Get the keccak256 of the off-chain Level 1 Hades proof attached at
+    /// registration. Returns 0 if not yet attached. Phase A: auditable only.
+    fn get_level1_proof_hash(
+        self: @TContractState, model_id: felt252,
+    ) -> felt252;
+
     /// Get full details of the last verification for a model.
     /// Returns (io_commitment, proof_hash, timestamp, proof_felts, n_layers, trace_log_size, verification_count).
     fn get_last_verification(
         self: @TContractState, model_id: felt252,
     ) -> (felt252, felt252, u64, u32, u32, u32, u64);
+
+    /// Open a new streaming decode session for a registered model.
+    ///
+    /// Each session tracks a rolling KV-cache commitment. Steps must arrive
+    /// in order (no gaps, no reorder). Returns the new session_id.
+    ///
+    /// `initial_kv_commitment`: the anchor state for the session. Pass `0` for
+    /// decode-from-fresh sessions, or the post-prefill KV-cache commitment when
+    /// continuing an off-chain prefill. The first decode step's
+    /// `prev_kv_cache_commitment` MUST equal this value.
+    fn start_decode_session(
+        ref self: TContractState,
+        model_id: felt252,
+        initial_kv_commitment: felt252,
+    ) -> u64;
+
+    /// Verify the next step of an open decode session.
+    ///
+    /// Performs full STARK verification (identical to `verify_recursive`) plus
+    /// continuity checks: the proof body's `prev_kv_cache_commitment` (proof[24])
+    /// MUST equal `session.last_kv_commitment`, and on success the session's
+    /// rolling commitment is rolled forward to the body's `kv_cache_commitment`
+    /// (proof[25]). `expected_step_idx` MUST equal `session.step_count`.
+    fn verify_decode_step(
+        ref self: TContractState,
+        session_id: u64,
+        expected_step_idx: u32,
+        model_id: felt252,
+        io_commitment: felt252,
+        circuit_hash: felt252,
+        weight_super_root: felt252,
+        n_layers: u32,
+        n_matmuls: u32,
+        hidden_size: u32,
+        num_transformer_blocks: u32,
+        policy_commitment: felt252,
+        trace_log_size: u32,
+        stark_proof_data: Array<felt252>,
+    ) -> bool;
+
+    /// Finalize a decode session. Only the initiator may finalize. Requires
+    /// at least one accepted step. Returns the final rolling KV commitment.
+    fn finalize_decode_session(ref self: TContractState, session_id: u64) -> felt252;
+
+    /// Read a decode session's full state.
+    fn get_decode_session(self: @TContractState, session_id: u64) -> DecodeSession;
 
     /// Propose a contract class upgrade (owner only, subject to timelock).
     fn propose_upgrade(ref self: TContractState, new_class_hash: starknet::ClassHash);
@@ -140,9 +217,9 @@ pub trait IRecursiveVerifier<TContractState> {
 
 #[starknet::contract]
 pub mod RecursiveVerifierContract {
-    use super::RecursiveModelInfo;
+    use super::{RecursiveModelInfo, DecodeSession};
     use starknet::storage::{Map, StorageMapReadAccess, StorageMapWriteAccess, StoragePointerReadAccess, StoragePointerWriteAccess};
-    use starknet::{get_caller_address, ContractAddress};
+    use starknet::{get_caller_address, get_block_timestamp, ContractAddress};
     use core::poseidon::poseidon_hash_span;
     use stwo_verifier_core::fields::qm31::{QM31, QM31Zero, QM31Trait};
     use stwo_verifier_core::fields::m31::{M31, m31};
@@ -182,6 +259,12 @@ pub mod RecursiveVerifierContract {
 
         /// Timestamp when upgrade was proposed.
         upgrade_proposed_at: u64,
+
+        /// Streaming decode sessions: session_id → DecodeSession.
+        decode_sessions: Map<u64, DecodeSession>,
+
+        /// Monotonically increasing session id counter.
+        next_session_id: u64,
     }
 
     /// Minimum delay (seconds) between propose_upgrade and execute_upgrade.
@@ -196,6 +279,9 @@ pub mod RecursiveVerifierContract {
         UpgradeProposed: UpgradeProposed,
         UpgradeExecuted: UpgradeExecuted,
         UpgradeCancelled: UpgradeCancelled,
+        DecodeSessionStarted: DecodeSessionStarted,
+        DecodeStepVerified: DecodeStepVerified,
+        DecodeSessionFinalized: DecodeSessionFinalized,
     }
 
     #[derive(Drop, starknet::Event)]
@@ -205,6 +291,8 @@ pub mod RecursiveVerifierContract {
         pub circuit_hash: felt252,
         pub weight_super_root: felt252,
         pub policy_commitment: felt252,
+        /// keccak256 of the off-chain Hades Level 1 proof (0 = not attached).
+        pub level1_proof_hash: felt252,
         pub owner: ContractAddress,
     }
 
@@ -255,6 +343,39 @@ pub mod RecursiveVerifierContract {
         pub cancelled_by: ContractAddress,
     }
 
+    #[derive(Drop, starknet::Event)]
+    pub struct DecodeSessionStarted {
+        #[key]
+        pub session_id: u64,
+        #[key]
+        pub model_id: felt252,
+        pub initiator: ContractAddress,
+        pub started_at: u64,
+        pub initial_kv_commitment: felt252,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    pub struct DecodeStepVerified {
+        #[key]
+        pub session_id: u64,
+        pub step_idx: u32,
+        /// KV-cache commitment expected on entry (matches session.last_kv_commitment).
+        pub prev_kv: felt252,
+        /// KV-cache commitment after this step (rolled into session).
+        pub new_kv: felt252,
+        /// Poseidon dedup hash of the step proof (over model_id, io_commitment).
+        pub proof_hash: felt252,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    pub struct DecodeSessionFinalized {
+        #[key]
+        pub session_id: u64,
+        pub n_steps: u32,
+        pub final_kv: felt252,
+        pub finalized_at: u64,
+    }
+
     #[constructor]
     fn constructor(ref self: ContractState, owner: ContractAddress) {
         self.owner.write(owner);
@@ -272,6 +393,7 @@ pub mod RecursiveVerifierContract {
             hidden_size: u32,
             num_transformer_blocks: u32,
             expected_n_poseidon_perms: u32,
+            level1_proof_hash: felt252,
         ) {
             // Only owner can register models
             let caller = get_caller_address();
@@ -292,6 +414,7 @@ pub mod RecursiveVerifierContract {
                 hidden_size,
                 num_transformer_blocks,
                 expected_n_poseidon_perms,
+                level1_proof_hash,
                 owner: caller,
             };
             self.recursive_models.write(model_id, info);
@@ -301,6 +424,7 @@ pub mod RecursiveVerifierContract {
                 circuit_hash,
                 weight_super_root,
                 policy_commitment,
+                level1_proof_hash,
                 owner: caller,
             });
         }
@@ -319,6 +443,306 @@ pub mod RecursiveVerifierContract {
             trace_log_size: u32,
             stark_proof_data: Array<felt252>,
         ) -> bool {
+            // Single-pass wrapper: runs the shared inner verifier, then enforces
+            // the single-pass invariant (no KV-cache continuity), and finally
+            // performs dedup write + verification-count update + event emit.
+            let stark_proof_data_len: u32 = stark_proof_data.len();
+            let (proof_hash, prev_kv, _new_kv) = self._verify_recursive_inner(
+                model_id,
+                io_commitment,
+                circuit_hash,
+                weight_super_root,
+                n_layers,
+                n_matmuls,
+                hidden_size,
+                num_transformer_blocks,
+                policy_commitment,
+                trace_log_size,
+                stark_proof_data,
+            );
+
+            // Single-pass mode: prover MUST set prev_kv_cache_commitment = 0.
+            // Streaming continuity (nonzero prev) is only valid through
+            // verify_decode_step.
+            assert(prev_kv == 0, 'Single-pass requires prev_kv=0');
+
+            // Record verification + rich on-chain state.
+            self.recursive_verified.write(proof_hash, true);
+            let count = self.recursive_count.read(model_id);
+            self.recursive_count.write(model_id, count + 1);
+            let block_ts = get_block_timestamp();
+            self.last_io.write(model_id, io_commitment);
+            self.last_proof_hash.write(model_id, proof_hash);
+            self.last_verified_at.write(model_id, block_ts);
+            self.last_proof_felts.write(model_id, stark_proof_data_len);
+            self.last_n_layers.write(model_id, n_layers);
+            self.last_trace_log_size.write(model_id, trace_log_size);
+
+            // Emit rich verification event — full provenance in one TX.
+            self.emit(RecursiveProofVerified {
+                model_id,
+                proof_hash,
+                io_commitment,
+                circuit_hash,
+                weight_super_root,
+                policy_commitment,
+                n_layers,
+                trace_log_size,
+                proof_felts: stark_proof_data_len,
+                verification_count: count + 1,
+                verified_at: block_ts,
+                submitter: get_caller_address(),
+            });
+
+            true
+        }
+
+        fn start_decode_session(
+            ref self: ContractState,
+            model_id: felt252,
+            initial_kv_commitment: felt252,
+        ) -> u64 {
+            // Model must be registered.
+            let model = self.recursive_models.read(model_id);
+            assert(model.circuit_hash != 0, 'Model not registered');
+
+            // Allocate next session id (monotonic, never reused).
+            let session_id = self.next_session_id.read() + 1;
+            self.next_session_id.write(session_id);
+
+            let caller = get_caller_address();
+            let now = get_block_timestamp();
+            let session = DecodeSession {
+                model_id,
+                started_at: now,
+                step_count: 0,
+                last_kv_commitment: initial_kv_commitment,
+                finalized: false,
+                initiator: caller,
+            };
+            self.decode_sessions.write(session_id, session);
+
+            self.emit(DecodeSessionStarted {
+                session_id, model_id, initiator: caller, started_at: now,
+                initial_kv_commitment,
+            });
+
+            session_id
+        }
+
+        fn verify_decode_step(
+            ref self: ContractState,
+            session_id: u64,
+            expected_step_idx: u32,
+            model_id: felt252,
+            io_commitment: felt252,
+            circuit_hash: felt252,
+            weight_super_root: felt252,
+            n_layers: u32,
+            n_matmuls: u32,
+            hidden_size: u32,
+            num_transformer_blocks: u32,
+            policy_commitment: felt252,
+            trace_log_size: u32,
+            stark_proof_data: Array<felt252>,
+        ) -> bool {
+            // Load session and enforce continuity preconditions BEFORE the
+            // expensive STARK verification, so cheap rejections fail fast.
+            let mut session = self.decode_sessions.read(session_id);
+            assert(session.model_id != 0, 'Session not found');
+            assert(!session.finalized, 'Session finalized');
+            assert(session.model_id == model_id, 'Session model_id mismatch');
+            assert(expected_step_idx == session.step_count, 'Step idx mismatch');
+
+            // Run shared inner verifier — performs full STARK verification and
+            // returns the proof's KV-cache commitments (proof[24], proof[25]).
+            let (proof_hash, prev_kv, new_kv) = self._verify_recursive_inner(
+                model_id,
+                io_commitment,
+                circuit_hash,
+                weight_super_root,
+                n_layers,
+                n_matmuls,
+                hidden_size,
+                num_transformer_blocks,
+                policy_commitment,
+                trace_log_size,
+                stark_proof_data,
+            );
+
+            // Continuity check: the body's prev_kv MUST match the rolling
+            // commitment of the session. This binds each step to its predecessor.
+            assert(prev_kv == session.last_kv_commitment, 'KV cache continuity broken');
+
+            // Roll the session forward and persist.
+            session.last_kv_commitment = new_kv;
+            session.step_count = session.step_count + 1;
+            self.decode_sessions.write(session_id, session);
+
+            self.emit(DecodeStepVerified {
+                session_id,
+                step_idx: expected_step_idx,
+                prev_kv,
+                new_kv,
+                proof_hash,
+            });
+
+            true
+        }
+
+        fn finalize_decode_session(ref self: ContractState, session_id: u64) -> felt252 {
+            let mut session = self.decode_sessions.read(session_id);
+            assert(session.model_id != 0, 'Session not found');
+            assert(!session.finalized, 'Session finalized');
+            assert(session.step_count > 0, 'Session has no steps');
+            assert(get_caller_address() == session.initiator, 'Only initiator finalizes');
+
+            session.finalized = true;
+            self.decode_sessions.write(session_id, session);
+
+            let now = get_block_timestamp();
+            self.emit(DecodeSessionFinalized {
+                session_id,
+                n_steps: session.step_count,
+                final_kv: session.last_kv_commitment,
+                finalized_at: now,
+            });
+
+            session.last_kv_commitment
+        }
+
+        fn get_decode_session(self: @ContractState, session_id: u64) -> DecodeSession {
+            self.decode_sessions.read(session_id)
+        }
+
+        fn is_recursive_proof_verified(
+            self: @ContractState, proof_hash: felt252,
+        ) -> bool {
+            self.recursive_verified.read(proof_hash)
+        }
+
+        fn get_recursive_verification_count(
+            self: @ContractState, model_id: felt252,
+        ) -> u64 {
+            self.recursive_count.read(model_id)
+        }
+
+        fn get_recursive_model_info(
+            self: @ContractState, model_id: felt252,
+        ) -> RecursiveModelInfo {
+            self.recursive_models.read(model_id)
+        }
+
+        fn get_model_policy(
+            self: @ContractState, model_id: felt252,
+        ) -> felt252 {
+            self.recursive_models.read(model_id).policy_commitment
+        }
+
+        fn get_level1_proof_hash(
+            self: @ContractState, model_id: felt252,
+        ) -> felt252 {
+            self.recursive_models.read(model_id).level1_proof_hash
+        }
+
+        fn get_last_verification(
+            self: @ContractState, model_id: felt252,
+        ) -> (felt252, felt252, u64, u32, u32, u32, u64) {
+            (
+                self.last_io.read(model_id),
+                self.last_proof_hash.read(model_id),
+                self.last_verified_at.read(model_id),
+                self.last_proof_felts.read(model_id),
+                self.last_n_layers.read(model_id),
+                self.last_trace_log_size.read(model_id),
+                self.recursive_count.read(model_id),
+            )
+        }
+
+        fn propose_upgrade(ref self: ContractState, new_class_hash: starknet::ClassHash) {
+            assert!(get_caller_address() == self.owner.read(), "Only owner");
+            assert!(new_class_hash.into() != 0_felt252, "Class hash cannot be zero");
+
+            let existing: felt252 = self.pending_upgrade.read().into();
+            assert!(existing == 0, "Upgrade already pending, cancel first");
+
+            let now = starknet::get_block_timestamp();
+            self.pending_upgrade.write(new_class_hash);
+            self.upgrade_proposed_at.write(now);
+
+            self.emit(UpgradeProposed {
+                new_class_hash, proposed_at: now, proposer: get_caller_address(),
+            });
+        }
+
+        fn execute_upgrade(ref self: ContractState) {
+            assert!(get_caller_address() == self.owner.read(), "Only owner");
+
+            let new_class_hash = self.pending_upgrade.read();
+            assert!(new_class_hash.into() != 0_felt252, "No upgrade pending");
+
+            let proposed_at = self.upgrade_proposed_at.read();
+            let now = starknet::get_block_timestamp();
+            assert!(now >= proposed_at + UPGRADE_DELAY, "Upgrade delay not elapsed");
+
+            self.pending_upgrade.write(0.try_into().unwrap());
+            self.upgrade_proposed_at.write(0);
+
+            self.emit(UpgradeExecuted {
+                new_class_hash, executed_at: now,
+            });
+
+            starknet::syscalls::replace_class_syscall(new_class_hash).unwrap();
+        }
+
+        fn cancel_upgrade(ref self: ContractState) {
+            assert!(get_caller_address() == self.owner.read(), "Only owner");
+
+            let pending: starknet::ClassHash = self.pending_upgrade.read();
+            assert!(pending.into() != 0_felt252, "No upgrade pending");
+
+            self.pending_upgrade.write(0.try_into().unwrap());
+            self.upgrade_proposed_at.write(0);
+
+            self.emit(UpgradeCancelled {
+                cancelled_class_hash: pending, cancelled_by: get_caller_address(),
+            });
+        }
+
+        fn get_pending_upgrade(self: @ContractState) -> (starknet::ClassHash, u64) {
+            (self.pending_upgrade.read(), self.upgrade_proposed_at.read())
+        }
+
+    }
+
+    /// Private helpers — not part of the public ABI.
+    #[generate_trait]
+    impl RecursiveVerifierInternalImpl of RecursiveVerifierInternal {
+        /// Shared inner verifier used by both `verify_recursive` (single-pass)
+        /// and `verify_decode_step` (streaming).
+        ///
+        /// Performs ALL the existing verify_recursive logic (header parse,
+        /// metadata cross-checks, channel binding, OODS/Merkle/FRI/PoW), but
+        /// does NOT perform the dedup write, verification-count update,
+        /// last_* writes, or event emit — the public callers do that.
+        ///
+        /// Returns `(proof_hash, prev_kv_cache_commitment, kv_cache_commitment)`.
+        /// `proof_hash` is the Poseidon dedup hash; the two commitments come
+        /// from proof body slots [24] and [25].
+        fn _verify_recursive_inner(
+            ref self: ContractState,
+            model_id: felt252,
+            io_commitment: felt252,
+            circuit_hash: felt252,
+            weight_super_root: felt252,
+            n_layers: u32,
+            n_matmuls: u32,
+            hidden_size: u32,
+            num_transformer_blocks: u32,
+            policy_commitment: felt252,
+            trace_log_size: u32,
+            stark_proof_data: Array<felt252>,
+        ) -> (felt252, felt252, felt252) {
             // 1. Look up registered model
             let model = self.recursive_models.read(model_id);
             assert(model.circuit_hash != 0, 'Model not registered');
@@ -355,11 +779,12 @@ pub mod RecursiveVerifierContract {
             //   [21]     final_digest: felt252 (Pass 2 chain AIR boundary)
             //   [22]     log_size: u32
             //   [23]     n_real_rows: u32 (active HadesPerm rows for accumulator)
-            //   [24..)   CommitmentSchemeProof (Serde-compatible)
+            //   [24]     prev_kv_cache_commitment: felt252 (0 = single-pass)
+            //   [25]     kv_cache_commitment: felt252 (0 = single-pass)
+            //   [26..)   CommitmentSchemeProof (Serde-compatible)
 
-            let stark_proof_data_len: u32 = stark_proof_data.len();
             let mut proof_span = stark_proof_data.span();
-            assert!(proof_span.len() >= 20, "Proof too short");
+            assert!(proof_span.len() >= 26, "Proof too short");
 
             // Parse circuit_hash: QM31 (4 M31 limbs)
             let ch0: felt252 = *proof_span.pop_front().unwrap();
@@ -405,6 +830,13 @@ pub mod RecursiveVerifierContract {
             let final_digest: felt252 = *proof_span.pop_front().unwrap();
             let proof_log_size: u32 = (*proof_span.pop_front().unwrap()).try_into().unwrap();
             let proof_n_real_rows: u32 = (*proof_span.pop_front().unwrap()).try_into().unwrap();
+
+            // Streaming KV-cache commitments (NEW in v4).
+            // Single-pass callers MUST emit ZERO for both. Streaming callers
+            // emit the previous step's KV root in [24] and the new one in [25].
+            // Both are channel-bound below; no extra cross-checks needed here.
+            let prev_kv_cache_commitment: felt252 = *proof_span.pop_front().unwrap();
+            let kv_cache_commitment: felt252 = *proof_span.pop_front().unwrap();
 
             // Verify proof binds to the registered model's circuit and weights.
             // Pack 4 M31 limbs into felt252: a * 2^93 + b * 2^62 + c * 2^31 + d
@@ -576,6 +1008,24 @@ pub mod RecursiveVerifierContract {
             channel.mix_u64(((hc_u256 / 0x10000000000000000_u256) & 0xFFFFFFFFFFFFFFFF_u256).try_into().unwrap());
             channel.mix_u64((hc_u256 & 0xFFFFFFFFFFFFFFFF_u256).try_into().unwrap());
 
+            // SECURITY: Bind streaming KV-cache commitments (v4).
+            // prev_kv FIRST, then new_kv — order MUST match the Rust prover at
+            // recursive/prover.rs (mixed immediately after hades_commitment,
+            // before io_commitment_felt252). For single-pass both are zero,
+            // so the eight mix_u64 calls inject 64 bytes of zeros — still
+            // channel-affecting and identical on prover & verifier sides.
+            let prev_kv_u256: u256 = prev_kv_cache_commitment.into();
+            channel.mix_u64((prev_kv_u256 / 0x10000000000000000_u256 / 0x10000000000000000_u256 / 0x10000000000000000_u256).try_into().unwrap());
+            channel.mix_u64(((prev_kv_u256 / 0x10000000000000000_u256 / 0x10000000000000000_u256) & 0xFFFFFFFFFFFFFFFF_u256).try_into().unwrap());
+            channel.mix_u64(((prev_kv_u256 / 0x10000000000000000_u256) & 0xFFFFFFFFFFFFFFFF_u256).try_into().unwrap());
+            channel.mix_u64((prev_kv_u256 & 0xFFFFFFFFFFFFFFFF_u256).try_into().unwrap());
+
+            let new_kv_u256: u256 = kv_cache_commitment.into();
+            channel.mix_u64((new_kv_u256 / 0x10000000000000000_u256 / 0x10000000000000000_u256 / 0x10000000000000000_u256).try_into().unwrap());
+            channel.mix_u64(((new_kv_u256 / 0x10000000000000000_u256 / 0x10000000000000000_u256) & 0xFFFFFFFFFFFFFFFF_u256).try_into().unwrap());
+            channel.mix_u64(((new_kv_u256 / 0x10000000000000000_u256) & 0xFFFFFFFFFFFFFFFF_u256).try_into().unwrap());
+            channel.mix_u64((new_kv_u256 & 0xFFFFFFFFFFFFFFFF_u256).try_into().unwrap());
+
             // Bind the full felt252 io_commitment into the channel.
             // This ensures the proof body's io_commitment_felt252 field
             // cannot be tampered without invalidating the STARK.
@@ -632,129 +1082,8 @@ pub mod RecursiveVerifierContract {
                 composition_commitment, commitment_scheme, ref channel, 0,
             );
 
-            // 6. Record verification + rich on-chain state
-            self.recursive_verified.write(proof_hash, true);
-            let count = self.recursive_count.read(model_id);
-            self.recursive_count.write(model_id, count + 1);
-            let block_ts = starknet::get_block_timestamp();
-            self.last_io.write(model_id, io_commitment);
-            self.last_proof_hash.write(model_id, proof_hash);
-            self.last_verified_at.write(model_id, block_ts);
-            self.last_proof_felts.write(model_id, stark_proof_data_len);
-            self.last_n_layers.write(model_id, n_layers);
-            self.last_trace_log_size.write(model_id, trace_log_size);
-
-            // 7. Emit rich verification event — full provenance in one TX
-            self.emit(RecursiveProofVerified {
-                model_id,
-                proof_hash,
-                io_commitment,
-                circuit_hash,
-                weight_super_root,
-                policy_commitment,
-                n_layers,
-                trace_log_size,
-                proof_felts: stark_proof_data_len,
-                verification_count: count + 1,
-                verified_at: block_ts,
-                submitter: get_caller_address(),
-            });
-
-            true
+            (proof_hash, prev_kv_cache_commitment, kv_cache_commitment)
         }
-
-        fn is_recursive_proof_verified(
-            self: @ContractState, proof_hash: felt252,
-        ) -> bool {
-            self.recursive_verified.read(proof_hash)
-        }
-
-        fn get_recursive_verification_count(
-            self: @ContractState, model_id: felt252,
-        ) -> u64 {
-            self.recursive_count.read(model_id)
-        }
-
-        fn get_recursive_model_info(
-            self: @ContractState, model_id: felt252,
-        ) -> RecursiveModelInfo {
-            self.recursive_models.read(model_id)
-        }
-
-        fn get_model_policy(
-            self: @ContractState, model_id: felt252,
-        ) -> felt252 {
-            self.recursive_models.read(model_id).policy_commitment
-        }
-
-        fn get_last_verification(
-            self: @ContractState, model_id: felt252,
-        ) -> (felt252, felt252, u64, u32, u32, u32, u64) {
-            (
-                self.last_io.read(model_id),
-                self.last_proof_hash.read(model_id),
-                self.last_verified_at.read(model_id),
-                self.last_proof_felts.read(model_id),
-                self.last_n_layers.read(model_id),
-                self.last_trace_log_size.read(model_id),
-                self.recursive_count.read(model_id),
-            )
-        }
-
-        fn propose_upgrade(ref self: ContractState, new_class_hash: starknet::ClassHash) {
-            assert!(get_caller_address() == self.owner.read(), "Only owner");
-            assert!(new_class_hash.into() != 0_felt252, "Class hash cannot be zero");
-
-            let existing: felt252 = self.pending_upgrade.read().into();
-            assert!(existing == 0, "Upgrade already pending, cancel first");
-
-            let now = starknet::get_block_timestamp();
-            self.pending_upgrade.write(new_class_hash);
-            self.upgrade_proposed_at.write(now);
-
-            self.emit(UpgradeProposed {
-                new_class_hash, proposed_at: now, proposer: get_caller_address(),
-            });
-        }
-
-        fn execute_upgrade(ref self: ContractState) {
-            assert!(get_caller_address() == self.owner.read(), "Only owner");
-
-            let new_class_hash = self.pending_upgrade.read();
-            assert!(new_class_hash.into() != 0_felt252, "No upgrade pending");
-
-            let proposed_at = self.upgrade_proposed_at.read();
-            let now = starknet::get_block_timestamp();
-            assert!(now >= proposed_at + UPGRADE_DELAY, "Upgrade delay not elapsed");
-
-            self.pending_upgrade.write(0.try_into().unwrap());
-            self.upgrade_proposed_at.write(0);
-
-            self.emit(UpgradeExecuted {
-                new_class_hash, executed_at: now,
-            });
-
-            starknet::syscalls::replace_class_syscall(new_class_hash).unwrap();
-        }
-
-        fn cancel_upgrade(ref self: ContractState) {
-            assert!(get_caller_address() == self.owner.read(), "Only owner");
-
-            let pending: starknet::ClassHash = self.pending_upgrade.read();
-            assert!(pending.into() != 0_felt252, "No upgrade pending");
-
-            self.pending_upgrade.write(0.try_into().unwrap());
-            self.upgrade_proposed_at.write(0);
-
-            self.emit(UpgradeCancelled {
-                cancelled_class_hash: pending, cancelled_by: get_caller_address(),
-            });
-        }
-
-        fn get_pending_upgrade(self: @ContractState) -> (starknet::ClassHash, u64) {
-            (self.pending_upgrade.read(), self.upgrade_proposed_at.read())
-        }
-
     }
 
     /// Convert a felt252 that holds an M31 value (0..2^31-1) to M31.

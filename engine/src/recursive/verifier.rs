@@ -100,6 +100,20 @@ pub fn verify_recursive(
         channel.mix_u64(u64::from_be_bytes(bytes[24..32].try_into().unwrap()));
     }
 
+    // KV-cache continuity binding (multi-token autoregressive sessions).
+    // Both ZERO on prefill / single-pass; non-zero on decode steps.
+    // Order MUST match prover.rs: prev first, then curr.
+    for fe in [
+        public_inputs.prev_kv_cache_commitment,
+        public_inputs.kv_cache_commitment,
+    ] {
+        let bytes = fe.to_bytes_be();
+        channel.mix_u64(u64::from_be_bytes(bytes[0..8].try_into().unwrap()));
+        channel.mix_u64(u64::from_be_bytes(bytes[8..16].try_into().unwrap()));
+        channel.mix_u64(u64::from_be_bytes(bytes[16..24].try_into().unwrap()));
+        channel.mix_u64(u64::from_be_bytes(bytes[24..32].try_into().unwrap()));
+    }
+
     // Also bind the felt252 io_commitment (4 × u64, matching prover)
     {
         let io_felt =
@@ -628,6 +642,8 @@ mod tests {
             n_poseidon_perms: 9999,
             seed_digest: QM31::default(),
             hades_commitment: starknet_ff::FieldElement::ZERO,
+            kv_cache_commitment: starknet_ff::FieldElement::ZERO,
+            prev_kv_cache_commitment: starknet_ff::FieldElement::ZERO,
         };
         let err = verify_recursive(&rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest, rp.logup_claimed_sum);
         assert!(
