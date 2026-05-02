@@ -1264,6 +1264,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "stale: v1 withdrawal bindings deprecated; relayer now rejects with InvalidInput (sibling test test_relayer_flow_rejects_legacy_v1_with_split_recipients covers the new behavior) (G7)"]
     fn test_relayer_flow_accepts_legacy_v1_with_mirrored_recipients() {
         let backend = MockBackend::new(1);
         let mut inputs = sample_inputs();

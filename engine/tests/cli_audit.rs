@@ -9,14 +9,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use stwo::core::fields::m31::M31;
 
-use stwo_ml::aggregation::compute_io_commitment;
-use stwo_ml::audit::log::InferenceLog;
-use stwo_ml::audit::orchestrator::run_audit_dry;
-use stwo_ml::audit::replay::execute_forward_pass;
-use stwo_ml::audit::types::{AuditRequest, InferenceLogEntry, ModelInfo};
-use stwo_ml::compiler::onnx::build_mlp_with_weights;
-use stwo_ml::components::activation::ActivationType;
-use stwo_ml::components::matmul::M31Matrix;
+use obelyzk::aggregation::compute_io_commitment;
+use obelyzk::audit::log::InferenceLog;
+use obelyzk::audit::orchestrator::run_audit_dry;
+use obelyzk::audit::replay::execute_forward_pass;
+use obelyzk::audit::types::{AuditRequest, InferenceLogEntry, ModelInfo};
+use obelyzk::compiler::onnx::build_mlp_with_weights;
+use obelyzk::components::activation::ActivationType;
+use obelyzk::components::matmul::M31Matrix;
 
 fn temp_dir() -> PathBuf {
     let d = SystemTime::now()

@@ -1780,7 +1780,7 @@ pub fn build_chunked_gkr_calldata(
     // from producing proofs that fail on-chain verification.
     // Self-verification: non-fatal when STWO_SKIP_RMS_SQ_PROOF is set
     // (the Rust replay verifier diverges at RMSNorm, but on-chain Cairo handles it correctly)
-    let skip_fatal_selfverify = std::env::var("STWO_SKIP_RMS_SQ_PROOF").is_ok();
+    let skip_fatal_selfverify = crate::policy::skip_rms_sq_proof();
     if actually_double_packed {
         match replay_verify_double_packed_proof(
             &proof_data,
@@ -2116,7 +2116,7 @@ pub fn build_streaming_gkr_calldata(
         init_calldata.push("0".to_string()); // new_tokens
         // When STWO_SKIP_POLICY_COMMITMENT is set, send 0 so the Cairo verifier
         // also skips the policy mix (matching the prover's channel).
-        let skip_policy = std::env::var("STWO_SKIP_POLICY_COMMITMENT").is_ok();
+        let skip_policy = crate::policy::policy_commitment_skipped();
         let effective_policy = if skip_policy { FieldElement::ZERO } else { policy_commitment };
         init_calldata.push(format!("0x{:x}", effective_policy)); // policy_hash
     }
@@ -3225,7 +3225,7 @@ fn build_verify_model_gkr_calldata_inner(
     ) {
         Ok(()) => eprintln!("  [v4] replay self-verification: PASSED"),
         Err(e) => {
-            if std::env::var("STWO_SKIP_POLICY_COMMITMENT").is_ok() {
+            if crate::policy::policy_commitment_skipped() {
                 eprintln!("  [v4] replay self-verification: WARNING — {e} (non-fatal with SKIP_POLICY_COMMITMENT)");
             } else {
                 return Err(StarknetModelError::SoundnessGate(
@@ -3768,7 +3768,7 @@ pub fn replay_verify_serialized_proof(
     // Bind policy commitment — must match prove_gkr's channel seeding.
     let resolved_policy = crate::policy::resolve(None);
     let policy_commitment = resolved_policy.policy_commitment();
-    let skip_policy = std::env::var("STWO_SKIP_POLICY_COMMITMENT").is_ok();
+    let skip_policy = crate::policy::policy_commitment_skipped();
     if !skip_policy && policy_commitment != FieldElement::ZERO {
         ch.mix_felt(policy_commitment);
     }
@@ -3886,7 +3886,7 @@ pub fn replay_verify_serialized_proof(
                 let has_p0 = read_u32_from(proof_data, &mut off);
                 // SIMD consistency gate: non-SIMD must have Part 0, SIMD must not
                 // Exception: STWO_SKIP_RMS_SQ_PROOF bypasses Part 0 for on-chain streaming
-                let skip_p0 = std::env::var("STWO_SKIP_RMS_SQ_PROOF").is_ok();
+                let skip_p0 = crate::policy::skip_rms_sq_proof();
                 if !skip_p0 && simd_combined == 0 && has_p0 != 1 {
                     return Err(format!("layer {}: non-SIMD RMSNorm requires Part 0 (has_p0={})", layer, has_p0));
                 }
@@ -7899,7 +7899,7 @@ mod tests {
         // Bind policy commitment (must match GKR prover's channel seeding).
         let replay_policy = crate::policy::resolve(None);
         let replay_pc = replay_policy.policy_commitment();
-        let skip_policy = std::env::var("STWO_SKIP_POLICY_COMMITMENT").is_ok();
+        let skip_policy = crate::policy::policy_commitment_skipped();
         if !skip_policy && replay_pc != FieldElement::ZERO {
             ch.mix_felt(replay_pc);
         }
@@ -8907,7 +8907,7 @@ mod tests {
         // Bind policy commitment (must match GKR prover's channel seeding).
         let replay_policy = crate::policy::resolve(None);
         let replay_policy_commitment = replay_policy.policy_commitment();
-        let skip_policy = std::env::var("STWO_SKIP_POLICY_COMMITMENT").is_ok();
+        let skip_policy = crate::policy::policy_commitment_skipped();
         if !skip_policy && replay_policy_commitment != FieldElement::ZERO {
             ch.mix_felt(replay_policy_commitment);
         }
@@ -8988,7 +8988,7 @@ mod tests {
                     // SIMD consistency gate (relaxed when STWO_SKIP_RMS_SQ_PROOF is set)
                     assert!(simd_combined == 0 || has_p0 == 0,
                         "layer {}: SIMD RMSNorm must not have Part 0", layer);
-                    if !std::env::var("STWO_SKIP_RMS_SQ_PROOF").is_ok() {
+                    if !crate::policy::skip_rms_sq_proof() {
                         assert!(simd_combined == 1 || has_p0 == 1,
                             "layer {}: non-SIMD RMSNorm requires Part 0", layer);
                     }
@@ -9236,7 +9236,7 @@ mod tests {
         ch2.mix_u64(input_cols);
         // Bind policy commitment — use the captured policy from packed prove time.
         let packed_pc = packed_mode_policy.policy_commitment();
-        let skip_policy = std::env::var("STWO_SKIP_POLICY_COMMITMENT").is_ok();
+        let skip_policy = crate::policy::policy_commitment_skipped();
         if !skip_policy && packed_pc != FieldElement::ZERO {
             ch2.mix_felt(packed_pc);
         }

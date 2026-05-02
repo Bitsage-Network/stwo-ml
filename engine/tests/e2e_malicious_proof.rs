@@ -12,13 +12,13 @@
 use stwo::core::fields::m31::M31;
 use stwo::core::fields::qm31::QM31;
 
-use stwo_ml::aggregation::prove_model_pure_gkr;
-use stwo_ml::compiler::graph::{GraphBuilder, GraphWeights};
-use stwo_ml::components::activation::ActivationType;
-use stwo_ml::crypto::poseidon_channel::PoseidonChannel;
-use stwo_ml::gkr::types::LayerProof;
-use stwo_ml::gkr::LayeredCircuit;
-use stwo_ml::prelude::*;
+use obelyzk::aggregation::prove_model_pure_gkr;
+use obelyzk::compiler::graph::{GraphBuilder, GraphWeights};
+use obelyzk::components::activation::ActivationType;
+use obelyzk::crypto::poseidon_channel::PoseidonChannel;
+use obelyzk::gkr::types::LayerProof;
+use obelyzk::gkr::LayeredCircuit;
+use obelyzk::prelude::*;
 
 // ============================================================================
 // Helpers
@@ -26,7 +26,7 @@ use stwo_ml::prelude::*;
 
 /// Single MatMul: 1×4 @ 4×2
 fn build_matmul_only() -> (
-    stwo_ml::compiler::graph::ComputationGraph,
+    obelyzk::compiler::graph::ComputationGraph,
     M31Matrix,
     GraphWeights,
 ) {
@@ -53,7 +53,7 @@ fn build_matmul_only() -> (
 
 /// MLP: 1×4 → Linear(4) → ReLU → Linear(2)
 fn build_mlp_relu() -> (
-    stwo_ml::compiler::graph::ComputationGraph,
+    obelyzk::compiler::graph::ComputationGraph,
     M31Matrix,
     GraphWeights,
 ) {
@@ -88,7 +88,7 @@ fn build_mlp_relu() -> (
 
 /// Deep MLP: 1×4 → Linear(4) → ReLU → Linear(4) → GELU → Linear(2)
 fn build_deep_mlp() -> (
-    stwo_ml::compiler::graph::ComputationGraph,
+    obelyzk::compiler::graph::ComputationGraph,
     M31Matrix,
     GraphWeights,
 ) {
@@ -137,7 +137,7 @@ fn build_deep_mlp() -> (
 
 /// Residual DAG: x → MatMul(0) → MatMul(1) → Add(skip from MatMul(0))
 fn build_residual_dag() -> (
-    stwo_ml::compiler::graph::ComputationGraph,
+    obelyzk::compiler::graph::ComputationGraph,
     M31Matrix,
     GraphWeights,
 ) {
@@ -189,7 +189,7 @@ fn test_e2e_tampered_round_poly_single_matmul() {
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let mut ch = PoseidonChannel::new();
-    let result = stwo_ml::gkr::verify_gkr_with_weights(
+    let result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit, &gkr, &proof.execution.output, &weights, &mut ch,
     );
     assert!(result.is_err(), "tampered round poly must be rejected");
@@ -224,7 +224,7 @@ fn test_e2e_tampered_round_poly_deep_chain() {
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let mut ch = PoseidonChannel::new();
-    let result = stwo_ml::gkr::verify_gkr_with_weights(
+    let result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit, &gkr, &proof.execution.output, &weights, &mut ch,
     );
     assert!(result.is_err(), "mid-chain tampered round poly must be rejected");
@@ -249,7 +249,7 @@ fn test_e2e_tampered_last_round_poly() {
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let mut ch = PoseidonChannel::new();
-    let result = stwo_ml::gkr::verify_gkr_with_weights(
+    let result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit, &gkr, &proof.execution.output, &weights, &mut ch,
     );
     assert!(result.is_err(), "tampered last round poly must be rejected");
@@ -272,7 +272,7 @@ fn test_e2e_forged_weight_claim_single_matmul() {
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let mut ch = PoseidonChannel::new();
-    let result = stwo_ml::gkr::verify_gkr_with_weights(
+    let result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit, &gkr, &proof.execution.output, &weights, &mut ch,
     );
     assert!(result.is_err(), "forged weight claim must be rejected");
@@ -300,7 +300,7 @@ fn test_e2e_forged_weight_claim_mlp() {
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let mut ch = PoseidonChannel::new();
-    let result = stwo_ml::gkr::verify_gkr_with_weights(
+    let result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit, &gkr, &proof.execution.output, &weights, &mut ch,
     );
     assert!(result.is_err(), "forged second weight claim must be rejected");
@@ -321,7 +321,7 @@ fn test_e2e_forged_weight_eval_point() {
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let mut ch = PoseidonChannel::new();
-    let result = stwo_ml::gkr::verify_gkr_with_weights(
+    let result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit, &gkr, &proof.execution.output, &weights, &mut ch,
     );
     assert!(result.is_err(), "forged eval point must be rejected");
@@ -341,7 +341,7 @@ fn test_e2e_forged_weight_node_id() {
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let mut ch = PoseidonChannel::new();
-    let result = stwo_ml::gkr::verify_gkr_with_weights(
+    let result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit, &gkr, &proof.execution.output, &weights, &mut ch,
     );
     // Should fail: either the verifier detects the wrong node_id ordering,
@@ -377,7 +377,7 @@ fn test_e2e_wrong_activation_type() {
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let mut ch = PoseidonChannel::new();
-    let result = stwo_ml::gkr::verify_gkr_with_weights(
+    let result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit, &gkr, &proof.execution.output, &weights, &mut ch,
     );
     assert!(
@@ -410,7 +410,7 @@ fn test_e2e_tampered_activation_input_eval() {
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let mut ch = PoseidonChannel::new();
-    let result = stwo_ml::gkr::verify_gkr_with_weights(
+    let result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit, &gkr, &proof.execution.output, &weights, &mut ch,
     );
     assert!(result.is_err(), "tampered activation input_eval must be rejected");
@@ -445,7 +445,7 @@ fn test_e2e_tampered_activation_logup_multiplicities() {
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let mut ch = PoseidonChannel::new();
-    let result = stwo_ml::gkr::verify_gkr_with_weights(
+    let result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit, &gkr, &proof.execution.output, &weights, &mut ch,
     );
     assert!(result.is_err(), "tampered LogUp multiplicities must be rejected");
@@ -471,7 +471,7 @@ fn test_e2e_tampered_final_a_eval() {
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let mut ch = PoseidonChannel::new();
-    let result = stwo_ml::gkr::verify_gkr_with_weights(
+    let result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit, &gkr, &proof.execution.output, &weights, &mut ch,
     );
     assert!(result.is_err(), "tampered final_a_eval must be rejected");
@@ -493,7 +493,7 @@ fn test_e2e_tampered_final_b_eval() {
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let mut ch = PoseidonChannel::new();
-    let result = stwo_ml::gkr::verify_gkr_with_weights(
+    let result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit, &gkr, &proof.execution.output, &weights, &mut ch,
     );
     assert!(result.is_err(), "tampered final_b_eval must be rejected");
@@ -524,7 +524,7 @@ fn test_e2e_tampered_final_eval_deep_chain() {
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let mut ch = PoseidonChannel::new();
-    let result = stwo_ml::gkr::verify_gkr_with_weights(
+    let result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit, &gkr, &proof.execution.output, &weights, &mut ch,
     );
     assert!(result.is_err(), "tampered final eval in last layer must be rejected");
@@ -557,7 +557,7 @@ fn test_e2e_tampered_deferred_round_poly() {
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let mut ch = PoseidonChannel::new();
-    let result = stwo_ml::gkr::verify_gkr_with_weights(
+    let result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit, &gkr, &proof.execution.output, &weights, &mut ch,
     );
     assert!(result.is_err(), "tampered deferred round poly must be rejected");
@@ -578,7 +578,7 @@ fn test_e2e_forged_deferred_weight_claim() {
     // Find a deferred proof with a weight claim and tamper it
     let mut found = false;
     for deferred in &mut gkr.deferred_proofs {
-        if let stwo_ml::gkr::types::DeferredProofKind::MatMul {
+        if let obelyzk::gkr::types::DeferredProofKind::MatMul {
             ref mut weight_claim,
             ..
         } = deferred.kind
@@ -593,7 +593,7 @@ fn test_e2e_forged_deferred_weight_claim() {
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let mut ch = PoseidonChannel::new();
-    let result = stwo_ml::gkr::verify_gkr_with_weights(
+    let result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit, &gkr, &proof.execution.output, &weights, &mut ch,
     );
     assert!(result.is_err(), "forged deferred weight claim must be rejected");
@@ -615,7 +615,7 @@ fn test_e2e_tampered_output() {
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let mut ch = PoseidonChannel::new();
-    let result = stwo_ml::gkr::verify_gkr_with_weights(
+    let result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit, gkr, &bad_output, &weights, &mut ch,
     );
     assert!(result.is_err(), "tampered output must be rejected");
@@ -633,7 +633,7 @@ fn test_e2e_tampered_input_claim() {
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let mut ch = PoseidonChannel::new();
-    let result = stwo_ml::gkr::verify_gkr_with_weights(
+    let result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit, &gkr, &proof.execution.output, &weights, &mut ch,
     );
     assert!(result.is_err(), "tampered input claim must be rejected");
@@ -652,7 +652,7 @@ fn test_e2e_valid_proofs_pass() {
     let gkr = proof.gkr_proof.as_ref().unwrap();
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let mut ch = PoseidonChannel::new();
-    stwo_ml::gkr::verify_gkr_with_weights(
+    obelyzk::gkr::verify_gkr_with_weights(
         &circuit, gkr, &proof.execution.output, &weights, &mut ch,
     )
     .expect("valid single matmul proof should pass");
@@ -663,7 +663,7 @@ fn test_e2e_valid_proofs_pass() {
     let gkr = proof.gkr_proof.as_ref().unwrap();
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let mut ch = PoseidonChannel::new();
-    stwo_ml::gkr::verify_gkr_with_weights(
+    obelyzk::gkr::verify_gkr_with_weights(
         &circuit, gkr, &proof.execution.output, &weights, &mut ch,
     )
     .expect("valid MLP proof should pass");
@@ -674,7 +674,7 @@ fn test_e2e_valid_proofs_pass() {
     let gkr = proof.gkr_proof.as_ref().unwrap();
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let mut ch = PoseidonChannel::new();
-    stwo_ml::gkr::verify_gkr_with_weights(
+    obelyzk::gkr::verify_gkr_with_weights(
         &circuit, gkr, &proof.execution.output, &weights, &mut ch,
     )
     .expect("valid deep MLP proof should pass");
@@ -685,8 +685,63 @@ fn test_e2e_valid_proofs_pass() {
     let gkr = proof.gkr_proof.as_ref().unwrap();
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let mut ch = PoseidonChannel::new();
-    stwo_ml::gkr::verify_gkr_with_weights(
+    obelyzk::gkr::verify_gkr_with_weights(
         &circuit, gkr, &proof.execution.output, &weights, &mut ch,
     )
     .expect("valid residual DAG proof should pass");
+}
+
+/// Regression test for G24 (nested-DAG `skip_layers` carve-out, Apr 30 2026).
+///
+/// Builds a graph with TWO stacked residual Adds (transformer-block-shape)
+/// where the outer Add's skip branch is itself an Add layer. Without the
+/// G24 carve-out, the inner Add gets skipped in the main walk → its claim
+/// transformation never runs → downstream layers receive the wrong claim →
+/// the prover's internal sumcheck self-check fails.
+///
+/// Graph structure:
+///   x → linear → fork(r1) → linear → fork(r2) → linear → add_from(r2) → add_from(r1)
+///
+/// Layer indices (rough): 0 Identity, 1-3 Linears, 4 Add (uses r2 as skip),
+/// 5 Add (uses r1 as skip; r1's chain includes the inner Add at layer 4).
+#[test]
+fn test_nested_dag_residual_proves_and_verifies() {
+    let mut builder = GraphBuilder::new((1, 4));
+    builder.linear(4);
+    let r1 = builder.fork();
+    builder.linear(4);
+    let r2 = builder.fork();
+    builder.linear(4);
+    builder.add_from(r2);
+    builder.add_from(r1);
+    let graph = builder.build();
+
+    let mut input = M31Matrix::new(1, 4);
+    for j in 0..4 {
+        input.set(0, j, M31::from((j + 1) as u32));
+    }
+
+    // Random weights for each MatMul node (regardless of position in graph).
+    let mut weights = GraphWeights::new();
+    for node in &graph.nodes {
+        if let obelyzk::compiler::graph::GraphOp::MatMul { .. } = &node.op {
+            let mut w = M31Matrix::new(4, 4);
+            for i in 0..4 {
+                for j in 0..4 {
+                    w.set(i, j, M31::from(((i * 4 + j + node.id * 7) % 11 + 1) as u32));
+                }
+            }
+            weights.add_weight(node.id, w);
+        }
+    }
+
+    let proof = prove_model_pure_gkr(&graph, &input, &weights)
+        .expect("nested-DAG residual proof should generate cleanly");
+    let gkr = proof.gkr_proof.as_ref().expect("GKR proof present");
+    let circuit = LayeredCircuit::from_graph(&graph).unwrap();
+    let mut ch = PoseidonChannel::new();
+    obelyzk::gkr::verify_gkr_with_weights(
+        &circuit, gkr, &proof.execution.output, &weights, &mut ch,
+    )
+    .expect("nested-DAG residual proof must verify (G24 regression)");
 }

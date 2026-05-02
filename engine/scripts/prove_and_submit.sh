@@ -43,10 +43,12 @@ echo ""
 # ── Step 1: Generate Proof ──────────────────────────────────────────
 echo -e "${Y}[1/2]${X} Generating on-chain compatible proof..."
 
-export STWO_SKIP_RMS_SQ_PROOF=1
-export STWO_ALLOW_MISSING_NORM_PROOF=1
-export STWO_PIECEWISE_ACTIVATION=0
-export STWO_ALLOW_LOGUP_ACTIVATION=1
+# Hardened Apr 30 2026 (two passes): all 4 soundness gates that the audit
+# has cleared are now CLOSED in PolicyConfig::standard (the default). Don't
+# re-export them here.
+#   Pass 1: STWO_SKIP_RMS_SQ_PROOF=1 + STWO_ALLOW_MISSING_NORM_PROOF=1
+#   Pass 2: STWO_PIECEWISE_ACTIVATION=0 + STWO_ALLOW_LOGUP_ACTIVATION=1
+# Remaining: STWO_SKIP_BATCH_TOKENS (multi-token batch coupled audit pending).
 export STWO_AGGREGATED_FULL_BINDING=1
 export STWO_SKIP_BATCH_TOKENS=1
 export STWO_MLE_N_QUERIES=5

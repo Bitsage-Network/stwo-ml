@@ -13,10 +13,10 @@
 //! This is the SP1 sync point.
 
 use stwo::core::fields::m31::M31;
-use stwo_ml::compiler::graph::{GraphBuilder, GraphWeights};
-use stwo_ml::components::activation::ActivationType;
-use stwo_ml::components::matmul::M31Matrix;
-use stwo_ml::crypto::poseidon_channel::PoseidonChannel;
+use obelyzk::compiler::graph::{GraphBuilder, GraphWeights};
+use obelyzk::components::activation::ActivationType;
+use obelyzk::components::matmul::M31Matrix;
+use obelyzk::crypto::poseidon_channel::PoseidonChannel;
 
 /// A checkpoint in the Fiat-Shamir transcript.
 #[derive(Debug)]
@@ -40,7 +40,7 @@ struct TranscriptTestVector {
 
 /// Build a simple 1×4 → 4 → ReLU → 4 → 2 MLP with deterministic weights.
 fn build_mlp_3layer() -> (
-    stwo_ml::compiler::graph::ComputationGraph,
+    obelyzk::compiler::graph::ComputationGraph,
     M31Matrix,
     GraphWeights,
 ) {
@@ -78,7 +78,7 @@ fn build_mlp_3layer() -> (
 
 /// Build a matmul-only model: 1×4 → 2.
 fn build_matmul_only() -> (
-    stwo_ml::compiler::graph::ComputationGraph,
+    obelyzk::compiler::graph::ComputationGraph,
     M31Matrix,
     GraphWeights,
 ) {
@@ -113,8 +113,8 @@ fn build_matmul_only() -> (
 /// The seed checkpoints are replayed manually to give Engineer A granular
 /// verification points. The final digest comes from `verify_gkr()` itself.
 fn generate_checkpoints(
-    circuit: &stwo_ml::gkr::LayeredCircuit,
-    proof: &stwo_ml::gkr::GKRProof,
+    circuit: &obelyzk::gkr::LayeredCircuit,
+    proof: &obelyzk::gkr::GKRProof,
     output: &M31Matrix,
 ) -> Vec<TranscriptCheckpoint> {
     let mut checkpoints = Vec::new();
@@ -155,7 +155,7 @@ fn generate_checkpoints(
 
     // ===== Final state: run full verify_gkr and capture digest =====
     let mut verify_channel = PoseidonChannel::new();
-    let _result = stwo_ml::gkr::verify_gkr(circuit, proof, output, &mut verify_channel);
+    let _result = obelyzk::gkr::verify_gkr(circuit, proof, output, &mut verify_channel);
 
     checkpoints.push(TranscriptCheckpoint {
         label: "final_after_verify_gkr".to_string(),
@@ -204,12 +204,12 @@ fn test_transcript_vector_matmul_only() {
     let (graph, input, weights) = build_matmul_only();
 
     // Prove via GKR
-    let proof = stwo_ml::aggregation::prove_model_pure_gkr(&graph, &input, &weights)
+    let proof = obelyzk::aggregation::prove_model_pure_gkr(&graph, &input, &weights)
         .expect("GKR proving should succeed");
     let gkr_proof = proof.gkr_proof.as_ref().expect("should have GKR proof");
 
     // Build circuit for verification
-    let circuit = stwo_ml::gkr::LayeredCircuit::from_graph(&graph)
+    let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&graph)
         .expect("circuit compilation should succeed");
 
     // Generate checkpoints
@@ -217,7 +217,7 @@ fn test_transcript_vector_matmul_only() {
 
     // Serialize calldata
     let mut gkr_calldata = Vec::new();
-    stwo_ml::cairo_serde::serialize_gkr_model_proof(gkr_proof, &mut gkr_calldata);
+    obelyzk::cairo_serde::serialize_gkr_model_proof(gkr_proof, &mut gkr_calldata);
 
     let tv = TranscriptTestVector {
         description: "Matmul-only 1x4 -> 2".to_string(),
@@ -251,10 +251,11 @@ fn test_transcript_vector_matmul_only() {
 
     // Verify the GKR proof actually verifies
     let mut verify_channel = PoseidonChannel::new();
-    let result = stwo_ml::gkr::verify_gkr(
+    let result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit,
         gkr_proof,
         &proof.execution.output,
+        &weights,
         &mut verify_channel,
     );
     assert!(
@@ -280,12 +281,12 @@ fn test_transcript_vector_mlp_relu() {
     let (graph, input, weights) = build_mlp_3layer();
 
     // Prove via GKR
-    let proof = stwo_ml::aggregation::prove_model_pure_gkr(&graph, &input, &weights)
+    let proof = obelyzk::aggregation::prove_model_pure_gkr(&graph, &input, &weights)
         .expect("GKR proving should succeed");
     let gkr_proof = proof.gkr_proof.as_ref().expect("should have GKR proof");
 
     // Build circuit
-    let circuit = stwo_ml::gkr::LayeredCircuit::from_graph(&graph)
+    let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&graph)
         .expect("circuit compilation should succeed");
 
     // Generate checkpoints
@@ -293,7 +294,7 @@ fn test_transcript_vector_mlp_relu() {
 
     // Serialize calldata
     let mut gkr_calldata = Vec::new();
-    stwo_ml::cairo_serde::serialize_gkr_model_proof(gkr_proof, &mut gkr_calldata);
+    obelyzk::cairo_serde::serialize_gkr_model_proof(gkr_proof, &mut gkr_calldata);
 
     let tv = TranscriptTestVector {
         description: "MLP 1x4 -> Linear(4) -> ReLU -> Linear(2)".to_string(),
@@ -317,10 +318,11 @@ fn test_transcript_vector_mlp_relu() {
 
     // Verify the GKR proof actually verifies
     let mut verify_channel = PoseidonChannel::new();
-    let result = stwo_ml::gkr::verify_gkr(
+    let result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit,
         gkr_proof,
         &proof.execution.output,
+        &weights,
         &mut verify_channel,
     );
     assert!(
@@ -354,12 +356,12 @@ fn test_transcript_deterministic() {
     let (graph, input, weights) = build_matmul_only();
 
     // Run twice
-    let proof1 = stwo_ml::aggregation::prove_model_pure_gkr(&graph, &input, &weights)
+    let proof1 = obelyzk::aggregation::prove_model_pure_gkr(&graph, &input, &weights)
         .expect("proving should succeed");
-    let proof2 = stwo_ml::aggregation::prove_model_pure_gkr(&graph, &input, &weights)
+    let proof2 = obelyzk::aggregation::prove_model_pure_gkr(&graph, &input, &weights)
         .expect("proving should succeed");
 
-    let circuit = stwo_ml::gkr::LayeredCircuit::from_graph(&graph).expect("circuit should compile");
+    let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&graph).expect("circuit should compile");
 
     let gkr1 = proof1.gkr_proof.as_ref().unwrap();
     let gkr2 = proof2.gkr_proof.as_ref().unwrap();
@@ -367,8 +369,8 @@ fn test_transcript_deterministic() {
     // Verify both
     let mut ch1 = PoseidonChannel::new();
     let mut ch2 = PoseidonChannel::new();
-    let r1 = stwo_ml::gkr::verify_gkr(&circuit, gkr1, &proof1.execution.output, &mut ch1);
-    let r2 = stwo_ml::gkr::verify_gkr(&circuit, gkr2, &proof2.execution.output, &mut ch2);
+    let r1 = obelyzk::gkr::verify_gkr_with_weights(&circuit, gkr1, &proof1.execution.output, &weights, &mut ch1);
+    let r2 = obelyzk::gkr::verify_gkr_with_weights(&circuit, gkr2, &proof2.execution.output, &weights, &mut ch2);
 
     assert!(r1.is_ok());
     assert!(r2.is_ok());
@@ -383,8 +385,8 @@ fn test_transcript_deterministic() {
     // Serialized proofs must be identical
     let mut buf1 = Vec::new();
     let mut buf2 = Vec::new();
-    stwo_ml::cairo_serde::serialize_gkr_model_proof(gkr1, &mut buf1);
-    stwo_ml::cairo_serde::serialize_gkr_model_proof(gkr2, &mut buf2);
+    obelyzk::cairo_serde::serialize_gkr_model_proof(gkr1, &mut buf1);
+    obelyzk::cairo_serde::serialize_gkr_model_proof(gkr2, &mut buf2);
     assert_eq!(
         buf1, buf2,
         "deterministic proofs must serialize identically"
@@ -408,7 +410,7 @@ fn test_export_seed_digest_for_cairo() {
     // So d = 2 for a single matmul node (input layer + matmul layer)
     // But let's verify by actually building the circuit:
     let (graph, _input, _weights) = build_matmul_only();
-    let circuit = stwo_ml::gkr::LayeredCircuit::from_graph(&graph).expect("circuit should compile");
+    let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&graph).expect("circuit should compile");
 
     let d = circuit.layers.len();
     let (in_rows, in_cols) = circuit.input_shape;

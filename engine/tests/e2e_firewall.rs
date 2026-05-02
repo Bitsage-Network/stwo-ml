@@ -15,8 +15,8 @@
 
 use starknet_ff::FieldElement;
 
-use stwo_ml::classifier::*;
-use stwo_ml::policy::PolicyConfig;
+use obelyzk::classifier::*;
+use obelyzk::policy::PolicyConfig;
 
 // ─── Firewall Logic (mirrors Cairo AgentFirewallZK exactly) ──────────────────
 

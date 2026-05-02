@@ -16,13 +16,13 @@
 use std::time::Instant;
 
 use stwo::core::fields::m31::M31;
-use stwo_ml::aggregation::{IncrementalKVCommitment, prove_model_pure_gkr_decode_step};
-use stwo_ml::components::attention::{
+use obelyzk::aggregation::{IncrementalKVCommitment, prove_model_pure_gkr_decode_step_incremental as prove_model_pure_gkr_decode_step};
+use obelyzk::components::attention::{
     attention_forward_cached, AttentionWeights, ModelKVCache,
 };
-use stwo_ml::components::matmul::M31Matrix;
-use stwo_ml::compiler::graph::GraphBuilder;
-use stwo_ml::compiler::onnx::generate_weights_for_graph;
+use obelyzk::components::matmul::M31Matrix;
+use obelyzk::compiler::graph::GraphBuilder;
+use obelyzk::compiler::onnx::generate_weights_for_graph;
 
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
@@ -88,7 +88,7 @@ fn decode_benchmark() {
     let topo = decode_graph.topological_order();
     for &node_id in &topo {
         let node = &decode_graph.nodes[node_id];
-        if let stwo_ml::compiler::graph::GraphOp::Attention { config: _ } = &node.op {
+        if let obelyzk::compiler::graph::GraphOp::Attention { config: _ } = &node.op {
             let w_q = random_m31_matrix(d_model, d_model, 200 + node.id as u64);
             let w_k = random_m31_matrix(d_model, d_model, 300 + node.id as u64);
             let w_v = random_m31_matrix(d_model, d_model, 400 + node.id as u64);
@@ -107,7 +107,7 @@ fn decode_benchmark() {
     // Find the attention node to seed the cache
     for &node_id in &topo {
         let node = &decode_graph.nodes[node_id];
-        if let stwo_ml::compiler::graph::GraphOp::Attention { config } = &node.op {
+        if let obelyzk::compiler::graph::GraphOp::Attention { config } = &node.op {
             let w_q = weights.get_named_weight(node.id, "w_q").unwrap();
             let w_k = weights.get_named_weight(node.id, "w_k").unwrap();
             let w_v = weights.get_named_weight(node.id, "w_v").unwrap();
@@ -139,7 +139,7 @@ fn decode_benchmark() {
     eprintln!("  Initial KV commitment: {:?}", kv_commitment.commitment());
 
     // Weight cache: first step populates, subsequent steps hit all-cached fast path
-    let weight_cache = stwo_ml::weight_cache::shared_cache("decode-bench");
+    let weight_cache = obelyzk::weight_cache::shared_cache("decode-bench");
 
     // Decode loop
     let mut decode_times = Vec::with_capacity(decode_steps);
@@ -153,6 +153,7 @@ fn decode_benchmark() {
             &mut kv_cache,
             &mut kv_commitment,
             Some(&weight_cache),
+            None,
         );
         let elapsed = t.elapsed();
         decode_times.push(elapsed);
@@ -221,6 +222,26 @@ fn decode_benchmark() {
     }
 }
 
+/// G15 diagnostic: dump the circuit + proof layer types for the failing roundtrip.
+#[test]
+#[ignore = "diagnostic only — run with --ignored to inspect layer alignment"]
+fn dump_decode_layers() {
+    let d_model = 64;
+    let num_heads = 2;
+    let d_ff = 256;
+    let mut builder = GraphBuilder::new((1, d_model));
+    builder.transformer_block(num_heads, num_heads, 1, d_ff);
+    let graph = builder.build();
+    let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&graph).unwrap();
+    eprintln!("circuit has {} layers", circuit.layers.len());
+    for (i, layer) in circuit.layers.iter().enumerate() {
+        eprintln!(
+            "  circuit layer {}: node={}, type={:?}, inputs={:?}",
+            i, layer.node_id, layer.layer_type, layer.input_layers
+        );
+    }
+}
+
 /// Prove a single decode step and verify the GKR proof end-to-end.
 #[test]
 fn decode_prove_verify_roundtrip() {
@@ -240,7 +261,7 @@ fn decode_prove_verify_roundtrip() {
     let topo = graph.topological_order();
     for &node_id in &topo {
         let node = &graph.nodes[node_id];
-        if let stwo_ml::compiler::graph::GraphOp::Attention { config: _ } = &node.op {
+        if let obelyzk::compiler::graph::GraphOp::Attention { config: _ } = &node.op {
             weights.add_named_weight(node.id, "w_q", random_m31_matrix(d_model, d_model, 200 + node.id as u64));
             weights.add_named_weight(node.id, "w_k", random_m31_matrix(d_model, d_model, 300 + node.id as u64));
             weights.add_named_weight(node.id, "w_v", random_m31_matrix(d_model, d_model, 400 + node.id as u64));
@@ -253,7 +274,7 @@ fn decode_prove_verify_roundtrip() {
     let prefill_input = random_m31_matrix(prefill_len, d_model, 123);
     for &node_id in &topo {
         let node = &graph.nodes[node_id];
-        if let stwo_ml::compiler::graph::GraphOp::Attention { config } = &node.op {
+        if let obelyzk::compiler::graph::GraphOp::Attention { config } = &node.op {
             let attn_weights = AttentionWeights {
                 w_q: weights.get_named_weight(node.id, "w_q").unwrap().clone(),
                 w_k: weights.get_named_weight(node.id, "w_k").unwrap().clone(),
@@ -270,6 +291,7 @@ fn decode_prove_verify_roundtrip() {
     let mut kv_commitment = IncrementalKVCommitment::from_kv_cache(&kv_cache, 16);
     let result = prove_model_pure_gkr_decode_step(
         &graph, &token_input, &weights, &mut kv_cache, &mut kv_commitment, None,
+        None,
     );
     let (proof, kv_commit) = result.expect("decode proving should succeed");
 
@@ -291,7 +313,7 @@ fn decode_prove_verify_roundtrip() {
 
     // Verify position_offset is set correctly in the decode proof
     for lp in &gkr_proof.layer_proofs {
-        if let stwo_ml::gkr::types::LayerProof::AttentionDecode {
+        if let obelyzk::gkr::types::LayerProof::AttentionDecode {
             position_offset,
             full_seq_len,
             new_tokens,
@@ -318,12 +340,12 @@ fn decode_prove_verify_roundtrip() {
     }
 
     // Replay the verification channel with same KV commitment mixing
-    let circuit = stwo_ml::gkr::LayeredCircuit::from_graph(&graph).unwrap();
-    let mut verify_channel = stwo_ml::crypto::poseidon_channel::PoseidonChannel::new();
+    let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&graph).unwrap();
+    let mut verify_channel = obelyzk::crypto::poseidon_channel::PoseidonChannel::new();
     verify_channel.mix_felt(gkr_proof.kv_cache_commitment.unwrap());
     verify_channel.mix_felt(gkr_proof.prev_kv_cache_commitment.unwrap());
 
-    let verify_result = stwo_ml::gkr::verify_gkr_with_weights(
+    let verify_result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit,
         gkr_proof,
         &proof.execution.output,
@@ -355,7 +377,7 @@ fn decode_kv_commitment_chain() {
     let topo = graph.topological_order();
     for &node_id in &topo {
         let node = &graph.nodes[node_id];
-        if let stwo_ml::compiler::graph::GraphOp::Attention { config: _ } = &node.op {
+        if let obelyzk::compiler::graph::GraphOp::Attention { config: _ } = &node.op {
             weights.add_named_weight(node.id, "w_q", random_m31_matrix(d_model, d_model, 200 + node.id as u64));
             weights.add_named_weight(node.id, "w_k", random_m31_matrix(d_model, d_model, 300 + node.id as u64));
             weights.add_named_weight(node.id, "w_v", random_m31_matrix(d_model, d_model, 400 + node.id as u64));
@@ -368,7 +390,7 @@ fn decode_kv_commitment_chain() {
     let prefill_input = random_m31_matrix(prefill_len, d_model, 123);
     for &node_id in &topo {
         let node = &graph.nodes[node_id];
-        if let stwo_ml::compiler::graph::GraphOp::Attention { config } = &node.op {
+        if let obelyzk::compiler::graph::GraphOp::Attention { config } = &node.op {
             let attn_weights = AttentionWeights {
                 w_q: weights.get_named_weight(node.id, "w_q").unwrap().clone(),
                 w_k: weights.get_named_weight(node.id, "w_k").unwrap().clone(),
@@ -382,7 +404,7 @@ fn decode_kv_commitment_chain() {
 
     let mut kv_commitment = IncrementalKVCommitment::from_kv_cache(&kv_cache, prefill_len + decode_steps);
     let initial_commitment = kv_commitment.commitment();
-    let weight_cache = stwo_ml::weight_cache::shared_cache("chain-test");
+    let weight_cache = obelyzk::weight_cache::shared_cache("chain-test");
 
     // Run decode steps and verify commitment chain
     let mut prev_commitment = initial_commitment;
@@ -392,6 +414,7 @@ fn decode_kv_commitment_chain() {
             prove_model_pure_gkr_decode_step(
                 &graph, &token_input, &weights, &mut kv_cache, &mut kv_commitment,
                 Some(&weight_cache),
+                None,
             )
                 .unwrap_or_else(|e| panic!("step {} failed: {:?}", step, e));
 
@@ -421,7 +444,7 @@ fn decode_kv_commitment_chain() {
 
         // Verify position_offset chain: position_offset[step] == full_seq_len[step-1]
         for lp in &gkr_proof.layer_proofs {
-            if let stwo_ml::gkr::types::LayerProof::AttentionDecode {
+            if let obelyzk::gkr::types::LayerProof::AttentionDecode {
                 position_offset,
                 full_seq_len,
                 new_tokens,
@@ -463,7 +486,7 @@ fn decode_kv_commitment_chain() {
 fn incremental_merkle_basic() {
     use starknet_crypto::poseidon_hash;
     use starknet_ff::FieldElement;
-    use stwo_ml::crypto::poseidon_merkle::{IncrementalPoseidonMerkle, PoseidonMerkleTree};
+    use obelyzk::crypto::poseidon_merkle::{IncrementalPoseidonMerkle, PoseidonMerkleTree};
 
     for n in [1usize, 2, 3, 4, 7, 8, 15, 16, 32] {
         let leaves: Vec<FieldElement> = (0..n).map(|i| FieldElement::from(i as u64 + 1)).collect();
@@ -516,7 +539,7 @@ fn incremental_merkle_basic() {
 #[test]
 fn incremental_merkle_grow() {
     use starknet_ff::FieldElement;
-    use stwo_ml::crypto::poseidon_merkle::{IncrementalPoseidonMerkle, PoseidonMerkleTree};
+    use obelyzk::crypto::poseidon_merkle::{IncrementalPoseidonMerkle, PoseidonMerkleTree};
 
     // Start with capacity 4, push 8 leaves (forces one grow)
     let mut inc = IncrementalPoseidonMerkle::new(4);
@@ -572,7 +595,7 @@ fn incremental_kv_commitment_matches() {
     let topo = graph.topological_order();
     for &node_id in &topo {
         let node = &graph.nodes[node_id];
-        if let stwo_ml::compiler::graph::GraphOp::Attention { config: _ } = &node.op {
+        if let obelyzk::compiler::graph::GraphOp::Attention { config: _ } = &node.op {
             weights.add_named_weight(node.id, "w_q", random_m31_matrix(d_model, d_model, 200 + node.id as u64));
             weights.add_named_weight(node.id, "w_k", random_m31_matrix(d_model, d_model, 300 + node.id as u64));
             weights.add_named_weight(node.id, "w_v", random_m31_matrix(d_model, d_model, 400 + node.id as u64));
@@ -585,7 +608,7 @@ fn incremental_kv_commitment_matches() {
     let prefill_input = random_m31_matrix(prefill_len, d_model, 123);
     for &node_id in &topo {
         let node = &graph.nodes[node_id];
-        if let stwo_ml::compiler::graph::GraphOp::Attention { config } = &node.op {
+        if let obelyzk::compiler::graph::GraphOp::Attention { config } = &node.op {
             let attn_weights = AttentionWeights {
                 w_q: weights.get_named_weight(node.id, "w_q").unwrap().clone(),
                 w_k: weights.get_named_weight(node.id, "w_k").unwrap().clone(),
@@ -621,7 +644,7 @@ fn incremental_kv_commitment_matches() {
     // Simulate one decode step's KV append
     for &node_id in &topo {
         let node = &graph.nodes[node_id];
-        if let stwo_ml::compiler::graph::GraphOp::Attention { config } = &node.op {
+        if let obelyzk::compiler::graph::GraphOp::Attention { config } = &node.op {
             let attn_weights = AttentionWeights {
                 w_q: weights.get_named_weight(node.id, "w_q").unwrap().clone(),
                 w_k: weights.get_named_weight(node.id, "w_k").unwrap().clone(),
@@ -663,14 +686,15 @@ fn decode_benchmark_prefill_vs_decode() {
 
     let prefill_weights = generate_weights_for_graph(&prefill_graph, 42);
     let prefill_input = random_m31_matrix(decode_steps, d_model, 555);
-    let weight_cache = stwo_ml::weight_cache::shared_cache("prefill-bench");
+    let weight_cache = obelyzk::weight_cache::shared_cache("prefill-bench");
 
     let t_prefill = Instant::now();
-    let prefill_result = stwo_ml::aggregation::prove_model_pure_gkr_auto_with_cache(
+    let prefill_result = obelyzk::aggregation::prove_model_pure_gkr_auto_with_cache(
         &prefill_graph,
         &prefill_input,
         &prefill_weights,
         Some(&weight_cache),
+        None,
     );
     let prefill_elapsed = t_prefill.elapsed();
     match &prefill_result {
@@ -687,7 +711,7 @@ fn decode_benchmark_prefill_vs_decode() {
     let topo = decode_graph.topological_order();
     for &node_id in &topo {
         let node = &decode_graph.nodes[node_id];
-        if let stwo_ml::compiler::graph::GraphOp::Attention { config: _ } = &node.op {
+        if let obelyzk::compiler::graph::GraphOp::Attention { config: _ } = &node.op {
             decode_weights.add_named_weight(node.id, "w_q", random_m31_matrix(d_model, d_model, 200 + node.id as u64));
             decode_weights.add_named_weight(node.id, "w_k", random_m31_matrix(d_model, d_model, 300 + node.id as u64));
             decode_weights.add_named_weight(node.id, "w_v", random_m31_matrix(d_model, d_model, 400 + node.id as u64));
@@ -699,7 +723,7 @@ fn decode_benchmark_prefill_vs_decode() {
     let seed_input = random_m31_matrix(prefill_len, d_model, 123);
     for &node_id in &topo {
         let node = &decode_graph.nodes[node_id];
-        if let stwo_ml::compiler::graph::GraphOp::Attention { config } = &node.op {
+        if let obelyzk::compiler::graph::GraphOp::Attention { config } = &node.op {
             let attn_weights = AttentionWeights {
                 w_q: decode_weights.get_named_weight(node.id, "w_q").unwrap().clone(),
                 w_k: decode_weights.get_named_weight(node.id, "w_k").unwrap().clone(),
@@ -712,7 +736,7 @@ fn decode_benchmark_prefill_vs_decode() {
     }
 
     let mut kv_commitment = IncrementalKVCommitment::from_kv_cache(&kv_cache, prefill_len + decode_steps);
-    let decode_cache = stwo_ml::weight_cache::shared_cache("decode-bench-cmp");
+    let decode_cache = obelyzk::weight_cache::shared_cache("decode-bench-cmp");
 
     let t_decode_total = Instant::now();
     for step in 0..decode_steps {
@@ -720,6 +744,7 @@ fn decode_benchmark_prefill_vs_decode() {
         let result = prove_model_pure_gkr_decode_step(
             &decode_graph, &token_input, &decode_weights,
             &mut kv_cache, &mut kv_commitment, Some(&decode_cache),
+            None,
         );
         if let Err(e) = &result {
             eprintln!("  Decode step {} FAILED: {:?}", step, e);
@@ -760,9 +785,9 @@ fn decode_benchmark_prefill_vs_decode() {
 /// Helper: build a decode graph + weights + seeded KV cache, prove one decode step.
 /// Returns (graph, weights, proof, output, kv_commitment) for tamper testing.
 fn setup_decode_proof() -> (
-    stwo_ml::compiler::graph::ComputationGraph,
-    stwo_ml::compiler::graph::GraphWeights,
-    stwo_ml::aggregation::AggregatedModelProofOnChain,
+    obelyzk::compiler::graph::ComputationGraph,
+    obelyzk::compiler::graph::GraphWeights,
+    obelyzk::aggregation::AggregatedModelProofOnChain,
     M31Matrix,
     starknet_ff::FieldElement,
 ) {
@@ -775,11 +800,11 @@ fn setup_decode_proof() -> (
     builder.transformer_block(num_heads, num_heads, 1, d_ff);
     let graph = builder.build();
 
-    let mut weights = stwo_ml::compiler::onnx::generate_weights_for_graph(&graph, 42);
+    let mut weights = obelyzk::compiler::onnx::generate_weights_for_graph(&graph, 42);
     let topo = graph.topological_order();
     for &node_id in &topo {
         let node = &graph.nodes[node_id];
-        if let stwo_ml::compiler::graph::GraphOp::Attention { .. } = &node.op {
+        if let obelyzk::compiler::graph::GraphOp::Attention { .. } = &node.op {
             weights.add_named_weight(node.id, "w_q", random_m31_matrix(d_model, d_model, 200 + node.id as u64));
             weights.add_named_weight(node.id, "w_k", random_m31_matrix(d_model, d_model, 300 + node.id as u64));
             weights.add_named_weight(node.id, "w_v", random_m31_matrix(d_model, d_model, 400 + node.id as u64));
@@ -791,7 +816,7 @@ fn setup_decode_proof() -> (
     let prefill_input = random_m31_matrix(prefill_len, d_model, 123);
     for &node_id in &topo {
         let node = &graph.nodes[node_id];
-        if let stwo_ml::compiler::graph::GraphOp::Attention { config } = &node.op {
+        if let obelyzk::compiler::graph::GraphOp::Attention { config } = &node.op {
             let attn_weights = AttentionWeights {
                 w_q: weights.get_named_weight(node.id, "w_q").unwrap().clone(),
                 w_k: weights.get_named_weight(node.id, "w_k").unwrap().clone(),
@@ -808,6 +833,7 @@ fn setup_decode_proof() -> (
 
     let (proof, kv_commit) = prove_model_pure_gkr_decode_step(
         &graph, &token_input, &weights, &mut kv_cache, &mut kv_commitment, None,
+        None,
     )
     .expect("setup: decode proving should succeed");
 
@@ -825,7 +851,7 @@ fn decode_tamper_position_offset_rejected() {
     // Tamper: modify position_offset in every AttentionDecode layer
     let mut tampered = false;
     for lp in &mut gkr_proof.layer_proofs {
-        if let stwo_ml::gkr::types::LayerProof::AttentionDecode {
+        if let obelyzk::gkr::types::LayerProof::AttentionDecode {
             ref mut position_offset,
             ..
         } = lp
@@ -837,8 +863,8 @@ fn decode_tamper_position_offset_rejected() {
     assert!(tampered, "should have found at least one AttentionDecode layer to tamper");
 
     // Verify should fail
-    let circuit = stwo_ml::gkr::LayeredCircuit::from_graph(&graph).unwrap();
-    let mut channel = stwo_ml::crypto::poseidon_channel::PoseidonChannel::new();
+    let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&graph).unwrap();
+    let mut channel = obelyzk::crypto::poseidon_channel::PoseidonChannel::new();
     if let Some(kv) = gkr_proof.kv_cache_commitment {
         channel.mix_felt(kv);
     }
@@ -846,7 +872,7 @@ fn decode_tamper_position_offset_rejected() {
         channel.mix_felt(prev);
     }
 
-    let result = stwo_ml::gkr::verify_gkr_with_weights(
+    let result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit, gkr_proof, &proof.execution.output, &weights, &mut channel,
     );
     assert!(result.is_err(), "tampered position_offset should fail verification");
@@ -877,14 +903,14 @@ fn decode_tamper_kv_commitment_rejected() {
 
     // Verify with the TAMPERED commitment mixed into the channel
     // (simulating what a malicious prover would present)
-    let circuit = stwo_ml::gkr::LayeredCircuit::from_graph(&graph).unwrap();
-    let mut channel = stwo_ml::crypto::poseidon_channel::PoseidonChannel::new();
+    let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&graph).unwrap();
+    let mut channel = obelyzk::crypto::poseidon_channel::PoseidonChannel::new();
     channel.mix_felt(gkr_proof.kv_cache_commitment.unwrap());
     if let Some(prev) = gkr_proof.prev_kv_cache_commitment {
         channel.mix_felt(prev);
     }
 
-    let result = stwo_ml::gkr::verify_gkr_with_weights(
+    let result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit, gkr_proof, &proof.execution.output, &weights, &mut channel,
     );
     // The transcript divergence should cause sumcheck/claim verification to fail
@@ -906,7 +932,7 @@ fn decode_tamper_new_tokens_rejected() {
     // Tamper: change new_tokens to 5 (was 1)
     let mut tampered = false;
     for lp in &mut gkr_proof.layer_proofs {
-        if let stwo_ml::gkr::types::LayerProof::AttentionDecode {
+        if let obelyzk::gkr::types::LayerProof::AttentionDecode {
             ref mut new_tokens,
             ..
         } = lp
@@ -917,8 +943,8 @@ fn decode_tamper_new_tokens_rejected() {
     }
     assert!(tampered, "should have found AttentionDecode layer to tamper");
 
-    let circuit = stwo_ml::gkr::LayeredCircuit::from_graph(&graph).unwrap();
-    let mut channel = stwo_ml::crypto::poseidon_channel::PoseidonChannel::new();
+    let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&graph).unwrap();
+    let mut channel = obelyzk::crypto::poseidon_channel::PoseidonChannel::new();
     if let Some(kv) = gkr_proof.kv_cache_commitment {
         channel.mix_felt(kv);
     }
@@ -926,7 +952,7 @@ fn decode_tamper_new_tokens_rejected() {
         channel.mix_felt(prev);
     }
 
-    let result = stwo_ml::gkr::verify_gkr_with_weights(
+    let result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit, gkr_proof, &proof.execution.output, &weights, &mut channel,
     );
     assert!(result.is_err(), "tampered new_tokens should fail verification");
@@ -949,15 +975,15 @@ fn decode_tamper_prev_kv_commitment_rejected() {
     // Tamper: replace prev_kv_cache_commitment
     gkr_proof.prev_kv_cache_commitment = Some(starknet_ff::FieldElement::from(0xCAFEBABEu64));
 
-    let circuit = stwo_ml::gkr::LayeredCircuit::from_graph(&graph).unwrap();
-    let mut channel = stwo_ml::crypto::poseidon_channel::PoseidonChannel::new();
+    let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&graph).unwrap();
+    let mut channel = obelyzk::crypto::poseidon_channel::PoseidonChannel::new();
     if let Some(kv) = gkr_proof.kv_cache_commitment {
         channel.mix_felt(kv);
     }
     // Mix the TAMPERED prev commitment
     channel.mix_felt(gkr_proof.prev_kv_cache_commitment.unwrap());
 
-    let result = stwo_ml::gkr::verify_gkr_with_weights(
+    let result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit, gkr_proof, &proof.execution.output, &weights, &mut channel,
     );
     assert!(
@@ -976,7 +1002,7 @@ fn decode_tamper_full_seq_len_rejected() {
 
     let mut tampered = false;
     for lp in &mut gkr_proof.layer_proofs {
-        if let stwo_ml::gkr::types::LayerProof::AttentionDecode {
+        if let obelyzk::gkr::types::LayerProof::AttentionDecode {
             ref mut full_seq_len,
             ..
         } = lp
@@ -987,8 +1013,8 @@ fn decode_tamper_full_seq_len_rejected() {
     }
     assert!(tampered);
 
-    let circuit = stwo_ml::gkr::LayeredCircuit::from_graph(&graph).unwrap();
-    let mut channel = stwo_ml::crypto::poseidon_channel::PoseidonChannel::new();
+    let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&graph).unwrap();
+    let mut channel = obelyzk::crypto::poseidon_channel::PoseidonChannel::new();
     if let Some(kv) = gkr_proof.kv_cache_commitment {
         channel.mix_felt(kv);
     }
@@ -996,7 +1022,7 @@ fn decode_tamper_full_seq_len_rejected() {
         channel.mix_felt(prev);
     }
 
-    let result = stwo_ml::gkr::verify_gkr_with_weights(
+    let result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit, gkr_proof, &proof.execution.output, &weights, &mut channel,
     );
     assert!(result.is_err(), "tampered full_seq_len should fail verification");
@@ -1016,7 +1042,7 @@ fn decode_tamper_sub_claim_value_rejected() {
 
     let mut tampered = false;
     for lp in &mut gkr_proof.layer_proofs {
-        if let stwo_ml::gkr::types::LayerProof::AttentionDecode {
+        if let obelyzk::gkr::types::LayerProof::AttentionDecode {
             ref mut sub_claim_values,
             ..
         } = lp
@@ -1030,8 +1056,8 @@ fn decode_tamper_sub_claim_value_rejected() {
     }
     assert!(tampered, "should have found sub_claim_values to tamper");
 
-    let circuit = stwo_ml::gkr::LayeredCircuit::from_graph(&graph).unwrap();
-    let mut channel = stwo_ml::crypto::poseidon_channel::PoseidonChannel::new();
+    let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&graph).unwrap();
+    let mut channel = obelyzk::crypto::poseidon_channel::PoseidonChannel::new();
     if let Some(kv) = gkr_proof.kv_cache_commitment {
         channel.mix_felt(kv);
     }
@@ -1039,7 +1065,7 @@ fn decode_tamper_sub_claim_value_rejected() {
         channel.mix_felt(prev);
     }
 
-    let result = stwo_ml::gkr::verify_gkr_with_weights(
+    let result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit, gkr_proof, &proof.execution.output, &weights, &mut channel,
     );
     assert!(
@@ -1068,11 +1094,11 @@ fn decode_multi_token_batch() {
     builder.transformer_block(num_heads, num_heads, new_tokens, d_ff);
     let graph = builder.build();
 
-    let mut weights = stwo_ml::compiler::onnx::generate_weights_for_graph(&graph, 42);
+    let mut weights = obelyzk::compiler::onnx::generate_weights_for_graph(&graph, 42);
     let topo = graph.topological_order();
     for &node_id in &topo {
         let node = &graph.nodes[node_id];
-        if let stwo_ml::compiler::graph::GraphOp::Attention { .. } = &node.op {
+        if let obelyzk::compiler::graph::GraphOp::Attention { .. } = &node.op {
             weights.add_named_weight(node.id, "w_q", random_m31_matrix(d_model, d_model, 200 + node.id as u64));
             weights.add_named_weight(node.id, "w_k", random_m31_matrix(d_model, d_model, 300 + node.id as u64));
             weights.add_named_weight(node.id, "w_v", random_m31_matrix(d_model, d_model, 400 + node.id as u64));
@@ -1085,7 +1111,7 @@ fn decode_multi_token_batch() {
     let prefill_input = random_m31_matrix(prefill_len, d_model, 123);
     for &node_id in &topo {
         let node = &graph.nodes[node_id];
-        if let stwo_ml::compiler::graph::GraphOp::Attention { config } = &node.op {
+        if let obelyzk::compiler::graph::GraphOp::Attention { config } = &node.op {
             let attn_weights = AttentionWeights {
                 w_q: weights.get_named_weight(node.id, "w_q").unwrap().clone(),
                 w_k: weights.get_named_weight(node.id, "w_k").unwrap().clone(),
@@ -1103,6 +1129,7 @@ fn decode_multi_token_batch() {
 
     let result = prove_model_pure_gkr_decode_step(
         &graph, &batch_input, &weights, &mut kv_cache, &mut kv_commitment, None,
+        None,
     );
     let (proof, kv_commit) = result.expect("multi-token decode proving should succeed");
 
@@ -1112,7 +1139,7 @@ fn decode_multi_token_batch() {
 
     // Check AttentionDecode metadata
     for lp in &gkr_proof.layer_proofs {
-        if let stwo_ml::gkr::types::LayerProof::AttentionDecode {
+        if let obelyzk::gkr::types::LayerProof::AttentionDecode {
             new_tokens: nt,
             full_seq_len,
             position_offset,
@@ -1142,12 +1169,12 @@ fn decode_multi_token_batch() {
     }
 
     // Verify GKR proof
-    let circuit = stwo_ml::gkr::LayeredCircuit::from_graph(&graph).unwrap();
-    let mut channel = stwo_ml::crypto::poseidon_channel::PoseidonChannel::new();
+    let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&graph).unwrap();
+    let mut channel = obelyzk::crypto::poseidon_channel::PoseidonChannel::new();
     channel.mix_felt(gkr_proof.kv_cache_commitment.unwrap());
     channel.mix_felt(gkr_proof.prev_kv_cache_commitment.unwrap());
 
-    let verify_result = stwo_ml::gkr::verify_gkr_with_weights(
+    let verify_result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit, gkr_proof, &proof.execution.output, &weights, &mut channel,
     );
     assert!(
@@ -1179,11 +1206,11 @@ fn decode_multi_then_single_chain() {
     builder.transformer_block(num_heads, num_heads, 1, d_ff);
     let graph = builder.build();
 
-    let mut weights = stwo_ml::compiler::onnx::generate_weights_for_graph(&graph, 42);
+    let mut weights = obelyzk::compiler::onnx::generate_weights_for_graph(&graph, 42);
     let topo = graph.topological_order();
     for &node_id in &topo {
         let node = &graph.nodes[node_id];
-        if let stwo_ml::compiler::graph::GraphOp::Attention { .. } = &node.op {
+        if let obelyzk::compiler::graph::GraphOp::Attention { .. } = &node.op {
             weights.add_named_weight(node.id, "w_q", random_m31_matrix(d_model, d_model, 200 + node.id as u64));
             weights.add_named_weight(node.id, "w_k", random_m31_matrix(d_model, d_model, 300 + node.id as u64));
             weights.add_named_weight(node.id, "w_v", random_m31_matrix(d_model, d_model, 400 + node.id as u64));
@@ -1195,7 +1222,7 @@ fn decode_multi_then_single_chain() {
     let prefill_input = random_m31_matrix(prefill_len, d_model, 123);
     for &node_id in &topo {
         let node = &graph.nodes[node_id];
-        if let stwo_ml::compiler::graph::GraphOp::Attention { config } = &node.op {
+        if let obelyzk::compiler::graph::GraphOp::Attention { config } = &node.op {
             let attn_weights = AttentionWeights {
                 w_q: weights.get_named_weight(node.id, "w_q").unwrap().clone(),
                 w_k: weights.get_named_weight(node.id, "w_k").unwrap().clone(),
@@ -1208,18 +1235,20 @@ fn decode_multi_then_single_chain() {
     }
 
     let mut kv_commitment = IncrementalKVCommitment::from_kv_cache(&kv_cache, 16);
-    let weight_cache = stwo_ml::weight_cache::shared_cache("multi-single-chain");
+    let weight_cache = obelyzk::weight_cache::shared_cache("multi-single-chain");
 
     // Step 0: first single decode
     let t0_input = random_m31_matrix(1, d_model, 1000);
     let (proof0, commit0) = prove_model_pure_gkr_decode_step(
         &graph, &t0_input, &weights, &mut kv_cache, &mut kv_commitment, Some(&weight_cache),
+        None,
     ).expect("step 0 should succeed");
 
     // Step 1: second single decode
     let t1_input = random_m31_matrix(1, d_model, 1001);
     let (proof1, commit1) = prove_model_pure_gkr_decode_step(
         &graph, &t1_input, &weights, &mut kv_cache, &mut kv_commitment, Some(&weight_cache),
+        None,
     ).expect("step 1 should succeed");
 
     // Chain: step1's prev must equal step0's new
@@ -1235,12 +1264,12 @@ fn decode_multi_then_single_chain() {
 
     // Verify position offsets
     for lp in &gkr0.layer_proofs {
-        if let stwo_ml::gkr::types::LayerProof::AttentionDecode { position_offset, .. } = lp {
+        if let obelyzk::gkr::types::LayerProof::AttentionDecode { position_offset, .. } = lp {
             assert_eq!(*position_offset, prefill_len, "step 0 offset");
         }
     }
     for lp in &gkr1.layer_proofs {
-        if let stwo_ml::gkr::types::LayerProof::AttentionDecode { position_offset, .. } = lp {
+        if let obelyzk::gkr::types::LayerProof::AttentionDecode { position_offset, .. } = lp {
             assert_eq!(*position_offset, prefill_len + 1, "step 1 offset");
         }
     }
@@ -1252,8 +1281,8 @@ fn decode_multi_then_single_chain() {
 #[cfg(feature = "cuda-runtime")]
 #[test]
 fn decode_gpu_cpu_equivalence() {
-    use stwo_ml::gkr::circuit::LayeredCircuit;
-    use stwo_ml::compiler::onnx::generate_weights_for_graph;
+    use obelyzk::gkr::circuit::LayeredCircuit;
+    use obelyzk::compiler::onnx::generate_weights_for_graph;
 
     let d_model = 64;
     let num_heads = 2;
@@ -1269,7 +1298,7 @@ fn decode_gpu_cpu_equivalence() {
     let topo = graph.topological_order();
     for &node_id in &topo {
         let node = &graph.nodes[node_id];
-        if let stwo_ml::compiler::graph::GraphOp::Attention { config: _ } = &node.op {
+        if let obelyzk::compiler::graph::GraphOp::Attention { config: _ } = &node.op {
             weights.add_named_weight(node.id, "w_q", random_m31_matrix(d_model, d_model, 200 + node.id as u64));
             weights.add_named_weight(node.id, "w_k", random_m31_matrix(d_model, d_model, 300 + node.id as u64));
             weights.add_named_weight(node.id, "w_v", random_m31_matrix(d_model, d_model, 400 + node.id as u64));
@@ -1283,7 +1312,7 @@ fn decode_gpu_cpu_equivalence() {
     let prefill_input = random_m31_matrix(prefill_len, d_model, 123);
     for &node_id in &topo {
         let node = &graph.nodes[node_id];
-        if let stwo_ml::compiler::graph::GraphOp::Attention { config } = &node.op {
+        if let obelyzk::compiler::graph::GraphOp::Attention { config } = &node.op {
             let attn_weights = AttentionWeights {
                 w_q: weights.get_named_weight(node.id, "w_q").unwrap().clone(),
                 w_k: weights.get_named_weight(node.id, "w_k").unwrap().clone(),

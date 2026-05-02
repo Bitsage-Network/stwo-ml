@@ -9,13 +9,13 @@ The GKR prover uses 5 environment variable "gates" that weaken proof components 
 
 ## Results
 
-| Gate | Default | Closed Result | Can Close? | Risk if Open |
+| Gate | Default (Apr 30 2026) | Closed Result | Can Close? | Risk if Open |
 |------|---------|---------------|------------|--------------|
-| `STWO_SKIP_RMS_SQ_PROOF` | `=1` (skip) | **PASSED** | **YES** | Fake RMS variance |
-| `STWO_ALLOW_MISSING_NORM_PROOF` | `=1` (allow) | **PASSED** (verified on A10G) | **YES** | Skip normalization |
-| `STWO_PIECEWISE_ACTIVATION` | `=0` (off) | Not tested (coupled) | Needs work | Upper bits unverified |
-| `STWO_ALLOW_LOGUP_ACTIVATION` | `=1` (allow) | Not tested (coupled) | Needs work | Lower-bit only |
-| `STWO_SKIP_BATCH_TOKENS` | `=1` (skip) | Not tested | Unknown | Batch manipulation |
+| `STWO_SKIP_RMS_SQ_PROOF` | **CLOSED** | **PASSED** | **DONE** | Fake RMS variance |
+| `STWO_ALLOW_MISSING_NORM_PROOF` | **CLOSED** | **PASSED** (A10G + M1 CPU) | **DONE** | Skip normalization |
+| `STWO_PIECEWISE_ACTIVATION` | **ENABLED** | **PASSED** (M1 CPU, SmolLM2) | **DONE** | Upper bits unverified |
+| `STWO_ALLOW_LOGUP_ACTIVATION` | **CLOSED** | **PASSED** (M1 CPU, SmolLM2) | **DONE** | Lower-bit only |
+| `STWO_SKIP_BATCH_TOKENS` | `=1` (skip) | N/A — demo flag, not soundness | N/A | None (demo only) |
 
 ## Detailed Analysis
 
@@ -49,7 +49,13 @@ The GKR prover uses 5 environment variable "gates" that weaken proof components 
 
 **Recommendation**: Test closing both piecewise + LogUp gates together in a future sprint.
 
-### STWO_SKIP_BATCH_TOKENS — NOT TESTED
+### STWO_SKIP_BATCH_TOKENS — NOT A SOUNDNESS GATE (audited Apr 30 2026)
+
+**What it does**: Originally documented as "skip batch token accumulation proofs". Code audit shows the only reader in the entire engine is `src/bin/prove_model.rs:5166` — the demo binary, which uses it to gate an end-of-run batched conversation forward pass. There is NO production lib code that consumes this flag, so it cannot affect proof soundness.
+
+**Recommendation**: Re-classify as a demo binary feature toggle, not a soundness gate. The PolicyConfig field still exists (so the policy commitment hash includes it), but the audit table no longer treats it as a closure target.
+
+### STWO_SKIP_BATCH_TOKENS — original (superseded) note
 
 **What it does**: Skips batch token accumulation proofs for multi-token inference.
 
@@ -59,10 +65,11 @@ The GKR prover uses 5 environment variable "gates" that weaken proof components 
 
 ## Action Items
 
-1. **DONE**: Remove `STWO_SKIP_RMS_SQ_PROOF=1` from `deploy_node.sh` — verified safe
-2. **DONE**: Remove `STWO_ALLOW_MISSING_NORM_PROOF=1` from deployment scripts — verified safe on A10G
-3. **Phase 3**: Test and close piecewise + LogUp activation gates together
-4. **Phase 4**: Test batch token gate
+1. **DONE (Apr 30 2026)**: Closed `skip_rms_sq_proof` in `PolicyConfig::standard()`. Removed from `prove_onchain.sh` + `prove_and_submit.sh` + `deploy_node.sh`. Verified on M1 CPU.
+2. **DONE (Apr 30 2026)**: Closed `allow_missing_norm_proof` in `standard()`. Verified on A10G + M1 CPU.
+3. **DONE (Apr 30 2026)**: Closed `allow_logup_activation` + enabled `piecewise_activation` in `standard()`. Verified on M1 CPU with SmolLM2-135M (1L proof generates, self-verifies, externally cryptographically re-verifies).
+4. **DONE (Apr 30 2026)**: Audited `skip_batch_tokens` — confirmed it's a demo binary feature toggle, not a soundness gate. No closure needed.
+5. **DONE (Apr 30 2026)**: All 4 soundness-critical gate readers now use thread-local overrides via `policy::skip_rms_sq_proof()`, `policy::allow_missing_norm_proof()`, `policy::piecewise_activation_enabled()`, `policy::allow_logup_activation()`. Closes env-var-bypass attack surface.
 
 ---
 

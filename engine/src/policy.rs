@@ -76,8 +76,11 @@ pub struct PolicyConfig {
     /// Env: `STWO_PIECEWISE_ACTIVATION` (default: true)
     pub piecewise_activation: bool,
 
-    /// Skip batch token accumulation proofs.
-    /// Env: `STWO_SKIP_BATCH_TOKENS`
+    /// Skip the demo binary's batched-conversation token proving pass.
+    /// Despite the name, this is NOT a soundness gate — no lib code consumes it.
+    /// It's read at `src/bin/prove_model.rs:5166` to gate a demo feature that
+    /// runs an extra batched forward pass over all response tokens at end-of-run.
+    /// Env: `STWO_SKIP_BATCH_TOKENS`. Audited Apr 30 2026.
     pub skip_batch_tokens: bool,
 
     /// Skip unified STARK layer in pure-GKR mode.
@@ -154,17 +157,26 @@ impl PolicyConfig {
 
     /// On-chain streaming preset: matches prove_server auto-set defaults.
     ///
-    /// This is the policy the prove_server has been implicitly using via
-    /// `unsafe { std::env::set_var(...) }` at startup. Now explicit.
+    /// Hardening (Apr 30 2026, two passes):
+    /// - Pass 1 closed `skip_rms_sq_proof` + `allow_missing_norm_proof`
+    ///   per `engine/docs/SOUNDNESS_GATES_AUDIT.md` (verified safe on A10G).
+    /// - Pass 2 closed `allow_logup_activation` and enabled
+    ///   `piecewise_activation`. Verified safe on M-series CPU with SmolLM2-135M
+    ///   (1L proof generates, self-verifies, externally cryptographically
+    ///   re-verifies — same code path as `strict()` for these two fields).
+    ///
+    /// Remaining: `skip_batch_tokens` is NOT a soundness gate (it's a demo
+    /// binary feature toggle — see field doc); `skip_unified_stark` is the
+    /// pure-GKR mode for streaming compatibility.
     pub fn standard() -> Self {
         Self {
-            // Soundness: relax norm + logup for on-chain streaming compat
-            allow_missing_norm_proof: true,
-            allow_logup_activation: true,
+            // Soundness: norm proofs required, full-precision activations required
+            allow_missing_norm_proof: false,
+            allow_logup_activation: false,
             allow_missing_segment_binding: false,
-            // Prover: skip RMS Part 0 (Cairo handles it), skip batch tokens
-            skip_rms_sq_proof: true,
-            piecewise_activation: false,
+            // Prover: RMS Part 0 proven, piecewise activation enabled, batch skipped
+            skip_rms_sq_proof: false,
+            piecewise_activation: true,
             skip_batch_tokens: true,
             skip_unified_stark: true,
             // Weight: aggregated with full binding
@@ -361,6 +373,202 @@ pub fn from_file(path: &std::path::Path) -> Result<PolicyConfig, String> {
         .map_err(|e| format!("invalid policy JSON in '{}': {e}", path.display()))
 }
 
+// ── Policy commitment skip override ──────────────────────────────────────────
+//
+// `STWO_SKIP_POLICY_COMMITMENT` was previously a process-global env var read at
+// 9 production call sites in `starknet.rs` and `gkr/{prover,verifier}.rs`. That
+// is racy under parallel `cargo test` execution and exposes an attack surface
+// where an external operator can disable policy binding mid-process.
+//
+// `policy_commitment_skipped()` is the canonical reader. It checks a
+// thread-local override first, then falls back to the env var (preserved for
+// backwards compatibility with existing deploy scripts and CLI flags).
+//
+// Same pattern memory's `aggregated-binding.md` documents for
+// `STWO_WEIGHT_BINDING`. Tests should use `PolicyCommitmentSkipGuard::enter()`
+// instead of `std::env::set_var(...)`.
+use std::cell::Cell;
+
+thread_local! {
+    static SKIP_POLICY_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// Returns `true` if the policy-commitment binding should be skipped on the
+/// current thread.
+///
+/// Resolution order: thread-local override → `STWO_SKIP_POLICY_COMMITMENT` env
+/// var → false.
+pub fn policy_commitment_skipped() -> bool {
+    if let Some(v) = SKIP_POLICY_OVERRIDE.with(|c| c.get()) {
+        return v;
+    }
+    std::env::var("STWO_SKIP_POLICY_COMMITMENT").is_ok()
+}
+
+/// RAII guard that overrides `policy_commitment_skipped()` for the current
+/// thread until dropped. Composable with the env var (env var is the fallback,
+/// override wins).
+#[must_use = "the guard must be held for the duration of the override"]
+pub struct PolicyCommitmentSkipGuard {
+    prev: Option<bool>,
+}
+
+impl PolicyCommitmentSkipGuard {
+    /// Set the override to `value` for the current thread.
+    pub fn set(value: bool) -> Self {
+        let prev = SKIP_POLICY_OVERRIDE.with(|c| c.replace(Some(value)));
+        Self { prev }
+    }
+}
+
+impl Drop for PolicyCommitmentSkipGuard {
+    fn drop(&mut self) {
+        SKIP_POLICY_OVERRIDE.with(|c| c.set(self.prev));
+    }
+}
+
+// ── Soundness gate thread-local overrides ────────────────────────────────────
+//
+// These four gates were closed in `PolicyConfig::standard()` on Apr 30 2026
+// (audit-verified safe in `engine/docs/SOUNDNESS_GATES_AUDIT.md`). Closing them
+// in the preset is necessary but not sufficient — production code at 8 sites
+// reads the corresponding env vars directly, so an external operator could
+// set e.g. `STWO_SKIP_RMS_SQ_PROOF=1` to re-open a gate at runtime even when
+// the policy says `skip_rms_sq_proof: false`. The thread-local overrides below
+// give explicit precedence over the env var so a properly-resolved policy
+// cannot be downgraded mid-process.
+//
+// Resolution order for each gate: thread-local override (Some) → env var → default.
+// Production code path uses the canonical reader (`*_skipped()` / `*_enabled()`).
+// Tests should `set_thread_policy_overrides()` and hold the returned guard.
+
+thread_local! {
+    static SKIP_RMS_SQ_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+    static ALLOW_MISSING_NORM_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+    static PIECEWISE_ACTIVATION_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+    static ALLOW_LOGUP_ACTIVATION_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+    static AGGREGATED_RLC_ONLY_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+    static AGGREGATED_FULL_BINDING_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// Returns `true` if the RMSNorm Part 0 (variance) sumcheck should be skipped.
+/// Default: `false` (proven). Hardened in `standard()` Apr 30 2026.
+pub fn skip_rms_sq_proof() -> bool {
+    if let Some(v) = SKIP_RMS_SQ_OVERRIDE.with(|c| c.get()) {
+        return v;
+    }
+    std::env::var("STWO_SKIP_RMS_SQ_PROOF").is_ok()
+}
+
+/// Returns `true` if proofs without LayerNorm/RMSNorm sub-proofs are accepted.
+/// Default: `false` (sub-proofs required). Hardened in `standard()` Apr 30 2026.
+pub fn allow_missing_norm_proof() -> bool {
+    if let Some(v) = ALLOW_MISSING_NORM_OVERRIDE.with(|c| c.get()) {
+        return v;
+    }
+    std::env::var("STWO_ALLOW_MISSING_NORM_PROOF")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Returns `true` if piecewise-linear algebraic activation proofs are enabled.
+/// Default: `true` (full M31 domain proven). Hardened in `standard()` Apr 30 2026.
+pub fn piecewise_activation_enabled() -> bool {
+    if let Some(v) = PIECEWISE_ACTIVATION_OVERRIDE.with(|c| c.get()) {
+        return v;
+    }
+    match std::env::var("STWO_PIECEWISE_ACTIVATION") {
+        Ok(s) => !matches!(s.as_str(), "0" | "false" | "no" | "off"),
+        Err(_) => true,
+    }
+}
+
+/// Returns `true` if proofs with missing/lower-bits LogUp activation proofs
+/// are accepted. Default: `false`. Hardened in `standard()` Apr 30 2026.
+pub fn allow_logup_activation() -> bool {
+    if let Some(v) = ALLOW_LOGUP_ACTIVATION_OVERRIDE.with(|c| c.get()) {
+        return v;
+    }
+    std::env::var("STWO_ALLOW_LOGUP_ACTIVATION")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Returns `true` if aggregated weight binding should use RLC-only mode (no
+/// MLE opening proof). Default: `false`. Pollutes Fiat-Shamir transcript if
+/// inconsistent across prover/verifier.
+pub fn aggregated_rlc_only() -> bool {
+    if let Some(v) = AGGREGATED_RLC_ONLY_OVERRIDE.with(|c| c.get()) {
+        return v;
+    }
+    std::env::var("STWO_AGGREGATED_RLC_ONLY")
+        .ok()
+        .map(|v| !v.is_empty() && v != "0" && v != "false")
+        .unwrap_or(false)
+}
+
+/// Returns `true` if aggregated weight binding should produce a full MLE
+/// opening proof (trustless on-chain verification). Default: `false` (RLC).
+pub fn aggregated_full_binding() -> bool {
+    if let Some(v) = AGGREGATED_FULL_BINDING_OVERRIDE.with(|c| c.get()) {
+        return v;
+    }
+    std::env::var("STWO_AGGREGATED_FULL_BINDING")
+        .ok()
+        .map(|v| !v.is_empty() && v != "0" && v != "false")
+        .unwrap_or(false)
+}
+
+/// RAII guard that overrides one or more soundness gate readers for the current
+/// thread until dropped. Pass `None` to leave a gate at its env-var fallback.
+#[must_use = "the guard must be held for the duration of the override"]
+pub struct SoundnessGateGuard {
+    prev_skip_rms_sq: Option<bool>,
+    prev_missing_norm: Option<bool>,
+    prev_piecewise: Option<bool>,
+    prev_logup: Option<bool>,
+}
+
+/// Single-gate setter helpers (composable).
+impl SoundnessGateGuard {
+    /// Override all four gates at once. `None` means "use env var fallback".
+    pub fn set(
+        skip_rms_sq: Option<bool>,
+        allow_missing_norm: Option<bool>,
+        piecewise: Option<bool>,
+        allow_logup: Option<bool>,
+    ) -> Self {
+        let prev_skip_rms_sq = SKIP_RMS_SQ_OVERRIDE.with(|c| c.replace(skip_rms_sq));
+        let prev_missing_norm =
+            ALLOW_MISSING_NORM_OVERRIDE.with(|c| c.replace(allow_missing_norm));
+        let prev_piecewise = PIECEWISE_ACTIVATION_OVERRIDE.with(|c| c.replace(piecewise));
+        let prev_logup = ALLOW_LOGUP_ACTIVATION_OVERRIDE.with(|c| c.replace(allow_logup));
+        Self {
+            prev_skip_rms_sq,
+            prev_missing_norm,
+            prev_piecewise,
+            prev_logup,
+        }
+    }
+
+    /// Convenience: enter strict-aligned soundness mode for the current thread.
+    /// Equivalent to `PolicyConfig::strict()` for these four gates.
+    pub fn strict() -> Self {
+        Self::set(Some(false), Some(false), Some(true), Some(false))
+    }
+}
+
+impl Drop for SoundnessGateGuard {
+    fn drop(&mut self) {
+        SKIP_RMS_SQ_OVERRIDE.with(|c| c.set(self.prev_skip_rms_sq));
+        ALLOW_MISSING_NORM_OVERRIDE.with(|c| c.set(self.prev_missing_norm));
+        PIECEWISE_ACTIVATION_OVERRIDE.with(|c| c.set(self.prev_piecewise));
+        ALLOW_LOGUP_ACTIVATION_OVERRIDE.with(|c| c.set(self.prev_logup));
+    }
+}
+
 /// Detect `STWO_*` env vars that would be overridden by an explicit policy.
 ///
 /// Returns the names of set env vars. Empty means no conflicts.
@@ -395,7 +603,22 @@ pub fn detect_env_conflicts() -> Vec<&'static str> {
 /// This ensures that any downstream code calling `PolicyConfig::from_env()`
 /// (e.g. the streaming calldata self-verifier) produces the same policy
 /// commitment as the prover that used an explicit `--policy` preset.
+///
+/// Also writes thread-local overrides for the migrated soundness gates, so
+/// that parallel-test pollution of process-global env vars cannot downgrade
+/// the calling thread's policy. Migrated gates: `skip_rms_sq_proof`,
+/// `allow_missing_norm_proof`, `piecewise_activation`, `allow_logup_activation`.
+/// (G16, Apr 30 2026.)
 pub fn apply_to_env(policy: &PolicyConfig) {
+    // Thread-local overrides for migrated readers — these win over env vars
+    // and are immune to parallel-test pollution.
+    SKIP_RMS_SQ_OVERRIDE.with(|c| c.set(Some(policy.skip_rms_sq_proof)));
+    ALLOW_MISSING_NORM_OVERRIDE.with(|c| c.set(Some(policy.allow_missing_norm_proof)));
+    PIECEWISE_ACTIVATION_OVERRIDE.with(|c| c.set(Some(policy.piecewise_activation)));
+    ALLOW_LOGUP_ACTIVATION_OVERRIDE.with(|c| c.set(Some(policy.allow_logup_activation)));
+    AGGREGATED_RLC_ONLY_OVERRIDE.with(|c| c.set(Some(policy.aggregated_rlc_only)));
+    AGGREGATED_FULL_BINDING_OVERRIDE.with(|c| c.set(Some(policy.aggregated_full_binding)));
+
     let set = |name: &str, val: bool| {
         if val {
             std::env::set_var(name, "1");
@@ -589,6 +812,61 @@ mod tests {
     }
 
     #[test]
+    fn test_soundness_gate_thread_local_overrides_env() {
+        // With thread-local override set, the env var must be ignored.
+        // Use a separate thread so we don't pollute the global env var
+        // for parallel tests (the env var fallback is observed only when
+        // no override is set on the calling thread).
+        let handle = std::thread::spawn(|| {
+            // Set the env var to weakened
+            std::env::set_var("STWO_SKIP_RMS_SQ_PROOF", "1");
+            std::env::set_var("STWO_ALLOW_LOGUP_ACTIVATION", "1");
+            std::env::set_var("STWO_ALLOW_MISSING_NORM_PROOF", "1");
+            std::env::set_var("STWO_PIECEWISE_ACTIVATION", "0");
+            // No override yet — env vars should win
+            assert!(skip_rms_sq_proof());
+            assert!(allow_logup_activation());
+            assert!(allow_missing_norm_proof());
+            assert!(!piecewise_activation_enabled());
+
+            // Now apply strict-aligned override
+            {
+                let _g = SoundnessGateGuard::strict();
+                assert!(!skip_rms_sq_proof(), "thread-local must override env");
+                assert!(!allow_logup_activation());
+                assert!(!allow_missing_norm_proof());
+                assert!(piecewise_activation_enabled());
+            }
+            // Guard dropped — env var fallback restored
+            assert!(skip_rms_sq_proof(), "env var fallback must restore on drop");
+
+            // Cleanup
+            std::env::remove_var("STWO_SKIP_RMS_SQ_PROOF");
+            std::env::remove_var("STWO_ALLOW_LOGUP_ACTIVATION");
+            std::env::remove_var("STWO_ALLOW_MISSING_NORM_PROOF");
+            std::env::remove_var("STWO_PIECEWISE_ACTIVATION");
+        });
+        handle.join().expect("spawned thread panicked");
+    }
+
+    #[test]
+    fn test_soundness_gate_guard_restores_previous() {
+        // Nested guards must restore the previous value, not None.
+        let _outer = SoundnessGateGuard::set(Some(true), Some(true), Some(false), Some(true));
+        assert!(skip_rms_sq_proof());
+        assert!(!piecewise_activation_enabled());
+
+        {
+            let _inner = SoundnessGateGuard::strict();
+            assert!(!skip_rms_sq_proof());
+            assert!(piecewise_activation_enabled());
+        }
+        // Inner dropped — outer's overrides restored, not the env-var fallback.
+        assert!(skip_rms_sq_proof(), "inner drop must restore outer override");
+        assert!(!piecewise_activation_enabled());
+    }
+
+    #[test]
     fn test_strict_preset_values() {
         let p = PolicyConfig::strict();
         assert!(!p.allow_missing_norm_proof);
@@ -610,13 +888,15 @@ mod tests {
     #[test]
     fn test_standard_preset_matches_prove_server_defaults() {
         let p = PolicyConfig::standard();
-        // These match the 7 env vars prove_server.rs:2972-2984 auto-sets:
-        assert!(p.skip_rms_sq_proof);           // STWO_SKIP_RMS_SQ_PROOF=1
-        assert!(p.allow_missing_norm_proof);     // STWO_ALLOW_MISSING_NORM_PROOF=1
-        assert!(!p.piecewise_activation);        // STWO_PIECEWISE_ACTIVATION=0
-        assert!(p.allow_logup_activation);       // STWO_ALLOW_LOGUP_ACTIVATION=1
+        // Hardened Apr 30 2026 (two-pass):
+        // Pass 1: skip_rms_sq_proof + allow_missing_norm_proof closed.
+        // Pass 2: piecewise_activation enabled + allow_logup_activation closed.
+        assert!(!p.skip_rms_sq_proof);           // CLOSED — RMS Part 0 proven
+        assert!(!p.allow_missing_norm_proof);    // CLOSED — norm sub-proofs required
+        assert!(p.piecewise_activation);         // CLOSED — full-precision activation
+        assert!(!p.allow_logup_activation);      // CLOSED — no lower-bits-only fallback
         assert!(p.aggregated_full_binding);      // STWO_AGGREGATED_FULL_BINDING=1
-        assert!(p.skip_batch_tokens);            // STWO_SKIP_BATCH_TOKENS=1
+        assert!(p.skip_batch_tokens);            // STWO_SKIP_BATCH_TOKENS=1 (still open)
         assert!(p.skip_unified_stark);           // STWO_PURE_GKR_SKIP_UNIFIED_STARK=1
     }
 

@@ -68,5 +68,4 @@ pub use types::{
     ReductionOutput, RoundPolyDeg3, WeightOpeningTranscriptMode,
 };
 pub use profiler::PhaseProfiler;
-pub use verifier::verify_gkr_with_weights;
-pub use verifier::verify_gkr_with_policy;
+pub use verifier::{verify_gkr, verify_gkr_with_policy, verify_gkr_with_weights};

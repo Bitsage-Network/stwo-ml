@@ -9,17 +9,17 @@ use std::sync::Mutex;
 use stwo::core::fields::m31::M31;
 
 
-use stwo_ml::aggregation::{
+use obelyzk::aggregation::{
     compute_io_commitment, compute_io_commitment_packed, prove_model_pure_gkr,
     verify_kv_cache_binding, verify_kv_cache_commitment_chain, IncrementalKVCommitment,
 };
-use stwo_ml::compiler::graph::{GraphBuilder, GraphWeights};
-use stwo_ml::compiler::onnx::generate_weights_for_graph;
-use stwo_ml::components::activation::ActivationType;
-use stwo_ml::components::matmul::M31Matrix;
-use stwo_ml::crypto::poseidon_channel::PoseidonChannel;
-use stwo_ml::gkr::types::LayerProof;
-use stwo_ml::gkr::LayeredCircuit;
+use obelyzk::compiler::graph::{GraphBuilder, GraphWeights};
+use obelyzk::compiler::onnx::generate_weights_for_graph;
+use obelyzk::components::activation::ActivationType;
+use obelyzk::components::matmul::M31Matrix;
+use obelyzk::crypto::poseidon_channel::PoseidonChannel;
+use obelyzk::gkr::types::LayerProof;
+use obelyzk::gkr::LayeredCircuit;
 
 // ============================================================================
 // Thread Safety — tests mutate process-wide env vars
@@ -68,7 +68,7 @@ impl Drop for EnvVarGuard {
 
 /// 1×4 → Linear(4) → GELU → Linear(2): triggers activation gate.
 fn build_mlp_gelu() -> (
-    stwo_ml::compiler::graph::ComputationGraph,
+    obelyzk::compiler::graph::ComputationGraph,
     M31Matrix,
     GraphWeights,
 ) {
@@ -89,7 +89,7 @@ fn build_mlp_gelu() -> (
 
 /// 1×4 → Linear(4) → LayerNorm → Linear(2): triggers norm gate.
 fn build_mlp_layernorm() -> (
-    stwo_ml::compiler::graph::ComputationGraph,
+    obelyzk::compiler::graph::ComputationGraph,
     M31Matrix,
     GraphWeights,
 ) {
@@ -107,7 +107,7 @@ fn build_mlp_layernorm() -> (
 
 /// 1×4 → Linear(4) → Linear(2): simple MatMul-only for weight binding tests.
 fn build_matmul_only() -> (
-    stwo_ml::compiler::graph::ComputationGraph,
+    obelyzk::compiler::graph::ComputationGraph,
     M31Matrix,
     GraphWeights,
 ) {
@@ -167,7 +167,7 @@ fn security_gate_activation_default_rejects() {
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let mut ch = PoseidonChannel::new();
-    let result = stwo_ml::gkr::verify_gkr_with_weights(
+    let result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit,
         gkr,
         &proof.execution.output,
@@ -208,7 +208,7 @@ fn security_gate_activation_bypass_allows() {
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let mut ch = PoseidonChannel::new();
-    let result = stwo_ml::gkr::verify_gkr_with_weights(
+    let result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit,
         gkr,
         &proof.execution.output,
@@ -265,7 +265,7 @@ fn security_gate_norm_proof_default_rejects() {
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let mut ch = PoseidonChannel::new();
-    let result = stwo_ml::gkr::verify_gkr_with_weights(
+    let result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit,
         gkr,
         &proof.execution.output,
@@ -321,7 +321,7 @@ fn security_gate_norm_proof_bypass_allows() {
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let mut ch = PoseidonChannel::new();
-    let result = stwo_ml::gkr::verify_gkr_with_weights(
+    let result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit,
         gkr,
         &proof.execution.output,
@@ -363,7 +363,7 @@ fn security_gate_segment_binding_default_rejects() {
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let mut ch = PoseidonChannel::new();
-    let result = stwo_ml::gkr::verify_gkr_with_weights(
+    let result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit,
         gkr,
         &proof.execution.output,
@@ -406,7 +406,7 @@ fn security_gate_segment_binding_bypass_allows() {
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let mut ch = PoseidonChannel::new();
-    let result = stwo_ml::gkr::verify_gkr_with_weights(
+    let result = obelyzk::gkr::verify_gkr_with_weights(
         &circuit,
         gkr,
         &proof.execution.output,
@@ -439,8 +439,8 @@ fn security_gate_rlc_only_default_rejects_streaming() {
     // Check that streaming calldata rejects RLC-only proofs.
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let model_id = starknet_ff::FieldElement::from(0x4u64);
-    let raw_io = stwo_ml::cairo_serde::serialize_raw_io(&input, &proof.execution.output);
-    let result = stwo_ml::starknet::build_streaming_gkr_calldata(
+    let raw_io = obelyzk::cairo_serde::serialize_raw_io(&input, &proof.execution.output);
+    let result = obelyzk::starknet::build_streaming_gkr_calldata(
         gkr,
         &circuit,
         model_id,
@@ -453,7 +453,7 @@ fn security_gate_rlc_only_default_rejects_streaming() {
     // If the proof was in AggregatedOracleSumcheck mode, streaming should reject.
     // If it was in a different mode, the check may not apply (that's fine).
     if gkr.weight_opening_transcript_mode
-        == stwo_ml::gkr::types::WeightOpeningTranscriptMode::AggregatedOracleSumcheck
+        == obelyzk::gkr::types::WeightOpeningTranscriptMode::AggregatedOracleSumcheck
     {
         assert!(
             result.is_err(),
@@ -481,7 +481,7 @@ fn security_gate_rlc_only_bypass_documents_risk() {
     // Document: with RLC-only, aggregated_binding may be None.
     // This weakens security by not independently verifying weight claims.
     if gkr.weight_opening_transcript_mode
-        == stwo_ml::gkr::types::WeightOpeningTranscriptMode::AggregatedOracleSumcheck
+        == obelyzk::gkr::types::WeightOpeningTranscriptMode::AggregatedOracleSumcheck
     {
         assert!(
             gkr.aggregated_binding.is_none(),
@@ -533,9 +533,9 @@ fn streaming_calldata_roundtrip_integrity() {
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let model_id = starknet_ff::FieldElement::from(0x4u64);
-    let raw_io = stwo_ml::cairo_serde::serialize_raw_io(&input, &proof.execution.output);
+    let raw_io = obelyzk::cairo_serde::serialize_raw_io(&input, &proof.execution.output);
 
-    let calldata = stwo_ml::starknet::build_streaming_gkr_calldata(
+    let calldata = obelyzk::starknet::build_streaming_gkr_calldata(
         gkr,
         &circuit,
         model_id,
@@ -606,9 +606,9 @@ fn streaming_calldata_tampered_batch_audit_finding() {
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let model_id = starknet_ff::FieldElement::from(0x4u64);
-    let raw_io = stwo_ml::cairo_serde::serialize_raw_io(&input, &proof.execution.output);
+    let raw_io = obelyzk::cairo_serde::serialize_raw_io(&input, &proof.execution.output);
 
-    let calldata = stwo_ml::starknet::build_streaming_gkr_calldata(
+    let calldata = obelyzk::starknet::build_streaming_gkr_calldata(
         gkr,
         &circuit,
         model_id,
@@ -645,9 +645,9 @@ fn streaming_output_mle_chunks_complete() {
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let model_id = starknet_ff::FieldElement::from(0x4u64);
-    let raw_io = stwo_ml::cairo_serde::serialize_raw_io(&input, &proof.execution.output);
+    let raw_io = obelyzk::cairo_serde::serialize_raw_io(&input, &proof.execution.output);
 
-    let calldata = stwo_ml::starknet::build_streaming_gkr_calldata(
+    let calldata = obelyzk::starknet::build_streaming_gkr_calldata(
         gkr,
         &circuit,
         model_id,
@@ -691,9 +691,9 @@ fn streaming_session_metadata_consistent() {
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let model_id = starknet_ff::FieldElement::from(0x4u64);
-    let raw_io = stwo_ml::cairo_serde::serialize_raw_io(&input, &proof.execution.output);
+    let raw_io = obelyzk::cairo_serde::serialize_raw_io(&input, &proof.execution.output);
 
-    let calldata = stwo_ml::starknet::build_streaming_gkr_calldata(
+    let calldata = obelyzk::starknet::build_streaming_gkr_calldata(
         gkr,
         &circuit,
         model_id,
@@ -739,13 +739,13 @@ fn streaming_calldata_kv_fields_present() {
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let model_id = starknet_ff::FieldElement::from(0x4u64);
-    let raw_io = stwo_ml::cairo_serde::serialize_raw_io(&input, &proof.execution.output);
+    let raw_io = obelyzk::cairo_serde::serialize_raw_io(&input, &proof.execution.output);
 
     // Supply non-zero KV commitment fields.
     let kv_commit = starknet_ff::FieldElement::from(0x123u64);
     let prev_kv = starknet_ff::FieldElement::from(0x456u64);
 
-    let calldata = stwo_ml::starknet::build_streaming_gkr_calldata(
+    let calldata = obelyzk::starknet::build_streaming_gkr_calldata(
         gkr,
         &circuit,
         model_id,
@@ -779,7 +779,7 @@ fn build_decode_transformer(
     num_heads: usize,
     d_ff: usize,
 ) -> (
-    stwo_ml::compiler::graph::ComputationGraph,
+    obelyzk::compiler::graph::ComputationGraph,
     GraphWeights,
 ) {
     let mut builder = GraphBuilder::new((1, d_model));
@@ -791,7 +791,7 @@ fn build_decode_transformer(
     let topo = graph.topological_order();
     for &node_id in &topo {
         let node = &graph.nodes[node_id];
-        if let stwo_ml::compiler::graph::GraphOp::Attention { .. } = &node.op {
+        if let obelyzk::compiler::graph::GraphOp::Attention { .. } = &node.op {
             let w_q = random_m31_matrix(d_model, d_model, 200 + node_id as u64);
             let w_k = random_m31_matrix(d_model, d_model, 300 + node_id as u64);
             let w_v = random_m31_matrix(d_model, d_model, 400 + node_id as u64);
@@ -808,12 +808,12 @@ fn build_decode_transformer(
 
 /// Seed KV cache with prefill data.
 fn seed_kv_cache(
-    graph: &stwo_ml::compiler::graph::ComputationGraph,
+    graph: &obelyzk::compiler::graph::ComputationGraph,
     weights: &GraphWeights,
     prefill_len: usize,
     d_model: usize,
-) -> stwo_ml::components::attention::ModelKVCache {
-    use stwo_ml::components::attention::{
+) -> obelyzk::components::attention::ModelKVCache {
+    use obelyzk::components::attention::{
         attention_forward_cached, AttentionWeights, ModelKVCache,
     };
 
@@ -823,7 +823,7 @@ fn seed_kv_cache(
 
     for &node_id in &topo {
         let node = &graph.nodes[node_id];
-        if let stwo_ml::compiler::graph::GraphOp::Attention { config } = &node.op {
+        if let obelyzk::compiler::graph::GraphOp::Attention { config } = &node.op {
             let w_q = weights.get_named_weight(node_id, "w_q").unwrap();
             let w_k = weights.get_named_weight(node_id, "w_k").unwrap();
             let w_v = weights.get_named_weight(node_id, "w_v").unwrap();
@@ -859,7 +859,7 @@ fn decode_chain_valid_sequence_passes() {
     let (graph, weights) = build_decode_transformer(d_model, num_heads, d_ff);
     let mut kv_cache = seed_kv_cache(&graph, &weights, prefill_len, d_model);
 
-    let weight_cache = stwo_ml::weight_cache::shared_cache("decode-chain-test");
+    let weight_cache = obelyzk::weight_cache::shared_cache("decode-chain-test");
     let mut kv_commitment =
         IncrementalKVCommitment::from_kv_cache(&kv_cache, prefill_len + decode_steps);
 
@@ -867,13 +867,14 @@ fn decode_chain_valid_sequence_passes() {
 
     for step in 0..decode_steps {
         let token = random_m31_matrix(1, d_model, 1000 + step as u64);
-        let result = stwo_ml::aggregation::prove_model_pure_gkr_decode_step_incremental(
+        let result = obelyzk::aggregation::prove_model_pure_gkr_decode_step_incremental(
             &graph,
             &token,
             &weights,
             &mut kv_cache,
             &mut kv_commitment,
             Some(&weight_cache),
+            None,
         );
         match result {
             Ok((proof, _commit)) => proofs.push(proof),
@@ -917,20 +918,21 @@ fn decode_chain_tampered_kv_fails() {
     let (graph, weights) = build_decode_transformer(d_model, num_heads, d_ff);
     let mut kv_cache = seed_kv_cache(&graph, &weights, prefill_len, d_model);
 
-    let weight_cache = stwo_ml::weight_cache::shared_cache("decode-tamper-test");
+    let weight_cache = obelyzk::weight_cache::shared_cache("decode-tamper-test");
     let mut kv_commitment = IncrementalKVCommitment::from_kv_cache(&kv_cache, prefill_len + 3);
 
     let mut proofs = Vec::new();
 
     for step in 0..2 {
         let token = random_m31_matrix(1, d_model, 2000 + step as u64);
-        let (proof, _) = stwo_ml::aggregation::prove_model_pure_gkr_decode_step_incremental(
+        let (proof, _) = obelyzk::aggregation::prove_model_pure_gkr_decode_step_incremental(
             &graph,
             &token,
             &weights,
             &mut kv_cache,
             &mut kv_commitment,
             Some(&weight_cache),
+            None,
         )
         .unwrap_or_else(|e| panic!("step {} failed: {:?}", step, e));
         proofs.push(proof);
@@ -960,19 +962,20 @@ fn decode_chain_position_offset_validated() {
     let (graph, weights) = build_decode_transformer(d_model, num_heads, d_ff);
     let mut kv_cache = seed_kv_cache(&graph, &weights, prefill_len, d_model);
 
-    let weight_cache = stwo_ml::weight_cache::shared_cache("decode-offset-test");
+    let weight_cache = obelyzk::weight_cache::shared_cache("decode-offset-test");
     let mut kv_commitment =
         IncrementalKVCommitment::from_kv_cache(&kv_cache, prefill_len + decode_steps);
 
     for step in 0..decode_steps {
         let token = random_m31_matrix(1, d_model, 3000 + step as u64);
-        let (proof, _) = stwo_ml::aggregation::prove_model_pure_gkr_decode_step_incremental(
+        let (proof, _) = obelyzk::aggregation::prove_model_pure_gkr_decode_step_incremental(
             &graph,
             &token,
             &weights,
             &mut kv_cache,
             &mut kv_commitment,
             Some(&weight_cache),
+            None,
         )
         .unwrap_or_else(|e| panic!("step {} failed: {:?}", step, e));
 
@@ -1014,18 +1017,19 @@ fn decode_kv_binding_matches_cache_state() {
     let (graph, weights) = build_decode_transformer(d_model, num_heads, d_ff);
     let mut kv_cache = seed_kv_cache(&graph, &weights, prefill_len, d_model);
 
-    let weight_cache = stwo_ml::weight_cache::shared_cache("decode-binding-test");
+    let weight_cache = obelyzk::weight_cache::shared_cache("decode-binding-test");
     let mut kv_commitment = IncrementalKVCommitment::from_kv_cache(&kv_cache, prefill_len + 1);
 
     let token = random_m31_matrix(1, d_model, 4000);
     let (proof, new_commit) =
-        stwo_ml::aggregation::prove_model_pure_gkr_decode_step_incremental(
+        obelyzk::aggregation::prove_model_pure_gkr_decode_step_incremental(
             &graph,
             &token,
             &weights,
             &mut kv_cache,
             &mut kv_commitment,
             Some(&weight_cache),
+            None,
         )
         .expect("decode step should succeed");
 
@@ -1078,17 +1082,18 @@ fn decode_chain_first_proof_nonzero_prev_fails() {
     let (graph, weights) = build_decode_transformer(d_model, num_heads, d_ff);
     let mut kv_cache = seed_kv_cache(&graph, &weights, prefill_len, d_model);
 
-    let weight_cache = stwo_ml::weight_cache::shared_cache("decode-first-test");
+    let weight_cache = obelyzk::weight_cache::shared_cache("decode-first-test");
     let mut kv_commitment = IncrementalKVCommitment::from_kv_cache(&kv_cache, prefill_len + 2);
 
     let token = random_m31_matrix(1, d_model, 5000);
-    let (mut proof, _) = stwo_ml::aggregation::prove_model_pure_gkr_decode_step_incremental(
+    let (mut proof, _) = obelyzk::aggregation::prove_model_pure_gkr_decode_step_incremental(
         &graph,
         &token,
         &weights,
         &mut kv_cache,
         &mut kv_commitment,
         Some(&weight_cache),
+        None,
     )
     .expect("decode step should succeed");
 
@@ -1178,9 +1183,9 @@ fn streaming_io_commitment_matches_proof() {
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
     let model_id = starknet_ff::FieldElement::from(0x4u64);
-    let raw_io = stwo_ml::cairo_serde::serialize_raw_io(&input, &proof.execution.output);
+    let raw_io = obelyzk::cairo_serde::serialize_raw_io(&input, &proof.execution.output);
 
-    let calldata = stwo_ml::starknet::build_streaming_gkr_calldata(
+    let calldata = obelyzk::starknet::build_streaming_gkr_calldata(
         gkr,
         &circuit,
         model_id,

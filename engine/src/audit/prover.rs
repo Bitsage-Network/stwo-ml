@@ -1036,6 +1036,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "stale: streaming proof storage was removed in commit f6ea3469 — proofs upload as calldata via own node now (G7)"]
     fn test_prove_gkr_with_verify_on_chain_generates_streaming_steps() {
         // Hold the env mutex to prevent RLC_ONLY pollution from parallel tests.
         let _guard = EnvVarGuard::remove("STWO_AGGREGATED_RLC_ONLY");

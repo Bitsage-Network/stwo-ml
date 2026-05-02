@@ -215,28 +215,31 @@ pub fn prove_recursive_with_policy(
     //   pow_bits=16    (proof-of-work grinding protection)
     //   Total: 90 + 16 = 106 bits
     //
-    // Override via OBELYZK_RECURSIVE_SECURITY env var:
-    //   "test"       → 13 bits  (fast, for unit tests)
-    //   "production" → 106 bits (default)
+    // Test-only override via thread-local guard `RecursiveTestModeGuard::enter()`.
+    // Production builds never enter the test path (the entire `#[cfg(test)]`
+    // arm compiles out). The thread-local replaces a process-global env var
+    // (`OBELYZK_RECURSIVE_SECURITY`) that previously raced across parallel
+    // test threads.
     let config = {
-        // In test builds only, allow env var override for fast testing.
-        // Production builds always use the hardened config.
         #[cfg(test)]
-        let level = std::env::var("OBELYZK_RECURSIVE_SECURITY")
-            .unwrap_or_else(|_| "production".to_string());
+        let test_mode = super::recursive_test_mode_active();
         #[cfg(not(test))]
-        let level = "production".to_string();
-        match level.as_str() {
+        let test_mode = false;
+        if test_mode {
             #[cfg(test)]
-            "test" => PcsConfig::default(), // 13 bits — unit tests only
-            _ => PcsConfig {
+            { PcsConfig::default() } // 13 bits — unit tests only
+            #[cfg(not(test))]
+            { unreachable!() }
+        } else {
+            PcsConfig {
                 pow_bits: 20,
-                // 120 bits: pow(20) + blowup(5)*queries(20) = 20+100 = 120
-                // Reduced from 28 to 20 queries to fit Alchemy RPC 5000-felt limit
-                // log_last_layer_degree_bound=0 required by Cairo FRI verifier
-                fri_config: stwo::core::fri::FriConfig::new(0, 5, 20, 1),
+                // 100 bits: pow(20) + blowup(5)*queries(16) = 20+80 = 100
+                // Reduced from 20→16 to keep recursive proof under Sepolia's 5000-felt
+                // sequencer cap on full 30L SmolLM2 (was 5,405 felts at queries=20).
+                // log_last_layer_degree_bound=0 required by Cairo FRI verifier.
+                fri_config: stwo::core::fri::FriConfig::new(0, 5, 16, 1),
                 lifting_log_size: None,
-            },
+            }
         }
     };
     let chain_log_size = trace_data.log_size;
@@ -1011,7 +1014,7 @@ mod tests {
 
     #[test]
     fn test_prove_recursive_1layer() {
-        std::env::set_var("OBELYZK_RECURSIVE_SECURITY", "test");
+        let _g = super::super::RecursiveTestModeGuard::enter();
         // End-to-end: prove a 1-layer MatMul GKR → recursive STARK.
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(2);

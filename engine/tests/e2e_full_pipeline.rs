@@ -14,13 +14,13 @@
 use starknet_ff::FieldElement;
 use stwo::core::fields::m31::M31;
 
-use stwo_ml::aggregation::{
+use obelyzk::aggregation::{
     compute_io_commitment, prove_model_aggregated_onchain, prove_model_aggregated_onchain_gkr,
     verify_aggregated_model_proof_onchain,
 };
-use stwo_ml::cairo_serde::DirectProofMetadata;
-use stwo_ml::prelude::*;
-use stwo_ml::starknet::{
+use obelyzk::cairo_serde::DirectProofMetadata;
+use obelyzk::prelude::*;
+use obelyzk::starknet::{
     build_starknet_proof_direct, build_starknet_proof_onchain, compute_weight_commitment,
     estimate_gas_from_proof, prepare_model_registration, register_model_calldata,
     register_model_calldata_sumcheck,
@@ -301,12 +301,13 @@ fn test_e2e_gkr_pipeline() {
 
     // Verify GKR proof end-to-end (prover↔verifier channel sync)
     {
-        let circuit = stwo_ml::gkr::LayeredCircuit::from_graph(&graph).unwrap();
-        let mut verify_channel = stwo_ml::crypto::poseidon_channel::PoseidonChannel::new();
-        stwo_ml::gkr::verifier::verify_gkr(
+        let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&graph).unwrap();
+        let mut verify_channel = obelyzk::crypto::poseidon_channel::PoseidonChannel::new();
+        obelyzk::gkr::verifier::verify_gkr_with_weights(
             &circuit,
             gkr_proof.gkr_proof.as_ref().unwrap(),
             &gkr_proof.execution.output,
+            &weights,
             &mut verify_channel,
         )
         .expect("GKR multi-layer verification should succeed");
@@ -443,9 +444,9 @@ fn test_e2e_direct_pipeline() {
 /// 6. Truncate calldata → assert tail sentinel failure
 #[test]
 fn test_e2e_prove_health_check_dry_run() {
-    use stwo_ml::aggregation::prove_model_pure_gkr;
-    use stwo_ml::gkr::types::WeightOpeningTranscriptMode;
-    use stwo_ml::starknet::{
+    use obelyzk::aggregation::prove_model_pure_gkr;
+    use obelyzk::gkr::types::WeightOpeningTranscriptMode;
+    use obelyzk::starknet::{
         build_verify_model_gkr_v4_packed_io_calldata, dry_run_onchain, verify_proof_fast,
     };
 
@@ -490,8 +491,8 @@ fn test_e2e_prove_health_check_dry_run() {
 
     // 3. Serialize to v4 packed IO calldata
     let circuit =
-        stwo_ml::gkr::LayeredCircuit::from_graph(&graph).expect("circuit should compile");
-    let raw_io = stwo_ml::cairo_serde::serialize_raw_io(&input, &agg_proof.execution.output);
+        obelyzk::gkr::LayeredCircuit::from_graph(&graph).expect("circuit should compile");
+    let raw_io = obelyzk::cairo_serde::serialize_raw_io(&input, &agg_proof.execution.output);
     let model_id = FieldElement::from(0x42u64);
 
     let v4_calldata =

@@ -8,7 +8,7 @@
 
 use proof_stream::sink::CollectingSink;
 use proof_stream::{ProofEvent, ProofSink};
-use stwo_ml::gkr::prover::{set_proof_sink, PROOF_SINK};
+use obelyzk::gkr::prover::{set_proof_sink, PROOF_SINK};
 
 #[test]
 fn test_sink_install_teardown() {

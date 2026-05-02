@@ -108,7 +108,7 @@ fn verify_gkr_inner(
 
     // Bind policy commitment (must match prover's mix position exactly).
     let policy_commitment = resolved_policy.policy_commitment();
-    let skip_policy = std::env::var("STWO_SKIP_POLICY_COMMITMENT").is_ok();
+    let skip_policy = crate::policy::policy_commitment_skipped();
     if !skip_policy && policy_commitment != starknet_ff::FieldElement::ZERO {
         channel.mix_felt(policy_commitment);
     }
@@ -157,6 +157,14 @@ fn verify_gkr_inner(
         let layer = &circuit.layers[layer_idx];
 
         match &layer.layer_type {
+            LayerType::RoPE { .. } => {
+                // Decode/non-decode provers skip RoPE in the layer walk
+                // (gkr/prover.rs line 2400 and matching CPU/GPU paths).
+                // The verifier must match: do not advance proof_idx, propagate
+                // current_claim unchanged. (G15 fix, Apr 30 2026.)
+                continue;
+            }
+
             LayerType::Identity | LayerType::TopK { .. } => {
                 // TopK: verify witness binding in the channel, propagate claim.
                 // The TopK proof data is mixed into the channel during proving.
@@ -275,7 +283,20 @@ fn verify_gkr_inner(
                     0
                 };
                 deferred_skip_layer_indices.push(skip_layer_idx);
-                skip_layers.insert(skip_layer_idx);
+                // G24 (Apr 30 2026): nested-DAG carve-out — only skip in the
+                // main walk if the skip layer is a leaf type. For nested
+                // residuals (skip layer is itself an Add), the inner Add must
+                // process normally so its claim transformation propagates to
+                // downstream layers (e.g., Attention). Mirrors prover at
+                // gkr/prover.rs::process_add_deferred.
+                let skip_is_add = circuit
+                    .layers
+                    .get(skip_layer_idx)
+                    .map(|l| matches!(l.layer_type, LayerType::Add { .. }))
+                    .unwrap_or(false);
+                if !skip_is_add {
+                    skip_layers.insert(skip_layer_idx);
+                }
                 verify_add_reduction(
                     &current_claim,
                     *lhs_eval,
@@ -548,7 +569,7 @@ fn verify_gkr_inner(
             }
 
             (
-                LayerType::Attention { config: _ },
+                LayerType::Attention { config },
                 LayerProof::AttentionDecode {
                     sub_proofs,
                     sub_claim_values,
@@ -560,11 +581,14 @@ fn verify_gkr_inner(
                     position_offset,
                 },
             ) => {
+                // GQA support (G23): get num_kv_heads from circuit's config —
+                // the AttentionDecode proof struct doesn't carry it.
                 verify_attention_reduction_decode(
                     &current_claim,
                     sub_proofs,
                     sub_claim_values,
                     *num_heads,
+                    config.num_kv_heads,
                     *new_tokens,
                     *full_seq_len,
                     *d_model,
@@ -1574,6 +1598,19 @@ fn verify_gkr_simd_inner(
     channel.mix_u64(circuit.input_shape.1 as u64);
     channel.mix_u64(simd_config.num_blocks as u64);
 
+    // Bind policy commitment into Fiat-Shamir transcript (G29 hardening,
+    // Apr 30 2026). Mirrors prove_gkr_simd_gpu_with_cache. Without this, SIMD
+    // path is unbound to policy — relaxed and strict proofs would be
+    // structurally indistinguishable.
+    {
+        let resolved_policy = crate::policy::resolve(None);
+        let policy_commitment = resolved_policy.policy_commitment();
+        let skip_policy = crate::policy::policy_commitment_skipped();
+        if !skip_policy && policy_commitment != starknet_ff::FieldElement::ZERO {
+            channel.mix_felt(policy_commitment);
+        }
+    }
+
     // Draw SIMD block-selection challenges
     let r_simd = channel.draw_qm31s(simd_config.simd_log_size);
 
@@ -1611,6 +1648,14 @@ fn verify_gkr_simd_inner(
         let layer = &circuit.layers[layer_idx];
 
         match &layer.layer_type {
+            LayerType::RoPE { .. } => {
+                // Decode/non-decode provers skip RoPE in the layer walk
+                // (gkr/prover.rs line 2400 and matching CPU/GPU paths).
+                // The verifier must match: do not advance proof_idx, propagate
+                // current_claim unchanged. (G15 fix, Apr 30 2026.)
+                continue;
+            }
+
             LayerType::Identity | LayerType::TopK { .. } => {
                 // TopK: verify witness binding in the channel, propagate claim.
                 // The TopK proof data is mixed into the channel during proving.
@@ -1719,7 +1764,20 @@ fn verify_gkr_simd_inner(
                     0
                 };
                 deferred_skip_layer_indices.push(skip_layer_idx);
-                skip_layers.insert(skip_layer_idx);
+                // G24 (Apr 30 2026): nested-DAG carve-out — only skip in the
+                // main walk if the skip layer is a leaf type. For nested
+                // residuals (skip layer is itself an Add), the inner Add must
+                // process normally so its claim transformation propagates to
+                // downstream layers (e.g., Attention). Mirrors prover at
+                // gkr/prover.rs::process_add_deferred.
+                let skip_is_add = circuit
+                    .layers
+                    .get(skip_layer_idx)
+                    .map(|l| matches!(l.layer_type, LayerType::Add { .. }))
+                    .unwrap_or(false);
+                if !skip_is_add {
+                    skip_layers.insert(skip_layer_idx);
+                }
                 verify_add_reduction(
                     &current_claim,
                     *lhs_eval,
@@ -1878,7 +1936,7 @@ fn verify_gkr_simd_inner(
             )?,
 
             (
-                LayerType::Attention { .. },
+                LayerType::Attention { config },
                 LayerProof::AttentionDecode {
                     sub_proofs,
                     sub_claim_values,
@@ -1894,6 +1952,7 @@ fn verify_gkr_simd_inner(
                 sub_proofs,
                 sub_claim_values,
                 *num_heads,
+                config.num_kv_heads,
                 *new_tokens,
                 *full_seq_len,
                 *d_model,
@@ -3123,12 +3182,7 @@ fn verify_activation_reduction(
         && !matches!(activation_type, ActivationType::ReLU)
         && piecewise_proof.is_none()
     {
-        let allow_logup = std::env::var("STWO_ALLOW_LOGUP_ACTIVATION")
-            .map(|v| {
-                let s = v.trim();
-                s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
-            })
-            .unwrap_or(false);
+        let allow_logup = crate::policy::allow_logup_activation();
         if !allow_logup {
             return Err(GKRError::VerificationError {
                 layer_idx,
@@ -4474,12 +4528,7 @@ fn verify_layernorm_reduction(
             });
         }
     } else if !simd_combined {
-        let allow_missing = std::env::var("STWO_ALLOW_MISSING_NORM_PROOF")
-            .map(|v| {
-                let s = v.trim();
-                s == "1" || s.eq_ignore_ascii_case("true")
-            })
-            .unwrap_or(false);
+        let allow_missing = crate::policy::allow_missing_norm_proof();
         if !allow_missing {
             return Err(GKRError::VerificationError {
                 layer_idx,
@@ -4887,12 +4936,7 @@ fn verify_rmsnorm_reduction(
         }
     } else if !simd_combined {
         // Soundness gate: reject missing RMS² proof unless SIMD combined path.
-        let allow_missing = std::env::var("STWO_ALLOW_MISSING_NORM_PROOF")
-            .map(|v| {
-                let s = v.trim();
-                s == "1" || s.eq_ignore_ascii_case("true")
-            })
-            .unwrap_or(false);
+        let allow_missing = crate::policy::allow_missing_norm_proof();
         if !allow_missing {
             return Err(GKRError::VerificationError {
                 layer_idx,
@@ -5107,6 +5151,10 @@ pub(crate) fn verify_attention_reduction(
     let seq_len = config.seq_len;
     let d_model = config.d_model;
     let d_k = config.d_k();
+    // GQA support (G22, Apr 30 2026): kv_dim = num_kv_heads * d_k. For MHA
+    // this equals d_model (no-op change). For GQA, K/V projection target dim
+    // is smaller than d_model.
+    let kv_dim = config.kv_dim();
     let n_blocks = r_simd.map(|r| 1 << r.len()).unwrap_or(1);
 
     let expected_count = 4 + 2 * num_heads;
@@ -5408,12 +5456,13 @@ pub(crate) fn verify_attention_reduction(
     }
 
     // --- Projection matmuls (fresh claims): V, K, Q ---
+    // GQA: V/K project to kv_dim (= num_kv_heads * d_k). For MHA, kv_dim = d_model.
     let _v_claim = verify_fresh_sub_matmul(
         &sub_proofs[proof_idx],
         sub_claim_values[proof_idx],
         seq_len,
         d_model,
-        d_model,
+        kv_dim,
         r_simd,
         channel,
     )?;
@@ -5424,7 +5473,7 @@ pub(crate) fn verify_attention_reduction(
         sub_claim_values[proof_idx],
         seq_len,
         d_model,
-        d_model,
+        kv_dim,
         r_simd,
         channel,
     )?;
@@ -5479,6 +5528,7 @@ pub(crate) fn verify_attention_reduction_decode(
     sub_proofs: &[LayerProof],
     sub_claim_values: &[SecureField],
     num_heads: usize,
+    num_kv_heads: usize,
     new_tokens: usize,
     full_seq_len: usize,
     d_model: usize,
@@ -5488,6 +5538,11 @@ pub(crate) fn verify_attention_reduction_decode(
     channel: &mut PoseidonChannel,
 ) -> Result<GKRClaim, GKRError> {
     let d_k = d_model / num_heads;
+    // GQA support (G23 fix, Apr 30 2026): K/V projection target dim is
+    // kv_dim = num_kv_heads * d_k. For MHA (num_kv_heads == num_heads) this
+    // equals d_model; for GQA it's smaller. Must match decode prover at
+    // gkr/prover.rs::reduce_attention_layer_decode line 10520.
+    let kv_dim = num_kv_heads * d_k;
 
     let expected_count = 4 + 2 * num_heads;
     if sub_proofs.len() != expected_count {
@@ -5642,13 +5697,13 @@ pub(crate) fn verify_attention_reduction_decode(
         proof_idx += 1;
     }
 
-    // V, K projections: new_tokens × d_model × d_model
+    // V, K projections: new_tokens × d_model × kv_dim (= num_kv_heads * d_k)
     let _v_claim = verify_fresh_sub_matmul(
         &sub_proofs[proof_idx],
         sub_claim_values[proof_idx],
         new_tokens,
         d_model,
-        d_model,
+        kv_dim,
         channel,
     )?;
     proof_idx += 1;
@@ -5658,7 +5713,7 @@ pub(crate) fn verify_attention_reduction_decode(
         sub_claim_values[proof_idx],
         new_tokens,
         d_model,
-        d_model,
+        kv_dim,
         channel,
     )?;
     proof_idx += 1;
@@ -6127,8 +6182,10 @@ mod tests {
             output: out.clone(),
         };
 
-        // Skip policy commitment for this isolated unit test to avoid env interaction
-        let _guard = EnvVarGuard::set("STWO_SKIP_POLICY_COMMITMENT", "1");
+        // Skip policy commitment for this isolated unit test. Thread-local
+        // override avoids the process-global mutex pollution that EnvVarGuard
+        // had under parallel cargo test (G3 hardening, Apr 30 2026).
+        let _guard = crate::policy::PolicyCommitmentSkipGuard::set(true);
 
         let mut prover_channel = PoseidonChannel::new();
         let mut proof = prove_gkr(&circuit, &execution, &weights, &mut prover_channel).unwrap();
@@ -10007,8 +10064,10 @@ mod tests {
             output: out.clone(),
         };
 
-        // Skip policy commitment for this isolated unit test to avoid env interaction
-        let _guard = EnvVarGuard::set("STWO_SKIP_POLICY_COMMITMENT", "1");
+        // Skip policy commitment for this isolated unit test. Thread-local
+        // override avoids the process-global mutex pollution that EnvVarGuard
+        // had under parallel cargo test (G3 hardening, Apr 30 2026).
+        let _guard = crate::policy::PolicyCommitmentSkipGuard::set(true);
 
         // Prove
         let mut prover_channel = PoseidonChannel::new();

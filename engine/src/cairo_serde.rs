@@ -4263,7 +4263,8 @@ mod tests {
         let config = PcsConfig::default();
         let mut out = Vec::new();
         serialize_pcs_config(&config, &mut out);
-        assert_eq!(out.len(), 4, "PcsConfig = pow_bits + 3 FriConfig fields");
+        // pow_bits + FriConfig{log_blowup, log_last_layer_deg, n_queries, fold_step} = 5 felts.
+        assert_eq!(out.len(), 5, "PcsConfig = pow_bits + 4 FriConfig fields");
     }
 
     #[test]
@@ -5122,7 +5123,7 @@ mod tests {
         }
         idx += 4;
 
-        // 4.9: pcs_config = 4 felts (pow_bits + fri_config)
+        // 4.9: pcs_config = 5 felts (pow_bits + fri_config{log_blowup, log_last_layer_deg, n_queries, fold_step})
         let default_config = PcsConfig::default();
         assert_eq!(
             felts[idx],
@@ -5146,6 +5147,12 @@ mod tests {
             felts[idx],
             FieldElement::from(default_config.fri_config.n_queries as u64),
             "fri_config.n_queries"
+        );
+        idx += 1;
+        assert_eq!(
+            felts[idx],
+            FieldElement::from(default_config.fri_config.fold_step as u64),
+            "fri_config.fold_step"
         );
         idx += 1;
 
@@ -5594,14 +5601,14 @@ mod tests {
         );
         idx += 4;
 
-        // 9. pcs_config
+        // 9. pcs_config (5 felts: pow_bits + 4 FriConfig fields)
         let default_config = PcsConfig::default();
         assert_eq!(
             felts[idx],
             FieldElement::from(default_config.pow_bits as u64),
             "pcs_config.pow_bits"
         );
-        idx += 4;
+        idx += 5;
 
         // 10. interaction_pow = 0
         assert_eq!(felts[idx], FieldElement::ZERO, "interaction_pow");

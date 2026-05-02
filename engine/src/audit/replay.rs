@@ -63,6 +63,59 @@ pub fn execute_forward_pass(
                 let weight = weights.get_weight(node.id).ok_or_else(|| {
                     AuditError::ProvingFailed(format!("missing weight for node {}", node.id))
                 })?;
+
+                // Gated FFN (SwiGLU) handling — mirrors prover at aggregation.rs:4115.
+                // For LLMs with SwiGLU (Llama, Qwen, Mistral, SmolLM, Phi-3): the
+                // down_proj MatMul has a named "up_proj" weight. The activated gate
+                // (`current`) must be multiplied by up_out (= ffn_input × W_up)
+                // BEFORE the down_proj MatMul. Without this, the replay's
+                // forward pass diverges from the prover's at every gated FFN
+                // layer, breaking external proof verification (G5, fixed Apr 30 2026).
+                if let Some(up_weight) = weights.get_named_weight(node.id, "up_proj") {
+                    // Walk back inputs to find the FFN input (norm output) whose
+                    // column count matches up_weight.rows.
+                    let ffn_input = node
+                        .inputs
+                        .first()
+                        .and_then(|&id| {
+                            let mut search = id;
+                            for _ in 0..4 {
+                                if let Some(out) = node_outputs.get(&search) {
+                                    if out.cols == up_weight.rows {
+                                        return Some(out.clone());
+                                    }
+                                }
+                                if let Some(&prev) =
+                                    graph.nodes.get(search).and_then(|n| n.inputs.first())
+                                {
+                                    search = prev;
+                                } else {
+                                    break;
+                                }
+                            }
+                            None
+                        })
+                        .unwrap_or_else(|| current.clone());
+
+                    let up_out = matmul_m31_auto(&ffn_input, up_weight);
+
+                    // gate * up element-wise (only when dimensions match — the
+                    // prover does the same dimension-guard, see aggregation.rs:4149).
+                    if current.data.len() == up_out.data.len() {
+                        let data: Vec<_> = current
+                            .data
+                            .iter()
+                            .zip(up_out.data.iter())
+                            .map(|(&g, &u)| g * u)
+                            .collect();
+                        current = M31Matrix {
+                            rows: current.rows,
+                            cols: current.cols,
+                            data,
+                        };
+                    }
+                }
+
                 matmul_m31_auto(&current, weight)
             }
             GraphOp::Activation {
@@ -75,7 +128,23 @@ pub fn execute_forward_pass(
                 apply_activation_pub(&current, &*f)
             }
             GraphOp::LayerNorm { dim } => apply_layernorm_pub(&current, *dim),
-            GraphOp::RMSNorm { dim } => apply_rmsnorm_detailed(&current, *dim).output_matrix,
+            GraphOp::RMSNorm { dim } => {
+                // Mirror prover at aggregation.rs:1206-1215: apply learned gamma
+                // scale after RMSNorm if a "gamma" named weight is registered.
+                // Without this, replay diverges at every RMSNorm in modern LLMs
+                // (Llama, Qwen, SmolLM, Mistral, Phi-3 all use RMSNorm × γ).
+                let mut output = apply_rmsnorm_detailed(&current, *dim).output_matrix;
+                if let Some(gamma_matrix) = weights.get_named_weight(node.id, "gamma") {
+                    let gamma = &gamma_matrix.data;
+                    for row in 0..output.rows {
+                        for col in 0..output.cols.min(gamma.len()) {
+                            let idx = row * output.cols + col;
+                            output.data[idx] = output.data[idx] * gamma[col];
+                        }
+                    }
+                }
+                output
+            }
             GraphOp::Add { .. } => {
                 let lhs_id = node.inputs.get(0).copied().unwrap_or(0);
                 let rhs_id = node.inputs.get(1).copied().unwrap_or(0);
@@ -104,11 +173,15 @@ pub fn execute_forward_pass(
                         w_v: wv.clone(),
                         w_o: wo.clone(),
                     };
+                    // Use config.causal to match the prover (G22, Apr 30 2026):
+                    // prover at gkr/prover.rs:10142 uses config.causal; replay
+                    // must do the same or io_commitment diverges for any model
+                    // with causal masking (every modern decoder LLM).
                     let intermediates = crate::components::attention::attention_forward(
                         &current,
                         &attn_weights,
                         config,
-                        false,
+                        config.causal,
                     );
                     intermediates.final_output
                 } else {

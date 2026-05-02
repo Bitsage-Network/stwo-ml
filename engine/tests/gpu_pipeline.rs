@@ -5,24 +5,24 @@
 //! exercise real GPU acceleration.
 
 use stwo::core::fields::m31::M31;
-use stwo_ml::prelude::*;
+use obelyzk::prelude::*;
 
-use stwo_ml::aggregation::compute_io_commitment;
-use stwo_ml::aggregation::{
+use obelyzk::aggregation::compute_io_commitment;
+use obelyzk::aggregation::{
     prove_model_aggregated, prove_model_aggregated_auto, prove_model_aggregated_onchain,
     prove_model_aggregated_onchain_auto, prove_model_aggregated_with, AggregatedModelProofFor,
 };
-use stwo_ml::backend::BackendInfo;
-use stwo_ml::cairo_serde::serialize_proof;
-use stwo_ml::compiler::prove::{
+use obelyzk::backend::BackendInfo;
+use obelyzk::cairo_serde::serialize_proof;
+use obelyzk::compiler::prove::{
     prove_model, prove_model_auto, prove_model_with, verify_model_matmuls,
 };
-use stwo_ml::gpu::GpuModelProver;
-use stwo_ml::receipt::{
+use obelyzk::gpu::GpuModelProver;
+use obelyzk::receipt::{
     prove_receipt, prove_receipt_batch, prove_receipt_batch_auto, prove_receipt_batch_with,
     ComputeReceipt,
 };
-use stwo_ml::starknet::{
+use obelyzk::starknet::{
     build_starknet_proof, build_starknet_proof_onchain, estimate_gas_from_proof, prove_for_starknet,
 };
 
@@ -296,7 +296,7 @@ fn test_receipt_chain_prove_and_serialize() {
     let chain = [r0, r1, r2];
 
     // Verify chain linking
-    stwo_ml::receipt::verify_receipt_chain(&chain).expect("chain should be valid");
+    obelyzk::receipt::verify_receipt_chain(&chain).expect("chain should be valid");
 
     // Prove batch
     let proof = prove_receipt_batch(&chain).expect("batch proving should succeed");
@@ -316,8 +316,8 @@ fn test_receipt_chain_prove_and_serialize() {
 
 #[test]
 fn test_build_mlp_with_weights_full_pipeline() {
-    use stwo_ml::compiler::inspect::summarize_model;
-    use stwo_ml::compiler::onnx::build_mlp_with_weights;
+    use obelyzk::compiler::inspect::summarize_model;
+    use obelyzk::compiler::onnx::build_mlp_with_weights;
 
     // Build auto-weighted MLP
     let model = build_mlp_with_weights(4, &[4], 2, ActivationType::ReLU, 42);
@@ -350,13 +350,17 @@ fn test_build_mlp_with_weights_full_pipeline() {
 
 #[test]
 fn test_transformer_block_full_pipeline() {
-    use stwo_ml::compiler::onnx::{build_transformer_block, TransformerConfig};
+    use obelyzk::compiler::onnx::{build_transformer_block, TransformerConfig};
 
     let config = TransformerConfig {
         d_model: 4,
         num_heads: 1,
         d_ff: 8,
         activation: ActivationType::GELU,
+        norm_type: obelyzk::compiler::onnx::NormType::LayerNorm,
+        head_dim: 4,
+        num_experts: 0,
+        num_experts_per_tok: 0,
     };
     let model = build_transformer_block(&config, 77);
 
@@ -379,7 +383,7 @@ fn test_transformer_block_full_pipeline() {
 #[test]
 fn test_prelude_exports_model_loading() {
     // Verify all model-loading types are accessible from prelude
-    use stwo_ml::prelude::{
+    use obelyzk::prelude::{
         build_mlp, build_mlp_with_weights, build_transformer, build_transformer_block,
         generate_weights_for_graph, summarize_graph, summarize_model, ModelMetadata, ModelSummary,
         OnnxError, OnnxModel, TransformerConfig,
@@ -413,8 +417,8 @@ fn test_prelude_exports_model_loading() {
 
 #[test]
 fn test_matmul_onchain_proof_full_pipeline() {
-    use stwo_ml::cairo_serde::serialize_matmul_sumcheck_proof;
-    use stwo_ml::components::matmul::{
+    use obelyzk::cairo_serde::serialize_matmul_sumcheck_proof;
+    use obelyzk::components::matmul::{
         prove_matmul_sumcheck_onchain, verify_matmul_sumcheck_onchain,
     };
 

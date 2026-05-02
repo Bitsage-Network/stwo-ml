@@ -409,15 +409,11 @@ fn apply_aggregated_oracle_sumcheck(
     // channel-mixed weight commitments). Full MLE opening proof only needed for
     // trustless on-chain verification where the verifier cannot re-check commitments.
     // Opt-in: STWO_AGGREGATED_FULL_BINDING=1 for trustless on-chain streaming.
-    let rlc_only_override = std::env::var("STWO_AGGREGATED_RLC_ONLY")
-        .map(|v| !v.is_empty() && v != "0" && v != "false")
-        .unwrap_or(false);
+    let rlc_only_override = crate::policy::aggregated_rlc_only();
     let need_full_binding = if rlc_only_override {
         false
     } else {
-        std::env::var("STWO_AGGREGATED_FULL_BINDING")
-            .map(|v| !v.is_empty() && v != "0" && v != "false")
-            .unwrap_or(false)
+        crate::policy::aggregated_full_binding()
     };
     let total_claims = weight_data.len() + deferred_weight_claims_data.len();
     eprintln!(
@@ -1421,11 +1417,31 @@ fn finalize_weight_transcript_mode(
 /// Process Add layer reduction result: determine trunk/skip, push deferred claim.
 ///
 /// Returns `(LayerProof, trunk_claim)`.
+///
+/// **Skip-layer tracking** (G19, Apr 30 2026): the verifier
+/// (`gkr/verifier.rs:286`) inserts the lower-index input layer of each Add
+/// into its own `skip_layers` set and skips that layer in the main walk,
+/// expecting its proof to come from `deferred_proofs`. The prover must
+/// mirror this — `skip_layers.insert(skip_layer_idx)` ensures the main
+/// walk doesn't emit a layer_proofs entry for the skip branch (which the
+/// verifier would never read), preventing channel divergence and proof_idx
+/// misalignment.
+///
+/// **Nested-DAG carve-out** (G24, Apr 30 2026): if the skip layer is itself
+/// an `Add` (nested residuals — e.g., transformer block), DON'T insert it.
+/// The inner Add must process normally in main walk so its claim
+/// transformation propagates correctly to downstream layers (e.g.,
+/// Attention). Without this carve-out, the trunk-side claim arriving at
+/// downstream layers is the Add output (= sum of its inputs) instead of the
+/// transformed trunk-input claim, causing the prover's internal sumcheck
+/// self-check to fail. Verifier must carry the same carve-out.
 fn process_add_deferred(
     add_proof: LayerProof,
     current_claim: &GKRClaim,
     input_layers: &[usize],
     deferred_info: &mut Vec<(GKRClaim, usize)>,
+    skip_layers: &mut std::collections::HashSet<usize>,
+    circuit: &LayeredCircuit,
 ) -> (LayerProof, GKRClaim) {
     let LayerProof::Add {
         lhs_eval, rhs_eval, ..
@@ -1446,6 +1462,17 @@ fn process_add_deferred(
         },
         skip_layer_idx,
     ));
+    // G24 carve-out: only skip in main walk if the skip layer is a leaf type.
+    // For Add layers, let the main walk process them so the claim transformation
+    // chain stays correct for downstream layers.
+    let skip_layer_type = circuit
+        .layers
+        .get(skip_layer_idx)
+        .map(|l| &l.layer_type);
+    let is_add = matches!(skip_layer_type, Some(LayerType::Add { .. }));
+    if !is_add {
+        skip_layers.insert(skip_layer_idx);
+    }
     let claim = GKRClaim {
         point: current_claim.point.clone(),
         value: trunk_eval,
@@ -1531,7 +1558,7 @@ pub fn prove_gkr_with_cache(
 
     // Bind policy commitment into Fiat-Shamir transcript.
     let policy_commitment = resolved_policy.policy_commitment();
-    let skip_policy = std::env::var("STWO_SKIP_POLICY_COMMITMENT").is_ok();
+    let skip_policy = crate::policy::policy_commitment_skipped();
     if !skip_policy && policy_commitment != starknet_ff::FieldElement::ZERO {
         channel.mix_felt(policy_commitment);
     }
@@ -1713,6 +1740,8 @@ pub fn prove_gkr_with_cache(
                     &current_claim,
                     &layer.input_layers,
                     &mut deferred_info,
+                    &mut skip_layers,
+                    circuit,
                 )
             }
 
@@ -2041,6 +2070,71 @@ pub fn prove_gkr_with_cache(
                     kind: super::types::DeferredProofKind::Weightless,
                 });
             }
+            // ── G22 (Apr 30 2026): added Add/Identity/RoPE/Attention/passthrough
+            // handlers to support graphs with chained DAG residuals (e.g.,
+            // transformer blocks with multiple stacked residual Adds). Mirrors
+            // the decode prover's deferred queue (gkr/prover.rs:2624+). Without
+            // these arms, SmolLM2 / Qwen3 / Llama-3 full-graph proofs fail at
+            // the inner residual Add. ──────────────────────────────────────
+            LayerType::Add { .. } => {
+                // Deferred Add: reduce the Add layer and follow the trunk.
+                // Skip branch value is bound by the Add reduction itself
+                // (lhs_eval + rhs_eval = claim_value).
+                let (lhs_vals, rhs_vals) =
+                    get_binary_op_intermediates(execution, rhs_layer, circuit)?;
+                mix_secure_field(channel, deferred_claim.value);
+                let (add_proof, _claim) =
+                    reduce_add_layer(deferred_claim, &lhs_vals, &rhs_vals, channel)?;
+                let (final_proof, trunk_claim) = process_add_deferred(
+                    add_proof,
+                    deferred_claim,
+                    &rhs_layer.input_layers,
+                    &mut Vec::new(),
+                    &mut std::collections::HashSet::new(),
+                    circuit,
+                );
+                deferred_proofs.push(super::types::DeferredProof {
+                    claim: deferred_claim.clone(),
+                    layer_proof: final_proof,
+                    input_claim: trunk_claim,
+                    kind: super::types::DeferredProofKind::Weightless,
+                });
+            }
+            LayerType::Identity | LayerType::RoPE { .. } | LayerType::Input => {
+                // Identity/Input/RoPE: claim propagates unchanged. Replay Add
+                // reduction channel ops for transcript consistency.
+                mix_secure_field(channel, deferred_claim.value);
+                let lhs_eval = deferred_claim.value;
+                let rhs_eval = SecureField::zero();
+                mix_secure_field(channel, lhs_eval);
+                mix_secure_field(channel, rhs_eval);
+                let _alpha = channel.draw_qm31();
+                deferred_proofs.push(super::types::DeferredProof {
+                    claim: deferred_claim.clone(),
+                    layer_proof: LayerProof::Add {
+                        lhs_eval,
+                        rhs_eval,
+                        trunk_idx: 0,
+                    },
+                    input_claim: deferred_claim.clone(),
+                    kind: super::types::DeferredProofKind::Weightless,
+                });
+            }
+            LayerType::Attention { config } => {
+                let input_matrix = get_intermediate(execution, rhs_layer.node_id)?;
+                let attn_weights = get_attention_weights(weights, rhs_layer)?;
+                mix_secure_field(channel, deferred_claim.value);
+                let (layer_proof, input_claim) =
+                    reduce_attention_layer(
+                        deferred_claim, input_matrix, &attn_weights, config, channel,
+                    )?;
+                deferred_proofs.push(super::types::DeferredProof {
+                    claim: deferred_claim.clone(),
+                    layer_proof,
+                    input_claim,
+                    kind: super::types::DeferredProofKind::Weightless,
+                });
+            }
             other => {
                 return Err(GKRError::ReductionError {
                     layer_idx: *rhs_layer_idx,
@@ -2271,6 +2365,19 @@ pub fn prove_gkr_decode(
     channel.mix_u64(circuit.input_shape.0 as u64);
     channel.mix_u64(circuit.input_shape.1 as u64);
 
+    // Bind policy commitment into Fiat-Shamir transcript.
+    // Mirrors `verify_gkr_inner` at gkr/verifier.rs:109-114 — without this the
+    // verifier draws a different challenge sequence and verification fails at
+    // the first sumcheck round (Apr 30 2026 hardening, soundness fix G15).
+    {
+        let resolved_policy = crate::policy::resolve(None);
+        let policy_commitment = resolved_policy.policy_commitment();
+        let skip_policy = crate::policy::policy_commitment_skipped();
+        if !skip_policy && policy_commitment != starknet_ff::FieldElement::ZERO {
+            channel.mix_felt(policy_commitment);
+        }
+    }
+
     // Start with claim on output layer
     let output = &execution.output;
     let output_padded = pad_matrix_pow2(output);
@@ -2289,9 +2396,17 @@ pub fn prove_gkr_decode(
 
     // Deferred claims from DAG Add layers
     let mut deferred_info: Vec<(GKRClaim, usize)> = Vec::new();
+    // Layers to skip in the main walk (deferred branches of DAG Adds — see G19).
+    let mut skip_layers: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
     // Walk layers from output → input
     for layer_idx in (0..d).rev() {
+        // Skip layers that belong to deferred branches (resolved after main walk).
+        // Mirrors verifier's `gkr/verifier.rs:154` skip check; without this the
+        // prover emits proofs for layers the verifier ignores → proof_idx desync.
+        if skip_layers.contains(&layer_idx) {
+            continue;
+        }
         let layer = &circuit.layers[layer_idx];
 
         let (proof, next_claim) = match &layer.layer_type {
@@ -2326,6 +2441,8 @@ pub fn prove_gkr_decode(
                     reduce_add_layer(&current_claim, &lhs_vals, &rhs_vals, channel)?;
                 process_add_deferred(
                     proof, &current_claim, &layer.input_layers, &mut deferred_info,
+                    &mut skip_layers,
+                    circuit,
                 )
             }
 
@@ -2339,6 +2456,13 @@ pub fn prove_gkr_decode(
                 let input_matrix = get_intermediate(execution, layer.node_id)?;
                 if *activation_type == crate::components::activation::ActivationType::ReLU {
                     reduce_activation_layer_algebraic(
+                        &current_claim, input_matrix, *activation_type, channel,
+                    )?
+                } else if crate::components::activation::piecewise_activation_enabled() {
+                    // Mirror non-decode prover at line 1777 (G15 hardening, Apr 30 2026):
+                    // when piecewise is enabled (the standard hardened default), use the
+                    // full-M31-domain reducer; the LogUp fallback only verifies lower bits.
+                    reduce_activation_layer_piecewise(
                         &current_claim, input_matrix, *activation_type, channel,
                     )?
                 } else {
@@ -2598,6 +2722,8 @@ pub fn prove_gkr_decode(
                     &deferred_claim,
                     &rhs_layer.input_layers,
                     &mut Vec::new(), // sub-deferred not queued — skip bound by Add reduction
+                    &mut std::collections::HashSet::new(), // skip-tracking unused outside main walk
+                    circuit,
                 );
 
                 deferred_proofs.push(super::types::DeferredProof {
@@ -2844,6 +2970,8 @@ pub fn prove_gkr_gpu_with_cache(
     // Capture (weight_node_id, eval_point, final_b_eval) per MatMul.
     let mut weight_data: Vec<(usize, Vec<SecureField>, SecureField)> = Vec::with_capacity(d / 2);
     let mut deferred_info: Vec<(GKRClaim, usize)> = Vec::new();
+    // Layers to skip in the main walk (deferred branches of DAG Adds — see G19).
+    let mut skip_layers: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
     // ── Phase: channel_init ──
     profiler.begin_phase("channel_init", channel.hash_count());
@@ -2862,7 +2990,7 @@ pub fn prove_gkr_gpu_with_cache(
 
     // Bind policy commitment into Fiat-Shamir transcript (same position as CPU prover).
     let policy_commitment = resolved_policy.policy_commitment();
-    let skip_policy = std::env::var("STWO_SKIP_POLICY_COMMITMENT").is_ok();
+    let skip_policy = crate::policy::policy_commitment_skipped();
     if !skip_policy && policy_commitment != starknet_ff::FieldElement::ZERO {
         channel.mix_felt(policy_commitment);
     }
@@ -2940,6 +3068,10 @@ pub fn prove_gkr_gpu_with_cache(
 
     // Walk layers from output → input
     for layer_idx in (0..d).rev() {
+        // Skip deferred-branch layers (G19): mirrors verifier's skip_layers.
+        if skip_layers.contains(&layer_idx) {
+            continue;
+        }
         let layer = &circuit.layers[layer_idx];
 
         #[cfg(feature = "proof-stream")]
@@ -3051,6 +3183,8 @@ pub fn prove_gkr_gpu_with_cache(
                     &current_claim,
                     &layer.input_layers,
                     &mut deferred_info,
+                    &mut skip_layers,
+                    circuit,
                 )
             }
 
@@ -3878,11 +4012,26 @@ pub fn prove_gkr_decode_gpu_with_cache(
     let mut weight_commitments = Vec::with_capacity(d / 2);
     let mut weight_data: Vec<(usize, Vec<SecureField>, SecureField)> = Vec::with_capacity(d / 2);
     let mut deferred_info: Vec<(GKRClaim, usize)> = Vec::new();
+    // Layers to skip in the main walk (deferred branches of DAG Adds — see G19).
+    let mut skip_layers: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
     // Seed channel with circuit metadata (same as all provers)
     channel.mix_u64(d as u64);
     channel.mix_u64(circuit.input_shape.0 as u64);
     channel.mix_u64(circuit.input_shape.1 as u64);
+
+    // Bind policy commitment into Fiat-Shamir transcript.
+    // Mirrors `verify_gkr_inner` at gkr/verifier.rs:109-114 — without this the
+    // verifier draws a different challenge sequence and verification fails at
+    // the first sumcheck round (Apr 30 2026 hardening, soundness fix G15).
+    {
+        let resolved_policy = crate::policy::resolve(None);
+        let policy_commitment = resolved_policy.policy_commitment();
+        let skip_policy = crate::policy::policy_commitment_skipped();
+        if !skip_policy && policy_commitment != starknet_ff::FieldElement::ZERO {
+            channel.mix_felt(policy_commitment);
+        }
+    }
 
     // Start with claim on output layer
     let output = &execution.output;
@@ -3936,6 +4085,10 @@ pub fn prove_gkr_decode_gpu_with_cache(
 
     // Walk layers from output → input (GPU dispatch + decode attention)
     for layer_idx in (0..d).rev() {
+        // Skip deferred-branch layers (G19): mirrors verifier's skip_layers.
+        if skip_layers.contains(&layer_idx) {
+            continue;
+        }
         let layer = &circuit.layers[layer_idx];
 
         #[cfg(feature = "proof-stream")]
@@ -4011,6 +4164,8 @@ pub fn prove_gkr_decode_gpu_with_cache(
                     reduce_add_layer_gpu(&gpu, &current_claim, &lhs_vals, &rhs_vals, channel)?;
                 process_add_deferred(
                     proof, &current_claim, &layer.input_layers, &mut deferred_info,
+                    &mut skip_layers,
+                    circuit,
                 )
             }
 
@@ -4023,6 +4178,14 @@ pub fn prove_gkr_decode_gpu_with_cache(
                 let input_matrix = get_intermediate(execution, layer.node_id)?;
                 if *activation_type == crate::components::activation::ActivationType::ReLU {
                     reduce_activation_layer_algebraic(
+                        &current_claim, input_matrix, *activation_type, channel,
+                    )?
+                } else if crate::components::activation::piecewise_activation_enabled() {
+                    // Fall back to CPU piecewise reducer (no GPU piecewise yet).
+                    // Required for soundness under hardened standard policy
+                    // (G15, Apr 30 2026); without it the verifier rejects
+                    // LogUp-only activation proofs as lower-bits-unbound.
+                    reduce_activation_layer_piecewise(
                         &current_claim, input_matrix, *activation_type, channel,
                     )?
                 } else {
@@ -4328,6 +4491,8 @@ pub fn prove_gkr_decode_gpu_with_cache(
                 let (final_proof, trunk_claim) = process_add_deferred(
                     add_proof, &deferred_claim, &rhs_layer.input_layers,
                     &mut Vec::new(),
+                    &mut std::collections::HashSet::new(), // sub-deferred — main-walk skip unused
+                    circuit,
                 );
                 deferred_proofs.push(super::types::DeferredProof {
                     claim: deferred_claim.clone(),
@@ -4861,12 +5026,27 @@ pub fn prove_gkr_simd_gpu_with_cache(
     // Capture (weight_node_id, eval_point, final_b_eval) per MatMul.
     let mut weight_data: Vec<(usize, Vec<SecureField>, SecureField)> = Vec::with_capacity(d / 2);
     let mut deferred_info: Vec<(GKRClaim, usize)> = Vec::new();
+    // Layers to skip in the main walk (deferred branches of DAG Adds — see G19).
+    let mut skip_layers: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
     // Seed channel with circuit + SIMD metadata
     channel.mix_u64(d as u64);
     channel.mix_u64(circuit.input_shape.0 as u64);
     channel.mix_u64(circuit.input_shape.1 as u64);
     channel.mix_u64(n_blocks as u64);
+
+    // Bind policy commitment into Fiat-Shamir transcript (G29 hardening,
+    // Apr 30 2026). Mirrors verify_gkr_simd_inner. Without this, SIMD-path
+    // proofs are unbound to policy — a relaxed-policy proof would be
+    // structurally indistinguishable from a strict-policy proof.
+    {
+        let resolved_policy = crate::policy::resolve(None);
+        let policy_commitment = resolved_policy.policy_commitment();
+        let skip_policy = crate::policy::policy_commitment_skipped();
+        if !skip_policy && policy_commitment != starknet_ff::FieldElement::ZERO {
+            channel.mix_felt(policy_commitment);
+        }
+    }
 
     // Draw SIMD block-selection challenges
     let r_simd = channel.draw_qm31s(simd_config.simd_log_size);
@@ -4898,6 +5078,10 @@ pub fn prove_gkr_simd_gpu_with_cache(
     let template_layers: Vec<usize> = (template.start..template.end).rev().collect();
 
     for &layer_idx in &template_layers {
+        // Skip deferred-branch layers (G19): mirrors verifier's skip_layers.
+        if skip_layers.contains(&layer_idx) {
+            continue;
+        }
         let layer = &circuit.layers[layer_idx];
 
         let (proof, next_claim) = match &layer.layer_type {
@@ -4970,6 +5154,8 @@ pub fn prove_gkr_simd_gpu_with_cache(
                     &current_claim,
                     &layer.input_layers,
                     &mut deferred_info,
+                    &mut skip_layers,
+                    circuit,
                 )
             }
 
@@ -8496,7 +8682,7 @@ fn reduce_rmsnorm_layer_with_gamma(
     // Proves: Σ_x input(x)² = total_sq_sum  (no eq weighting)
     // This prevents the prover from fabricating rms_sq to pick a favorable rsqrt.
     // When STWO_SKIP_RMS_SQ_PROOF is set, skip Part 0 entirely (both channel ops and data).
-    let skip_rms_sq = std::env::var("STWO_SKIP_RMS_SQ_PROOF").is_ok();
+    let skip_rms_sq = crate::policy::skip_rms_sq_proof();
     let total_sq_sum: SecureField = input_mle
         .iter()
         .map(|&v| v * v)
@@ -9987,9 +10173,12 @@ fn reduce_attention_layer(
     channel: &mut PoseidonChannel,
 ) -> Result<(LayerProof, GKRClaim), GKRError> {
     let num_heads = config.num_heads;
+    let num_kv_heads = config.num_kv_heads;
+    let group_size = config.group_size();
     let seq_len = config.seq_len;
     let d_model = config.d_model;
     let d_k = config.d_k();
+    let kv_dim = config.kv_dim();
 
     // Run the full attention forward pass to get all intermediates
     let intermediates = attention_forward(input_matrix, attn_weights, config, config.causal);
@@ -10087,20 +10276,26 @@ fn reduce_attention_layer(
     });
     sub_claim_values.push(output_claim.value);
 
-    // Split intermediates per head
-    let k_heads = split_heads(&intermediates.k, num_heads);
-    let v_heads = split_heads(&intermediates.v, num_heads);
+    // Split intermediates per head. For GQA (num_kv_heads < num_heads), K/V
+    // are split by num_kv_heads since the K/V projection produces kv_dim cols
+    // (= num_kv_heads × d_k), not d_model. Q stays split by num_heads.
+    // Each Q head h uses K/V head index `h / group_size`.
+    let _ = num_kv_heads; // (referenced via group_size + kv_dim below)
+    let k_heads = split_heads(&intermediates.k, num_kv_heads);
+    let v_heads = split_heads(&intermediates.v, num_kv_heads);
     let q_heads = split_heads(&intermediates.q, num_heads);
 
     // --- Per-head sub-proofs (h = H-1..0) ---
     let mut softmax_sum_proofs_vec = Vec::with_capacity(num_heads);
 
     for h in (0..num_heads).rev() {
-        // Context matmul: context_h = softmax_h × V_h
+        let kv_idx = h / group_size; // GQA: maps Q head → K/V head group
+
+        // Context matmul: context_h = softmax_h × V_kv
         // shape: seq×d_k = seq×seq × seq×d_k
         let (ctx_proof, _ctx_input, ctx_value) = prove_sub_matmul(
             &intermediates.softmax_outputs[h],
-            &v_heads[h],
+            &v_heads[kv_idx],
             seq_len,
             seq_len,
             d_k,
@@ -10139,9 +10334,9 @@ fn reduce_attention_layer(
             softmax_sum_proofs_vec.push(sum_proof);
         }
 
-        // Score matmul: scores_h = Q_h × K_h^T
+        // Score matmul: scores_h = Q_h × K_kv^T
         // shape: seq×seq = seq×d_k × d_k×seq
-        let k_h_t = transpose_m31(&k_heads[h]);
+        let k_h_t = transpose_m31(&k_heads[kv_idx]);
         let (score_proof, _score_input, score_value) =
             prove_sub_matmul(&q_heads[h], &k_h_t, seq_len, d_k, seq_len, channel)?;
         sub_proofs.push(score_proof);
@@ -10149,25 +10344,26 @@ fn reduce_attention_layer(
     }
 
     // --- Projection matmuls: V, K, Q = input × W_V/K/Q ---
-    // V projection
+    // For GQA (num_kv_heads < num_heads): V/K project to kv_dim, not d_model.
+    // V projection: input(seq, d_model) × W_V(d_model, kv_dim) → (seq, kv_dim)
     let (v_proof, _v_input, v_value) = prove_sub_matmul(
         input_matrix,
         &attn_weights.w_v,
         seq_len,
         d_model,
-        d_model,
+        kv_dim,
         channel,
     )?;
     sub_proofs.push(v_proof);
     sub_claim_values.push(v_value);
 
-    // K projection
+    // K projection: same dims as V
     let (k_proof, _k_input, k_value) = prove_sub_matmul(
         input_matrix,
         &attn_weights.w_k,
         seq_len,
         d_model,
-        d_model,
+        kv_dim,
         channel,
     )?;
     sub_proofs.push(k_proof);

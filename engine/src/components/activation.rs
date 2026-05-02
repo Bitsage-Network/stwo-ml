@@ -360,16 +360,15 @@ pub fn piecewise_linear_eval(coeffs: &PiecewiseLinearCoeffs, val: M31) -> M31 {
 /// Check whether piecewise activation mode is enabled (default: ON).
 ///
 /// Piecewise-linear algebraic activation proves correctness over the full M31 domain
-/// via a 16-segment eq-sumcheck with no lookup tables. Opt-out for legacy LogUp path:
-/// `STWO_PIECEWISE_ACTIVATION=0` (or `false`/`no`).
+/// via a 16-segment eq-sumcheck with no lookup tables.
+///
+/// Resolution order: thread-local override → `STWO_PIECEWISE_ACTIVATION` env var → ON.
+/// Opt-out via env: `STWO_PIECEWISE_ACTIVATION=0` (or `false`/`no`/`off`).
+///
+/// Delegates to `policy::piecewise_activation_enabled()` so a single thread-local
+/// override governs all read sites and parallel tests can't race via env var.
 pub fn piecewise_activation_enabled() -> bool {
-    std::env::var("STWO_PIECEWISE_ACTIVATION")
-        .map(|v| {
-            let s = v.trim();
-            // Opt-out: 0 / false / no / off → disable piecewise
-            !(s == "0" || s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("no") || s.eq_ignore_ascii_case("off"))
-        })
-        .unwrap_or(true)
+    crate::policy::piecewise_activation_enabled()
 }
 
 /// Check piecewise activation from an explicit policy configuration.

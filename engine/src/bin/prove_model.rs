@@ -898,12 +898,43 @@ fn generate_random_input(rows: usize, cols: usize) -> M31Matrix {
 
 fn load_model(cli: &Cli) -> OnnxModel {
     if let Some(ref model_dir) = cli.model_dir {
-        // HuggingFace directory mode — validation is built into load_hf_model
-        eprintln!("Loading HuggingFace model from: {}", model_dir.display());
-        obelyzk::compiler::hf_loader::load_hf_model(model_dir, cli.layers).unwrap_or_else(|e| {
-            eprintln!("Error loading model directory: {e}");
-            process::exit(1);
-        })
+        // HuggingFace directory mode. As of G21 (Apr 30 2026), the default
+        // loader is `load_hf_model_decode` which produces a residual-aware
+        // graph (with explicit Add nodes for residual connections + proper
+        // Attention nodes). The previous default (`load_hf_model` /
+        // `build_hf_transformer_graph`) built a FLAT graph without residual
+        // Adds — proofs attested to a residualless approximation, not the
+        // actual model (G20 finding). G24 fixed the nested-DAG skip_layers
+        // bug that previously prevented the residual-aware path from
+        // self-verifying.
+        //
+        // Set `OBELYSK_FLAT_GRAPH=1` to opt into the legacy residualless
+        // loader (smaller proofs, faster, but does NOT prove residual adds).
+        let use_flat_graph = std::env::var("OBELYSK_FLAT_GRAPH")
+            .ok()
+            .as_deref()
+            == Some("1");
+        eprintln!(
+            "Loading HuggingFace model from: {} ({})",
+            model_dir.display(),
+            if use_flat_graph {
+                "flat graph (no residuals — legacy)"
+            } else {
+                "full residual graph (default)"
+            }
+        );
+        if use_flat_graph {
+            obelyzk::compiler::hf_loader::load_hf_model(model_dir, cli.layers).unwrap_or_else(|e| {
+                eprintln!("Error loading model directory: {e}");
+                process::exit(1);
+            })
+        } else {
+            obelyzk::compiler::hf_loader::load_hf_model_decode(model_dir, cli.layers)
+                .unwrap_or_else(|e| {
+                    eprintln!("Error loading model directory: {e}");
+                    process::exit(1);
+                })
+        }
     } else if let Some(ref model_path) = cli.model {
         // ONNX mode
         eprintln!("Loading ONNX model: {}", model_path.display());
@@ -1393,6 +1424,73 @@ fn main() {
                 );
                 process::exit(1);
             });
+
+            // Cross-check: gkr_calldata must serialize from gkr_proof_native.
+            // The on-chain Cairo verifier consumes gkr_calldata; the local
+            // verifier here verifies gkr_proof_native cryptographically. Without
+            // this check, an attacker could tamper gkr_calldata (the on-chain
+            // payload) leaving the native form intact, and local verify would
+            // false-positive (G9, fixed Apr 30 2026). On-chain still rejects
+            // tampered calldata via Fiat-Shamir divergence, but local verify
+            // shouldn't be misleading.
+            if let Some(gkr_arr) = proof_json
+                .get("gkr_calldata")
+                .and_then(|v| v.as_array())
+            {
+                let mut expected = Vec::new();
+                obelyzk::cairo_serde::serialize_gkr_proof_data_only(
+                    &native_proof,
+                    &mut expected,
+                );
+                let actual: Result<Vec<FieldElement>, String> = gkr_arr
+                    .iter()
+                    .map(|v| {
+                        FieldElement::from_hex_be(v.as_str().unwrap_or("0x0"))
+                            .map_err(|e| e.to_string())
+                    })
+                    .collect();
+                match actual {
+                    Ok(actual) => {
+                        if actual.len() != expected.len() {
+                            eprintln!(
+                                "VERIFICATION FAILED: gkr_calldata length {} does not match \
+                                 re-serialization of gkr_proof_native (expected {})",
+                                actual.len(),
+                                expected.len()
+                            );
+                            process::exit(1);
+                        }
+                        let mut diff = 0usize;
+                        let mut first_diff = None;
+                        for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                            if a != e {
+                                if first_diff.is_none() {
+                                    first_diff = Some((i, *a, *e));
+                                }
+                                diff += 1;
+                            }
+                        }
+                        if diff > 0 {
+                            let (i, a, e) = first_diff.unwrap();
+                            eprintln!(
+                                "VERIFICATION FAILED: gkr_calldata diverges from \
+                                 gkr_proof_native at {} positions (first @ {}: actual={a:#x}, \
+                                 expected={e:#x}). The on-chain payload was tampered \
+                                 independently of the native proof — proof rejected.",
+                                diff, i
+                            );
+                            process::exit(1);
+                        }
+                        eprintln!("  calldata/native consistency: verified ✓");
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "VERIFICATION FAILED: could not parse gkr_calldata felts: {e}"
+                        );
+                        process::exit(1);
+                    }
+                }
+            }
 
             let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&model.graph)
                 .unwrap_or_else(|e| {
