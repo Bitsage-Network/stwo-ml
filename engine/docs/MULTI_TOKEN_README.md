@@ -44,17 +44,39 @@ STARK's Fiat-Shamir verification — the kv commitments are channel-bound).
 
 ## Scope notes
 
-**Path A / real decode-step KV-cache binding** (current): each step's
+**Path A / real decode-step KV-cache binding**: each step's
 `kv_cache_commitment` is the actual incremental KV-cache Merkle commitment
 from `prove_model_pure_gkr_decode_step_incremental`. The recursive witness
 correctly replays the decode prover's channel-mixed kv commitments
 (witness.rs:446 — fix landed May 3). On-chain validated Session 7
-(`0x58cca48a5ae40cf1...`).
+(`0x58cca48a5ae40cf1...`) on SmolLM2-135M.
 
-**Path B (deprecated)**: earlier Sessions 3+4 used a synthetic
-`Poseidon(prev_kv, hash_of_input_token)` chain because of the now-fixed
-witness seeding bug. Those sessions remain on-chain as part of the demo
-trail, but new runs use Path A.
+**Path A scope limitation**: the chain-AIR's carry-chain validity constraint
+enforces `c ∈ {0, 1}` (degree 2). For larger models (Llama-1B+), some
+decode-mode channel ops produce limb-level integer sums where `c = -1`
+(borrow) is needed — caused by P's high-bit structure
+(`P = 2^251 + 17*2^192 + 1`). When this happens, the prover's
+`compute_addition_carry_chain` returns the FALLBACK and the recursive STARK
+fails with `ConstraintsNotSatisfied`. Resolving requires either:
+- bumping `max_constraint_log_degree_bound` to `log_n+2` with degree-3
+  validity constraint `c*(c-1)*(c+1) == 0`, AND increasing stwo's
+  `COMPOSITION_LOG_SPLIT` (workspace-level change), OR
+- adding 8 borrow columns to the chain trace at the cost of breaking the
+  deployed Cairo verifier's hardcoded `n_trace=48`.
+
+Either is a multi-day refactor beyond the current scope.
+
+**Path B / synthetic chain**: regular `prove_model_pure_gkr` + per-step
+input-hash kv commitments. Used for Llama-1B in Session 4
+(`0x4cb0fe5726edc43e...`). Cryptographic chain via Fiat-Shamir is real;
+the binding is over input-token continuity rather than the actual decode
+KV cache. Valid for any model size since it doesn't trigger the carry-chain
+edge case.
+
+**Recommendation**: use path A for SmolLM2-class (≤8-layer) models; use
+path B for larger. The CLI selects based on model size internally as a
+follow-up; for now `--decode --recursive` uses path A and falls back if
+it hits ConstraintsNotSatisfied.
 
 ## Required env
 

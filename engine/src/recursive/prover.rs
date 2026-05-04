@@ -806,14 +806,23 @@ pub fn prove_recursive_with_policy(
         let col_ac_next = 47;
 
         let mut chain_failures = 0usize;
+        let mut failed_rows: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        // Carries are signed: encoded as M31 with -1 represented as P-1 (= 2^31-2).
+        // Decode each trace cell to its signed integer form for residual check.
+        let m31_p_minus_one: i64 = (1i64 << 31) - 2;
+        let decode_signed = |raw: i64| -> i64 {
+            if raw == m31_p_minus_one { -1 } else { raw }
+        };
         for i in 0..n_real.saturating_sub(1) {
             for j in 0..super::air::LIMBS_PER_FELT {
                 let da = trace_data.execution_trace[col_digest_after + j][i].0 as i64;
                 let add = trace_data.execution_trace[col_addition + j][i].0 as i64;
-                let carry_in = if j == 0 { 0i64 } else { trace_data.execution_trace[col_carry + j - 1][i].0 as i64 };
+                let carry_in_raw = if j == 0 { 0i64 } else { trace_data.execution_trace[col_carry + j - 1][i].0 as i64 };
+                let carry_in = decode_signed(carry_in_raw);
                 let snb = trace_data.execution_trace[col_shifted + j][i].0 as i64;
                 let k = trace_data.execution_trace[col_k_idx][i].0 as i64;
-                let carry_out = if j < 8 { trace_data.execution_trace[col_carry + j][i].0 as i64 } else { 0 };
+                let carry_out_raw = if j < 8 { trace_data.execution_trace[col_carry + j][i].0 as i64 } else { 0 };
+                let carry_out = decode_signed(carry_out_raw);
                 let p_j = super::air::P_LIMBS_28[j] as i64;
                 let residual = da + add + carry_in - snb - k * p_j - carry_out * (1i64 << 28);
                 if residual != 0 {
@@ -821,8 +830,27 @@ pub fn prove_recursive_with_policy(
                         eprintln!("[chain-check] FAIL row {i} limb {j}: residual={residual} (da={da} add={add} cin={carry_in} snb={snb} k={k} cout={carry_out})");
                     }
                     chain_failures += 1;
+                    failed_rows.insert(i);
                 }
             }
+        }
+        // Reconstruct felts at each failing row to compare felt-level vs limb-level.
+        for &i in failed_rows.iter().take(3) {
+            let da_limbs: [M31; super::air::LIMBS_PER_FELT] =
+                std::array::from_fn(|j| trace_data.execution_trace[col_digest_after + j][i]);
+            let add_limbs: [M31; super::air::LIMBS_PER_FELT] =
+                std::array::from_fn(|j| trace_data.execution_trace[col_addition + j][i]);
+            let snb_limbs: [M31; super::air::LIMBS_PER_FELT] =
+                std::array::from_fn(|j| trace_data.execution_trace[col_shifted + j][i]);
+            let da_felt = super::air::limbs_to_felt252(&da_limbs);
+            let add_felt = super::air::limbs_to_felt252(&add_limbs);
+            let snb_felt = super::air::limbs_to_felt252(&snb_limbs);
+            let sum = da_felt + add_felt;
+            let diff = sum - snb_felt;
+            eprintln!(
+                "[chain-check FELT] row {i}: da={:#066x} add={:#066x} snb={:#066x} sum-snb={:#066x}",
+                da_felt, add_felt, snb_felt, diff,
+            );
         }
         if chain_failures > 0 {
             eprintln!("[chain-check] {} total constraint failures across {} chain rows", chain_failures, n_real - 1);
