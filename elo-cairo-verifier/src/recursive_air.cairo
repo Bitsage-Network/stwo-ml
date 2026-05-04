@@ -2,29 +2,35 @@
 ///
 /// Verifies that a chain of Poseidon channel operations was executed correctly.
 ///
-/// Slim trace layout (48 columns per row):
+/// Trace layout (56 columns per row, signed carry via pos/neg split):
 ///   [0..9)    digest_before
 ///   [9..18)   digest_after
 ///   [18..27)  shifted_next_before
 ///   [27..36)  addition_digest
-///   [36..44)  addition_carry
-///   [44]      addition_k
-///   [45]      is_active
-///   [46]      active_count
-///   [47]      active_count_next
+///   [36..44)  addition_carry_pos[8]   (positive carry indicator ∈ {0,1})
+///   [44..52)  addition_carry_neg[8]   (negative carry / borrow indicator ∈ {0,1})
+///   [52]      addition_k
+///   [53]      is_active
+///   [54]      active_count
+///   [55]      active_count_next
 ///
 /// Plus 3 preprocessed selector columns (is_first, is_last, is_chain).
 ///
-/// Constraints (40 total, all degree ≤ 2):
+/// Signed carry at limb j = pos[j] - neg[j] ∈ {-1, 0, 1} via pos*neg=0 enforcement.
+/// Negative carries (borrows) are required for Llama-class decode-mode channel ops
+/// because P's high-bit limbs (P_LIMBS_28[6]=2^24, [7]=1, [8]=2^27) cause
+/// limb-level integer sums to fall below the result limb at some positions.
+///
+/// Constraints (54 total, all degree ≤ 2):
 ///   C1:  is_active boolean                     [1, unconditional]
 ///   C2:  amortized accumulator                 [1, unconditional — BLOCKS all-zeros]
-///   C3b: is_chain_gate = is_active * is_active_next  [1]
-///   C3c: is_boundary_gate = is_active - is_chain_gate [1]
-///   C4:  initial boundary (is_first × 9 limbs) [9]
-///   C5:  final boundary (is_last × 9 limbs)   [9]
-///   C6:  carry-chain modular addition (9 limbs) [9]
-///   C6k: k boolean                             [1]
-///   C6c: carry booleans                        [8]
+///   C3:  initial boundary (is_first × 9 limbs) [9]
+///   C4:  final boundary (is_last × 9 limbs)    [9]
+///   C5k: k boolean                             [1]
+///   C5pos: pos[j] boolean                      [8]
+///   C5neg: neg[j] boolean                      [8]
+///   C5excl: pos[j] * neg[j] = 0                [8]
+///   C5:  carry-chain modular addition (9 limbs) [9]
 
 use stwo_verifier_core::fields::qm31::{QM31, QM31Zero, QM31One, QM31Trait};
 use stwo_verifier_core::fields::m31::{M31, m31};
@@ -38,7 +44,7 @@ use stwo_verifier_core::{TreeSpan, ColumnSpan};
 pub const LIMBS_PER_FELT: u32 = 9;
 
 /// Total trace columns.
-const TRACE_COLS: u32 = 48;
+const TRACE_COLS: u32 = 56;
 
 /// Columns per full Hades state (3 felt252 × 9 limbs).
 const COLS_PER_STATE: u32 = 27;
@@ -46,8 +52,8 @@ const COLS_PER_STATE: u32 = 27;
 /// Number of preprocessed selector columns: is_first, is_last, is_chain.
 const PREPROCESS_COLS: u32 = 3;
 
-/// Total constraints: 1 + 1 + 9 + 9 + 1 + 8 + 9 = 38.
-const N_CONSTRAINTS: u32 = 38;
+/// Total constraints: 1 + 1 + 9 + 9 + 1 + 8 + 8 + 8 + 9 = 54.
+const N_CONSTRAINTS: u32 = 54;
 
 /// Stark prime P in 28-bit limbs (LSB first).
 /// P = 2^251 + 17*2^192 + 1
@@ -66,7 +72,7 @@ pub struct RecursiveAir {
     pub initial_digest_limbs: Array<QM31>,
     /// Expected final digest decomposed into 9 M31 limbs.
     pub final_digest_limbs: Array<QM31>,
-    /// When true, evaluates 1225 Hades columns after the 48 chain columns.
+    /// When true, evaluates 1225 Hades columns after the 56 chain columns.
     pub hades_enabled: bool,
 }
 
@@ -95,21 +101,22 @@ impl RecursiveAirImpl of Air<RecursiveAir> {
         let zero: QM31 = QM31Zero::zero();
 
         // Column extraction helpers
-        // Slim 48-column layout:
+        // 56-column layout (signed carry via pos/neg split):
         // digest_before [0..9)
         // digest_after [9..18)
         // shifted_next_before [18..27)
         // addition_digest [27..36)
-        // addition_carry [36..44)
-        // addition_k [44]
-        // is_active [45]
-        // active_count [46]
-        // active_count_next [47]
+        // addition_carry_pos [36..44)
+        // addition_carry_neg [44..52)
+        // addition_k [52]
+        // is_active [53]
+        // active_count [54]
+        // active_count_next [55]
 
-        let is_active = extract_single_val(trace_vals, 45);
-        let active_count = extract_single_val(trace_vals, 46);
-        let active_count_next = extract_single_val(trace_vals, 47);
-        let addition_k = extract_single_val(trace_vals, 44);
+        let is_active = extract_single_val(trace_vals, 53);
+        let active_count = extract_single_val(trace_vals, 54);
+        let active_count_next = extract_single_val(trace_vals, 55);
+        let addition_k = extract_single_val(trace_vals, 52);
 
         // NOTE: Do NOT divide by vanishing polynomial here.
         // verify() multiplies the result by denominator_inv (vanishing^{-1}) externally.
@@ -168,21 +175,26 @@ impl RecursiveAirImpl of Air<RecursiveAir> {
         );
 
         // ═══════════════════════════════════════════════════════════
-        // C5c: carry booleans — is_chain × carry[j] × (carry[j] - 1) [8]
+        // C5pos: pos[j] boolean — is_chain × pos[j] × (pos[j] - 1) [8]
+        // C5neg: neg[j] boolean — is_chain × neg[j] × (neg[j] - 1) [8]
+        // C5excl: pos[j] * neg[j] = 0 — is_chain × pos[j] × neg[j]   [8]
+        // Net signed carry at limb j = pos[j] - neg[j] ∈ {-1, 0, 1}.
         // ═══════════════════════════════════════════════════════════
         j = 0;
         loop {
             if j >= 8 { break; }
-            let carry_j = extract_single_val(trace_vals, 36 + j); // addition_carry
-            quotients.append(
-                is_chain * carry_j * (carry_j - one)
-            );
+            let pos_j = extract_single_val(trace_vals, 36 + j); // addition_carry_pos
+            let neg_j = extract_single_val(trace_vals, 44 + j); // addition_carry_neg
+            quotients.append(is_chain * pos_j * (pos_j - one));
+            quotients.append(is_chain * neg_j * (neg_j - one));
+            quotients.append(is_chain * pos_j * neg_j);
             j += 1;
         };
 
         // ═══════════════════════════════════════════════════════════
         // C5: Carry-chain modular addition [9 limbs]
-        // da[j] + add[j] + carry_in - snb[j] - k*P[j] - carry_out*2^28 = 0
+        // da[j] + add[j] + (pos[j-1] - neg[j-1])
+        //   - snb[j] - k*P[j] - (pos[j] - neg[j])*2^28 = 0
         // ═══════════════════════════════════════════════════════════
         let p_limbs = stark_prime_28bit_limbs();
         let two_pow_28: QM31 = m31_to_qm31(m31(268435456)); // 2^28
@@ -198,11 +210,15 @@ impl RecursiveAirImpl of Air<RecursiveAir> {
             let carry_in: QM31 = if j == 0 {
                 zero
             } else {
-                extract_single_val(trace_vals, 36 + j - 1) // addition_carry
+                let pos_prev = extract_single_val(trace_vals, 36 + j - 1);
+                let neg_prev = extract_single_val(trace_vals, 44 + j - 1);
+                pos_prev - neg_prev
             };
 
             let carry_out_term: QM31 = if j < 8 {
-                extract_single_val(trace_vals, 36 + j) * two_pow_28 // addition_carry
+                let pos_j = extract_single_val(trace_vals, 36 + j);
+                let neg_j = extract_single_val(trace_vals, 44 + j);
+                (pos_j - neg_j) * two_pow_28
             } else {
                 zero
             };

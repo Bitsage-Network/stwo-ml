@@ -234,7 +234,7 @@ pub fn qm31_from_u32(v: u32) -> QM31 {
 
 /// Evaluate all Hades constraints at the OOD point.
 ///
-/// Reads 1225 columns from trace_vals starting at col_offset (= 48 for chain+hades).
+/// Reads 1225 columns from trace_vals starting at col_offset (= 56 for chain+hades).
 /// Returns an array of constraint quotients (422 total).
 ///
 /// Column layout (1225 columns, matching Rust air.rs):

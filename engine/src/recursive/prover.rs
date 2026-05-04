@@ -426,16 +426,17 @@ pub fn prove_recursive_with_policy(
         if unified_log_size > chain_log_size {
             let unified_n = 1usize << unified_log_size;
             let n_real = trace_data.n_real_rows;
-            // Slim 48-column layout offsets
-            let col_is_active = 45;
-            let col_ac = 46;
-            let col_ac_next = 47;
+            // 56-column layout offsets (pos/neg signed carry split)
+            let col_is_active = 53;
+            let col_ac = 54;
+            let col_ac_next = 55;
             let col_shifted = 18;
             let col_digest_before = 0;
             let col_digest_after = 9;
             let col_addition = 27;
-            let col_carry = 36;
-            let col_k = 44;
+            let col_carry_pos = 36;
+            let col_carry_neg = 44;
+            let col_k = 52;
 
             // Pad execution columns to unified size first
             for col in trace_data.execution_trace.iter_mut() {
@@ -475,10 +476,11 @@ pub fn prove_recursive_with_policy(
                     std::array::from_fn(|j| trace_data.execution_trace[col_addition + j][row_idx]);
                 let next_before_limbs: [M31; super::air::LIMBS_PER_FELT] =
                     std::array::from_fn(|j| trace_data.execution_trace[col_digest_before + j][row_idx + 1]);
-                let (carries, k) =
+                let (carry_pos, carry_neg, k) =
                     super::air::compute_addition_carry_chain(&da_limbs, &add_limbs, &next_before_limbs);
                 for j in 0..8 {
-                    trace_data.execution_trace[col_carry + j][row_idx] = carries[j];
+                    trace_data.execution_trace[col_carry_pos + j][row_idx] = carry_pos[j];
+                    trace_data.execution_trace[col_carry_neg + j][row_idx] = carry_neg[j];
                 }
                 trace_data.execution_trace[col_k][row_idx] = k;
             }
@@ -489,7 +491,7 @@ pub fn prove_recursive_with_policy(
             );
         }
 
-        // Chain columns: 48 columns, padded to unified_log_size
+        // Chain columns: 56 columns, padded to unified_log_size
         let chain_evals: Vec<CircleEvaluation<SimdBackend, M31, _>> = trace_data
             .execution_trace
             .iter()
@@ -791,38 +793,37 @@ pub fn prove_recursive_with_policy(
         }
     }
 
-    // Verify chain constraints before proving (slim 48-column offsets)
+    // Verify chain constraints before proving (56-column pos/neg layout)
     {
         let n_real = trace_data.n_real_rows;
         let n_padded = 1usize << unified_log_size;
-        // Slim layout offsets
+        // 56-column layout offsets
         let col_digest_after = 9;
         let col_shifted = 18;
         let col_addition = 27;
-        let col_carry = 36;
-        let col_k_idx = 44;
-        let col_is_active_offset = 45;
-        let col_ac = 46;
-        let col_ac_next = 47;
+        let col_carry_pos = 36;
+        let col_carry_neg = 44;
+        let col_k_idx = 52;
+        let col_is_active_offset = 53;
+        let col_ac = 54;
+        let col_ac_next = 55;
 
         let mut chain_failures = 0usize;
         let mut failed_rows: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        // Carries are signed: encoded as M31 with -1 represented as P-1 (= 2^31-2).
-        // Decode each trace cell to its signed integer form for residual check.
-        let m31_p_minus_one: i64 = (1i64 << 31) - 2;
-        let decode_signed = |raw: i64| -> i64 {
-            if raw == m31_p_minus_one { -1 } else { raw }
+        // Signed carry at limb j = pos[j] - neg[j] ∈ {-1, 0, 1}.
+        let signed_carry = |i: usize, j: usize| -> i64 {
+            let pos = trace_data.execution_trace[col_carry_pos + j][i].0 as i64;
+            let neg = trace_data.execution_trace[col_carry_neg + j][i].0 as i64;
+            pos - neg
         };
         for i in 0..n_real.saturating_sub(1) {
             for j in 0..super::air::LIMBS_PER_FELT {
                 let da = trace_data.execution_trace[col_digest_after + j][i].0 as i64;
                 let add = trace_data.execution_trace[col_addition + j][i].0 as i64;
-                let carry_in_raw = if j == 0 { 0i64 } else { trace_data.execution_trace[col_carry + j - 1][i].0 as i64 };
-                let carry_in = decode_signed(carry_in_raw);
+                let carry_in = if j == 0 { 0i64 } else { signed_carry(i, j - 1) };
                 let snb = trace_data.execution_trace[col_shifted + j][i].0 as i64;
                 let k = trace_data.execution_trace[col_k_idx][i].0 as i64;
-                let carry_out_raw = if j < 8 { trace_data.execution_trace[col_carry + j][i].0 as i64 } else { 0 };
-                let carry_out = decode_signed(carry_out_raw);
+                let carry_out = if j < 8 { signed_carry(i, j) } else { 0 };
                 let p_j = super::air::P_LIMBS_28[j] as i64;
                 let residual = da + add + carry_in - snb - k * p_j - carry_out * (1i64 << 28);
                 if residual != 0 {

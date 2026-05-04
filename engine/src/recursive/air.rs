@@ -27,11 +27,13 @@
 //! | digest_after  | 9 | felt252 → 9 M31 limbs |
 //! | shifted_next  | 9 | next row's digest_before |
 //! | addition_dig  | 9 | intermediate addition |
-//! | carry         | 8 | carry chain |
+//! | carry_pos     | 8 | positive carry indicator (boolean) |
+//! | carry_neg     | 8 | negative carry / borrow indicator (boolean) |
 //! | k, is_active, acc, acc_next | 4 | selectors |
-//! | **Total**     | **48** | |
+//! | **Total**     | **56** | |
 //!
-//! For 15K Hades calls: log_size=14, ~720K cells. Compact and efficient.
+//! Signed carry at limb j = carry_pos[j] - carry_neg[j] ∈ {-1, 0, 1}.
+//! Mutually exclusive (pos*neg = 0) — both AIR-enforced via degree-2 constraints.
 
 use starknet_ff::FieldElement;
 use stwo::core::fields::m31::BaseField as M31;
@@ -95,10 +97,14 @@ pub const COLS_PER_ROW: usize = COLS_PER_DIGEST  // digest_before: 9
     + COLS_PER_DIGEST // digest_after: 9
     + COLS_PER_DIGEST // shifted_next_before: 9
     + COLS_PER_DIGEST // addition_digest: 9
-    + 8  // addition_carry: 8 (carry chain for modular limb addition)
-    + 1  // addition_k: 1 (modular reduction quotient, 0 or 1)
-    + 3; // [45] is_active, [46] active_count, [47] active_count_next
-         // Total: 9 + 9 + 9 + 9 + 8 + 1 + 3 = 48
+    + 8  // addition_carry_pos: 8 (positive carry chain ∈ {0, 1})
+    + 8  // addition_carry_neg: 8 (negative carry / borrow chain ∈ {0, 1})
+    + 1  // addition_k: 1 (modular reduction quotient ∈ {0, 1})
+    + 3; // is_active, active_count, active_count_next
+         // Total: 9 + 9 + 9 + 9 + 8 + 8 + 1 + 3 = 56
+         // Effective signed carry at limb j: addition_carry_pos[j] - addition_carry_neg[j].
+         // Constraint enforces pos*neg = 0 so they're mutually exclusive
+         // → effective carry ∈ {-1, 0, 1}.
 
 // ═══════════════════════════════════════════════════════════════════════
 // Felt252 ↔ M31 limb decomposition
@@ -109,26 +115,26 @@ pub const COLS_PER_ROW: usize = COLS_PER_DIGEST  // digest_before: 9
 pub const P_LIMBS_28: [u32; 9] = [1, 0, 0, 0, 0, 0, 16777216, 1, 134217728];
 
 /// Compute carry-chain witnesses for modular limb addition:
-///   a[j] + b[j] + carry[j-1] = result[j] + k*P[j] + carry[j]*2^28
+///   a[j] + b[j] + (pos[j-1] - neg[j-1]) = result[j] + k*P[j] + (pos[j] - neg[j])*2^28
 ///
-/// Returns (carries[8], k) where carries[j] ∈ {0,1} and k ∈ {0,1}.
+/// Returns (carry_pos[8], carry_neg[8], k) where:
+/// - carry_pos[j] ∈ {0,1}: positive carry indicator for limb j
+/// - carry_neg[j] ∈ {0,1}: negative carry (borrow) indicator for limb j
+/// - signed carry at position j = pos[j] - neg[j] ∈ {-1, 0, 1}
+/// - pos[j] * neg[j] = 0 enforced by the AIR (mutual exclusion)
+/// - k ∈ {0,1}: modular reduction quotient
+///
 /// `a_limbs` = digest_after, `b_limbs` = addition_digest, `result_limbs` = shifted_next_before.
+///
+/// Negative carries (borrows) are needed when P's high-bit limbs (P_LIMBS_28[6..9]
+/// non-zero due to 2^251 + 17*2^192 + 1) cause the running integer sum's limb to
+/// fall below the result's limb at some position. This happens for Llama-class
+/// decode-mode channel ops.
 pub fn compute_addition_carry_chain(
     a_limbs: &[M31; LIMBS_PER_FELT],
     b_limbs: &[M31; LIMBS_PER_FELT],
     result_limbs: &[M31; LIMBS_PER_FELT],
-) -> ([M31; 8], M31) {
-    // Find k ∈ {0, 1} and per-limb carries ∈ {-1, 0, 1} such that
-    //   a[j] + b[j] + carry[j-1] = result[j] + k*P[j] + carry[j] * 2^28
-    // for all j, with carry[-1] = 0 and final carry[LIMBS-1] = 0.
-    //
-    // Carries can be NEGATIVE (borrows) when P's high-bit limbs (P_LIMBS_28[6..9]
-    // are non-zero due to 2^251 + 17*2^192 + 1) exceed the running integer sum's
-    // limb. The chain-AIR constraint allows carry ∈ {-1, 0, 1} via the
-    // degree-3 boolean (carry-1)*carry*(carry+1) == 0.
-    //
-    // Negative carries are encoded as M31::from(P - 1) (= 2^31 - 2).
-    let p_m31: u32 = (1u32 << 31) - 1;
+) -> ([M31; 8], [M31; 8], M31) {
     for k in 0..=1u32 {
         let mut carries_signed = [0i64; 8];
         let mut carry: i64 = 0;
@@ -153,28 +159,31 @@ pub fn compute_addition_carry_chain(
             }
         }
         if valid && carry == 0 {
-            // Encode signed carries: -1 → P-1, 0 → 0, 1 → 1
-            let carries = std::array::from_fn(|j| {
-                let c = carries_signed[j];
-                let v = if c < 0 {
-                    (p_m31 as i64 + c) as u32
-                } else {
-                    c as u32
-                };
-                M31::from_u32_unchecked(v)
+            // Split signed carries into pos/neg indicator columns:
+            //   c = +1 → pos=1, neg=0
+            //   c =  0 → pos=0, neg=0
+            //   c = -1 → pos=0, neg=1
+            let pos = std::array::from_fn(|j| {
+                M31::from_u32_unchecked(if carries_signed[j] == 1 { 1 } else { 0 })
             });
-            return (carries, M31::from_u32_unchecked(k));
+            let neg = std::array::from_fn(|j| {
+                M31::from_u32_unchecked(if carries_signed[j] == -1 { 1 } else { 0 })
+            });
+            return (pos, neg, M31::from_u32_unchecked(k));
         }
     }
-    // Fallback: should never happen for consistent felt252 sums with the
-    // degree-3 carry constraint. If hit, log limbs for debugging.
+    // Fallback: should never happen if a + b ≡ result (mod P).
     eprintln!(
         "[carry-chain FALLBACK] a_limbs={:?} b_limbs={:?} result_limbs={:?}",
         a_limbs.map(|m| m.0),
         b_limbs.map(|m| m.0),
         result_limbs.map(|m| m.0),
     );
-    ([M31::from_u32_unchecked(0); 8], M31::from_u32_unchecked(0))
+    (
+        [M31::from_u32_unchecked(0); 8],
+        [M31::from_u32_unchecked(0); 8],
+        M31::from_u32_unchecked(0),
+    )
 }
 
 /// Decompose a felt252 into 9 M31 limbs (LSB first).
@@ -269,7 +278,7 @@ pub struct RecursiveVerifierEval {
     /// When `None`, LogUp is disabled (backward-compatible mode).
     pub hades_lookup: Option<HadesPermRelation>,
 
-    /// When true, the Hades AIR columns (1225 columns) follow the 48 chain
+    /// When true, the Hades AIR columns (1225 columns) follow the 56 chain
     /// columns in the committed trace and their constraints are evaluated
     /// inline. This merges chain + Hades into a single component.
     pub hades_enabled: bool,
@@ -281,19 +290,11 @@ impl FrameworkEval for RecursiveVerifierEval {
     }
 
     fn max_constraint_log_degree_bound(&self) -> u32 {
-        // All constraints are degree ≤ 2 (helper columns precompute products).
-        //
-        // KNOWN LIMITATION: this constrains the carry-chain validity to
-        // c ∈ {0, 1} (positive carries only). For larger models (Llama-1B+),
-        // some decode-mode channel ops produce limb-level integer sums that
-        // require negative carries (borrows) — see compute_addition_carry_chain
-        // FALLBACK warning. Resolving this requires either (a) bumping the
-        // bound to log_n_rows+2 and adjusting stwo's COMPOSITION_LOG_SPLIT, or
-        // (b) splitting the carry into pos/neg columns at the cost of 8
-        // additional trace columns (would also break the deployed Cairo
-        // verifier's hardcoded n_trace=48). For now, path A works for
-        // ≤8-layer models (SmolLM2-135M class). Larger models fall back
-        // to path B (synthetic kv chain).
+        // All constraints are degree ≤ 2. Signed carry encoding via pos/neg
+        // indicator columns (boolean each, mutually exclusive) keeps the
+        // carry-validity constraint at degree 2 while supporting carry ∈
+        // {-1, 0, 1} — which is required for Llama-class decode-mode channel
+        // ops where limb-level borrows occur.
         self.log_n_rows + 1
     }
 
@@ -313,7 +314,7 @@ impl FrameworkEval for RecursiveVerifierEval {
             id: "is_chain".into(),
         });
 
-        // ── Read execution trace columns (slim 48-column layout) ─────
+        // ── Read execution trace columns (56-column layout with pos/neg carries) ─────
         // digest_before[9]
         let digest_before: [E::F; LIMBS_PER_FELT] = std::array::from_fn(|_| eval.next_trace_mask());
 
@@ -330,9 +331,16 @@ impl FrameworkEval for RecursiveVerifierEval {
         let addition_digest: [E::F; LIMBS_PER_FELT] = std::array::from_fn(|_| eval.next_trace_mask());
 
         // Carry chain for modular limb addition:
-        //   digest_after[j] + addition[j] + carry[j-1] = result[j] + k*P[j] + carry[j]*2^28
-        // where result[j] = shifted_next_before[j], k ∈ {0,1}, carry[j] ∈ {0,1}
-        let addition_carry: [E::F; 8] = std::array::from_fn(|_| eval.next_trace_mask());
+        //   digest_after[j] + addition[j] + signed_carry[j-1]
+        //     = result[j] + k*P[j] + signed_carry[j]*2^28
+        // where signed_carry[j] = addition_carry_pos[j] - addition_carry_neg[j],
+        // result[j] = shifted_next_before[j], k ∈ {0,1}, pos/neg ∈ {0,1} mutually exclusive
+        // (so signed_carry ∈ {-1, 0, 1}).
+        // Negative carries (borrows) are needed when P's high-bit limbs cause the
+        // limb-level integer sum to fall below the result's limb at some position
+        // (e.g., decode-mode channel ops on Llama-class models).
+        let addition_carry_pos: [E::F; 8] = std::array::from_fn(|_| eval.next_trace_mask());
+        let addition_carry_neg: [E::F; 8] = std::array::from_fn(|_| eval.next_trace_mask());
         let addition_k = eval.next_trace_mask();
 
         // ── Execution-trace selectors ────────────────────────────────
@@ -399,13 +407,25 @@ impl FrameworkEval for RecursiveVerifierEval {
             eval.add_constraint(
                 _is_chain.clone() * addition_k.clone() * (addition_k.clone() - E::F::from(M31::from(1u32))),
             );
-            // Carries must be boolean (∈ {0, 1}). See max_constraint_log_degree_bound
-            // comment for the limitation this imposes on path A for larger models.
+            // pos/neg carries must each be boolean (∈ {0, 1})
+            // and mutually exclusive (pos*neg = 0). Net signed carry = pos - neg ∈ {-1, 0, 1}.
+            // All three constraints stay degree 2.
+            let one = E::F::from(M31::from(1u32));
             for j in 0..8 {
                 eval.add_constraint(
                     _is_chain.clone()
-                        * addition_carry[j].clone()
-                        * (addition_carry[j].clone() - E::F::from(M31::from(1u32))),
+                        * addition_carry_pos[j].clone()
+                        * (addition_carry_pos[j].clone() - one.clone()),
+                );
+                eval.add_constraint(
+                    _is_chain.clone()
+                        * addition_carry_neg[j].clone()
+                        * (addition_carry_neg[j].clone() - one.clone()),
+                );
+                eval.add_constraint(
+                    _is_chain.clone()
+                        * addition_carry_pos[j].clone()
+                        * addition_carry_neg[j].clone(),
                 );
             }
 
@@ -414,10 +434,11 @@ impl FrameworkEval for RecursiveVerifierEval {
                 let carry_in = if j == 0 {
                     E::F::from(M31::from(0u32))
                 } else {
-                    addition_carry[j - 1].clone()
+                    addition_carry_pos[j - 1].clone() - addition_carry_neg[j - 1].clone()
                 };
                 let carry_out_term = if j < 8 {
-                    addition_carry[j].clone() * two_pow_28.clone()
+                    (addition_carry_pos[j].clone() - addition_carry_neg[j].clone())
+                        * two_pow_28.clone()
                 } else {
                     // Last limb: carry out must be 0 (no overflow past 252 bits)
                     E::F::from(M31::from(0u32))
@@ -442,7 +463,7 @@ impl FrameworkEval for RecursiveVerifierEval {
         // ══════════════════════════════════════════════════════════════
         //
         // When hades_enabled is true, we read the 1225 Hades trace columns
-        // that follow the 48 chain columns in the committed trace and
+        // that follow the 56 chain columns in the committed trace and
         // evaluate the core Hades constraints (boolean selectors, S-box/cube,
         // post-sbox interpolation, MDS, round transition).
         //
@@ -698,16 +719,17 @@ struct ChainRow {
 /// Each row stores the actual felt252 Hades input/output from the GKR
 /// verifier's Fiat-Shamir transcript, decomposed into M31 limbs.
 ///
-/// Slim layout (48 columns):
+/// Layout (56 columns):
 ///   [0..9)    digest_before
 ///   [9..18)   digest_after
 ///   [18..27)  shifted_next_before
 ///   [27..36)  addition_digest
-///   [36..44)  addition_carry
-///   [44]      addition_k
-///   [45]      is_active
-///   [46]      active_count
-///   [47]      active_count_next
+///   [36..44)  addition_carry_pos[8]   (positive carry indicator ∈ {0,1})
+///   [44..52)  addition_carry_neg[8]   (negative carry / borrow indicator ∈ {0,1})
+///   [52]      addition_k
+///   [53]      is_active
+///   [54]      active_count
+///   [55]      active_count_next
 pub fn build_recursive_trace(witness: &super::types::GkrVerifierWitness) -> RecursiveTraceData {
     use super::types::WitnessOp;
 
@@ -764,22 +786,23 @@ pub fn build_recursive_trace(witness: &super::types::GkrVerifierWitness) -> Recu
         "n_padded ({n_padded_rows}) must be > n_real ({n_real_rows}) for boundary constraints"
     );
 
-    // Build trace columns (48 columns — slim layout)
+    // Build trace columns (56 columns — pos/neg carry layout)
     let mut execution_trace: Vec<Vec<M31>> = Vec::with_capacity(COLS_PER_ROW);
     for _ in 0..COLS_PER_ROW {
         execution_trace.push(vec![M31::from_u32_unchecked(0); n_padded_rows]);
     }
 
-    // Column offsets for the slim 48-column layout
+    // Column offsets for the 56-column layout
     let col_digest_before = 0;       // [0..9)
     let col_digest_after = 9;        // [9..18)
     let col_shifted = 18;            // [18..27)
     let col_addition = 27;           // [27..36)
-    let col_carry = 36;              // [36..44)
-    let col_k = 44;                  // [44]
-    let col_is_active = 45;          // [45]
-    let col_active_count = 46;       // [46]
-    let col_active_count_next = 47;  // [47]
+    let col_carry_pos = 36;          // [36..44) positive carry indicator
+    let col_carry_neg = 44;          // [44..52) negative carry / borrow indicator
+    let col_k = 52;                  // [52]
+    let col_is_active = 53;          // [53]
+    let col_active_count = 54;       // [54]
+    let col_active_count_next = 55;  // [55]
 
     // Populate trace
     for row_idx in 0..n_padded_rows {
@@ -822,10 +845,11 @@ pub fn build_recursive_trace(witness: &super::types::GkrVerifierWitness) -> Recu
                 std::array::from_fn(|j| execution_trace[col_addition + j][row_idx]);
             let next_before_limbs: [M31; LIMBS_PER_FELT] =
                 std::array::from_fn(|j| execution_trace[col_digest_before + j][row_idx + 1]);
-            let (carries, k) =
+            let (carry_pos, carry_neg, k) =
                 compute_addition_carry_chain(&da_limbs, &add_limbs, &next_before_limbs);
             for j in 0..8 {
-                execution_trace[col_carry + j][row_idx] = carries[j];
+                execution_trace[col_carry_pos + j][row_idx] = carry_pos[j];
+                execution_trace[col_carry_neg + j][row_idx] = carry_neg[j];
             }
             execution_trace[col_k][row_idx] = k;
         }
@@ -918,8 +942,8 @@ mod tests {
         assert_eq!(LIMBS_PER_FELT, 9);
         assert_eq!(COLS_PER_DIGEST, 9);
         assert_eq!(COLS_PER_STATE, 27);
-        // 9 + 9 + 9 + 9 (addition) + 8 (carry) + 1 (k) + 3 (selectors) = 48
-        assert_eq!(COLS_PER_ROW, 48);
+        // 9 + 9 + 9 + 9 (addition) + 8 (carry_pos) + 8 (carry_neg) + 1 (k) + 3 (selectors) = 56
+        assert_eq!(COLS_PER_ROW, 56);
     }
 
     #[test]

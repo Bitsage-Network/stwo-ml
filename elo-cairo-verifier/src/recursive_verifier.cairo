@@ -951,8 +951,8 @@ pub mod RecursiveVerifierContract {
             i = 0;
             loop { if i >= n_preprocess { break; } preprocessed_sizes.append(proof_log_size); i += 1; };
 
-            // Trace sizes: 48 (chain-only) or 1273 (48 chain + 1225 Hades)
-            let n_trace: u32 = if hades_enabled { 1273 } else { 48 };
+            // Trace sizes: 56 (chain-only) or 1281 (56 chain + 1225 Hades)
+            let n_trace: u32 = if hades_enabled { 1281 } else { 56 };
             let mut trace_sizes: Array<u32> = array![];
             i = 0;
             loop { if i >= n_trace { break; } trace_sizes.append(proof_log_size); i += 1; };
